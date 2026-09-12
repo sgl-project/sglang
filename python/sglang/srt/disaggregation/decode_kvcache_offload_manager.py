@@ -14,7 +14,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_hybrid_swa_stack,
     build_kv_host_pool,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -22,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
@@ -56,15 +64,6 @@ class DecodeKVCacheOffloadManager:
             self.offload_stride = max(
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
-            raise ValueError("Unsupported KV cache type for decode offload")
-        self.decode_host_mem_pool = build_kv_host_pool(
-            kv_pool=kv_cache,
-            page_size=self.page_size,
-            use_mla=isinstance(kv_cache, MLATokenToKVPool),
-        )
-
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
@@ -79,17 +78,56 @@ class DecodeKVCacheOffloadManager:
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
 
-        self.cache_controller = HiCacheController(
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            mem_pool_host=self.decode_host_mem_pool,
-            page_size=self.page_size,
-            tp_group=tp_group,
-            io_backend=get_memory().hicache_io_backend,
-            load_cache_event=threading.Event(),
-            storage_backend=get_memory().hicache_storage_backend,
-            model_name=get_serving().served_model_name,
-            storage_backend_extra_config=hicache_storage_backend_extra_config,
-        )
+        self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(self.kv_cache, UnifiedSWAKVPool):
+            full_mapping = {
+                gid: lid
+                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
+                if not is_swa
+            }
+            swa_mapping = {
+                gid: lid
+                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
+                if is_swa
+            }
+            params = CacheInitParams(
+                disable=False,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                tp_cache_group=tp_group,
+            )
+            self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
+                params=params,
+                full_kv_pool=self.kv_cache.full_kv_pool,
+                swa_kv_pool=self.kv_cache.swa_kv_pool,
+                full_layer_mapping=full_mapping,
+                swa_layer_mapping=swa_mapping,
+                load_cache_event=threading.Event(),
+                storage_backend=get_memory().hicache_storage_backend,
+                use_mla=False,
+                model_name=get_serving().served_model_name,
+                storage_backend_extra_config=hicache_storage_backend_extra_config,
+            )
+        else:
+            if not isinstance(self.kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
+                raise ValueError("Unsupported KV cache type for decode offload")
+            self.decode_host_mem_pool = build_kv_host_pool(
+                kv_pool=self.kv_cache,
+                page_size=self.page_size,
+                use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
+            )
+            self.cache_controller = HiCacheController(
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                mem_pool_host=self.decode_host_mem_pool,
+                page_size=self.page_size,
+                tp_group=tp_group,
+                io_backend=get_memory().hicache_io_backend,
+                load_cache_event=threading.Event(),
+                storage_backend=get_memory().hicache_storage_backend,
+                model_name=get_serving().served_model_name,
+                storage_backend_extra_config=hicache_storage_backend_extra_config,
+            )
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
@@ -118,6 +156,33 @@ class DecodeKVCacheOffloadManager:
     def _prefill_offloaded_len(self, req: Req) -> int:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
+
+    def has_inflight_device_transfer(self) -> bool:
+        """Whether a device-to-host copy may still read unified KV pages."""
+        return bool(self.ongoing_offload)
+
+    def _resolve_offload_transfers(
+        self, virtual_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, list[PoolTransfer]]:
+        full_indices = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                virtual_indices
+            )
+        )
+        if not isinstance(self.kv_cache, UnifiedSWAKVPool):
+            return full_indices, []
+
+        swa_indices = self.kv_cache.translate_loc_from_full_to_swa(virtual_indices)
+        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
+        if live_swa_indices.numel() == 0:
+            return full_indices, []
+        return full_indices, [
+            PoolTransfer(
+                name=PoolName.SWA,
+                device_indices=live_swa_indices,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -158,7 +223,10 @@ class DecodeKVCacheOffloadManager:
         start = prefill_offloaded_len + state.inc_len
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
-        incremental_indices = token_indices[start:end]
+        incremental_indices = token_indices[start:end].to(torch.int64)
+        device_indices, pool_transfers = self._resolve_offload_transfers(
+            incremental_indices
+        )
 
         # Prefill-aligned GPU slots are freed at request finish in
         # _release_finished_req, NOT here. The decoding request
@@ -170,8 +238,9 @@ class DecodeKVCacheOffloadManager:
         self.request_counter += 1
         ack_id = self.request_counter
         host_indices = self.cache_controller.write(
-            device_indices=incremental_indices.long(),
+            device_indices=device_indices,
             node_id=ack_id,
+            **({"extra_pools": pool_transfers} if pool_transfers else {}),
         )
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
@@ -183,6 +252,7 @@ class DecodeKVCacheOffloadManager:
             host_indices,
             incremental_tokens,
             time.time(),
+            pool_transfers,
         )
         state.inc_len += incremental_aligned_len
         return True
@@ -218,6 +288,7 @@ class DecodeKVCacheOffloadManager:
                     host_indices,
                     incremental_tokens,
                     start_time,
+                    pool_transfers,
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._mark_offload_finished(req)
@@ -227,7 +298,12 @@ class DecodeKVCacheOffloadManager:
                     else None
                 )
                 last_hash = self._trigger_backup(
-                    req, host_indices, incremental_tokens, start_time, prior_hash
+                    req,
+                    host_indices,
+                    incremental_tokens,
+                    start_time,
+                    prior_hash,
+                    pool_transfers,
                 )
                 if req in self.offloaded_state:
                     self.offloaded_state[req].last_hash = last_hash
@@ -258,9 +334,15 @@ class DecodeKVCacheOffloadManager:
         for _ in range(finish_count):
             storage_operation = self.cache_controller.ack_backup_queue.get()
             ack_id = storage_operation.id
-            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
+            req_id, host_indices, start_time, pool_transfers = self.ongoing_backup.pop(
+                ack_id
+            )
 
             # Release host memory
+            for transfer in pool_transfers:
+                self.decode_host_mem_pool.get_pool(transfer.name).free(
+                    transfer.host_indices
+                )
             self.decode_host_mem_pool.free(host_indices)
 
             logger.debug(
@@ -268,16 +350,31 @@ class DecodeKVCacheOffloadManager:
             )
 
     def _trigger_backup(
-        self, req, host_indices, incremental_tokens, start_time, prior_hash
+        self,
+        req,
+        host_indices,
+        incremental_tokens,
+        start_time,
+        prior_hash,
+        pool_transfers=(),
     ):
         """Trigger async backup from host to storage."""
         page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
+        for transfer in pool_transfers:
+            page_count = transfer.device_indices.numel() // self.page_size
+            transfer.keys = page_hashes[-page_count:]
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
             hash_value=page_hashes,
+            **({"extra_pools": pool_transfers} if pool_transfers else {}),
         )
-        self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
+        self.ongoing_backup[ack_id] = (
+            req.rid,
+            host_indices,
+            start_time,
+            pool_transfers,
+        )
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
     def _compute_prefix_hash(self, tokens, prior_hash=""):

@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -94,12 +95,19 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
-        if self.is_hybrid_swa and not self.full_tokens_per_layer:
+        allocator = self.token_to_kv_pool_allocator
+        full_capacity = (
+            allocator.current_full_capacity
+            if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+            and allocator.supports_asymmetric_reservation
+            else self.full_tokens_per_layer
+        )
+        if self.is_hybrid_swa and not full_capacity:
             return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_full_tokens()
-            total = self.full_tokens_per_layer
+            total = full_capacity
         elif self.is_hybrid_ssm:
             # Branch on cache type for the protected accessor (MambaRadixCache
             # splits full/mamba; ChunkCache only has the single protected_size).
@@ -119,7 +127,6 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
-        allocator = self.token_to_kv_pool_allocator
         if get_parallel().dcp_enabled and allocator.page_size > 1:
             # DCP stores logical tokens in widened physical pages.  Prefix cache
             # counters are logical-token based, while the allocator frees whole
@@ -173,7 +180,12 @@ class SchedulerInvariantChecker:
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),
-            self.swa_tokens_per_layer,
+            (
+                allocator.current_swa_capacity
+                if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+                and allocator.supports_asymmetric_reservation
+                else self.swa_tokens_per_layer
+            ),
             uncached,
         )
 
