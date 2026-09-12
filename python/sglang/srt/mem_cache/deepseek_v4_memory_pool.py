@@ -20,6 +20,16 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.kv_region import (
+    KVRegion,
+    PageAligned,
+    ReqScoped,
+    RequestCtx,
+    SwaMapped,
+    SwaPageRing,
+    load_regions,
+    save_regions,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -625,6 +635,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.max_num_reqs = max_num_reqs
+        # Registered by SWATokenToKVPoolAllocator; None until then.
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
         # PD preallocation can exceed max_num_reqs;
         # the SWA ring must cover every addressable req_pool_idx.
         self.num_req_slots = (
@@ -913,6 +925,173 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(t.nbytes)
             item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
+
+    # ---- Host offload of one request's KV + compress state -----------------
+
+    def iter_kv_regions(self) -> List[KVRegion]:
+        """Every buffer holding per-request state, paired with how to address it.
+        A subclass that changes buffer layout overrides only this and inherits
+        ``get_cpu_copy`` / ``load_cpu_copy``.
+        """
+        if self._unified_kv:
+            raise NotImplementedError(
+                "DSV4 unified_kv packs the SWA ring and the compressed region into "
+                "one buffer; host offload addresses them as separate regions."
+            )
+        if isinstance(self.c4_kv_pool, HiSparseC4DevicePool):
+            raise NotImplementedError(
+                "DSV4 HiSparse keeps c4 pages in its own host tier and remaps "
+                "device locations; host offload would double-manage them."
+            )
+        assert self.full_to_swa_index_mapping is not None, (
+            "full_to_swa_index_mapping is registered by the allocator; host "
+            "offload needs it to locate SWA rows"
+        )
+        return [
+            self._swa_kv_region(),
+            *self._compressed_kv_regions(),
+            *self._compress_state_regions(),
+            *self._request_scoped_regions(),
+        ]
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        return save_regions(
+            regions=self.iter_kv_regions(),
+            ctx=self._request_ctx(indices, req_pool_index),
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        load_regions(
+            regions=self.iter_kv_regions(),
+            host=kv_cache_cpu,
+            ctx=self._request_ctx(indices, req_pool_index),
+        )
+
+    @staticmethod
+    def _request_ctx(
+        indices: torch.Tensor, req_pool_index: Optional[int]
+    ) -> RequestCtx:
+        assert req_pool_index is not None, (
+            "DSV4 host offload needs req_pool_index: the request-scoped C128 state "
+            "is addressed by req slot, not by token location"
+        )
+        return RequestCtx(token_indices=indices, req_pool_idx=int(req_pool_index))
+
+    def _swa_kv_region(self) -> KVRegion:
+        return KVRegion(
+            name="swa_kv",
+            tensors=tuple(self.swa_kv_pool.kv_buffer),
+            addressing=SwaMapped(
+                mapping=self.full_to_swa_index_mapping,
+                page_size=self.swa_kv_pool.page_size,
+            ),
+        )
+
+    def _compressed_kv_regions(self) -> List[KVRegion]:
+        """Compressed latent KV and the c4 indexer K, both paged by token."""
+        entries = [
+            ("c4_kv", tuple(self.c4_kv_pool.kv_buffer), 4, self.c4_kv_pool.page_size),
+            (
+                "c128_kv",
+                tuple(self.c128_kv_pool.kv_buffer),
+                128,
+                self.c128_kv_pool.page_size,
+            ),
+            (
+                "c4_indexer_kv",
+                tuple(self.c4_indexer_kv_pool.index_k_with_scale_buffer),
+                4,
+                self.c4_indexer_kv_pool.page_size,
+            ),
+        ]
+        regions = []
+        for name, tensors, ratio, pool_page_size in entries:
+            if not tensors:  # this PP stage owns no layer of this ratio
+                continue
+            stride = ratio * pool_page_size
+            assert self.page_size % stride == 0, (
+                f"{name} row spans {stride} tokens, which must divide the model "
+                f"page_size {self.page_size} so that whole-row copies stay inside "
+                "pages owned by the request"
+            )
+            regions.append(
+                KVRegion(
+                    name=name,
+                    tensors=tensors,
+                    addressing=PageAligned(stride=stride),
+                )
+            )
+        return regions
+
+    def _compress_state_regions(self) -> List[KVRegion]:
+        """C4 attention and indexer state: one ring block per SWA page."""
+        groups = [
+            ("c4_state", self.compress_state_pools),
+            ("c4_indexer_state", self.indexer_compress_state_pools),
+        ]
+        regions = []
+        for name, pools in groups:
+            live = [p for p in pools if p is not None and p.ratio != 128]
+            if not live:
+                continue
+            ring_size = live[0].ring_size
+            swa_page_size = live[0].swa_page_size
+            assert all(
+                p.ring_size == ring_size and p.swa_page_size == swa_page_size
+                for p in live
+            ), f"{name} pools must share ring geometry to share one region"
+            regions.append(
+                KVRegion(
+                    name=name,
+                    tensors=tuple(p.kv_score_buffer.kv_score for p in live),
+                    addressing=SwaPageRing(
+                        mapping=self.full_to_swa_index_mapping,
+                        swa_page_size=swa_page_size,
+                        ring_size=ring_size,
+                    ),
+                )
+            )
+        return regions
+
+    def _request_scoped_regions(self) -> List[KVRegion]:
+        """C128 state and the online MTP pending lengths, addressed by req slot."""
+        regions = []
+        c128_pools = [
+            p for p in self.compress_state_pools if p is not None and p.ratio == 128
+        ]
+        if c128_pools:
+            if ONLINE_C128:
+                # One committed state row per request slot.
+                addressing = ReqScoped(rows_per_req=1, block_rows=1, block_tokens=128)
+            else:
+                # A per-request ring of raw token states, cleared and addressed a
+                # whole 128-row block at a time (see clear_c128_req_state).
+                ring_size = self.get_ring_size(128)
+                assert ring_size % 128 == 0, (
+                    f"C128 ring_size must be 128-aligned, got {ring_size}"
+                )
+                addressing = ReqScoped(
+                    rows_per_req=ring_size, block_rows=128, block_tokens=128
+                )
+            regions.append(
+                KVRegion(
+                    name="c128_state",
+                    tensors=tuple(p.kv_score_buffer.kv_score for p in c128_pools),
+                    addressing=addressing,
+                    reset_before_load=self.clear_c128_req_state,
+                )
+            )
+        if self.online_c128_mtp_pending_seq_lens is not None:
+            regions.append(
+                KVRegion(
+                    name="online_c128_mtp_pending_seq_lens",
+                    tensors=(self.online_c128_mtp_pending_seq_lens,),
+                    addressing=ReqScoped(),
+                )
+            )
+        return regions
 
     def _init_compressed_pools(
         self,

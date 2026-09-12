@@ -372,6 +372,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kernel_page_size=page_size,
         )
 
+    def iter_kv_regions(self):
+        # NPU keeps live index data in index_k_buffer / index_scale_buffer, not the
+        # packed index_k_with_scale_buffer the base regions describe, and pages by
+        # kernel_page_size rather than page_size; both would offload wrong rows.
+        raise NotImplementedError(
+            "DSV4 NPU pools do not support host offload; retracted requests "
+            "recompute their prefix KV instead."
+        )
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Main PD buffers addressed by the full KV page id."""
         indexer_pool = self._indexer_pool(4)
