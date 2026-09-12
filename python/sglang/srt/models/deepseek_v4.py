@@ -426,7 +426,9 @@ _wo_a_aiter_batched_gemm_disabled = False
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
+_hip = None
 if _is_hip:
+    from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
         apply_wo_a_fp8_mxscale_fused_invrope,
@@ -454,13 +456,14 @@ def _apply_wo_a_bf16_matmul(
     is_target_verify: bool = False,
     fuse_mxfp8_quant: bool = False,
     is_prefill: bool = False,
+    fp8_grid: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows and large prefill batches write token-major
     output directly to avoid the layout copy before wo_b. ROCm decode can use
-    aiter batched GEMM; other cases use torch.einsum.
+    aiter batched GEMM with an optional fp8-grid operand; other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -512,6 +515,10 @@ def _apply_wo_a_bf16_matmul(
         and _wo_a_aiter_batched_gemm_enabled
         and not _wo_a_aiter_batched_gemm_disabled
     ):
+        if _is_hip:
+            y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
+            if y is not None:
+                return y
         try:
             # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
             # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
@@ -723,7 +730,11 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     get_attn_backend().forward_low_ratio_sources(
         layer=layer,
         x=x[:real_num_tokens],
-        q_lora=q_lora[:real_num_tokens],
+        q_lora=(
+            _hip.live_rows(q_lora, real_num_tokens)
+            if _is_hip
+            else q_lora[:real_num_tokens]
+        ),
         positions=positions[:real_num_tokens],
         forward_batch=forward_batch,
     )
@@ -837,6 +848,8 @@ class MqaAttentionBase(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
+        if _is_hip:
+            _hip.init_mqa_attention_base(self)
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -1168,9 +1181,11 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.use_fused_qk_norm_rope = (
-            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+        self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(
+            self, quant_config
         )
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -1240,6 +1255,8 @@ class MQALayer(MqaAttentionBase):
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         # Keep the BF16 normalized row for the indexer while emitting the
         # quantized input consumed by wq_b in the same launch.
+        if _is_hip:
+            return _hip.q_norm_for_wq_b(self, q)
         method = self.wq_b.quant_method
         if (
             _is_cuda
@@ -1338,13 +1355,16 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         qkv_a: Optional[torch.Tensor] = None,
+        q_rope: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        ``q_rope`` ([T, H, head_dim]) has its query heads roped by the same launch.
         """
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+            assert q_rope is None
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
             # values across fp8 bins relative to bf16-sourced consumers).
@@ -1368,6 +1388,7 @@ class MQALayer(MqaAttentionBase):
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
+            q=q_rope,
         )
 
     def _compute_kv_bf16(
@@ -1712,8 +1733,8 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
             )
         else:
-            q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            q_lora, q_for_wq_b = self._normalize_q_lora(q_lora)
+            q = self._compute_q_b(q_for_wq_b, positions, q_out)
             self._compute_kv_to_cache(
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
@@ -1749,6 +1770,19 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        # kv_score depends only on x, so its CP all-gather can start before the
+        # projections and be collected inside forward_core_compressor below --
+        # the projections are what hides it. No-op unless the CP+TBO path armed
+        # _cp_prefetch_comm_stream.
+        if (
+            _is_hip
+            and self.compressor is not None
+            and self.compress_ratio not in (1, 2)
+        ):
+            self.compressor.prelaunch_kv_score(x, forward_batch)
+            if self.indexer is not None:
+                self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
+
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1962,8 +1996,18 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            q = self._compute_q_b(q_for_wqb, positions, q_out)
+            q_lora, q_for_wq_b = self._normalize_q_lora(q_lora)
+            fuse_q_rope = _is_hip and _hip.fuses_q_rope_into_k_store(
+                self, q_out, unified=unified, use_cp=use_cp
+            )
+            if fuse_q_rope:
+                # the K store launch below ropes the query heads
+                q = _hip.wq_b_unroped(self, q_for_wq_b)
+            else:
+                q = self._compute_q_b(q_for_wq_b, positions, q_out)
+            if _is_hip and q_for_wq_b is not q_lora:
+                # the indexer's wq_b would re-round onto the same grid, so hand it the fused operand
+                q_lora = q_for_wq_b
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1997,7 +2041,12 @@ class MQALayer(MqaAttentionBase):
                 kv = None
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                    x_linear,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    qkv_a=qkv_a,
+                    q_rope=q if fuse_q_rope else None,
                 )
                 kv = None
 
@@ -2166,7 +2215,11 @@ class MQALayer(MqaAttentionBase):
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
             kernel_num_heads = self.n_local_heads
         else:
-            kernel_num_heads = self._kernel_num_heads(x.shape[0])
+            kernel_num_heads = (
+                self.n_local_heads
+                if _is_hip and _hip.skip_head_pad(self)
+                else self._kernel_num_heads(x.shape[0])
+            )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
@@ -2263,6 +2316,16 @@ class MQALayer(MqaAttentionBase):
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
+        inv_rope = None
+        if _is_hip:
+            # the attention kernel applies the inverse RoPE itself; the else-branch below keeps it
+            inv_rope = _hip.attention_inv_rope(
+                self,
+                positions,
+                forward_batch,
+                wo_a_applies_inv_rope=self.wo_a_fp8
+                and _wo_a_fp8_mxscale_fused_invrope is not None,
+            )
         if unified:
             # only the HIP radix backend takes these two; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2282,6 +2345,7 @@ class MQALayer(MqaAttentionBase):
                 attn_sink=attn_sink[: self.n_local_heads],
                 save_kv_cache=kv is not None,
                 **rope_kwargs,
+                inv_rope=inv_rope,
             )
         else:
             attn_q = q_padded if q_padded is not None else q
@@ -2309,6 +2373,7 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
+                    inv_rope=inv_rope,
                 )
             o = o[:, tp_slice, :]
         if (
@@ -2343,7 +2408,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            else:
+            elif inv_rope is None:
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,
@@ -2417,10 +2482,17 @@ class MQALayer(MqaAttentionBase):
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    # ROCm: the 16-row decode kernels also serve target-verify rows
                     o = _apply_wo_a_bf16_matmul(
                         o,
                         wo_a,
-                        is_decode=forward_batch.forward_mode.is_decode(),
+                        is_decode=(
+                            forward_batch.forward_mode.is_decode()
+                            or (
+                                _is_hip
+                                and forward_batch.forward_mode.is_target_verify()
+                            )
+                        ),
                         is_target_verify=forward_batch.forward_mode.is_target_verify(),
                         is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                         fuse_mxfp8_quant=(
@@ -2440,6 +2512,7 @@ class MQALayer(MqaAttentionBase):
                                 or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
                             )
                         ),
+                        fp8_grid=_is_hip and _hip.wo_b_takes_fp8_grid(self),
                     )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2453,7 +2526,7 @@ class MQALayer(MqaAttentionBase):
 
         mhc = current_mhc_post_fusion()
         o, _ = self.wo_b(
-            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+            o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=mhc is not None,
         )
         if mhc is not None:
@@ -2593,6 +2666,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+        if _is_hip:
+            _hip.init_decoder_layer(self, quant_config)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(
@@ -2673,6 +2748,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_attn_fn.data
                     )
                     self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+    def _input_norm(
+        self,
+        hidden_states: torch.Tensor,
+        allow_aiter_quant: bool = True,
+        coefficients=None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
+        """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the pre-quantized
+        operand of its dense projections or None); ``coefficients`` is a ROCm boundary's pending
+        reduce + sinkhorn."""
+        if _is_hip:
+            return _hip.input_norm(self, hidden_states, allow_aiter_quant, coefficients)
+        return self.input_layernorm(hidden_states), None
 
     def hc_pre(
         self,
@@ -2964,18 +3051,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # Triton fused post+pre (gfx95 small-batch or gfx1250) returns
-                    # norm_fused=False — the input layernorm is NOT folded.
-                    # gfx95 takes the fp8-quant path; gfx1250 takes plain layernorm.
-                    if _use_aiter and _is_gfx95_supported:
-                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.rms_norm_eps,
-                        )
-                    else:
-                        hidden_states = self.input_layernorm(hidden_states)
-                        x_quant = None
+                    # the Triton fused post+pre does not fold the input layernorm
+                    hidden_states, x_quant = self._input_norm(hidden_states)
                 else:
                     x_quant = None
             else:
@@ -2992,15 +3069,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
-                    if _use_aiter and _is_gfx95_supported:
-                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.rms_norm_eps,
-                        )
-                    else:
-                        hidden_states = self.input_layernorm(hidden_states)
-                        x_quant = None
+                    hidden_states, x_quant = self._input_norm(hidden_states)
                 else:
                     x_quant = None
         else:
@@ -3014,15 +3083,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
             if not norm_fused:
-                if _use_aiter and _is_gfx95_supported:
-                    x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                        hidden_states,
-                        self.input_layernorm.weight,
-                        self.rms_norm_eps,
-                    )
-                else:
-                    hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                hidden_states, x_quant = self._input_norm(hidden_states)
             else:
                 x_quant = None
 
@@ -3195,14 +3256,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         x_flat = x.flatten(1)
 
         if (
-            x.is_cuda
-            and torch.version.cuda is not None
-            and (
-                get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
+            # ROCm: the fused Triton port wins at every decode row count
+            (_is_hip and x.is_cuda)
+            or (
+                x.is_cuda
+                and torch.version.cuda is not None
+                and (
+                    get_platform().is_blackwell
+                    or (get_platform().is_sm90 and x.shape[0] == 1)
+                )
             )
-            and x.dtype == torch.bfloat16
-        ):
+        ) and x.dtype == torch.bfloat16:
             # The split-K partial fixes the reduction order;
             # fusing the reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
@@ -3699,15 +3763,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if not norm_fused:
-            if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
-                x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                    hidden_states,
-                    self.input_layernorm.weight,
-                    self.rms_norm_eps,
-                )
-            else:
-                hidden_states = self.input_layernorm(hidden_states)
-                x_quant = None
+            hidden_states, x_quant = self._input_norm(hidden_states)
         else:
             x_quant = None
 
@@ -4212,13 +4268,19 @@ class DeepseekV4Model(nn.Module):
         saved_full = None
         prev_pre = None
         precomputed_attn = None
+        # HIP: the fused boundary hands the next layer its FFN hc_post unapplied
+        pending_post = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
-                    tail.rows(hidden_states),
+                if pending_post is not None:
+                    # the fused boundary carries the residual stream here, not in hidden_states
+                    pending_post = tuple(tail.rows(t) for t in pending_post)
+                else:
+                    hidden_states = tail.rows(hidden_states)
+                prev_pre, input_ids, input_ids_global = (
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
                     tail.rows(input_ids_global),
@@ -4230,12 +4292,18 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
+                # the fused HIP gate keeps the image-token rows itself
+                image_select = (
+                    _hip.engram_image_select(self.config, input_ids)
+                    if _is_hip
+                    else None
+                )
                 if i == 14 and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_stream(self.engram_prefetch_stream)
                     prefetched_engram_kv.record_stream(main_stream)
                     hidden_states = engram.apply_gate(
-                        hidden_states, prefetched_engram_kv
+                        hidden_states, prefetched_engram_kv, image_select=image_select
                     )
                     prefetched_engram_kv = None
                 else:
@@ -4244,8 +4312,9 @@ class DeepseekV4Model(nn.Module):
                         hash_ids[:, engram.layer_hash_index],
                         forward_batch,
                         cp_all_tokens=cp_extend,
+                        image_select=image_select,
                     )
-                if (
+                if image_select is None and (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
                 ):
@@ -4297,6 +4366,22 @@ class DeepseekV4Model(nn.Module):
                 ):
                     next_norm = norm
             with ctx:
+                if _is_hip and self.layers[i].hc_boundary_fused:
+                    hidden_states, prev_pre, pending_post = (
+                        _hip.forward_layer_fused_boundary(
+                            self,
+                            i,
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            input_ids=input_ids,
+                            forward_batch=forward_batch,
+                            input_ids_global=input_ids_global,
+                            prev_pre=prev_pre,
+                            pending_post=pending_post,
+                            capture_dspark=capture_dspark,
+                        )
+                    )
+                    continue
                 hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
                     hidden_states=hidden_states,
