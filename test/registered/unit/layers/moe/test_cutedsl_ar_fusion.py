@@ -85,9 +85,9 @@ def test_framework_capacity_is_maximum_of_all_sources(_cutedsl_moe_max_num_token
         ),
         role="test",
     )
-    runner = SimpleNamespace(server_args=SimpleNamespace(), max_running_requests=2048)
-
-    assert resolve_max_m(runner) == 8192
+    assert (
+        resolve_max_m(server_args=SimpleNamespace(), max_running_requests=2048) == 8192
+    )
 
 
 def test_deferred_handoff_reuses_producer_storage():
@@ -229,7 +229,12 @@ def test_last_layer_prepare_attn_consumes_the_pending_all_reduce():
     """
     last = _eligible_communicator(successor=False)
     last.fusion_service = SimpleNamespace(
-        all_reduce_residual_rms_norm=lambda h, r, g: (h + 1, r + 1)
+        all_reduce_residual_rms_norm=(
+            lambda *, local_contribution, residual, gamma: (
+                local_contribution + 1,
+                residual + 1,
+            )
+        )
     )
     forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
@@ -295,8 +300,8 @@ def test_last_layer_still_declines_to_skip_its_own_all_reduce():
             ),
         ),
     ):
-        assert last.can_consume_post_moe_all_reduce(forward_batch, 8) is True
-        assert last.can_absorb_post_moe_all_reduce(forward_batch, 8) is False
+        assert last._can_consume_post_moe_all_reduce(forward_batch, 8) is True
+        assert last._can_absorb_post_moe_all_reduce(forward_batch, 8) is False
 
 
 def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
@@ -342,18 +347,6 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
             return_value=parallel(ep=1, moe_tp=4),
         ):
             assert comm._common_eligible(forward_batch, 8) is True
-
-
-def test_scoped_leaves_unlisted_forward_flags_alone():
-    """Why dsv2_flashinfer_moe_dual_stream_graph must pin the deferral off:
-    entering a scope for other flags does not reset the deferral the decoder
-    published, so it reaches into the op. The op's own contract is exercised in
-    test_dsv2_dual_stream_op_contract.py, which needs CUDA."""
-    from sglang.srt.runtime_context import get_forward
-
-    with get_forward().scoped(defer_moe_finalize=True):
-        with get_forward().scoped(fuse_mlp_allreduce=True):
-            assert get_forward().defer_moe_finalize is True
 
 
 if __name__ == "__main__":

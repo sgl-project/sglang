@@ -862,6 +862,21 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.multi_stream)
         self.assertFalse(fwd.multi_stream)
 
+    def test_scoped_leaves_unlisted_flags_alone(self):
+        """A scope opened for one flag must not reset the others to their
+        defaults. deepseek_v2's dual-stream custom op relies on the converse:
+        it pins defer_moe_finalize off because the decoder's scope reaches in.
+        """
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        with fwd.scoped(defer_moe_finalize=True):
+            with fwd.scoped(fuse_mlp_allreduce=True):
+                self.assertTrue(fwd.defer_moe_finalize)
+            self.assertTrue(fwd.defer_moe_finalize)
+        self.assertFalse(fwd.defer_moe_finalize)
+
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward
 

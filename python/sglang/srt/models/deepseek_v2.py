@@ -3102,7 +3102,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         prepare_cutedsl_fusion(
             self.model.flashinfer_mnnvl_cutedsl_fusion,
-            model_runner,
+            server_args=model_runner.server_args,
+            max_running_requests=model_runner.max_running_requests,
             label="DeepSeek-V3/GLM",
         )
 
@@ -3255,11 +3256,8 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
-        # scoped() leaves unlisted flags alone, so the decoder's deferral would
-        # otherwise reach in here and hand back a MoeFinalizeHandoff, which this
-        # op's Tensor schema cannot carry. Finalize locally instead; the skipped
-        # all-reduce still reaches the next layer through
-        # _sglang_needs_allreduce_fusion.
+        # scoped() leaves unlisted flags alone, and this op's Tensor schema
+        # cannot carry a MoeFinalizeHandoff; finalize locally instead.
         defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)

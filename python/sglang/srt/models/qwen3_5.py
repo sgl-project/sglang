@@ -1715,7 +1715,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
 
         prepare_cutedsl_fusion(
-            self.flashinfer_mnnvl_cutedsl_fusion, model_runner, label="Qwen3.5"
+            self.flashinfer_mnnvl_cutedsl_fusion,
+            server_args=model_runner.server_args,
+            max_running_requests=model_runner.max_running_requests,
+            label="Qwen3.5",
         )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):

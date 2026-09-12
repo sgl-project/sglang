@@ -5,7 +5,7 @@ through its Tensor schema.
 type, while ``forward_normal_dual_stream`` may hand back a
 ``MoeFinalizeHandoff``. ``ForwardFlags.scoped()`` overrides only the flags it
 is given, so the decoder's ``defer_moe_finalize`` reaches inside the op unless
-the op pins it off. The op is CUDA-only, hence a GPU suite.
+the op pins it off. The op is CUDA-only, so this is a GPU suite rather than a unit test.
 """
 
 import unittest
