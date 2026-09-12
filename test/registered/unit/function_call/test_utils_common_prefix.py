@@ -3,6 +3,10 @@ import random
 import unittest
 
 from sglang.srt.function_call.utils import _find_common_prefix
+from sglang.test.ci.ci_register import register_cpu_ci
+
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _reference_common_prefix(left: str, right: str) -> str:
