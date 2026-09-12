@@ -31,7 +31,10 @@ class DsaGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        dp_max_seq_len = getattr(forward_batch, "dp_max_seq_len", None)
+        if dp_max_seq_len is not None:
+            max_kv_len = dp_max_seq_len
+        elif seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
             max_kv_len = int(seq_lens_cpu.max().item())
         elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
@@ -79,8 +82,8 @@ class Dsv41CandidateGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
-        max_seq_len = None
-        if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
+        max_seq_len = getattr(forward_batch, "dp_max_seq_len", None)
+        if max_seq_len is None and lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
             max_seq_len = int(lengths.max())
         if max_seq_len is None and self.verify_extra_tokens:
             # Includes acceptance still in flight, without a GPU-to-CPU copy.
@@ -116,8 +119,7 @@ def create_dsv41_candidate_graph_variants(
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
-        and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and (is_hip() or torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10)
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):
