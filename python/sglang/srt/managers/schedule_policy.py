@@ -167,6 +167,7 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            for_reuse=True,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -370,7 +371,8 @@ class SchedulePolicy:
                             token_ids=prefix_ids,
                             extra_key=extra_key,
                             cache_salt=cache_salt,
-                        )
+                        ),
+                        for_reuse=True,
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():

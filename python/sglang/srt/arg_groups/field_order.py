@@ -362,6 +362,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_host_memory_mode",
     "hicache_ratio",
     "hicache_size",
+    "hicache_swa_offload_page_stride",
     "hicache_write_policy",
     "hicache_io_backend",
     "hicache_mem_layout",

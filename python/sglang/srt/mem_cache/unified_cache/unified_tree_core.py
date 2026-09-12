@@ -16,6 +16,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 from array import array
@@ -764,7 +765,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, for_reuse=params.for_reuse)
         return self._match_post_processor(
             params,
             value,
@@ -776,7 +777,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, for_reuse: bool = False
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -789,6 +790,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
+        #
+        # `for_reuse` distinguishes cross-request reuse matches (scheduler) from
+        # self-match lookups (`cache_unfinished_req`). On the device-only match
+        # validators, `cd.value` is trusted even without a durable host copy —
+        # required for self-match (the request's own freshly-computed nodes
+        # aren't host-backed yet), but unsafe on reuse (the per-request SWA
+        # device ring is recycled across requests, so a device-only match past
+        # the host-gated boundary can be stale). So on reuse we clamp the FULL
+        # device anchor to the host-gated `best_match_node` boundary below.
         node = self.root_node
         key_offset = 0
         child_key = key.child_key_at(key_offset, self.page_size)
@@ -796,6 +806,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        # FULL value-chunk length at the moment `best_match_node` (the node
+        # accepted by ALL validators, i.e. host-gated) was last set. Only
+        # meaningful when `best_match_node` is device-resident at that point,
+        # which holds for the Mine-1 scenario this clamp targets.
+        best_match_value_len = 0
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
@@ -813,15 +828,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 for comp in self.components
             )
 
+        # Clamping is only meaningful when some component's device-only validator
+        # can outrun the host-gated one; gating on that keeps the reuse path
+        # byte-identical for everyone else instead of relying on min() happening to
+        # be an identity.
+        clamp_device_anchor = for_reuse and any(
+            comp.device_anchor_needs_reuse_clamp() for comp in self.components
+        )
+
         def _all_valid(validators, node):
             return all([v(node) for v in validators])
 
         def _update_best_if_valid(node):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
+            nonlocal best_match_value_len
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                best_match_value_len = len(value)
 
             if not separate_device_match:
                 if matched:
@@ -855,6 +880,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key_offset += prefix_len
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
+
+        if clamp_device_anchor:
+            # Reuse path only: never let the FULL device anchor extend past the
+            # host-gated best_match_node boundary, even if the per-request
+            # device-only validators (trusting `cd.value`) matched further.
+            # Self-match must NOT clamp here — see docstring above.
+            best_match_device_value_len = min(
+                best_match_device_value_len, best_match_value_len
+            )
 
         return (
             value,
@@ -1643,6 +1677,42 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def drive_host_leaf_eviction(
+        self,
+        num_tokens: int,
+        key_component: ComponentType,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> tuple[int, int]:
+        """Evict whole host leaves atomically until
+        ``tracker[key_component] >= num_tokens``, dropping every component
+        (Full + SWA) on each leaf together. Used by strict bit-exact SWA so a
+        Full-host copy never outlives its SWA-host copy.
+
+        Returns ``(full_tokens_freed, leaves_evicted)`` so the caller can
+        attribute Full-host losses to the auxiliary pool's pressure.
+        """
+        full_before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        leaves = 0
+        heap = [
+            (self.eviction_strategy.get_priority(n), n)
+            for n in self.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        while tracker[key_component] < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x not in self.evictable_host_leaves:
+                continue
+            self._evict_host_leaf(x, tracker, device_frees, host_frees)
+            leaves += 1
+            if x.parent is not None and x.parent in self.evictable_host_leaves:
+                heapq.heappush(
+                    heap,
+                    (self.eviction_strategy.get_priority(x.parent), x.parent),
+                )
+        return tracker.get(BASE_COMPONENT_TYPE, 0) - full_before, leaves
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -1874,6 +1944,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        # Free any interior stride carrier's not-yet-promoted SWA capture page
+        # here, the single node-removal chokepoint. Pending tracks the Full (base)
+        # lifetime, so it is dropped only on real removal -- not on a device
+        # tombstone -- and independently of per-component eviction order.
+        swa_comp = self.components_by_type.get(ComponentType.SWA)
+        if swa_comp is not None:
+            swa_comp.free_pending_host_on_remove(node)
+
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 

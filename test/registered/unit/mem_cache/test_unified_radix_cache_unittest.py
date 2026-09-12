@@ -9274,6 +9274,40 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         )
         cache.sanity_check()
 
+    def test_cache_finished_req_eagle_branch_does_not_split_a_page(self):
+        # page_size=1 tests never see this: adjacent tokens are distinct pages.
+        # EAGLE +1 on a page-aligned SWA branch emits [ps_aligned, +1) then
+        # [+1, full); without coalescing, _page_disjoint fires (E6 warmup).
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self.assertTrue(cache.tree_core.is_eagle)
+        ps = self.cfg.page_size
+        branching = 2 * ps
+        seq_len = 4 * ps
+
+        req = Req(
+            rid=1,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        tokens = list(range(1, seq_len + 1))
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        kv_indices = self._alloc_paged(allocator, seq_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req.kv.kv_committed_len = seq_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_branching_seqlen = branching
+
+        cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=seq_len)
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.

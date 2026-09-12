@@ -52,6 +52,20 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+def merge_adjacent_kv_row_ranges(
+    ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    # token-adjacent ranges can still share a page (EAGLE +1 on a page-aligned
+    # SWA branch). _page_disjoint rejects that; one segment frees the page once.
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted((s, e) for s, e in ranges if s < e):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,

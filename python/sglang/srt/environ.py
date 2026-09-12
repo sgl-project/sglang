@@ -658,6 +658,20 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # Strict bit-exact SWA HiCache for unified_kv (DeepSeek-V4): offload the SWA
+    # ring to host and restore it on reuse instead of reprefilling a 128-token
+    # tail. Sizing: --hicache-swa-offload-page-stride. OFF == #29417 best-effort (tail
+    # reprefill, no SWA host pool) -- cheaper for short-prefix workloads.
+    SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE = EnvBool(False)
+    # Staging headroom, in absolute pages, for the c4/indexer state pools that
+    # ride the strict SWA windows. Default -1: auto = ceil(ISL/(page*stride)) + 1
+    # at per-rank batch 1, with ISL = min(200k, context_length). A row lives from
+    # capture until write_through BACKUP_HOST promote, so a long prefix can hold
+    # every strided window at once; do not scale by max_running_requests. Raise
+    # it when [SWA-HiCache] reports staging exhausted -- N concurrent prefills
+    # want roughly N times the auto value. 0 restores the legacy 1.5x-of-durable
+    # sizing.
+    SGLANG_SWA_HICACHE_STATE_STAGING_PAGES = EnvInt(-1)
 
     # ===================================================================
     # PD disaggregation runtime

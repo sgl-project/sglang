@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -32,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     import torch
@@ -470,6 +472,340 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _dsv4_swa_ring_region_buffers(kvcache: Any) -> tuple[list, int]:
+    """Resolve (device_buffers, item_bytes) for the unified_kv SWA ring.
+
+    The SWA ring occupies rows [0, swa_pages) of every unified layer buffer
+    (addressed by req_pool_idx * swa_ring_size + pos % swa_ring_size). The host
+    pool pages the ring by sliding window: one host page mirrors one window
+    (unified_swa_ring_size consecutive rows), so device rows match the host
+    item_bytes in transfer_kv.
+    """
+    assert getattr(kvcache, "_unified_kv", False)
+    return kvcache.swa_region_buffers()
+
+
+def _dsv4_unified_state_paged_pool(
+    *,
+    pool_name: str,
+    state_pools,
+    global_layers,
+    ring_size: int,
+    num_host_pages: int,
+    allocator_type: str,
+    staging_slack_pages: int = 0,
+) -> DeepSeekV4PagedHostPool:
+    """Build a host pool for the c4 / c4-indexer overlap compress state. One host
+    page mirrors one per-request state ring block (ring_size slots). Uses
+    layer_first layout so data_refs[li][page_row] is the contiguous tile the
+    riding capture/restore helpers index directly. Not registered with the
+    HiCache controller; the tiles ride the SWA window's lifetime and are managed
+    by swa_component.
+
+    The pool splits into num_host_pages durable rows (addressed by the coupled
+    SWA window's host page row) plus staging_slack_pages staging rows (the only
+    region the allocator hands out, for transient capture keyed by (rid, B)
+    before the durable row is known). promote copies a staged tile into its
+    durable row, so the state persists in its own L3 pool at the same row as the
+    SWA window and is fetched by the coupled key family. staging_slack_pages == 0
+    keeps the legacy single-region behavior.
+    """
+    device_buffers = []
+    item_bytes = None
+    for gl in global_layers:
+        sp = state_pools[gl]
+        buf = sp.kv_score_buffer.kv_score  # [total_state_slots, last_dim]
+        device_buffers.append(buf)
+        ib = ring_size * buf.shape[-1] * buf.element_size()
+        if item_bytes is None:
+            item_bytes = ib
+        elif item_bytes != ib:
+            raise AssertionError(
+                f"{pool_name}: inconsistent state item_bytes {ib} vs {item_bytes} "
+                f"at global layer {gl}"
+            )
+    durable_pages = num_host_pages
+    total_pages = durable_pages + max(0, int(staging_slack_pages))
+    hp = DeepSeekV4PagedHostPool(
+        pool_name=pool_name,
+        device_buffers=device_buffers,
+        item_bytes=item_bytes,
+        num_host_pages=total_pages,
+        slot_page_size=ring_size,
+        layout="layer_first",
+        allocator_type=allocator_type,
+    )
+    if staging_slack_pages:
+        # Reserve [0, durable_pages) rows for window-coupled durable storage;
+        # allocator serves only the slack tail. Re-clear to apply the reserve.
+        hp._durable_reserve_slots = durable_pages * ring_size
+        hp.clear()
+    hp._capture_staging = {}
+    hp._capture_state_crc = {}
+    return hp
+
+
+# Default assumed average sequence length (tokens) of prefixes cached to host;
+# each such prefix needs one SWA window across many full-KV pages.
+_SWA_HICACHE_DEFAULT_AVG_SEQ_LEN = 50_000
+# Slow-launch WARN tier: above this per-rank size, page-locking the pool is slow
+# enough that a healthy launch can look like a hang -- warn, never fail. This is
+# the tier that owns the "fake hang" concern.
+_SWA_HICACHE_SLOW_LAUNCH_GB = 16.0
+# Hard FAIL-FAST tier: a fraction of *available* host DRAM the SWA offload pool
+# may claim on this node. Every GPU rank sharing the node pins its own copy, so
+# the per-rank ceiling is available_dram * fraction / ranks_per_node. This tier
+# owns only the "would physically exhaust host DRAM (real OOM)" concern -- NOT
+# slow pinning, which is the warn tier above.
+_SWA_HICACHE_HARD_LIMIT_DRAM_FRACTION = 0.9
+# Peak unpromoted c4 tiles: one long prefix (daily ISL 50/100/200k) at
+# per-rank batch 1. write_through ack can lag across chunked-prefill inserts,
+# so occupancy is the prefix's strided windows, not one chunk and not
+# max_running_requests (that is the device pool, often 1024).
+_STATE_STAGING_DESIGN_ISL_TOKENS = 200_000
+_STATE_STAGING_DEFAULT_PAGE_SIZE = 256
+_STATE_STAGING_DEFAULT_CONCURRENT = 1
+# floor so a huge stride still has a few concurrent boundaries
+_STATE_STAGING_MIN_PAGES = 64
+
+
+def _state_staging_windows(*, inflight_tokens: int, page_size: int, stride: int) -> int:
+    page_size = max(1, int(page_size))
+    stride = max(1, int(stride))
+    inflight_tokens = max(1, int(inflight_tokens))
+    # stride-aligned page boundaries plus the true-tail window
+    return -(-inflight_tokens // (page_size * stride)) + 1
+
+
+class _StateStagingPlan(NamedTuple):
+    """What the staging sizing decided, plus the inputs it decided from, so the
+    launch log cannot describe a formula the pools were not built with."""
+
+    pages: int
+    inflight_tokens: int
+    page_size: int
+    stride: int
+    basis: str
+
+
+def _state_staging_plan(
+    durable_pages: int, *, server_args, page_size: int
+) -> _StateStagingPlan:
+    """``_state_staging_slack_pages`` for a live config.
+
+    Both the DRAM guard and the pool build go through here, so the row count the
+    guard weighs cannot drift from the one actually allocated.
+
+    ``page_size`` is the resolved tree page size (``params.page_size``) -- the
+    same quantity the attention backend gates the capture stride on. ServerArgs
+    fields hold the raw input, so ``server_args.page_size`` is None unless
+    --page-size was passed explicitly, and must not be read here.
+    """
+    ctx = int(getattr(server_args, "context_length", 0) or 0)
+    # context_length only lowers the design ISL: a 1M-context launch does not
+    # make a batch-1 prefill hold 1M tokens worth of unpromoted windows.
+    inflight = (
+        min(_STATE_STAGING_DESIGN_ISL_TOKENS, ctx)
+        if ctx > 0
+        else _STATE_STAGING_DESIGN_ISL_TOKENS
+    )
+    stride = max(
+        1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1) or 1)
+    )
+    override = int(envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.get())
+    return _StateStagingPlan(
+        pages=_state_staging_slack_pages(
+            durable_pages,
+            page_size=page_size,
+            stride=stride,
+            inflight_tokens=inflight,
+        ),
+        inflight_tokens=inflight,
+        page_size=page_size,
+        stride=stride,
+        basis="env override"
+        if override > 0
+        else ("legacy 1.5x" if override == 0 else "auto"),
+    )
+
+
+def _state_staging_slack_pages(
+    durable_pages: int,
+    *,
+    page_size: int = _STATE_STAGING_DEFAULT_PAGE_SIZE,
+    stride: int = 1,
+    inflight_tokens: int = _STATE_STAGING_DESIGN_ISL_TOKENS,
+    concurrent: int = _STATE_STAGING_DEFAULT_CONCURRENT,
+) -> int:
+    """Staging rows for the c4/indexer state pools riding the SWA windows.
+
+    A row is occupied from capture until BACKUP_HOST promote. Daily load is
+    ISL 50-200k at per-rank batch 1, so the bound is
+    concurrent * (ceil(ISL / (page*stride)) + 1), not durable cache size and not
+    the req-pool width. At stride 2 the old 1.5x asked for ~20k rows (~99
+    GB/rank). 1.5x stays the bound on the derived value so small pools are
+    unchanged; running out is correctness-safe and _state_alloc_fail counts it.
+    An explicit env override is taken as-is -- it is the escape hatch for
+    concurrent prefills, and _check_swa_host_pool_upper_bound still fails fast
+    if the resulting pools cannot be pinned.
+    """
+    legacy = (durable_pages * 3 + 1) // 2
+    override = int(envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.get())
+    if override == 0:
+        return legacy
+    if override > 0:
+        return override
+    windows = _state_staging_windows(
+        inflight_tokens=inflight_tokens, page_size=page_size, stride=stride
+    )
+    return min(legacy, max(_STATE_STAGING_MIN_PAGES, max(1, concurrent) * windows))
+
+
+def _dsv4_coupled_state_page_bytes(kvcache, global_layers) -> int:
+    """Per-page bytes across the c4 and c4-indexer state pools together, matching
+    the item_bytes _dsv4_unified_state_paged_pool derives per layer."""
+    if not global_layers:
+        return 0
+    ring_size = kvcache.compress_state_pools[global_layers[0]].ring_size
+    total = 0
+    for pools in (kvcache.compress_state_pools, kvcache.indexer_compress_state_pools):
+        buf = pools[global_layers[0]].kv_score_buffer.kv_score
+        total += ring_size * buf.shape[-1] * buf.element_size() * len(global_layers)
+    return total
+
+
+def _swa_host_hard_limit_gb(server_args) -> tuple[float, float | None, int | None]:
+    """Per-rank hard ceiling (GB) for the SWA offload host pool, derived from real
+    host DRAM instead of a fixed constant.
+
+    Every GPU rank on the node page-locks its own SWA host pool, so what fits per
+    rank is available_dram * fraction / ranks_per_node (ranks_per_node = tp_size
+    // nnodes). Returns (hard_gb, available_gb, ranks_per_node); if DRAM cannot be
+    probed, returns (inf, None, None) so the guard degrades to warn-only rather
+    than blocking launch.
+    """
+    try:
+        import psutil
+
+        avail_gb = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return float("inf"), None, None
+    nnodes = max(1, int(getattr(server_args, "nnodes", 1) or 1))
+    tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+    ranks_per_node = max(1, tp_size // nnodes)
+    hard_gb = avail_gb * _SWA_HICACHE_HARD_LIMIT_DRAM_FRACTION / ranks_per_node
+    return hard_gb, avail_gb, ranks_per_node
+
+
+def _check_swa_host_pool_upper_bound(
+    *,
+    swa_gb: float,
+    slow_gb: float,
+    hard_gb: float,
+    full_host_pages: int,
+    stride: int,
+    page_bytes: int,
+    avail_gb: float | None = None,
+    ranks_per_node: int | None = None,
+    state_gb: float = 0.0,
+) -> None:
+    """Startup budget guard for the strict SWA offload host pool. The pool is pinned
+    host memory. Two tiers, never clamps:
+      * total in [slow_gb, hard_gb): warn and proceed. A large but feasible pin,
+        surfaced so slow page-locking is not mistaken for a hang.
+      * total >= hard_gb: raise ValueError. hard_gb is DRAM-derived, so crossing
+        it means the pool (summed across ranks on the node) would exhaust host
+        DRAM. Fail fast with a breakdown and the one knob that shrinks it: a
+        larger --hicache-swa-offload-page-stride.
+
+    ``total`` is SWA plus ``state_gb``, the coupled c4/indexer pools whose durable
+    rows the SWA page count forces one-for-one. Weighing SWA alone understates the
+    pin ~2.5x (stride 2: 110 GB SWA, 275 GB for the three), so a config could clear
+    the ceiling and still die hours into pinning. The ratio-driven FP4 mirrors
+    follow --hicache-ratio, not the SWA page count, and stay out of scope.
+    """
+    if not page_bytes or swa_gb <= 0:
+        return
+    total_gb = swa_gb + max(0.0, state_gb)
+    if total_gb >= hard_gb:
+        dram_detail = ""
+        if avail_gb is not None and ranks_per_node is not None:
+            dram_detail = (
+                f" With {ranks_per_node} rank(s)/node each pinning these pools, "
+                f"that is ~{total_gb * ranks_per_node:.0f} GB of host DRAM against "
+                f"{avail_gb:.0f} GB available "
+                f"(hard limit = {_SWA_HICACHE_HARD_LIMIT_DRAM_FRACTION:.0%} of "
+                f"available / rank = {hard_gb:.1f} GB/rank)."
+            )
+        raise ValueError(
+            f"[SWA-HiCache] strict SWA host pools would need {total_gb:.1f} GB/rank "
+            f"(>= hard limit {hard_gb:.1f} GB/rank): SWA {swa_gb:.1f} GB + coupled "
+            f"c4/indexer state {state_gb:.1f} GB, full_host_pages={full_host_pages}, "
+            f"stride={stride}, page_bytes={page_bytes}.{dram_detail} Pinning this "
+            f"much host memory would exhaust host DRAM (OOM), not merely slow "
+            f"launch. Raise --hicache-swa-offload-page-stride to shrink these pools "
+            f"~linearly (the only knob that shrinks them); or disable strict reuse "
+            f"entirely (SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0)."
+        )
+    if total_gb >= slow_gb:
+        logger.warning(
+            "[SWA-HiCache] strict SWA host pools are %.1f GB/rank (SWA %.1f + "
+            "coupled c4/indexer state %.1f, >%.0f GB); host pinning "
+            "(cudaHostRegister) may slow server launch. Raise "
+            "--hicache-swa-offload-page-stride to shrink them, or use best-effort "
+            "(SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0).",
+            total_gb,
+            swa_gb,
+            state_gb,
+            slow_gb,
+        )
+
+
+def _swa_host_num_pages(
+    *,
+    server_args,
+    full_host_pages,
+    device_ring_pages,
+    page_bytes,
+    state_page_bytes: int = 0,
+    token_page_size: int = _STATE_STAGING_DEFAULT_PAGE_SIZE,
+):
+    """SWA-ring host pool size in pages: one SWA window every ``stride`` full
+    pages, plus one tail window per in-flight request (bounded by the device
+    ring), floored at the device ring. _check_swa_host_pool_upper_bound warns
+    above _SWA_HICACHE_SLOW_LAUNCH_GB and fails fast above the DRAM-derived hard
+    ceiling; it never clamps. ``state_page_bytes`` covers the coupled c4/indexer
+    pools, whose row count derives from the page count returned here;
+    ``token_page_size`` is the resolved tree page size their staging is sized
+    from, and has to be the value the pool build passes too."""
+    stride = max(1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1)))
+    strided = -(-full_host_pages // stride)  # ceil(full_host_pages / stride)
+    tail_pages = device_ring_pages  # <= max in-flight tail windows
+    pages = max(1, device_ring_pages, strided + tail_pages)
+    gb = pages * page_bytes / 1e9
+    state_rows = 0
+    if state_page_bytes:
+        state_rows = (
+            pages
+            + _state_staging_plan(
+                pages, server_args=server_args, page_size=token_page_size
+            ).pages
+        )
+    hard_gb, avail_gb, ranks_per_node = _swa_host_hard_limit_gb(server_args)
+    _check_swa_host_pool_upper_bound(
+        swa_gb=gb,
+        slow_gb=_SWA_HICACHE_SLOW_LAUNCH_GB,
+        hard_gb=hard_gb,
+        full_host_pages=full_host_pages,
+        stride=stride,
+        page_bytes=page_bytes,
+        avail_gb=avail_gb,
+        ranks_per_node=ranks_per_node,
+        state_gb=state_rows * state_page_bytes / 1e9,
+    )
+    return pages
+
+
 @dataclass(frozen=True)
 class _IndexerRegion:
     """One page-contiguous indexer buffer group to mirror on the host."""
@@ -539,6 +875,7 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
+    server_args: ServerArgs,
     kvcache: Any,
     load_cache_event,
     storage_backend: Optional[str],
@@ -556,11 +893,21 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = layer_mappings.full
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    # Strict bit-exact SWA HiCache: offload the unified SWA ring to a host pool
+    # and restore it on reuse instead of reprefilling the trailing 128-token tail.
+    unified_swa_hicache = (
+        is_unified_kv and envs.SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE.get()
+    )
     mtp_swa_device_buffers = []
     if is_unified_kv:
-        # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
-        # so there is no separate SWA host pool to map.
-        swa_layer_mapping = {}
+        # Flag OFF: unified_kv keeps the SWA ring device-only (no host pool).
+        # Flag ON: mirror every layer like the non-unified SWA path so the ring
+        # can be offloaded/restored.
+        swa_layer_mapping = (
+            {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+            if unified_swa_hicache
+            else {}
+        )
     else:
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
             raise ValueError(
@@ -636,6 +983,194 @@ def build_deepseek_v4_hicache_stack(
                 packed_draft_device_pools=tuple(mtp_swa_device_buffers),
             )
         )
+    elif unified_swa_hicache:
+        swa_ring_buffers, swa_item_bytes = _dsv4_swa_ring_region_buffers(kvcache)
+        num_swa_layers = len(swa_ring_buffers)
+        page_bytes = swa_item_bytes * num_swa_layers
+        # Page unit = one sliding window; the ring holds exactly num_slots windows.
+        swa_ring_size = kvcache.unified_swa_ring_size
+        device_ring_pages = kvcache.unified_kv_pool.swa_pages // swa_ring_size
+        # the state pools below are pinned in the same launch and sized off this
+        # page count, so the guard has to weigh them too
+        _state_page_bytes = _dsv4_coupled_state_page_bytes(
+            kvcache, c4_state_global_layers
+        )
+        unified_swa_host_pages = _swa_host_num_pages(
+            server_args=server_args,
+            full_host_pages=num_host_pages,
+            device_ring_pages=device_ring_pages,
+            page_bytes=page_bytes,
+            state_page_bytes=_state_page_bytes,
+            token_page_size=page_size,
+        )
+        logger.info(
+            "[SWA-HiCache] SWA host pool: %d pages (%.2f GB), full_host_pages=%d, "
+            "layers=%d.",
+            unified_swa_host_pages,
+            unified_swa_host_pages * page_bytes / 1e9,
+            num_host_pages,
+            num_swa_layers,
+        )
+        swa_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.SWA),
+            device_buffers=swa_ring_buffers,
+            item_bytes=swa_item_bytes,
+            num_host_pages=unified_swa_host_pages,
+            slot_page_size=swa_ring_size,
+            layout=server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        # Expose the host SWA pool + capture staging on the device kvcache so
+        # both the model forward (window capture) and swa_component insert
+        # (binding) can reach them.
+        kvcache._swa_host_pool = swa_host_pool
+        # Stride knob for sparse SWA offload, read by capture_swa_windows. Default
+        # 1 == one window per page; N>1 keeps one window every N pages plus the
+        # sequence tail window.
+        kvcache._swa_offload_page_stride = max(
+            1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1))
+        )
+        # EAGLE makes the radix key a bigram view (len == tokens - 1): a node
+        # inserted with n tokens ends at ((n-1)//page)*page, one page below n
+        # whenever n is page-aligned -- which every chunked-prefill insert is.
+        # Windows keyed at the token boundary would sit one page past every node
+        # that could claim them and be freed unused, collapsing reuse to 0.
+        # Both capture sites read this flag and must agree boundary for boundary.
+        kvcache._swa_capture_bigram_key = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        ).is_eagle()
+        if not hasattr(swa_host_pool, "_capture_staging"):
+            swa_host_pool._capture_staging = {}
+        if not hasattr(swa_host_pool, "_capture_crc"):
+            swa_host_pool._capture_crc = {}
+            swa_host_pool._dbg_restore_verified = 0
+
+        # c4 / c4-indexer overlap compress-state riding pools. Required whenever c4
+        # state layers exist -- there is no "SWA only" mode, because a captured SWA
+        # window is bit-exact on reuse only if the boundary overlap state
+        # [B-ratio, B) shares its bind/promote/offload/restore/free lifetime.
+        # State lives in its own L3 pool, coupled to the SWA window by key family
+        # plus positional durable row.
+        _state_ride = bool(c4_state_global_layers)
+        if _state_ride:
+            _ring_size = kvcache.compress_state_pools[
+                c4_state_global_layers[0]
+            ].ring_size
+            # transient landing rows for in-flight (rid, B) tiles not yet promoted
+            # to their window's durable row; sizing rationale in the helper
+            _staging = _state_staging_plan(
+                unified_swa_host_pages,
+                server_args=server_args,
+                page_size=page_size,
+            )
+            _staging_slack = _staging.pages
+            kvcache._c4_state_host_pool = _dsv4_unified_state_paged_pool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
+                state_pools=kvcache.compress_state_pools,
+                global_layers=c4_state_global_layers,
+                ring_size=_ring_size,
+                num_host_pages=unified_swa_host_pages,
+                allocator_type=server_args.hicache_storage_backend,
+                staging_slack_pages=_staging_slack,
+            )
+            kvcache._c4_indexer_state_host_pool = _dsv4_unified_state_paged_pool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+                state_pools=kvcache.indexer_compress_state_pools,
+                global_layers=c4_state_global_layers,
+                ring_size=_ring_size,
+                num_host_pages=unified_swa_host_pages,
+                allocator_type=server_args.hicache_storage_backend,
+                staging_slack_pages=_staging_slack,
+            )
+            kvcache._c4_state_layer_index = {
+                gl: i for i, gl in enumerate(c4_state_global_layers)
+            }
+            # Each state pool is registered below as a first-class HiCache pool and
+            # persisted/prefetched through its own page (get_data_page /
+            # set_from_flat / get_page_buffer_meta), coupled to the SWA window by
+            # key alone (sidecar C4_STATE->SWA + TRAILING_PAGES + batch_exists_v2
+            # min-across-pools). Nothing is blob-packed, so every L3 backend moves
+            # the state unchanged.
+            #   * _l3_page_size: L3 addresses the durable row by the coupled SWA
+            #     window page (index // swa_ring_size), not the state pool's own
+            #     ring_size slot -- the sidecar hands over SWA host indices.
+            #   * _manual_device_ride: device<->host stays owned by the manual
+            #     capture/restore ride, because the unified path overwrites the state
+            #     ring mid-prefill and a controller-driven device read would pick up
+            #     a dirty row. The controller device transfer becomes a no-op.
+            for _hp in (
+                kvcache._c4_state_host_pool,
+                kvcache._c4_indexer_state_host_pool,
+            ):
+                _hp._l3_page_size = swa_ring_size
+                _hp._manual_device_ride = True
+                # L3 backend page granularity == the coupled SWA window page
+                # (the sidecar hands SWA host indices). Must override the pool's
+                # own slot_page_size (== state ring_size, kept for the capture
+                # allocator/promote) so ``_batch_io_v2`` splits keys/indices per
+                # SWA page, matching the non-unified DeepSeekV4StateHostPool
+                # (page_size == swa_page_size). Leaving it at ring_size makes the
+                # storage backend reject every state page as a length mismatch.
+                _hp.page_size = swa_ring_size
+            logger.info(
+                "[SWA-HiCache] c4 state riding wired: %d c4 layers, ring_size=%d, "
+                "%d durable + %d staging host pages/pool, %.2f GB across both "
+                "pools (staging %s, for ISL %d at page %d x stride %d, per-rank "
+                "batch 1; independent L3 pool, key-coupled to SWA).",
+                len(c4_state_global_layers),
+                _ring_size,
+                unified_swa_host_pages,
+                _staging_slack,
+                (unified_swa_host_pages + _staging_slack) * _state_page_bytes / 1e9,
+                _staging.basis,
+                _staging.inflight_tokens,
+                _staging.page_size,
+                _staging.stride,
+            )
+        else:
+            kvcache._c4_state_host_pool = None
+            kvcache._c4_indexer_state_host_pool = None
+            kvcache._c4_state_layer_index = None
+        swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+        entries.append(
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=None,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                device_alloc_fn=swa_attn_allocator.alloc,
+                device_free_fn=swa_attn_allocator.free,
+            )
+        )
+        # Register the unified c4 / c4-indexer overlap-state pools as first-class
+        # HiCache pools (device_pool=None, controller device transfer no-op'd via
+        # _manual_device_ride). This lands them in host_pool_group.entry_map, which
+        # activates the pre-existing SWA-coupled sidecar specs
+        # ((C4_STATE, SWA) / (C4_INDEXER_STATE, SWA), TRAILING_PAGES) so their L3
+        # pages ride the SWA window's key family. Mirrors the non-unified
+        # DEEPSEEK_V4_C4_STATE registration; replaces the A-gather blob packing.
+        if kvcache._c4_state_host_pool is not None:
+            entries.append(
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4_STATE,
+                    host_pool=kvcache._c4_state_host_pool,
+                    device_pool=None,
+                    layer_mapping=c4_state_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                )
+            )
+            entries.append(
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                    host_pool=kvcache._c4_indexer_state_host_pool,
+                    device_pool=None,
+                    layer_mapping=c4_state_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                )
+            )
 
     if c4_layer_mapping:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
@@ -1243,6 +1778,9 @@ class StackBuildResult:
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
     component_host_pools: dict[ComponentType, Any]
+    # Strict bit-exact SWA HiCache (unified_kv only): couple SWA-host lifetime
+    # to Full-host via leaf-atomic eviction (no orphan tail). See SWAComponent.
+    swa_bit_exact: bool = False
     sidecars: list[SidecarPoolSpec] = field(default_factory=list)
     # Mamba state lives in req_to_token_pool, not in kvcache, so its
     # layer_transfer_counter has to be wired separately.
@@ -1316,9 +1854,28 @@ class _DeepSeekV4Strategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        # Fail fast before allocating/pinning the SWA host pool: strict
+        # bit-exact needs write_through so the owning request offloads its
+        # true SWA window at insert time (while its ring slot is still valid).
+        # write_back defers the ring->host copy to eviction, by when the slot
+        # may have been recycled -> silent non-bit-exact reuse.
+        swa_bit_exact = (
+            getattr(kvcache, "_unified_kv", False)
+            and envs.SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE.get()
+        )
+        if swa_bit_exact and server_args.hicache_write_policy != "write_through":
+            raise ValueError(
+                "SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE requires "
+                "--hicache-write-policy write_through (got "
+                f"{server_args.hicache_write_policy!r}); write_back cannot "
+                "guarantee the SWA ring is offloaded before its slot is reused."
+            )
+
         layer_mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
+
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
+            server_args=server_args,
             kvcache=kvcache,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -1363,6 +1920,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools=component_host_pools,
+            swa_bit_exact=swa_bit_exact,
             sidecars=sidecars,
             transfer_layer_num=kvcache.end_layer - kvcache.start_layer,
             pools_desc="KV + SWA + DeepSeekV4 sidecars",
@@ -1792,6 +2350,25 @@ def _apply_stack_result(
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
         setattr(cache, cache_attr, host_pool)
         setattr(cache.components[ct], component_attr, host_pool)
+
+    if result.swa_bit_exact and ComponentType.SWA in cache.components:
+        swa_comp = cache.components[ComponentType.SWA]
+        swa_comp._strict_bit_exact = True
+        # unified_kv: SWA device ring is positional; enable deferred
+        # positional restore (H->D at prepare_for_extend, after req_pool_idx).
+        swa_comp._unified_positional_swa = getattr(kvcache, "_unified_kv", False)
+        # Phase C: expose the c4/c4-indexer state riding pools + device state
+        # pool lists so the riding helpers (bind/promote/restore/free) can move
+        # state tiles alongside SWA windows. All None unless state riding wired.
+        swa_comp._c4_state_host_pool = getattr(kvcache, "_c4_state_host_pool", None)
+        swa_comp._c4_indexer_state_host_pool = getattr(
+            kvcache, "_c4_indexer_state_host_pool", None
+        )
+        swa_comp._c4_state_layer_index = getattr(kvcache, "_c4_state_layer_index", None)
+        swa_comp._compress_state_pools = getattr(kvcache, "compress_state_pools", None)
+        swa_comp._indexer_compress_state_pools = getattr(
+            kvcache, "indexer_compress_state_pools", None
+        )
 
     for sidecar in result.sidecars:
         cache.register_sidecar_pool(sidecar)
