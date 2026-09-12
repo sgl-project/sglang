@@ -2052,6 +2052,19 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
+            # This rank has no ongoing prefetch for req_id, but other TP/PP
+            # ranks may. We must still participate in the same all_reduce as
+            # _can_terminate_prefetch to avoid a gloo same-group deadlock:
+            # ranks with ongoing block in all_reduce while ranks without
+            # ongoing skip it, causing a permanent hang on the shared
+            # ProcessGroup.
+            #
+            # _can_terminate_prefetch only does all_reduce for the "timeout"
+            # policy (using _all_reduce with MAX). We match that here with a
+            # dummy 0 contribution so the MAX result is unaffected.
+            if self.prefetch_stop_policy == "timeout":
+                dummy = torch.tensor(0, dtype=torch.int, device="cpu")
+                self._all_reduce(dummy, torch.distributed.ReduceOp.MAX)
             return True
 
         _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
