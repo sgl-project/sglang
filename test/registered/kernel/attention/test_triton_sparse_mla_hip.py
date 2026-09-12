@@ -190,3 +190,7 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
     torch.testing.assert_close(
         run(_reduce_d_chunk(active_splits)), run(64), rtol=0, atol=0
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
