@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -732,6 +733,14 @@ class SWAComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
+        if (
+            self.tree_core.is_write_back
+            and self.tree_core.swa_write_back_eviction_barrier_enabled
+            and not x.backuped
+        ):
+            # Back up a dirty internal SWA node before its device value is lost.
+            self.request_backup_before_device_eviction(x.id)
+            return None
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
         self.tree_core._evict_component_and_detach_lru(
@@ -1000,6 +1009,11 @@ class SWAComponent(TreeComponent):
             # device-guaranteed, require a full window.
             return PreparePrefetchResult()
         num_tokens = num_pages * self.cache.page_size
+        if (
+            isinstance(self._swa_kv_pool_host, HostKVCache)
+            and self._swa_kv_pool_host.shared_allocation_domain is not None
+        ):
+            return PreparePrefetchResult(deferred_host_allocation=True)
         host_indices = self.cache.host_pool_group.alloc(
             num_tokens,
             pool=PoolName.SWA,
@@ -1036,12 +1050,25 @@ class SWAComponent(TreeComponent):
             if not dirty:
                 return None
             dirty.reverse()
+            allocator = self._unified_allocator()
+            if allocator is not None:
+                full_values = []
+                for dirty_node in dirty:
+                    full_value = dirty_node.component_data[BASE_COMPONENT_TYPE].value
+                    assert full_value is not None
+                    assert len(full_value) == len(dirty_node.component_data[ct].value)
+                    full_values.append(full_value)
+                device_indices = allocator.translate_swa_indices_for_transfer(
+                    torch.cat(full_values)
+                )
+            else:
+                device_indices = torch.cat(
+                    [n.component_data[ct].value for n in dirty]
+                ).to(torch.int64)
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=torch.cat(
-                        [n.component_data[ct].value for n in dirty]
-                    ).to(torch.int64),
+                    device_indices=device_indices,
                     nodes_to_load=[n.id for n in dirty],
                 )
             ]
@@ -1100,10 +1127,19 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
             # Keys are unknowable at build time; placeholders carry the
             # count, _sync_trailing_keys fills the real trailing hashes.
-            num_pages = host_indices.numel() // self.tree_core.page_size
+            if host_indices is None:
+                assert (
+                    isinstance(self._swa_kv_pool_host, HostKVCache)
+                    and self._swa_kv_pool_host.shared_allocation_domain is not None
+                ), "deferred SWA prefetch allocation requires a shared host arena"
+                num_pages = min(
+                    self.full_window_pages,
+                    prefetch_tokens // self.tree_core.page_size,
+                )
+            else:
+                num_pages = host_indices.numel() // self.tree_core.page_size
             return [
                 PoolTransfer(
                     name=PoolName.SWA,

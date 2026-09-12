@@ -276,6 +276,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_rate_limited": 0,
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
+            "declined_host_oversize": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
             "l3_demand_requests": 0,
@@ -481,6 +482,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         # State initialization
+        if self.buffer_pipeline is not None:
+            self.cache_controller.host_write_staged_tokens_fn = lambda: (
+                self.buffer_pipeline.write_staged_tokens_
+            )
         self.write_through_threshold = (
             1 if get_memory().hicache_write_policy == "write_through" else 2
         )
@@ -489,6 +494,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller.write_policy == "write_back"
         )
         # Pre-seed the logical dropped-tokens series.
+        if self.host_memory_mode == "cache" and self.tree_core.has_swa_host_pool:
+            self.tree_core.enable_swa_write_back_eviction_barrier()
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
             if self._tracks_write_through_unbacked_evictions():
@@ -735,16 +742,35 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> tuple[Optional[NodeId], bool]:
-        """Advance the eviction walk one node, consuming its step result."""
-        result = self.tree_core.evict_device_next_node(component_type, tracker)
-        self._free_values(result.device_frees, result.host_frees)
-        if self._tracks_write_through_unbacked_evictions():
-            self._record_dropped_tokens(
-                result.unbacked_tokens,
-                reason="write_through_unbacked_eviction",
+        """Advance the walk, completing any pre-eviction backup barriers."""
+        while True:
+            result = self.tree_core.evict_device_next_node(component_type, tracker)
+            self._free_values(result.device_frees, result.host_frees)
+            if self._tracks_write_through_unbacked_evictions():
+                self._record_dropped_tokens(
+                    result.unbacked_tokens,
+                    reason="write_through_unbacked_eviction",
+                )
+            self._accumulate_tracker(tracker, result.tracker)
+            if result.backup_kv is None:
+                return result.node_id, result.made_progress
+
+            assert result.node_id is None
+            assert self.buffer_pipeline is None, (
+                "SWA write-back eviction barriers are cache-mode only"
             )
-        self._accumulate_tracker(tracker, result.tracker)
-        return result.node_id, result.made_progress
+            written = self._execute_and_commit_kv_backup(
+                result.backup_kv, write_back=True
+            )
+            if written <= 0:
+                logger.warning(
+                    "write_back: backup failed before auxiliary component "
+                    "eviction; leaving the component device-resident "
+                    "(component=%s)",
+                    component_type.name,
+                )
+                return None, False
+            self.writing_check(write_back=True)
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -1308,21 +1334,31 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
-        full_indices = self.req_to_token_pool.req_to_token[
+        full_virtual_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :num_tokens
         ].to(torch.int64)
-        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
+        full_virtual_indices = self._pad_retraction_indices(
+            full_virtual_indices, self.page_size
+        )
+        full_device_indices = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                full_virtual_indices
+            )
+        )
 
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
         if self.supports_swa():
-            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
             assert self.sliding_window_size is not None
             window_start = max(0, num_tokens - self.sliding_window_size)
             window_start = window_start // self.page_size * self.page_size
             window_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, window_start:num_tokens
             ].to(torch.int64)
-            swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
+            swa_indices = (
+                self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                    window_indices
+                )
+            )
             assert bool((swa_indices > 0).all()), (
                 f"unmapped SWA window positions for request {req.rid}"
             )
@@ -1335,20 +1371,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             ]
 
-        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_indices)
+        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_device_indices)
         extra_transfers = [
             transfer
             for transfers in component_transfers.values()
             for transfer in transfers
         ]
-        extra_transfers.extend(
-            self._build_sidecar_transfers(
-                CacheTransferPhase.BACKUP_HOST,
-                kv_transfer,
-                component_transfers,
-            )
+        sidecar_transfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST,
+            kv_transfer,
+            component_transfers,
         )
-        return full_indices, extra_transfers
+        for transfer in sidecar_transfers:
+            if transfer.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER):
+                transfer.device_indices = full_virtual_indices
+        extra_transfers.extend(sidecar_transfers)
+        return full_device_indices, extra_transfers
 
     def _reclaim_retraction_host(self, num_tokens: int) -> int:
         if self.disable:
@@ -1360,21 +1398,35 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
+        anchor_entry = self.host_pool_group.anchor_entry
+        if self.cache_controller._uses_shared_host_layout(anchor_entry.host_pool):
+            allocation = self.cache_controller.allocate_shared_host_transfers(
+                device_indices, extra_transfers or None
+            )
+            if allocation is None and anchor_entry.host_evict_fn is None:
+                self._reclaim_retraction_host(len(device_indices))
+                allocation = self.cache_controller.allocate_shared_host_transfers(
+                    device_indices, extra_transfers or None
+                )
+            if allocation is None:
+                return None
+            host_indices, resolved = allocation
+        else:
             host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
+            if host_indices is None:
+                self._reclaim_retraction_host(len(device_indices))
+                host_indices = self.host_pool_group.alloc(len(device_indices))
+            if host_indices is None:
+                return None
 
-        resolved = self.host_pool_group.resolve_host_transfers(
-            extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
-            return None
+            resolved = self.host_pool_group.resolve_host_transfers(
+                extra_transfers or None,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+            )
+            if resolved is None and extra_transfers:
+                self.host_pool_group.free(host_indices)
+                return None
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1514,15 +1566,27 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        transfer_device_value = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                device_value
+            )
+        )
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            transfer_device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
         )
 
     def _track_write_through_node(
@@ -1903,7 +1967,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prep.alloc_failed:
                 alloc_failed = True
                 break
-            if prep.host_indices is None:
+            if prep.host_indices is None and not prep.deferred_host_allocation:
                 continue
             transfers = self.tree_core.build_hicache_transfers(
                 ct,
@@ -2234,7 +2298,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.buffer_pipeline.release_anchor_lock(req_id)
             del self.ongoing_prefetch[req_id]
             self.cache_controller.prefetch_tokens_occupied -= (
-                self._prefetch_occupied_span(prefetch_key, host_indices)
+                self._prefetch_occupied_span(
+                    prefetch_key, host_indices, operation=operation
+                )
             )
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
@@ -2419,7 +2485,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Buffer mode granted occupancy at hit-alloc, sized to the bounce;
         # cache mode reserved the requested span at enqueue.
         self.cache_controller.prefetch_tokens_occupied -= self._prefetch_occupied_span(
-            prefetch_key, host_indices
+            prefetch_key, host_indices, operation=operation
         )
 
     def _invalidate_absent_from_hit_query(self, operation) -> None:
@@ -2456,11 +2522,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def prefetch_outcome_stats_snapshot(self) -> dict:
         return self._prefetch_outcome_stats.copy()
 
-    def _prefetch_occupied_span(self, prefetch_key, host_indices) -> int:
+    def _prefetch_occupied_span(
+        self, prefetch_key, host_indices, *, operation=None
+    ) -> int:
         """Occupancy units held by a prefetch: cache mode reserves the
         requested span at enqueue; buffer mode grants at hit-alloc, sized
         to the allocation (0 while still querying / parked)."""
         if self.host_memory_mode == "buffer_only":
+            if (
+                operation is not None
+                and operation.buffer_host_occupied_units is not None
+            ):
+                return operation.buffer_host_occupied_units
             return len(host_indices) if host_indices is not None else 0
         return len(prefetch_key)
 
@@ -2494,7 +2567,9 @@ class UnifiedRadixCache(BasePrefixCache):
         cc.prefetch_tokens_occupied = max(
             0,
             cc.prefetch_tokens_occupied
-            - self._prefetch_occupied_span(prefetch_key, _host_indices),
+            - self._prefetch_occupied_span(
+                prefetch_key, _host_indices, operation=operation
+            ),
         )
 
     def _drain_storage_control_queues_impl(
@@ -2568,11 +2643,28 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(req_id)
                     return True
             alloc_len = hit_tokens
-            host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
+            if buffer_mode and not cc.can_fit_prefetch_host_buffers(
+                operation, alloc_len
+            ):
+                self._prefetch_outcome_stats["declined_host_oversize"] += 1
+                logger.warning(
+                    "HiCache buffer prefetch declined req=%s: the Full/sidecar "
+                    "bounce cannot fit in an empty host arena",
+                    req_id,
+                )
+                self.revoke_pending_prefetch(req_id)
+                return True
+            host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
+            anchor = cc.mem_pool_host.anchor_entry.host_pool
+            shared_domain = (
+                anchor.shared_allocation_domain
+                if HybridCacheController._uses_shared_host_layout(anchor)
+                else None
+            )
+            if host_indices is None and shared_domain is None:
                 self.evict_host(alloc_len)
-                host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
+                host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
+            if host_indices is None and not buffer_mode and shared_domain is None:
                 # Memory-pressure fallback: a shorter page-aligned prefix.
                 # (Cache mode only — buffer mode parks for the full hit.)
                 available_size = cc.mem_pool_host.available_size()
@@ -2581,7 +2673,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     available_size - (available_size % self.page_size),
                 )
                 if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                    host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     return False
@@ -2599,8 +2691,25 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.host_indices = host_indices
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
             if buffer_mode:
-                cc.prefetch_tokens_occupied += alloc_len
-            cc.prefetch_buffer.put(operation)
+                operation.buffer_host_occupied_units = (
+                    self.buffer_pipeline.host_allocation_units(
+                        host_indices, operation.pool_transfers
+                    )
+                )
+                cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
+            try:
+                cc.prefetch_buffer.put(operation)
+            except Exception:
+                cc.free_prefetch_host_buffers(operation, host_indices)
+                operation.host_indices = None
+                if buffer_mode:
+                    cc.prefetch_tokens_occupied -= operation.buffer_host_occupied_units
+                    operation.buffer_host_occupied_units = None
+                    self.buffer_pipeline.pop_prefix_ctx(req_id)
+                    self.buffer_pipeline.release_anchor_lock(req_id)
+                self.ongoing_prefetch.pop(req_id, None)
+                operation.mark_terminate()
+                raise
             return True
 
         def _drain_and_alloc_storage_hit():

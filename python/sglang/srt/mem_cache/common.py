@@ -150,7 +150,11 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    swa_num_tokens: Optional[int] = None,
+):
     if tree_cache is None:
         return
 
@@ -161,15 +165,37 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+        is_unified_allocator = (
+            isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+            and allocator.supports_asymmetric_reservation
+        )
+        if is_unified_allocator:
+            reclaim_plan = allocator.reclaim_plan(
+                num_tokens,
+                required_swa,
+                full_evictable_tokens=tree_cache.full_evictable_size(),
+                swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            )
+            if reclaim_plan is None:
+                return
+            full_num_tokens, swa_num_tokens = reclaim_plan
+        else:
+            full_num_tokens = max(0, num_tokens - allocator.full_available_size())
+            swa_num_tokens = max(0, required_swa - allocator.swa_available_size())
+
+        if full_num_tokens or swa_num_tokens:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
+        if is_unified_allocator:
+            # The reclaim plan may rely on compacting cross-side holes. Make
+            # that projected state real before callers inspect availability.
+            allocator.ensure_capacity(num_tokens, required_swa)
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()

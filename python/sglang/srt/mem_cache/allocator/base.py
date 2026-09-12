@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Hashable, Protocol
 
 import torch
 
@@ -134,9 +134,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Token ids as the PD transfer engine addresses them. Identity here
-        because a static pool's ids index its registered buffers directly;
-        virtual-id pools must override."""
+        """Token ids as device transfer engines address them.
+
+        Identity here: a static pool's token ids index its registered buffers
+        directly. Virtual-id pools must override.
+        """
         return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
@@ -146,6 +148,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        """Record an asynchronous HiCache transfer completion event if needed."""
+        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

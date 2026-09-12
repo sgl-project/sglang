@@ -649,25 +649,36 @@ class UMBPStore(HiCacheStorage):
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
             elif mem_pool_host is not None:
-                # Probe element_size from the same buffer-meta helper that
-                # batch_preprocess will actually use; this matches per-call
-                # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
-                # without per-case formulas (NSA in particular: get_ksize_per_token
-                # would over-count by the indexer buffer that is never put to UMBP).
-                dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
-                if self.is_mla_backend:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                elif storage_config is not None and getattr(
+                split_factor = 1
+                if storage_config is not None and getattr(
                     storage_config, "should_split_heads", False
                 ):
-                    sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                    split_factor = storage_config.tp_lcm_size // storage_config.tp_size
+                element_size_getter = getattr(
+                    mem_pool_host, "get_page_buffer_element_size", None
+                )
+                if element_size_getter is not None:
+                    page_byte_size = element_size_getter(split_factor)
                 else:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                # A hybrid logical anchor returns None here by design; leave
-                # dram_page_size at 0 and let the per-pool v2 sizes handle it.
-                esz = meta[1] if meta else None
-                page_byte_size = int(esz[0]) if esz else 0
+                    # Probe element_size from the same buffer-meta helper that
+                    # batch_preprocess will actually use; this matches per-call
+                    # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
+                    # without per-case formulas (NSA in particular:
+                    # get_ksize_per_token would over-count by the indexer buffer
+                    # that is never put to UMBP).
+                    dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
+                    if self.is_mla_backend:
+                        meta = mem_pool_host.get_page_buffer_meta(dummy)
+                    elif split_factor != 1:
+                        meta = mem_pool_host.get_split_heads_page_buffer_meta(
+                            dummy, split_factor
+                        )
+                    else:
+                        meta = mem_pool_host.get_page_buffer_meta(dummy)
+                    # A hybrid logical anchor returns None here by design; leave
+                    # dram_page_size at 0 and let the per-pool v2 sizes handle it.
+                    esz = meta[1] if meta else None
+                    page_byte_size = int(esz[0]) if esz else 0
 
             if (
                 page_byte_size is not None
@@ -928,6 +939,7 @@ class UMBPStore(HiCacheStorage):
         # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
         self._kv_anchor_is_logical = False
+        self._kv_anchor_is_page_envelope = False
         self._registered_regions: set = set()
 
         self.client = UMBPClient(cfg)
@@ -1012,6 +1024,9 @@ class UMBPStore(HiCacheStorage):
 
         # A logical anchor owns indices; side pools carry the data.
         self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
+        self._kv_anchor_is_page_envelope = bool(
+            getattr(self.mem_pool_host, "stores_page_envelope", False)
+        )
         self._zero_copy_registered = False
 
         # Side-pool registration needs the mode even for a logical anchor.
@@ -1183,6 +1198,15 @@ class UMBPStore(HiCacheStorage):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _get_page_envelope_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        key_list = self._get_page_envelope_keys(keys)
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
+    def _get_page_envelope_keys(self, keys):
+        return [f"{key_}_{self.mha_suffix}_kv" for key_ in keys]
+
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
@@ -1208,7 +1232,9 @@ class UMBPStore(HiCacheStorage):
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
-        if self.is_mla_backend:
+        if self._kv_anchor_is_page_envelope:
+            return self._get_page_envelope_buffer_meta(keys, host_indices)
+        elif self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
             if self.storage_config and self.storage_config.should_split_heads:
@@ -1219,10 +1245,10 @@ class UMBPStore(HiCacheStorage):
     def _batch_postprocess(self, results: List[bool], is_set_operate=False):
         """Convert per-key-component results to per-page results.
 
-        For MHA: each page has K+V → group pairs.
-        For MLA: each page has K only.
+        Unified page envelopes and MLA have one object per page. Ordinary MHA
+        has K+V pairs, or one pair per split rank.
         """
-        if self.is_mla_backend:
+        if self._kv_anchor_is_page_envelope or self.is_mla_backend:
             return list(results)
         else:
             if self.storage_config and self.storage_config.should_split_heads:
@@ -1295,8 +1321,8 @@ class UMBPStore(HiCacheStorage):
         # Expand to match the key_strs layout produced by _batch_preprocess.
         expanded = []
         for d in depths_per_page:
-            if self.is_mla_backend:
-                expanded.append(d)  # MLA: 1 key per page
+            if self._kv_anchor_is_page_envelope or self.is_mla_backend:
+                expanded.append(d)  # One storage object per page.
             elif self.storage_config and self.storage_config.should_split_heads:
                 # split heads: 2 keys per split rank, split_factor ranks per page
                 for _ in range(self.split_factor):
@@ -1363,7 +1389,10 @@ class UMBPStore(HiCacheStorage):
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         """Return count of consecutive existing keys from start."""
-        if self.is_mla_backend:
+        if self._kv_anchor_is_page_envelope:
+            query_keys = self._get_page_envelope_keys(keys)
+            key_multiplier = 1
+        elif self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
         else:

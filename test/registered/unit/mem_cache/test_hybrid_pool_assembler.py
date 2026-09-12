@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
@@ -12,6 +14,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -126,6 +131,62 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
+
+
+def _build_unified_swa_pool(page_size: int = 4):
+    return init_unified_swa_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        head_num=2,
+        head_dim=4,
+        v_head_dim=4,
+        swa_head_num=2,
+        swa_head_dim=4,
+        swa_v_head_dim=4,
+        page_size=page_size,
+        start_layer=0,
+        end_layer=4,
+        swa_attention_layer_ids=[3],
+        full_attention_layer_ids=[0, 1, 2],
+        total_bytes=4096,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+    )
+
+
+def _build_unified_host_pair(bundle):
+    pool = bundle.token_to_kv_pool
+    host_pool_cls = get_mha_host_pool_cls(pool.full_kv_pool)
+    assert host_pool_cls is UnifiedPageEnvelopeHostPool
+    assert get_mha_host_pool_cls(pool.swa_kv_pool) is host_pool_cls
+    return host_pool_cls.build_hybrid_swa_pool_pair(
+        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+        host_to_device_ratio=1.0,
+        host_size=0,
+        page_size=pool.page_size,
+        layout="layer_first",
+        pin_memory=False,
+        allocator_type="default",
+    )
+
+
+class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_shared_arena_can_reuse_bytes_across_sides(self):
+        page_size = 4
+        full_pool, swa_pool = _build_unified_host_pair(
+            _build_unified_swa_pool(page_size)
+        )
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+
+        full_indices = full_pool.alloc(full_pool.available_size())
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_pool.alloc(swa_pool.available_size()))
+        self.assertIsNone(swa_pool.alloc(page_size))
+
+        full_pool.free(full_indices[page_size:])
+        self.assertIsNotNone(swa_pool.alloc(page_size))
 
 
 if __name__ == "__main__":

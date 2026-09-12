@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from array import array
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -335,6 +335,20 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
+        self.swa_write_back_eviction_barrier_enabled = False
+        self._swa_backup_index_mapper: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+        allocator = params.token_to_kv_pool_allocator
+        if allocator is not None and ComponentType.SWA in self.tree_components:
+            from sglang.srt.mem_cache.allocator.unified_sub_pool import (
+                MultiEndedAllocator,
+            )
+
+            if isinstance(allocator.swa_attn_allocator, MultiEndedAllocator):
+                self._swa_backup_index_mapper = (
+                    allocator.translate_swa_indices_for_transfer
+                )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -461,6 +475,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
+            backup_kv=(
+                _cache_action_from_tagged(binding_result.backup_kv)
+                if binding_result.backup_kv is not None
+                else None
+            ),
         )
         return _fill_evict_result(binding_result, result)
 
@@ -630,6 +649,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
 
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        self.swa_write_back_eviction_barrier_enabled = True
+        self._binding.enable_swa_write_back_eviction_barrier()
+
     @property
     def page_size(self) -> int:
         # Read-only: the Rust core freezes it at construction.
@@ -714,7 +737,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        return device_value, _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        if self._swa_backup_index_mapper is not None:
+            # Full tree values are stable virtual IDs; stored SWA physical IDs are not.
+            for transfer in comp_xfers.get(ComponentType.SWA, ()):
+                assert transfer.device_indices is not None
+                assert transfer.device_indices.numel() == device_value.numel()
+                transfer.device_indices = self._swa_backup_index_mapper(
+                    device_value
+                ).to(torch.int64)
+        return device_value, comp_xfers
 
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool

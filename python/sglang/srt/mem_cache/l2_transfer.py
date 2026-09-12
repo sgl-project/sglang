@@ -6,6 +6,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -54,21 +55,101 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
+    @staticmethod
+    def _uses_shared_layout(host_pool: Any) -> bool:
+        return (
+            isinstance(host_pool, HostKVCache)
+            and host_pool.shared_allocation_domain is not None
+        )
+
+    @staticmethod
+    def _layout_domains(transfers: list[L2Transfer]) -> list[Any]:
+        domains = []
+        seen = set()
+        for transfer in transfers:
+            if not L2TransferEngine._uses_shared_layout(transfer.host_pool):
+                continue
+            domain = transfer.host_pool.shared_allocation_domain
+            if domain is None or id(domain) in seen:
+                continue
+            seen.add(id(domain))
+            domains.append(domain)
+        return domains
+
+    def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
+        prepared = []
+        for transfer in transfers:
+            if self._uses_shared_layout(transfer.host_pool):
+                host_indices, device_indices = (
+                    transfer.host_pool.prepare_transfer_indices(
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        self.io_backend,
+                    )
+                )
+            else:
+                host_indices, device_indices = (
+                    transfer.host_indices,
+                    transfer.device_indices,
+                )
+            prepared.append(
+                transfer._replace(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return prepared
+
+    @staticmethod
+    def _acquire_layouts(domains: list[Any]) -> None:
+        for domain in domains:
+            domain.acquire_layout()
+
+    @staticmethod
+    def _release_layouts(
+        domains: list[Any], finish_event=None, transfer_key=None
+    ) -> None:
+        for domain in reversed(domains):
+            domain.release_layout(finish_event, transfer_key)
+
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
-            start_event.wait(self.device_to_host_stream)
-            ack_start.record()
-            for transfer in transfers:
-                transfer.host_pool.backup_from_device_all_layer(
-                    transfer.device_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    self.io_backend,
-                )
-            ack_finish.record()
-            self._record_stream(transfers, self.device_to_host_stream)
+        domains = self._layout_domains(transfers)
+        self._acquire_layouts(domains)
+        finish_recorded = False
+        try:
+            with device_module.stream(self.device_to_host_stream):
+                transfers = self._prepare_transfers(transfers)
+                start_event.wait(self.device_to_host_stream)
+                ack_start.record()
+                for transfer in transfers:
+                    if self._uses_shared_layout(transfer.host_pool):
+                        transfer.host_pool.backup_from_device_all_layer_physical(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            self.io_backend,
+                        )
+                    else:
+                        transfer.host_pool.backup_from_device_all_layer(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            self.io_backend,
+                        )
+                ack_finish.record()
+                finish_recorded = True
+                self._record_stream(transfers, self.device_to_host_stream)
+        except Exception:
+            self.device_to_host_stream.synchronize()
+            raise
+        finally:
+            self._release_layouts(
+                domains,
+                ack_finish if finish_recorded else None,
+                (id(self), "device_to_host"),
+            )
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     def submit_host_to_device(
@@ -81,35 +162,60 @@ class L2TransferEngine:
     ) -> TransferCompletion:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
-            start_event.wait(self.host_to_device_stream)
-            ack_start.record()
-            for layer_id in range(layer_num):
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
-                if on_layer_done is not None:
-                    on_layer_done(layer_id)
-            ack_finish.record()
-            self._record_stream(transfers, self.host_to_device_stream)
+        domains = self._layout_domains(transfers)
+        self._acquire_layouts(domains)
+        finish_recorded = False
+        try:
+            with device_module.stream(self.host_to_device_stream):
+                transfers = self._prepare_transfers(transfers)
+                primary = transfers[0] if transfers else None
+                start_event.wait(self.host_to_device_stream)
+                ack_start.record()
+                for layer_id in range(layer_num):
+                    for transfer in transfers:
+                        local_layer_id = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local_layer_id is None or (
+                            transfer is not primary
+                            and transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        if self._uses_shared_layout(transfer.host_pool):
+                            transfer.host_pool.load_to_device_per_layer_physical(
+                                transfer.device_pool,
+                                transfer.host_indices,
+                                transfer.device_indices,
+                                local_layer_id,
+                                self.io_backend,
+                                is_draft=transfer.is_draft,
+                            )
+                        else:
+                            transfer.host_pool.load_to_device_per_layer(
+                                transfer.device_pool,
+                                transfer.host_indices,
+                                transfer.device_indices,
+                                local_layer_id,
+                                self.io_backend,
+                                is_draft=transfer.is_draft,
+                            )
+                    if on_layer_done is not None:
+                        on_layer_done(layer_id)
+                ack_finish.record()
+                finish_recorded = True
+                self._record_stream(transfers, self.host_to_device_stream)
+        except Exception:
+            self.host_to_device_stream.synchronize()
+            raise
+        finally:
+            self._release_layouts(
+                domains,
+                ack_finish if finish_recorded else None,
+                (id(self), "host_to_device"),
+            )
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     @staticmethod

@@ -78,8 +78,8 @@ class Memory(msgspec.Struct):
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends; not yet compatible with PD disaggregation or speculative "
-        "decoding.",
+        "backends. Supported PD-disaggregation and speculative-decoding "
+        "configurations are validated at startup.",
     ] = False
     enable_session_radix_cache: A[
         bool,

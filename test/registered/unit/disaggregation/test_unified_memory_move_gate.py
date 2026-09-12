@@ -56,6 +56,7 @@ class _FakeScheduler:
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
         self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.decode_offload_manager = None
 
 
 class TestDecodeMoveGate(CustomTestCase):
@@ -145,6 +146,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         def __init__(self, gate):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
+            self._pending_hicache_load_pages = 0
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
 

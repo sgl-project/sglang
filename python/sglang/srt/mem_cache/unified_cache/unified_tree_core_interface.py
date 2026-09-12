@@ -49,6 +49,7 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
     """
 
     node_id: Optional[NodeId] = None
+    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
 
@@ -152,6 +153,7 @@ class UnifiedTreeCoreInterface(ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    swa_write_back_eviction_barrier_enabled: bool
     kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
@@ -454,6 +456,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def set_hicache_enabled(self) -> None:
         """Mark the host tier (HiCache) as wired."""
+        ...
+
+    @abstractmethod
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        """Preserve dirty SWA before cache-mode write-back eviction."""
         ...
 
     @abstractmethod

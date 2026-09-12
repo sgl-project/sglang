@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,8 +86,9 @@ class TestMaxTokenPoolSize(CustomTestCase):
             full_max_total_num_tokens=3000,
             swa_max_total_num_tokens=500,
         )
-        self.assertEqual(instance.max_token_pool_size, 3000)
-        self.assertEqual(instance.effective_max_total_num_tokens, 3000)
+        with get_context().override_server_args(enable_unified_memory=False):
+            self.assertEqual(instance.max_token_pool_size, 3000)
+            self.assertEqual(instance.effective_max_total_num_tokens, 3000)
 
 
 def _make_prealloc_queue(
