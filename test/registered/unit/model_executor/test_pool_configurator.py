@@ -1118,6 +1118,10 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
         cfg._unified = True
+        cfg._unified_fp8 = False
+        cfg._dspark_draft_on_bf16 = False
+        # object.__new__ skips __init__; bf16 unified row is 2B * latent
+        cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
 
     # Token pool plus the three request-scoped fixed pools, sized from the
@@ -1139,6 +1143,38 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
         self.assertEqual(sizes.c4_state_pool_size, 0)
+
+    def test_dsv4_fp8_dspark_swa_ring_includes_bf16_draft(self):
+        """Target fp8 ring + one-layer bf16 draft ring, not (T+1)/T * fp8."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import dsv4_unified_row_bytes
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = dsv4_unified_row_bytes(448, 64, fp8=True)
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 448, 64
+        cfg._dspark_draft_on_bf16 = True
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        got = cfg._fixed_swa_bytes(mrr)
+        target = (
+            slots * cfg._swa_ring_size * cfg._unified_row_bytes * cfg.num_layers_total
+        )
+        draft = slots * cfg._swa_ring_size * dsv4_unified_row_bytes(448, 64, False)
+        self.assertEqual(got, target + draft)
+        mtp_formula = int(target * cfg._spec_infl)
+        self.assertGreater(got, mtp_formula)
+
+    def test_dsv4_fp8_mtp_swa_ring_keeps_spec_inflation(self):
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = 640
+        cfg._dspark_draft_on_bf16 = False
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
+        self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
 
 
 if __name__ == "__main__":

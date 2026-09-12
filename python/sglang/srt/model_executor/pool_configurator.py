@@ -932,6 +932,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     is the request-scoped fixed pools that do not scale with full_token.
     """
 
+    # object.__new__ stubs (SWA floor tests) skip __init__
+    _dspark_draft_on_bf16 = False
+
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
@@ -986,15 +989,60 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        # Unified-KV uses a different physical layout than the non-unified V4 path:
+        #  * one row carries the full latent -- 1024 B bf16, or 640 B under
+        #    SGLANG_DSV4_UNIFIED_KV_FP8 (512 B fp8 nope + 128 B bf16 rope) -- not
+        #    that path's 584-byte fp8(nope) + bf16(rope) + scales cell.
+        #  * SWA is a fixed per-request ring (num_req_slots * ring_size),
+        #    independent of full_token, so it is a fixed *bias* rather than a
+        #    per-token term. Gate on the same switch the pool itself uses so the
+        #    sizing and the allocation never drift apart.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            dsv4_unified_row_bytes,
         )
 
         self._unified = is_unified_kv_triton()
+        self._unified_fp8 = is_unified_kv_fp8()
+        # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
+        # under-count that ring (640 vs 1024). MTP keeps the old inflation.
+        self._dspark_draft_on_bf16 = bool(
+            self._unified_fp8 and kvc.spec_algorithm.is_dspark()
+        )
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # Row width across both pools: 1024 B bf16, 640 B fp8. Read from the pool
+        # module so sizing can't drift from the allocation.
+        self._unified_row_bytes = dsv4_unified_row_bytes(
+            self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
+        )
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
         self._spec_infl = 1.0
+
+        # The unified pool takes no dtype, so --kv-cache-dtype never reaches it.
+        # V4 defaults "auto" to fp8_e4m3 (overrides.py
+        # _deepseek_v4_kv_cache_dtype), so only a bfloat16 here tells us the user
+        # set it explicitly; warning on the fp8 side would fire on every run.
+        if self._unified_fp8 and self.kv_cache_dtype_str == "bfloat16":
+            logger.warning(
+                "--kv-cache-dtype=bfloat16 is ignored on the unified_kv path; "
+                "SGLANG_DSV4_UNIFIED_KV_FP8=1 stores the latent as fp8. Unset the "
+                "env switch to get a bf16 unified pool."
+            )
+
+        # get_contiguous_buf_infos ships one pointer per layer and prices a row as
+        # buf[0].nbytes, which under fp8 covers the nope pool only. Fail at startup
+        # rather than at the first transfer.
+        # TODO(danli103): drop this once the transfer ships the rope pool.
+        if self._unified_fp8 and self.disaggregation_mode != "null":
+            raise ValueError(
+                "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+                f"(disaggregation_mode={self.disaggregation_mode!r}). Unset the fp8 "
+                "switch or run without disaggregation."
+            )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -1065,8 +1113,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_bytes_per_full_token(self) -> float:
         if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            kv_bytes = self.attn_head_dim * 2
+            # Unified_kv stores the whole latent: one bf16 pool, or an fp8 nope
+            # pool plus a bf16 rope pool. kv_bytes also prices the compressed
+            # c4/c128 rows below, which live in the same pool(s).
+            kv_bytes = self._unified_row_bytes
         else:
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
@@ -1199,17 +1249,33 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return min(estimated, full_token // 2)
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
+        """Unified_kv SWA is a fixed per-request ring, sized by concurrency
+        (num_req_slots) rather than by full_token. MTP inflates the target ring
+        by _spec_infl; DSpark+fp8 adds a bf16 draft ring instead (640 vs 1024).
+        Returns 0 on the non-unified path (SWA already counted per-token)."""
         if not self._unified:
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
-        ring_bytes = (
+        target_ring = (
             num_req_slots
             * self._swa_ring_size
-            * self.attn_head_dim
-            * 2  # bf16
+            * self._unified_row_bytes
             * self.num_layers_total
         )
-        return int(ring_bytes * self._spec_infl)
+        if self._dspark_draft_on_bf16:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                dsv4_unified_row_bytes,
+            )
+
+            draft_row = dsv4_unified_row_bytes(
+                self.qk_nope_head_dim, self.qk_rope_head_dim, fp8=False
+            )
+            # 1 layer is what the shipped DSpark drafts allocate. A multi-stage
+            # draft would under-count by ~9 MB/layer (128-wide window, ~65 req
+            # slots), which the (T+1)/T on bytes_per_full_token already covers.
+            draft_ring = num_req_slots * self._swa_ring_size * draft_row
+            return int(target_ring + draft_ring)
+        return int(target_ring * self._spec_infl)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -1277,6 +1343,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: unified={self._unified}, "
+            f"unified_fp8={self._unified_fp8}, "
+            f"dspark_draft_bf16={self._dspark_draft_on_bf16}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
