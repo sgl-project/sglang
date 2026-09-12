@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -27,7 +27,6 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
-        c.get_hash_str = get_hash_str
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
@@ -149,6 +148,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c, cache = self.c, self.cache
         self.submit()
         ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
+        ticket.last_hash = None
         c.pp_rank = 1
         c.pp_prefetch_states.clear()
         cache.bind_prefetch_ticket("hit")
@@ -156,6 +156,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c._storage_hit_query.reset_mock()
         self.run_commands(ticket)
         operation = c.prefetch_buffer.get_nowait()
+        self.assertEqual(
+            operation.hash_value, get_storage_hash_str(ticket.prefetch_key, page_size=4)
+        )
         self.assertTrue(operation.token_ids.is_bigram)
         self.assertEqual(len(operation.token_ids), 8)
         c._storage_hit_query.assert_not_called()

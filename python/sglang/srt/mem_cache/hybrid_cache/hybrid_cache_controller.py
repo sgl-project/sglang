@@ -42,6 +42,8 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+from sglang.srt.mem_cache.utils import get_storage_hash_str
+
 logger = logging.getLogger(__name__)
 
 
@@ -946,8 +948,8 @@ class HybridCacheController(BaseHiCacheController):
                         self.pp_prefetch_decisions.pop(ticket.rid)
                     operation = state.operation
 
-                operation.hash_value = self.get_hash_str(
-                    ticket.prefetch_key.token_ids,
+                operation.hash_value = get_storage_hash_str(
+                    ticket.prefetch_key,
                     ticket.last_hash,
                     page_size=self.page_size,
                 )[: ticket.storage_hit_count // self.page_size]
@@ -994,7 +996,7 @@ class HybridCacheController(BaseHiCacheController):
     def _storage_hit_query(
         self, operation, pp_rank: Optional[int] = None
     ) -> tuple[list[str], int]:
-        hash_value = self.get_hash_str(
+        hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
