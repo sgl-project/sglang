@@ -120,10 +120,10 @@ def get_hash_str(
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
-def storage_namespace_seed(
-    extra_key: Optional[str], cache_salt: Optional[str]
-) -> Optional[str]:
+def storage_namespace_seed(key: Any) -> Optional[str]:
     """Seed storage chains; preserve unnamespaced keys and Rust byte parity."""
+    extra_key = getattr(key, "extra_key", None)
+    cache_salt = getattr(key, "cache_salt", None)
     if extra_key is None and cache_salt is None:
         return None
     digest = hashlib.sha256(b"sglang-cache-namespace-v1")
@@ -144,9 +144,7 @@ def get_storage_hash_str(
 ) -> str | List[str]:
     """Seed new storage chains with the request namespace."""
     if prior_hash is None:
-        prior_hash = storage_namespace_seed(
-            getattr(key, "extra_key", None), getattr(key, "cache_salt", None)
-        )
+        prior_hash = storage_namespace_seed(key)
     return get_hash_str(key, prior_hash, page_size=page_size)
 
 

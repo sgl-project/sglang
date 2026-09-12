@@ -139,9 +139,7 @@ class DecodeKVCacheOffloadManager:
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len],
-                extra_key=req.extra_key,
-                cache_salt=req.cache_salt,
+                req, req.origin_input_ids[:prefill_offloaded_len]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
@@ -274,12 +272,7 @@ class DecodeKVCacheOffloadManager:
         self, req, host_indices, incremental_tokens, start_time, prior_hash
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(
-            incremental_tokens,
-            prior_hash,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-        )
+        page_hashes = self._compute_prefix_hash(req, incremental_tokens, prior_hash)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
@@ -288,12 +281,10 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(
-        self, tokens, prior_hash="", extra_key=None, cache_salt=None
-    ):
+    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
         """Match prefill storage hashes."""
         page_hashes = []
-        last_hash = prior_hash or storage_namespace_seed(extra_key, cache_salt)
+        last_hash = prior_hash or storage_namespace_seed(req)
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
