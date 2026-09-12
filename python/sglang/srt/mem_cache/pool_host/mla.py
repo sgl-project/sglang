@@ -1043,6 +1043,88 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
+        if self.layout == "page_first_kv_split":
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            index_k_buffer = getattr(self, "index_k_buffer", None)
+            index_k_buffer_data_ptr = (
+                index_k_buffer.data_ptr() if index_k_buffer is not None else None
+            )
+            scale_buffer = getattr(self, "index_k_scale_buffer", None)
+            scale_buffer_data_ptr = (
+                scale_buffer.data_ptr() if scale_buffer is not None else None
+            )
+            # k row width mirrors the device pool (packed dim for FP8 DSA).
+            k_width = self.k_buffer.shape[-1]
+            k_item_size = self.k_buffer.element_size()
+            # Indexer buffers cover only physical Indexer layers, which can be
+            # a subset of all layers (e.g. GLM 5.2: 21 of 78).
+            num_indexer_layers = (
+                index_k_buffer.shape[1] if index_k_buffer is not None else 0
+            )
+            index_k_width = (
+                index_k_buffer.shape[-1] if index_k_buffer is not None else 0
+            )
+            index_k_item_size = (
+                index_k_buffer.element_size() if index_k_buffer is not None else 0
+            )
+            # FP8 DSA packs V into k_buffer; the device v_buffer is empty and
+            # never transferred, so the host v mirror holds no valid data and
+            # must not be persisted to storage.
+            skip_v = getattr(self, "dsa_kv_cache_store_fp8", False)
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    k_buffer_data_ptr
+                    + indices[index] * self.layer_num * k_width * k_item_size
+                )
+                ptr_list.append(k_ptr)
+                if not skip_v:
+                    v_ptr = (
+                        v_buffer_data_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.qk_rope_head_dim
+                        * self.dtype.itemsize
+                    )
+                    ptr_list.append(v_ptr)
+                if index_k_buffer_data_ptr is not None:
+                    # Host index_k layout is (page_num, num_indexer_layers,
+                    # page_size, 1, index_head_dim).
+                    ptr_list.append(
+                        index_k_buffer_data_ptr
+                        + indices[index]
+                        * num_indexer_layers
+                        * index_k_width
+                        * index_k_item_size
+                    )
+                if scale_buffer_data_ptr is not None:
+                    # Host scale layout is (page_num, num_indexer_layers,
+                    # page_size, 1, 1) FP32: one scale value per token per
+                    # indexer layer.
+                    ptr_list.append(
+                        scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
+                    )
+            k_element_size = self.layer_num * k_item_size * self.page_size * k_width
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            index_k_element_size = (
+                num_indexer_layers * index_k_item_size * self.page_size * index_k_width
+            )
+            scale_element_size = num_indexer_layers * 4 * self.page_size
+            element_size_list = []
+            for _ in range(0, len(indices), self.page_size):
+                element_size_list.append(k_element_size)
+                if not skip_v:
+                    element_size_list.append(v_element_size)
+                if index_k_buffer_data_ptr is not None:
+                    element_size_list.append(index_k_element_size)
+                if scale_buffer_data_ptr is not None:
+                    element_size_list.append(scale_element_size)
+            return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
                 for layer_id in range(self.layer_num):
