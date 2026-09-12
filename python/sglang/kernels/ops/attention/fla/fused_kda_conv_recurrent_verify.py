@@ -12,9 +12,13 @@ two transpose copies the unfused path needs to feed the conv kernel.
 
 Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
-kernels. Requires ``T >= kernel_width - 1`` (the rolled conv state is then
-exactly the last ``kernel_width - 1`` input tokens, matching the reference
-kernel's store).
+kernels. Requires ``T >= kernel_width - 1``.
+
+State: conv_state and the SSM state are read-only here. Verify is speculative,
+and the commit scatter advances conv_state from the selected intermediate
+window, so writing it back is both redundant and unsafe -- all V tiles read
+the same Q/K conv history, so a tile in a later wave would read the rolled
+values.
 
 Numerics: deliberately bit-aligned with the unfused pair. The conv output is
 rounded to the activation dtype (bf16) before entering the recurrence —
@@ -318,19 +322,9 @@ def fused_kda_conv_gating_verify_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
-    # Rolled conv state after consuming T >= W-1 tokens is exactly the last
-    # W-1 input tokens — which are the current window registers. The verify
-    # pass never writes the ssm state back (rollback happens at commit).
-    if is_qk_owner:
-        tl.store(cs_base + q_ch + 0 * stride_cs_tok, q_c0, mask=mask_k)
-        tl.store(cs_base + q_ch + 1 * stride_cs_tok, q_c1, mask=mask_k)
-        tl.store(cs_base + q_ch + 2 * stride_cs_tok, q_c2, mask=mask_k)
-        tl.store(cs_base + k_ch + 0 * stride_cs_tok, k_c0, mask=mask_k)
-        tl.store(cs_base + k_ch + 1 * stride_cs_tok, k_c1, mask=mask_k)
-        tl.store(cs_base + k_ch + 2 * stride_cs_tok, k_c2, mask=mask_k)
-    tl.store(cs_base + v_ch + 0 * stride_cs_tok, v_c0, mask=mask_v)
-    tl.store(cs_base + v_ch + 1 * stride_cs_tok, v_c1, mask=mask_v)
-    tl.store(cs_base + v_ch + 2 * stride_cs_tok, v_c2, mask=mask_v)
+    # No conv-state writeback: every V tile reads the same Q/K history, so a
+    # tile scheduled in a later wave would read what i_v == 0 had overwritten.
+    # The commit scatter advances conv_state from the selected window instead.
 
 
 def fused_kda_conv_gating_verify(
