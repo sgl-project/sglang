@@ -308,6 +308,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dense_fp8: A[
+        bool,
+        "Quantize large bf16 dense projections the checkpoint leaves unquantized (e.g. quark MXFP4 shared_expert.down_proj) to online w8a8 FP8.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):
