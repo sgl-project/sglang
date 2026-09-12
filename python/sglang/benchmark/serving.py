@@ -40,6 +40,11 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark.accuracy import (
+    ACCURACY_DATASET_NAMES,
+    run_accuracy_eval,
+    write_accuracy_result,
+)
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
@@ -2077,6 +2082,37 @@ def run_benchmark(args_: argparse.Namespace):
         print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
         sys.exit(1)
 
+    if args.dataset_name in ACCURACY_DATASET_NAMES:
+        if not getattr(args, "eval_accuracy", False) and not getattr(
+            args, "accuracy_only", False
+        ):
+            print(
+                f"Dataset '{args.dataset_name}' is for accuracy evaluation; "
+                "pass --eval-accuracy or --accuracy-only."
+            )
+            sys.exit(1)
+        result = run_accuracy_eval(args, base_url=base_url)
+        out_path = write_accuracy_result(
+            result, getattr(args, "accuracy_output", None)
+        )
+        print("\n{s:{c}^{n}}".format(s=" Accuracy Evaluation Result ", n=50, c="="))
+        print("{:<40} {:<10}".format("Dataset:", result.dataset))
+        print("{:<40} {:<10}".format("Eval:", result.eval_name or ""))
+        print("{:<40} {:<10.3f}".format("Accuracy:", result.accuracy))
+        print("{:<40} {:<10}".format("Num samples:", result.num_samples))
+        if result.latency is not None:
+            print("{:<40} {:<10.2f}".format("Latency (s):", result.latency))
+        if result.output_throughput is not None:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Output throughput (tok/s):", result.output_throughput
+                )
+            )
+        print("{:<40} {:<10}".format("Result file:", out_path))
+        print("=" * 50)
+        if getattr(args, "accuracy_only", False):
+            return
+
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
         assert not args.tokenize_prompt, (
@@ -2251,6 +2287,12 @@ def cli_main():
             "mooncake",
             "longbench_v2",
             "speed-bench",
+            "gsm8k",
+            "gpqa",
+            "aime",
+            "aime24",
+            "aime25",
+            "aime26",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -2733,6 +2775,59 @@ def cli_main():
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--eval-accuracy",
+        action="store_true",
+        help="Run accuracy evaluation for gsm8k/gpqa/aime/mmmu datasets.",
+    )
+    parser.add_argument(
+        "--accuracy-only",
+        action="store_true",
+        help="Skip throughput benchmark; only run accuracy evaluation.",
+    )
+    parser.add_argument(
+        "--accuracy-output",
+        type=str,
+        default=None,
+        help="JSON path for accuracy results (default: accuracy_<dataset>.json).",
+    )
+    parser.add_argument(
+        "--accuracy-num-threads",
+        type=int,
+        default=None,
+        help="Thread count for accuracy eval (default: max_concurrency or 64).",
+    )
+    parser.add_argument(
+        "--accuracy-max-tokens",
+        type=int,
+        default=2048,
+        help="Max generation tokens for accuracy evaluation.",
+    )
+    parser.add_argument(
+        "--aime-year",
+        type=int,
+        choices=[24, 25, 26],
+        default=None,
+        help="AIME year when --dataset-name aime (default: 25).",
+    )
+    parser.add_argument(
+        "--hf-endpoint",
+        type=str,
+        default=None,
+        help="HuggingFace endpoint for accuracy dataset download (e.g. https://hf-mirror.com).",
+    )
+    parser.add_argument(
+        "--gsm8k-num-shots",
+        type=int,
+        default=5,
+        help="Few-shot count for GSM8K accuracy eval.",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Optional local GSM8K test.jsonl path.",
     )
     parser.add_argument(
         "--fake-prefill",
