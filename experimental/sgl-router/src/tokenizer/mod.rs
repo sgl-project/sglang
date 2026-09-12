@@ -64,56 +64,18 @@ impl TokenizerRegistry {
         let m = &cfg.model;
         let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
-        if let Some(formatter) = me.resolve_chat_formatter(&m.id, &m.tokenizer_path) {
-            me.formatters
-                .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
+        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
+            Ok(Some(formatter)) => {
+                me.formatters
+                    .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
+                tracing::info!(model = %m.id, "Dynamo chat rendering enabled");
+            }
+            Ok(None) => tracing::info!(model = %m.id,
+                "no supported chat formatter; chat traffic routes via raw prompt text"),
+            Err(e) => tracing::warn!(model = %m.id, error = %format!("{e:#}"),
+                "failed to load chat formatter; chat traffic routes via raw prompt text"),
         }
         Ok(me)
-    }
-
-    /// Pick the chat formatter for a model, logging the outcome on every branch.
-    /// Like the engine, in-code families skip a shipped template; otherwise the
-    /// HF template wins, then Dynamo's built-in formatter, then none.
-    fn resolve_chat_formatter(
-        &self,
-        model_id: &str,
-        tokenizer_path: &str,
-    ) -> Option<ChatFormatter> {
-        let warn = |file, e: anyhow::Error| tracing::warn!(model = %model_id, %file, error = %e, "failed to load");
-        let load_json = |file| {
-            adapter::load_sibling_json(tokenizer_path, file).unwrap_or_else(|e| {
-                warn(file, e);
-                None
-            })
-        };
-        let model_type =
-            load_json("config.json").and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
-        if !ChatFormatter::engine_ignores_template(model_type.as_deref()) {
-            let cfg = load_json("tokenizer_config.json").unwrap_or_else(|| serde_json::json!({}));
-            let jinja = adapter::load_sibling_text(tokenizer_path, "chat_template.jinja")
-                .unwrap_or_else(|e| {
-                    warn("chat_template.jinja", e);
-                    None
-                });
-            match ChatFormatter::from_tokenizer_config(&cfg, jinja.as_deref()) {
-                Ok(Some(formatter)) => {
-                    tracing::info!(model = %model_id,
-                        "chat-template routing enabled; chat requests route by templated tokens");
-                    return Some(formatter);
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(model = %model_id, error = %e,
-                    "failed to compile chat template; falling back to built-in detection"),
-            }
-        }
-        let formatter = ChatFormatter::native(model_type.as_deref(), model_id);
-        match &formatter {
-            Some(_) => tracing::info!(model = %model_id, ?model_type,
-                "built-in chat formatter enabled; chat requests route by encoded tokens"),
-            None => tracing::info!(model = %model_id,
-                "no chat template or built-in formatter; chat traffic routes via raw prompt text"),
-        }
-        formatter
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
@@ -364,20 +326,46 @@ mod tests {
 
     /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
     #[test]
-    fn resolve_chat_formatter_mirrors_engine_precedence() {
+    fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
         std::fs::write(&tok, "{}").unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "T").unwrap();
-        let reg = TokenizerRegistry::default();
         let resolve = |model_type: &str| {
             let cfg = serde_json::json!({ "model_type": model_type }).to_string();
             std::fs::write(dir.path().join("config.json"), cfg).unwrap();
-            reg.resolve_chat_formatter("m", tok.to_str().unwrap())
+            ChatFormatter::load("m", tok.to_str().unwrap()).unwrap()
         };
-        assert!(resolve("llama").is_some());
+        let request = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        for model_type in ["llama", "deepseek_v32"] {
+            assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
+        }
         assert!(resolve("inkling_mm_model").is_none());
-        assert!(resolve("deepseek_v41").is_some());
+        assert!(resolve("kimi_k3").is_none());
+        assert_eq!(
+            resolve("deepseek_v41").unwrap().render(&request).unwrap(),
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn invalid_chat_template_keeps_tokenizer_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tok).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"deepseek_v32"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "{% invalid %}").unwrap();
+        let mut cfg = cfg();
+        cfg.model.tokenizer_path = tok.to_str().unwrap().to_owned();
+
+        let reg = TokenizerRegistry::load_from_config(&cfg).unwrap();
+        let tokenizer = reg.get(&cfg.model.id).unwrap();
+        assert!(!adapter::encode(&tokenizer, "hello").unwrap().is_empty());
+        assert!(!reg.has_chat_formatter(&cfg.model.id));
     }
 
     #[test]

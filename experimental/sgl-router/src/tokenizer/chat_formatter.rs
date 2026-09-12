@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use dynamo_renderer::{
     deepseek_formatter_for, may_be_fix_tool_schema, ChatTemplate, ContextMixins,
-    OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
+    OAIChatLikeRequest, PromptFormatter,
 };
 use minijinja::Value;
 
@@ -35,6 +35,26 @@ pub struct ChatFormatter {
 }
 
 impl ChatFormatter {
+    /// Load model files and select a Dynamo formatter. The renderer itself
+    /// accepts parsed config; it does not fetch files or choose HF vs native.
+    pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
+        let model_type = super::adapter::load_sibling_json(tokenizer_path, "config.json")?
+            .and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
+        match model_type.as_deref() {
+            // These require tokenization paths not yet supported by this adapter.
+            Some("inkling_mm_model" | "kimi_k3") => return Ok(None),
+            Some(t) if t.starts_with("deepseek_v4") => {
+                return Ok(Self::native(model_type.as_deref(), model_id));
+            }
+            _ => {}
+        }
+        let cfg = super::adapter::load_sibling_json(tokenizer_path, "tokenizer_config.json")?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let jinja = super::adapter::load_sibling_text(tokenizer_path, "chat_template.jinja")?;
+        Ok(Self::from_tokenizer_config(&cfg, jinja.as_deref())?
+            .or_else(|| Self::native(model_type.as_deref(), model_id)))
+    }
+
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
     /// `chat_template.jinja` when present (transformers' precedence); `Ok(None)`
     /// when the model ships neither.
@@ -46,19 +66,19 @@ impl ChatFormatter {
         if let Some(template) = chat_template_jinja {
             cfg["chat_template"] = template.into();
         }
-        let mut defaults: ChatTemplateKwargs = SPECIAL_TOKEN_KEYS
-            .into_iter()
-            .map(|key| {
-                let token = cfg[key]
-                    .as_str()
-                    .or_else(|| cfg[key]["content"].as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                // Normalize absent tokens and HF AddedToken objects to strings.
-                cfg[key] = token.clone().into();
-                (key.to_owned(), token.into())
-            })
-            .collect();
+        let mut defaults = ChatTemplateKwargs::new();
+        for key in SPECIAL_TOKEN_KEYS {
+            let token = cfg[key]
+                .as_str()
+                .or_else(|| cfg[key]["content"].as_str())
+                .unwrap_or_default()
+                .to_owned();
+            cfg[key] = token.clone().into();
+            // Dynamo already supplies bos/eos/unk from the normalized config.
+            if !matches!(key, "bos_token" | "eos_token" | "unk_token") {
+                defaults.insert(key.to_owned(), token.into());
+            }
+        }
         if let Some(extra) = cfg
             .get("additional_special_tokens")
             .filter(|v| v.is_array())
@@ -78,24 +98,12 @@ impl ChatFormatter {
         if template.chat_template.is_none() {
             return Ok(None);
         }
-        let formatter = PromptFormatter::from_parts(
-            template,
-            ContextMixins::new(&[PromptContextMixin::OaiChat]),
-            true,
-        )
-        .context("compile chat template")?;
+        let formatter = PromptFormatter::from_parts(template, ContextMixins::default(), true)
+            .context("compile chat template")?;
         Ok(Some(Self {
             formatter,
             defaults,
         }))
-    }
-
-    /// Families the engine encodes in code even when a template ships (mirrors
-    /// `chat_encoding.resolve_chat_encoding_spec`).
-    pub fn engine_ignores_template(model_type: Option<&str>) -> bool {
-        model_type.is_some_and(|t| {
-            t.starts_with("deepseek_v4") || matches!(t, "inkling_mm_model" | "kimi_k3")
-        })
     }
 
     /// Dynamo's DeepSeek encoders (V4 family, V3.2), the only built-in ones
