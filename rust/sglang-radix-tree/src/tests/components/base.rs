@@ -70,7 +70,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         &self,
         tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         unimplemented!()
@@ -95,6 +95,7 @@ fn insert_overlap_default_consumes_nothing() {
             mamba_value: None,
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
+            swa_branching_seqlen: None,
             chunked: false,
             priority: 0,
             track_adopted_ranges: false,

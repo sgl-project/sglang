@@ -23,6 +23,8 @@ pair, so without this gate a running server crashes mid-serving.
 import unittest
 from types import SimpleNamespace
 
+import msgspec
+
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
@@ -33,7 +35,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _run_handler(*, unified, tbo):
     """Run just `handle_unified_memory_pool` over a minimal stand-in."""
-    sa = ServerArgs.__new__(ServerArgs)
+    sa = ServerArgs(model_path="dummy")
     for name, value in {
         "enable_unified_memory": unified,
         "enable_two_batch_overlap": tbo,
@@ -49,7 +51,7 @@ def _run_handler(*, unified, tbo):
         ),
         "cuda_graph_backend_prefill": Backend.DISABLED,
     }.items():
-        object.__setattr__(sa, name, value)
+        msgspec.Struct.__setattr__(sa, name, value)
     handle_unified_memory_pool(sa)
 
 

@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -578,7 +580,7 @@ def _conv_multi_build_meta(pairs, block_size: int):
             ]
         )
         block_start += triton.cdiv(elem, block_size)
-    meta = torch.tensor(rows, dtype=torch.int64, device=pairs[0][0].device)
+    meta = make_ptr_table(rows, device=pairs[0][0].device)
     return meta, block_start
 
 

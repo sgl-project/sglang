@@ -116,7 +116,7 @@ on:
         type: string
         # A single flavor, unlike the schedule and the dispatch form: a caller
         # that says nothing should not silently get multi-version GPU cost.
-        default: rocm724
+        default: rocm10
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false

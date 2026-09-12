@@ -50,7 +50,6 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-from ..utils.distributed import RankGenerator
 from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
@@ -58,6 +57,7 @@ from .group_coordinator import (
     get_local_torch_device,
     new_device_group,
 )
+from .utils import RankGenerator
 
 logger = init_logger(__name__)
 

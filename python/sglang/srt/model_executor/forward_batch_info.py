@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_lora,
     get_parallel,
     mamba_cache_chunk_size,
@@ -303,12 +304,18 @@ def compute_local_num_token_non_padded_cpu(
 
 
 def prefill_graph_tolerates_sum_len() -> bool:
-    """Whether MegaMoE may replay prefill graphs with local shapes."""
+    """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
+
+    The graph body is captured with MAX_LEN geometry, so a graph that recorded
+    a DP gather/scatter only replays correctly when every rank uses one bucket.
+    """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
     from sglang.srt.layers.cp.utils import is_mla_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_megamoe():
+        return False
+    if get_flags().dp.prefill_graph_has_dp_gather:
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
@@ -1323,7 +1330,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :,
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
                 ]
-                if mrope_positions.numel() == 0:
+                if (
+                    batch.reqs[batch_idx].session is not None
+                    and mrope_positions.shape[1] < extend_seq_len
+                ):
+                    # Session history includes generated and appended text that
+                    # is not covered by the saved prompt positions.
+                    tail_len = extend_seq_len - mrope_positions.shape[1]
+                    tail_start = extend_prefix_len + mrope_positions.shape[1]
+                    text_positions = self._expand_mrope_from_input(
+                        mm_input, tail_start + 1
+                    ) + torch.arange(tail_len)
+                    mrope_positions = torch.cat(
+                        [mrope_positions, text_positions], dim=1
+                    )
+                elif mrope_positions.numel() == 0:
                     mrope_positions = self._expand_mrope_from_input(
                         mm_input, seq_lens_cpu[batch_idx]
                     )

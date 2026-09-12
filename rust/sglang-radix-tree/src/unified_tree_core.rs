@@ -8,7 +8,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{self, FullComponent, MambaComponent, SwaComponent, TreeComponent};
+use crate::components::{
+    self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
+};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -34,28 +36,41 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 // ---- interface types ----
 
 /// Result of `inc_lock_ref`, handed back to the matching `dec_lock_ref`.
+///
+/// The receipt a release needs is per-component lock evidence: the SWA
+/// segment boundary uuid (None means the segment reached the root) and
+/// whether the single-node Mamba lock was taken (the decode hold opts
+/// out). Locks count every node in their contiguous segment, so no
+/// per-node skip state exists. Receipt fields default to nothing-acquired;
+/// `inc_lock_ref` stamps what it actually took.
 #[derive(Default)]
 pub struct IncLockRefResult {
     /// Tokens newly protected (moved out of evictable) by this lock.
     pub delta: Option<usize>,
+    /// The node the lock was taken on; a release replays the receipt there only.
+    pub node_id: Option<NodeId>,
     /// SWA lock-window uuid minted/reused by the device lock walk.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid minted/reused by the host lock walk.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes that were tombstones at acquire time; replayed at
-    /// release so the unlock skips them.
-    pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
+    /// Components the acquire left untaken; the release skips them too.
+    pub skipped_lock_components: ComponentSet,
 }
 
-/// Params for `dec_lock_ref`.
+/// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
+/// a lost receipt under-releases (a leak sanity checks report) instead of
+/// releasing a lock another holder owns.
 #[derive(Default)]
 pub struct DecLockRefParams {
+    /// The node the matching acquire locked; None only for receipts that did
+    /// not come from this core (a mispaired anchor is a protocol violation).
+    pub node_id: Option<NodeId>,
     /// SWA lock-window uuid the device unlock stops at, from the matching acquire.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes the unlock walk skips (from the matching acquire).
-    pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
+    /// Components the matching acquire left untaken.
+    pub skipped_lock_components: ComponentSet,
 }
 
 /// Result of `dec_lock_ref`.
@@ -77,6 +92,8 @@ pub struct MatchResult {
     /// SWA tokens that hit on host (within the sliding window) and will be
     /// loaded back into the SWA device pool.
     pub swa_host_hit_length: usize,
+    /// The longest page-aligned position that could have hit if an SWA window existed.
+    pub swa_branching_seqlen: Option<usize>,
     /// Mamba slots that hit on host and will be loaded back; 0 or 1.
     pub mamba_host_hit_length: usize,
     /// The longest chunk-aligned position that could have hit if a mamba state existed.
@@ -109,6 +126,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub prev_prefix_len: usize,
     /// The request's SWA-evicted prefix boundary; SWA data below it stays tombstoned.
     pub swa_evicted_seqlen: usize,
+    /// The Full-KV-derived boundary whose SWA window this insert should materialize.
+    pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
     /// Whether this is a chunked-prefill insert (no hit-count bump).
@@ -131,6 +150,8 @@ pub struct InsertResult {
     /// Whether the cache holds Mamba state covering the inserted sequence;
     /// vacuously true for an empty insert.
     pub mamba_exist: bool,
+    /// Whether this insert reached the requested SWA branch boundary.
+    pub swa_branch_inserted: bool,
     /// The deepest host-backed node an insert_host attached or matched.
     pub inserted_host_node: Option<NodeId>,
     /// Whether write-through rejected a host suffix below an unbacked parent.
@@ -192,6 +213,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     namespace: KeyNamespace,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
+    swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
     chunked: bool,
     priority: i64,
@@ -517,17 +539,21 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
     pub(crate) enable_hicache: bool,
+    /// Whether the host tier stages one node per FIFO backup intent rather than
+    /// caching windows; buffer mode sizes its storage keys off a single node.
+    pub(crate) is_host_memory_buffer_only: bool,
     /// Whether the storage tier (L3) is wired; gates page-hash computation.
     pub(crate) enable_storage: bool,
+    /// Whether a direct device-to-external-cache linker is wired.
+    pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
     /// Queued placement events, drained by take_events.
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
-    /// Namespace-aware event hashes, populated only for salted nodes whose
-    /// placement events are requested. Storage hashes remain on the nodes.
-    pub(crate) salted_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
+    /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
+    pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
 
@@ -701,11 +727,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
+            is_host_memory_buffer_only: false,
             enable_storage: false,
+            enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
-            salted_event_hashes: HashMap::new(),
+            namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             swa_uuid_counter: 1,
             device: params.device,
@@ -734,7 +762,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.write_back_coexist_reclaim_digest = 0;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
-        self.salted_event_hashes.clear();
+        self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
     }
 
@@ -792,58 +820,90 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.swa_uuid_counter
     }
 
-    /// Bump the reference count on a node's component locks.
-    pub fn inc_lock_ref(&mut self, node_id: NodeId) -> Result<IncLockRefResult, NodeAccessError> {
-        self.inc_lock_ref_with_skip(node_id, &[])
-    }
-
-    /// Bump component locks, leaving explicitly skipped target components evictable.
-    pub fn inc_lock_ref_with_skip(
+    /// Bump the reference count on a node's component locks. Components in
+    /// `skip_lock_components` are left untaken; the receipt records the anchor
+    /// node and the skipped set so the paired release mirrors them.
+    pub fn inc_lock_ref(
         &mut self,
         node_id: NodeId,
-        skip_lock_components: &[ComponentType],
+        skip_lock_components: ComponentSet,
     ) -> Result<IncLockRefResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let node = self.arena.node(node_id);
-        let node_handle = node.id;
-        let is_root = node.is_root();
-        let mut result = IncLockRefResult::default();
+        let node_idx = self.arena.resolve(node_id)?;
+        let mut result = IncLockRefResult {
+            node_id: Some(self.arena.node(node_idx).id),
+            skipped_lock_components: skip_lock_components,
+            ..Default::default()
+        };
         for i in 0..self.components.len() {
-            let component_type = self.components[i].component_type();
-            if skip_lock_components.contains(&component_type) {
-                if !is_root {
-                    result
-                        .skip_lock_node_ids
-                        .entry(component_type)
-                        .or_default()
-                        .insert(node_handle);
-                }
+            let component = Arc::clone(&self.components[i]);
+            if skip_lock_components.contains(component.component_type()) {
                 continue;
             }
-            let component = Arc::clone(&self.components[i]);
             result = component
-                .acquire_component_lock(self, node_id, result, /* lock_host = */ false);
+                .acquire_component_lock(self, node_idx, result, /* lock_host = */ false);
         }
-        self.update_evictable_leaf_sets_(node_id);
+        self.update_evictable_leaf_sets_(node_idx);
         Ok(result)
     }
 
-    /// Decrease the reference count on a node's component locks.
+    /// A receipt releases only the node its acquire returned; a mispaired
+    /// node would silently release (or steal) another holder's segment.
+    fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
+        if let Some(anchor) = params.node_id {
+            let node_handle = self.arena.node(node_idx).id;
+            assert!(
+                anchor == node_handle,
+                "lock receipt anchored on node {anchor} released on node {node_handle}"
+            );
+        }
+    }
+
+    /// Release each component this receipt acquired. Auxiliaries go first so
+    /// Full, whose walk refreshes leaf membership on every node it unlocks,
+    /// sees their final refs; the auxiliary walks also refresh the nodes they
+    /// unlock, so the order is not load-bearing for the sets.
+    fn release_components_(
+        &mut self,
+        node_idx: NodeIdx_,
+        params: &DecLockRefParams,
+        lock_host: bool,
+        skip_swa_and_below: bool,
+    ) {
+        let swa_priority = if skip_swa_and_below {
+            self.try_component_by_type_(SWA)
+                .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
+        } else {
+            None
+        };
+        for i in (0..self.components.len()).rev() {
+            let component = Arc::clone(&self.components[i]);
+            let ct = component.component_type();
+            if params.skipped_lock_components.contains(ct) {
+                continue;
+            }
+            if let Some(swa_priority) = swa_priority
+                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
+            {
+                continue;
+            }
+            component.release_component_lock(self, node_idx, params, lock_host);
+        }
+    }
+
+    /// Decrease the reference count on a node's component locks. The receipt
+    /// is required: a release must replay its acquire's evidence. After an SWA
+    /// early release (`dec_swa_lock_only`), `skip_swa` leaves SWA and the
+    /// lower-priority components it already dropped alone.
     pub fn dec_lock_ref(
         &mut self,
         node_id: NodeId,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         skip_swa: bool,
     ) -> Result<DecLockRefResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        for i in 0..self.components.len() {
-            if skip_swa && self.components[i].component_type() == SWA {
-                continue;
-            }
-            let component = Arc::clone(&self.components[i]);
-            component.release_component_lock(self, node_id, params, /* lock_host = */ false);
-        }
-        self.update_evictable_leaf_sets_(node_id);
+        let node_idx = self.arena.resolve(node_id)?;
+        self.assert_receipt_anchor_(node_idx, params);
+        self.release_components_(node_idx, params, /* lock_host = */ false, skip_swa);
+        self.update_evictable_leaf_sets_(node_idx);
         // TODO: delta is not aggregated from components; no caller uses it yet.
         Ok(DecLockRefResult::default())
     }
@@ -853,50 +913,37 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn dec_swa_lock_only(
         &mut self,
         node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
+        params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) -> Result<(), NodeAccessError> {
-        self.dec_swa_lock_only_with_skip(
-            node_id,
-            swa_uuid_for_lock,
-            /* skip_lock_node_ids = */ None,
-            device_frees,
-            host_frees,
-        )
-    }
-
-    /// Skip-aware variant used when an acquire deliberately omitted a component.
-    pub fn dec_swa_lock_only_with_skip(
-        &mut self,
-        node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
-        skip_lock_node_ids: Option<&HashMap<ComponentType, HashSet<NodeId>>>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) -> Result<(), NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
+        let node_idx = self.arena.resolve(node_id)?;
+        self.assert_receipt_anchor_(node_idx, params);
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return Ok(());
         };
-        swa.release_window_lock(self, node_id, swa_uuid_for_lock, device_frees, host_frees);
+        swa.release_window_lock(
+            self,
+            node_idx,
+            params.swa_uuid_for_lock,
+            device_frees,
+            host_frees,
+        );
 
-        // Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node.
+        // Drop strictly-lower-priority locks co-located on the node, skipping
+        // any the paired inc never took.
         let swa_priority = swa.eviction_priority(/* is_leaf = */ false);
-        let dec_params = DecLockRefParams {
-            swa_uuid_for_lock,
-            skip_lock_node_ids: skip_lock_node_ids.cloned().unwrap_or_default(),
-            ..Default::default()
-        };
-        for i in 0..self.components.len() {
+        for i in (0..self.components.len()).rev() {
             let component = Arc::clone(&self.components[i]);
+            if params
+                .skipped_lock_components
+                .contains(component.component_type())
+            {
+                continue;
+            }
             if component.eviction_priority(/* is_leaf = */ false) < swa_priority {
-                component.release_component_lock(
-                    self,
-                    node_id,
-                    Some(&dec_params),
-                    /* lock_host = */ false,
-                );
+                component
+                    .release_component_lock(self, node_idx, params, /* lock_host = */ false);
             }
         }
         Ok(())
@@ -925,29 +972,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
     ) -> Result<IncLockRefResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let mut result = IncLockRefResult::default();
+        let node_idx = self.arena.resolve(node_id)?;
+        let mut result = IncLockRefResult {
+            node_id: Some(self.arena.node(node_idx).id),
+            ..Default::default()
+        };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
             result = component
-                .acquire_component_lock(self, node_id, result, /* lock_host = */ true);
+                .acquire_component_lock(self, node_idx, result, /* lock_host = */ true);
         }
-        self.update_evictable_leaf_sets_(node_id);
+        self.update_evictable_leaf_sets_(node_idx);
         Ok(result)
     }
 
     /// Decrease the reference count on a node's host-side component locks.
+    /// The receipt is required, as for `dec_lock_ref`.
     pub fn dec_host_lock_ref(
         &mut self,
         node_id: NodeId,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
     ) -> Result<DecLockRefResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        for i in 0..self.components.len() {
-            let component = Arc::clone(&self.components[i]);
-            component.release_component_lock(self, node_id, params, /* lock_host = */ true);
-        }
-        self.update_evictable_leaf_sets_(node_id);
+        let node_idx = self.arena.resolve(node_id)?;
+        self.assert_receipt_anchor_(node_idx, params);
+        self.release_components_(node_idx, params, /* lock_host = */ true, false);
+        self.update_evictable_leaf_sets_(node_idx);
         Ok(DecLockRefResult::default())
     }
 
@@ -1190,6 +1239,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
             swa_host_hit_length: 0,
+            swa_branching_seqlen: None,
             full_kv_hit_length,
             cache_actions: Vec::new(),
         };
@@ -1219,6 +1269,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_node_id: root_id,
             host_hit_length: 0,
             swa_host_hit_length: 0,
+            swa_branching_seqlen: None,
             full_kv_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
@@ -1283,6 +1334,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         node.hit_count += 1;
+
+        if self.enable_external_cache_linker {
+            return Self::needs_external_linker_offload_(node)
+                && node.hit_count >= self.write_through_threshold;
+        }
+
         self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
     }
 
@@ -1345,6 +1402,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     inserted_host_node: None,
                     host_insert_dropped: false,
                     mamba_exist: true,
+                    swa_branch_inserted: false,
                     adopted_ranges: None,
                     cache_actions: Vec::new(),
                 }),
@@ -1366,6 +1424,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespace: params.namespace.to_owned(),
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: params.chunked,
             priority: params.priority,
@@ -1491,6 +1550,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
+            swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
@@ -1641,6 +1701,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
+            swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
@@ -1663,7 +1724,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Whether an auxiliary component has new device data missing from Host.
     fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
         self.components.iter().any(|component| {
-            component.component_type() != BASE_COMPONENT_TYPE
+            let component_type = component.component_type();
+            // Write-back defers Full and Mamba to eviction; SWA still publishes
+            // its window here because out-of-window frees never reach eviction.
+            component_type != BASE_COMPONENT_TYPE
+                && (!self.is_write_back || component_type == SWA)
                 && component.needs_incremental_backup(self, node_id)
         })
     }
@@ -1680,7 +1745,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         let node = self.arena.node(target_node_id);
         self.enable_hicache
-            && !self.is_write_back
             && node.backuped()
             && node.write_through_pending_id.is_none()
             && self.needs_incremental_component_backup_(target_node_id)
@@ -1727,6 +1791,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child = self.arena.node(child_id);
         let parent_id = child.parent();
         let child_namespace = child.namespace.clone();
+        let child_external_cache_stored = child.external_cache_stored;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
         let parent_map_key = key_head.child_key(page_size);
@@ -1742,14 +1807,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             (child_namespace.clone(), key_tail.child_key(page_size)),
             child_id,
         );
-
-        // The child's aux LRU cells detach while it is re-linked.
-        self.for_each_component_lru_(
-            child_id,
-            &mut |lru, node_id| lru.remove_node(node_id),
-            EvictLayer::Device,
-            /* skip_existing = */ false,
-        );
+        self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
@@ -1759,13 +1817,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         child.hash_value = child_hash;
         self.arena.node_mut(new_node_id).hash_value = new_node_hash;
         let child_handle = self.arena.node(child_id).id;
-        if let Some(mut parent_event_hashes) = self.salted_event_hashes.remove(&child_handle) {
+        if let Some(mut parent_event_hashes) = self.namespaced_event_hashes.remove(&child_handle) {
             let child_event_hashes = parent_event_hashes.split_off(split_len / self.page_size);
             parent_event_hashes.shrink_to_fit();
             let new_node_handle = self.arena.node(new_node_id).id;
-            self.salted_event_hashes
+            self.namespaced_event_hashes
                 .insert(new_node_handle, parent_event_hashes);
-            self.salted_event_hashes
+            self.namespaced_event_hashes
                 .insert(child_handle, child_event_hashes);
         }
 
@@ -1799,15 +1857,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             None
         };
 
+        // A split does not access the suffix; keep both fragments at its old position.
         self.for_each_component_lru_(
             new_node_id,
-            &mut |lru, node_id| lru.insert_mru(node_id),
-            EvictLayer::Device,
-            /* skip_existing = */ true,
-        );
-        self.for_each_component_lru_(
-            child_id,
-            &mut |lru, node_id| lru.insert_mru(node_id),
+            &mut |lru, node_id| lru.insert_after(child_id, node_id),
             EvictLayer::Device,
             /* skip_existing = */ true,
         );
@@ -1861,7 +1914,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "add_new_node_: parent {parent_id} already has a child on the new node's page"
         );
         self.inc_evictable_size(FULL, value.size()[0] as usize);
-        if self.enable_storage {
+        if self.enable_storage || self.enable_external_cache_linker {
             let hash_values = self.arena.compute_node_hash_values(new_node_id, page_size);
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
         }
@@ -1877,7 +1930,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn unevict_node_on_insert_(&mut self, node_id: NodeIdx_, fresh_value: &Tensor) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
-        self.inc_evictable_size(FULL, fresh_value.size()[0] as usize);
+        let tokens = fresh_value.size()[0] as usize;
+        // A value materialized under lock is protected; the last release
+        // moves it to evictable.
+        if self.arena.device_lock_ref(node_id, FULL) > 0 {
+            self.inc_protected_size(FULL, tokens);
+        } else {
+            self.inc_evictable_size(FULL, tokens);
+        }
         self.update_evictable_leaf_sets_(node_id);
         self.update_full_coexisting_host_tracking_(node_id);
         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
@@ -2489,7 +2549,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn remove_leaf_from_parent_(&mut self, node_id: NodeIdx_) {
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
-        self.salted_event_hashes
+        self.namespaced_event_hashes
             .remove(&self.arena.node(node_id).id);
         // The arena is the registry: freeing detaches by page key and recycles the slot.
         self.arena
@@ -2644,6 +2704,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if node.is_host_locked() {
             return false;
         }
+        // Segment locks count evicted nodes too: a device-locked candidate is
+        // a live segment's anchor, and evict_host_leaf_ would delete it.
+        if node.is_device_locked() {
+            return false;
+        }
         if !node.children.is_empty() {
             return false;
         }
@@ -2655,9 +2720,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.enable_hicache = true;
     }
 
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
+    pub fn set_host_memory_buffer_only(&mut self) {
+        self.is_host_memory_buffer_only = true;
+    }
+
     /// Whether the storage tier (L3) is wired; storage attaches after tree construction.
     pub fn set_enable_storage(&mut self, value: bool) {
         self.enable_storage = value;
+    }
+
+    /// Enable or disable the direct external-cache linker.
+    pub fn set_enable_external_cache_linker(
+        &mut self,
+        value: bool,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        if value && self.components_by_type[MAMBA.idx()].is_some() {
+            return Err(
+                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
+                    component_type: MAMBA,
+                },
+            );
+        }
+        self.enable_external_cache_linker = value;
+        Ok(())
     }
 
     // ==== KV cache placement events ====
@@ -2705,18 +2791,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
-    /// Fill the salted external event-hash chain through `node_id`.
-    fn ensure_salted_event_hashes_(&mut self, node_id: NodeIdx_) {
-        let cache_salt = self
-            .arena
-            .node(node_id)
-            .namespace
-            .cache_salt_arc()
-            .expect("salted event hashing requires cache_salt");
-        let node_handle = self.arena.node(node_id).id;
-        if self.salted_event_hashes.contains_key(&node_handle) {
+    /// Fill the event chain through `node_id`, using only cache_salt.
+    fn ensure_namespaced_event_hashes_(&mut self, node_id: NodeIdx_) {
+        let node = self.arena.node(node_id);
+        if self.namespaced_event_hashes.contains_key(&node.id) {
             return;
         }
+        let namespace = node.namespace.clone();
 
         let mut missing = Vec::new();
         let mut cursor = Some(node_id);
@@ -2727,11 +2808,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 break;
             }
             assert_eq!(
-                node.namespace.cache_salt(),
-                Some(cache_salt.as_ref()),
-                "radix path contains mismatched cache_salt values"
+                node.namespace, namespace,
+                "radix path contains mismatched cache namespaces"
             );
-            if let Some(hashes) = self.salted_event_hashes.get(&node.id) {
+            if let Some(hashes) = self.namespaced_event_hashes.get(&node.id) {
                 prior = hashes.last().copied();
                 break;
             }
@@ -2739,12 +2819,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cursor = node.try_parent();
         }
 
-        let mut prior = prior.unwrap_or_else(|| {
-            let mut hasher = Sha256::new();
-            hasher.update(b"sglang-cache-salt-v1\0");
-            hasher.update(cache_salt.as_bytes());
-            hasher.finalize().into()
-        });
+        if prior.is_none() {
+            prior = namespace.cache_salt().map(|cache_salt| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"sglang-cache-salt-v1\0");
+                hasher.update(cache_salt.as_bytes());
+                hasher.finalize().into()
+            });
+        }
         for id in missing.into_iter().rev() {
             let (handle, hashes) = {
                 let node = self.arena.node(id);
@@ -2752,15 +2834,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     node.id,
                     crate::node::get_hash_digests::<K>(
                         node.key.as_ref(),
-                        Some(&prior),
+                        prior.as_ref(),
                         self.page_size,
                     ),
                 )
             };
             if let Some(last) = hashes.last() {
-                prior = *last;
+                prior = Some(*last);
             }
-            self.salted_event_hashes.insert(handle, hashes);
+            self.namespaced_event_hashes.insert(handle, hashes);
         }
     }
 
@@ -2774,15 +2856,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        if cache_salt.is_some() {
-            self.ensure_salted_event_hashes_(node_id);
+        let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        if namespaced {
+            self.ensure_namespaced_event_hashes_(node_id);
         }
         let events = {
             let node = self.arena.node(node_id);
             let mut parent_block_hash = node.parent.and_then(|parent_id| {
                 let parent = self.arena.node(parent_id);
-                if cache_salt.is_some() {
-                    self.salted_event_hashes
+                if namespaced {
+                    self.namespaced_event_hashes
                         .get(&parent.id)
                         .and_then(|hashes| hashes.last())
                         .map(crate::node::hash_digest_to_int64)
@@ -2805,8 +2888,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 });
                 parent_block_hash = Some(block_hash);
             };
-            if cache_salt.is_some() {
-                let hashes = &self.salted_event_hashes[&node.id];
+            if namespaced {
+                let hashes = &self.namespaced_event_hashes[&node.id];
                 assert!(
                     hashes.len() >= num_pages,
                     "store event: {} page hashes for {num_pages} pages",
@@ -2842,14 +2925,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
-        let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        if cache_salt.is_some() {
-            self.ensure_salted_event_hashes_(node_id);
+        let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        if namespaced {
+            self.ensure_namespaced_event_hashes_(node_id);
         }
         let node = self.arena.node(node_id);
         let num_pages = node.key.atom_len().div_ceil(self.page_size);
-        let block_hashes: Vec<i64> = if cache_salt.is_some() {
-            self.salted_event_hashes[&node.id][..num_pages]
+        let block_hashes: Vec<i64> = if namespaced {
+            self.namespaced_event_hashes[&node.id][..num_pages]
                 .iter()
                 .map(crate::node::hash_digest_to_int64)
                 .collect()
@@ -2925,6 +3008,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 inserted_host_node: None,
                 host_insert_dropped: false,
                 mamba_exist: true,
+                swa_branch_inserted: false,
                 adopted_ranges: None,
                 cache_actions: Vec::new(),
             });
@@ -2964,6 +3048,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             inserted_host_node: None,
             host_insert_dropped: false,
             mamba_exist: false,
+            swa_branch_inserted: false,
             adopted_ranges: None,
             cache_actions,
         };
@@ -3415,14 +3500,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(order)
     }
 
-    /// Build the backup action for a node and its unbacked ancestors.
+    /// Build the backup action for a node and its not-yet-persisted ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
         let mut chain = vec![node.id];
         if !write_back {
             let mut ancestor = node.try_parent();
             while let Some(ancestor_idx) = ancestor {
                 let ancestor_node = self.arena.node(ancestor_idx);
-                if ancestor_node.is_root() || ancestor_node.backuped() {
+                if ancestor_node.is_root()
+                    || ancestor_node.backuped()
+                    || ancestor_node.external_cache_stored
+                    || (self.enable_external_cache_linker
+                        && ancestor_node.write_through_pending_id.is_some())
+                {
                     break;
                 }
                 chain.push(ancestor_node.id);
@@ -3648,6 +3738,103 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         depth
     }
 
+    /// Build transfers for a node with no stored or pending external copy.
+    pub fn build_external_linker_offload_transfers(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<Vec<PoolTransfer>>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        if !Self::needs_external_linker_offload_(self.arena.node(node_id)) {
+            return Ok(None);
+        }
+
+        let transfers = self
+            .components
+            .iter()
+            .filter_map(|component| component.build_external_linker_offload_transfer(self, node_id))
+            .collect();
+        Ok(Some(transfers))
+    }
+
+    fn needs_external_linker_offload_(node: &Node<K>) -> bool {
+        !node.external_cache_stored && node.write_through_pending_id.is_none()
+    }
+
+    /// Mark the path from `from_node_id` to, but excluding, `until_node_id` as
+    /// available in the external cache.
+    pub fn mark_external_cache_stored_path(
+        &mut self,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let from = self.arena.resolve(from_node_id)?;
+        let until = self.arena.resolve(until_node_id)?;
+        let mut path = Vec::new();
+        let mut current = from;
+        while current != until {
+            let node = self.arena.node(current);
+            let Some(parent) = node.try_parent() else {
+                return Err(TreeCoreRuntimeError::ExternalCachePathNotAncestor {
+                    from_node_id,
+                    until_node_id,
+                });
+            };
+            path.push(current);
+            current = parent;
+        }
+        for node_id in path {
+            self.arena.node_mut(node_id).external_cache_stored = true;
+        }
+        Ok(())
+    }
+
+    /// Publish an accepted external offload as pending.
+    pub fn mark_external_linker_offload_pending(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let node = self.arena.node(node_idx);
+        if !Self::needs_external_linker_offload_(node) {
+            return Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+                node_id,
+                stored: node.external_cache_stored,
+                pending_id: node.write_through_pending_id,
+            });
+        }
+        self.arena.node_mut(node_idx).write_through_pending_id = Some(node_id);
+        Ok(())
+    }
+
+    /// Finalize external-store state for an offload and its split fragments.
+    pub fn finish_external_linker_offload(
+        &mut self,
+        node_ids: &[NodeId],
+        ack_id: NodeId,
+        success: bool,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_indices = node_ids
+            .iter()
+            .map(|&node_id| self.arena.resolve(node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (&node_id, &node_idx) in node_ids.iter().zip(&node_indices) {
+            let node = self.arena.node(node_idx);
+            if node.write_through_pending_id != Some(ack_id) {
+                return Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+                    node_id,
+                    stored: node.external_cache_stored,
+                    pending_id: node.write_through_pending_id,
+                });
+            }
+        }
+        for node_id in node_indices {
+            let node = self.arena.node_mut(node_id);
+            node.write_through_pending_id = None;
+            node.external_cache_stored |= success;
+        }
+        Ok(())
+    }
+
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
     /// host store event for each acked node.
     pub fn finish_write_through(
@@ -3702,7 +3889,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             host_lru.remove_node(node_id);
         }
         self.device_lru_list_mut(component_type).insert_mru(node_id);
-        self.inc_evictable_size(component_type, tokens);
+        // A value materialized under lock is protected; the last release
+        // moves it to evictable.
+        if self.arena.device_lock_ref(node_id, component_type) > 0 {
+            self.inc_protected_size(component_type, tokens);
+        } else {
+            self.inc_evictable_size(component_type, tokens);
+        }
     }
 
     /// The component's device value on the node, or None if evicted.
@@ -3785,23 +3978,23 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &orphans[..orphans.len().min(5)]
             ));
         }
-        for (&node_handle, hashes) in &self.salted_event_hashes {
+        for (&node_handle, hashes) in &self.namespaced_event_hashes {
             let Ok(node_id) = self.arena.resolve(node_handle) else {
                 errors.push(format!(
-                    "[Events] salted hashes reference freed node {node_handle}"
+                    "[Events] event hashes reference freed node {node_handle}"
                 ));
                 continue;
             };
             let node = self.arena.node(node_id);
-            if node.namespace.cache_salt().is_none() {
+            if node.namespace == KeyNamespace::default() {
                 errors.push(format!(
-                    "[Events] unsalted node {node_handle} carries salted hashes"
+                    "[Events] default-namespace node {node_handle} carries event hashes"
                 ));
             }
             let expected_pages = node.key.atom_len().div_ceil(self.page_size);
             if hashes.len() != expected_pages {
                 errors.push(format!(
-                    "[Events] node {node_handle} has {} salted hashes for {expected_pages} pages",
+                    "[Events] node {node_handle} has {} event hashes for {expected_pages} pages",
                     hashes.len()
                 ));
             }
@@ -3931,12 +4124,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         device_state.lock_ref
                     ));
                 }
-                if device_state.value.is_none() && device_state.lock_ref > 0 {
-                    errors.push(format!(
-                        "node {node_id} {ct:?} evicted but lock_ref={}",
-                        device_state.lock_ref
-                    ));
-                }
+                // Locked tombstones are legal: segment locks count every
+                // node in [start, boundary], data-bearing or not.
             }
 
             // Collect expected leaf qualification (single pass)
@@ -4305,6 +4494,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<Option<usize>, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).write_through_pending_id)
+    }
+
+    /// Whether a node is known to be stored in the external cache.
+    pub fn inspect_is_external_cache_stored(
+        &self,
+        node_id: NodeId,
+    ) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).external_cache_stored)
     }
 
     /// Whether a node is in a component's device LRU.

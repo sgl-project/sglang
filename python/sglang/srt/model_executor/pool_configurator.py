@@ -55,10 +55,12 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -429,12 +431,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
-            QSA_VARIANT_COMPRESSED,
             parse_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
-            QwenDSATokenToKVPool,
         )
 
         if num_layers == 0:
@@ -442,16 +442,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        if qsa_profile.variant == QSA_VARIANT_COMPRESSED:
-            return QSATokenToKVPool.qsa_bytes_per_token(
-                kv_heads=qsa_profile.kv_heads,
-                head_dim=qsa_profile.head_dim,
-                compress_ratio=qsa_profile.compress_ratio,
-                num_layers=num_layers,
-            )
-        return QwenDSATokenToKVPool.qsa_bytes_per_token(
+        return QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=qsa_profile.kv_heads,
             head_dim=qsa_profile.head_dim,
+            compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
         )
 
@@ -469,6 +463,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            dtype = kvc.kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

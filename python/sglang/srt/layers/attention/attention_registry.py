@@ -181,12 +181,15 @@ def create_dsv4_backend(runner):
         )
         return DeepseekV4HipRadixBackend(runner)
     else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
-        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
-        return DeepseekV4AttnBackend(runner)
+        backend = create_deepseek_v4_attn_backend(runner)
+        logger.info(
+            f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
+        )
+        return backend
 
 
 @register_attention_backend("triton")
@@ -256,13 +259,6 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
-@register_attention_backend("cutlass_mla")
-def create_cutlass_mla_backend(runner):
-    from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
-
-    return CutlassMLABackend(runner)
-
-
 @register_attention_backend("trtllm_mha")
 def create_trtllm_mha_backend(runner):
     if runner.use_mla_backend:
@@ -294,15 +290,6 @@ def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
     return IntelAMXAttnBackend(runner)
-
-
-@register_attention_backend("dual_chunk_flash_attn")
-def create_dual_chunk_flash_attn_backend(runner):
-    from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
-        DualChunkFlashAttentionBackend,
-    )
-
-    return DualChunkFlashAttentionBackend(runner)
 
 
 def attn_backend_wrapper_for_draft_extend(

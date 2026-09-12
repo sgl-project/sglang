@@ -26,10 +26,15 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
 def _event_hashes(events):
@@ -168,6 +173,8 @@ class TestMamba(unittest.TestCase):
         conv_dim = 5
 
         pool = object.__new__(WindowFirstMambaPool)
+        # Bypasses __init__, so set the device the allocator reads directly.
+        pool.device = get_device()
         physical, view = pool._allocate_deduplicated_conv_window(
             conv_shape=(window_size, conv_dim),
             num_mamba_layers=num_mamba_layers,

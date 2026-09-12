@@ -114,6 +114,8 @@ logger = logging.getLogger(__name__)
 
 
 class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
+    last_draft_extend_staged: bool = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -289,8 +291,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def _compute_boundary_kv_locs_positions(self, batch):
         if self.draft_extend_num_front_tokens == 0 or batch.forward_mode.is_idle():
-            return None, None, None
-        locs, positions = compute_widened_draft_extend_locs_positions(
+            return None, None
+        return compute_widened_draft_extend_locs_positions(
             batch.seq_lens,
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -299,11 +301,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_extend_num_front_tokens,
             self.draft_extend_num_warmup_tokens,
         )
-        ready_event = None
-        if self.plan_stream:
-            ready_event = torch.get_device_module(self.device).Event()
-            ready_event.record()
-        return locs, positions, ready_event
 
     def _seed_boundary_kv_stash(self, forward_batch, target_hidden_states):
         if (
@@ -411,15 +408,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         if not _is_npu:
-            # The single-CG runner replays with no Python between steps, so the
-            # attn backend must fully rebuild its per-step metadata as captured
-            # tensor ops; anything less gets capture-time-stale metadata (e.g.
-            # SWA translations, which only the eager replay path refreshes).
-            # Per-depth pools (banded MTP) mean per-depth backends — EVERY step
-            # must satisfy this, not just step 0.
+            # Every step must refresh metadata in-graph or stage it before replay.
             draft_backend = self.draft_runner_list[0].attn_backend
             backend_supports_single_cg = all(
                 runner.attn_backend.draft_extend_metadata_captured_in_graph()
+                or runner.attn_backend.supports_draft_extend_metadata_staging
                 for runner in self.draft_runner_list
             )
             if envs.SGLANG_ENABLE_SINGLE_CG_DRAFT.get() and backend_supports_single_cg:
@@ -429,8 +422,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             else:
                 if envs.SGLANG_ENABLE_SINGLE_CG_DRAFT.get():
                     logger.warning(
-                        "SGLANG_ENABLE_SINGLE_CG_DRAFT is on but %s does not fully "
-                        "rebuild its draft-extend metadata in-graph; falling back "
+                        "SGLANG_ENABLE_SINGLE_CG_DRAFT is on but %s cannot refresh "
+                        "its draft-extend metadata for a combined graph; falling back "
                         "to per-step draft graphs.",
                         type(draft_backend).__name__,
                     )
@@ -724,8 +717,57 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         return next_draft_input
 
+    def _draft_extend_plan_for_decode(self, batch: ScheduleBatch) -> bool:
+        runner = self.cuda_graph_runner_for_draft_extend
+        if runner is None:
+            return False
+        assert self.draft_extend_attn_backend_list, (
+            "Draft graphs require initialized attention backends"
+        )
+        target_graph = self.target_worker.model_runner.decode_cuda_graph_runner
+        # In-graph mapping reads still require the final draft fence.
+        if (
+            batch.forward_mode.is_idle()
+            or getattr(target_graph, "in_graph_metadata_prep_done", None) is None
+            or not all(
+                b.supports_draft_extend_metadata_staging
+                and not b.draft_extend_metadata_captured_in_graph()
+                for b in self.draft_extend_attn_backend_list
+            )
+            or runner.require_mlp_tp_gather
+            or len(batch.seq_lens) > runner.max_bs
+            or (runner.disable_padding and len(batch.seq_lens) not in runner.capture_bs)
+        ):
+            return False
+        assert self.topk == 1, "Draft-extend metadata staging requires topk=1"
+        locs, positions = self._compute_boundary_kv_locs_positions(batch)
+        if locs is None:
+            from sglang.kernels.ops.speculative.cache_locs import (
+                assign_extend_cache_locs_uniform_func,
+            )
+
+            locs = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=len(batch.seq_lens),
+                draft_token_num=self.speculative_num_draft_tokens,
+                device=batch.device,
+            )
+        runner.stage_shared_reads(
+            seq_lens=batch.seq_lens + self.speculative_num_draft_tokens,
+            req_pool_indices=batch.req_pool_indices,
+            out_cache_loc=locs,
+            positions=positions,
+        )
+        return True
+
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        *,
+        staged: bool = False,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -742,9 +784,19 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
-        boundary_kv_locs, boundary_kv_positions, boundary_kv_ready_event = (
-            self._compute_boundary_kv_locs_positions(batch)
-        )
+        if staged and self.draft_extend_num_front_tokens:
+            runner = self.cuda_graph_runner_for_draft_extend
+            num_tokens = len(batch.seq_lens) * runner.captured_req_width
+            boundary_kv_locs = runner.buffers.out_cache_loc[:num_tokens]
+            boundary_kv_positions = runner.buffers.positions[:num_tokens]
+        else:
+            boundary_kv_locs, boundary_kv_positions = (
+                self._compute_boundary_kv_locs_positions(batch)
+            )
+        boundary_kv_ready_event = None
+        if boundary_kv_locs is not None and self.plan_stream:
+            boundary_kv_ready_event = torch.get_device_module(self.device).Event()
+            boundary_kv_ready_event.record()
 
         with self.plan_stream_ctx:
             if boundary_kv_ready_event is not None:
@@ -798,7 +850,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 cgr = self.cuda_graph_runner_for_draft_extend
                 # Populate the single shared buffer set once; each step replays
                 # against it and the chain is advanced in place between steps.
-                cgr.prepare(forward_batch)
+                cgr.prepare(forward_batch, staged=staged)
                 rotates_in_graph = cgr.rotates_in_graph
                 for step in range(self.speculative_num_steps):
                     _out, ret_topk_p, ret_topk_index = cgr.replay(step)
@@ -936,6 +988,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             ret_draft_probs = torch.stack(ret_draft_probs_list, dim=1)
         next_draft_input.draft_probs = ret_draft_probs
 
+        self.last_draft_extend_staged = bool(
+            staged and can_run_decode_cuda_graph and batch_result.can_run_cuda_graph
+        )
+
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def __init__(
@@ -979,7 +1035,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        return self._draft_worker.draft_runner_list[-1]
+        if self.draft_worker.last_draft_extend_staged:
+            return self.target_worker.model_runner
+        # Multi-layer eagle has no draft forward, only draft extend.
+        return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -997,6 +1056,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        self.draft_worker.last_draft_extend_staged = False
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1043,11 +1103,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            staged = self.draft_worker._draft_extend_plan_for_decode(batch)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            self.draft_worker._draft_extend_for_decode(
+                batch, batch_output, staged=staged
+            )
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
