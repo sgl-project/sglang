@@ -25,6 +25,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
