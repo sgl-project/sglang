@@ -3,9 +3,11 @@
 
 pub mod cache;
 pub mod chat;
+pub mod generate;
 pub mod health;
 pub mod metrics;
 pub mod models;
 #[cfg(feature = "profiling")]
 pub mod pprof;
+pub mod surface;
 pub mod tokenize;

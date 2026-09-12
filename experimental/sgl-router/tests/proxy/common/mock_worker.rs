@@ -24,6 +24,9 @@ pub struct CapturedHeaders {
     pub seen: HashSet<String>,            // names (kept for backwards compat)
     pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
+    /// The path of the most recent inbound request (`/v1/chat/completions`
+    /// vs `/generate`).
+    pub last_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,6 +84,7 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/generate", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .route("/v1/loads", get(serve_tiny_loads))
@@ -450,10 +454,16 @@ async fn serve_tiny_loads() -> Json<Value> {
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
-async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn chat(
+    State(s): State<MockWorkerState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();
         g.last_body = Some(body.clone());
+        g.last_path = Some(uri.path().to_string());
         for (k, v) in headers.iter() {
             g.seen.insert(k.as_str().to_string());
             if let Ok(val) = v.to_str() {

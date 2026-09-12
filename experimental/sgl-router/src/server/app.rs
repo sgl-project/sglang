@@ -6,7 +6,7 @@ use crate::server::header_utils::SERVER_TIMING;
 use crate::server::metrics::{
     outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome, WorkerModeLabel,
 };
-use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use crate::server::routes::chat::MAX_REQUEST_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -378,7 +378,13 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/generate",
+            post(crate::server::routes::generate::generate)
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
@@ -571,6 +577,39 @@ mod tests {
         assert!(
             !m.contains(r#"sgl_router_responses_total{route="/v1/chat/completions""#),
             "a never-answered request must NOT appear in responses_total; got:\n{m}",
+        );
+    }
+
+    /// `/generate` must book as its own route label, not `unmatched`:
+    /// `MatchedPath` resolves for a registered route, and the intake counter
+    /// proves it.
+    #[tokio::test]
+    async fn generate_route_books_under_its_own_route_label() {
+        ensure_global_tracing_default();
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route("/generate", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let m = metrics.render();
+        assert!(
+            m.contains(r#"sgl_router_requests_total{route="/generate",method="POST"} 1"#),
+            "the /generate route must resolve MatchedPath; got:\n{m}",
+        );
+        assert!(
+            !m.contains(r#"route="unmatched""#),
+            "a registered route must never book as unmatched; got:\n{m}",
         );
     }
 

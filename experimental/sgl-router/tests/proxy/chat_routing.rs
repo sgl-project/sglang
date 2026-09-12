@@ -10,7 +10,7 @@ use sgl_router::policies::factory::build_registry_with_defaults as build_policy_
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use sgl_router::server::routes::chat::MAX_REQUEST_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
@@ -1032,8 +1032,8 @@ async fn oversized_request_body_returns_413() {
     let app = build_router(ctx.clone());
 
     // One byte over the configured cap, so the test tracks the cap
-    // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
-    let big = vec![b'x'; MAX_CHAT_BODY_BYTES + 1];
+    // (`MAX_REQUEST_BODY_BYTES`) instead of a hardcoded size.
+    let big = vec![b'x'; MAX_REQUEST_BODY_BYTES + 1];
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

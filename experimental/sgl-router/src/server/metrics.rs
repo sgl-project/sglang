@@ -99,7 +99,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
-/// 32–64 tokens each, and the `MAX_CHAT_BODY_BYTES` cap bounds context length —
+/// 32–64 tokens each, and the `MAX_REQUEST_BODY_BYTES` cap bounds context length —
 /// putting the practical ceiling for a maximum-length context in the low tens
 /// of thousands of blocks. The ladder spans 0 → ~8k blocks at the resolution
 /// worth charting; the `+Inf` bucket catches the longer-context tail beyond
