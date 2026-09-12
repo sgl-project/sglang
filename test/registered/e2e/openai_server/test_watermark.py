@@ -238,6 +238,77 @@ class TestWatermarkDefaultEnabledEndpoint(WatermarkServerTest):
         )
         assert disabled.status_code == 200, disabled.text
 
+    def test_structured_output_stays_valid_and_detectable(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "minItems": 8,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "minLength": 4,
+                                "maxLength": 24,
+                            },
+                            "habitat": {
+                                "type": "string",
+                                "minLength": 4,
+                                "maxLength": 32,
+                            },
+                            "observation": {
+                                "type": "string",
+                                "minLength": 8,
+                                "maxLength": 48,
+                            },
+                            "evergreen": {"type": "boolean"},
+                        },
+                        "required": [
+                            "name",
+                            "habitat",
+                            "observation",
+                            "evergreen",
+                        ],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["entries"],
+            "additionalProperties": False,
+        }
+        payload = _chat_payload(max_tokens=768)
+        payload["messages"][0]["content"] = (
+            "Return a field guide to eight distinct trees as the requested JSON."
+        )
+        payload["ignore_eos"] = False
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "tree_guide",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+            json=payload,
+            timeout=180,
+        )
+
+        assert response.status_code == 200, response.text
+        choice = response.json()["choices"][0]
+        assert len(json.loads(choice["message"]["content"])["entries"]) == 8
+        count, z_score = _watermark_z_score(
+            choice["prompt_token_ids"],
+            choice["response_token_ids"],
+            int(_KEY_A, 16),
+        )
+        assert count >= 100
+        assert z_score >= 3.0
+
 
 class TestWatermarkEnforceAllEndpoint(WatermarkServerTest):
     mode_args = ["--watermark-enforce-all"]

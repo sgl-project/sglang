@@ -121,10 +121,13 @@ recording request bodies in proxies or application logs.
 
 ## How generation works
 
-At each non-greedy sampling step, SGLang first applies the ordinary temperature,
-top-k, top-p, and min-p truncation rules. Let `p_i` be the resulting probability
-of candidate token `i`. SGLang hashes the secret key, the preceding token
-context, and `i` to obtain a deterministic uniform value `u_i`, then selects:
+At each non-greedy sampling step, SGLang first applies frequency, presence, and
+repetition penalties, logit bias, any structured-output grammar mask, and the
+ordinary temperature, top-k, top-p, and min-p truncation rules. Grammar-masked
+tokens have zero probability and cannot be selected by the watermark. Let `p_i`
+be the resulting probability of candidate token `i`. SGLang hashes the secret
+key, the preceding token context, and `i` to obtain a deterministic uniform
+value `u_i`, then selects:
 
 ```text
 argmax_i log(u_i) / p_i
@@ -208,26 +211,40 @@ their own traffic.
 
 ## Compatibility
 
-| Mode | Status |
-| --- | --- |
-| CUDA graphs | Supported |
-| Overlap scheduling | Supported |
-| Tensor parallelism | Verified with TP2 and TP4; NEXTN verified with TP2 |
-| NGRAM speculative decoding | Supported |
-| EAGLE and EAGLE3 speculative decoding | Supported |
-| NEXTN speculative decoding | Supported through the EAGLE verification path |
-| Other speculative algorithms | Not supported |
-| Speculative rejection sampling | Not supported |
-| Custom logit processors | Not supported together with watermarking |
-| Beam search | Not supported for watermarked requests |
-| Diffusion LLM | Not supported |
-| PD disaggregation | Not supported |
-| Embedded Rust API server | Not supported |
-| Non-CUDA devices | Not supported |
+| Feature | Status | Behavior and validation |
+| --- | --- | --- |
+| CUDA graphs | Verified | Decode graphs, eager fallback, and fused state updates use the same selector contract. |
+| Overlap scheduling | Verified | Prompt initialization is carried with the delayed sampling batch. |
+| Tensor parallelism | Verified | TP2 and TP4 ordinary decode, plus NEXTN with TP2, produce detectable output without rank divergence. |
+| Mixed enabled and disabled requests | Verified | Keys, context windows, histories, and enablement are resolved per request. |
+| JSON schema and regex grammars | Verified | Grammar masking runs before watermark selection; strict outputs remain valid and detectable. |
+| Streaming chat completions | Verified | Streaming and non-streaming requests use the same watermark state and token selection. |
+| Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
+| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at eligible positions; repeated-context and greedy bypass positions retain ordinary log probabilities. Speculative decode reports the unmodified target-model distribution. |
+| Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
+| Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
+| Chunked prefill | Verified | Each prefill chunk rebuilds the prompt tail from the request's complete logical fill IDs. |
+| Radix-cache prompt reuse | Verified | Prompt-tail initialization uses logical request IDs rather than only newly computed tokens. |
+| Decode retraction | Verified | Re-prefill restores the unique-context history before generation resumes. |
+| Request abort and request-slot reuse | Verified | A later prefill resets ring-buffer and context-history state for the reused slot. |
+| Multimodal text generation | Verified | Qwen3-VL text tokens use the same watermark path after multimodal prefill. |
+| DP attention | Untested | The per-rank state path has not received a service-level DP-attention gate. |
+| NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
+| EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
+| NEXTN speculative decoding | Verified | NEXTN uses the EAGLE verification path. |
+| Other speculative algorithms | Rejected | Startup validation fails closed. |
+| Speculative rejection sampling | Rejected | Startup validation fails closed. |
+| Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
+| Beam search | Rejected | Request validation rejects watermarked beam-search requests. |
+| Diffusion LLM | Rejected | Startup validation fails closed. |
+| PD disaggregation | Rejected | Startup validation fails closed because watermark state is not transferred between workers. |
+| Embedded Rust API server | Rejected | Startup validation fails closed. |
+| Non-CUDA devices | Rejected | Startup validation fails closed. |
 
-Speculative verification forces a clone of the target logits so log-probability
-reporting continues to observe the unmodified tensor. Tree-based EAGLE modes
-reconstruct a separate context for each draft node before selection.
+Speculative verification forces a clone of the target logits so downstream
+target-model log-probability computation continues to observe the unmodified
+tensor. Tree-based EAGLE modes reconstruct a separate context for each draft
+node before selection.
 
 ## Limitations and performance
 
