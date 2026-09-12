@@ -172,96 +172,110 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
     def test_verify_commit_verify(self):
         # B=1 exercises the enabled path. Platform override makes the dispatch
         # testable on any CUDA CI runner; it does not replace a GPU kernel.
-        for heads, v_heads, lower_bound in ((2, 2, None), (2, 4, -5.0)):
-            for num_accept_tokens in (1, 2, 4):
-                with (
-                    self.subTest(
-                        heads=heads,
-                        v_heads=v_heads,
-                        lower_bound=lower_bound,
-                        num_accept_tokens=num_accept_tokens,
-                    ),
-                    override_platform(is_sm90=True),
-                ):
-                    layers, initial, slots, batch, rounds = self._make_case(
-                        heads=heads, v_heads=v_heads, lower_bound=lower_bound
-                    )
-                    fused, fused_hybrid, fused_state = self._make_backend(
-                        initial, slots, 4, fused=True
-                    )
-                    reference, ref_hybrid, ref_state = self._make_backend(
-                        initial, slots, 4, fused=False
-                    )
-                    snapshots, _, snapshot_state = self._make_backend(
-                        initial, slots, 4, fused=False, ring=False
-                    )
-                    out_fused = self._verify(fused, layers, batch, rounds[0])
-                    out_ref = self._verify(reference, layers, batch, rounds[0])
-                    self._verify(snapshots, layers, batch, rounds[0])
-                    for actual, expected in zip(out_fused, out_ref):
-                        torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
-                    for state in (fused_state, ref_state):
-                        torch.testing.assert_close(
-                            state.temporal, initial.temporal, rtol=0, atol=0
-                        )
-
-                    last_steps = torch.full_like(slots, num_accept_tokens - 1)
-                    for hybrid in (fused_hybrid, ref_hybrid):
-                        hybrid.update_mamba_state_after_mtp_verify(
-                            last_correct_step_indices=last_steps,
-                            mamba_track_indices=None,
-                            mamba_steps_to_track=None,
-                            model=None,
-                        )
-                    torch.testing.assert_close(
-                        fused_state.temporal, ref_state.temporal, rtol=0, atol=0
-                    )
-                    torch.testing.assert_close(
-                        fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
-                    )
-                    # Independent snapshot oracle: equality between two ring
-                    # arms alone would miss a shared no-op / wrong-step commit.
-                    expected_ssm = initial.temporal.clone()
-                    expected_ssm[:, slots.long()] = snapshot_state.intermediate_ssm[
-                        :, :, num_accept_tokens - 1
-                    ]
-                    torch.testing.assert_close(
-                        fused_state.temporal, expected_ssm, **_SNAPSHOT_ORACLE_TOL
-                    )
-                    expected_conv = initial.conv[0].clone()
-                    for i, (mixed, _, _) in enumerate(rounds[0]):
-                        history = torch.cat(
-                            (
-                                initial.conv[0][i, slots.long()],
-                                mixed.view(1, 4, -1)[:, :num_accept_tokens],
-                            ),
-                            dim=1,
-                        )
-                        expected_conv[i, slots.long()] = history[:, -3:]
-                    torch.testing.assert_close(
-                        fused_state.conv[0], expected_conv, rtol=0, atol=0
-                    )
-
-                    out_fused = self._verify(fused, layers, batch, rounds[1])
-                    out_ref = self._verify(reference, layers, batch, rounds[1])
-                    for actual, expected in zip(out_fused, out_ref):
-                        torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
-                    self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
-
-    def test_ring_dispatch_falls_back(self):
-        # Include B=2 (unswept) and the known H20 regression sizes. No ring
-        # performance evidence exists for Blackwell yet, even for B=1.
-        for is_sm90, batch_size in (
-            (True, 2),
-            (True, 4),
-            (True, 16),
-            (True, 64),
-            (False, 1),
-            (False, 4),
+        for platform, (heads, v_heads, lower_bound), num_accept_tokens in (
+            ({"is_sm90": True}, (2, 2, None), 1),
+            ({"is_sm90": True}, (2, 2, None), 2),
+            ({"is_sm90": True}, (2, 2, None), 4),
+            ({"is_sm90": True}, (2, 4, -5.0), 1),
+            ({"is_sm90": True}, (2, 4, -5.0), 2),
+            ({"is_sm90": True}, (2, 4, -5.0), 4),
+            ({"is_sm90": False, "is_sm100": True}, (2, 4, -5.0), 2),
         ):
             with (
-                self.subTest(is_sm90=is_sm90, batch_size=batch_size),
-                override_platform(is_sm90=is_sm90),
+                self.subTest(
+                    platform=platform,
+                    heads=heads,
+                    v_heads=v_heads,
+                    lower_bound=lower_bound,
+                    num_accept_tokens=num_accept_tokens,
+                ),
+                override_platform(**platform),
+            ):
+                layers, initial, slots, batch, rounds = self._make_case(
+                    heads=heads, v_heads=v_heads, lower_bound=lower_bound
+                )
+                fused, fused_hybrid, fused_state = self._make_backend(
+                    initial, slots, 4, fused=True
+                )
+                reference, ref_hybrid, ref_state = self._make_backend(
+                    initial, slots, 4, fused=False
+                )
+                snapshots, _, snapshot_state = self._make_backend(
+                    initial, slots, 4, fused=False, ring=False
+                )
+                out_fused = self._verify(fused, layers, batch, rounds[0])
+                out_ref = self._verify(reference, layers, batch, rounds[0])
+                self._verify(snapshots, layers, batch, rounds[0])
+                for actual, expected in zip(out_fused, out_ref):
+                    torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+                for state in (fused_state, ref_state):
+                    torch.testing.assert_close(
+                        state.temporal, initial.temporal, rtol=0, atol=0
+                    )
+
+                last_steps = torch.full_like(slots, num_accept_tokens - 1)
+                for hybrid in (fused_hybrid, ref_hybrid):
+                    hybrid.update_mamba_state_after_mtp_verify(
+                        last_correct_step_indices=last_steps,
+                        mamba_track_indices=None,
+                        mamba_steps_to_track=None,
+                        model=None,
+                    )
+                torch.testing.assert_close(
+                    fused_state.temporal, ref_state.temporal, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
+                )
+                # Independent snapshot oracle: equality between two ring
+                # arms alone would miss a shared no-op / wrong-step commit.
+                expected_ssm = initial.temporal.clone()
+                expected_ssm[:, slots.long()] = snapshot_state.intermediate_ssm[
+                    :, :, num_accept_tokens - 1
+                ]
+                torch.testing.assert_close(
+                    fused_state.temporal, expected_ssm, **_SNAPSHOT_ORACLE_TOL
+                )
+                expected_conv = initial.conv[0].clone()
+                for i, (mixed, _, _) in enumerate(rounds[0]):
+                    history = torch.cat(
+                        (
+                            initial.conv[0][i, slots.long()],
+                            mixed.view(1, 4, -1)[:, :num_accept_tokens],
+                        ),
+                        dim=1,
+                    )
+                    expected_conv[i, slots.long()] = history[:, -3:]
+                torch.testing.assert_close(
+                    fused_state.conv[0], expected_conv, rtol=0, atol=0
+                )
+
+                out_fused = self._verify(fused, layers, batch, rounds[1])
+                out_ref = self._verify(reference, layers, batch, rounds[1])
+                for actual, expected in zip(out_fused, out_ref):
+                    torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+                self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
+
+    def test_ring_dispatch_falls_back(self):
+        # B=2 and the measured regression sizes on the enabled architectures,
+        # plus B=1 on an architecture without ring measurements.
+        sm90 = {"is_sm90": True, "is_sm100": False}
+        sm100 = {"is_sm90": False, "is_sm100": True}
+        other = {"is_sm90": False, "is_sm100": False}
+        for platform, batch_size in (
+            (sm90, 2),
+            (sm90, 4),
+            (sm90, 16),
+            (sm90, 64),
+            (sm100, 2),
+            (sm100, 4),
+            (sm100, 16),
+            (other, 1),
+            (other, 4),
+        ):
+            with (
+                self.subTest(platform=platform, batch_size=batch_size),
+                override_platform(**platform),
             ):
                 layers, initial, slots, batch, rounds = self._make_case(batch_size)
                 backend, _, state = self._make_backend(initial, slots, 4, fused=True)
@@ -284,8 +298,12 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     )
 
     def test_snapshot_dispatch_is_unchanged(self):
-        for is_sm90 in (True, False):
-            with self.subTest(is_sm90=is_sm90), override_platform(is_sm90=is_sm90):
+        for platform in (
+            {"is_sm90": True, "is_sm100": False},
+            {"is_sm90": False, "is_sm100": True},
+            {"is_sm90": False, "is_sm100": False},
+        ):
+            with self.subTest(platform=platform), override_platform(**platform):
                 layers, initial, slots, batch, rounds = self._make_case(batch_size=4)
                 backend, _, _ = self._make_backend(
                     initial, slots, 4, fused=True, ring=False
