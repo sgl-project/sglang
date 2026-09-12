@@ -14,6 +14,8 @@ from sglang.multimodal_gen.runtime.realtime.video import (
     RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
     build_delta_gzip_raw_rgb_payload,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.server import test_server_common
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_event_payload,
     build_realtime_init_payload,
@@ -41,6 +43,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
+    ScenarioConfig,
 )
 
 # Request construction
@@ -385,6 +388,54 @@ def test_realtime_requires_e2e_without_threshold_checks(e2e_ms):
         PerformanceValidationError, match="E2E duration missing or invalid"
     ):
         runner._validate_realtime_performance(None, case, [])
+
+
+@pytest.mark.parametrize("peak_mb", [1000, 2000])
+def test_realtime_memory_guard_retains_session_e2e(monkeypatch, peak_mb):
+    case = DiffusionTestCase(
+        "stream-memory-e2e",
+        DiffusionServerArgs(model_path="test", modality="video"),
+        DiffusionSamplingParams(prompt="test"),
+        run_perf_check=True,
+    )
+    scenario = ScenarioConfig(
+        {}, {}, 0, 0, 0, load_peak_vram_mb=1000, runtime_peak_vram_mb=1000
+    )
+    monkeypatch.setitem(test_server_common.BASELINE_CONFIG.scenarios, case.id, scenario)
+    monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: False)
+    monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    record = RequestPerfRecord(
+        request_id="last-chunk",
+        commit_hash="test",
+        tag="test",
+        stages=[],
+        steps=[],
+        total_duration_ms=20,
+        memory_snapshots={
+            "load_peak": {"peak_reserved_mb": 1000},
+            "runtime_peak": {"peak_reserved_mb": peak_mb},
+        },
+    )
+    monkeypatch.setattr(
+        test_server_common, "wait_for_req_perf_record", lambda *a, **k: record
+    )
+    stats = [
+        parse_realtime_chunk_stats(
+            msgspec.msgpack.decode(_packed_realtime_chunk_stats(0))
+        )
+    ]
+    record_realtime_perf_stats(case.id, stats, 2000)
+    runner = DiffusionServerBase()
+    runner._perf_results = []
+    ctx = SimpleNamespace(perf_log_path="unused")
+    if peak_mb > 1000:
+        with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
+            runner._validate_realtime_performance(ctx, case, stats)
+    else:
+        runner._validate_realtime_performance(ctx, case, stats)
+    assert runner._perf_results[0]["e2e_ms"] == 2000
+    assert runner._perf_results[0]["runtime_peak_vram_mb"] == peak_mb
 
 
 def test_collect_realtime_output_accepts_combined_frame_batch(monkeypatch):
