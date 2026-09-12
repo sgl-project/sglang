@@ -229,6 +229,14 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Backup outcome, filled in by the backup worker so the ack consumer
+        # can tell a partial or failed write from a complete one.
+        self.failed: bool = False
+        # "backend_false" | "exception" | "sidecar_backend_false"
+        self.failure_kind: Optional[str] = None
+        self.unwritten_pages: int = 0
+        # pool name -> number of pages the sidecar backend did not write
+        self.sidecar_unwritten_by_pool: dict = {}
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -1292,8 +1300,13 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
+                operation.failed = True
+                operation.failure_kind = "backend_false"
+                remaining = len(operation.hash_value) - i
+                operation.unwritten_pages = remaining
                 logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                    f"Write page to storage: {len(batch_hashes)} pages failed, "
+                    f"{remaining} pages unwritten."
                 )
                 break
 
@@ -1312,7 +1325,23 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    try:
+                        self._page_backup(operation)
+                    except Exception:
+                        # A backend error must not kill the worker: every
+                        # operation is still acked so the tree cache releases
+                        # its host memory and the queue keeps draining.
+                        operation.failed = True
+                        operation.failure_kind = "exception"
+                        operation.unwritten_pages = max(
+                            0,
+                            len(operation.hash_value)
+                            - operation.completed_tokens // self.page_size,
+                        )
+                        logger.exception(
+                            "Backup operation %s raised an exception.",
+                            operation.id,
+                        )
                 self.ack_backup_queue.put(operation)
 
             except Empty:
