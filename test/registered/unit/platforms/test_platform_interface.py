@@ -209,6 +209,24 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_mamba_cache_extra_buffer_capability(self):
+        self.assertTrue(CudaSRTPlatform().support_mamba_cache_extra_buffer())
+        self.assertTrue(RocmSRTPlatform().support_mamba_cache_extra_buffer())
+        self.assertTrue(XpuSRTPlatform().support_mamba_cache_extra_buffer())
+        for platform_type in (PlatformEnum.MUSA, PlatformEnum.NPU):
+            with self.subTest(platform=platform_type.name):
+                platform = SRTPlatform()
+                platform._enum = platform_type
+                self.assertTrue(platform.support_mamba_cache_extra_buffer())
+        self.assertFalse(CpuSRTPlatform().support_mamba_cache_extra_buffer())
+        self.assertFalse(SRTPlatform().support_mamba_cache_extra_buffer())
+
+        class OutOfTreePlatform(SRTPlatform):
+            def support_mamba_cache_extra_buffer(self) -> bool:
+                return True
+
+        self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
