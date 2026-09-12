@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability.fpm_timing import wrap_forward_with_fpm
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -335,19 +336,13 @@ class SchedulerMetricsReporter:
                 worker_id=self.scheduler._fpm_worker_id,
                 dp_rank=self.scheduler._fpm_dp_rank,
             )
-            self.scheduler._fpm_gpu_time_acc = 0.0
-
-            def _fpm_device_timer_reporter(t, **_kwargs):
-                self.scheduler._fpm_gpu_time_acc += t
-
-            if self.forward_pass_device_timer is not None:
-                self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
-            else:
-                self.forward_pass_device_timer = DeviceTimer(
-                    reporter=_fpm_device_timer_reporter,
-                )
+            if self.forward_pass_device_timer is None:
+                self.forward_pass_device_timer = DeviceTimer()
             self.scheduler._fpm_uses_device_timer = True
             self.scheduler.enable_fpm = True
+            self.scheduler.run_batch = wrap_forward_with_fpm(
+                self.scheduler.run_batch, self.forward_pass_device_timer
+            )
             logger.info(
                 "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
                 endpoint,
@@ -355,7 +350,39 @@ class SchedulerMetricsReporter:
                 self.scheduler._fpm_uses_device_timer,
             )
 
-    def _build_scheduled_request_metrics(self, batch: ScheduleBatch):
+    def snapshot_spec_decode_metrics(self, batch, result):
+        if not self.scheduler.enable_fpm:
+            return
+
+        from sglang.srt.observability.forward_pass_metrics import (
+            ScheduledRequestMetrics,
+            WelfordAccumulator,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if batch.spec_algorithm not in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            return
+
+        # Before settling this result, token history includes one pending token
+        # outside KV. Unlike kv_committed_len, it survives in-flight retraction.
+        decode_kv = WelfordAccumulator()
+        for req in batch.reqs:
+            decode_kv.add(req.seqlen - 1)
+        result.fpm_scheduled_requests = ScheduledRequestMetrics(
+            num_decode_requests=decode_kv.count,
+            sum_decode_kv_tokens=decode_kv.total,
+            var_decode_kv_tokens=decode_kv.variance(),
+        )
+
+    def _build_scheduled_request_metrics(self, batch: ScheduleBatch, result=None):
+        snapshot = getattr(result, "fpm_scheduled_requests", None)
+        if snapshot is not None:
+            return snapshot
+
         from sglang.srt.observability.forward_pass_metrics import (
             ScheduledRequestMetrics,
             WelfordAccumulator,
@@ -1116,8 +1143,10 @@ class SchedulerMetricsReporter:
     ):
         """Emit per-iteration ForwardPassMetrics over ZMQ PUB.
 
-        Prefers GPU-accurate timing from DeviceTimer (which wraps
-        model_runner.forward / cuda_graph.replay via PR #24197).
+        GPU time spans this result's first/last existing instrumented events on
+        one stream, including gaps between segments but not leading/trailing work.
+        This is not complete iteration latency or just target-verify time.
+        Snapshot scheduling stats now; publish later if those events are pending.
         Falls back to monotonic clock when DeviceTimer is not enabled.
         """
         if not self.scheduler.enable_fpm:
@@ -1126,11 +1155,12 @@ class SchedulerMetricsReporter:
         from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 
         if self.scheduler._fpm_uses_device_timer:
-            self.forward_pass_device_timer._report()
-            wall_time = self.scheduler._fpm_gpu_time_acc
-            self.scheduler._fpm_gpu_time_acc = 0.0
-            if wall_time == 0.0:
+            timing = result.fpm_timing
+            if timing is None or timing.num_intervals == 0:
+                # No recorded forward, e.g. a prebuilt without an inner idle batch.
                 return
+            self.forward_pass_device_timer._report()
+            wall_time = 0.0
         else:
             wall_time = max(0.0, time.monotonic() - batch.fpm_start_time)
 
@@ -1138,14 +1168,19 @@ class SchedulerMetricsReporter:
             worker_id=self.scheduler._fpm_worker_id,
             dp_rank=self.scheduler._fpm_dp_rank,
             wall_time=wall_time,
-            scheduled_requests=self._build_scheduled_request_metrics(batch),
+            scheduled_requests=self._build_scheduled_request_metrics(batch, result),
             queued_requests=self._build_queued_request_metrics(),
         )
-        self.scheduler._fpm_publisher.publish(fpm)
+        publisher = self.scheduler._fpm_publisher
+        if self.scheduler._fpm_uses_device_timer:
+            timing.publish_when_ready(fpm, publisher)
+        else:
+            publisher.publish(fpm)
 
     def _shutdown_fpm(self):
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
+            self.forward_pass_device_timer._report()
             self.scheduler._fpm_publisher.shutdown()
 
     def _log_hicache_stats(self):
@@ -1223,9 +1258,10 @@ class SchedulerMetricsReporter:
                 )
 
     def update_device_timer(self):
+        if self.forward_pass_device_timer is not None:
+            self.forward_pass_device_timer._report()
         if not ENABLE_METRICS_DEVICE_TIMER:
             return
-        self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
             # Window start: keep the last published value instead of NaN-ing
@@ -1303,6 +1339,8 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
+        if self.scheduler.enable_fpm:
+            self.forward_pass_device_timer._report()
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
         is_fwd_occupancy_stale = ENABLE_METRICS_DEVICE_TIMER and not math.isnan(
             self.stats.fwd_occupancy
