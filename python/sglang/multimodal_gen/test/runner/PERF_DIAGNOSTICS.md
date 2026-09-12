@@ -53,8 +53,10 @@ does not attach a debugger, and does not change device settings.
 
 Every generated testcase must report finite, positive E2E, including cases with
 `run_perf_check=False`. Missing request records, absent performance logs and
-missing/invalid E2E fail CI. Disabling performance checks disables threshold
-comparisons, not metric reporting. Explicit GT generation skips validation.
+missing/invalid E2E fail CI. `run_perf_check=False` disables stage/step and
+memory checks, not the request's E2E threshold guard. Baseline generation still
+requires valid E2E but skips baseline comparisons. Explicit GT generation skips
+validation.
 
 A performance failure stops the testcase's remaining repeated requests and
 subsequent checks. It also prevents pytest retries, even if another testcase
