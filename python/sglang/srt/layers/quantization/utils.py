@@ -608,7 +608,10 @@ def swizzle_blockscale(scale: torch.Tensor):
     round_up_multiple = lambda x, m: (x + m - 1) // m * m
     M_padded = round_up_multiple(M, 128)
     K_padded = round_up_multiple(K, 4)
-    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    # Online weight updates do not necessarily run under a CUDA device context.
+    padded_scale = torch.zeros(
+        (B, M_padded, K_padded), dtype=scale.dtype, device=scale.device
+    )
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
     assert rows % 128 == 0
