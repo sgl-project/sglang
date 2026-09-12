@@ -378,11 +378,14 @@ class DiffusionServerBase:
 
         log_path = ctx.perf_log_path
         log_wait_timeout = 30
-        req_perf_record = wait_for_req_perf_record(
-            rid,
-            log_path,
-            timeout=log_wait_timeout,
-        )
+        try:
+            req_perf_record = wait_for_req_perf_record(
+                rid,
+                log_path,
+                timeout=log_wait_timeout,
+            )
+        except AssertionError as exc:
+            raise PerformanceValidationError(f"[performance] {case_id}: {exc}") from exc
 
         return (req_perf_record, content)
 

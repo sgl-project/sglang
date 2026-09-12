@@ -30,7 +30,8 @@ def test_infrastructure_failure_policy_is_unchanged(output):
 
 
 @pytest.mark.parametrize(
-    "problem", ["regression", "missing_baseline", "missing_record", "missing_e2e"]
+    "problem",
+    ["regression", "missing_baseline", "missing_record", "missing_e2e", "missing_log"],
 )
 def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     # exercise the validator, request loop, pytest output and retry classifier together
@@ -39,14 +40,16 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
         textwrap.dedent(
             """
             import pytest
+            from types import SimpleNamespace
             from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
             from sglang.multimodal_gen.test.server import test_server_common as common
+            from sglang.multimodal_gen.test.test_utils import wait_for_req_perf_record
             from sglang.multimodal_gen.test.server.testcase_configs import (
                 DiffusionSamplingParams, DiffusionServerArgs, DiffusionTestCase, ScenarioConfig,
             )
 
             @pytest.mark.parametrize("case_id", ["threshold_guard"])
-            def test_guard(case_id, monkeypatch):
+            def test_guard(case_id, monkeypatch, tmp_path):
                 server = common.DiffusionServerBase()
                 server._perf_results = []
                 case = DiffusionTestCase(
@@ -55,7 +58,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                     DiffusionSamplingParams(prompt="test"),
                     run_lora_basic_api_check=True, perf_repeat_requests=2,
                     run_consistency_check=False, run_models_api_check=False,
-                    run_perf_check=PROBLEM not in ("missing_record", "missing_e2e"),
+                    run_perf_check=PROBLEM not in ("missing_record", "missing_e2e", "missing_log"),
                 )
                 scenario = ScenarioConfig({}, {}, 1000, 100, 100)
                 if PROBLEM == "missing_baseline":
@@ -76,13 +79,28 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                         stages=[], steps=[100],
                         total_duration_ms=None if PROBLEM == "missing_e2e" else 2000,
                     ), b""
-                monkeypatch.setattr(server, "run_and_collect", collect)
+                context = None
+                if PROBLEM == "missing_log":
+                    log_path = tmp_path / "empty-perf.jsonl"
+                    log_path.write_text("")
+                    context = SimpleNamespace(perf_log_path=log_path)
+                    monkeypatch.setattr(server, "_client", lambda ctx: None)
+                    def generate(*args):
+                        requests.append(1)
+                        return "guard", b""
+                    monkeypatch.setattr(server, "_run_generation_with_server_watchdog", generate)
+                    monkeypatch.setattr(
+                        common, "wait_for_req_perf_record",
+                        lambda rid, path, timeout: wait_for_req_perf_record(rid, path, timeout=0.01),
+                    )
+                else:
+                    monkeypatch.setattr(server, "run_and_collect", collect)
                 monkeypatch.setattr(
                     server, "_test_lora_api_functionality",
                     lambda *args: lora_checks.append(1),
                 )
                 try:
-                    server._test_diffusion_generation_impl(case, None)
+                    server._test_diffusion_generation_impl(case, context)
                 finally:
                     print(f"GUARD_REQUESTS={len(requests)} LORA_CHECKS={len(lora_checks)}")
                     print(f"RETAINED_METRICS={len(server._perf_results)}")
@@ -118,7 +136,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     assert result.returncode == 1, output
     assert "[performance]" in output, output
     assert "GUARD_REQUESTS=1 LORA_CHECKS=0" in output, output
-    retained = 0 if problem in {"missing_record", "missing_e2e"} else 1
+    retained = 0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
     assert f"RETAINED_METRICS={retained}" in output, output
     assert output.count("Starting pytest attempt") == 1, output
     assert "'threshold_guard': 'fail'" in output, output
