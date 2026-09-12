@@ -25,7 +25,6 @@ import torch
 from torch import nn
 from transformers import GPTBigCodeConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -38,11 +37,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
 class GPTBigCodeAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -53,7 +52,7 @@ class GPTBigCodeAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         total_num_heads = config.num_attention_heads
-        self.tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        self.tensor_model_parallel_world_size = get_parallel().tp_size
         assert total_num_heads % self.tensor_model_parallel_world_size == 0
         self.num_heads = total_num_heads // self.tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // total_num_heads
@@ -114,7 +113,6 @@ class GPTBigCodeAttention(nn.Module):
 
 
 class GPTBigMLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -150,7 +148,6 @@ class GPTBigMLP(nn.Module):
 
 
 class GPTBigCodeBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -193,7 +190,6 @@ class GPTBigCodeBlock(nn.Module):
 
 
 class GPTBigCodeModel(nn.Module):
-
     def __init__(
         self,
         config: GPTBigCodeConfig,

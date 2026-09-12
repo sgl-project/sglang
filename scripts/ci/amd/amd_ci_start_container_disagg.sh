@@ -7,7 +7,7 @@ SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
   # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
+  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
@@ -23,16 +23,18 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -40,7 +42,7 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image IMAGE] [--rocm-version VERSION]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -141,11 +143,7 @@ find_latest_image() {
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry.
-  # See amd_ci_start_container.sh for why we don't probe
-  # ${LOCAL_DOCKER_REGISTRY} with `docker manifest inspect --insecure` from
-  # the runner pod's network namespace; the actual local-registry pull
-  # happens at the call site below via the docker daemon on the host.
+  # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -156,11 +154,17 @@ find_latest_image() {
     fi
   done
 
-  # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
+  echo "Exact version not found. Searching remote registry for versioned ${ROCM_VERSION}-${gpu_arch} images…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+      if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
+        echo "${tag}"
+        break
+      fi
+    done || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -168,9 +172,14 @@ find_latest_image() {
     fi
   done
 
-  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#rocm/sgl-dev:}"
+    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
+      echo "${image}"
+    fi
+  done | sort -r | head -n 1)
   if [[ -n "$any_local" ]]; then
       echo "Using cached fallback image: ${any_local}" >&2
       echo "${any_local}"
@@ -201,29 +210,52 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-# Try the local docker registry first (avoids Docker Hub rate limits and is
-# faster on the LAN); if that fails for any reason, fall back to the
-# public registry with exponential-backoff retries. Capture stderr so the
-# real failure reason (TLS handshake, 404, connection refused, etc.) is
-# visible in the job log instead of being silently swallowed.
-if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-  echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-  docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+# Determine which image to use
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
+  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+    docker pull "${IMAGE}"
+  else
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 else
-  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  # Temporarily bypass the shared local registry while concurrent CI pulls
+  # saturate it. Keep using the authenticated, retried public-registry path.
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
-    CACHE_VOLUME=""
+CACHE_HOST=/home/runner/sglang-data
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
 fi
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
+    fi
+    ;;
+  0|false|no|off|"")
+    CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""
@@ -313,6 +345,11 @@ docker run -dt --user root \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

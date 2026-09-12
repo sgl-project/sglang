@@ -131,7 +131,6 @@ class MiniLoadBalancer:
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
@@ -141,7 +140,6 @@ class MiniLoadBalancer:
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
             if "return_logprob" in modified_request:
-
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
 
@@ -258,12 +256,18 @@ async def health_generate():
 
 
 @app.post("/flush_cache")
-async def flush_cache():
+async def flush_cache(timeout: Optional[float] = None):
+    # `timeout` must reach the workers. The scheduler treats a missing or
+    # non-positive timeout as "flush now, skip the idle check", so dropping it
+    # here frees KV buffers while a PD KV transfer is still reading them: the
+    # transfer then fails for real and the peer session gets blacklisted.
+    # Forwarding it keeps the scheduler on its deferred, drain-first path.
+    params = None if timeout is None else {"timeout": timeout}
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
         for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.post(f"{server}/flush_cache"))
+            tasks.append(session.post(f"{server}/flush_cache", params=params))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)
@@ -336,7 +340,7 @@ async def _get_model_info_impl():
                 model_info_json = await response.json()
                 return ORJSONResponse(content=model_info_json)
 
-        except aiohttp.ClientError as e:
+        except aiohttp.ClientError:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 detail=f"Failed to get model info from backend",

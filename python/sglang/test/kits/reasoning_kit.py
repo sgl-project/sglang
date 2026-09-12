@@ -27,7 +27,7 @@ class ReasoningTokenUsageMixin:
     def init_reasoning_token_verifier(cls):
         assert cls.reasoning_parser_name, "reasoning_parser_name must be set"
         cls.tokenizer = get_tokenizer(cls.model)
-        parser = ReasoningParser(cls.reasoning_parser_name)
+        parser = ReasoningParser(cls.reasoning_parser_name, tokenizer=cls.tokenizer)
         cls.think_end_token_id = cls.tokenizer.convert_tokens_to_ids(
             parser.detector.think_end_token
         )

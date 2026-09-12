@@ -21,11 +21,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=315, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestCPUGraph(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",
@@ -35,7 +34,7 @@ class TestCPUGraph(CustomTestCase):
             "--enable-torch-compile",
             "--torch-compile-max-bs",
             "2",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "2",
         ],
         min_throughput=7,
@@ -63,7 +62,7 @@ class TestCPUGraph(CustomTestCase):
                 "--trust-remote-code",
                 "--disable-overlap-schedule",
                 "--enable-torch-compile",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "2",
                 "--tp",
                 f"{n_numa_node}",

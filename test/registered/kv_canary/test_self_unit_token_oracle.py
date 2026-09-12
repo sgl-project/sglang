@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=1, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=1, suite="extra-a-test-1-gpu-small-amd")
 
 
@@ -46,8 +46,18 @@ class TestTokenOracleManager(CustomTestCase):
             expected_inputs_out=expected_inputs,
         )
 
+        # draft-extend-v2 is not an extend mode, so fill_expected_inputs records
+        # deterministic oracle tokens (not input_ids). The req row [3, 7] expands
+        # to num_tokens_per_req=4 draft tokens each -> one row per draft token.
+        expected_generalized_req_ids = torch.tensor(
+            [3, 3, 3, 3, 7, 7, 7, 7], dtype=torch.int64, device=self.device
+        )
+        expected_tokens = manager.oracle.expected_tokens(
+            generalized_req_ids=expected_generalized_req_ids,
+            positions=forward_batch.positions.to(torch.int64),
+        )
         self.assertTrue(
-            torch.equal(expected_inputs.tokens[:8], forward_batch.input_ids)
+            torch.equal(expected_inputs.tokens[:8], expected_tokens.to(torch.int64))
         )
         self.assertTrue(
             torch.equal(expected_inputs.positions[:8], forward_batch.positions)

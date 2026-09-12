@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=700, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
 # Bumped from b071bc6f -> 419004c8 (HF main HEAD as of 2026-05-18). The pinned
@@ -93,7 +93,7 @@ class TestKimiK25MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (Kimi-K2.5-MXFP4)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (Kimi-K2.5-MXFP4)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.92)
 
@@ -105,7 +105,7 @@ class TestKimiK25MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (Kimi-K2.5-MXFP4)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (Kimi-K2.5-MXFP4)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 30)

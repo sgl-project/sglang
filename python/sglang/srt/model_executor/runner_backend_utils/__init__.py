@@ -9,16 +9,20 @@ Subpackages:
 Backends in cuda_graph_backend/ import from here. Runners do not.
 """
 
-# Generic failure-message hint for non-piecewise CUDA graph capture
-# paths (Full backend used by decode + EAGLE draft runners). The
-# piecewise-specific variant lives in
-# piecewise_cuda_graph.context_manager and points users at
-# --disable-piecewise-cuda-graph, which doesn't apply here.
+# Generic failure-message hint for decode-style CUDA graph capture paths
+# (Full backend used by decode + EAGLE draft runners).
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "Possible solutions:\n"
     "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
     "2. set --cuda-graph-max-bs-decode to a smaller value (e.g., 16)\n"
-    "3. disable torch compile by not using --enable-torch-compile\n"
-    "4. disable CUDA graph by --cuda-graph-backend-decode=disabled. (Not recommended. Huge performance loss)\n"
+    "3. disable decode CUDA graph by --cuda-graph-backend-decode=disabled. "
+    "(Not recommended. Huge performance loss)\n"
+    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+)
+
+PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+    "Fail when using backend: {backend} for prefill runner.\n"
+    "Possible suggestions:\n"
+    "{suggestions}"
     "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )

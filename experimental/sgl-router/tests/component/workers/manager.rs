@@ -7,9 +7,9 @@ use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, Worke
 use sgl_router::workers::{manager, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Barrier};
 
 /// Spin up a tiny fake worker that returns `body` on `GET /server_info`.
 /// Returns the worker base URL and a shutdown channel.
@@ -48,6 +48,19 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
     }
 }
 
+async fn wait_until(condition: impl Fn() -> bool, description: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+}
+
 #[tokio::test]
 async fn manager_processes_added_then_removed() {
     let (url_a, _s_a) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
@@ -72,8 +85,11 @@ async fn manager_processes_added_then_removed() {
     .await
     .unwrap();
 
-    // Give the manager time to drain.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || registry.workers_for(&ModelId("m".into())).len() == 2,
+        "both workers to register",
+    )
+    .await;
     assert_eq!(registry.workers_for(&ModelId("m".into())).len(), 2);
 
     tx.send(DiscoveryEvent::Removed {
@@ -81,7 +97,11 @@ async fn manager_processes_added_then_removed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until(
+        || registry.workers_for(&ModelId("m".into())).len() == 1,
+        "removed worker to leave the registry",
+    )
+    .await;
     assert_eq!(registry.workers_for(&ModelId("m".into())).len(), 1);
 
     drop(tx);
@@ -103,7 +123,16 @@ async fn manager_handles_mode_changed() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || {
+            registry
+                .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .len()
+                == 1
+        },
+        "prefill worker to register",
+    )
+    .await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -117,7 +146,19 @@ async fn manager_handles_mode_changed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until(
+        || {
+            registry
+                .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .is_empty()
+                && registry
+                    .workers_for_mode(&ModelId("m".into()), WorkerMode::Decode)
+                    .len()
+                    == 1
+        },
+        "worker mode to change to decode",
+    )
+    .await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -280,7 +321,15 @@ async fn manager_handles_duplicate_added_as_upsert() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until(
+        || {
+            registry
+                .get(&WorkerId("w1".into()))
+                .is_some_and(|worker| worker.url == url_second)
+        },
+        "replacement Added event to update the worker",
+    )
+    .await;
 
     assert_eq!(
         registry.workers_for(&ModelId("m1".into())).len(),
@@ -304,6 +353,32 @@ async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Se
             let body = body.clone();
             async move {
                 tokio::time::sleep(delay).await;
+                Json((*body).clone())
+            }
+        }),
+    );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), tx)
+}
+
+async fn spawn_gated_worker(body: Value, gate: Arc<Barrier>) -> (String, oneshot::Sender<()>) {
+    let body = Arc::new(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let body = body.clone();
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.wait().await;
                 Json((*body).clone())
             }
         }),
@@ -350,25 +425,22 @@ async fn spawn_counting_worker(body: Value) -> (String, Arc<AtomicUsize>, onesho
     (format!("http://127.0.0.1:{port}"), counter, tx)
 }
 
-/// Registration must run in parallel across multiple `Added` events.
-/// Each fake worker delays its `/server_info` by 200ms; with sequential
-/// processing the manager would take ≥1000ms for 5 workers. We allow
-/// up to 600ms (3x the per-fetch delay) as a generous bound that still
-/// rejects the sequential implementation.
+/// Registration must start every `/server_info` fetch before any response is
+/// released. A sequential manager stalls at the first worker's barrier.
 #[tokio::test]
 async fn added_events_run_in_parallel() {
-    let delay = Duration::from_millis(200);
     let n = 5;
+    let gate = Arc::new(Barrier::new(n + 1));
     let mut workers = Vec::new();
     for _ in 0..n {
-        workers.push(spawn_slow_worker(json!({"served_model_name": "m"}), delay).await);
+        workers
+            .push(spawn_gated_worker(json!({"served_model_name": "m"}), Arc::clone(&gate)).await);
     }
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    let start = Instant::now();
     for (i, (url, _s)) in workers.iter().enumerate() {
         tx.send(DiscoveryEvent::Added(spec_for(
             &format!("w{i}"),
@@ -378,22 +450,22 @@ async fn added_events_run_in_parallel() {
         .await
         .unwrap();
     }
-    let registered = tokio::time::timeout(Duration::from_secs(5), async {
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), gate.wait())
+            .await
+            .is_ok(),
+        "manager did not start all {n} /server_info requests concurrently"
+    );
+    let registered = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if registry.workers_for(&ModelId("m".into())).len() == n {
-                return true;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
-    let elapsed = start.elapsed();
     assert!(registered.is_ok(), "manager failed to register {n} workers");
-    assert!(
-        elapsed < Duration::from_millis(600),
-        "registration of {n} workers took {elapsed:?}; sequential per-worker /server_info \
-         fetches would take ≥1000ms — parallel spawn is required"
-    );
 
     drop(tx);
     h.await.unwrap();
@@ -508,4 +580,109 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
     drop(tx);
     h.await.unwrap();
     kv_index.shutdown().await;
+}
+
+/// Public-API integration for the reconcile loop: a worker that registers
+/// with empty `model_ids` (its `/server_info` was failing when discovery
+/// first reported it — the "EndpointSlice ready before the engine can
+/// answer /server_info" race) must be recovered by the manager's
+/// reconcile loop once `/server_info` starts answering. Exercised through
+/// the public `run_with_introspector_and_reconcile` entrypoint with no
+/// new discovery event after the initial `Added`.
+#[tokio::test]
+async fn reconcile_recovers_worker_with_unresolved_model_ids() {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use sgl_router::workers::WorkerIntrospector;
+    use std::sync::atomic::AtomicBool;
+
+    // Switchable fake engine: 503 on /server_info until `ready` flips
+    // true, then serves a body advertising model "m".
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_handler = ready.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let ready = ready_handler.clone();
+            async move {
+                if ready.load(Ordering::SeqCst) {
+                    Json(json!({"served_model_name": "m"})).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        }),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    let url = format!("http://127.0.0.1:{port}");
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run_with_introspector_and_reconcile(
+        rx,
+        registry.clone(),
+        None,
+        None,
+        None,
+        Arc::new(WorkerIntrospector::new(Duration::from_millis(300))),
+        Duration::from_millis(150),
+    ));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-slow",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    // Phase 1: the worker registers but stays out of the model pool while
+    // /server_info keeps failing.
+    let stuck = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(w) = registry.get(&WorkerId("w-slow".into())) {
+                if w.model_ids.is_empty() && registry.workers_for(&ModelId("m".into())).is_empty() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        stuck.is_ok(),
+        "worker should register with empty model_ids (invisible to routing) while /server_info fails",
+    );
+
+    // Engine finishes coming up.
+    ready.store(true, Ordering::SeqCst);
+
+    // Phase 2: the reconcile loop re-introspects and the worker joins the
+    // model pool — no new discovery event was sent.
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if registry.workers_for(&ModelId("m".into())).len() == 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "reconcile loop must add the worker to the model pool once /server_info recovers",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+    let _ = shutdown_tx.send(());
 }

@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import triton
 
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update_kernel,
 )
 
@@ -30,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -52,8 +53,9 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(
-        triton.next_power_of_2(V), 16
+    BK, BV = (
+        triton.next_power_of_2(K),
+        min(triton.next_power_of_2(V), 16),
     )  # use 16 here to reduce register pressure
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -85,6 +87,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,
         v=v,
@@ -121,6 +124,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

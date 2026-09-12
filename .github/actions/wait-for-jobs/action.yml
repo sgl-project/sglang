@@ -34,7 +34,7 @@ runs:
   steps:
     - name: Wait for jobs to complete
       id: wait
-      uses: actions/github-script@v7
+      uses: actions/github-script@v8
       env:
         INPUT_STAGE_NAME: ${{ inputs.stage-name }}
         INPUT_JOBS: ${{ inputs.jobs }}
@@ -182,15 +182,15 @@ runs:
               if (matchingJobs.length < spec.expected_count) {
                 // Job-level `if:` is evaluated before matrix expansion. When it
                 // evaluates false, GitHub emits exactly one "skipped" entry
-                // without a "(shard)" suffix instead of N matrix entries. Two
-                // shapes are possible:
+                // instead of N matrix entries. Shapes include:
                 //   - inline matrix:     `<prefix>`
                 //   - reusable workflow: `<prefix> / <called-job>`
-                // Both lack the ` (` shard marker. Detect that precise shape so
-                // we don't poll forever — and so we don't mistake a partially
-                // materialized dynamic/reusable matrix for a skipped one.
+                // Reusable workflows can also retain an unevaluated matrix
+                // expression in the shard suffix. Recognize that placeholder,
+                // while still waiting for missing shards of an expanded matrix.
                 const unexpandedSkip = matchingJobs.length === 1 &&
-                  !matchingJobs[0].name.includes(' (') &&
+                  (!matchingJobs[0].name.includes(' (') ||
+                    /\(\$\{\{\s*matrix\.partition\s*\}\}\)$/.test(matchingJobs[0].name)) &&
                   matchingJobs[0].status === 'completed' &&
                   matchingJobs[0].conclusion === 'skipped';
                 if (unexpandedSkip) {
@@ -198,7 +198,7 @@ runs:
                   totalCount += missing;
                   completedCount += missing;
                   if (!cached) {
-                    console.log(`${spec.prefix}: job-level skip (bare entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
+                    console.log(`${spec.prefix}: job-level skip (unexpanded entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
                   }
                 } else {
                   console.log(`${spec.prefix}: found ${matchingJobs.length}/${spec.expected_count} jobs (waiting for more)`);

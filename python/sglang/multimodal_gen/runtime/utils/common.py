@@ -4,10 +4,7 @@ import ipaddress
 import logging
 import os
 import platform
-import signal
 import socket
-import sys
-import threading
 from functools import lru_cache
 from typing import Any
 
@@ -17,45 +14,6 @@ import zmq
 
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -108,6 +66,16 @@ def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
     if len(set(parsed)) != len(parsed):
         raise ValueError(f"--gpu-ids contains duplicate GPU ids: {parsed}")
     return parsed
+
+
+def parse_size(size: str) -> tuple[int | None, int | None]:
+    try:
+        parts = size.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
 
 
 def parse_tcp_host_port(value: str | None, field_name: str) -> tuple[str, int]:
@@ -388,14 +356,15 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -406,7 +375,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):

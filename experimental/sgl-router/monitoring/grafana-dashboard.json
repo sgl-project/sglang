@@ -89,7 +89,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -161,7 +161,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "100 * sum(rate(sgl_router_requests_total{outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
+          "expr": "100 * sum(rate(sgl_router_worker_requests_total{outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -407,7 +407,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
@@ -500,7 +500,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (mode) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (mode) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{mode}}",
@@ -686,7 +686,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (worker_url) (rate(sgl_router_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (worker_url) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1606,111 +1606,6 @@
       ]
     },
     {
-      "type": "timeseries",
-      "title": "Overlap blocks quantiles",
-      "description": "Cache-aware-zmq overlap-block count at policy selection.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "x": 16,
-        "y": 41,
-        "w": 8,
-        "h": 8
-      },
-      "id": 23,
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
-          "range": true,
-          "refId": "A",
-          "legendFormat": "p50",
-          "format": "time_series"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
-          "range": true,
-          "refId": "B",
-          "legendFormat": "p99",
-          "format": "time_series"
-        }
-      ]
-    },
-    {
       "type": "row",
       "title": "Routing Policy",
       "collapsed": false,
@@ -2035,7 +1930,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_requests_total, model_id)",
+        "definition": "label_values(sgl_router_worker_requests_total, model_id)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -2044,7 +1939,7 @@
         "name": "model_id",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_requests_total, model_id)",
+          "query": "label_values(sgl_router_worker_requests_total, model_id)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2061,7 +1956,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_requests_total, worker_url)",
+        "definition": "label_values(sgl_router_worker_requests_total, worker_url)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -2070,7 +1965,7 @@
         "name": "worker_url",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_requests_total, worker_url)",
+          "query": "label_values(sgl_router_worker_requests_total, worker_url)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,

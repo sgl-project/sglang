@@ -76,6 +76,18 @@ def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
     torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
 
 
+def maybe_assert_async(cond: torch.Tensor, msg: str = ""):
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    torch._assert_async(cond, msg)
+
+
+def maybe_assert_sum(tensor: torch.Tensor, expected: int, msg: str = "") -> None:
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    torch._assert_async(tensor.sum() == expected, msg)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
@@ -96,6 +108,19 @@ def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
     torch._assert_async(~torch.any(torch.isinf(tensor)), f"Inf detected! {msg}")
 
 
+def maybe_detect_in_closed_range(
+    tensor: Optional[torch.Tensor], low: float, high: float, msg: str = ""
+):
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    if tensor is None or tensor.numel() == 0:
+        return
+    torch._assert_async(
+        ((tensor >= low) & (tensor <= high)).all(),
+        f"value outside [{low}, {high}]: {msg}",
+    )
+
+
 def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: str):
     """Async OOB check — no GPU-CPU sync, error surfaces at next sync point.
 
@@ -113,6 +138,27 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
     torch._assert_async(
         indices.max() < high,
         f"index >= {high} (out of range): {msg}",
+    )
+
+
+def maybe_detect_kernel_facing_loc(
+    indices: Optional[torch.Tensor], page_size: int, blocks_per_page: int, msg: str
+):
+    """Async check that a write loc is in the pool's KERNEL-FACING id space.
+
+    A kernel-facing id is `phys_page * (page_size * blocks_per_page) + offset`
+    with `offset < page_size`, so its remainder modulo the page stride is
+    below page_size; a VIRTUAL id satisfies that only in the first block.
+    Vacuous at blocks_per_page 1. Virtual ids are in range for the OOB probe,
+    so this is the only check that separates them.
+    """
+    if blocks_per_page <= 1 or not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    if indices is None or indices.numel() == 0:
+        return
+    torch._assert_async(
+        (indices % (page_size * blocks_per_page) < page_size).all(),
+        f"write loc outside the kernel-facing id space (virtual ids?): {msg}",
     )
 
 

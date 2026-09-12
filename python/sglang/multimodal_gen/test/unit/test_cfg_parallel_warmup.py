@@ -1,13 +1,14 @@
 """Unit tests for the --enable-cfg-parallel warmup fix and guard.
 
 Covers warmup and cfg-parallel guard paths introduced alongside this file:
-- Scheduler.prepare_server_warmup_reqs synthesizes warmup Reqs that
-  actually enable classifier-free guidance when cfg-parallel is on.
+- build_warmup_reqs synthesizes warmup Reqs that actually enable
+  classifier-free guidance when cfg-parallel is on.
+- DiffGenerator sends explicit warmup resolutions through the scheduler client.
 - InputValidationStage.forward rejects non-CFG requests when the server
   has cfg-parallel on.
 - Server-based warmup can opt into model-default negative prompts so warmup
   populates the negative text embedding cache.
-- Req-based warmup remains available only through the explicit legacy path.
+- Req-based warmup remains available only through the lazy legacy path.
 
 All tests are CPU-only; no model loading, no distributed init.
 """
@@ -23,20 +24,41 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
+    LongLive2T2VConfig,
+)
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.server_warmup import (
+    format_warmup_req,
+    should_run_explicit_client_warmup,
+    should_run_synthetic_server_warmup,
+)
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
-    DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
     DEFAULT_PLACEHOLDER_PROMPT,
+    SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
+    _apply_warmup_sampling_overrides,
+    _resolve_warmup_num_frames,
     build_warmup_reqs,
     should_include_warmup_image,
+    supports_synthetic_warmup,
 )
 
 
@@ -44,28 +66,22 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     """
     Build a minimal Scheduler without calling __init__ (which requires
     distributed init, ZMQ sockets, pipeline load, etc.). Populates only
-    the attributes prepare_server_warmup_reqs reads/writes for a
-    text-only task so _prepare_shared_warmup_image_path is skipped.
+    the attributes req-based warmup reads/writes.
     """
     scheduler = object.__new__(Scheduler)
 
     server_args = MagicMock()
-    server_args.warmup = True
+    server_args.warmup_mode = "request"
     server_args.warmup_steps = 1
     server_args.warmup_resolutions = ["512x512"]
     server_args.enable_cfg_parallel = enable_cfg_parallel
+    server_args.enable_torch_compile = False
+    server_args.is_arg_explicitly_set.return_value = False
 
-    # Text-only task — accepts_image_input() False skips the image-path
-    # branch entirely, so we don't need to mock
-    # _prepare_shared_warmup_image_path.
-    task_type = MagicMock()
-    task_type.requires_image_input.return_value = False
-    task_type.accepts_image_input.return_value = False
-    task_type.data_type.return_value = ModelTaskType.T2I.data_type()
-    server_args.pipeline_config.task_type = task_type
+    server_args.pipeline_config.task_type = ModelTaskType.T2I
 
     scheduler.server_args = server_args
-    scheduler.warmed_up = False
+    scheduler.req_based_warmup_scheduled = False
     scheduler.waiting_queue = deque()
     return scheduler
 
@@ -92,14 +108,79 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 
 
 class TestWarmupReqCfgParallel(unittest.TestCase):
-    """Commit 1 regression: prepare_server_warmup_reqs."""
+    """Warmup request construction and req-based warmup guards."""
+
+    def test_sampling_workload_override_accepts_json(self):
+        defaults = SamplingParams(
+            width=1024,
+            height=1024,
+            num_frames=81,
+            num_inference_steps=35,
+        )
+        server_args = SimpleNamespace(
+            warmup_sampling_params=(
+                '{"width":832,"height":480,"num_frames":9,"num_inference_steps":4}'
+            )
+        )
+
+        overridden = _apply_warmup_sampling_overrides(server_args, defaults)
+
+        self.assertEqual(
+            (
+                overridden.width,
+                overridden.height,
+                overridden.num_frames,
+                overridden.num_inference_steps,
+            ),
+            (832, 480, 9, 4),
+        )
+        self.assertEqual((defaults.width, defaults.height), (1024, 1024))
+
+    def test_sampling_workload_override_rejects_unknown_field(self):
+        server_args = SimpleNamespace(
+            warmup_sampling_params={"not_a_sampling_field": 1}
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid --warmup-sampling-params"):
+            _apply_warmup_sampling_overrides(server_args, SamplingParams())
+
+    def test_sampling_workload_override_supports_fixed_model_fields(self):
+        defaults = MiniMaxH3SamplingParams()
+        server_args = SimpleNamespace(
+            warmup_sampling_params={"num_frames": 49, "fps": 12}
+        )
+
+        overridden = _apply_warmup_sampling_overrides(server_args, defaults)
+
+        self.assertEqual((overridden.num_frames, overridden.fps), (49, 12))
+        self.assertEqual((defaults.num_frames, defaults.fps), (1, 24))
 
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
-        scheduler = _make_bare_scheduler(enable_cfg_parallel=True)
-        scheduler.prepare_server_warmup_reqs()
+        server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
+        sampling_defaults = SamplingParams()
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertIs(req.do_classifier_free_guidance, True)
+        self.assertEqual(req.negative_prompt, sampling_defaults.negative_prompt)
 
-        self.assertEqual(len(scheduler.waiting_queue), 1)
-        _, req, _ = scheduler.waiting_queue[0]
+    def test_warmup_req_cfg_parallel_fills_missing_negative_prompt(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(negative_prompt=None),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
@@ -109,18 +190,99 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         # AND the synthesized Req is not using the cfg-parallel-specific
         # "warmup" placeholder for negative_prompt (which would indicate
         # the fix's kwargs leaked into this branch).
-        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
-        scheduler.prepare_server_warmup_reqs()
-
-        self.assertEqual(len(scheduler.waiting_queue), 1)
-        _, req, _ = scheduler.waiting_queue[0]
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
+
+    def test_server_warmup_keeps_minimum_image_steps_without_compile(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.num_inference_steps, 2)
+
+    def test_torch_compile_respects_explicit_server_warmup_steps(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_torch_compile = True
+        server_args.is_arg_explicitly_set.side_effect = lambda name: (
+            name == "warmup_steps"
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertIn("(512x512, 1/9 steps)", format_warmup_req(req))
+
+    def test_torch_compile_server_warmup_repeats_each_bucket(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_torch_compile = True
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512", "1024x1024"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(reqs), 4)
+        self.assertEqual(
+            [(req.width, req.height) for req in reqs],
+            [(512, 512)] * 2 + [(1024, 1024)] * 2,
+        )
+        self.assertEqual([req.is_warmup for req in reqs], [True, False] * 2)
+        self.assertEqual([req.num_inference_steps for req in reqs], [2] * 4)
+        self.assertEqual(
+            [req.extra.get("server_internal_prewarm", False) for req in reqs],
+            [False, True] * 2,
+        )
+        self.assertEqual([req.save_output for req in reqs], [False] * 4)
+        self.assertIsNot(reqs[0].sampling_params, reqs[1].sampling_params)
+        self.assertEqual(reqs[1].sampling_params.num_inference_steps, 2)
+        reqs[1].sampling_params.num_inference_steps = 123
+        self.assertEqual(reqs[0].sampling_params.num_inference_steps, 2)
+
+    def test_lightweight_warmup_result_ignores_control_requests(self):
+        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
+
+        self.assertFalse(
+            scheduler._should_return_lightweight_warmup_result(SetLoraReq("test"))
+        )
+        self.assertFalse(
+            scheduler._should_return_lightweight_warmup_result(UnmergeLoraWeightsReq())
+        )
+
+    def test_lightweight_warmup_result_returns_internal_prewarm(self):
+        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
+        req = _make_generation_req()
+        req.extra["server_internal_prewarm"] = True
+
+        self.assertTrue(scheduler._should_return_lightweight_warmup_result(req))
 
     def test_req_based_warmup_remains_explicit_legacy_entry(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
         scheduler.server_args.warmup_resolutions = None
-        scheduler.server_args.server_warmup = False
+        scheduler.server_args.warmup_mode = "request"
 
         req = _make_generation_req()
         recv_reqs = [(b"0", req)]
@@ -133,31 +295,64 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(processed[0][1].metrics.suppress_stage_breakdown)
         self.assertEqual(processed[0][1].num_inference_steps, 1)
         self.assertEqual(processed[0][1].extra["cache_dit_num_inference_steps"], 20)
-        self.assertTrue(scheduler.warmed_up)
+        self.assertTrue(scheduler.req_based_warmup_scheduled)
 
     def test_req_based_warmup_skips_default_server_warmup_path(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
         scheduler.server_args.warmup_resolutions = None
-        scheduler.server_args.server_warmup = True
+        scheduler.server_args.warmup_mode = "server"
 
         recv_reqs = [(b"0", _make_generation_req())]
         processed = scheduler.process_received_reqs_with_req_based_warmup(recv_reqs)
 
         self.assertIs(processed, recv_reqs)
         self.assertEqual(len(processed), 1)
-        self.assertFalse(scheduler.warmed_up)
+        self.assertFalse(scheduler.req_based_warmup_scheduled)
+
+    def test_diff_generator_runs_explicit_warmup_through_scheduler_client(self):
+        generator = object.__new__(DiffGenerator)
+        server_args = MagicMock()
+        server_args.warmup_mode = "request"
+        server_args.warmup_resolutions = ["832x480"]
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+        generator.server_args = server_args
+
+        sampling_defaults = SamplingParams(num_frames=81, num_inference_steps=50)
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                return_value=sampling_defaults,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator.sync_scheduler_client.forward",
+                return_value=OutputBatch(error=None),
+            ) as forward,
+        ):
+            generator._run_client_warmup_if_needed()
+
+        forward.assert_called_once()
+        req = forward.call_args.args[0]
+        self.assertTrue(req.is_warmup)
+        self.assertEqual((req.width, req.height), (832, 480))
+        self.assertEqual(req.num_frames, 17)
+        self.assertEqual(req.num_inference_steps, 2)
+        self.assertTrue(req.extra["return_warmup_result"])
+        self.assertTrue(req.extra["server_based_warmup"])
+        self.assertEqual(req.extra["warmup_total"], 1)
 
     def test_server_based_warmup_uses_model_default_negative_prompt(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
 
-        task_type = MagicMock()
-        task_type.requires_image_input.return_value = False
-        task_type.accepts_image_input.return_value = False
-        task_type.is_image_gen.return_value = True
-        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
-        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
 
         sampling_defaults = SamplingParams(
             negative_prompt="model default negative",
@@ -171,7 +366,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 return_warmup_result=True,
                 server_based_warmup=True,
             )
@@ -183,21 +377,80 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.num_inference_steps, 2)
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 20)
         self.assertEqual(req.negative_prompt, "model default negative")
+        self.assertEqual(req.prompt, DEFAULT_PLACEHOLDER_PROMPT)
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
+
+    def test_auto_residency_uses_one_full_serving_shape_probe(self):
+        server_args = SimpleNamespace(
+            warmup_steps=1,
+            enable_cfg_parallel=False,
+            enable_torch_compile=False,
+            enable_breakable_cuda_graph=False,
+            pipeline_class_name=None,
+            num_gpus=1,
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                adjust_num_frames=lambda value: value,
+                vae_stride=None,
+                vae_scale_factor=None,
+                vae_config=SimpleNamespace(arch_config=None),
+            ),
+            is_arg_explicitly_set=lambda _name: False,
+        )
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            num_inference_steps=35,
+            adjust_frames=False,
+            supported_resolutions=[(1280, 720), (832, 480)],
+        )
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                return_value=sampling_defaults,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
+                return_value=None,
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        # the bounded warmup runs first so the worker can size the probe, and
+        # once more after it so serving starts from a serving-shaped pool
+        self.assertEqual(len(reqs), 3)
+        self.assertFalse(reqs[0].extra.get("auto_residency_full_shape_probe"))
+        self.assertFalse(reqs[2].extra.get("auto_residency_full_shape_probe"))
+        self.assertEqual(
+            (reqs[2].width, reqs[2].height, reqs[2].num_frames),
+            (reqs[0].width, reqs[0].height, reqs[0].num_frames),
+        )
+        self.assertEqual(
+            (reqs[1].width, reqs[1].height, reqs[1].num_frames),
+            (1280, 720, 81),
+        )
+        self.assertTrue(reqs[1].extra["auto_residency_full_shape_probe"])
+        self.assertFalse(reqs[1].metrics.suppress_stage_breakdown)
+        self.assertEqual(reqs[1].num_inference_steps, 4)
+        self.assertIn(
+            "auto residency probe (1280x720x81f, 4/35 steps)",
+            format_warmup_req(reqs[1]),
+        )
 
     def test_server_based_warmup_uses_model_default_resolution(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
 
-        task_type = MagicMock()
-        task_type.requires_image_input.return_value = False
-        task_type.accepts_image_input.return_value = False
-        task_type.is_image_gen.return_value = True
-        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
-        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
 
         sampling_defaults = SamplingParams(width=640, height=640)
         with patch(
@@ -207,7 +460,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -215,17 +467,52 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.width, 640)
         self.assertEqual(req.height, 640)
 
-    def test_server_based_warmup_prefers_default_resolution_over_supported_min(self):
+    def test_server_based_warmup_resolutions_keep_sampling_defaults_and_caps(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
-        task_type = MagicMock()
-        task_type.requires_image_input.return_value = False
-        task_type.accepts_image_input.return_value = False
-        task_type.is_image_gen.return_value = True
-        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
-        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+
+        sampling_defaults = SamplingParams(
+            negative_prompt="model default negative",
+            guidance_scale=3.5,
+            num_frames=81,
+            num_inference_steps=50,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["832x480"],
+                return_warmup_result=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual((req.width, req.height), (832, 480))
+        self.assertEqual(req.num_frames, 17)
+        self.assertEqual(req.num_inference_steps, 2)
+        self.assertEqual(req.extra["cache_dit_num_inference_steps"], 50)
+        self.assertEqual(req.negative_prompt, "model default negative")
+        self.assertIs(req.do_classifier_free_guidance, True)
+
+    def test_server_based_image_warmup_uses_model_default_over_supported(self):
+        """Server-based image warmup uses the model's default resolution so it
+        warms up at the real inference shape (avoiding a residual
+        cudagraph/compile gap), rather than shrinking to the smallest supported
+        resolution within an area budget."""
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
 
         sampling_defaults = SamplingParams(
             width=1024,
@@ -239,7 +526,55 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual((reqs[0].width, reqs[0].height), (1024, 1024))
+
+    def test_server_based_image_warmup_uses_full_model_default(self):
+        """Server-based image warmup keeps the model's full default resolution
+        instead of scaling down to a server-warmup area budget, so warmup hits
+        the real inference shape."""
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.backend = "auto"
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
+
+        sampling_defaults = SamplingParams(width=1024, height=1024)
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual((reqs[0].width, reqs[0].height), (1024, 1024))
+
+    def test_server_based_image_warmup_diffusers_uses_model_default(self):
+        """Even on the diffusers backend, server-based image warmup uses the
+        model default resolution rather than the diffusers image area budget."""
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.backend = "diffusers"
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
+
+        sampling_defaults = SamplingParams(width=1024, height=1024)
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
                 server_based_warmup=True,
             )
 
@@ -249,13 +584,11 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
-        task_type = MagicMock()
-        task_type.requires_image_input.return_value = False
-        task_type.accepts_image_input.return_value = False
-        task_type.is_image_gen.return_value = False
-        task_type.data_type.return_value = ModelTaskType.T2V.data_type()
-        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
 
         sampling_defaults = SamplingParams(
             width=832,
@@ -270,24 +603,154 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
-        self.assertEqual(reqs[0].num_inference_steps, 1)
-        self.assertEqual(reqs[0].num_frames, 81)
+        self.assertEqual(reqs[0].num_inference_steps, 2)
+        self.assertEqual(reqs[0].num_frames, 17)
 
-    def test_server_based_warmup_keeps_lightweight_image_fallback(self):
+    def test_video_warmup_preserves_model_frame_alignment(self):
+        pipeline_config = LongLive2T2VConfig()
+        server_args = SimpleNamespace(
+            pipeline_config=pipeline_config,
+            enable_breakable_cuda_graph=False,
+            pipeline_class_name=None,
+            num_gpus=1,
+        )
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args,
+            LongLive2SamplingParams(),
+            server_based_warmup=True,
+        )
+
+        temporal_scale = pipeline_config.vae_config.arch_config.scale_factor_temporal
+        latent_frames = (num_frames - 1) // temporal_scale + 1
+        self.assertEqual(num_frames, 29)
+        self.assertEqual(
+            latent_frames % pipeline_config.dit_config.arch_config.num_frames_per_block,
+            0,
+        )
+
+    def test_breakable_cuda_graph_uses_explicit_warmup_num_frames(self):
+        pipeline_config = MagicMock()
+        pipeline_config.task_type = ModelTaskType.T2V
+        pipeline_config.adjust_num_frames.side_effect = lambda value: value
+        server_args = SimpleNamespace(
+            pipeline_config=pipeline_config,
+            enable_breakable_cuda_graph=True,
+            pipeline_class_name=None,
+            num_gpus=1,
+            warmup_num_frames=17,
+        )
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args,
+            SamplingParams(num_frames=81),
+            server_based_warmup=True,
+        )
+
+        self.assertEqual(num_frames, 17)
+        pipeline_config.adjust_num_frames.assert_called_once_with(17)
+
+    def test_server_based_warmup_uses_video_supported_resolution_budget(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
-        task_type = MagicMock()
-        task_type.requires_image_input.return_value = False
-        task_type.accepts_image_input.return_value = False
-        task_type.is_image_gen.return_value = True
-        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
-        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            num_inference_steps=35,
+            supported_resolutions=[
+                (1280, 720),
+                (720, 1280),
+                (832, 480),
+                (480, 832),
+                (1024, 1024),
+            ],
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual((reqs[0].width, reqs[0].height), (832, 480))
+        self.assertEqual(reqs[0].num_frames, 17)
+        self.assertEqual(reqs[0].num_inference_steps, 2)
+
+    def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
+        server_args.pipeline_class_name = "LTX2TwoStageHQPipeline"
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.vae_scale_factor = 32
+        server_args.pipeline_config.vae_config = SimpleNamespace(
+            use_temporal_scaling_frames=True,
+            arch_config=SimpleNamespace(temporal_compression_ratio=8),
+        )
+        server_args.pipeline_config.adjust_num_frames.return_value = 25
+        server_args.num_gpus = 2
+
+        sampling_defaults = SamplingParams(
+            width=1920,
+            height=1088,
+            num_frames=121,
+            num_inference_steps=15,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual((reqs[0].width, reqs[0].height), (832, 448))
+        self.assertEqual(reqs[0].width % 64, 0)
+        self.assertEqual(reqs[0].height % 64, 0)
+        self.assertEqual(reqs[0].num_frames, 25)
+        server_args.pipeline_config.adjust_num_frames.assert_called_once_with(25)
+
+    def test_ltx2_two_stage_single_gpu_keeps_generic_frame_cap(self):
+        server_args = MagicMock()
+        server_args.pipeline_class_name = "LTX2TwoStagePipeline"
+        server_args.num_gpus = 1
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args,
+            SamplingParams(num_frames=121),
+            server_based_warmup=True,
+        )
+
+        self.assertEqual(num_frames, 17)
+
+    def test_server_based_warmup_uses_representative_image_fallback(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+
+        server_args.pipeline_config.task_type = ModelTaskType.T2I
 
         with patch(
             "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
@@ -296,14 +759,13 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
         req = reqs[0]
         self.assertEqual(
             (req.width, req.height),
-            DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
+            SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
         )
 
     def test_warmup_image_inclusion_policy_all_task_types(self):
@@ -315,7 +777,12 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ModelTaskType.I2I: True,
             ModelTaskType.I2V: True,
             ModelTaskType.I2M: True,
+            ModelTaskType.VLA_ACTION: False,
         }
+        request_based_expected = {
+            task_type: task_type.accepts_image_input() for task_type in ModelTaskType
+        }
+        request_based_expected[ModelTaskType.VLA_ACTION] = False
 
         for task_type in ModelTaskType:
             server_args = MagicMock()
@@ -328,14 +795,88 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )
             self.assertEqual(
                 should_include_warmup_image(server_args, server_based_warmup=False),
-                task_type.accepts_image_input(),
+                request_based_expected[task_type],
                 task_type.name,
             )
+
+    def test_action_pipeline_skips_synthetic_warmup_before_sampling_defaults(self):
+        server_args = MagicMock()
+        server_args.pipeline_config.task_type = ModelTaskType.VLA_ACTION
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults"
+            ) as get_defaults,
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder._resolve_default_warmup_resolution"
+            ) as resolve_resolution,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs, [])
+        get_defaults.assert_not_called()
+        resolve_resolution.assert_not_called()
+
+    def test_action_pipeline_disables_synthetic_warmup(self):
+        server_args = MagicMock()
+        server_args.warmup_mode = "server"
+        server_args.warmup_resolutions = ["512x512"]
+        server_args.pipeline_config.task_type = ModelTaskType.VLA_ACTION
+
+        self.assertFalse(supports_synthetic_warmup(server_args))
+        self.assertFalse(should_run_synthetic_server_warmup(server_args))
+        self.assertFalse(should_run_explicit_client_warmup(server_args))
+
+    def test_mesh_pipeline_builds_image_conditioned_warmup(self):
+        server_args = MagicMock()
+        server_args.warmup_mode = "server"
+        server_args.warmup_steps = 1
+        server_args.warmup_resolutions = None
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = False
+        server_args.backend = "native"
+        server_args.pipeline_class_name = None
+        server_args.is_arg_explicitly_set.return_value = False
+        server_args.pipeline_config = SimpleNamespace(
+            task_type=ModelTaskType.I2M,
+            supports_auto_residency=True,
+            vae_stride=None,
+            vae_scale_factor=None,
+            vae_config=None,
+        )
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                return_value=SamplingParams(width=512, height=512),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_warmup.is_realtime_serving",
+                return_value=False,
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+            self.assertTrue(should_run_synthetic_server_warmup(server_args))
+
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].data_type, ModelTaskType.I2M.data_type())
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
     def test_server_based_warmup_keeps_ti2i_image_input(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
         server_args.pipeline_config.task_type = ModelTaskType.TI2I
 
         with patch(
@@ -346,16 +887,43 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
+    def test_server_based_warmup_keeps_image_input_count(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(
+                width=512,
+                height=512,
+                image_path=["first.png", "second.png"],
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(
+            reqs[0].image_path,
+            ["/tmp/warmup.png", "/tmp/warmup.png"],
+        )
+
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
         server_args.pipeline_config.task_type = ModelTaskType.I2I
 
         with patch(
@@ -366,7 +934,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -376,6 +943,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
         server_args.pipeline_config.task_type = ModelTaskType.TI2V
 
         with patch(
@@ -386,7 +955,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 

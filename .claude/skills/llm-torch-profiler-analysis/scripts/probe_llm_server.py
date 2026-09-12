@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--framework",
         required=True,
-        choices=("sglang", "vllm", "trtllm"),
+        choices=("sglang", "vllm", "trtllm", "tokenspeed"),
         help="Serving framework.",
     )
     parser.add_argument(
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="OpenAI model id. Auto-discovered for vLLM and TensorRT-LLM when omitted.",
+        help="OpenAI model id. Auto-discovered for vLLM, TensorRT-LLM, and TokenSpeed when omitted.",
     )
     parser.add_argument(
         "--requests",
@@ -153,7 +153,7 @@ def openai_request(
 def run_probe(args: argparse.Namespace) -> Dict[str, Any]:
     prompts = args.prompt or list(DEFAULT_PROMPTS)
     model = args.model
-    if args.framework in {"vllm", "trtllm"} and not model:
+    if args.framework in {"vllm", "trtllm", "tokenspeed"} and not model:
         model = discover_openai_model(args.url, timeout=args.timeout)
 
     latencies: List[float] = []

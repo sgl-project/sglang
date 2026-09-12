@@ -4,19 +4,12 @@
 from typing import Optional
 
 import torch
-from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV2Model
+from sglang.srt.models.deepseek_v2 import DeepseekV2Model
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -31,50 +24,17 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        nn.Module.__init__(self)
-
-        self.config = config
-        self.vocab_size = config.vocab_size
-        assert get_pp_group().world_size == 1
-        self.pp_group = get_pp_group()
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
-        )
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=add_prefix("embed_tokens", prefix),
-        )
-
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config=config,
-                    prefix=add_prefix(prefix, f"layers.{i}"),
-                    quant_config=quant_config,
-                    layer_id=i,
-                    dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
-                    mla_enable_prefill_cp=self.mla_enable_prefill_cp,
-                )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
-        self.start_layer = 0
-        self.end_layer = self.config.num_hidden_layers
+        super().__init__(config, quant_config, prefix=prefix)
+        assert self.pp_group.world_size == 1
 
         self.fc = RowParallelLinear(
-            self.config.hidden_size * 2,
-            self.config.hidden_size,
+            config.hidden_size * 2,
+            config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix(prefix, "fc"),
+            prefix=add_prefix("fc", prefix),
             input_is_parallel=False,
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture = []
-        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
     def forward(
         self,

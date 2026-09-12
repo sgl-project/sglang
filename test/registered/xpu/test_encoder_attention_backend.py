@@ -40,7 +40,6 @@ class TestEncoderAttention(CustomTestCase):
             "--mm-attention-backend",
             "xpu_attn",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -128,7 +127,6 @@ class TestEncoderAttention_Triton(TestEncoderAttention):
             "--mm-attention-backend",
             "triton_attn",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

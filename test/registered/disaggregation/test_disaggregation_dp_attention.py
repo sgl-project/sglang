@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=191, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):

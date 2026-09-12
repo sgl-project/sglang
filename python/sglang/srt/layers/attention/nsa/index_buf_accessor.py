@@ -3,8 +3,8 @@ import warnings
 
 warnings.warn(
     "sglang.srt.layers.attention.nsa.index_buf_accessor is deprecated; "
-    "use sglang.srt.layers.attention.dsa.index_buf_accessor instead.",
+    "use sglang.kernels.ops.attention.dsa.index_buf_accessor instead.",
     DeprecationWarning,
     stacklevel=2,
 )
-from sglang.srt.layers.attention.dsa.index_buf_accessor import *  # noqa: F401, F403
+from sglang.kernels.ops.attention.dsa.index_buf_accessor import *  # noqa: F401, F403

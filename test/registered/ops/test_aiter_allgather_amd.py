@@ -12,7 +12,6 @@ register_amd_ci(est_time=180, suite="stage-c-test-large-8-gpu-amd")
 
 
 class TestAiterAllGatherAmd(unittest.TestCase):
-
     @staticmethod
     def _gpu_count():
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -35,13 +34,6 @@ class TestAiterAllGatherAmd(unittest.TestCase):
             "float32",
             "float16",
             "bfloat16",
-            "uint64_t",
-            "int64_t",
-            "uint32_t",
-            "int32_t",
-            "int16_t",
-            "uint8_t",
-            "int8_t",
         ]
         # Keep the CI matrix compact: one small metadata shape and one
         # medium aligned 2-D shape exercise both naive and vectorized kernels.

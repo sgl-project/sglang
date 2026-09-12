@@ -18,11 +18,13 @@ from sglang.srt.compilation.compile_phase import (
     is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
-from sglang.srt.utils import is_hip
+from sglang.srt.model_executor.runner_utils.pool import (
+    graph_pool_capture_scope,
+    graph_pool_replay_scope,
+)
 from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
-_is_hip = is_hip()
 
 
 @dataclasses.dataclass
@@ -43,7 +45,6 @@ class ConcreteSizeEntry:
 
 
 class CUDAPiecewiseBackend:
-
     def __init__(
         self,
         graph: fx.GraphModule,
@@ -155,22 +156,21 @@ class CUDAPiecewiseBackend:
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
             # set_pcg_capture_stream() guarantees a valid stream. However,
-            # Dynamo may silently recompile on HIP/MLA serving batches whose
-            # token count exceeds the captured range. The replacement backend
-            # has no capture stream; fall back there instead of crashing while
-            # preserving the original assertion on other platforms.
+            # Dynamo may silently recompile serving batches when a dynamic
+            # multimodal input introduces a previously unseen guard. The
+            # replacement backend has no capture stream, so it cannot safely
+            # create a CUDA graph. Execute that subgraph normally instead of
+            # crashing the scheduler; subsequent matching shapes still use
+            # their captured graphs.
             stream = get_pcg_capture_stream()
-            if _is_hip and stream is None:
+            if stream is None:
                 print_warning_once(
-                    "PCG capture stream is not set; likely a Dynamo runtime "
-                    "recompilation. Falling back to eager execution for this "
+                    "PCG capture stream is not set. This can be a Dynamo runtime "
+                    "recompilation or an optional VLM branch pre-warmed outside "
+                    "CUDA graph capture; falling back to eager execution for this "
                     "subgraph."
                 )
                 return entry.runnable(*args)
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
-
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -189,7 +189,10 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
+                with (
+                    graph_pool_capture_scope(),
+                    torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream),
+                ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
@@ -221,5 +224,6 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
-        entry.cudagraph.replay()
+        with graph_pool_replay_scope():
+            entry.cudagraph.replay()
         return entry.output
