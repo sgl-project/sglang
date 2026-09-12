@@ -46,6 +46,7 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.quantization import fp8_hip
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -858,6 +859,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif backend.is_gfx95():
+            fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
@@ -1056,6 +1059,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if _is_hip:
+            if self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+                return fp8_hip.apply_dense(self, layer, x, bias)
+            x = fp8_hip.unwrap_activation(x)
 
         if self.use_mxfp8 or (
             self.block_fp8_as_mxfp8
