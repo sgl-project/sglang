@@ -106,7 +106,7 @@ class HybridCacheController(BaseHiCacheController):
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        transfer_layer_id_limit: Optional[int] = None,
+        transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
     ):
@@ -133,11 +133,11 @@ class HybridCacheController(BaseHiCacheController):
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
         if (
-            transfer_layer_id_limit is not None
-            and transfer_layer_id_limit != self.transfer_layer_id_limit
+            transfer_layer_id_max is not None
+            and transfer_layer_id_max != self.transfer_layer_id_max
         ):
-            self.transfer_layer_id_limit = transfer_layer_id_limit
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_limit)
+            self.transfer_layer_id_max = transfer_layer_id_max
+            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -439,7 +439,7 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             for depth, draft_device_pool in enumerate(entry.packed_draft_device_pools):
                 draft_host_layer = target_transfer.layer_mapper(
-                    self.transfer_layer_id_limit + depth
+                    self.transfer_layer_id_max + depth
                 )
                 if draft_host_layer is None:
                     continue
