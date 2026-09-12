@@ -53,10 +53,10 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
-    if backend == "cute-dsl":
+    if backend == "cutedsl":
         if not get_platform().is_sm100:
             raise ValueError(
-                "FlashInfer allreduce fusion cute-dsl backend requires a "
+                "FlashInfer allreduce fusion cutedsl backend requires a "
                 "Blackwell system."
             )
         return backend
@@ -90,7 +90,7 @@ def uses_cutedsl_ar_fusion() -> bool:
     """Whether the CuTe DSL backend is selected. It owns both fusion patterns
     through its own workspace, so the legacy TRTLLM/MNNVL workspace, its group
     tagging and its dispatch all stand down."""
-    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
 
 
 def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:

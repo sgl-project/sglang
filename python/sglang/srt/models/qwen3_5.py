@@ -170,7 +170,7 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(
-        get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
+        get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
         or is_shared_experts_fusion_disabled()
     )
 
@@ -206,7 +206,7 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     return bool(
         not is_nextn
         and config.model_type == "qwen3_5_moe_text"
-        and get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
     )
 
 

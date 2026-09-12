@@ -344,7 +344,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             inplace=not _needs_hidden_after_experts,
             enable_qwen35_fp8_deferred_finalize=(
                 config.model_type == "qwen3_5_moe_text"
-                and get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
+                and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
             ),
         )
 

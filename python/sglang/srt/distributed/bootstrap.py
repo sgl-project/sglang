@@ -205,7 +205,7 @@ def _set_all_reduce_flags() -> None:
 
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None
-        # cute-dsl has no legacy workspace for tagged groups to reduce over.
+        # cutedsl has no legacy workspace for tagged groups to reduce over.
         and not uses_cutedsl_ar_fusion()
     )
 

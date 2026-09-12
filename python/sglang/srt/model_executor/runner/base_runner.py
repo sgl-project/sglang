@@ -284,7 +284,7 @@ class BaseRunner(ABC):
             uses_cutedsl_ar_fusion,
         )
 
-        # cute-dsl builds its own workspace from the model's pre-capture hook.
+        # cutedsl builds its own workspace from the model's pre-capture hook.
         if (
             get_exec().comm.flashinfer_allreduce_fusion_backend is None
             or uses_cutedsl_ar_fusion()

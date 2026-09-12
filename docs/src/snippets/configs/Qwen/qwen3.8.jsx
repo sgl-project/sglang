@@ -412,7 +412,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 16",
         "--kv-cache-dtype fp8_e4m3",
         "--attention-backend trtllm_mha",
@@ -492,7 +492,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 8",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
@@ -673,7 +673,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 8",
         "--moe-runner-backend flashinfer_trtllm",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -819,7 +819,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 16",
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
@@ -846,7 +846,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 8",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
@@ -906,7 +906,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--flashinfer-allreduce-fusion-backend cute-dsl",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--tp-size 8",
         "--context-length 200000",
         "--preferred-sampling-params '{\"top_k\": 20}'",

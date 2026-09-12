@@ -1192,7 +1192,7 @@ class Envs:
     # Deferring trades the GEMM2 in-epilogue reduction for an HBM round trip of
     # the [M*top_k, hidden] permuted output, so it only pays at small M. 0
     # disables the bound. Measured crossover on GLM-5.2 H=6144/top_k=8 TP8 B300
-    # with the cute-dsl backend, where the finalize folds into the collective:
+    # with the cutedsl backend, where the finalize folds into the collective:
     # -8.4% TPOT at M=16, neutral at 192, +9.3% at 512.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
@@ -1829,7 +1829,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # there is no env var left to forward the value to.
     "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
         note=(
-            "Pass --flashinfer-allreduce-fusion-backend cute-dsl instead. "
+            "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
             "Without it an eligible model auto-enables the legacy mnnvl "
             "backend rather than the CuTe DSL fusion."
         )

@@ -2275,9 +2275,7 @@ class DeepseekV2AttentionMLA(
 
 
 def _use_mnnvl_cutedsl_fusion() -> bool:
-    return (
-        _is_cuda and get_exec().comm.flashinfer_allreduce_fusion_backend == "cute-dsl"
-    )
+    return _is_cuda and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
 
 
 class DeepseekV2DecoderLayer(nn.Module):

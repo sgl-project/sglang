@@ -199,7 +199,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
-        # cute-dsl runs its own fused path from the fusion communicator.
+        # cutedsl runs its own fused path from the fusion communicator.
         and not uses_cutedsl_ar_fusion()
         and not is_flashinfer_allreduce_unavailable()
         # Symbolic size checks stay last: under Dynamo tracing they guard on
