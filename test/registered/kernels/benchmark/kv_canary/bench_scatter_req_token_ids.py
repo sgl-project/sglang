@@ -49,19 +49,20 @@ _X_NAMES = ["bs", "seq_len"]
 _X_VALS = [(c.bs, c.seq_len) for c in _build_cases()]
 
 
-def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
+def _inputs_from_lens(lens: torch.Tensor, device: torch.device) -> dict:
+    """Build kernel inputs from a per-req length vector (uniform or skewed)."""
+    bs = int(lens.shape[0])
     max_reqs = max(bs + 1, 4)
-    max_context_len = max(seq_len + 1, 1)
-    total_tokens = bs * seq_len
+    max_context_len = max(int(lens.max().item()) + 1, 1) if bs else 1
+    total_tokens = int(lens.sum().item())
 
     flat = torch.randint(
         low=0,
         high=1 << 30,
-        size=(total_tokens,),
+        size=(max(total_tokens, 1),),
         dtype=torch.int64,
         device=device,
-    )
-    lens = torch.full((bs,), seq_len, dtype=torch.int64, device=device)
+    )[:total_tokens]
     offsets = torch.zeros(bs + 1, dtype=torch.int64, device=device)
     offsets[1:] = torch.cumsum(lens, dim=0)
 
@@ -73,6 +74,41 @@ def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
         req_pool_indices=req_pool_indices,
         pool_out=pool,
     )
+
+
+def _build_inputs(*, bs: int, seq_len: int, device: torch.device) -> dict:
+    lens = torch.full((bs,), seq_len, dtype=torch.int64, device=device)
+    return _inputs_from_lens(lens, device)
+
+
+# Skewed workloads: a few long requests among many short/empty ones. These are the
+# shapes the (request, column-block) grid + per-request early-return are designed for,
+# and that the uniform bs x seq_len grid above does not cover.
+_SKEWED_FULL: list[str] = [
+    "one_long_among_short_bs256",
+    "one_long_among_short_bs64",
+    "few_long_among_short_bs256",
+    "many_medium_bs256",
+]
+_SKEWED_CI: list[str] = ["one_long_among_short_bs256", "many_medium_bs256"]
+
+
+def _build_skewed_lens(name: str, device: torch.device) -> torch.Tensor:
+    g = torch.Generator(device=device).manual_seed(0)
+    if name == "one_long_among_short_bs256":
+        lens = torch.randint(0, 4, (256,), generator=g, device=device)
+        lens[128] = 32768
+    elif name == "one_long_among_short_bs64":
+        lens = torch.randint(0, 4, (64,), generator=g, device=device)
+        lens[32] = 32768
+    elif name == "few_long_among_short_bs256":
+        lens = torch.randint(0, 4, (256,), generator=g, device=device)
+        lens[::64] = 16384
+    elif name == "many_medium_bs256":
+        lens = torch.full((256,), 64, dtype=torch.int64, device=device)
+    else:
+        raise ValueError(f"unknown skewed workload {name}")
+    return lens.to(torch.int64)
 
 
 @triton.testing.perf_report(
@@ -95,5 +131,28 @@ def benchmark(bs: int, seq_len: int, provider: str) -> tuple[float, float, float
     )
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["workload"],
+        x_vals=get_benchmark_range(full_range=_SKEWED_FULL, ci_range=_SKEWED_CI),
+        line_arg="provider",
+        line_vals=["triton"],
+        line_names=["Triton"],
+        styles=[("green", "-")],
+        ylabel="time (us)",
+        plot_name="kv-canary-scatter-req-token-ids-skewed",
+        args={},
+    )
+)
+def benchmark_skewed(workload: str, provider: str) -> tuple[float, float, float]:
+    device = torch.device(DEFAULT_DEVICE)
+    lens = _build_skewed_lens(workload, device)
+    inputs = _inputs_from_lens(lens, device)
+    return run_benchmark_no_cudagraph(
+        lambda: launch_scatter_req_token_ids_kernel(**inputs)
+    )
+
+
 if __name__ == "__main__":
     benchmark.run(print_data=True)
+    benchmark_skewed.run(print_data=True)
