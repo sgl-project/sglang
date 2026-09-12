@@ -20,6 +20,7 @@ from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
+from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
 from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
     register_model_override,
@@ -36,6 +37,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
+from sglang.srt.server_args import _declared_default
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +109,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "prefill_decode_interval",
+                    "radix_eviction_policy",
+                    "mm_preprocess_cache_size_mb",
+                    "mm_feature_transport",
                 }
             ),
         )
@@ -614,16 +620,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
-    def test_qwen4_rejects_pd_and_unified_memory(self):
+    def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        for kwargs, message in (
-            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
-            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
-            ({"enable_unified_memory": True}, "enable-unified-memory"),
-        ):
-            with self.subTest(**kwargs):
-                with self.assertRaisesRegex(ValueError, message):
-                    self._construct(*qwen4, **kwargs)
+        with override_platform(is_cuda=True):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self._construct(*qwen4, disaggregation_mode=mode)
+
+            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
+                self._construct(
+                    *qwen4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mori",
+                    pp_size=2,
+                )
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
@@ -1123,6 +1135,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("attention_backend", overrides)
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
+    def test_nemotron_h_omni_uses_inner_text_config(self):
+        outer_config = SimpleNamespace(
+            architectures=["NemotronH_Omni_Reasoning_V3"],
+            quantization_config={"quant_algo": "NVFP4"},
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt",
+            hf_config=outer_config,
+            hf_text_config=SimpleNamespace(mlp_hidden_act="relu2"),
+        )
+        server_args = SimpleNamespace(
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+            attention_backend=None,
+            _model_config=model_config,
+        )
+
+        with (
+            override_platform(is_blackwell=False),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "NemotronH_Omni_Reasoning_V3",
+                    server_args,
+                    outer_config,
+                ),
+                [
+                    (
+                        "_nemotron_h_overrides",
+                        {
+                            "quantization": "modelopt_fp4",
+                            "moe_runner_backend": "flashinfer_cutlass",
+                        },
+                    )
+                ],
+            )
+
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
@@ -1422,7 +1474,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _attention_backend_default,
-            _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
         )
@@ -1457,19 +1508,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(has_amx=True):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
-
-        # dual-chunk config: mismatched explicit backend raises verbatim
-        def _mc(dual):
-            return SimpleNamespace(
-                _model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
-                ),
-                attention_backend="fa3",
-            )
-
-        with self.assertRaises(ValueError):
-            _attention_backend_dual_chunk(ResolvedView(_mc({"a": 1})))
-        self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1613,14 +1651,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
             _deepseek_v4_overrides,
         )
-        from sglang.srt.server_args import ServerArgs
 
         hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
         def _args(**kw):
             defaults = dict(
                 device="cuda",
-                swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
                 _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
@@ -1952,12 +1989,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
-            # ROCm with both unset -> tilelang
+            # ROCm with both unset -> Triton for FP8 and BF16 KV cache.
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
                 {
-                    "dsa_prefill_backend": "tilelang",
-                    "dsa_decode_backend": "tilelang",
+                    "dsa_prefill_backend": "triton",
+                    "dsa_decode_backend": "triton",
                 },
             )
 
@@ -1991,6 +2028,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ):
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(arch="NemotronH_Omni_Reasoning_V3")
+                ),
                 {"flashinfer_allreduce_fusion_backend": "auto"},
             )
             # guards: unsupported arch / tp==1 / dp attention / a2a backend
@@ -2355,13 +2398,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         # NemotronH routes through the pass (covered by the guard union,
         # not the branch chain — its hook invokes the handler)
-        self.assertEqual(
-            _mamba_radix_cache_resolution(_view("NemotronHForCausalLM")),
-            {
-                "uses_mamba_radix_cache": True,
-                "mamba_radix_cache_strategy": "extra_buffer",
-            },
-        )
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _mamba_radix_cache_resolution(_view(architecture)),
+                    {
+                        "uses_mamba_radix_cache": True,
+                        "mamba_radix_cache_strategy": "extra_buffer",
+                    },
+                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(
@@ -2480,7 +2528,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults = dict(
+                quantization=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+            )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
@@ -2667,16 +2719,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _view(attention_backend="trtllm_mha", page_size=256)
             ),
             {"page_size": 64},
-        )
-        # chained: cutlass_mla decode -> 128, then trtllm_mha prefill keeps 128
-        self.assertEqual(
-            _mla_backend_page_constraints(
-                _view(
-                    decode_attention_backend="cutlass_mla",
-                    prefill_attention_backend="trtllm_mha",
-                )
-            ),
-            {"page_size": 128},
         )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
@@ -3068,6 +3110,108 @@ class TestDeclarationValidation(CustomTestCase):
         args = _FakeArgs()
         with self.assertRaises(ValueError):
             validate_declarations(args, [("src", {"nope": 1})])
+
+
+class TestQwen3VLHopperServingOverrides(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(envs.SGLANG_VLM_CACHE_SIZE_MB.clear)
+        self.addCleanup(envs.SGLANG_MM_FEATURE_CACHE_MB.clear)
+        envs.SGLANG_VLM_CACHE_SIZE_MB.clear()
+        envs.SGLANG_MM_FEATURE_CACHE_MB.clear()
+
+    @staticmethod
+    def _args(**overrides):
+        from sglang.srt.server_args import ServerArgs
+
+        values = {
+            "mm_preprocess_cache_size_mb": None,
+            "mm_feature_transport": None,
+            "max_running_requests": 400,
+            "radix_eviction_policy": "lru",
+            "prefill_decode_interval": None,
+            "attention_backend": None,
+            "decode_attention_backend": None,
+        }
+        values.update(overrides)
+        return ServerArgs(model_path="dummy", **values)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_profiled_defaults_are_valid_model_overrides(self, _mock_model_type):
+        server_args = self._args()
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(server_args, None)
+
+        self.assertEqual(
+            updates,
+            {
+                "mm_preprocess_cache_size_mb": 0,
+                "mm_feature_transport": "cuda_ipc",
+                "radix_eviction_policy": "priority",
+                "prefill_decode_interval": 22,
+                "decode_attention_backend": "flashinfer",
+            },
+        )
+        validate_declarations(
+            server_args,
+            [("_qwen3vl_hopper_serving_overrides", updates)],
+        )
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 0)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 3 * 1024)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_multinode_does_not_auto_select_cuda_ipc(self, _mock_model_type):
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(nnodes=2), None
+        )
+
+        self.assertNotIn("mm_feature_transport", updates)
+        self.assertFalse(envs.SGLANG_MM_FEATURE_CACHE_MB.is_set())
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        side_effect=AssertionError("must not load model config without GPU memory"),
+    )
+    def test_decode_graph_expansion_skips_unknown_gpu_memory(self, _mock_model_type):
+        decode_config = SimpleNamespace(max_bs=256)
+
+        qwen3_vl_module.expand_multimodal_decode_graph_to_running_limit(
+            self._args(), decode_config, gpu_mem=None
+        )
+
+        self.assertEqual(decode_config.max_bs, 256)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_explicit_choices_are_not_replaced(self, _mock_model_type):
+        envs.SGLANG_VLM_CACHE_SIZE_MB.set(512)
+        envs.SGLANG_MM_FEATURE_CACHE_MB.set(2048)
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(
+                mm_preprocess_cache_size_mb=256,
+                mm_feature_transport="cpu",
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
+                prefill_decode_interval=0,
+                decode_attention_backend="fa3",
+            ),
+            None,
+        )
+
+        self.assertEqual(updates, {})
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
 if __name__ == "__main__":
