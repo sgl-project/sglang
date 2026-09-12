@@ -767,6 +767,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
     @staticmethod
     def _prepare_scheduler(scheduler):
+        scheduler.scheduler_stage_metrics = None
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
         scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())

@@ -424,6 +424,7 @@ async def edits(
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
+    perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -484,6 +485,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            perf_dump_path=perf_dump_path,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

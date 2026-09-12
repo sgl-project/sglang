@@ -28,10 +28,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
 # 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
 # layer):
-#   rawv hv*RL*v_dim, rawk h_k*RL*k_dim  -> conv dtype
-#   g    hv*RL (GDN) / hv*RL*k_dim (KDA) -> fp32
-#   beta hv*RL                           -> fp32
-#   d/k  like rawv/rawk                  -> conv dtype (KDA only)
+# GDN stores compact d/k plus scalar g. KDA stores raw v/k, vector g, beta,
+# and its existing d/k rings.
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -44,7 +42,7 @@ def _kda_params():
     return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
 
 
-def _gdn_params():
+def _gdn_params(temporal_dtype=torch.float32):
     # Only shape.temporal and shape.num_k_heads_per_tp are read here; the rest
     # are dummy (the accounting does not depend on them).
     shape = Mamba2StateShape(
@@ -59,15 +57,20 @@ def _gdn_params():
         conv_kernel=0,
         num_k_heads_per_tp=4,
     )
-    return Mamba2CacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
+    dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=temporal_dtype)
+    return Mamba2CacheParams(shape=shape, dtype=dtype, layers=LAYERS)
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
     def test_gdn_fold(self):
-        # fold window: rawv 512 + rawk 512 + g(scalar, 4*8*4) 128 + beta 128 = 1280
+        # d 512 + normalized k 512 + scalar g 128 + d/k low parts 1024 = 2176
         self.assertEqual(
             _gdn_params().replayssm_ring_bytes_per_req(record_len=RL),
-            1280 * len(LAYERS),
+            2176 * len(LAYERS),
+        )
+        self.assertEqual(
+            _gdn_params(torch.bfloat16).replayssm_ring_bytes_per_req(record_len=RL),
+            2176 * len(LAYERS),
         )
 
     def test_kda_fold(self):

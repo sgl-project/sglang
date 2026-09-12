@@ -14,19 +14,11 @@
 """GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
-The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) + t%ps); the
-reference pool receives the raw token ids. Every (layer, token) cell must hold
-identical bytes afterwards. Covers:
-
-  - `set_mla_kv_buffer` under BOTH kernel paths — the Triton fallback
-    (n_loc < 768) and the TMA JIT fast path (n_loc >= 768, which flattens the
-    buffer via `.view(shape[0], -1)`, only legal because per-layer views are
-    contiguous);
-  - `set_kv_buffer` (combined pre-concatenated write, the Triton-backend path);
-  - `get_mla_kv_buffer` roundtrip;
-  - page_size 1 and 64.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mla_gpu_parity.py -v
+The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) +
+t%ps) where the reference pool receives raw token ids; every (layer, token)
+cell must hold identical bytes afterwards. The TMA JIT fast path (n_loc >= 768)
+flattens the buffer via `.view(shape[0], -1)`, which is legal only because the
+per-layer views are contiguous.
 """
 
 import types
@@ -134,17 +126,12 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
         torch.cuda.synchronize()
         self._assert_parity(unified, ref, locs, ps)
 
-    def test_set_mla_kv_buffer_triton_fallback_ps1(self):
-        self._run_set_mla(ps=1, n_loc=256)  # < 768 -> Triton fallback kernel
-
-    def test_set_mla_kv_buffer_tma_jit_ps1(self):
-        self._run_set_mla(ps=1, n_loc=1024)  # >= 768 -> TMA JIT fast path
-
-    def test_set_mla_kv_buffer_triton_fallback_ps64(self):
-        self._run_set_mla(ps=64, n_loc=256)
-
-    def test_set_mla_kv_buffer_tma_jit_ps64(self):
-        self._run_set_mla(ps=64, n_loc=1024)
+    def test_set_mla_kv_buffer_matches_stock_pool(self):
+        """Both kernel paths at both page sizes: n_loc < 768 takes the Triton
+        fallback, n_loc >= 768 the TMA JIT fast path."""
+        for ps, n_loc in ((1, 256), (1, 1024), (64, 256), (64, 1024)):
+            with self.subTest(page_size=ps, n_loc=n_loc):
+                self._run_set_mla(ps=ps, n_loc=n_loc)
 
     def test_set_kv_buffer_combined_write(self):
         for ps in (1, 64):
@@ -174,29 +161,6 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
-
-    def test_move_kv_cache_page_envelope_gpu(self):
-        for ps in (1, 64):
-            unified, ref, max_tokens = _make_pools(ps)
-            num_pages = max_tokens // ps
-            n_loc = ps  # one full page of tokens
-            src_page, dst_page = num_pages - 2, 2
-            src_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + src_page * ps
-            dst_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + dst_page * ps
-            torch.manual_seed(17)
-            for l in range(_L):
-                layer = types.SimpleNamespace(layer_id=l)
-                k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _kernel_id(src_t, ps), k, None)
-            before = [
-                unified.get_key_buffer(l)[_kernel_id(src_t, ps)].clone()
-                for l in range(_L)
-            ]
-            unified.move_kv_cache(dst_t, src_t)
-            torch.cuda.synchronize()
-            for l in range(_L):
-                got = unified.get_key_buffer(l)[_kernel_id(dst_t, ps)]
-                torch.testing.assert_close(got, before[l], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

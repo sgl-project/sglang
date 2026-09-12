@@ -9,7 +9,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=3600, suite="base-c-test-perf-8-npu-a3")
 register_npu_ci(est_time=3600, suite="nightly-perf-8-npu-a3", nightly=True)
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {

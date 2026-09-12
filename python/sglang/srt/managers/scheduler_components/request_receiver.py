@@ -32,12 +32,16 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_RECV_REQUESTS,
+    SchedulerStageMetricsRecorder,
+    scheduler_stage_method,
+)
 from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -73,13 +77,14 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    @scheduler_nvtx_method("scheduler.recv_requests")
+    @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:

@@ -75,6 +75,17 @@ def _make_tools():
     ]
 
 
+class _Hy4Tokenizer:
+    def get_vocab(self):
+        return {
+            "<tool_calls:opensource>": 1,
+            "<tool_call:opensource>": 2,
+            "<arg_key:opensource>": 3,
+            "<arg_value:opensource>": 4,
+            "<think:opensource>": 5,
+        }
+
+
 class TestHunyuanDetectorHasToolCall(CustomTestCase):
     def setUp(self):
         self.detector = HunyuanDetector()
@@ -110,6 +121,21 @@ class TestHunyuanDetectorDetectAndParse(CustomTestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
+
+    def test_hy4_format_without_tool_separator(self):
+        detector = HunyuanDetector(_Hy4Tokenizer())
+        text = (
+            "<tool_calls:opensource>"
+            "<tool_call:opensource>get_weather"
+            "<arg_key:opensource>city</arg_key:opensource>"
+            "<arg_value:opensource>Beijing</arg_value:opensource>"
+            "</tool_call:opensource></tool_calls:opensource>"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Beijing"})
 
     def test_zero_arg_inline(self):
         text = (
@@ -293,6 +319,43 @@ class TestHunyuanDetectorArgDeserialization(CustomTestCase):
         args = json.loads(result.calls[0].parameters)
         self.assertIs(args["verbose"], True)
 
+    def test_top_level_composed_schema_args(self):
+        cases = (
+            ("anyOf", {"type": "integer"}, "7", 7),
+            ("oneOf", {"type": "boolean"}, "true", True),
+            ("allOf", {"type": "array", "items": {"type": "integer"}}, "[1,2]", [1, 2]),
+        )
+        for keyword, arg_schema, raw_value, expected in cases:
+            with self.subTest(keyword=keyword):
+                function_name = f"composed_{keyword}"
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=function_name,
+                            description="Composed schema",
+                            parameters={
+                                keyword: [
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": arg_schema},
+                                    }
+                                ]
+                            },
+                        ),
+                    )
+                ]
+                text = (
+                    f"<tool_calls><tool_call>{function_name}<tool_sep>"
+                    f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value>"
+                    "</tool_call></tool_calls>"
+                )
+
+                result = self.detector.detect_and_parse(text, tools)
+                args = json.loads(result.calls[0].parameters)
+
+                self.assertEqual(args, {"value": expected})
+
     def test_string_arg_not_deserialized(self):
         """String-typed args should stay as strings even if they look like JSON."""
         text = (
@@ -358,6 +421,23 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(collected[0]["name"], "get_current_date")
         self.assertEqual(json.loads(collected[0]["parameters"]), {})
+
+    def test_hy4_format_without_tool_separator_char_by_char(self):
+        detector = HunyuanDetector(_Hy4Tokenizer())
+        text = (
+            "<tool_calls:opensource>"
+            "<tool_call:opensource>get_weather"
+            "<arg_key:opensource>city</arg_key:opensource>"
+            "<arg_value:opensource>Tokyo</arg_value:opensource>"
+            "</tool_call:opensource></tool_calls:opensource>"
+        )
+        all_calls = []
+        for char in text:
+            all_calls.extend(detector.parse_streaming_increment(char, self.tools).calls)
+
+        collected = _collect_streamed_tool_calls(all_calls)
+        self.assertEqual(collected[0]["name"], "get_weather")
+        self.assertEqual(json.loads(collected[0]["parameters"]), {"city": "Tokyo"})
 
     def test_chunked_tool_call(self):
         detector = self._new_detector()

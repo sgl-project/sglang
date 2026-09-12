@@ -121,6 +121,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
                 fused: None,
                 eligibility: None,
             },

@@ -692,7 +692,7 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
-DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+DSpark currently requires CUDA and `pp_size == 1`. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The MI355X Flash Official recipes therefore run target-only, and so do the DP-Attention recipes in the Deploy panel — for a DP-Attention configuration that does run DSpark, see the [agentic recipe below](#3-6-agentic-long-context-with-hicache-dram-offload-b200-fp4-dspark). If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
 
 ### 3.5 Vision (Image Inputs)
 
@@ -734,3 +734,64 @@ Pending update...
 ```
 
 </Accordion>
+
+### 3.6 Agentic Long-Context with HiCache DRAM Offload (B200 FP4, DSpark)
+
+**TP8, concurrency 8–16:**
+```bash Command
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.90 \
+  --swa-full-tokens-ratio 0.1 \
+  --chunked-prefill-size 8192 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2.75 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+DSv4 HiCache sizes the host tier with `--hicache-ratio` (host/device token ratio), not `--hicache-size`. Concurrency 1–5 runs the same command without the HiCache flags.
+
+**DEP8 (DP Attention), concurrency 64–160:**
+```bash Command
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --ep-size 8 \
+  --moe-a2a-backend megamoe \
+  --enable-w4a4-mxfp4-megamoe \
+  --enable-deepseek-v4-fp4-indexer \
+  --disable-shared-experts-fusion \
+  --disable-flashinfer-autotune \
+  --mem-fraction-static 0.88 \
+  --swa-full-tokens-ratio 0.02 \
+  --chunked-prefill-size 49152 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 8 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+`--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 6144 tokens per rank.

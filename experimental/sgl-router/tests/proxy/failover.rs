@@ -41,6 +41,7 @@ async fn failover_when_one_worker_dies() {
             }),
             cache_aware: None,
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },

@@ -147,6 +147,44 @@ def _load_fused_indexer_wk(
     return True
 
 
+def _load_fused_expert_tensor(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+) -> bool:
+    mappings = (
+        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale_inv", "w13"),
+        (".experts.down_proj_scale", ".experts.w2_weight_scale_inv", "w2"),
+        (".experts.gate_up_proj", ".experts.w13_weight", "w13"),
+        (".experts.down_proj", ".experts.w2_weight", "w2"),
+    )
+    for source, target, shard_id in mappings:
+        if not name.endswith(source):
+            continue
+        param_name = name[: -len(source)] + target
+        param = params_dict.get(param_name)
+        if param is None:
+            return False
+        weight_loader = param.weight_loader
+        for expert_id, expert_weight in enumerate(loaded_weight):
+            if shard_id == "w13":
+                gate, up = expert_weight.chunk(2, dim=0)
+                weight_loader(
+                    param, gate, param_name, shard_id="w1", expert_id=expert_id
+                )
+                weight_loader(param, up, param_name, shard_id="w3", expert_id=expert_id)
+            else:
+                weight_loader(
+                    param,
+                    expert_weight,
+                    param_name,
+                    shard_id="w2",
+                    expert_id=expert_id,
+                )
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -280,6 +318,9 @@ class DeepseekV2WeightLoaderMixin:
                                     >= self.config.num_hidden_layers
                                 ):
                                     continue
+
+                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                    continue
 
                 if "rotary_emb.inv_freq" in name:
                     continue
@@ -594,7 +635,11 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if (
+                    if weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8:
+                        weight_scale = (weight_scale.to(torch.int32) << 23).view(
+                            torch.float32
+                        )
+                    elif (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=(
                                 self.quant_config.weight_block_size
