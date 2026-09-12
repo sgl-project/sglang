@@ -58,6 +58,7 @@ Add these options to your existing compatible MoE launch configuration:
 ```bash
 --moe-a2a-backend nccl_ep \
 --nccl-ep-mode low_latency \
+--dtype bfloat16 \
 --enable-nccl-ep-cuda-graph
 ```
 
@@ -71,7 +72,21 @@ with the same communicator, expert count, hidden size, top-k and dtype. Supporte
 hidden sizes are 2048, 2560, 4096, 5120, 6144, 7168 and 8192; top-k must be at most
 9. This describes the communication input, not a new expert-compute backend.
 
-Prefill runs eagerly. Prefill Graphs, piecewise or breakable decode Graphs,
+NCCL EP sets the expert-parallel size to the tensor-parallel size, so you do not
+need to repeat `--ep` when setting `--tp`. Both eager and Graph execution require
+BF16 inputs and an FP8 or W4A-FP8 expert-compute configuration. The current
+float32 group scales are incompatible with `DEEPGEMM_BLACKWELL` UE8M0 scales;
+the capability check reports this before communicator creation. SM120 with
+float32 group scales remains eligible.
+
+Prefill runs eagerly through LL. After DP divides the chunk size, SGLang limits
+each rank's chunk to `--nccl-ep-num-max-dispatch-tokens-per-rank` (default 1024),
+rounded down to a KV page boundary. Long prompts then run in multiple chunks.
+Unchunked prefill and PP dynamic chunking are unsupported. Decode-only
+disaggregation skips this prefill requirement. SBO/TBO are unsupported for every
+NCCL EP compute backend, including eager execution.
+
+Prefill Graphs, piecewise or breakable decode Graphs,
 speculative decoding, TBO/SBO, PDMux, EPLB, elastic EP, multiple nodes, Torch
 compile and memory saver are outside this initial scope. Unsupported opt-in
 configurations raise an error during setup.

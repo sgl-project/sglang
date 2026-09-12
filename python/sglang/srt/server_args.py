@@ -6366,13 +6366,21 @@ class ServerArgs:
             if reason is not None:
                 if self.enable_nccl_ep_cuda_graph:
                     raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
-                fallback = "deepep" if _deepep_importable() else "none"
+                # Triton consumes standard dispatch output outside NCCL EP;
+                # there is no DeepEP -> Triton format adapter.
+                fallback = (
+                    "deepep"
+                    if resolved_view(self).moe_runner_backend != "triton"
+                    and _deepep_importable()
+                    else "none"
+                )
                 logger.warning(
                     f"NCCL EP MoE requested but unavailable ({reason}); "
                     f"falling back to moe_a2a_backend='{fallback}'. "
                     f"Install nccl4py[cu13] on a CUDA13 + NCCL>=2.29 Hopper/Blackwell box."
                 )
                 self.moe_a2a_backend = fallback
+                run_post_process_pass(self, _a2a_ep_size)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
         if self.enable_waterfill:
@@ -6460,6 +6468,9 @@ class ServerArgs:
                 )
 
         if a2a_backend == "nccl_ep":
+            if self.enable_single_batch_overlap or self.enable_two_batch_overlap:
+                raise ValueError("NCCL EP LL does not support single/two batch overlap")
+            self._handle_nccl_ep_token_budget()
             if not self.enable_nccl_ep_cuda_graph:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
@@ -6468,6 +6479,42 @@ class ServerArgs:
                 f"to be the same as the tensor parallel size[{self.tp_size}]. "
                 f"Only the low-latency (LL) path is implemented; prefill and decode both run through LL."
             )
+
+    def _handle_nccl_ep_token_budget(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK,
+            _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP,
+        )
+
+        budget = self.nccl_ep_num_max_dispatch_tokens_per_rank
+        if not 0 <= budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP:
+            raise ValueError("NCCL EP LL dispatch budget must be in [0, 1024]")
+        budget = budget or _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
+        if self.disaggregation_mode == "decode":
+            return
+        if self.chunked_prefill_size <= 0:
+            raise ValueError(
+                "NCCL EP LL requires chunked prefill; set --chunked-prefill-size"
+            )
+        if self.enable_dynamic_chunking and self.pp_size > 1:
+            raise ValueError("NCCL EP LL does not support PP dynamic chunking")
+
+        # DP has already divided the chunk size. Bound the local scheduler's
+        # budget, including mixed decode tokens, by the native LL capacity.
+        chunk = min(self.chunked_prefill_size, budget)
+        page_size = self._resolved().page_size
+        chunk = chunk // page_size * page_size
+        if chunk <= 0:
+            raise ValueError("NCCL EP LL dispatch budget must fit at least one KV page")
+        if chunk != self.chunked_prefill_size:
+            logger.warning(
+                "NCCL EP LL limits per-rank chunked prefill from %s to %s tokens "
+                "(dispatch budget %s).",
+                self.chunked_prefill_size,
+                chunk,
+                budget,
+            )
+            self.chunked_prefill_size = chunk
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
