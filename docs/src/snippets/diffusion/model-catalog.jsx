@@ -104,6 +104,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
     },
     {
+      name: "SenseNova-U1.5",
+      modelIds: ["sensenova/SenseNova-U1.5-8B-MoT"],
+      cookbook: "/cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT",
+    },
+    {
       name: "GLM-Image",
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
@@ -184,6 +189,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
       ],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+    },
+    {
+      name: "VDN-H3",
+      modelIds: ["OpenVDN/vdn-minimax-h3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
     },
     {
       name: "MOVA",
