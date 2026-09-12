@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -37,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     _dfs_weight_order,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
@@ -123,6 +125,11 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Wall-clock twins of the logical timestamps above. Only the KV age
+        # metrics read them; eviction order keeps using the logical counter.
+        now = time.monotonic()
+        self.last_access_wall = now
+        self.creation_wall = now
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
@@ -882,8 +889,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        now_wall = time.monotonic()
+        observe_kv_age = (
+            self.kv_age_observer is not None and take_kv_age_hit_observation(params)
+        )
         while node_update:
+            if observe_kv_age:
+                self._emit_kv_age(
+                    node_update,
+                    "hit",
+                    "host" if node_update.evicted else "device",
+                    "hit",
+                    now_wall,
+                )
             node_update.last_access_time = cur_time
+            node_update.last_access_wall = now_wall
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -950,8 +970,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
+    def _emit_kv_age(
+        self,
+        node: UnifiedTreeNode,
+        event: str,
+        tier: str,
+        outcome: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Report a node's age to the Controller's KV-age observer, if installed."""
+        observer = self.kv_age_observer
+        if observer is None or node.parent is None or node.key is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        observer(
+            event,
+            tier,
+            outcome,
+            now - node.last_access_wall,
+            now - node.creation_wall,
+            node.hit_count,
+            len(node.key),
+        )
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1301,6 +1346,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
+        new_node.creation_wall = child.creation_wall
+        new_node.last_access_wall = child.last_access_wall
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
         # The rotation base is constant along a chain (position-page P keeps
@@ -1341,6 +1388,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+        child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1557,6 +1605,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # this node being a D-leaf, and D-leaves evict before ancestors.
             assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
             assert desc.write_through_pending_id is None
+            self._emit_kv_age(desc, "evict", "host", "dropped")
             self._release_all_component_layers(
                 desc,
                 StorageMedium.CPU,
@@ -1605,6 +1654,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
+        self._emit_kv_age(node, "evict", "device", "dropped")
         self._release_all_component_layers(
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
@@ -1733,6 +1783,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
+        self._emit_kv_age(node, "evict", "host", "dropped")
         self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
@@ -1768,6 +1819,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         assert not node.evicted and node.backuped
+        self._emit_kv_age(node, "evict", "device", "demoted")
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,

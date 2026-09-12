@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1293,6 +1294,7 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         device_indices = node.value
+        self._observe_kv_eviction(node, len(device_indices), "device", "demoted")
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
         return num_evicted
@@ -1301,6 +1303,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
+        self._observe_kv_eviction(node, len(node.value), "device", "dropped")
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1373,6 +1376,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
+            self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1741,7 +1745,12 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        observe_kv_age = (
+            self.metrics_collector is not None and take_kv_age_hit_observation(params)
+        )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, observe_kv_age=observe_kv_age
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -1855,15 +1864,25 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
+    ):
         node.last_access_time = time.monotonic()
         child_key = key.child_key(self.page_size)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if observe_kv_age:
+                self.metrics_collector.observe_kv_age(
+                    time.monotonic() - child.last_access_time,
+                    prefix_len,
+                    event="hit",
+                    tier="host" if child.evicted else "device",
+                    outcome="hit",
+                )
+            child.last_access_time = time.monotonic()
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:

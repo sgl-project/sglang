@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
@@ -445,7 +446,12 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        observe_kv_age = (
+            self.metrics_collector is not None and take_kv_age_hit_observation(params)
+        )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, observe_kv_age=observe_kv_age
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -650,10 +656,12 @@ class RadixCache(BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        now = time.monotonic()
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            self._observe_kv_eviction(x, len(x.value), "device", "dropped", now)
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -667,6 +675,28 @@ class RadixCache(BasePrefixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _observe_kv_eviction(
+        self,
+        node: TreeNode,
+        num_tokens: int,
+        tier: str,
+        outcome: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record age / lifetime / reuse metrics for a node leaving a tier."""
+        if self.metrics_collector is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        self.metrics_collector.observe_kv_eviction(
+            age_seconds=now - node.last_access_time,
+            lifetime_seconds=now - node.creation_time,
+            reuses=node.hit_count,
+            num_tokens=num_tokens,
+            tier=tier,
+            outcome=outcome,
+        )
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -724,7 +754,9 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
+    ):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
@@ -733,8 +765,16 @@ class RadixCache(BasePrefixCache):
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if observe_kv_age:
+                self.metrics_collector.observe_kv_age(
+                    access_time - child.last_access_time,
+                    prefix_len,
+                    event="hit",
+                    tier="host" if child.evicted else "device",
+                    outcome="hit",
+                )
+            child.last_access_time = access_time
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
