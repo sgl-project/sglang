@@ -16,7 +16,6 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_device_name
 
 logger = logging.getLogger(__name__)
 
@@ -130,29 +129,13 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        if cfg.dcp_replicate_q_proj is None:
+        # dcp_comm_backend is resolved generically in handle_dcp_defaults.
+        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+            "a2a",
+            "fi_a2a",
+        ):
             logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
-
-        from sglang.srt.layers.dcp.comm import is_fi_a2a_supported
-
-        device_name = get_device_name()
-        dcp_comm_backend = (
-            "fi_a2a"
-            if is_fi_a2a_supported(
-                dcp_size=cfg.dcp_size,
-                tp_size=cfg.tp_size,
-                pp_size=cfg.pp_size,
-                nnodes=cfg.nnodes,
-            )
-            else "a2a"
-        )
-        logger.info(
-            "Kimi-K3 DCP selects communication backend on "
-            f"{device_name!r}: {cfg.dcp_comm_backend!r} -> "
-            f"{dcp_comm_backend!r}."
-        )
-        overrides["dcp_comm_backend"] = dcp_comm_backend
         return overrides
 
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):

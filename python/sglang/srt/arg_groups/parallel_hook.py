@@ -114,6 +114,43 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
+def _is_fi_a2a_supported(**topology: int) -> bool:
+    from sglang.srt.layers.dcp.comm import is_fi_a2a_supported
+
+    return is_fi_a2a_supported(**topology)
+
+
+def _dcp_comm_backend_default(view: Any) -> dict:
+    """fi_a2a where the DCP group shares an MNNVL domain, else a2a on
+    CUDA/ROCm, else ag_rs. An explicit --dcp-comm-backend wins."""
+    if view.dcp_comm_backend is not None:
+        return {}
+    if view.dcp_size <= 1:
+        return {"dcp_comm_backend": "ag_rs"}
+    platform = get_platform()
+    if _is_fi_a2a_supported(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    ):
+        backend = "fi_a2a"
+    elif platform.is_cuda or platform.is_hip:
+        backend = "a2a"
+    else:
+        backend = "ag_rs"
+    logger.info(
+        "DCP (dcp_size=%d) selects communication backend %r.",
+        view.dcp_size,
+        backend,
+    )
+    return {"dcp_comm_backend": backend}
+
+
+def handle_dcp_defaults(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
+
+
 def handle_dcp_validation(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
@@ -132,10 +169,9 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-            "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-            "authoritative fabric probe runs at model-runner init; use 'a2a' "
-            "or 'ag_rs' on clusters without MNNVL."
+            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
+            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
+            "the flag unset to resolve it."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:

@@ -163,6 +163,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
         handle_data_parallelism,
+        handle_dcp_defaults,
         handle_dcp_validation,
         handle_dwdp,
         handle_elastic_ep,
@@ -171,6 +172,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
+    handle_dcp_defaults(server_args)
     handle_dcp_validation(server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
