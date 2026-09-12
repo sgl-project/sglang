@@ -173,6 +173,13 @@ class AttentionBackend(ABC):
     # assume that generic ForwardBatch metadata is sufficient for every
     # attention implementation.
     supports_full_cuda_graph_chunked_prefix: bool = False
+    # Off CUDA, breakable prefill graphs route MLA extend through the MHA
+    # companion, and the prefill runner rejects any batch with a cached prefix
+    # (every MIXED batch and every later prefill chunk) because the generic
+    # chunked-prefix MHA merge is CUDA-only. A backend whose MHA-method extend
+    # gathers the prefix itself inside the (eager) attention break can serve
+    # those batches from the captured graph and opts in here.
+    supports_breakable_cuda_graph_prefix_off_cuda: bool = False
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,

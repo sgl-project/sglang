@@ -238,6 +238,11 @@ class AiterAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    # forward_extend (use_mla) gathers a cached prefix from the KV pool inside
+    # the attention call, which runs in the eager BCG break; see
+    # AttentionBackend.supports_breakable_cuda_graph_prefix_off_cuda.
+    supports_breakable_cuda_graph_prefix_off_cuda: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,

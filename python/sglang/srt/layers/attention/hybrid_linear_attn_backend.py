@@ -1116,6 +1116,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         return getattr(self.full_attn_backend, "use_mha", False)
 
     @property
+    def supports_breakable_cuda_graph_prefix_off_cuda(self) -> bool:
+        # The full-attention backend serves the MLA/MHA extend breaks; the linear
+        # (KDA) backend keeps no cached prefix of its own.
+        return getattr(
+            self.full_attn_backend, "supports_breakable_cuda_graph_prefix_off_cuda", False
+        )
+
+    @property
     def kv_cache_dtype(self):
         # Expose the full-attention backend's cache dtype because fused DSA/NSA RoPE
         # reads it from this wrapper.

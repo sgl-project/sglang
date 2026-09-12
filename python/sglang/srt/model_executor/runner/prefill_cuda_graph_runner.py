@@ -1168,6 +1168,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not is_cuda()
+            and not self.model_runner.attn_backend.supports_breakable_cuda_graph_prefix_off_cuda
             and prefix_lens is not None
             and any(prefix_lens)
         ):
