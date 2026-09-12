@@ -482,9 +482,8 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
-        self.is_dspark_draft = (
-            self.is_draft_worker and model_runner.spec_algorithm.is_dspark()
-        )
+        self.is_dspark = model_runner.spec_algorithm.is_dspark()
+        self.is_dspark_draft = self.is_draft_worker and self.is_dspark
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -719,7 +718,7 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_gpu_plan=ragged_layout is not None,
             extend_start_loc=extend_start_loc,
-            attach_decode_streams=True,
+            attach_decode_streams=not self.is_dspark,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -1342,9 +1341,11 @@ class DeepseekV4HipRadixBackend(
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
 
-        # Target-verify runs through the unified_kv DECODE kernel, same path as
-        # decode; its per-token decode streams were built in metadata.
-        verify_as_decode = forward_batch.forward_mode.is_target_verify()
+        # Non-DSpark target-verify runs through the unified_kv DECODE kernel,
+        # same path as decode; its per-token decode streams were built in metadata.
+        verify_as_decode = (
+            forward_batch.forward_mode.is_target_verify() and not self.is_dspark
+        )
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
         if is_decode:
             if verify_as_decode:
