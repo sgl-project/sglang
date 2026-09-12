@@ -1,18 +1,24 @@
-"""Page-granularity envelope (page-major, layer-major within a page) cache views.
+"""Page-granularity envelope (page-major, token-major within a page) cache views.
 
 A pool of this layout keeps all layers of all slots in one contiguous byte
-buffer. The buffer is split into pages of ``page_size`` slots; within a page,
-each layer's K and V (or each Mamba conv/temporal tensor) are grouped together:
+buffer, split into pages of ``page_size`` slots. Within a page the slots follow
+one another, and one slot's ENTRY holds every part of that token -- K and V of
+every layer for MHA, the latent row of every layer for MLA -- at a fixed byte
+offset:
 
-    page bytes = [L0_K * ps | L0_V * ps | L1_K * ps | L1_V * ps | ...]
+    page bytes  = [ entry(slot 0) | entry(slot 1) | ... | entry(slot ps-1) ]
+    entry bytes = [ K_0 | V_0 | K_1 | V_1 | ... ]  (MHA)
+                  [ lat_0 | lat_1 | ... ]           (MLA)
 
-Across pages the layout is envelope-major (one ``page_bytes`` block per page).
-At ``page_size == 1`` a page is a single slot, so the within-page block is the
-per-slot ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope (token-granularity).
+Every per-layer view is therefore a flat ``(num_pages * page_size, *row_shape)``
+tensor with slot stride ``entry_bytes`` and storage offset
+``anchor + part offset``, indexed by the PHYSICAL token id
+``page * page_size + slot``. Parts may differ in row width (K vs V); only their
+offsets differ, never the stride.
 
-These builders produce per-layer views into a raw ``uint8`` buffer; they hold
-no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
-pool's region inside the raw buffer (0 for a standalone pool).
+These builders produce views into a raw ``uint8`` buffer; they hold no
+allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
+region inside the raw buffer (0 for a standalone pool).
 """
 
 from typing import List, Sequence, Tuple
@@ -184,10 +190,10 @@ def build_dense_views(
 def mha_entry_bytes(
     *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
 ) -> int:
-    """Bytes occupied by one slot across all layers (K and V)."""
+    """Bytes occupied by one slot across all layers (K and V), aligned."""
     k_row_bytes = head_num * head_dim * itemsize
     v_row_bytes = head_num * v_head_dim * itemsize
-    return layer_num * (k_row_bytes + v_row_bytes)
+    return align_entry_bytes(layer_num * (k_row_bytes + v_row_bytes))
 
 
 def build_mha_views(
@@ -259,8 +265,8 @@ def build_mha_views(
 
 
 def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
-    """Bytes occupied by one MLA slot across all layers (single latent row, no V)."""
-    return layer_num * kv_cache_dim * itemsize
+    """Bytes occupied by one MLA slot across all layers (latent rows), aligned."""
+    return align_entry_bytes(layer_num * kv_cache_dim * itemsize)
 
 
 def build_mla_views(
