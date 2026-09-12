@@ -3305,6 +3305,18 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(value, {"pattern": "\\d+"})
 
 
+
+    def test_parse_arguments_unquoted_scalar_keeps_raw_text_for_string(self):
+        """A string-typed arg emitted as a bare scalar (123, true, null) must
+        stay the raw text, not the JSON-coerced value."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        for raw in ("123", "true", "null", "0"):
+            value, is_good = parse_arguments(raw, arg_type="string")
+            self.assertTrue(is_good)
+            self.assertIsInstance(value, str)
+            self.assertEqual(value, raw)
+
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
         self.tools = [
@@ -4520,6 +4532,15 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(info.end, ")]<|tool_call_end|>")
         self.assertEqual(info.trigger, "<|tool_call_start|>")
 
+
+
+    def test_parse_arguments_unquoted_scalar_keeps_raw_text_for_string(self):
+        """Same contract on the glm47 twin parser."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertEqual(value, "123")
 
 class TestGigaChat3Detector(unittest.TestCase):
     def setUp(self):
