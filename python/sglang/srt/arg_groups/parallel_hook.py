@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -22,7 +23,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_fi_a2a_supported, parse_connector_type
+from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -112,31 +113,6 @@ def handle_context_parallelism(server_args: Any):
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
     )
-
-
-def _dcp_comm_backend_default(view: Any) -> dict:
-    if view.dcp_comm_backend is not None:
-        return {}
-    if view.dcp_size <= 1:
-        return {"dcp_comm_backend": "ag_rs"}
-    platform = get_platform()
-    if is_fi_a2a_supported(
-        dcp_size=view.dcp_size,
-        tp_size=view.tp_size,
-        pp_size=view.pp_size,
-        nnodes=view.nnodes,
-    ):
-        backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
-        backend = "a2a"
-    else:
-        backend = "ag_rs"
-    logger.info(
-        "DCP (dcp_size=%d) selects communication backend %r.",
-        view.dcp_size,
-        backend,
-    )
-    return {"dcp_comm_backend": backend}
 
 
 def handle_dcp_defaults(server_args: Any):
