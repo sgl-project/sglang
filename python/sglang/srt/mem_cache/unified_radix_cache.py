@@ -532,13 +532,6 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
-        logger.info(
-            "UnifiedRadixCache.match_prefix: key_length=%d, "
-            "full_kv_hit_length=%d, device_indices_length=%d",
-            len(params.key),
-            result.full_kv_hit_length,
-            len(result.device_indices),
-        )
         return result
 
     def supports_fast_match_prefix(self) -> bool:
