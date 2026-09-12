@@ -1467,6 +1467,17 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        # HIP graph capture: torch.distributed.broadcast aborts every rank (hipErrorCapturedEvent)
+        if is_hip():
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is not None and not pynccl_comm.disabled:
+                pynccl_comm.broadcast(input_, src=src)
+                return input_
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{self.unique_name}: a broadcast captured into a HIP graph needs "
+                    "the group's pynccl communicator (use_pynccl=True)"
+                )
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group

@@ -168,6 +168,9 @@ def _weak_ref_if_tensor(x):
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
+        if hasattr(x, "_fields"):
+            # a NamedTuple wrapper keeps its type: break bodies dispatch on it
+            return type(x)(*(_weak_ref_if_tensor(e) for e in x))
         return tuple(_weak_ref_if_tensor(e) for e in x)
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
