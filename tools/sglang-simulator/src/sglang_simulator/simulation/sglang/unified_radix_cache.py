@@ -12,11 +12,11 @@ class C_UnifiedRadixCacheHook(BaseHook):
     def hook(cls, target):
         original_check_hicache_events = target.check_hicache_events
 
-        def handle_pending_operations(controller):
+        def handle_pending_operations(controller, prefetch_handler_name):
             if controller is None:
                 return
             backup_handler = getattr(controller, "handle_backup_operation", None)
-            prefetch_handler = getattr(controller, "handle_prefetch_operation", None)
+            prefetch_handler = getattr(controller, prefetch_handler_name, None)
             if backup_handler is not None:
                 backup_handler()
             if prefetch_handler is not None:
@@ -24,11 +24,10 @@ class C_UnifiedRadixCacheHook(BaseHook):
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
             controller = getattr(self, "cache_controller", None)
-            handle_pending_operations(controller)
+            handle_pending_operations(controller, "handle_prefetch_query")
             result = original_check_hicache_events(self, *args, **kwargs)
-            # Unified allocates host pages while draining its scheduler-side
-            # control queues. Process those newly admitted reads immediately.
-            handle_pending_operations(controller)
+            # Advance transfers once, after Unified allocates their host pages.
+            handle_pending_operations(controller, "handle_prefetch_operation")
             return result
 
         target.check_hicache_events = wrapped_check_hicache_events

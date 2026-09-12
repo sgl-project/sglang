@@ -76,23 +76,12 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
-        def handle_prefetch_operation(self):
+        def handle_prefetch_query(self):
+            """Query storage for pending prefetch requests."""
             if not self.enable_storage:
                 return
 
-            if C_HiCacheController.KV_CACHE_BYTES is None:
-                C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
-            if C_HiCacheController.DISK_READ_BANDWIDTH_BYTES is None:
-                C_HiCacheController.DISK_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().disk_read_bandwidth
-                )
-
-            # TODO: Overlap schedule
-            remain_dur = StateManager.get_current_inference_dur()
-
-            # Process all operations in the prefetch_queue: place those meeting
-            # the prefetch criteria into the sim_prefetch_buffer, and release the
-            # remaining operations along with any excess memory they have allocated.
+            # Process pending prefetch requests and publish storage hits.
             while not self.prefetch_queue.empty():
                 try:
                     operation = self.prefetch_queue.get(block=False)
@@ -142,6 +131,21 @@ class C_HiCacheController(BaseHook):
                         self.sim_prefetch_buffer.put(operation)
                 except Empty:
                     break
+
+        def handle_prefetch_operation(self):
+            """Advance ready transfers using the current inference duration."""
+            if not self.enable_storage:
+                return
+
+            if C_HiCacheController.KV_CACHE_BYTES is None:
+                C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
+            if C_HiCacheController.DISK_READ_BANDWIDTH_BYTES is None:
+                C_HiCacheController.DISK_READ_BANDWIDTH_BYTES = (
+                    ConfigManager.get_platform_config().disk_read_bandwidth
+                )
+
+            # TODO: Overlap schedule
+            remain_dur = StateManager.get_current_inference_dur()
 
             # handle operation which not yet fully prefetched
             chunked_prefetch_operation = getattr(
@@ -269,6 +273,7 @@ class C_HiCacheController(BaseHook):
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
+        target.handle_prefetch_query = handle_prefetch_query
         target.handle_prefetch_operation = handle_prefetch_operation
         target.append_host_mem_release = wrapped_append_host_mem_release
         target._generic_page_set = override_generic_page_set
