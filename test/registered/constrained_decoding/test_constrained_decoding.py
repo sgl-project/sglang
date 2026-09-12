@@ -1,6 +1,7 @@
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -24,6 +25,7 @@ register_amd_ci(est_time=220, suite="stage-b-test-1-gpu-small-amd")
 class ServerWithGrammar(CustomTestCase):
     backend = "xgrammar"
     disable_overlap = False
+    tp_size = 1
 
     @classmethod
     def setUpClass(cls):
@@ -35,6 +37,9 @@ class ServerWithGrammar(CustomTestCase):
             "--grammar-backend",
             cls.backend,
         ]
+
+        if cls.tp_size > 1:
+            launch_args += ["--tp-size", str(cls.tp_size)]
 
         if cls.disable_overlap:
             launch_args += ["--disable-overlap-schedule"]
@@ -77,6 +82,39 @@ class TestLLGuidanceBackend(
     RegexConstrainedMixin,
 ):
     backend = "llguidance"
+
+
+# With TP > 1 only the entry rank compiles grammars and applies the vocab
+# mask; the sampled token ids are broadcast in the sampler. These variants
+# exercise that path end to end.
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
+class TestXGrammarBackendTP2(
+    ServerWithGrammar,
+    JSONConstrainedMixin,
+    JSONModeMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
+):
+    backend = "xgrammar"
+    tp_size = 2
+
+
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
+class TestOutlinesBackendTP2(ServerWithGrammar, JSONConstrainedMixin, JSONModeMixin):
+    backend = "outlines"
+    tp_size = 2
+
+
+@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
+class TestLLGuidanceBackendTP2(
+    ServerWithGrammar,
+    JSONConstrainedMixin,
+    JSONModeMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
+):
+    backend = "llguidance"
+    tp_size = 2
 
 
 if __name__ == "__main__":
