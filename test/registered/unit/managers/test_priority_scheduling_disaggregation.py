@@ -8,17 +8,24 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.prefill import (  # noqa: E402
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -95,6 +102,135 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
+
+
+class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
+    def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.is_mamba_enabled = False
+        cache.tree_core = SimpleNamespace(is_eagle=False)
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(16, dtype=torch.int64).reshape(2, 8)
+        )
+        component = MagicMock()
+        component.prepare_for_caching_req.return_value = None
+        cache._components_tuple = (component,)
+        cache.insert = MagicMock()
+        last_node = object()
+        req = SimpleNamespace(
+            get_fill_ids=lambda: [1, 2, 3, 4],
+            kv=SimpleNamespace(
+                req_pool_idx=1,
+                cache_protected_len=2,
+                swa_evicted_seqlen=1,
+            ),
+            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
+            priority=3,
+            extra_key=None,
+            cache_salt=None,
+            last_node=last_node,
+        )
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.advance_unpublished_req(req, chunked=True)
+
+        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
+        self.assertEqual(req.kv.cache_protected_len, 2)
+        self.assertIs(req.last_node, last_node)
+        prepare_params = component.prepare_for_caching_req.call_args.kwargs[
+            "insert_params"
+        ]
+        self.assertTrue(prepare_params.chunked)
+        self.assertEqual(prepare_params.prev_prefix_len, 2)
+        component.free_out_of_window_slots.assert_called_once_with(
+            req, 3, prepare_params
+        )
+        component.cleanup_after_caching_req.assert_called_once_with(
+            req, is_finished=False, insert_params=prepare_params
+        )
+        cache.insert.assert_not_called()
+
+    def test_write_through_pending_chunk_does_not_publish(self):
+        scheduler = SimpleNamespace()
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = object()
+        cache.tree_core = SimpleNamespace(is_write_back=False)
+        cache.advance_unpublished_req = MagicMock()
+        scheduler.tree_cache = cache
+        req = SimpleNamespace(pending_bootstrap=True)
+
+        SchedulerDisaggregationPrefillMixin.cache_unfinished_disagg_prefill(
+            scheduler, req, chunked=True
+        )
+
+        cache.advance_unpublished_req.assert_called_once_with(req, chunked=True)
+
+    def test_bootstrap_success_publishes_once(self):
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=MagicMock(),
+            cache_unfinished_disagg_prefill=MagicMock(),
+        )
+        scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.return_value = True
+        req = SimpleNamespace(rid="req")
+
+        result = SchedulerDisaggregationPrefillMixin.handle_pending_bootstrap(
+            scheduler, req, KVPoll.WaitingForInput
+        )
+
+        self.assertTrue(result)
+        scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.assert_called_once_with(
+            req
+        )
+        scheduler.cache_unfinished_disagg_prefill.assert_called_once_with(req)
+
+    def test_waiting_abort_releases_without_insert(self):
+        scheduler = SimpleNamespace(
+            tree_cache=MagicMock(),
+            req_to_metadata_buffer_idx_allocator=MagicMock(),
+            clear_pending_chunk_send=MagicMock(),
+        )
+        sender = MagicMock()
+        req = SimpleNamespace(
+            disagg_kv_sender=sender,
+            metadata_buffer_index=3,
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+            pending_bootstrap=True,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.prefill.release_kv_cache"
+        ) as release_kv_cache:
+            SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req(
+                scheduler, req
+            )
+
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+        sender.abort.assert_called_once()
+        self.assertFalse(req.pending_bootstrap)
+
+    def test_scheduler_waiting_abort_delegates_release_once(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_req = None
+        scheduler.mm_receiver = None
+        scheduler.waiting_queue = [MagicMock(rid="req")]
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hicache_storage = False
+        scheduler.ipc_channels = MagicMock()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.release_aborted_prefill_waiting_req = MagicMock()
+        scheduler.dllm_config = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.collect_inflight_reqs = MagicMock(return_value=set())
+
+        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+            scheduler.abort_request(AbortReq(rid="req"))
+
+        scheduler.release_aborted_prefill_waiting_req.assert_called_once()
+        release.assert_not_called()
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
