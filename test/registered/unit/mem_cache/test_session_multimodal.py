@@ -63,14 +63,15 @@ def multimodal(ids, model, kind):
 )
 @pytest.mark.parametrize("first", ["text", "image", "video"])
 @pytest.mark.parametrize("streaming", [False, True])
-def test_appends_match_full_history(model, first, streaming):
+@pytest.mark.parametrize("reply", [[], [3, 4]])
+def test_appends_match_full_history(model, first, streaming, reply):
     history = {"text": [1, 2], "image": IMAGE_IDS, "video": VIDEO_IDS}[first]
     if first == "video" and model == "qwen3_vl":
         history = [1, 10, 12, 13, 10, 12, 13, 2]
     media = [] if first == "text" else [first]
     saved = multimodal(history, model, first) if media else None
     for turn in range(2):
-        history = history + [3, 4] + IMAGE_IDS
+        history = history + reply + IMAGE_IDS
         media = media + ["image"]
         req = Req(
             str(turn),
@@ -105,3 +106,20 @@ def test_appends_match_full_history(model, first, streaming):
             assert saved.mm_items == old_items
             assert req.multimodal_inputs is not saved
         saved = req.multimodal_inputs
+
+
+def test_non_session_keeps_precomputed_input():
+    req = Req("normal", None, array("q", IMAGE_IDS), SamplingParams())
+    mm = multimodal(IMAGE_IDS, "qwen2_5_vl", "image")
+    original_positions = mm.mrope_positions
+    original_fill = req.full_untruncated_fill_ids
+    req.extend_image_inputs(mm)
+    assert req.multimodal_inputs is mm
+    assert mm.mrope_positions is original_positions
+    assert req.full_untruncated_fill_ids is original_fill
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
