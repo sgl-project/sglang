@@ -89,13 +89,27 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
-    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+    def _collect_unbacked_swa_nodes(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
+        """Nodes whose SWA data needs a host backup, deepest first.
+
+        Buffer mode stages one node per FIFO backup intent; cache mode backs
+        up every device-only node within one sliding window of ``node``.
+        """
         if not self.tree_core.has_swa_host_pool:
             return []
+        if self.tree_core.is_host_memory_buffer_only:
+            cd = node.component_data[self.component_type]
+            return [node] if cd.value is not None else []
+        return self._collect_unbacked_swa_nodes_in_window(node)
 
+    def _collect_unbacked_swa_nodes_in_window(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
         ct = self.component_type
         covered = 0
-        dirty: list[UnifiedTreeNode] = []
+        unbacked: list[UnifiedTreeNode] = []
         cur = node
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
@@ -109,12 +123,12 @@ class SWAComponent(TreeComponent):
                 break
             covered += len(value)
             if cd.value is not None and cd.host_value is None:
-                dirty.append(cur)
+                unbacked.append(cur)
             cur = cur.parent
-        return dirty
+        return unbacked
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return bool(self._dirty_backup_window(node))
+        return bool(self._collect_unbacked_swa_nodes(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -615,7 +629,10 @@ class SWAComponent(TreeComponent):
                 new_parent.component_data[self.component_type].value is None
                 and parent_swa_data.host_lock_ref == 0
             ):
-                host_lru.insert_mru(new_parent)
+                if host_lru.in_list(child):
+                    host_lru.insert_after(child, new_parent)
+                else:
+                    host_lru.insert_mru(new_parent)
             if (
                 child.component_data[self.component_type].value is None
                 and child_swa_data.host_lock_ref == 0
@@ -916,6 +933,11 @@ class SWAComponent(TreeComponent):
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
+        # A recurrent checkpoint must stay attached to its exact token prefix.
+        # Let MambaComponent select the insertion length for hybrid caches.
+        if self.cache.is_mamba_enabled:
+            return None
+
         branching_seqlen = req.swa_branching_seqlen
         if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
             return None
@@ -988,8 +1010,7 @@ class SWAComponent(TreeComponent):
         elif prefetch_pages <= 0:
             return PreparePrefetchResult()
         elif (
-            self.tree_core.is_root(node_id)
-            or self.cache.host_memory_mode == "buffer_only"
+            self.tree_core.is_root(node_id) or self.tree_core.is_host_memory_buffer_only
         ):
             # Sub-window fetch: at root the sequence IS its window; mid-tree
             # (buffer mode) the window head is the device prefix's own ring
@@ -1027,22 +1048,17 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if self.cache.host_memory_mode == "buffer_only":
-                # Buffer mode stages one node/hash span per FIFO backup intent.
-                cd = node.component_data[ct]
-                dirty = [node] if cd.value is not None else []
-            else:
-                dirty = self._dirty_backup_window(node)
-            if not dirty:
+            unbacked_swa_nodes = self._collect_unbacked_swa_nodes(node)
+            if not unbacked_swa_nodes:
                 return None
-            dirty.reverse()
+            unbacked_swa_nodes.reverse()
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     device_indices=torch.cat(
-                        [n.component_data[ct].value for n in dirty]
+                        [n.component_data[ct].value for n in unbacked_swa_nodes]
                     ).to(torch.int64),
-                    nodes_to_load=[n.id for n in dirty],
+                    nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
             ]
 

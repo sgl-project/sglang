@@ -456,6 +456,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
         if self.host_memory_mode == "buffer_only":
+            self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
@@ -1829,8 +1830,10 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
-        """Synchronously probe L3 storage for the reusable prefix length."""
+        """Probe L3 with the request namespace."""
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -1838,7 +1841,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
