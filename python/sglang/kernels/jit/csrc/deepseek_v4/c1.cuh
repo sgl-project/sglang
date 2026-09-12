@@ -53,7 +53,11 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
   using namespace device;
   using deepseek_v4::fp8::cast_to_ue8m0;
   using deepseek_v4::fp8::inv_scale_ue8m0;
+#ifndef USE_ROCM
   using deepseek_v4::fp8::pack_fp8;
+#else
+  using deepseek_v4::fp8::rn::pack_fp8;  // the hardware RNE pack, rounding as CUDA's does
+#endif
 
   /// Threads over one token, and the leading ones of those that carry the fp8
   /// nope part; the rest carry the bf16 RoPE tail.
@@ -254,7 +258,7 @@ struct FlashC1DecodeKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim})  //
         .with_dtype<bf16_t>()

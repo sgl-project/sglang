@@ -72,7 +72,11 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   using namespace device;
   using deepseek_v4::fp8::cast_to_ue8m0;
   using deepseek_v4::fp8::inv_scale_ue8m0;
+#ifndef USE_ROCM
   using deepseek_v4::fp8::pack_fp8;
+#else
+  using deepseek_v4::fp8::rn::pack_fp8;  // the hardware RNE pack, rounding as CUDA's does
+#endif
 
   constexpr uint32_t kVecSize = kC2VecSize;
   constexpr uint32_t kCTASize = kHeadDim / kVecSize;

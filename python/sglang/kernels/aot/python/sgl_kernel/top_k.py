@@ -87,6 +87,7 @@ def deepseek_v4_topk_transform_512(
     page_indices: torch.Tensor,
     page_size: int,
     raw_indices: Optional[torch.Tensor] = None,
+    sort_output: bool = False,
 ) -> None:
     """
     Performs the DeepSeek-V4 indexer top-k selection and writes the paged
@@ -96,7 +97,9 @@ def deepseek_v4_topk_transform_512(
 
     Args:
         scores: float32 ``[B, max_seq_len]`` indexer logits, contiguous on dim 1.
-        seq_lens: int32 ``[B]``, true KV length per batch row.
+        seq_lens: int32 ``[B]``, true KV length per batch row; each at most
+            ``max_seq_len`` and at most ``num_pages * page_size`` (a row reads
+            its scores and page table up to its length).
         page_table: int32 ``[B, num_pages]``, logical->physical page table,
             contiguous on dim 1.
         page_indices: int32 ``[B, topk]``, output buffer, contiguous. Filled
@@ -104,11 +107,13 @@ def deepseek_v4_topk_transform_512(
         page_size: power-of-2 page size.
         raw_indices: optional int32 ``[B, topk]``, contiguous. If provided,
             filled with raw token positions within each row.
+        sort_output: order every row ascending by position (-1 padding last)
+            in the kernel epilogue, so the consumer needs no sort launch.
     """
     if raw_indices is not None:
         assert raw_indices.dim() == 2
     torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-        scores, seq_lens, page_table, page_indices, page_size, raw_indices
+        scores, seq_lens, page_table, page_indices, page_size, raw_indices, sort_output
     )
 
 
