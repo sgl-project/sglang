@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -346,6 +347,8 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
 @lru_cache(maxsize=1)
 def _fp8_pertensor_backend():
     if not is_sm120_supported():
+        return None
+    if envs.SGLANG_DISABLE_SM120_FP8_PERTENSOR_GEMM.get():
         return None
     from sglang.kernels.ops.gemm import fp8_pertensor_gemm as pertensor
 

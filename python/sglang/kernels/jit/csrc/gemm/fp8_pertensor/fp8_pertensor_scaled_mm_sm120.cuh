@@ -48,9 +48,9 @@ using namespace host;
 
 using namespace cute;
 
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 
-template <int CtaM, int CtaN, int CtaK>
+template <class MmaTileShape_MNK, class KernelScheduleTag>
 void launch_fp8_pertensor_scaled_mm(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView mat_a,
@@ -68,7 +68,7 @@ void launch_fp8_pertensor_scaled_mm(
 
   // No C operand: the epilogue only rescales the accumulator.
   using ElementC = void;
-  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutC = cutlass::layout::ColumnMajor;
 
   using ElementD = cutlass::bfloat16_t;
   using LayoutD = LayoutC;
@@ -85,9 +85,7 @@ void launch_fp8_pertensor_scaled_mm(
       Sm90Compute<cutlass::multiplies, ElementD, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
   using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<ApplyScale, ScaleAB, cutlass::epilogue::fusion::Sm90AccFetch>;
 
-  using MmaTileShape_MNK = Shape<Int<CtaM>, Int<CtaN>, Int<CtaK>>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
-  using KernelScheduleTag = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
   using TileSchedulerTag = void;
 
   const int m = static_cast<int>(mat_a.size(0));
@@ -95,8 +93,8 @@ void launch_fp8_pertensor_scaled_mm(
   const int n = static_cast<int>(mat_b_nk.size(0));
   constexpr int l = 1;
 
-  auto* a_ptr = static_cast<ElementA*>(mat_a.data_ptr());
-  auto* b_ptr = static_cast<ElementB*>(mat_b_nk.data_ptr());
+  auto* weight_ptr = static_cast<ElementA*>(mat_b_nk.data_ptr());
+  auto* act_ptr = static_cast<ElementB*>(mat_a.data_ptr());
   auto* d_ptr = static_cast<ElementD*>(out.data_ptr());
   auto const* scale_a_ptr = static_cast<ElementCompute const*>(scale_a.data_ptr());
   auto const* scale_b_ptr = static_cast<ElementCompute const*>(scale_b.data_ptr());
@@ -146,18 +144,18 @@ void launch_fp8_pertensor_scaled_mm(
   using StrideC = typename Gemm::GemmKernel::StrideC;
   using StrideD = typename Gemm::GemmKernel::StrideD;
 
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, l));
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, l));
-  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, l));
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, l));
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(n, k, l));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(m, k, l));
+  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, l));
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, l));
 
   // EVT args are children-first; the broadcast takes {scalars, pointers, strides}.
   typename EpilogueEVT::Arguments epilogue_thread_args{{{}, {scale_a_ptr, scale_b_ptr}, {}}, {}, {}};
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, l},
-      {a_ptr, stride_A, b_ptr, stride_B},
+      {n, m, k, l},
+      {weight_ptr, stride_A, act_ptr, stride_B},
       {epilogue_thread_args, nullptr, stride_C, d_ptr, stride_D}};
 
   Gemm gemm;
@@ -171,7 +169,6 @@ void launch_fp8_pertensor_scaled_mm(
   CUTLASS_CHECK(gemm.run(stream));
 }
 
-// Below M=24 the deeper pipeline of the smaller CtaK wins; above it CTA count does.
 inline void fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView mat_a,
@@ -179,11 +176,13 @@ inline void fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView scale_a,
     tvm::ffi::TensorView scale_b,
     cudaStream_t stream) {
+  using Coop = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+  using Ping = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
   const int m = static_cast<int>(mat_a.size(0));
-  if (m < 24) {
-    launch_fp8_pertensor_scaled_mm<64, 128, 64>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
+  if (m <= 32) {
+    launch_fp8_pertensor_scaled_mm < Shape<_64, _32, _256>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
   } else {
-    launch_fp8_pertensor_scaled_mm<64, 64, 128>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
+    launch_fp8_pertensor_scaled_mm < Shape<_128, _32, _128>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
   }
 }
 
@@ -212,7 +211,7 @@ inline void fp8_pertensor_scaled_mm_sm120(
   RuntimeCheck(mat_a.size(1) == mat_b_nk.size(1), "mat_a and mat_b_nk K dims must match");
   RuntimeCheck(out.size(0) == mat_a.size(0), "out M must match mat_a M");
   RuntimeCheck(out.size(1) == mat_b_nk.size(0), "out N must match mat_b_nk N");
-
+  RuntimeCheck(mat_a.size(0) <= 64, "fp8_pertensor_scaled_mm supports M <= 64");
   RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_a.dtype()), "mat_a must be Float8_e4m3fn");
   RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_b_nk.dtype()), "mat_b_nk must be Float8_e4m3fn");
   RuntimeCheck(host::is_type<float>(scale_a.dtype()), "scale_a must be Float32");
@@ -223,6 +222,6 @@ inline void fp8_pertensor_scaled_mm_sm120(
   fp8_pertensor_dispatch_shape(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
 }
 
-#endif  // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#endif  // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 
 }  // namespace sglang

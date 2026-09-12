@@ -12,9 +12,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Above this N there are enough N-tiles to fill the GPU at a lower M.
-_NARROW_N = 8192
-
 
 def _fp8_pertensor_cuda_flags() -> list[str]:
     return [
@@ -75,14 +72,7 @@ def is_available() -> bool:
 
 
 def is_profitable(m: int, n: int, k: int) -> bool:
-    """Whether this shape is one where the #33632 sweep beats cuBLAS."""
-    if m > 64:
-        return False
-    if n > _NARROW_N:
-        return m >= 16
-    # Narrow N needs a higher M before the tile pays off; below it the GEMM is
-    # bound by streaming the weights, where cuBLAS is ahead.
-    return m >= 24
+    return m <= 64
 
 
 @debug_kernel_api
@@ -92,12 +82,7 @@ def fp8_pertensor_scaled_mm(
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
 ) -> torch.Tensor:
-    """FP8 e4m3 per-tensor scaled matmul on SM120.
-
-    Computes scale_a * scale_b * (mat_a[M,K] @ mat_b_nk[N,K]^T) into bf16. Both
-    scales are scalar f32 on device and are multiplied inside the epilogue, so
-    callers must not pre-fold them into a single alpha.
-    """
+    """FP8 e4m3 per-tensor scaled matmul on SM120."""
     out = torch.empty(
         (mat_a.shape[0], mat_b_nk.shape[0]),
         dtype=torch.bfloat16,
