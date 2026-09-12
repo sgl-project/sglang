@@ -472,7 +472,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    token_ids: Optional[List[int]] = None
+    response_token_ids: Optional[List[int]] = None
     prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
@@ -480,8 +480,8 @@ class CompletionResponseChoice(BaseModel):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.token_ids is None:
-            data.pop("token_ids", None)
+        if self.response_token_ids is None:
+            data.pop("response_token_ids", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
         return data
@@ -512,7 +512,7 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    token_ids: Optional[List[int]] = None
+    response_token_ids: Optional[List[int]] = None
     prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
@@ -520,8 +520,8 @@ class CompletionResponseStreamChoice(BaseModel):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.token_ids is None:
-            data.pop("token_ids", None)
+        if self.response_token_ids is None:
+            data.pop("response_token_ids", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
         return data
