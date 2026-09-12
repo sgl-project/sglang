@@ -292,7 +292,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        kernel_page_multiplier: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -316,14 +315,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Kernel-facing ids are the physical token ids: the token-major views
-        # step slots by the whole entry, so there is no per-page block scale.
-        # The kwarg is accepted (and must be 1) until the plumbing is removed.
-        assert kernel_page_multiplier in (None, 1), (
-            f"kernel_page_multiplier must be 1 (token-major views); got "
-            f"{kernel_page_multiplier}"
-        )
-        self.kernel_page_multiplier = 1
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
@@ -1055,10 +1046,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             kernel_id(t) = v2p[t // ps] * ps + t % ps
 
-        (`kernel_page_multiplier` is pinned to 1, so this equals
-        `translate_kv_loc`.) Tombstones (-1) clamp to id 0, the page-0 sink.
-        int64 out; a consumer whose kernel ABI wants int32 narrows where it
-        fills that buffer.
+        Same id as `translate_kv_loc` for any mapped virtual token; this one
+        is one Triton launch, and it is the path that sends an unmapped or
+        negative loc to id 0, the page-0 sink. int64 out; a consumer whose
+        kernel ABI wants int32 narrows where it fills that buffer.
         """
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
             return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
@@ -1088,7 +1079,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,
-            stride=self.pool_page_size * self.kernel_page_multiplier,
+            stride=self.pool_page_size,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,

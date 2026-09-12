@@ -73,15 +73,13 @@ def _armed_source(v2p, swa_map):
     # The WRITE loc has its own translate because under DCP it arrives widened;
     # at dcp_size == 1 it is the read translate, so arm it with the same fake.
     src._translate_write_full = src._translate_full
-    # Phase 2 derives from kernel-facing values through p2v + the swa v2p; arm
-    # the inverse of the fake v2p (ps=1, both multipliers 1: kernel == physical,
-    # and the expected swa loc for virtual t is swa_map[t]).
+    # Phase 2 derives from physical values through p2v + the swa v2p; arm the
+    # inverse of the fake v2p (ps=1, so the expected swa loc for virtual t is
+    # swa_map[t]).
     p2v = torch.zeros(int(v2p.max()) + 1, dtype=torch.int64)
     p2v[v2p] = torch.arange(v2p.numel(), dtype=torch.int64)
     src._full_p2v_table = p2v
     src._swa_v2p_table = swa_map
-    src._full_page_multiplier = 1
-    src._swa_page_multiplier = 1
     return src
 
 

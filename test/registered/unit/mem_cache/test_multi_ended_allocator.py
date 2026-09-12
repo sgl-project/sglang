@@ -2421,9 +2421,10 @@ class TestO3FusedAllocBind(unittest.TestCase):
 
 
 class TestSWACompositeKernelIdSurface(unittest.TestCase):
-    """The SWA composite's kernel-facing id surface. Attention backends probe for
-    `translate_kv_loc_for_kernel` / `full_v2p_page_table`, and every id must
-    follow `kernel_id(t) = v2p[t // ps] * ps + t % ps`."""
+    """The SWA composite's id surface: both translates follow
+    `phys(t) = v2p[t // ps] * ps + t % ps` over their own side's v2p table,
+    and the raw v2p tables are exposed unwrapped.
+    """
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -2473,22 +2474,21 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_full_kernel_translate_matches_formula(self):
-        """Kernel-facing ids ARE the physical token ids under the token-major
-        views, so both sides pin at multiplier 1 and the id follows
-        v2p[t // ps] * ps + t % ps."""
+    def test_composite_exposes_raw_v2p_tables(self):
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 1)
-        self.assertEqual(a.swa_kernel_page_multiplier, 1)
+        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
+        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+
+    def test_full_kernel_translate_matches_formula(self):
+        """With the per-page scale gone the two translates compute the same
+        id, so both must follow v2p[t // ps] * ps + t % ps."""
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
         expected = v2p[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
-        # The PHYSICAL translate must stay unscaled -- compaction and the byte
-        # machinery depend on it staying in physical space.
-        phys = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
     def test_kernel_translate_accepts_an_int32_page_table(self):
         """Regression: fa3 passes its own page table, which is int32 and 2-D, so
@@ -2618,8 +2618,6 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
 
     def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
-        # Token-major views: the kernel id is the physical token id.
-        self.assertEqual(a.kernel_page_multiplier, 1)
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
