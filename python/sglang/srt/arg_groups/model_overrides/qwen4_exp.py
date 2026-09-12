@@ -28,8 +28,16 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     which MambaRadixCache allows only with mamba extra-buffer or --disable-radix-cache.
     """
     cfg = resolving_view(server_args)
-    if cfg.disaggregation_mode != "null":
-        raise ValueError("Qwen4-Exp does not support PD disaggregation yet")
+    if (
+        cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend == "mori"
+        and cfg.pp_size > 1
+    ):
+        raise ValueError(
+            "Qwen4-Exp PD with MORI requires --pp-size 1; MORI does not yet "
+            "exchange the global QSA layer metadata needed to pair compact "
+            "state descriptors across pipeline stages."
+        )
     if cfg.enable_unified_memory:
         raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
     overrides: Dict[str, Any] = {}

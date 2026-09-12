@@ -100,7 +100,7 @@ jobs:
           - arch_label: sm90
             runner: 8-gpu-h200
             wheel_arch: x86_64
-            timeout: 120
+            timeout: 240
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
