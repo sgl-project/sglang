@@ -93,9 +93,10 @@ def _prefill_schedule_prep_kernel(
         off = tl.arange(0, BLOCK_T)
         live = off < T
         le = tl.load(le_ptr + off, mask=live, other=0)
+        le = tl.minimum(tl.maximum(le, 0), s_max * BLOCK_K)
         # ceil(le / block_k); a non-positive length contributes no chunks, which
         # matches the reference's clamp(floor_div(le + block_k - 1), min=0).
-        chunks = tl.where(live, (tl.maximum(le, 0) + (BLOCK_K - 1)) // BLOCK_K, 0)
+        chunks = tl.where(live, (le + (BLOCK_K - 1)) // BLOCK_K, 0)
 
         # A split factor s fits when the persistent grid can host every
         # (row, split) pair: sum_i ceil(chunks_i / s) <= P. ceil(c/s) is
@@ -348,18 +349,33 @@ def build_prefill_schedule(
     )
 
     BLOCK_P = 256
-    _prefill_cta_info_kernel[(triton.cdiv(parallel_unit_num, BLOCK_P),)](
+    cta_args = [
         buffers.incl,
         buffers.excl,
         buffers.chunks,
-        buffers.row_to_batch,
-        buffers.local_starts,
-        local_ends,
-        buffers.safe,
-        buffers.total_splits,
-        cta_info_out,
-        total_rows,
-        parallel_unit_num,
+    ]
+    # AITER's window-aware scheduler added first_chunks_ptr before rb_ptr.
+    # SGLang's fused prep always emits local_starts == 0, so that same zero
+    # buffer is the exact first-chunk vector. Keep the old signature working
+    # for released AITER builds.
+    if "first_chunks_ptr" in getattr(_prefill_cta_info_kernel, "arg_names", ()):
+        cta_args.append(buffers.local_starts)
+    cta_args.extend(
+        [
+            buffers.row_to_batch,
+            buffers.local_starts,
+            local_ends,
+            buffers.safe,
+            buffers.total_splits,
+            cta_info_out,
+            total_rows,
+            parallel_unit_num,
+        ]
+    )
+    if "max_seq_len" in getattr(_prefill_cta_info_kernel, "arg_names", ()):
+        cta_args.append(max_seq_len)
+    _prefill_cta_info_kernel[(triton.cdiv(parallel_unit_num, BLOCK_P),)](
+        *cta_args,
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers

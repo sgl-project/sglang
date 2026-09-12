@@ -16,10 +16,13 @@ logits kernel's ABI layout.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import fp4_indexer_schedule_hip as schedule_hip
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -31,6 +34,8 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     _decode_cta_count,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
+    aiter_fp4_paged_mqa_topk,
+    aiter_fp4_streaming_topk_available,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
     prepare_fp4_decode_workspace,
@@ -398,6 +403,106 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
 # ---------------------------------------------------------------------------
 # HIP-only surface: schedule bookkeeping and the paged MQA logits kernel
 # ---------------------------------------------------------------------------
+
+
+_LEGACY_CTA_ARG_NAMES = (
+    "incl_ptr",
+    "excl_ptr",
+    "chunks_ptr",
+    "rb_ptr",
+    "ls_ptr",
+    "le_ptr",
+    "safe_ptr",
+    "total_splits_ptr",
+    "cta_info_ptr",
+    "T",
+    "P",
+    "BLOCK_P",
+)
+_WINDOWED_CTA_ARG_NAMES = (
+    *_LEGACY_CTA_ARG_NAMES[:3],
+    "first_chunks_ptr",
+    *_LEGACY_CTA_ARG_NAMES[3:-1],
+    "max_seq_len",
+    "BLOCK_P",
+)
+
+
+@pytest.mark.parametrize(
+    ("arg_names", "window_aware"),
+    [
+        pytest.param(_LEGACY_CTA_ARG_NAMES, False, id="legacy-aiter"),
+        pytest.param(_WINDOWED_CTA_ARG_NAMES, True, id="window-aware-aiter"),
+    ],
+)
+def test_prefill_schedule_forwards_versioned_aiter_cta_args(
+    monkeypatch: pytest.MonkeyPatch,
+    arg_names: tuple[str, ...],
+    window_aware: bool,
+) -> None:
+    from aiter.ops.flydsl.kernels.mqa_logits import (
+        pa_mqa_logits_fp4_prefill as aiter_prefill,
+    )
+
+    prep_kernel = mock.MagicMock()
+    cta_kernel = mock.MagicMock()
+    cta_kernel.arg_names = arg_names
+    monkeypatch.setattr(schedule_hip, "_prefill_schedule_prep_kernel", prep_kernel)
+    monkeypatch.setattr(aiter_prefill, "_prefill_cta_info_kernel", cta_kernel)
+
+    buffers = SimpleNamespace(
+        fused=True,
+        incl=object(),
+        excl=object(),
+        chunks=object(),
+        row_to_batch=object(),
+        local_starts=object(),
+        safe=object(),
+        total_splits=object(),
+    )
+    page_table = torch.zeros((1, 1), dtype=torch.int32)
+    local_ends = torch.tensor([64], dtype=torch.int32)
+    guarded_out = torch.empty((1, 8), dtype=torch.int32)
+    cta_info_out = torch.empty((257, 6), dtype=torch.int32)
+    max_seq_len = 8192
+
+    schedule_hip.build_prefill_schedule(
+        page_table=page_table,
+        local_ends=local_ends,
+        cta_info_out=cta_info_out,
+        parallel_unit_num=257,
+        max_seq_len=max_seq_len,
+        guarded_out=guarded_out,
+        buffers=buffers,
+    )
+
+    expected = [buffers.incl, buffers.excl, buffers.chunks]
+    if window_aware:
+        expected.append(buffers.local_starts)
+    expected.extend(
+        [
+            buffers.row_to_batch,
+            buffers.local_starts,
+            local_ends,
+            buffers.safe,
+            buffers.total_splits,
+            cta_info_out,
+            1,
+            257,
+        ]
+    )
+    if window_aware:
+        expected.append(max_seq_len)
+
+    launch = cta_kernel.__getitem__.return_value
+    launch.assert_called_once()
+    assert launch.call_args.kwargs == {"BLOCK_P": 256}
+    assert len(launch.call_args.args) == len(expected)
+    for actual, wanted in zip(launch.call_args.args, expected, strict=True):
+        if isinstance(wanted, int):
+            assert actual == wanted
+        else:
+            assert actual is wanted
 
 
 @pytest.mark.parametrize("logical_width", [1, 3, 4, 5, 8, 33])
@@ -823,6 +928,107 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
                 full[start + row, :ctx],
                 msg=f"row {start + row} (ctx={ctx})",
             )
+
+
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_streaming_topk_writes_raw_and_physical_indices(topk: int) -> None:
+    if not aiter_fp4_streaming_topk_available():
+        pytest.skip("installed AITER does not expose FP4 streaming top-k")
+
+    torch.manual_seed(41 + topk)
+    contexts = [0, topk, topk + 64]
+    case = _build_logits_case(
+        len(contexts),
+        topk + 64,
+        ctx_lens=contexts,
+        shuffle_pages=True,
+    )
+    out_page_indices = torch.empty(
+        (len(contexts), topk),
+        dtype=torch.int32,
+        device=get_device(),
+    )
+    out_raw_indices = torch.empty_like(out_page_indices)
+    workspace = prepare_fp4_prefill_workspace(
+        case["page_table"],
+        case["c4_seq_lens"],
+    )
+    legacy_logits = _run_logits(
+        case,
+        is_decode=False,
+        prefill_ws=workspace,
+    ).clone()
+
+    scratch = aiter_fp4_paged_mqa_topk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        page_table=case["page_table"],
+        c4_seq_lens=case["c4_seq_lens"],
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+        prefill_workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    scratch_ptrs = (
+        scratch.values.data_ptr(),
+        scratch.raw_indices.data_ptr(),
+        scratch.counts.data_ptr(),
+        scratch.workspace.candidate_values.data_ptr(),
+    )
+    reused = aiter_fp4_paged_mqa_topk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        page_table=case["page_table"],
+        c4_seq_lens=case["c4_seq_lens"],
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+        prefill_workspace=workspace,
+        streaming_scratch=scratch,
+    )
+    torch.cuda.synchronize()
+    assert reused is scratch
+    assert scratch_ptrs == (
+        reused.values.data_ptr(),
+        reused.raw_indices.data_ptr(),
+        reused.counts.data_ptr(),
+        reused.workspace.candidate_values.data_ptr(),
+    )
+
+    for row, context in enumerate(contexts):
+        valid = min(context, topk)
+        raw = out_raw_indices[row, :valid].long()
+        assert torch.all((raw >= 0) & (raw < context))
+        assert torch.unique(raw).numel() == valid
+        if context <= topk:
+            expected_raw = torch.arange(context, device=raw.device)
+        else:
+            expected_raw = torch.argsort(
+                legacy_logits[row, :context],
+                descending=True,
+                stable=True,
+            )[:topk]
+        torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
+        expected_slots = (
+            case["page_table"][row, raw // PAGE_SIZE].long() * PAGE_SIZE
+            + raw % PAGE_SIZE
+        )
+        torch.testing.assert_close(
+            out_page_indices[row, :valid].long(),
+            expected_slots,
+            rtol=0,
+            atol=0,
+        )
+        if valid < topk:
+            assert torch.all(out_raw_indices[row, valid:] == -1)
+            assert torch.all(out_page_indices[row, valid:] == -1)
 
 
 if __name__ == "__main__":
