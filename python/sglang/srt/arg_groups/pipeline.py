@@ -171,6 +171,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
         handle_data_parallelism,
+        handle_dcp_validation,
         handle_decode_context_parallelism,
         handle_dwdp,
         handle_elastic_ep,
@@ -242,6 +243,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_specific_adjustments, server_args)
     run_hook(default_unset_prefill_decode_interval, server_args)
+    run_hook(handle_dcp_validation, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
 
