@@ -285,6 +285,13 @@ class DeepEPMoE(FusedMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    if get_moe_a2a_backend().is_nccl_ep() and not isinstance(
+        quant_config, (Fp8Config, W4AFp8Config)
+    ):
+        raise ValueError(
+            "NCCL EP LL requires FP8 or W4A-FP8 quantization; "
+            "unquantized and other MoE compute methods are unsupported."
+        )
     # [TODO] kk, temporary solution
     if (
         get_moe_a2a_backend().is_mori()
