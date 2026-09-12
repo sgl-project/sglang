@@ -180,9 +180,9 @@ inline void fp8_pertensor_dispatch_shape(
   using Ping = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
   const int m = static_cast<int>(mat_a.size(0));
   if (m <= 32) {
-    launch_fp8_pertensor_scaled_mm < Shape<_64, _32, _256>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
+    launch_fp8_pertensor_scaled_mm<Shape<_64, _32, _256>, Ping>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
   } else {
-    launch_fp8_pertensor_scaled_mm < Shape<_128, _32, _128>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
+    launch_fp8_pertensor_scaled_mm<Shape<_128, _32, _128>, Coop>(out, mat_a, mat_b_nk, scale_a, scale_b, stream);
   }
 }
 
