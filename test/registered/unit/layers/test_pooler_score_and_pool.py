@@ -16,6 +16,7 @@ from sglang.srt.layers.pooler import (
     PoolingType,
     score_and_pool,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -185,6 +186,54 @@ class TestScoreAndPool(CustomTestCase):
         self.assertIsInstance(out.embeddings, list)
         self.assertEqual(len(out.embeddings), 1)
         self.assertEqual(out.embeddings[0].shape, (0, self.num_labels))
+
+
+class TestDisableNormalizeEmbedding(CustomTestCase):
+    """--disable-normalize-embedding turns off the Pooler's L2 normalization.
+
+    ``Pooler.__init__`` reads the resolved flag from the ``model`` config bag,
+    so these tests publish a context via ``override_server_args`` rather than
+    constructing the pooler against an unpublished context.
+    """
+
+    def setUp(self):
+        torch.manual_seed(42)
+        self.hidden = torch.randn(4, 8)
+        self.fb = _make_forward_batch(extend_seq_lens=[2, 2])
+
+    def _pooled(self, pooler):
+        return pooler(self.hidden, self.fb).embeddings
+
+    def test_flag_disables_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertFalse(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        # Un-normalized rows keep the raw hidden-state norms.
+        expected = self.hidden[torch.tensor([1, 3])]
+        torch.testing.assert_close(pooled, expected)
+
+    def test_default_keeps_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertTrue(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        torch.testing.assert_close(
+            pooled.norm(p=2, dim=-1), torch.ones(pooled.shape[0])
+        )
+
+    def test_flag_does_not_force_enable_normalization(self):
+        """The override is one-way: normalize=False models stay un-normalized."""
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
 
 
 if __name__ == "__main__":
