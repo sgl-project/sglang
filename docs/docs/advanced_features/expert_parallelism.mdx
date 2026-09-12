@@ -74,6 +74,8 @@ DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode
 
 Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported. Note that `pplx` additionally requires `--enable-dp-attention` with at least 2 DP groups (i.e., `tp_size / attention_tp_size > 1`); otherwise pplx-kernels' AllToAll cannot be constructed.
 
+For NVIDIA Ampere GPUs, the `flashinfer` A2A backend can be paired with the `triton` MoE runner for unquantized BF16 models with an equal, contiguous expert partition. This combination is a compatibility path that uses the regular Triton alignment and kernel flow: it does not support quantized activation payloads, expert relocation/redundancy, or fused shared experts, and it requires `--enable-dp-attention` with `dp_size = tp_size`.
+
 ### Backends for MoE Computation
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
