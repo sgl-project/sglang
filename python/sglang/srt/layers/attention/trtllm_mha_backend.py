@@ -29,10 +29,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferMetadata
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -104,7 +102,7 @@ class TRTLLMMHAMetadata:
     encoder_row_map: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
