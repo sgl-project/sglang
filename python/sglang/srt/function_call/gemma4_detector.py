@@ -70,7 +70,7 @@ def _parse_gemma4_array(arr_str: str) -> list:
     n = len(arr_str)
 
     while i < n:
-        while i < n and arr_str[i] in (" ", ",", "\n", "\t"):
+        while i < n and arr_str[i] in (" ", ",", "\n", "\t", "]"):
             i += 1
         if i >= n:
             break

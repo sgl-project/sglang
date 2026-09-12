@@ -83,6 +83,11 @@ class TestGemma4StringDelimiters(CustomTestCase):
             {"limit": 5, "exact": True, "query": "Note: a, b"},
         )
 
+    def test_malformed_array_terminates(self):
+        text = f"<|tool_call>call:web_search{{query:[ k:{Q}1]]}}<tool_call|>"
+        result = Gemma4Detector().detect_and_parse(text, self.tools)
+        self.assertEqual([call.name for call in result.calls], ["web_search"])
+
     def test_streaming_omitted_opening_delimiter(self):
         chunks = [
             "<|tool_call>",
