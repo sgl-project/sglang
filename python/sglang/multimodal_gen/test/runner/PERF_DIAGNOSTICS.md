@@ -3,6 +3,7 @@
 The NVIDIA two-GPU diffusion job sets `SGLANG_DIFFUSION_DIAGNOSTICS_DIR`.
 Other jobs and local runs remain opt-in. This records evidence only: it does
 not change baselines, tolerances, warmup inputs, retry policy, or exit codes.
+The metric and failure contracts below apply independently of this sampler.
 
 Each invocation and retry gets a unique `attempt-N-*` directory:
 
@@ -24,8 +25,11 @@ prevent artifact upload.
   CUDA timings. Use case-begin to workers-ready to locate startup, not the first
   tqdm `0/N` refresh, which may occur well into warmup. Do not treat this as a
   precise loading assertion. Module loading is a subset of startup.
-- Request E2E is the existing worker forward metric, not total pytest wall time.
-  Warmup, output saving, consistency checks and retries are separate costs.
+- Ordinary request E2E is the existing worker forward metric, not total pytest
+  wall time. Realtime E2E measures the complete requested WebSocket generation
+  session, from sending initialization to receiving its frames and chunk stats;
+  it is not the last chunk's latency. Startup, warmup and later MP4 encoding are
+  excluded. Keep these two E2E scopes distinct when comparing results.
 - Cumulative CPU/I/O/fault counters must be differenced by `(pid, created)`.
   Processes shorter than a sample interval may be missed. Zero observed disk
   reads do not prove a warm cache or absence of I/O.
@@ -43,3 +47,17 @@ No arbitrary environment, command lines, prompts, file contents or full logs
 are saved. Only allowlisted log markers and numeric process/resource data are
 collected. Sampling runs in the pytest parent, never adds CUDA synchronization,
 does not attach a debugger, and does not change device settings.
+
+## Metric and failure contracts
+
+Every generated testcase must report finite, positive E2E, including cases with
+`run_perf_check=False`. Missing request records, absent performance logs and
+missing/invalid E2E fail CI. Disabling performance checks disables threshold
+comparisons, not metric reporting. Explicit GT generation skips validation.
+
+A performance failure stops the testcase's remaining repeated requests and
+subsequent checks. It also prevents pytest retries, even if another testcase
+has a retryable infrastructure failure. Standalone infrastructure failures
+retain their existing retry policy. Valid failed measurements are recorded
+before threshold validation; realtime chunk and memory guards remain enabled
+according to their existing configuration.
