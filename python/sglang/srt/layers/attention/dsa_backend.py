@@ -312,9 +312,8 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
-    # Only the TRT-LLM branch of __init__ allocates one, but init_cuda_graph_state
-    # sizes it for every backend, so declare the default here rather than relying
-    # on each constructor branch to define it.
+    # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
+    # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     def __init__(
@@ -527,10 +526,6 @@ class DeepseekSparseAttnBackend(
             prefill_impl=self.dsa_prefill_impl,
             decode_impl=self.dsa_decode_impl,
         )
-
-        # Only the TRT-LLM branch allocates one; the others must still define it,
-        # since init_cuda_graph_state sizes it for every backend.
-        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
         if uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
@@ -1316,51 +1311,38 @@ class DeepseekSparseAttnBackend(
 
         self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
 
-    def _multi_ctas_kv_counter_for(self, query_rows: int) -> Optional[torch.Tensor]:
-        """Counter to hand this call, without disturbing the captured one.
-
-        ``query_rows`` is ``page_table_1.shape[0]``, so a prefill batch wider
-        than ``TRTLLM_MLA_MAX_BATCH_SIZE`` lands here -- routine, not
-        hypothetical. Such a batch gets a temporary: rebinding
-        ``_multi_ctas_kv_counter_buffer`` would free the allocation the decode
-        graphs captured, leaving replays writing through a dangling pointer.
-        """
+    def _multi_ctas_kv_counter_for(
+        self, num_query_rows: int
+    ) -> Optional[torch.Tensor]:
+        # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
+        # rebinding would free the allocation the decode graphs captured.
         counter = grow_multi_ctas_kv_counter_buffer_if_needed(
-            self._multi_ctas_kv_counter_buffer,
-            torch.device(self.device),
-            self.num_q_heads,
-            query_rows,
+            buffer=self._multi_ctas_kv_counter_buffer,
+            device=torch.device(self.device),
+            num_q_heads=self.num_q_heads,
+            batch_size=num_query_rows,
         )
-        # A grow during capture would bake a temporary's address into the graph.
-        # _ensure_multi_ctas_kv_counter_capacity sizes for every captured row
-        # count first, so this is an invariant guard, not a live failure mode.
+        # Capacity is established before capture, so a grow here means that
+        # invariant broke rather than a case needing handling.
         assert (
             counter is self._multi_ctas_kv_counter_buffer
             or not torch.cuda.is_current_stream_capturing()
         ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
         return counter
 
-    def _ensure_multi_ctas_kv_counter_capacity(self, query_rows: int) -> None:
-        """Size the persistent multi-CTAs KV counter for ``query_rows``.
-
-        The counter is indexed by query rows, and target verify / draft extend
-        expand each request into ``speculative_num_draft_tokens`` of them, so the
-        ``max_running_requests`` used at construction undercounts what capture
-        asks for. Call this before the first capture: once a graph has recorded
-        the buffer's address, growing it would free the allocation that graph
-        replays against.
-
-        Grow-only. Each ``init_cuda_graph_state`` runs before its own capture,
-        but a shrink would discard a buffer an earlier graph already captured.
-        """
+    def _ensure_multi_ctas_kv_counter_capacity(self, num_query_rows: int) -> None:
+        # Capture indexes by query rows -- speculative_num_draft_tokens per
+        # request under target verify -- which max_running_requests undercounts.
         if self._multi_ctas_kv_counter_buffer is None:
             return
+        # Grow-only, and before any capture: shrinking or growing afterwards
+        # would free the allocation a captured graph replays against.
         self._multi_ctas_kv_counter_buffer = (
             grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                query_rows,
+                buffer=self._multi_ctas_kv_counter_buffer,
+                device=torch.device(self.device),
+                num_q_heads=self.num_q_heads,
+                batch_size=num_query_rows,
             )
         )
 
