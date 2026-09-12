@@ -1098,49 +1098,83 @@ class ChatCompletionRequest(BaseModel):
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
         renderer_handles_response_format: bool = False,
+        preferred_sampling_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
-        Priority: user value > model generation_config > OpenAI defaults
+        Priority: user value > preferred sampling params > model generation_config
+        > OpenAI defaults. Derived stop strings and output constraints are preserved.
         """
+        preferred_sampling_params = preferred_sampling_params or {}
 
-        def get_param(param_name: str):
+        def get_param(param_name: str, sampling_name: Optional[str] = None):
+            sampling_name = sampling_name or param_name
             value = getattr(self, param_name)
-            if value is None:
+            if (
+                param_name not in self.model_fields_set
+                and sampling_name in preferred_sampling_params
+            ):
+                return preferred_sampling_params[sampling_name]
+            if value is None and param_name in self._DEFAULT_SAMPLING_PARAMS:
+                # These five optional fields already treat null as "use defaults".
+                if sampling_name in preferred_sampling_params:
+                    return preferred_sampling_params[sampling_name]
                 return model_generation_config.get(
                     param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
                 )
             return value
 
-        # add per user request
-        spaces_between_special_tokens = (
-            True
-            if self.chat_template_kwargs is None
-            else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
+        max_new_tokens = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        if not {"max_completion_tokens", "max_tokens"} & self.model_fields_set:
+            max_new_tokens = preferred_sampling_params.get("max_new_tokens")
+
+        spaces_between_special_tokens = (self.chat_template_kwargs or {}).get(
+            "spaces_between_special_tokens",
+            preferred_sampling_params.get("spaces_between_special_tokens", True),
+        )
+
+        if "stop" not in self.model_fields_set:
+            preferred_stop = preferred_sampling_params.get("stop")
+            if preferred_stop:
+                preferred_stop = (
+                    [preferred_stop]
+                    if isinstance(preferred_stop, str)
+                    else preferred_stop
+                )
+                template_stop = [stop] if isinstance(stop, str) else (stop or [])
+                stop = list(dict.fromkeys([*preferred_stop, *template_stop]))
+
+        # A server default grammar must not displace a request/tool constraint.
+        has_request_constraint = (
+            self.response_format or self.regex or self.ebnf or tool_call_constraint
         )
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
-            "min_new_tokens": self.min_tokens,
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": get_param("min_tokens", "min_new_tokens"),
             "stop": stop,
-            "stop_token_ids": self.stop_token_ids,
-            "stop_regex": self.stop_regex,
+            "stop_token_ids": get_param("stop_token_ids"),
+            "stop_regex": get_param("stop_regex"),
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": get_param("presence_penalty"),
+            "frequency_penalty": get_param("frequency_penalty"),
             "repetition_penalty": get_param("repetition_penalty"),
-            "regex": self.regex,
-            "ebnf": self.ebnf,
-            "n": self.n,
-            "no_stop_trim": self.no_stop_trim,
-            "ignore_eos": self.ignore_eos,
-            "skip_special_tokens": self.skip_special_tokens,
-            "logit_bias": self.logit_bias,
-            "custom_params": self.custom_params,
-            "sampling_seed": self.seed,
+            "regex": self.regex if has_request_constraint else get_param("regex"),
+            "ebnf": self.ebnf if has_request_constraint else get_param("ebnf"),
+            "n": get_param("n"),
+            "no_stop_trim": get_param("no_stop_trim"),
+            "ignore_eos": get_param("ignore_eos"),
+            "skip_special_tokens": get_param("skip_special_tokens"),
+            "logit_bias": get_param("logit_bias"),
+            "custom_params": get_param("custom_params"),
+            "sampling_seed": get_param("seed", "sampling_seed"),
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 

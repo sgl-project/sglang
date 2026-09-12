@@ -1120,7 +1120,10 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
+            preferred_sampling_params=self.tokenizer_manager.preferred_sampling_params,
         )
+        # Response grouping and usage accounting must use the effective choice count.
+        request.n = sampling_params["n"]
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
