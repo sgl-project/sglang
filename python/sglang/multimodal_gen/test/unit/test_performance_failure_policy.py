@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import _is_retryable_failure
 from sglang.multimodal_gen.test.server import test_server_common as common
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
     ScenarioConfig,
@@ -21,6 +22,7 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
     case = DiffusionTestCase(
         "e2e_only",
         DiffusionServerArgs(model_path="test", modality="image"),
+        DiffusionSamplingParams(prompt="test"),
         run_perf_check=False,
     )
     scenario = ScenarioConfig({}, {}, 1000, 0, 0)
