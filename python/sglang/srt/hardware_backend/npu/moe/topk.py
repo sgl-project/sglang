@@ -87,14 +87,20 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
+        # npu_moe_gating_top_k requires x and bias to share a dtype. When
+        # they already match (e.g. a bf16 gate with bf16 bias) nothing is
+        # cast. Otherwise promote to fp32 if the bias is fp32 — bf16 bias
+        # reorders top-k routing (see the GLM-5.2 note in deepseek_v2.py) —
+        # and only downcast bf16 biases to the logits dtype.
+        if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
+            if correction_bias.dtype == torch.float32:
+                router_logits = router_logits.to(torch.float32)
+            else:
+                correction_bias = correction_bias.to(router_logits.dtype)
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
+            router_logits,
             k=topk_config.top_k,
-            bias=(
-                correction_bias.to(torch.float32)
-                if correction_bias is not None
-                else None
-            ),
+            bias=(correction_bias if correction_bias is not None else None),
             # num_expert_group and topk_group in some topk_config without group is None, (not supported by this ops)
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
@@ -109,6 +115,8 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
         )
+        # MoeLowLatencyCombineV2 (DeepEP) requires fp32 expert scales
+        # (DT_FLOAT in every operator prototype signature).
         topk_weights = topk_weights.to(torch.float32)
 
     # torch native is not yet supported num_token_non_padded
