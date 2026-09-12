@@ -118,6 +118,16 @@ class SpecTpSync:
             self._tp_group.broadcast(values, src=0)
         return values
 
+    def sync_cpu(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
+        """Broadcast a CPU decision tensor from rank 0 to its TP group."""
+        if site in self._sites:
+            torch.distributed.broadcast(
+                values,
+                src=self._tp_group.ranks[0],
+                group=self._tp_group.cpu_group,
+            )
+        return values
+
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
         """Free GPU memory, reduced to the group minimum when ``site`` is on."""
         distributed = self.enabled(site) and group.world_size > 1
