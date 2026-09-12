@@ -2877,6 +2877,16 @@ class DeepseekV4AttnBackend(
             # out_loc is -1 for an incomplete group and 0 for padding;
             # the kernel suppresses both stores.
             assert out_loc is not None
+            if pool.low_ratio_index_k_is_split(layer_id):
+                # ROCm keeps the index-K payload and scales in two buffers
+                from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+                    store_index_k_norm_rope_split,
+                )
+
+                store_index_k_norm_rope_split(
+                    pool, layer, latent, pos, out_loc, freqs_cis
+                )
+                return
             index_k_norm_rope_pack_store(
                 indexer.forward_wk(latent),
                 indexer.k_norm.weight.data,

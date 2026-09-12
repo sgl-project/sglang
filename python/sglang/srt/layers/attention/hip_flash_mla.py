@@ -1,4 +1,5 @@
-from typing import Any, Optional
+import functools
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -9,9 +10,148 @@ from sglang.srt.utils import is_hip
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
+_HIP_BACKENDS = ("tilelang", "triton", "aiter_sparse", "torch", "comparison")
+
+# at this many query tokens and above the aiter sparse kernel runs unsplit (batch-invariant prefill)
+_AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS = 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
+    """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]);
+    cached so graph capture sees a stable address."""
+    return torch.arange(
+        0, (num_tokens + 1) * width, width, dtype=torch.int32, device=device
+    )
+
+
+def aiter_sparse_decode_fwd(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    **_unused,
+):
+    """aiter's gfx950 gluon sparse decode kernel (``pa_decode_sparse``) behind the
+    ``flash_mla_with_kvcache`` shapes. Only ``-1`` entries are skipped, so callers fold
+    ``topk_length`` into the index lists; ``inv_rope`` folds the model's inverse RoPE into the output."""
+    from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+    from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
+        aiter_sparse_split_reduce,
+    )
+
+    b, s, h, d = q.shape
+    n = b * s
+    q3 = q.reshape(n, h, d)
+    assert k_cache.dim() == 4 and k_cache.shape[2] == 1, k_cache.shape
+    cache = k_cache.view(torch.uint8).squeeze(2)
+    idx = indices.reshape(-1)
+    assert idx.dtype == torch.int32 and idx.is_contiguous()
+    indptr = _uniform_indptr(n, indices.shape[-1], str(q.device))
+    extra_kwargs = {}
+    if extra_k_cache is not None:
+        assert extra_k_cache.dim() == 4 and extra_k_cache.shape[2] == 1
+        extra_idx = extra_indices_in_kvcache.reshape(-1)
+        assert extra_idx.dtype == torch.int32 and extra_idx.is_contiguous()
+        extra_kwargs = dict(
+            extra_cache=extra_k_cache.view(torch.uint8).squeeze(2),
+            extra_indices=extra_idx,
+            extra_indptr=_uniform_indptr(
+                n, extra_indices_in_kvcache.shape[-1], str(q.device)
+            ),
+        )
+    if n >= _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS:
+        extra_kwargs["kv_splits"] = 1
+    elif envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() > 0:
+        # a pinned split count keeps the combine order, hence the bits, the same at every batch size
+        extra_kwargs["kv_splits"] = envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
+    out = pa_decode_sparse(
+        q3,
+        cache,
+        idx,
+        indptr,
+        attn_sink,
+        softmax_scale,
+        skip_reduce=True,
+        **extra_kwargs,
+    )
+    if isinstance(out, tuple):
+        # Split-KV partials (acc, m, l): combine them here.
+        part_acc, part_m, part_l = out
+        out = aiter_sparse_split_reduce(
+            part_acc, part_m, part_l, attn_sink, q.dtype, inv_rope=inv_rope
+        )
+    elif inv_rope is not None:
+        _apply_inverse_rope(out, inv_rope)
+    return out.view(b, s, h, d), None
+
+
+def _apply_inverse_rope(
+    out: torch.Tensor, inv_rope: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """The model's standalone inverse RoPE on ``out`` [n, h, d] (last 64 dims of
+    every head), for the paths that did not fold it into their combine."""
+    from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+
+    freqs_real, positions = inv_rope
+    n = out.shape[0]
+    # freqs_real is view_as_real(freqs_cis).flatten(-2); fused_rope_inplace takes the complex table
+    freqs_cis = torch.view_as_complex(freqs_real.view(freqs_real.shape[0], -1, 2))
+    fused_rope_inplace(
+        out.view(n, -1, out.shape[-1])[..., -freqs_real.shape[-1] :],
+        None,
+        freqs_cis,
+        positions.view(-1)[:n],
+        inverse=True,
+    )
+
+
+def hip_fused_decode_glue() -> bool:
+    """Whether the DSV4.1 decode glue (page table, index widening, image select)
+    runs as fused HIP launches; the torch chains are bitwise the same."""
+    return is_hip() and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+
+
+def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:
+    """The HIP decode attention kernel name; "auto" (the default) is aiter's
+    gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere."""
+    if backend is None:
+        backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+    if backend == "auto":
+        from sglang.srt.utils import is_gfx95_supported
+
+        return "aiter_sparse" if is_gfx95_supported() else "tilelang"
+    return backend
+
+
+# kernels taking the real per-rank head count; the tilelang kernel builds only for 64-padded widths
+_HIP_BACKENDS_ANY_HEAD_COUNT = frozenset({"aiter_sparse", "triton"})
+
+
+def hip_attention_needs_head_pad() -> bool:
+    """Whether the kernel ``DeepseekV4HipRadixBackend.forward`` picks needs the per-rank query
+    heads padded to 64 (zero q, zero sink)."""
+    return resolve_hip_flashmla_backend() not in _HIP_BACKENDS_ANY_HEAD_COUNT
+
+
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
-        backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+        # a caller may name one HIP kernel per forward mode; CUDA names fall back to the HIP default
+        backend = resolve_hip_flashmla_backend(
+            backend if backend in _HIP_BACKENDS else None
+        )
+        if backend != "aiter_sparse" and kwargs.get("inv_rope") is not None:
+            # only the aiter kernel folds the inverse RoPE into its combine; apply it here for the rest
+            inv_rope = kwargs.pop("inv_rope")
+            out, lse = flash_mla_with_kvcache_entrypoint(backend=backend, **kwargs)
+            b, s_q, h, d = out.shape
+            _apply_inverse_rope(out.view(b * s_q, h, d), inv_rope)
+            return out, lse
     else:
         import sgl_kernel.flash_mla as flash_mla
 
@@ -43,6 +183,9 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         )
 
         return triton_fp8_attention_fwd(**kwargs)
+
+    if backend == "aiter_sparse":
+        return aiter_sparse_decode_fwd(**kwargs)
 
     if backend == "kernel":
         return flash_mla.flash_mla_with_kvcache(**kwargs)
