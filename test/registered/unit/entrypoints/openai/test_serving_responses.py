@@ -1060,7 +1060,6 @@ class HarmonyResponsesTestCase(CustomTestCase):
                 parameters={"type": "object"},
             ),
             ResponseTool(type="web_search"),
-            ResponseTool(type="namespace", name="codex"),
             ResponseTool(type="mcp"),
         ]
         msg = get_developer_message(instructions="be helpful", tools=tools)
