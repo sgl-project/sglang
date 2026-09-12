@@ -7,6 +7,8 @@ import torch
 
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
+    _config_for_shape,
+    _refit_preset,
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
@@ -50,6 +52,55 @@ class _TestProfile:
 @dataclass(frozen=True)
 class _TestConfig:
     profiles: tuple[_TestProfile, ...]
+
+
+# _config_for_shape reaches these through dataclasses.replace, so the stubs have
+# to be dataclasses like the flashinfer types they stand in for.
+@dataclass(frozen=True)
+class _TestShapeProfile:
+    tp_size: int
+    hidden_size: int
+    top_k: int
+    finalize_routes: _TestRoutes
+    all_reduce_routes: _TestRoutes
+    dtype: object = torch.bfloat16
+
+    def matches(self, *, tp_size, hidden_size, top_k, dtype):
+        return (self.tp_size, self.hidden_size, self.top_k, self.dtype) == (
+            tp_size,
+            hidden_size,
+            top_k,
+            dtype,
+        )
+
+
+def _ht_preset():
+    """The shipped tp8 / hidden 8192 all-reduce tuning, the refit's donor."""
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import HTAllReduceTuning
+
+    return HTAllReduceTuning(
+        persistent_ctas=None,
+        consumer_threads=512,
+        vectors_per_thread=2,
+        stages=2,
+        reduction_warps=2,
+        reduction_cta_groups=None,
+        rms_token_groups=2,
+        rms_pipeline_stages=1,
+        rms_shard_major=False,
+        enable_pdl=True,
+    )
+
+
+def _shape_profile(tp_size, hidden_size, top_k, preset=None):
+    routes = _TestRoutes(targets=(_TestTarget(preset if preset else object()),))
+    return _TestShapeProfile(
+        tp_size=tp_size,
+        hidden_size=hidden_size,
+        top_k=top_k,
+        finalize_routes=routes,
+        all_reduce_routes=routes,
+    )
 
 
 @pytest.mark.parametrize(
@@ -146,6 +197,84 @@ def test_qwen_workspace_config_enables_only_supported_finalize_presets():
     assert qwen_config.profiles[0].finalize_routes.targets[1].preset is untouched_preset
 
 
+def test_tuned_shape_reuses_the_shipped_config():
+    # Guards the probe degrading to "never matches": a shape flashinfer has
+    # tuned must keep its own dispatch tables rather than be re-stamped.
+    config = _TestConfig(
+        profiles=(_shape_profile(8, 8192, 10), _shape_profile(16, 8192, 10))
+    )
+
+    assert _config_for_shape(config, tp_size=8, hidden_size=8192, top_k=10) is config
+
+
+def test_untuned_shape_restamps_the_nearest_profile():
+    far = _shape_profile(16, 8192, 10)
+    donor = _shape_profile(8, 8192, 10)
+    config = _TestConfig(profiles=(far, donor))
+
+    resolved = _config_for_shape(config, tp_size=4, hidden_size=4096, top_k=8)
+
+    assert len(resolved.profiles) == 1
+    stamped = resolved.profiles[0]
+    assert (stamped.tp_size, stamped.hidden_size, stamped.top_k) == (4, 4096, 8)
+    assert (
+        stamped.finalize_routes.targets[0].preset
+        is donor.finalize_routes.targets[0].preset
+    )
+    # The shipped config is process-global; re-stamping must not reach into it.
+    assert config.profiles == (far, donor)
+    assert (donor.tp_size, donor.hidden_size, donor.top_k) == (8, 8192, 10)
+
+
+def test_donor_selection_ranks_top_k_after_tp_and_hidden_size():
+    # Two profiles identical but for top_k: without top_k in the key the winner
+    # is whichever min() happens to see first.
+    far = _shape_profile(4, 4096, 64)
+    near = _shape_profile(4, 4096, 9)
+    config = _TestConfig(profiles=(far, near))
+
+    resolved = _config_for_shape(config, tp_size=4, hidden_size=4096, top_k=8)
+
+    assert resolved.profiles[0].finalize_routes is not far.finalize_routes
+    assert (
+        resolved.profiles[0].finalize_routes.targets[0].preset
+        is near.finalize_routes.targets[0].preset
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "expected_threads", "expected_vectors"),
+    [
+        (8192, 512, 2),
+        (4096, 512, 1),
+        (2048, 256, 1),
+    ],
+)
+def test_ht_preset_shard_is_refit_to_divide_hidden(
+    hidden_size, expected_threads, expected_vectors
+):
+    preset = _ht_preset()
+
+    refit = _refit_preset(preset, hidden_size)
+
+    assert refit.consumer_threads == expected_threads
+    assert refit.vectors_per_thread == expected_vectors
+    # The shard the HT kernel rejects unless it tiles the hidden size.
+    assert hidden_size % (refit.consumer_threads * 8 * refit.vectors_per_thread) == 0
+
+
+def test_non_ht_preset_is_returned_untouched():
+    preset = _TestPreset()
+
+    assert _refit_preset(preset, 4096) is preset
+
+
+def test_hidden_size_no_shard_tiles_raises():
+    # 2880 = 2^6 * 45, so no power-of-two shard divides it.
+    with pytest.raises(RuntimeError, match="cannot refit MNNVL preset"):
+        _refit_preset(_ht_preset(), 2880)
+
+
 def test_wrapper_calls_only_the_stable_unified_api():
     calls = []
     wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
@@ -154,6 +283,7 @@ def test_wrapper_calls_only_the_stable_unified_api():
     wrapper.max_m = 4
     wrapper.rms_epsilon = 1e-5
     wrapper.weight_bias = 0.0
+    wrapper.fuse_residual = True
     wrapper.device = torch.device("cpu")
     wrapper.workspace = object()
     wrapper.supports = lambda m: True

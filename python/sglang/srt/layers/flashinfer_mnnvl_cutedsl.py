@@ -64,6 +64,117 @@ def _with_early_finalize_shared_load(config):
     return replace(config, profiles=tuple(profiles))
 
 
+def _config_for_shape(config, *, tp_size: int, hidden_size: int, top_k: int):
+    """Return a config that has a profile for this static shape.
+
+    FlashInfer ships profiles only for the shapes it has tuned. A model whose
+    (tp_size, hidden_size, top_k) is not among them can still run the kernels:
+    the routes carry launch tunings, and the shape reaches the kernel through
+    the workspace constructor. Re-stamp the nearest tuned profile so the
+    dispatch tables are reused rather than invented.
+    """
+    shape = dict(
+        tp_size=tp_size, hidden_size=hidden_size, top_k=top_k, dtype=torch.bfloat16
+    )
+    if any(profile.matches(**shape) for profile in config.profiles):
+        return config
+
+    if not config.profiles:
+        raise RuntimeError("FlashInfer MNNVL config carries no profiles")
+    # Nearest by TP size, then hidden size, then top-k: the route boundaries are
+    # M ranges, and those track how much work one rank publishes per token, of
+    # which top-k is the smallest term -- it multiplies only the finalize
+    # kernel's gather.
+    donor = min(
+        config.profiles,
+        key=lambda profile: (
+            abs(profile.tp_size - tp_size),
+            abs(profile.hidden_size - hidden_size),
+            abs(profile.top_k - top_k),
+        ),
+    )
+    logger.info(
+        "No tuned FlashInfer MNNVL profile for tp_size=%d hidden_size=%d top_k=%d; "
+        "reusing the dispatch tables of the tp_size=%d hidden_size=%d top_k=%d profile",
+        tp_size,
+        hidden_size,
+        top_k,
+        donor.tp_size,
+        donor.hidden_size,
+        donor.top_k,
+    )
+    return replace(
+        config,
+        profiles=(
+            replace(
+                donor,
+                tp_size=tp_size,
+                hidden_size=hidden_size,
+                top_k=top_k,
+                finalize_routes=_refit_routes(donor.finalize_routes, hidden_size),
+                all_reduce_routes=_refit_routes(donor.all_reduce_routes, hidden_size),
+            ),
+        ),
+    )
+
+
+def _refit_routes(routes, hidden_size: int):
+    """Shrink presets whose thread shard does not tile the donor's hidden size.
+
+    The HT presets shard a token across ``consumer_threads * 8 *
+    vectors_per_thread`` elements and reject a hidden size that does not divide
+    by it. Halving the per-thread vector count, then the thread count, keeps the
+    preset's shape while making the shard fit; everything else it encodes --
+    stage depth, warp roles, RMS grouping -- is carried over untouched.
+    """
+    return replace(
+        routes,
+        targets=tuple(
+            replace(target, preset=_refit_preset(target.preset, hidden_size))
+            for target in routes.targets
+        ),
+    )
+
+
+def _refit_preset(preset, hidden_size: int):
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
+        HTAllReduceTuning,
+        HTFinalizeTuning,
+    )
+
+    if not isinstance(preset, (HTAllReduceTuning, HTFinalizeTuning)):
+        return preset
+
+    threads = preset.consumer_threads
+    vectors = preset.vectors_per_thread
+    groups = preset.rms_token_groups
+    while hidden_size % (threads * 8 * vectors) or threads * 8 * vectors > hidden_size:
+        if vectors > 1:
+            vectors //= 2
+        elif (
+            threads // 2 >= 32
+            and not (threads // 2) % 32
+            and not (threads // 2) % groups
+        ):
+            threads //= 2
+        else:
+            raise RuntimeError(
+                f"cannot refit MNNVL preset {preset} to hidden_size={hidden_size}"
+            )
+    if (threads, vectors) == (preset.consumer_threads, preset.vectors_per_thread):
+        return preset
+    logger.info(
+        "Refit MNNVL HT preset for hidden_size=%d: consumer_threads %d -> %d, "
+        "vectors_per_thread %d -> %d",
+        hidden_size,
+        preset.consumer_threads,
+        threads,
+        preset.vectors_per_thread,
+        vectors,
+    )
+    return replace(preset, consumer_threads=threads, vectors_per_thread=vectors)
+
+
 @dataclass(frozen=True, slots=True)
 class _WorkspaceSignature:
     hidden_size: int
@@ -71,6 +182,7 @@ class _WorkspaceSignature:
     rms_epsilon: float
     weight_bias: float
     max_m: int
+    fuse_residual: bool
     device_index: int
     process_group_identity: int
 
@@ -88,6 +200,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         weight_bias: float,
         process_group: ProcessGroup,
         device: torch.device,
+        fuse_residual: bool = True,
     ) -> None:
         if hidden_size <= 0 or top_k <= 0 or max_m <= 0:
             raise ValueError("hidden_size, top_k, and max_m must be positive")
@@ -99,7 +212,11 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.max_m = int(max_m)
         self.rms_epsilon = float(rms_epsilon)
         self.weight_bias = float(weight_bias)
+        # Models whose residual stream is not a plain add (mHC hyper-connections,
+        # for one) take the reduced value back and combine it themselves.
+        self.fuse_residual = bool(fuse_residual)
         self.process_group = process_group
+        self.tp_size = dist.get_world_size(process_group)
         self.device = torch.device(device)
         self._destroyed = False
 
@@ -129,9 +246,14 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self._patterns,
                 default_config,
             ) = _import_kernel_backend()
+            default_config = _config_for_shape(
+                default_config,
+                tp_size=self.tp_size,
+                hidden_size=self.hidden_size,
+                top_k=self.top_k,
+            )
             # Only fused finalize launches have a completed shared-expert handoff;
             # standalone AllReduce kernels retain the safe load ordering.
-
             if get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(default_config)
             else:
@@ -144,7 +266,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 )
                 self.workspace_config = default_config
             self.workspace = workspace_type(
-                tp_size=dist.get_world_size(process_group),
+                tp_size=self.tp_size,
                 tp_rank=dist.get_rank(process_group),
                 max_token_num=self.max_m,
                 hidden_dim=self.hidden_size,
@@ -155,7 +277,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 routed_scaling_factor=1.0,
                 weight_bias=self.weight_bias,
                 include_shared_expert=True,
-                add_residual=True,
+                add_residual=self.fuse_residual,
                 write_residual_output=True,
                 config=self.workspace_config,
             )
@@ -169,7 +291,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         if self._destroyed or not 1 <= int(m) <= self.max_m:
             return False
         return self.workspace.is_buffer_size_sufficient(
-            tp_size=dist.get_world_size(self.process_group),
+            tp_size=self.tp_size,
             num_tokens=int(m),
             hidden_dim=self.hidden_size,
             dtype=torch.bfloat16,
@@ -187,6 +309,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.fuse_residual:
+            raise RuntimeError("workspace was compiled without the residual add")
         m = int(permuted_indices.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -227,6 +351,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.fuse_residual:
+            raise RuntimeError("workspace was compiled without the residual add")
         m = int(local_contribution.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -249,6 +375,38 @@ class FlashInferMNNVLCuteDSLARFusion:
             weight_bias=self.weight_bias,
         )
         return norm_output, residual_output
+
+    def all_reduce(
+        self,
+        *,
+        local_contribution: torch.Tensor,
+        gamma: torch.Tensor,
+        norm_scratch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce across TP ranks and hand the sum back unnormalized.
+
+        The compiled kernel always produces the normalized value as well; a
+        caller whose residual stream is not a plain add reads the pre-norm
+        output and lets ``norm_scratch`` absorb the rest.
+        """
+        if self.fuse_residual:
+            raise RuntimeError("workspace was compiled with the residual add")
+        m = int(local_contribution.shape[0])
+        if not self.supports(m):
+            raise ValueError(f"workspace does not support M={m}")
+        output = torch.empty_like(local_contribution)
+        self._allreduce_fusion(
+            input=local_contribution,
+            workspace=self.workspace,
+            pattern=self._patterns.kARResidualRMSNorm,
+            launch_with_pdl=True,
+            residual_out=output,
+            norm_out=norm_scratch,
+            rms_gamma=gamma,
+            rms_eps=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+        )
+        return output
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -280,6 +438,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     max_m: int | None = None,
     rms_epsilon: float | None = None,
     weight_bias: float | None = None,
+    fuse_residual: bool = True,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Lookup, or before graph capture create, the process-local workspace."""
     supplied = (hidden_size, top_k, max_m, rms_epsilon, weight_bias)
@@ -317,6 +476,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         int(top_k),
         float(rms_epsilon),
         float(weight_bias),
+        bool(fuse_residual),
         int(device.index),
         id(process_group),
     )
@@ -330,6 +490,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
                 signature.top_k,
                 signature.rms_epsilon,
                 signature.weight_bias,
+                signature.fuse_residual,
                 signature.device_index,
                 signature.process_group_identity,
             )
@@ -357,6 +518,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
             rms_epsilon=float(rms_epsilon),
             weight_bias=float(weight_bias),
             max_m=int(max_m),
+            fuse_residual=bool(fuse_residual),
             device_index=int(device.index),
             process_group_identity=id(process_group),
         )
@@ -368,6 +530,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
             weight_bias=weight_bias,
             process_group=process_group,
             device=device,
+            fuse_residual=fuse_residual,
         )
         _WORKSPACES[signature] = instance
         return instance
