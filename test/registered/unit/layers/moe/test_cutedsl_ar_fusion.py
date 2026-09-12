@@ -344,6 +344,18 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
             assert comm._common_eligible(forward_batch, 8) is True
 
 
+def test_scoped_leaves_unlisted_forward_flags_alone():
+    """Why dsv2_flashinfer_moe_dual_stream_graph must pin the deferral off:
+    entering a scope for other flags does not reset the deferral the decoder
+    published, so it reaches into the op. The op's own contract is exercised in
+    test_dsv2_dual_stream_op_contract.py, which needs CUDA."""
+    from sglang.srt.runtime_context import get_forward
+
+    with get_forward().scoped(defer_moe_finalize=True):
+        with get_forward().scoped(fuse_mlp_allreduce=True):
+            assert get_forward().defer_moe_finalize is True
+
+
 if __name__ == "__main__":
     import sys
 
