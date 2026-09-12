@@ -92,7 +92,7 @@ jobs:
         id: analysis
         continue-on-error: true
         run: |
-          python3 scripts/analyze_failure_report.py \
+          python3 scripts/ci/npu/precise-test/analyze_failure_report.py \
             --log-dir ./test-logs \
             --recommendations-file "${RECS_FILE}" \
             --recommendations-source "${RECS_SOURCE:-none}" \

@@ -203,7 +203,7 @@ jobs:
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          # Date tag derivation must match scripts/run_tests_with_coverage.sh
+          # Date tag derivation must match scripts/ci/npu/precise-test/run_tests_with_coverage.sh
           # (GITHUB_RUN_STARTED_AT is identical across all jobs of one run,
           # immune to cross-midnight splits).
           COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
@@ -238,7 +238,7 @@ jobs:
               || pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
 
-          python3 scripts/test_selector.py \
+          python3 scripts/ci/npu/precise-test/test_selector.py \
             --build-map \
             --coverage-dir "${COV_ROOT}" \
             --source-dir "${COVSTUB}" \

@@ -419,9 +419,9 @@ jobs:
           python3 -c "import regex; print('regex ok:', regex.__file__)"
           PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
           echo "Selecting tests for PR: ${PR_SPEC}"
-          # test_selector.py resolves relative paths against the scripts/ dir,
+          # test_selector.py resolves relative paths against the script's own dir,
           # so pass absolute paths for files downloaded to the workspace root.
-          python3 scripts/test_selector.py \
+          python3 scripts/ci/npu/precise-test/test_selector.py \
             --github-pr "${PR_SPEC}" \
             --source-dir "$PWD/outputs/covstub" \
             --map-file "$PWD/test_case_map.json"
@@ -430,7 +430,7 @@ jobs:
         id: export-paths
         if: always()
         run: |
-          FILE="scripts/recommended_pytest_paths.txt"
+          FILE="scripts/ci/npu/precise-test/recommended_pytest_paths.txt"
           if [ -f "$FILE" ]; then
             {
               echo "coverage_paths<<EOF"

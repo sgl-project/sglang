@@ -45,7 +45,7 @@ on:
         type: boolean
         default: false
       use_coverage_runner:
-        description: 'If true, delegate test execution to scripts/run_tests_with_coverage.sh instead of running via run_suite.py directly'
+        description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
         default: false
       upload_test_logs:
@@ -277,22 +277,23 @@ jobs:
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
 
-          # Optional: delegate execution to scripts/run_tests_with_coverage.sh when the
-          # caller sets use_coverage_runner=true. The original run_suite.py
-          # execution below is preserved unchanged for the default (false) path.
+          # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
+          # selected test files; the original run_suite.py execution below is preserved
+          # unchanged for the default (false) path.
           LOG_FILE="${TEST_LOG_DIR}/${{ inputs.self_name }}-part${{ matrix.partition }}.log"
 
           if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
             pip install coverage==7.8.*
-            python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
+            python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${{ inputs.self_name }} \
               --auto-partition-id ${{ matrix.partition }} \
               --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
-              ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-              $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG --list-tests-output /tmp/selected_tests.txt
+              ${{ inputs.is_nightly_pipeline_job && '--nightly' || '' }} \
+              -o /tmp/selected_tests.txt
             echo "Selected test files:"
             cat /tmp/selected_tests.txt
             if [ -s /tmp/selected_tests.txt ]; then
-              bash ../scripts/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+              bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
             fi
             exit 0
           fi
