@@ -96,5 +96,64 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
+@pytest.mark.skipif(
+    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
+    reason="NVFP4 Marlin requires CUDA SM8X/SM9X/SM120",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("prescale", ["awq", "identity", "plain"])
+def test_modelopt_nvfp4_marlin_prescale(dtype, num_tokens, prescale, monkeypatch):
+    from sglang.srt.layers.linear import RowParallelLinear
+    from sglang.srt.layers.quantization import fp4_utils
+    from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+    from sglang.test.layer_ut_utils import init_single_process_dist, load_linear_weights
+
+    init_single_process_dist()
+    monkeypatch.setattr(
+        fp4_utils, "FP4_GEMM_RUNNER_BACKEND", Fp4GemmRunnerBackend.MARLIN
+    )
+    torch.manual_seed(7209)
+    config = ModelOptFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        group_size=16,
+        exclude_modules=[],
+        packed_modules_mapping={},
+        is_awq=prescale != "plain",
+    )
+    layer = RowParallelLinear(
+        256,
+        128,
+        bias=False,
+        params_dtype=dtype,
+        quant_config=config,
+        tp_rank=0,
+        tp_size=1,
+        prefix="model.layers.0.mlp.down_proj",
+    ).cuda()
+    packed, scales, global_scale, weight_ref = make_nvfp4_weight_and_ref(
+        128, 256, dtype
+    )
+    load_linear_weights(
+        layer,
+        weight=packed,
+        weight_scale=scales,
+        weight_scale_2=global_scale.float(),
+        input_scale=torch.ones((), device="cuda"),
+    )
+    channel_scale = torch.ones(256, dtype=dtype, device="cuda")
+    if prescale == "awq":
+        channel_scale = torch.linspace(0.25, 4, 256, dtype=dtype, device="cuda")
+    if config.is_awq:
+        layer.pre_quant_scale.weight_loader(layer.pre_quant_scale, channel_scale)
+    layer.quant_method.process_weights_after_loading(layer)
+    x = torch.randn(num_tokens, 256, dtype=dtype, device="cuda") / 10
+    actual = layer(x)[0].float()
+    expected = (x * channel_scale).float() @ weight_ref.float().T
+    relative_l2 = (actual - expected).norm() / expected.norm()
+    assert relative_l2.item() < 0.01
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
