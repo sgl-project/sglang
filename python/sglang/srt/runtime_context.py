@@ -262,13 +262,12 @@ class ParallelContext:
     different names rather than two answers to one name.
     """
 
-    __slots__ = ("_overrides", "_config", "_derived", "_derived_log")
+    __slots__ = ("_overrides", "_config", "_derived")
 
     def __init__(self):
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
         self._derived = {}  # widths overridden permanently, as the groups are built
-        self._derived_log = []  # [(source, {name: value})], provenance for _derived
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -291,33 +290,22 @@ class ParallelContext:
         overrides = self._overrides
         return overrides[name] if name in overrides else getter()
 
-    def override_permanently(self, source: str, **widths) -> None:
+    def override_permanently(self, **widths) -> None:
         """Permanently correct a derived width the published bag can't answer
-        or no longer answers correctly -- the `RuntimeContext.override(source,
-        **fields)` shape, not that method, because a derived width is not a
-        resolved config leaf and this must work with no config published at
-        all (`multimodal_gen` lends a TP group to `srt` layers with no `srt`
-        config to publish against).
+        or no longer answers correctly -- not `RuntimeContext.override`,
+        because a derived width is not a resolved config leaf and this must
+        work with no config published at all (`multimodal_gen` lends a TP
+        group to `srt` layers with no `srt` config to publish against).
 
-        `initialize_dp_attention` calls this once `attn_dp_size` is known, and
-        an elastic EP scale-up calls it again where it already updates the
-        live one; `source` is provenance for both, kept for the same reason
-        `RuntimeContext.override` keeps one. Lives beside, not inside, the
-        `@contextmanager` `override` above -- a name it cannot also have on
-        this class -- because these are permanent for the process, not scoped
-        to a `with` block: none of the real callers ever restore the value
-        they set here.
+        Lives beside, not inside, the `@contextmanager` `override` above -- a
+        name it cannot also have on this class -- because these are permanent
+        for the process, not scoped to a `with` block: none of the real
+        callers ever restore the value they set here.
         """
         self._derived.update(widths)
-        self._derived_log.append((source, dict(widths)))
 
     def clear_derived_widths(self) -> None:
         self._derived.clear()
-        self._derived_log.clear()
-
-    def derived_widths_log(self) -> list:
-        """Provenance of `override_permanently` calls: `[(source, {name: value})]`."""
-        return [(source, dict(widths)) for source, widths in self._derived_log]
 
     def _derived_width(self, name):
         """A width the configuration implies: scoped override, else permanent

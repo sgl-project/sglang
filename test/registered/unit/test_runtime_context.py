@@ -1391,7 +1391,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.addCleanup(
             lambda: (
                 parallel.clear_derived_widths(),
-                parallel.override_permanently("test-restore", **self._saved_derived),
+                parallel.override_permanently(**self._saved_derived),
             )
         )
 
@@ -1447,7 +1447,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         answers where there is none.
         """
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_tp_size=7)
+        parallel.override_permanently(attn_tp_size=7)
         self.addCleanup(parallel.clear_derived_widths)
         with parallel.override(tp_size=8, attn_dp_size=2):
             self.assertEqual(parallel.attn_tp_size, 7)
@@ -1483,13 +1483,13 @@ class TestDerivedWidths(_IsolatedOverrides):
         )
         self.assertNotIn("world_size", widths)
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         with patch(f"{_PS}.get_world_size", return_value=9):
             self.assertEqual(parallel.world_size, 9)
 
     def test_a_permanently_overridden_width_is_what_the_reader_answers_with(self):
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_tp_size=4, moe_tp_size=1)
+        parallel.override_permanently(attn_tp_size=4, moe_tp_size=1)
         with patch(
             f"{_PS}.get_attn_tensor_model_parallel_world_size",
             side_effect=AssertionError("the group must not be asked"),
@@ -1498,7 +1498,7 @@ class TestDerivedWidths(_IsolatedOverrides):
 
     def test_a_scoped_override_still_wins_over_the_permanent_one(self):
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         with parallel.override(attn_tp_size=1):
             self.assertEqual(parallel.attn_tp_size, 1)
         self.assertEqual(parallel.attn_tp_size, 4)
@@ -1538,7 +1538,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         from sglang.srt.layers import dp_attention
 
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_dp_size=4)
+        parallel.override_permanently(attn_dp_size=4)
         with patch.object(dp_attention, "_ATTN_DP_SIZE", 4):
             with dp_attention.disable_dp_size():
                 self.assertEqual(dp_attention.get_attention_dp_size(), 1)
@@ -1547,10 +1547,10 @@ class TestDerivedWidths(_IsolatedOverrides):
 
     def test_the_permanent_override_is_cleared_and_reset(self):
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_dp_size=2)
+        parallel.override_permanently(attn_dp_size=2)
         self.assertEqual(parallel.attn_dp_size, 2)
         # Elastic scaling overrides again where it updates the live width.
-        parallel.override_permanently("test", attn_dp_size=4)
+        parallel.override_permanently(attn_dp_size=4)
         self.assertEqual(parallel.attn_dp_size, 4)
         parallel.clear_derived_widths()
         with parallel.override(tp_size=8, attn_dp_size=1):
@@ -1564,7 +1564,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         topology.
         """
         parallel = get_parallel()
-        parallel.override_permanently("test", attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         self.assertEqual(parallel.attn_tp_size, 4)
         reset_context()
         self.addCleanup(reset_context)

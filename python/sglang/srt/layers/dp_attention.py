@@ -71,9 +71,7 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    get_parallel().override_permanently(
-        "update_dp_attention_post_scale", attn_dp_size=new_dp_size
-    )
+    get_parallel().override_permanently(attn_dp_size=new_dp_size)
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -394,9 +392,7 @@ def initialize_dp_attention(
     _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    get_parallel().override_permanently(
-        "initialize_dp_attention", attn_dp_size=_ATTN_DP_SIZE
-    )
+    get_parallel().override_permanently(attn_dp_size=_ATTN_DP_SIZE)
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset

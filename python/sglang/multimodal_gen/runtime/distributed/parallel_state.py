@@ -186,7 +186,6 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._ATTN_TP = _TP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
-            "multimodal_gen._sync_srt_tp_group",
             **derive_parallel_widths(
                 tp_size=_TP.world_size,
                 attn_cp_size=1,
