@@ -533,9 +533,6 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            # The temp name must not extend the final name: a long model path
-            # plus a long sidecar pool name already approaches NAME_MAX, and
-            # an over-long temp name fails every write of that pool.
             tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
