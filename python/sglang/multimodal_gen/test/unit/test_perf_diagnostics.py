@@ -117,13 +117,13 @@ sys.exit(int(sys.argv[2]))
         assert events[-1]["sampler_stopped"] is True
 
 
-def test_retry_policy_and_attempt_numbers_are_unchanged(monkeypatch):
+def test_infrastructure_retries_keep_attempt_numbers(monkeypatch):
     seen = []
 
     def run(cmd, attempt):
         seen.append((cmd, attempt))
         if attempt == 1:
-            return 1, "short test summary info\nFAILED case [performance]\n=== end ==="
+            return 1, "short test summary info\nFAILED case TimeoutError\n=== end ==="
         return 0, "passed"
 
     monkeypatch.setattr(pytest_runner, "_run_pytest_attempt", run)
