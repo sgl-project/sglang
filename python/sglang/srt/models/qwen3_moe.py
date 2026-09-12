@@ -19,6 +19,7 @@
 
 import logging
 import math
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -71,6 +72,7 @@ from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -79,12 +81,19 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
+
+
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm_rope() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_rope_cpu")
+
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -527,6 +536,12 @@ class Qwen3MoeAttention(nn.Module):
                 _yarn_factor != 1.0,
             )
         )
+        self.use_fused_qk_norm_rope_cpu = (
+            _is_cpu
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.rotary_dim % 2 == 0
+            and _has_cpu_fused_qk_norm_rope()
+        )
         self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
@@ -594,31 +609,53 @@ class Qwen3MoeAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        use_fused = (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16) or (
+            self.use_fused_qk_norm_rope_cpu
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+        )
         if use_fused:
-            theta = self.rope_theta
-            positions = (
-                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
-            )
-            factor, low, high, attention_factor = compute_yarn_parameters(self.config)
-            fused_qk_norm_rope(
-                qkv,
-                self.num_heads,
-                self.num_kv_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                theta,
-                self.rotary_emb.is_neox_style,
-                positions,
-                factor,
-                low,
-                high,
-                attention_factor,
-            )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if _is_cuda:
+                theta = self.rope_theta
+                positions = (
+                    positions.view(-1)
+                    .to(dtype=torch.int32, device=qkv.device)
+                    .contiguous()
+                )
+                factor, low, high, attention_factor = compute_yarn_parameters(
+                    self.config
+                )
+                fused_qk_norm_rope(
+                    qkv,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    theta,
+                    self.rotary_emb.is_neox_style,
+                    positions,
+                    factor,
+                    low,
+                    high,
+                    attention_factor,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            elif _is_cpu:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                self.rotary_emb._match_cos_sin_cache_dtype(q)
+                torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.q_norm.variance_epsilon,
+                    self.rotary_emb.is_neox_style,
+                    positions.view(-1),
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.rotary_dim,
+                )
             self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
