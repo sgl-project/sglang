@@ -301,6 +301,12 @@ pub async fn chat_completions(
         .affinity
         .as_ref()
         .and_then(|config| config.worker_queue_limit);
+    let saturation_queue_floor = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.saturation_queue_floor);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -320,6 +326,7 @@ pub async fn chat_completions(
         tps_slo,
         session_affinity_mode,
         worker_queue_limit,
+        saturation_queue_floor,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
