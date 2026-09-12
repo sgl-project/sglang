@@ -61,7 +61,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -71,7 +71,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -82,7 +82,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -106,7 +106,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -116,7 +116,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -127,7 +127,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -286,7 +286,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -300,7 +300,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -398,7 +398,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="7c51d18fda59457cc9238ed262bd93c8cad906c9"
+ARG MORI_COMMIT="879983bdbd8c65c52e9f79ad836a61cbffef98b6"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -568,12 +568,16 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick 8578af1 commit for v4 fp4 indexer kv-cache fix, may be removed in next aiter upgrade
+# cherry-pick ROCm/aiter#5283 (7b481fb) and #5279 (24a62b1): gfx950 DSV4 a8w8 blockscale bpreshuffle configs; drop at the next aiter bump
+# aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage 1 left LDS-DMA loads in flight across the K-step barrier, so a8w4 was not bitwise repeatable; drop at the aiter bump that carries the fix
+COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c \
+ && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
+ && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && git apply --verbose /tmp/aiter_patches/aiter_flydsl_moe_stage1_lds_dma_drain.patch \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -1173,10 +1177,20 @@ ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
-ENV SGLANG_USE_ROCM700A=1
+# ROCm 7.0 dp-attention workaround (dp_attention.py _USE_ROCM700A_WA); off for the served ROCm 7.2+ stacks
+ENV SGLANG_USE_ROCM700A=0
+# aiter's bf16-vs-fp8 MoE token bound (default 256); 0 keeps every batch on the quantized expert kernels
+ENV AITER_BF16_FP8_MOE_BOUND=0
+# bf16 GEMMs through hipBLASLt
+ENV TORCH_BLAS_PREFER_HIPBLASLT=1
+# DeepSeek-V4.1 EP4 a8w4 tuned FMoE rows, under model_configs/ so aiter merges them into its table (AITER_CONFIG_FMOE=<file> would replace every other model's rows); drop once they land in aiter
+COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
+# bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
+ENV AITER_FLYDSL_FORCE_REDUCE=1
 
 ENV NCCL_MIN_NCHANNELS=112
-ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
+# Unquantized quick-reduce: INT8/INT4 all-reduce is lossier than the CUDA path.
+ENV ROCM_QUICK_REDUCE_QUANTIZATION=NONE
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
