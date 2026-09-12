@@ -1226,6 +1226,13 @@ class ChatCompletionRequest(BaseModel):
             else:
                 sampling_params[constraint_type] = constraint_value
 
+        if has_request_constraint:
+            # The tokenizer manager merges preferred settings once more. Mask
+            # other server grammars so that merge cannot reintroduce a conflict.
+            for name in ("json_schema", "regex", "ebnf", "structural_tag"):
+                if preferred_sampling_params.get(name) and name not in sampling_params:
+                    sampling_params[name] = None
+
         return sampling_params
 
 

@@ -13,9 +13,12 @@ from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    LegacyStructuralTagResponseFormat,
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -205,6 +208,78 @@ class TestChatPreferredSamplingParams(CustomTestCase):
         self.assertEqual(params, self.params({}))
         self.assertEqual(params, self.params({"not_a_sampling_param": 123}))
 
+    def test_preferred_grammar_merge_preserves_request_and_tool_constraints(self):
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+        tag = LegacyStructuralTagResponseFormat(
+            type="structural_tag",
+            structures=[{"begin": "<answer>", "schema": schema, "end": "</answer>"}],
+            triggers=["<answer>"],
+        )
+        grammars = {
+            "regex": "server",
+            "ebnf": 'root ::= "server"',
+            "json_schema": json.dumps({"type": "string"}),
+            "structural_tag": tag.model_dump_json(by_alias=True),
+        }
+        requests = (
+            ("regex", {"regex": "client"}, None),
+            ("ebnf", {"ebnf": 'root ::= "client"'}, None),
+            (
+                "json_schema",
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "answer", "schema": schema},
+                    }
+                },
+                None,
+            ),
+            (
+                "structural_tag",
+                {"response_format": tag.model_dump(by_alias=True)},
+                None,
+            ),
+            ("json_schema", {"tool_choice": "required"}, ("json_schema", schema)),
+            ("structural_tag", {"tool_choice": "required"}, ("structural_tag", tag)),
+        )
+        for preferred_key, preferred_value in grammars.items():
+            preferred = {preferred_key: preferred_value}
+            # Each default is a supported, valid SamplingParams setting alone.
+            SamplingParams(**preferred).verify(128)
+            for request_key, fields, tool_constraint in requests:
+                with self.subTest(
+                    preferred=preferred_key, request=request_key, fields=fields
+                ):
+                    request = self.request(**fields)
+                    kwargs = {
+                        "stop": [],
+                        "model_generation_config": {},
+                        "tool_call_constraint": tool_constraint,
+                    }
+                    expected = request.to_sampling_params(**kwargs)
+                    converted = request.to_sampling_params(
+                        **kwargs, preferred_sampling_params=preferred
+                    )
+                    # Exercise the same final merge used by TokenizerManager,
+                    # then run the actual mutual-exclusion validation.
+                    effective = SamplingParams(**{**preferred, **converted})
+                    effective.verify(128)
+                    self.assertEqual(
+                        getattr(effective, request_key), expected[request_key]
+                    )
+                    for other_key in grammars.keys() - {request_key}:
+                        self.assertIsNone(getattr(effective, other_key))
+                    # Only mask an active configured default, never add a
+                    # blanket set of None grammar fields to ordinary requests.
+                    self.assertLessEqual(
+                        set(converted) - set(expected), {preferred_key}
+                    )
+        for empty in (None, ""):
+            self.assertEqual(
+                self.params({key: empty for key in grammars}, regex="client"),
+                self.params(regex="client"),
+            )
+
     def test_serving_conversion_uses_preferred_params_and_choice_count(self):
         # Exercise the production conversion and batch expansion; only message
         # rendering is mocked, so no tokenizer, model weights, or GPU are needed.
@@ -246,6 +321,33 @@ class TestChatPreferredSamplingParams(CustomTestCase):
                     for params in internal.sampling_params:
                         self.assertEqual(params["temperature"], 0.7)
                         self.assertEqual(params["n"], expected_n)
+                results = [
+                    {
+                        "text": f"choice-{index}",
+                        "meta_info": {
+                            "id": "chatcmpl-preferred",
+                            "prompt_tokens": 10,
+                            "completion_tokens": index + 1,
+                            "cached_tokens": 4,
+                            "image_tokens": 3,
+                            "finish_reason": {"type": "stop"},
+                            "weight_version": "default",
+                        },
+                    }
+                    for index in range(expected_n)
+                ]
+                with get_context().override_server_args(enable_cache_report=True):
+                    response = chat._build_chat_response(request, results, created=123)
+                self.assertEqual(
+                    [choice.index for choice in response.choices],
+                    list(range(expected_n)),
+                )
+                self.assertEqual(response.usage.prompt_tokens, 10)
+                self.assertEqual(
+                    response.usage.completion_tokens, sum(range(1, expected_n + 1))
+                )
+                self.assertEqual(response.usage.prompt_tokens_details.cached_tokens, 4)
+                self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 3)
 
 
 if __name__ == "__main__":
