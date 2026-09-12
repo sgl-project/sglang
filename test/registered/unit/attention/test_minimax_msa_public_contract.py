@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops import msa
+from sglang.srt.layers.attention.minimax_sparse_ops import minimax_sparse as sparse_ops
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -106,6 +107,47 @@ def test_explicit_provider_selection_disables_runtime_fallback(monkeypatch):
 
     monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "flashinfer")
     assert not msa.msa_runtime_fallback_allowed()
+
+
+def test_decode_forwards_explicit_provider_and_graph_state(monkeypatch):
+    q = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
+    k = torch.zeros(256, 1, 128, dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    topk = torch.zeros(1, 2, 16, dtype=torch.int32)
+    page_table = torch.zeros(2, 2, dtype=torch.int32)
+    graph_state = object()
+    public_decode = Mock(return_value=q)
+    monkeypatch.setattr(msa, "msa_sparse_decode_main", public_decode)
+
+    _, output = sparse_ops.minimax_sparse_decode(
+        q,
+        None,
+        k,
+        v,
+        torch.zeros(2, 1, 128, dtype=torch.bfloat16),
+        None,
+        torch.zeros_like(k),
+        None,
+        torch.zeros(2, 256, dtype=torch.int32),
+        torch.arange(2, dtype=torch.int32),
+        torch.full((2,), 256, dtype=torch.int32),
+        256,
+        1,
+        128,
+        16,
+        1,
+        1,
+        use_msa=True,
+        cached_topk_idx=topk,
+        msa_backend="flashinfer",
+        msa_page_table=page_table,
+        msa_graph_state=graph_state,
+    )
+
+    assert output is q
+    assert public_decode.call_args.kwargs["backend"] == "flashinfer"
+    assert public_decode.call_args.kwargs["page_table"] is page_table
+    assert public_decode.call_args.kwargs["graph_state"] is graph_state
 
     monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "fmha_sm100")
     assert not msa.msa_runtime_fallback_allowed()
