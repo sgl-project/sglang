@@ -41,8 +41,12 @@ class Memory(msgspec.Struct):
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            resolvable=True,
         ),
     ] = "lru"
+    # The value alone cannot distinguish the default from an explicit LRU
+    # choice, which model-specific defaults must preserve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
