@@ -284,7 +284,7 @@ class DecodeKVCacheOffloadManager:
     def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
         """Match prefill storage hashes."""
         page_hashes = []
-        last_hash = prior_hash or storage_namespace_seed(req)
+        last_hash = prior_hash or storage_namespace_seed(req.extra_key, req.cache_salt)
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
