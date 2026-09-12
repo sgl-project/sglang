@@ -39,6 +39,13 @@
         ]
     },
     "scenarios": {
+        "pi05_action_http": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 21.37,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "qwen_image_t2i": {
             "stages_ms": {
                 "TextEncodingStage": 232.03,
