@@ -3005,7 +3005,7 @@
                 "CausalVaeDecodingStage": 217.75
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 1912.29,
+            "expected_e2e_ms": 18687.61,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "load_peak_vram_mb": 42814.0,
