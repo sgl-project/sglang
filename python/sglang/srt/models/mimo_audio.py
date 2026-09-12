@@ -21,6 +21,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import (
     get_model,
@@ -503,6 +504,13 @@ class AudioEncoderAttention(nn.Module):
         self.window_size = window_size
         self.causal = causal
 
+        # The audio encoder weights are sharded over the attention-TP group
+        # (see _remap_audio_tokenizer_state_dict), so its output projection
+        # must reduce over that same group. Without this flag the reduce runs
+        # on the full TP group, which deadlocks under DP attention whenever
+        # only one DP group's batch contains audio items (the other group
+        # never enters the collective), and silently sums partials across
+        # unrelated DP groups even when both do.
         self.attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -513,6 +521,7 @@ class AudioEncoderAttention(nn.Module):
             flatten_batch=True,
             window_size=window_size,
             customized_position_embedding_applier=_audio_rope_applier,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix="attn",
         )
 
