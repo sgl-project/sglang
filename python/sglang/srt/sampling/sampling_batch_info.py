@@ -68,7 +68,7 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     # Custom logit processor
     custom_logit_processor: Optional[
-        Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
+        Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]
     ] = None
 
     # Used for deterministic sampling
@@ -166,10 +166,8 @@ class SamplingBatchInfo:
                 hash(processor_str): (
                     # The deserialized custom logit processor object
                     CustomLogitProcessor.from_str(processor_str),
-                    # The mask tensor for the requests that use this custom logit processor
-                    torch.zeros(len(reqs), dtype=torch.bool)
-                    .scatter_(0, torch.tensor(true_indices), True)
-                    .to(device, non_blocking=True),
+                    true_indices,
+                    torch.tensor(true_indices, dtype=torch.long, device=device),
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
@@ -341,7 +339,7 @@ class SamplingBatchInfo:
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
-            self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+            self._filter_batch_custom_logit_processor(keep_indices)
 
         for item in [
             "temperatures",
@@ -369,17 +367,19 @@ class SamplingBatchInfo:
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
-    def _filter_batch_custom_logit_processor(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
+    def _filter_batch_custom_logit_processor(self, keep_indices: List[int]):
         """Filter the custom logit processor and custom params"""
-        self.custom_logit_processor = {
-            k: (p, mask[keep_indices_device])
-            for k, (p, mask) in self.custom_logit_processor.items()
-            if torch.any(
-                mask[keep_indices_device]
-            )  # ignore the custom logit processor whose mask is all False
-        }
+        filtered = {}
+        for key, (processor, rows, _) in self.custom_logit_processor.items():
+            selected = set(rows)
+            new_rows = [i for i, old in enumerate(keep_indices) if old in selected]
+            if new_rows:
+                filtered[key] = (
+                    processor,
+                    new_rows,
+                    torch.tensor(new_rows, dtype=torch.long, device=self.device),
+                )
+        self.custom_logit_processor = filtered
         self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         # If the custom logit processor is an empty dict, set the flag to False,
@@ -391,10 +391,9 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_custom_logit_processor(
-        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
-        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
+        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]],
+        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]],
         bs1: int,
-        bs2: int,
         device: str,
     ):
         if lhs is None and rhs is None:
@@ -407,24 +406,13 @@ class SamplingBatchInfo:
         for k in keys:
             # Get the logit processor object
             processor = lhs[k][0] if k in lhs else rhs[k][0]
-            # Get and merge the mask tensors from the two dicts
-            left_mask = (
-                lhs[k][1]
-                if k in lhs
-                else torch.zeros(bs1, dtype=torch.bool, device=device)
-            )
-            right_mask = (
-                rhs[k][1]
-                if k in rhs
-                else torch.zeros(bs2, dtype=torch.bool, device=device)
-            )
-            merged_dict[k] = (processor, torch.cat([left_mask, right_mask]))
-
-            assert merged_dict[k][1].shape[0] == bs1 + bs2, (
-                f"The batch size of merged mask ({merged_dict[k][1].shape[0]}) does not match "
-                f"the sum of the batch sizes of the two masks ({bs1 + bs2})"
-                f"\n{left_mask=}\n{right_mask=}\n{bs1=}\n{bs2=}"
-                f"\n{lhs=}\n{rhs=}"
+            rows = list(lhs[k][1]) if k in lhs else []
+            if k in rhs:
+                rows.extend(i + bs1 for i in rhs[k][1])
+            merged_dict[k] = (
+                processor,
+                rows,
+                torch.tensor(rows, dtype=torch.long, device=device),
             )
 
         return merged_dict
@@ -440,7 +428,6 @@ class SamplingBatchInfo:
                     self.custom_logit_processor,
                     other.custom_logit_processor,
                     len(self),
-                    len(other),
                     self.device,
                 )
             )
