@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.mamba_layer_ids import resolve_req_pool_mamba_layer_ids
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -1009,16 +1010,20 @@ class KVCacheConfigurator:
         return req_to_token_pool
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
-        mamba_layer_ids = [
-            i
-            for i in self.mambaish_config.mamba2_cache_params.layers
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        if max_speculative_num_draft_tokens():
-            for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
-                if layer_id not in mamba_layer_ids:
-                    mamba_layer_ids.append(layer_id)
-        return mamba_layer_ids
+        # A NextN (MTP draft) layer joins the list only if the config cannot
+        # classify it or classifies it as linear: GLM-5.3-Flash's NextN block is
+        # a DSA attention layer, so its slot in MambaPool / MambaPoolHost would
+        # be one layer of conv+ssm state that nothing ever indexes. Configs
+        # without ``is_kda_layer`` keep the unconditional append.
+        cfg = self.mambaish_config
+        return resolve_req_pool_mamba_layer_ids(
+            mamba_layers=cfg.mamba2_cache_params.layers,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            nextn_layer_ids=getattr(cfg, "nextn_layer_ids", []),
+            is_linear_layer=getattr(cfg, "is_kda_layer", None),
+            spec_enabled=bool(max_speculative_num_draft_tokens()),
+        )
 
     def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
         from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
