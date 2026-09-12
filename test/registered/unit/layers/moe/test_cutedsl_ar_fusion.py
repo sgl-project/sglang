@@ -5,11 +5,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.layers.communicator import LayerCommunicator
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+    CuteDSLFusionLayerCommunicator,
     MoeFinalizeHandoff,
     is_supported_forward_mode,
     resolve_max_m,
@@ -205,6 +207,141 @@ def test_text_entry_wrapper_delegates_pre_capture_prepare():
     Qwen3_5ForCausalLM.prepare_before_cuda_graph_capture(wrapper, runner)
 
     assert calls == [runner]
+
+
+def _eligible_communicator(*, successor: bool):
+    """A CuteDSLFusionLayerCommunicator stub whose only varying input is whether
+    a successor exists to absorb this layer's outgoing all-reduce."""
+    comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+    comm.successor_absorbs_all_reduce = successor
+    comm.input_layernorm = SimpleNamespace()
+    return comm
+
+
+def test_last_layer_prepare_attn_consumes_the_pending_all_reduce():
+    """Through the real call site, not the predicate.
+
+    The penultimate layer skips its all-reduce on the strength of a successor
+    and tags the tensor; the final layer has no successor of its own and must
+    still run the fused collective on it. Gating prepare_attn() on the outgoing
+    predicate drops the reduction silently, so assert the fused call happened
+    and that the plain path was not taken.
+    """
+    last = _eligible_communicator(successor=False)
+    last.fusion_service = SimpleNamespace(
+        all_reduce_residual_rms_norm=lambda h, r, g: (h + 1, r + 1)
+    )
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    hidden_states = torch.zeros(8, 8)
+    hidden_states._sglang_needs_allreduce_fusion = True
+    residual = torch.zeros(8, 8)
+
+    finished = []
+    with (
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.fused_norm_gamma",
+            return_value=torch.empty(8),
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_exec",
+            return_value=SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator,
+            "_finish_prepare_attn",
+            lambda self, h, r, fb: finished.append((h, r)) or (h, r),
+        ),
+        patch.object(
+            LayerCommunicator,
+            "prepare_attn",
+            lambda *a, **k: pytest.fail(
+                "the last layer fell through to the unfused path, dropping the "
+                "reduction its predecessor skipped"
+            ),
+        ),
+    ):
+        out_hidden, out_residual = last.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+    assert len(finished) == 1
+    assert torch.equal(out_hidden, torch.ones(8, 8))
+    assert torch.equal(out_residual, torch.ones(8, 8))
+
+
+def test_last_layer_still_declines_to_skip_its_own_all_reduce():
+    """The other half of the split: consuming is owed to it, deferring is not."""
+    last = _eligible_communicator(successor=False)
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    with (
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.fused_norm_gamma",
+            return_value=torch.empty(8),
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_exec",
+            return_value=SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+    ):
+        assert last.can_consume_post_moe_all_reduce(forward_batch, 8) is True
+        assert last.can_absorb_post_moe_all_reduce(forward_batch, 8) is False
+
+
+def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
+    """Skipping the post-experts reduction drops both the EP and the TP leg,
+    and one fused collective cannot restore both. LayerCommunicator refuses
+    this shape; the override must not admit it."""
+    comm = _eligible_communicator(successor=True)
+    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
+    comm._context = SimpleNamespace(tp_size=4, attn_dp_size=1)
+    comm.layer_scatter_modes = SimpleNamespace(mlp_mode=None)
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    def parallel(*, ep, moe_tp):
+        return SimpleNamespace(
+            moe_ep_size=ep,
+            moe_tp_size=moe_tp,
+            attn_cp_size=1,
+            tp_size=4,
+            attn_tp_size=4,
+        )
+
+    with (
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.is_dp_attention_enabled",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_attn_tp_context",
+            return_value=SimpleNamespace(input_scattered=False),
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+    ):
+        with patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_parallel",
+            return_value=parallel(ep=2, moe_tp=2),
+        ):
+            assert comm._common_eligible(forward_batch, 8) is False
+        with patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_parallel",
+            return_value=parallel(ep=1, moe_tp=4),
+        ):
+            assert comm._common_eligible(forward_batch, 8) is True
 
 
 if __name__ == "__main__":

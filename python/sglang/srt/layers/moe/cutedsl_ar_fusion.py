@@ -231,7 +231,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             residual is not None
             and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
             and hidden_states._sglang_needs_allreduce_fusion
-            and self.can_absorb_post_moe_all_reduce(
+            and self.can_consume_post_moe_all_reduce(
                 forward_batch, int(hidden_states.shape[0])
             )
         ):
@@ -308,20 +308,37 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and parallel.moe_ep_size == 1
         )
 
+    def can_consume_post_moe_all_reduce(
+        self, forward_batch: ForwardBatch, m: int
+    ) -> bool:
+        """Incoming side: whether this layer's input norm may absorb the
+        post-MoE all-reduce its predecessor skipped.
+
+        Deliberately independent of this layer's own successor. A layer that
+        publishes no handoff of its own still owes the reduction its
+        predecessor handed it, and the last layer is exactly that case.
+        """
+        return (
+            self._common_eligible(forward_batch, m)
+            and fused_norm_gamma(self.input_layernorm) is not None
+            and not get_exec().comm.enable_quant_communications
+        )
+
     def can_absorb_post_moe_all_reduce(
         self, forward_batch: ForwardBatch, m: int
     ) -> bool:
-        """Whether prepare_attn can fuse a plain post-MoE all-reduce here.
+        """Outgoing side: whether this layer may skip its own post-MoE
+        all-reduce because the next layer will absorb it.
 
         The finalize pattern minus the finalize: reached above the deferred
         finalize bound, where the MoE returns a tensor but its all-reduce is
-        still this layer's to perform.
+        still someone's to perform. Stands in its own consume eligibility for
+        the successor's; every fusion layer of a model shares its norm flavour
+        and topology.
         """
         return (
             self.successor_absorbs_all_reduce
-            and self._common_eligible(forward_batch, m)
-            and fused_norm_gamma(self.input_layernorm) is not None
-            and not get_exec().comm.enable_quant_communications
+            and self.can_consume_post_moe_all_reduce(forward_batch, m)
         )
 
     def should_defer_moe_finalize(
@@ -354,6 +371,10 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
             and self._context.tp_size > 1
+            # Under hybrid EP+TP the post-experts reduction spans two disjoint
+            # groups and skipping it drops both legs, so one fused collective
+            # cannot restore it. LayerCommunicator refuses the same shape.
+            and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
         )
 
     def should_fuse_mlp_allreduce_with_next_layer(
