@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_spec,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -160,9 +161,14 @@ for backend in CONCAT_ROPE_BACKENDS:
 
 def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
     prefill_backend, decode_backend = attention_backends()
-    is_decode = forward_batch.forward_mode.is_decode_or_idle()
-    if is_decode:
+    if forward_batch.forward_mode.is_decode_or_idle():
         backend = decode_backend
+    elif forward_batch.forward_mode.is_target_verify():
+        backend = (
+            decode_backend
+            if get_spec().speculative_attention_mode == "decode"
+            else prefill_backend
+        )
     else:
         backend = prefill_backend
         if (
