@@ -41,6 +41,8 @@ def _fused_gather_to_staging_kernel(
     ELEMS_PER_TOKEN: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ELEMS_PER_16B: tl.constexpr,
+    ALIGNED_16: tl.constexpr,
 ):
     layer_id = tl.program_id(0)
     block_id = tl.program_id(1)
@@ -58,13 +60,23 @@ def _fused_gather_to_staging_kernel(
     page_val = tl.load(page_indices + page_id, mask=mask, other=0)
     pool_token = page_val * PAGE_SIZE + intra_page
 
-    src_offsets = (
-        pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
+    src_row = (
+        layer_ptr
+        + pool_token * stride_pool_token.to(tl.int64)
+        + head_offset.to(tl.int64)
     )
-    vals = tl.load(layer_ptr + src_offsets, mask=mask)
-
-    dst_offsets = tl.program_id(0).to(tl.int64) * per_layer_elems.to(tl.int64) + offsets
-    tl.store(staging + dst_offsets, vals, mask=mask)
+    dst_row = staging + layer_id.to(tl.int64) * per_layer_elems.to(tl.int64)
+    if ALIGNED_16:
+        # `layer_ptr` is loaded from a device table, so Triton has no divisibility
+        # for it and lowers the payload one element at a time.
+        # Host validation proves both row bases. These compile-time assertions
+        # ensure the per-program index terms preserve that 16-byte alignment.
+        tl.static_assert(ELEMS_PER_TOKEN % ELEMS_PER_16B == 0)
+        tl.static_assert(BLOCK_SIZE % ELEMS_PER_16B == 0)
+        src_row = tl.multiple_of(src_row, 16)
+        dst_row = tl.multiple_of(dst_row, 16)
+    vals = tl.load(src_row + e_idx, mask=mask)
+    tl.store(dst_row + offsets, vals, mask=mask)
 
 
 @triton.jit
@@ -80,6 +92,8 @@ def _fused_scatter_from_staging_kernel(
     PAGE_SIZE: tl.constexpr,
     NUM_LAYERS_X2: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ELEMS_PER_16B: tl.constexpr,
+    ALIGNED_16: tl.constexpr,
 ):
     prog_id = tl.program_id(0)
     block_id = tl.program_id(1)
@@ -102,17 +116,94 @@ def _fused_scatter_from_staging_kernel(
     pool_token = page_val * PAGE_SIZE + intra_page
 
     per_rank_elems = per_layer_elems.to(tl.int64) * NUM_LAYERS_X2
-    src_offsets = (
+    src_row = staging + (
         writer_id.to(tl.int64) * per_rank_elems
         + layer_kv_id.to(tl.int64) * per_layer_elems.to(tl.int64)
-        + offsets
     )
-    vals = tl.load(staging + src_offsets, mask=mask)
+    dst_row = (
+        layer_ptr
+        + pool_token * stride_pool_token.to(tl.int64)
+        + head_offset.to(tl.int64)
+    )
+    if ALIGNED_16:
+        # See the gather kernel: the same proof covers both row bases here.
+        tl.static_assert(ELEMS_PER_TOKEN % ELEMS_PER_16B == 0)
+        tl.static_assert(BLOCK_SIZE % ELEMS_PER_16B == 0)
+        src_row = tl.multiple_of(src_row, 16)
+        dst_row = tl.multiple_of(dst_row, 16)
+    vals = tl.load(src_row + offsets, mask=mask)
+    tl.store(dst_row + e_idx, vals, mask=mask)
 
-    dst_offsets = (
-        pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
+
+def kv_buffers_preserve_16_byte_alignment(
+    buffers: list[torch.Tensor],
+    *,
+    stride_pool_token: int,
+    head_dim: int,
+) -> bool:
+    """Validate the stable KV-buffer terms of the 16-byte row-base proof."""
+    if not buffers:
+        return False
+
+    dtype = buffers[0].dtype
+    dtype_size = buffers[0].element_size()
+    return 16 % dtype_size == 0 and all(
+        buf.dtype == dtype
+        and buf.ndim == 3
+        and buf.shape[-1] == head_dim
+        and buf.stride(0) == stride_pool_token
+        and buf.stride(1) == head_dim
+        and buf.stride(2) == 1
+        and buf.data_ptr() % 16 == 0
+        for buf in buffers
     )
-    tl.store(layer_ptr + dst_offsets, vals, mask=mask)
+
+
+def _can_use_aligned_staging_copy(
+    buffers: list[torch.Tensor],
+    staging: torch.Tensor,
+    *,
+    stride_pool_token: int,
+    head_dim: int,
+    head_offsets: list[int],
+    elems_per_token: int,
+    per_layer_elems: int,
+    buffers_aligned_16: Optional[bool] = None,
+) -> bool:
+    """Whether every staging row base is 16-byte aligned on both sides.
+
+    The kernels reach the KV pool through a device pointer table and reach staging
+    through a layer/writer offset, so both bases have to be proven: each KV
+    buffer's own pointer and the three strides that reach a row inside it, plus the
+    staging allocation and the per-layer stride that indexes into it. Stable KV
+    terms may be validated once at buffer registration and passed through
+        ``buffers_aligned_16``; request-dependent terms are always checked here.
+        Keep each term explicit so future slicing or layout callers cannot weaken the
+        proof by relying on today's shape relationships. One failed term keeps the
+        whole launch on the generic path.
+    """
+    dtype_size = staging.element_size()
+    # ELEMS_PER_16B = 16 // dtype_size must be exact for the kernel's static asserts.
+    if 16 % dtype_size != 0:
+        return False
+
+    if buffers_aligned_16 is None:
+        buffers_aligned_16 = kv_buffers_preserve_16_byte_alignment(
+            buffers,
+            stride_pool_token=stride_pool_token,
+            head_dim=head_dim,
+        )
+
+    return (
+        buffers_aligned_16
+        and staging.is_contiguous()
+        and staging.data_ptr() % 16 == 0
+        and stride_pool_token * dtype_size % 16 == 0
+        and head_dim * dtype_size % 16 == 0
+        and elems_per_token * dtype_size % 16 == 0
+        and per_layer_elems * dtype_size % 16 == 0
+        and all(offset * dtype_size % 16 == 0 for offset in head_offsets)
+    )
 
 
 class StagingBuffer:
@@ -408,6 +499,7 @@ def _gather_all_layers_triton(
     num_heads: int,
     page_size: int,
     gpu_id: int,
+    buffers_aligned_16: Optional[bool] = None,
 ) -> int:
     """Triton fused kernel path: single kernel launch for all layers."""
     import numpy as np
@@ -421,13 +513,16 @@ def _gather_all_layers_triton(
     per_layer_elems = num_tokens * elems_per_token
     per_layer_bytes = per_layer_elems * dtype_size
     total_bytes = per_layer_bytes * num_layers * 2
+    stride_pool_token = total_heads * head_dim
+    head_offset = src_head_start * head_dim
+    buffers = k_buffers + v_buffers
 
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(gpu_id)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     layer_ptrs = torch.tensor(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
+        [buf.data_ptr() for buf in buffers],
         dtype=torch.int64,
         device=device,
     )
@@ -435,6 +530,16 @@ def _gather_all_layers_triton(
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
+    aligned_16 = _can_use_aligned_staging_copy(
+        buffers,
+        staging_typed,
+        stride_pool_token=stride_pool_token,
+        head_dim=head_dim,
+        head_offsets=[head_offset],
+        elems_per_token=elems_per_token,
+        per_layer_elems=per_layer_elems,
+        buffers_aligned_16=buffers_aligned_16,
+    )
 
     gather_stream = staging_buffer.get_gather_stream()
     gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
@@ -448,12 +553,14 @@ def _gather_all_layers_triton(
             page_idx_tensor,
             staging_typed,
             num_tokens,
-            total_heads * head_dim,
-            src_head_start * head_dim,
+            stride_pool_token,
+            head_offset,
             per_layer_elems,
             elems_per_token,
             page_size,
             BLOCK_SIZE,
+            16 // dtype_size,
+            aligned_16,
         )
 
     gather_stream.synchronize()
@@ -469,6 +576,7 @@ def gather_all_layers_to_staging(
     num_heads: int,
     page_size: int,
     gpu_id: int,
+    buffers_aligned_16: Optional[bool] = None,
 ) -> int:
     """Gather all layers' K and V head slices into a staging buffer.
 
@@ -485,6 +593,7 @@ def gather_all_layers_to_staging(
             num_heads,
             page_size,
             gpu_id,
+            buffers_aligned_16,
         )
     return _gather_all_layers_torch(
         k_buffers,
@@ -575,6 +684,7 @@ def _scatter_staging_to_kv_triton(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    buffers_aligned_16: Optional[bool] = None,
 ) -> None:
     """Triton fused kernel path for scatter."""
     num_layers = len(k_buffers)
@@ -599,25 +709,28 @@ def _scatter_staging_to_kv_triton(
     )
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
+    stride_pool_token = total_heads * head_dim
+    buffers = k_buffers + v_buffers
 
     layer_ptrs = torch.tensor(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
+        [buf.data_ptr() for buf in buffers],
         dtype=torch.int64,
         device=device,
     )
 
+    writer_head_offsets_host = [
+        compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            wr,
+            dst_tp_rank,
+            total_kv_heads,
+        )[2]
+        * head_dim
+        for wr in range(num_writers)
+    ]
     writer_head_offsets = torch.tensor(
-        [
-            compute_head_slice_params(
-                prefill_attn_tp_size,
-                decode_attn_tp_size,
-                wr,
-                dst_tp_rank,
-                total_kv_heads,
-            )[2]
-            * head_dim
-            for wr in range(num_writers)
-        ],
+        writer_head_offsets_host,
         dtype=torch.int64,
         device=device,
     )
@@ -628,6 +741,16 @@ def _scatter_staging_to_kv_triton(
         num_tokens * elems_per_token * dtype_size * num_layers * 2 * num_writers
     )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
+    aligned_16 = _can_use_aligned_staging_copy(
+        buffers,
+        staging_typed,
+        stride_pool_token=stride_pool_token,
+        head_dim=head_dim,
+        head_offsets=writer_head_offsets_host,
+        elems_per_token=elems_per_token,
+        per_layer_elems=per_layer_elems,
+        buffers_aligned_16=buffers_aligned_16,
+    )
 
     BLOCK_SIZE = 1024
     num_layers_x2 = 2 * num_layers
@@ -639,12 +762,14 @@ def _scatter_staging_to_kv_triton(
         staging_typed,
         writer_head_offsets,
         num_tokens,
-        total_heads * head_dim,
+        stride_pool_token,
         per_layer_elems,
         elems_per_token,
         page_size,
         num_layers_x2,
         BLOCK_SIZE,
+        16 // dtype_size,
+        aligned_16,
     )
 
 
@@ -658,6 +783,7 @@ def scatter_staging_to_kv(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    buffers_aligned_16: Optional[bool] = None,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
     if _USE_TRITON_STAGING:
@@ -671,6 +797,7 @@ def scatter_staging_to_kv(
             decode_attn_tp_size,
             dst_tp_rank,
             total_kv_heads,
+            buffers_aligned_16,
         )
     return _scatter_staging_to_kv_torch(
         staging_buffer_view,
