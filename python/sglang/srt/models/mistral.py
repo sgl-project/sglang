@@ -115,16 +115,27 @@ class Mistral3ForConditionalGeneration:
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        # Asking the tower for hidden states makes it build and hold one tensor
+        # per layer -- 49 of them for the single layer read here, ~1.8 GiB per
+        # 1540px image against 38 MB for the layer itself -- and they stay
+        # resident for the whole loop, so the cost scales with images in the
+        # batch. When the final layer is the one selected, request it alone:
+        # the tower returns the very tensor that would have been the last entry
+        # of that list.
+        last_layer_only = self.vision_feature_layer == -1
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = item.feature, item.image_sizes
-            image_outputs = self.vision_tower(
-                pixel_values, image_sizes, output_hidden_states=True
-            )
-            selected_image_feature = image_outputs.hidden_states[
-                self.vision_feature_layer
-            ]
+            if last_layer_only:
+                selected_image_feature = self.vision_tower(pixel_values, image_sizes)
+            else:
+                image_outputs = self.vision_tower(
+                    pixel_values, image_sizes, output_hidden_states=True
+                )
+                selected_image_feature = image_outputs.hidden_states[
+                    self.vision_feature_layer
+                ]
 
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
