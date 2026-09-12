@@ -1,7 +1,7 @@
 """Unit tests for the Mamba JIT transfer kernel.
 
 Verifies kernel backup (D2H) and load (H2D) correctness for
-``MambaPoolHost`` via the ``io_backend='kernel'`` path, across both
+``MambaPoolHost`` via the kernel and direct backends, across both
 supported layouts and multiple index scenarios.
 """
 
@@ -200,8 +200,9 @@ def assert_device_matches_host(host, device_pool, host_indices, device_indices):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
-    """Test D2H backup + H2D load roundtrip with io_backend='kernel'."""
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+def test_mamba_kernel_backup_load_roundtrip(dtype, layout, io_backend):
+    """Test D2H backup + H2D load roundtrip with both backends."""
     host = make_host_pool(dtype, layout)
     assert_host_mock_complete(host)
     device_pool = host.device_pool
@@ -214,9 +215,9 @@ def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
     host_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
     load_indices = torch.tensor([3, 7, 12], dtype=torch.int64, device=DEVICE)
 
-    # --- Backup: device -> host (kernel) ---
+    # --- Backup: device -> host ---
     host.backup_from_device_all_layer(
-        device_pool, host_indices, device_indices, io_backend="kernel"
+        device_pool, host_indices, device_indices, io_backend=io_backend
     )
     torch.cuda.synchronize()
     assert_host_matches_device(host, device_pool, host_indices, device_indices)
@@ -227,14 +228,14 @@ def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
         for conv_idx in range(len(device_pool.mamba_cache.conv)):
             device_pool.mamba_cache.conv[conv_idx][layer_id].zero_()
 
-    # --- Load: host -> device (kernel), per layer ---
+    # --- Load: host -> device, per layer ---
     for layer_id in range(NUM_LAYERS):
         host.load_to_device_per_layer(
             device_pool,
             host_indices,
             load_indices,
             layer_id,
-            io_backend="kernel",
+            io_backend=io_backend,
         )
     torch.cuda.synchronize()
     assert_device_matches_host(host, device_pool, host_indices, load_indices)
