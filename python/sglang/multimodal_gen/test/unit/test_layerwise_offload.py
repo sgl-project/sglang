@@ -1,4 +1,5 @@
 import gc
+import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -2500,6 +2501,153 @@ def test_offloaded_weight_bytes_counts_mapped_and_strided_entries():
     )
     total = LayerwiseOffloadManager.offloaded_weight_bytes(manager)
     assert total == 8 * 2 + 6 * 2 + 4 * 4
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+
+    # the page cache cannot hold the mapping: it is re-read from the drive every pass
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._ensure_mapped_courier().direct_read
+
+    # the same mapping on a host that can cache it keeps the page-cache path
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: False
+    )
+    manager._mapped_courier = None
+    assert not manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_sees_the_pages_the_cache_holds(tmp_path):
+    path = tmp_path / "cached.bin"
+    path.write_bytes(b"\x01" * (16 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=16 << 20, dtype=torch.uint8)
+    mapped.sum()  # touch every page
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr(), mapped.numel()
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # the page cache holds the layer: shipping it is a memcpy, not a drive read
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers
+    assert courier.stats["cached_layers"] >= 1
+    assert courier.stats["direct_read_bytes"] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_blocking_loads_of_cold_mapped_layers_go_through_the_courier(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 0.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    # a blocking load (how a resident set is armed) is shipped by the courier too
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert courier.stats["layers"] == 1
+    assert torch.equal(manager.model.blocks[0].weight.detach().cpu(), torch.zeros(8, 8))
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_a_fully_resident_small_component_may_still_read_directly(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # far below the size floor, but every layer is resident: it is armed once
+    # per request, so there is no re-streamed pass for the floor to protect
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 1 << 20
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=2)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+        resident_layers=2,
+    )
+    assert manager._mapped_cpu_weights[0] and not manager._streamed_order
+    assert manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_samples_a_large_mapping_at_page_aligned_offsets(tmp_path):
+    # large enough that the sampling stride exceeds one window: every window
+    # must start on a page boundary or mincore rejects it and the answer is -1
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"\x01" * (96 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=96 << 20, dtype=torch.uint8)
+    mapped.sum()
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr() + 1000, (96 << 20) - 1000
+    )
+    assert fraction >= 0.9
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
