@@ -185,6 +185,7 @@ impl Policy for CacheAwarePolicy {
             }
         }
         PowerOfTwoChoicesPolicy::new()
+            .with_load_control(self.config.min_load_choices, self.config.worker_queue_limit)
             .propose(workers, ctx)
             .map(PrefillProposal::Pair)
     }

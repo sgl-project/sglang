@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{PolicyKind, SessionAffinityMode};
+use crate::config::{PolicyKind, SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
     queue_gate_admits, resolve_cache_candidates, resolve_decode, resolve_prefill,
@@ -386,6 +386,16 @@ pub async fn chat_completions(
         .affinity
         .as_ref()
         .and_then(|config| config.worker_queue_limit);
+    // Sample size for the min-load fallback beneath admission
+    // (`--min-load-choices`). A policy with no affinity config never reaches
+    // the cache-aware paths, so it keeps the pre-existing power-of-2 default.
+    let min_load_choices = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.min_load_choices)
+        .unwrap_or(DEFAULT_MIN_LOAD_CHOICES);
     let worker = {
         let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
         // Set when the queue gate emptied the cache candidate set: how many
@@ -435,6 +445,7 @@ pub async fn chat_completions(
                         request_input_tokens,
                         snapshot,
                         worker_queue_limit,
+                        min_load_choices,
                     )
                 } else {
                     resolve_prefill_admitted(
