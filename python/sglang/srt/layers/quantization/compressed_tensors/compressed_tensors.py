@@ -284,10 +284,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
         #          "quant_method": "fp8", "weight_block_size": [128, 128]}
         linear_fp8_config = None
-        if "linear_fp8_config" in config:
+        fp8_cfg = config.get("linear_fp8_config")
+        if fp8_cfg is not None:
             from sglang.srt.layers.quantization.fp8 import Fp8Config
 
-            fp8_cfg = config["linear_fp8_config"]
             # Check if it's fp8 format based on quant_method field
             is_fp8 = fp8_cfg.get("quant_method") == "fp8"
             linear_fp8_config = Fp8Config(
