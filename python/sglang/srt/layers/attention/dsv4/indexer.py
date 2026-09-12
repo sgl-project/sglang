@@ -15,6 +15,7 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
@@ -387,6 +388,7 @@ def topk_transform_flashinfer_unfused(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     import flashinfer
+
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
     )
@@ -418,6 +420,7 @@ def topk_transform_flashinfer_fused(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     import flashinfer
+
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
     )

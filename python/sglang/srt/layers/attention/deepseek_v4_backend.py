@@ -18,6 +18,7 @@ from typing import (
 import msgspec
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -131,6 +132,7 @@ from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
