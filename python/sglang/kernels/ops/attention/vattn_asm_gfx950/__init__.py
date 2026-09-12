@@ -61,6 +61,7 @@ class VattnKernelArgs(ctypes.Structure):
         ("_pad", ctypes.c_uint32),
         ("k_descale_ptr", ctypes.c_int64),
         ("v_descale_ptr", ctypes.c_int64),
+        ("seg_plan_ptr", ctypes.c_int64),  # 0 = legacy fixed-SEGS split
     ]
 
 
@@ -77,11 +78,12 @@ class VredKernelArgs(ctypes.Structure):
         ("out_stride1", ctypes.c_uint32),
         ("magic_m", ctypes.c_uint32),
         ("magic_sh", ctypes.c_uint32),
+        ("tok_nseg_ptr", ctypes.c_int64),  # 0 = legacy: reduce all num_segments
     ]
 
 
-assert ctypes.sizeof(VattnKernelArgs) == 128
-assert ctypes.sizeof(VredKernelArgs) == 56
+assert ctypes.sizeof(VattnKernelArgs) == 136
+assert ctypes.sizeof(VredKernelArgs) == 64
 
 
 def _declared_kernarg_size(source_file):
@@ -296,6 +298,174 @@ def mtp_verify_attn_num_segments(num_seqs: int, num_kv_heads: int) -> int:
     return max(1, min(64, segs))
 
 
+_SEG_PLAN_TARGET_WGS = None
+
+
+def _seg_plan_target_wgs() -> int:
+    global _SEG_PLAN_TARGET_WGS
+    if _SEG_PLAN_TARGET_WGS is None:
+        _SEG_PLAN_TARGET_WGS = max(
+            1,
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count,
+        )
+    return _SEG_PLAN_TARGET_WGS
+
+
+def mtp_verify_attn_seg_max(num_seqs: int, num_kv_heads: int) -> int:
+    """Static grid.x for the planned split: 2x the legacy per-seq count, clamped to 16..64."""
+    return max(16, min(64, 2 * mtp_verify_attn_num_segments(num_seqs, num_kv_heads)))
+
+
+def _get_plan_kernel():
+    kern = _kernels.get("plan")
+    if kern is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _vattn_seg_plan_kernel(
+            seq_lens_ptr,
+            cu_q_ptr,
+            plan_ptr,
+            tok_nseg_ptr,
+            num_seqs,
+            num_work,
+            target_wgs,
+            seg_max,
+            BLOCK_B: tl.constexpr,
+            BLOCK_W: tl.constexpr,
+            BLOCK_Q: tl.constexpr,
+        ):
+            # one program per sequence; every program recomputes the (cheap) batch-wide plan
+            pid = tl.program_id(0)
+            b = tl.arange(0, BLOCK_B)
+            bm = b < num_seqs
+            slen = tl.load(seq_lens_ptr + b, mask=bm, other=0).to(tl.int32)
+            nt = (slen + 15) // 16
+            total = tl.sum(nt, axis=0)
+            mx = tl.max(nt, axis=0)
+            # smallest T (tiles per segment) with sum_b ceil(nt_b / T) <= target_wgs and max_b ceil(nt_b / T) <= seg_max
+            lo = tl.maximum(
+                tl.maximum(
+                    (total + target_wgs - 1) // target_wgs,
+                    (mx + seg_max - 1) // seg_max,
+                ),
+                1,
+            )
+            slack = target_wgs - num_seqs
+            hi = tl.where(
+                slack > 0,
+                (total + tl.maximum(slack, 1) - 1) // tl.maximum(slack, 1),
+                lo,
+            )
+            hi = tl.maximum(hi, lo)
+            for _ in range(16):
+                mid = (lo + hi) // 2
+                fits = tl.sum((nt + mid - 1) // mid, axis=0) <= target_wgs
+                hi = tl.where(fits, mid, hi)
+                lo = tl.where(fits, lo, mid + 1)
+            T = hi
+            nseg = (nt + T - 1) // T
+            ends = tl.cumsum(nseg, axis=0)
+            tot = tl.sum(nseg, axis=0)
+            my_n = tl.sum(tl.where(b == pid, nseg, 0), axis=0)
+            my_start = tl.sum(tl.where(b == pid, ends, 0), axis=0) - my_n
+            if pid == 0:
+                tl.store(plan_ptr, T)
+            w = tl.arange(0, BLOCK_W)
+            tl.store(plan_ptr + 1 + my_start + w, (pid << 16) | w, mask=w < my_n)
+            idle = tot + pid + w * num_seqs  # idle tail, strided over programs
+            tl.store(
+                plan_ptr + 1 + idle,
+                tl.full((BLOCK_W,), -1, tl.int32),
+                mask=idle < num_work,
+            )
+            q0 = tl.load(cu_q_ptr + pid).to(tl.int32)
+            q1 = tl.load(cu_q_ptr + pid + 1).to(tl.int32)
+            for t0 in range(q0, q1, BLOCK_Q):
+                t = t0 + tl.arange(0, BLOCK_Q)
+                tl.store(
+                    tok_nseg_ptr + t,
+                    tl.full((BLOCK_Q,), 0, tl.int32) + my_n,
+                    mask=t < q1,
+                )
+
+        kern = _vattn_seg_plan_kernel
+        _kernels["plan"] = kern
+    return kern
+
+
+def seg_plan_target_wgs(num_kv_heads: int) -> int:
+    """Working WGs to aim for: one per CU, shared over the kv-head grid dim."""
+    return max(1, _seg_plan_target_wgs() // max(1, num_kv_heads))
+
+
+def build_seg_plan(seq_lens, cu_seqlens_q, num_tokens, seg_max, num_kv_heads=1):
+    """plan int32[1 + seg_max*num_seqs] = (T tiles/segment, work list seq<<16|seg, -1 past the end),
+    tok_nseg int32[num_tokens] = segment count of the sequence owning each query token. One Triton launch,
+    static shapes, graph-capture safe. T is the smallest segment length whose total WG count fits the CU
+    budget, so uniform batches reproduce the legacy split exactly and skewed batches get per-length counts.
+    """
+    import triton
+
+    num_seqs = seq_lens.shape[0]
+    num_work = seg_max * num_seqs
+    plan = torch.empty(1 + num_work, dtype=torch.int32, device=seq_lens.device)
+    tok_nseg = torch.empty(
+        max(num_tokens, 1), dtype=torch.int32, device=seq_lens.device
+    )
+    _get_plan_kernel()[(num_seqs,)](
+        seq_lens,
+        cu_seqlens_q,
+        plan,
+        tok_nseg,
+        num_seqs,
+        num_work,
+        seg_plan_target_wgs(num_kv_heads),
+        seg_max,
+        BLOCK_B=max(16, triton.next_power_of_2(num_seqs)),
+        BLOCK_W=64,
+        BLOCK_Q=16,
+        num_warps=4,
+    )
+    return plan, tok_nseg
+
+
+_PLAN_CACHE = {}
+
+
+def reset_seg_plan_cache():
+    """Called by the attention backend at the start of every forward (eager and graph capture)."""
+    _PLAN_CACHE.clear()
+
+
+def _cached_seg_plan(seq_lens, cu_seqlens_q, num_tokens, seg_max, num_kv_heads):
+    # torch.cuda.is_current_stream_capturing() is part of the key: graph capture warms
+    # up and then records on the same tensors, and a plan built during warmup must not
+    # be reused while recording (its kernel would be missing from the graph).
+    key = (
+        seq_lens.data_ptr(),
+        cu_seqlens_q.data_ptr(),
+        seq_lens._version,
+        cu_seqlens_q._version,
+        num_tokens,
+        seq_lens.shape[0],
+        seg_max,
+        num_kv_heads,
+        torch.cuda.is_current_stream_capturing(),
+    )
+    hit = _PLAN_CACHE.get(key)
+    if hit is None:
+        plan, tok_nseg = build_seg_plan(
+            seq_lens, cu_seqlens_q, num_tokens, seg_max, num_kv_heads
+        )
+        # keep the key tensors alive so their storage cannot be reused under the same address while cached
+        hit = _PLAN_CACHE[key] = (plan, tok_nseg, seq_lens, cu_seqlens_q)
+    return hit[0], hit[1]
+
+
 def mtp_verify_attn_fwd_asm(
     q,
     k_cache,
@@ -308,13 +478,26 @@ def mtp_verify_attn_fwd_asm(
     softmax_scale,
     num_segments=None,
     out=None,
+    use_seg_plan=True,
 ):
-    """Same contract as aiter.mtp_verify_attn_fwd_asm (see that docstring)."""
+    """Same contract as aiter.mtp_verify_attn_fwd_asm (see that docstring).
+
+    use_seg_plan=False forces the fixed per-sequence split of #37465 (used by the tests as the
+    reference split); production callers leave it on."""
     num_tokens, num_q_heads, head_size = q.shape
     num_seqs = seq_lens.shape[0]
     num_kv_heads = k_cache.shape[2]
+    plan = tok_nseg = None
     if num_segments is None:
-        num_segments = mtp_verify_attn_num_segments(num_seqs, num_kv_heads)
+        if (
+            use_seg_plan and num_seqs > 1
+        ):  # bs=1: nothing to balance, the fixed split already uses 64 segments
+            num_segments = mtp_verify_attn_seg_max(num_seqs, num_kv_heads)
+            plan, tok_nseg = _cached_seg_plan(
+                seq_lens, cu_seqlens_q, num_tokens, num_segments, num_kv_heads
+            )
+        else:
+            num_segments = mtp_verify_attn_num_segments(num_seqs, num_kv_heads)
     segm_out = torch.empty(
         num_tokens,
         num_q_heads,
@@ -356,8 +539,15 @@ def mtp_verify_attn_fwd_asm(
         magic_sh=sh,
         k_descale_ptr=k_descale.data_ptr(),
         v_descale_ptr=v_descale.data_ptr(),
+        seg_plan_ptr=plan.data_ptr() if plan is not None else 0,
     )
-    kern.launch((num_segments, num_seqs, num_kv_heads), (512, 1, 1), args, stream)
+    if plan is not None:
+        # 1-D work list: working WGs first, idle tail exits in the prologue
+        kern.launch(
+            (num_segments * num_seqs, 1, num_kv_heads), (512, 1, 1), args, stream
+        )
+    else:
+        kern.launch((num_segments, num_seqs, num_kv_heads), (512, 1, 1), args, stream)
 
     assert out.stride(2) == 1 and out.dtype == torch.bfloat16
     rm, rsh = _magic_u32(num_q_heads)
@@ -372,6 +562,7 @@ def mtp_verify_attn_fwd_asm(
         out_stride1=out.stride(1),
         magic_m=rm,
         magic_sh=rsh,
+        tok_nseg_ptr=tok_nseg.data_ptr() if tok_nseg is not None else 0,
     )
     _get_reduce().launch((num_tokens * num_q_heads, 1, 1), (256, 1, 1), rargs, stream)
     return out
