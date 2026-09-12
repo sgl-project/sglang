@@ -98,6 +98,18 @@ class TestEnvField(unittest.TestCase):
             self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
         self.assertIn("Invalid value", str(caught[0].message))
 
+    def test_mamba_offload_hit_rate_accepts_only_positive_fractions(self):
+        with envs.SGLANG_MAMBA_OFFLOAD_HIT_RATE.override(0.5):
+            self.assertEqual(envs.SGLANG_MAMBA_OFFLOAD_HIT_RATE.get(), 0.5)
+
+        for invalid in (-0.1, 1.1, "nan"):
+            with self.subTest(invalid=invalid):
+                with envs.SGLANG_MAMBA_OFFLOAD_HIT_RATE.override(invalid):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        self.assertEqual(envs.SGLANG_MAMBA_OFFLOAD_HIT_RATE.get(), 1.0)
+                    self.assertIn("interval [0, 1]", str(caught[0].message))
+
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
     def _apply(self, old_name, deprecation):
