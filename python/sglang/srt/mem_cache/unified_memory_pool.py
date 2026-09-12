@@ -871,14 +871,41 @@ class UnifiedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
-    # take PHYSICAL slot ids; callers translate via the slot allocator first.
+    def _slot_envelopes(self) -> torch.Tensor:
+        spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
+        max_slots = self._unified_buffer.max_slots(self._sub_pool_name)
+        entry_bytes = spec.entry_bytes()
+        return self._unified_buffer._raw[: max_slots * entry_bytes].view(
+            max_slots, entry_bytes
+        )
+
+    def clear_slots(self, indices: torch.Tensor):
+        for sibling in self._slot_siblings:
+            sibling.reset_slots(indices)
+        spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
+        zero_pages(
+            self._unified_buffer._raw,
+            indices,
+            self._unified_buffer.max_slots(self._sub_pool_name),
+            spec.entry_bytes(),
+        )
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        src_indices = src_indices.to(dtype=torch.long)
+        dst_indices = dst_indices.to(dtype=torch.long)
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            dst_slots = dst_indices.tolist()
+            assert len(dst_slots) == len(set(dst_slots)), (
+                f"copy_from requires unique destination slots, got {dst_slots}"
+            )
+        envelopes = self._slot_envelopes()
+        envelopes.index_copy_(0, dst_indices, envelopes.index_select(0, src_indices))
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_indices, dst_indices)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Cross-pool physical-move contract, implemented by every pool the
-        # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
-        # takes (src, dst), hence the swap.
-        MambaPool.copy_from(self, src_loc, tgt_loc)
+        # Compaction passes physical ids; copy_from takes (src, dst).
+        self.copy_from(src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as

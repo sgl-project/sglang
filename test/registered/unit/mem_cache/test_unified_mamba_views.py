@@ -26,6 +26,7 @@ be a multiple of the temporal itemsize -- an alignment hazard that
 """
 
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -191,6 +192,38 @@ class TestUnifiedMambaViews(unittest.TestCase):
                     f"writing {names[target]} CORRUPTED {names[other]} "
                     f"(envelope regions overlap)",
                 )
+
+    def test_slot_lifecycle_updates_whole_envelopes(self):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        pool, spec = _make_pool(**self.FALCON_KW)
+        mamba_pool = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=0,
+            mamba_layer_ids=list(range(spec.layer_num)),
+        )
+        sibling = MagicMock()
+        mamba_pool.register_slot_state(sibling)
+        envelopes = mamba_pool._slot_envelopes()
+        values = torch.arange(
+            envelopes.numel(), dtype=torch.int64, device=envelopes.device
+        ).view_as(envelopes)
+        envelopes.copy_(values.to(torch.uint8))
+        before = envelopes.clone()
+
+        mamba_pool.clear_slots(torch.tensor([2, 5], device=envelopes.device))
+        self.assertTrue(bool((envelopes[[2, 5]] == 0).all().item()))
+        self.assertTrue(torch.equal(envelopes[1], before[1]))
+        sibling.reset_slots.assert_called_once()
+
+        mamba_pool.copy_from(
+            torch.tensor([1, 3], dtype=torch.int32, device=envelopes.device),
+            torch.tensor([4, 6], dtype=torch.int32, device=envelopes.device),
+        )
+        self.assertTrue(torch.equal(envelopes[4], before[1]))
+        self.assertTrue(torch.equal(envelopes[6], before[3]))
+        sibling.copy_slots.assert_called_once()
 
     def test_alignment_guard_fires_on_misaligned_spec(self):
         """A per-slot entry that is not a multiple of the temporal itemsize would
