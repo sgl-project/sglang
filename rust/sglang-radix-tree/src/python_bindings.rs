@@ -528,6 +528,7 @@ pub struct InsertParamsBinding {
     pub cache_salt: Option<String>,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
+    pub mamba_value_seqlen: Option<usize>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
@@ -539,7 +540,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, mamba_value_seqlen = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -553,6 +554,7 @@ impl InsertParamsBinding {
         chunked: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
+        mamba_value_seqlen: Option<usize>,
         track_adopted_ranges: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
@@ -562,6 +564,7 @@ impl InsertParamsBinding {
             cache_salt,
             session_id,
             mamba_value,
+            mamba_value_seqlen,
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
@@ -1054,6 +1057,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
+            mamba_value_seqlen: params.mamba_value_seqlen,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1091,6 +1095,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
+            mamba_value_seqlen: params.mamba_value_seqlen,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
