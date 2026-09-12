@@ -1038,7 +1038,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
-            documentation="Maximum total number of tokens in the KV cache pool.",
+            documentation="Maximum request-visible KV cache capacity in token positions. Under DCP, this capacity spans the DCP group.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1074,13 +1074,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self.page_size = Gauge(
             name="sglang:page_size",
-            documentation="KV cache page size in tokens.",
+            documentation="Per-rank physical KV cache page size in tokens; equals --page-size. Under DCP the allocator allocates in units of page_size * dcp_size token positions, so page_size * num_pages equals the per-rank pool size, not max_total_num_tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_pages = Gauge(
             name="sglang:num_pages",
-            documentation="Number of KV cache pages.",
+            documentation="Number of KV cache pages (the count is the same in per-rank physical and DCP-logical units).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
