@@ -1825,6 +1825,18 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         transform=_ms_to_s,
         note="Note the unit change: milliseconds -> seconds.",
     ),
+    # Migrated to a CLI flag: the backend argument now selects the fusion, so
+    # there is no env var left to forward the value to.
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
+        note=(
+            "Pass --flashinfer-allreduce-fusion-backend cute-dsl instead. "
+            "Without it an eligible model auto-enables the legacy mnnvl "
+            "backend rather than the CuTe DSL fusion."
+        )
+    ),
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
+        note="One workspace per process is now an invariant, not a limit."
+    ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
@@ -1833,6 +1845,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
     "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
+    # Qwen3.5 final-norm debug scaffolding, deleted with the fusion refactor.
+    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     # The unified free list is kept unsorted between flushes by design; the
     # sort-after-merge A/B knob never left its off default and is gone.
     "SGLANG_SORT_FREE_LIST_AFTER_MERGE": _DeprecatedEnv(),

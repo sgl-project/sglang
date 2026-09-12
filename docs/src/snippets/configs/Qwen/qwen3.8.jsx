@@ -407,12 +407,12 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 16",
         "--kv-cache-dtype fp8_e4m3",
         "--attention-backend trtllm_mha",
@@ -485,7 +485,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -493,6 +492,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 8",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
@@ -576,7 +576,6 @@ export const config = {
       // The sizing is derived, not measured.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -670,11 +669,11 @@ export const config = {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 8",
         "--moe-runner-backend flashinfer_trtllm",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -815,12 +814,12 @@ export const config = {
       // DeepEP v2 a2a rules DSpark out under DP-attention.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "dspark", nodes: "multi-4" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 16",
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
@@ -840,7 +839,6 @@ export const config = {
       // model in place of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "multi-2" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -848,6 +846,7 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 8",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
@@ -875,7 +874,6 @@ export const config = {
       // of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "dspark", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -904,11 +902,11 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE=1",
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--flashinfer-allreduce-fusion-backend cute-dsl",
         "--tp-size 8",
         "--context-length 200000",
         "--preferred-sampling-params '{\"top_k\": 20}'",
