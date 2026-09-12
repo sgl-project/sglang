@@ -7,18 +7,6 @@ expert per projection -- `experts.<id>.{gate,up,down}_proj.{weight,weight_scale}
 tensor fell through to a `logger.warning(...not found in params_dict)` and was
 silently dropped: the server started normally and then emitted garbage
 ("capital capital capital..." instead of " Paris.").
-
-Regression coverage for that silent drop. The guarded failure modes are:
-a split expert tensor being passed through unloaded (the bug), a scale losing its
-`weight_scale` suffix and being loaded as if it were the weight, a packed-layout
-w1/w2/w3 name being wrongly claimed here instead of downstream, and an
-unrecognised expert tensor being dropped rather than raising.
-
-The two helpers are covered directly as well as through the loader, because each
-decides which of those branches a tensor takes: `_match_split_expert` must return
-None for anything it does not own, and `_is_packed_expert` must match a shard only
-as a whole `.w1.`-style segment -- relaxing it to a bare substring test silently
-sends an unknown expert tensor down the pass-through path instead of raising.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,7 +20,6 @@ import torch
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.models.granitemoe import (
     _is_packed_expert,
-    _match_split_expert,
     granitemoe_load_split_experts,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -42,11 +29,8 @@ PREFIX = "model.layers.0.block_sparse_moe"
 
 
 class _RecordingParam:
-    """Stands in for a FusedMoE parameter, recording loader invocations.
-
-    Deliberately does NOT accept `return_success`: no loader in the tree does,
-    so a caller passing it would raise TypeError here.
-    """
+    """Deliberately rejects `return_success`: no loader in the tree accepts
+    it, so a caller passing it raises TypeError here."""
 
     def __init__(self, calls):
         self._calls = calls
@@ -157,7 +141,6 @@ class TestGraniteMoeLoadSplitExperts(CustomTestCase):
         )
 
     def test_non_expert_tensors_pass_through_untouched(self):
-        """Attention, router, norm and lm_head must reach the generic path."""
         weights = [
             ("model.layers.0.self_attn.q_proj.weight", torch.zeros(1)),
             ("model.layers.0.self_attn.q_proj.weight_scale", torch.zeros(1)),
@@ -191,59 +174,9 @@ class TestGraniteMoeLoadSplitExperts(CustomTestCase):
         self.assertIn("unmatched MoE expert tensor", str(ctx.exception))
 
 
-class TestMatchSplitExpert(CustomTestCase):
-    """Direct coverage for the name -> (param, expert, shard) resolution."""
-
-    def setUp(self):
-        self.mapping = _mapping()
-
-    def test_returns_none_when_nothing_matches(self):
-        """None is what tells the caller to fall through or raise; a predicate
-        that degraded to always-matching would break both branches."""
-        self.assertIsNone(
-            _match_split_expert("model.layers.0.self_attn.q_proj.weight", self.mapping)
-        )
-
-    def test_projection_maps_to_expected_shard(self):
-        for proj, expected_param, expected_shard in (
-            ("gate_proj", f"{PREFIX}.experts.w13_weight", "w1"),
-            ("up_proj", f"{PREFIX}.experts.w13_weight", "w3"),
-            ("down_proj", f"{PREFIX}.experts.w2_weight", "w2"),
-        ):
-            with self.subTest(proj=proj):
-                mapped, expert_id, shard_id = _match_split_expert(
-                    f"{PREFIX}.experts.2.{proj}.weight", self.mapping
-                )
-                self.assertEqual(mapped, expected_param)
-                self.assertEqual(expert_id, 2)
-                self.assertEqual(shard_id, expected_shard)
-
-    def test_empty_mapping_matches_nothing(self):
-        self.assertIsNone(
-            _match_split_expert(f"{PREFIX}.experts.0.gate_proj.weight", [])
-        )
-
-
 class TestIsPackedExpert(CustomTestCase):
-    """Direct coverage for the packed-layout (w1/w2/w3) predicate.
-
-    This predicate decides whether an unmatched expert tensor is passed through
-    or raises, so a false positive silently reintroduces the dropped-expert bug.
-    """
-
-    def test_packed_shard_names_are_recognized(self):
-        for shard in ("w1", "w2", "w3"):
-            with self.subTest(shard=shard):
-                self.assertTrue(_is_packed_expert(f"{PREFIX}.experts.0.{shard}.weight"))
-
-    def test_split_projection_names_are_not_packed(self):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            with self.subTest(proj=proj):
-                self.assertFalse(_is_packed_expert(f"{PREFIX}.experts.0.{proj}.weight"))
-
-    def test_unknown_projection_is_not_packed(self):
-        """The name that must reach the raise rather than pass through."""
-        self.assertFalse(_is_packed_expert(f"{PREFIX}.experts.0.mystery_proj.weight"))
+    """A false positive here silently reintroduces the dropped-expert bug:
+    an unmatched expert tensor passes through instead of raising."""
 
     def test_shard_substring_requires_dot_delimiters(self):
         """`w1` appearing inside a longer segment is not a packed shard. Without

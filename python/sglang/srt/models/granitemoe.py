@@ -61,9 +61,8 @@ def _match_split_expert(
     """Resolve a split-expert tensor name to (param_name, expert_id, shard_id)."""
     for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
         if weight_name in name:
-            # The mapped name keeps the checkpoint's trailing suffix (`.weight`
-            # vs `.weight_scale`), which is what routes a scale to the scale
-            # branch of FusedMoE's loader.
+            # Keeping the checkpoint's trailing suffix (`.weight` vs
+            # `.weight_scale`) routes scales to FusedMoE's scale branch.
             return name.replace(weight_name, param_name), expert_id, shard_id
     return None
 
@@ -78,12 +77,7 @@ def granitemoe_load_split_experts(
     expert_params_mapping: list[tuple[str, str, int, str]],
     params_dict: dict[str, torch.nn.Parameter],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Load per-expert quantized experts, yielding the tensors it does not claim.
-
-    Compressed-tensors checkpoints store one tensor per expert per projection
-    (`experts.{e}.gate_proj.weight`, `.weight_scale`, ...). Anything left is
-    yielded for the caller's generic (packed-layout) handling.
-    """
+    """Load split quantized experts, yielding the tensors it does not claim."""
     for name, loaded_weight in weights:
         match = _match_split_expert(name, expert_params_mapping)
 
