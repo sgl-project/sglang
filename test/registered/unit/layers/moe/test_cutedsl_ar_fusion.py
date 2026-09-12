@@ -219,14 +219,8 @@ def _eligible_communicator(*, successor: bool):
 
 
 def test_last_layer_prepare_attn_consumes_the_pending_all_reduce():
-    """Through the real call site, not the predicate.
-
-    The penultimate layer skips its all-reduce on the strength of a successor
-    and tags the tensor; the final layer has no successor of its own and must
-    still run the fused collective on it. Gating prepare_attn() on the outgoing
-    predicate drops the reduction silently, so assert the fused call happened
-    and that the plain path was not taken.
-    """
+    """A layer with no successor must still run the fused collective on a
+    tensor its predecessor tagged, or that reduction is silently dropped."""
     last = _eligible_communicator(successor=False)
     last.fusion_service = SimpleNamespace(
         all_reduce_residual_rms_norm=(
@@ -305,9 +299,8 @@ def test_last_layer_still_declines_to_skip_its_own_all_reduce():
 
 
 def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
-    """Skipping the post-experts reduction drops both the EP and the TP leg,
-    and one fused collective cannot restore both. LayerCommunicator refuses
-    this shape; the override must not admit it."""
+    """Hybrid EP+TP must stay refused: skipping the post-experts reduction
+    drops both legs and one fused collective cannot restore them."""
     comm = _eligible_communicator(successor=True)
     comm.fusion_service = SimpleNamespace(supports=lambda m: True)
     comm._context = SimpleNamespace(tp_size=4, attn_dp_size=1)
@@ -347,6 +340,77 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
             return_value=parallel(ep=1, moe_tp=4),
         ):
             assert comm._common_eligible(forward_batch, 8) is True
+
+
+def _call_dual_stream_op(fusion, hidden_states, *, fuse_mlp_allreduce=True):
+    """Redispatching to the CUDA key runs the real registered implementation
+    and its schema, while the stubbed MoE keeps the tensors on CPU."""
+    from sglang.srt.models.deepseek_v2 import (  # noqa: F401  (registers the op)
+        dsv2_flashinfer_moe_dual_stream_graph,
+    )
+
+    op = torch.ops.sglang.dsv2_flashinfer_moe_dual_stream_graph.default
+    cuda_key = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
+    with patch(
+        "sglang.srt.models.deepseek_v2.get_tc_piecewise_forward_context",
+        return_value=SimpleNamespace(moe_fusions={0: fusion}),
+    ):
+        return op.redispatch(cuda_key, hidden_states, 0, fuse_mlp_allreduce, False)
+
+
+class _DeferRecordingMoE:
+    """Returns a handoff whenever the deferral reaches it, as the real MoE does."""
+
+    def __init__(self):
+        self.seen_defer = None
+
+    def forward_normal_dual_stream(self, hidden_states):
+        from sglang.srt.runtime_context import get_forward
+
+        self.seen_defer = get_forward().defer_moe_finalize
+        if self.seen_defer:
+            return object()
+        return hidden_states + 1
+
+
+def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
+    """A deferring caller must not make the op hand a handoff back through its
+    Tensor schema; the dispatcher raises "Unable to cast ... to Tensor"."""
+    from sglang.srt.runtime_context import get_forward
+
+    reset_context()
+    fusion = _DeferRecordingMoE()
+    hidden_states = torch.zeros(4, 8)
+
+    with get_forward().scoped(defer_moe_finalize=True):
+        out = _call_dual_stream_op(fusion, hidden_states)
+        # The pin is scoped to the op; the caller's own flag survives it.
+        assert get_forward().defer_moe_finalize is True
+
+    assert fusion.seen_defer is False
+    assert isinstance(out, torch.Tensor)
+    assert torch.equal(out, hidden_states + 1)
+
+
+def test_dual_stream_op_still_republishes_its_operand_flags():
+    """Pinning the deferral must not disturb the two flags the op republishes
+    from its scalar operands."""
+    seen = {}
+
+    class _FlagReader:
+        def forward_normal_dual_stream(self, hidden_states):
+            from sglang.srt.runtime_context import get_forward
+
+            flags = get_forward()
+            seen["fuse"] = flags.fuse_mlp_allreduce
+            seen["scatter"] = flags.mlp_reduce_scatter
+            return hidden_states
+
+    reset_context()
+    _call_dual_stream_op(_FlagReader(), torch.zeros(4, 8))
+
+    assert seen["fuse"] is True
+    assert seen["scatter"] is False
 
 
 if __name__ == "__main__":
