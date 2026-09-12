@@ -46,11 +46,11 @@ from sglang.test.test_utils import (
 logger = logging.getLogger(__name__)
 
 # CI registration
-register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=125, stage="extra-a", runner_config="1-gpu-small")
 # Backend-specific: the span assertions require PREFILL_FORWARD/DECODE_FORWARD
 # to be emitted from the scheduler forward path, which ROCm reaches through its
 # own attention backend and graph replay.
-register_amd_ci(est_time=113, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=125, suite="stage-b-test-1-gpu-small-amd")
 
 
 # ============================================================================
@@ -588,6 +588,68 @@ class TestTraceServerAsync(TestTraceServer):
     test_trace_level_2 = None
     test_batch_request = None
     test_parallel_sample = None
+
+
+class TestTraceServerMultiTokenizer(TestTraceServer):
+    """Regression: router processes must init OTel, otherwise the pickled
+    TraceReqContext is disabled in-flight and scheduler-side spans
+    (prefill_forward, decode_forward) never reach the collector."""
+
+    # Extra env for the server process; the async variant below overrides it.
+    server_env = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.collector = LightweightOtlpCollector()
+        cls.collector.start()
+        time.sleep(0.2)
+
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-trace",
+                "--otlp-traces-endpoint",
+                "127.0.0.1:4317",
+                "--tokenizer-worker-num",
+                "2",
+                "--detokenizer-worker-num",
+                "2",
+            ],
+            env=cls.server_env,
+        )
+
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
+        assert response.status_code == 200
+
+        cls.collector.clear()
+
+    def test_trace_level_3(self):
+        """Assert the scheduler-side spans survive the router round-trip."""
+        self._send_request_and_wait("Explain quantum computing", trace_level=3)
+        self.assertTrue(
+            self.collector.has_all_spans(
+                [
+                    RequestStage.PREFILL_FORWARD.stage_name,
+                    RequestStage.DECODE_FORWARD.stage_name,
+                ]
+            ),
+            f"Scheduler-side spans missing: got {sorted(self.collector.get_span_names())}",
+        )
+
+    # Only run trace_level_3, the most comprehensive check.
+    test_trace_level_0 = None
+    test_trace_level_1 = None
+    test_trace_level_2 = None
+    test_batch_request = None
+    test_parallel_sample = None
+
+
+class TestTraceServerMultiTokenizerAsync(TestTraceServerMultiTokenizer):
+    """Same router regression check under SGLANG_TRACE_ASYNC=1."""
+
+    server_env = {"SGLANG_TRACE_ASYNC": "1"}
 
 
 if __name__ == "__main__":
