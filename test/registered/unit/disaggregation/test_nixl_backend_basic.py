@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
+    NixlKVSender,
     TransferInfo,
     TransferKVChunk,
 )
@@ -370,7 +371,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.kv_args = SimpleNamespace(
-            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0, gpu_id=3
         )
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -397,6 +398,24 @@ class TestNixlTransferWorker(CustomTestCase):
         queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue)
+
+    @staticmethod
+    def _record_device_bind(order):
+        """Patch the worker's device lookup so set_device records into `order`."""
+        device_module = MagicMock()
+        device_module.set_device.side_effect = lambda gpu_id: order.append(
+            f"bind:{gpu_id}"
+        )
+        return (
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.get_device",
+                return_value=SimpleNamespace(device="cuda"),
+            ),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.torch.get_device_module",
+                return_value=device_module,
+            ),
+        )
 
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -619,6 +638,88 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr._staging_outstanding)
 
+    def test_early_send_wait_event_is_synchronized_before_the_pages_are_read(self):
+        """A chunk carrying an early-send event is not read before that event.
+
+        Early-send issues the KV read before the step's forward is enqueued, so
+        the prior step's prefill forward may still be writing these pages. A read
+        that skips the wait ships partially written KV and still reports success.
+        """
+        room = 24
+        mgr = self._make_manager(room)
+        order = []
+
+        def record_read(*args, **kwargs):
+            order.append("read")
+            return "kv_handle"
+
+        mgr.send_kvcache = MagicMock(side_effect=record_read)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
+        get_device, get_device_module = self._record_device_bind(order)
+
+        with get_device, get_device_module:
+            self._run_worker_once(mgr, chunk)
+
+        # The wait is the thread's first device call: bound to the rank's GPU first,
+        # else it opens a context on device 0.
+        self.assertEqual(order, ["bind:3", "wait", "read"])
+
+    def test_early_send_wait_event_is_synchronized_before_the_staging_gather(self):
+        """With staging on, the wait precedes the staging strategy build.
+
+        The staged path gathers the pages into the staging buffer before posting
+        the RDMA, so a wait that only covers the post leaves the gather racing the
+        prior step's writes. gather_all_layers_to_staging() syncs its own gather
+        stream, which does not order those writes against the gather.
+        """
+        room = 25
+        mgr = self._make_manager(room)
+        mgr.enable_staging = True
+        order = []
+
+        def stop_at_strategy(_staging_buffer):
+            order.append("gather")
+            raise SystemExit
+
+        def record_read(*args, **kwargs):
+            # SystemExit, not AssertionError: the worker's except Exception would
+            # swallow the latter and re-dequeue this chunk forever.
+            order.append("read")
+            raise SystemExit
+
+        mgr._try_create_staging_strategy = stop_at_strategy
+        mgr.send_kvcache = MagicMock(side_effect=record_read)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
+        # Bounded: a body that reaches neither probe must end the worker, not spin.
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+        get_device, get_device_module = self._record_device_bind(order)
+
+        with get_device, get_device_module, self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, staging_buffer=object())
+
+        self.assertEqual(order, ["bind:3", "wait", "gather"])
+
+    def test_early_send_wait_is_skipped_for_a_failed_room(self):
+        """A failed room's chunk is dropped without blocking the worker on its event."""
+        room = 26
+        mgr = self._make_manager(room)
+        mgr.request_status[room] = KVPoll.Failed
+        order = []
+        mgr.send_kvcache = MagicMock()
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
+        # Patched so a missing skip reaches the wait; unpatched, get_device() raises
+        # first and the worker's except Exception hides it.
+        get_device, get_device_module = self._record_device_bind(order)
+
+        with get_device, get_device_module:
+            self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(order, [])
+        mgr.send_kvcache.assert_not_called()
+
 
 class TestNixlDecodeListener(CustomTestCase):
     def test_decode_listener_receives_zmq_chunk_and_success(self):
@@ -650,6 +751,49 @@ class TestNixlDecodeListener(CustomTestCase):
             11, 0, 0, 2, "decode_agent"
         )
         self.assertEqual(receiver.poll(), KVPoll.Success)
+
+
+class TestNixlEarlySendWaitEvent(CustomTestCase):
+    def test_sender_queues_the_early_send_event_on_the_next_chunk_only(self):
+        """send() hands the recorded event to the next queued chunk, then drops it.
+
+        Before this fix NIXL's add_transfer_request accepted the event but never
+        put it on the queued chunk, so the worker read prefix pages the prior
+        step's forward was still writing, and the transfer still reported
+        success. The event is one-shot: a later chunk that reused it would wait on
+        writes that already landed and leave its own unordered.
+        """
+        room = 32
+        mgr = object.__new__(NixlKVManager)
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_staging = False
+        mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
+        queue = SimpleNamespace(put=MagicMock())
+        mgr.transfer_queues = [queue]
+        mgr.prepare_send_state_indices = lambda state_indices: state_indices
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = room
+        sender.aux_index = None
+        sender.conclude_state = None
+        sender._transfer_start_time = None
+        sender.trace_ctx = MagicMock()
+        sender._prepare_send_indices = lambda kv_indices, state_indices: (
+            kv_indices,
+            slice(0, len(kv_indices)),
+            False,
+            False,
+        )
+        sender._record_transfer_indices = MagicMock()
+        event = object()
+        sender._early_send_wait_event = event
+
+        sender.send(np.array([1], dtype=np.int32))
+        sender.send(np.array([2], dtype=np.int32))
+
+        first, second = (c.args[0] for c in queue.put.call_args_list)
+        self.assertIs(first.wait_event, event)
+        self.assertIsNone(second.wait_event)
 
 
 class TestNixlNodeFailure(CustomTestCase):
