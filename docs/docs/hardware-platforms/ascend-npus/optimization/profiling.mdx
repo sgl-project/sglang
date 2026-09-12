@@ -531,6 +531,14 @@ If the original data is still needed, back it up before running `analyse()`.
   workers must be profiled separately — see
   [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
 
+## Agent Workflow (SKILL)
+
+For a repeatable end-to-end bottleneck report from `operator_details.csv` /
+`trace_view.json`, use the repository skill at
+`.claude/skills/sglang-npu-profiler-analysis/SKILL.md`. It wraps the capture
+methods above and emits a standard markdown report via
+`summarize_npu_trace.py`.
+
 ## See Also
 
 - [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
