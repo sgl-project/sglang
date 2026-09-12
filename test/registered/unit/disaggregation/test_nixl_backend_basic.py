@@ -575,7 +575,9 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
-        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
+        mgr.kv_args = SimpleNamespace(
+            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+        )
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -674,6 +676,7 @@ class TestNixlTransferWorker(CustomTestCase):
             engine_rank=0,
             kv_data_ptrs=[0x1000],
             page_size=4,
+            num_draft_entries=0,
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 
@@ -686,7 +689,8 @@ class TestNixlTransferWorker(CustomTestCase):
 
         def send_kvcache_dcp(*args, **kwargs):
             submitted.append((args[0], args[-1]))
-            return f"handle-{args[0]}"
+            # One handle per transfer part; the worker extends its handle list.
+            return [f"handle-{args[0]}"]
 
         mgr.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
         submitted_counts_at_poll = []
