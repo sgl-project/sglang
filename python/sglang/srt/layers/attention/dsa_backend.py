@@ -338,7 +338,6 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -354,6 +353,7 @@ class DeepseekSparseAttnBackend(
         self._dcp_sharded_kv = (
             get_parallel().dcp_enabled and not model_runner.is_draft_worker
         )
+        self.needs_cpu_seq_lens = self.dsa_index_kpool > 1 or self._dcp_sharded_kv
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -435,24 +435,6 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
-        if self._dcp_sharded_kv:
-            if (
-                not is_cuda()
-                or self.dsa_prefill_impl != "tilelang"
-                or self.dsa_decode_impl != "tilelang"
-                or model_runner.kv_cache_dtype != torch.bfloat16
-                or self.qk_rope_head_dim != 0
-                or not self.use_fused_topk
-                or self.dsa_topk_backend.is_torch()
-                or self.hisparse_coordinator is not None
-                or is_dsa_enable_prefill_cp()
-            ):
-                raise ValueError(
-                    "DSA decode context parallelism currently requires CUDA NoPE MLA, "
-                    "BF16 KV, tilelang prefill/decode, and fused top-k; "
-                    "HiSparse and prefill CP cannot be combined with it."
-                )
-            self.needs_cpu_seq_lens = True
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."

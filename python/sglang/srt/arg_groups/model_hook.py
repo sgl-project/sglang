@@ -259,6 +259,22 @@ def handle_model_specific_adjustments(server_args: Any):
                 # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
 
+            if cfg.dcp_size > 1 and (
+                not get_platform().is_cuda
+                or model_config.qk_rope_head_dim != 0
+                or cfg.dsa_prefill_backend != "tilelang"
+                or cfg.dsa_decode_backend != "tilelang"
+                or cfg.dsa_topk_backend == "torch"
+                or not envs.SGLANG_DSA_FUSE_TOPK.get()
+                or cfg.enable_hisparse
+                or cfg.enable_prefill_cp
+            ):
+                raise ValueError(
+                    "DSA decode context parallelism requires CUDA NoPE MLA, "
+                    "tilelang prefill/decode, and fused top-k; "
+                    "HiSparse and prefill CP cannot be combined with it."
+                )
+
             if cfg.enable_prefill_cp:
                 assert cfg.disaggregation_mode != "decode", (
                     "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
