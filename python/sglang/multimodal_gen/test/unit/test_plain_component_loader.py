@@ -72,9 +72,10 @@ def checkpoint(tmp_path):
 
 
 @pytest.fixture
-def server_args():
+def server_args(checkpoint):
+    component, _ = checkpoint
     return ServerArgs(
-        model_path="x",
+        model_path=str(component.parent),
         component_residency={"projection": COMPONENT_OFFLOAD},
     )
 
@@ -108,7 +109,7 @@ def test_pipeline_loads_strict_state_dict(checkpoint, server_args, sharded, prec
         server_args.component_precisions["projection"] = precision
 
     pipeline = object.__new__(_ProjectionPipeline)
-    pipeline.model_path = str(component.parent)
+    pipeline.model_path = server_args.model_path
     pipeline.server_args = server_args
     pipeline._disagg_role = RoleType.MONOLITHIC
     pipeline.memory_usages = {}

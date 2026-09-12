@@ -7,6 +7,7 @@ here is CPU/meta-device only -- no weights, no GPU.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -27,6 +28,49 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
     LTX25_DISTILLED_SIGMA_VALUES,
     LTX25PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    LTX2TwoStagePipeline,
+)
+
+
+class TestLTX2TwoStageComponentInventory(unittest.TestCase):
+    def test_resident_mode_declares_every_extra_weight_source(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            for filename in (
+                "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+                "ltx-2.3-20b-distilled-lora-384.safetensors",
+            ):
+                open(os.path.join(model_path, filename), "wb").close()
+
+            pipeline = object.__new__(LTX2TwoStagePipeline)
+            pipeline.model_path = model_path
+            server_args = SimpleNamespace(
+                component_paths={},
+                component_precisions={},
+                ltx2_two_stage_device_mode="resident",
+                lora_path=None,
+                pipeline_config=SimpleNamespace(
+                    dit_precision="bf16",
+                    vae_precision="bf16",
+                    text_encoder_precisions=("bf16",),
+                ),
+            )
+            with mock.patch.object(
+                pipeline,
+                "_should_merge_stage2_distilled_lora",
+                return_value=True,
+            ):
+                sources = pipeline.additional_component_weight_sources(server_args)
+
+        self.assertEqual(
+            [source.component_name for source in sources],
+            ["spatial_upsampler", "distilled_lora", "transformer_2"],
+        )
+        self.assertEqual(
+            sources[-1].component_model_path,
+            os.path.join(model_path, "transformer"),
+        )
+        self.assertTrue(sources[-1].supports_fsdp_loading)
 
 
 class TestLTX25DiTConfig(unittest.TestCase):

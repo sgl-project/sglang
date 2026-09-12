@@ -89,8 +89,12 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             "scheduler": ["diffusers", "Scheduler"],
         }
         server_args = SimpleNamespace(
+            performance_mode="manual",
             component_paths={},
+            component_precisions={},
+            component_weights_paths={},
             component_direct_gpu_weight_loading=set(),
+            pipeline_config=SimpleNamespace(),
             resolve_component_attention_backend=lambda *_names: (None, None),
         )
 

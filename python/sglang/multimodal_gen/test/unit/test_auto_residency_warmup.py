@@ -667,3 +667,128 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
         worker._rollback_everywhere.assert_not_called()
         self.assertEqual(worker._auto_residency_round_sizes, [])
+
+    def test_sync_startup_uses_shared_auto_residency_sequence(self):
+        server_args = SimpleNamespace()
+        forward = mock.Mock()
+
+        with (
+            mock.patch.object(
+                server_warmup, "maybe_apply_pre_warmup_auto_residency"
+            ) as apply_static,
+            mock.patch.object(server_warmup, "run_async_client_warmup") as warmup,
+            mock.patch.object(server_warmup, "maybe_apply_auto_residency") as refine,
+            mock.patch.object(
+                server_warmup,
+                "should_run_synthetic_server_warmup",
+                return_value=True,
+            ),
+        ):
+            server_warmup.run_sync_startup_warmup(server_args, forward)
+
+        apply_static.assert_awaited_once()
+        warmup.assert_awaited_once()
+        refine.assert_awaited_once()
+        self.assertIs(apply_static.await_args.args[0], server_args)
+        self.assertIs(warmup.await_args.args[0], server_args)
+        self.assertIs(refine.await_args.args[0], server_args)
+        self.assertTrue(warmup.await_args.kwargs["fail_open"])
+        self.assertIs(apply_static.await_args.args[1], warmup.await_args.args[1])
+        self.assertIs(apply_static.await_args.args[1], refine.await_args.args[1])
+
+    def test_sync_startup_static_planning_does_not_require_warmup(self):
+        with (
+            mock.patch.object(
+                server_warmup, "maybe_apply_pre_warmup_auto_residency"
+            ) as apply_static,
+            mock.patch.object(
+                server_warmup,
+                "should_run_synthetic_server_warmup",
+                return_value=False,
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup") as warmup,
+            mock.patch.object(server_warmup, "maybe_apply_auto_residency") as refine,
+        ):
+            server_warmup.run_sync_startup_warmup(SimpleNamespace(), mock.Mock())
+
+        apply_static.assert_awaited_once()
+        warmup.assert_not_awaited()
+        refine.assert_not_awaited()
+
+    def test_pre_warmup_planner_uses_static_action(self):
+        actions = []
+
+        async def forward(req):
+            actions.append(req.action)
+            return OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED})
+
+        with mock.patch.object(
+            server_warmup,
+            "should_apply_pre_warmup_auto_residency",
+            return_value=True,
+        ):
+            asyncio.run(
+                server_warmup.maybe_apply_pre_warmup_auto_residency(
+                    SimpleNamespace(), forward
+                )
+            )
+
+        self.assertEqual(actions, ["apply_static"])
+
+    def test_pre_warmup_worker_commits_seed_without_pending_round(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.rank = 0
+        worker.is_output_rank = False
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
+        worker._auto_residency_warmup_records = []
+        worker._auto_residency_applied = []
+        worker._auto_residency_round_sizes = []
+        worker._auto_residency_last_applied_plan = None
+        report = RankResidencyReport(
+            rank=0,
+            budget_bytes=10 * GIB_BYTES,
+            estimated_peak_bytes=5 * GIB_BYTES,
+        )
+        worker._build_pre_warmup_auto_residency_report = mock.Mock(return_value=report)
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
+        worker._auto_residency_modules = mock.Mock(return_value={})
+        worker._invalidate_component_strategies = mock.Mock()
+        candidate = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=RESIDENT,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=1,
+            target_residency_mode=COMPONENT_OFFLOAD,
+        )
+        plan = AutoResidencyPlan(changes=[candidate])
+        applied = AppliedResidencyChange("transformer", RESIDENT)
+        workload = DefaultWorkload(512, 512, 1, 4)
+
+        with (
+            mock.patch.object(
+                gpu_worker_module, "resolve_default_workload", return_value=workload
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=workload,
+            ),
+            mock.patch.object(
+                gpu_worker_module, "plan_auto_residency", return_value=plan
+            ),
+            mock.patch.object(
+                gpu_worker_module, "apply_residency_changes", return_value=[applied]
+            ),
+            mock.patch.object(gpu_worker_module, "commit_residency_changes") as commit,
+        ):
+            response = worker.apply_auto_residency(pre_warmup=True)
+
+        self.assertEqual(response.output["status"], PLACEMENT_STATUS_ADJUSTED)
+        commit.assert_called_once_with(
+            applied=[applied], modules={}, server_args=worker.server_args
+        )
+        self.assertEqual(worker._auto_residency_applied, [])
+        self.assertEqual(worker._auto_residency_round_sizes, [])
+        self.assertIsNone(worker._auto_residency_last_applied_plan)

@@ -1652,10 +1652,10 @@
             "expected_e2e_ms": 73811.61,
             "expected_avg_denoise_ms": 1689.73,
             "expected_median_denoise_ms": 1714.58,
-            "load_peak_vram_mb": 6440.0,
-            "runtime_peak_vram_mb": 26322.0,
-            "load_peak_allocated_mb": 6177.0,
-            "runtime_peak_allocated_mb": 19978.0,
+            "load_peak_vram_mb": 60038.0,
+            "runtime_peak_vram_mb": 75308.0,
+            "load_peak_allocated_mb": 57269.0,
+            "runtime_peak_allocated_mb": 71063.0,
             "estimated_full_test_time_s": 168.7
         },
         "wan2_1_i2v_14b_480P_2gpu": {
@@ -1725,10 +1725,10 @@
             "expected_avg_denoise_ms": 653.89,
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35344.0,
-            "runtime_peak_vram_mb": 52260.0,
+            "runtime_peak_vram_mb": 52478.0,
             "warmup_peak_vram_mb": 52334.0,
             "load_peak_allocated_mb": 34033.0,
-            "runtime_peak_allocated_mb": 50073.0,
+            "runtime_peak_allocated_mb": 50074.0,
             "estimated_full_test_time_s": 128.8
         },
         "wan2_1_i2v_14b_720P_2gpu": {
@@ -1857,11 +1857,11 @@
             "expected_e2e_ms": 83297.78,
             "expected_avg_denoise_ms": 2029.88,
             "expected_median_denoise_ms": 2020.71,
-            "load_peak_vram_mb": 6440.0,
-            "runtime_peak_vram_mb": 22120.0,
+            "load_peak_vram_mb": 60038.0,
+            "runtime_peak_vram_mb": 73984.0,
             "warmup_peak_vram_mb": 46020.0,
-            "load_peak_allocated_mb": 6175.0,
-            "runtime_peak_allocated_mb": 15472.0,
+            "load_peak_allocated_mb": 57269.0,
+            "runtime_peak_allocated_mb": 68578.0,
             "estimated_full_test_time_s": 188.0
         },
         "wan2_1_t2v_14b_2gpu": {
@@ -1988,10 +1988,10 @@
             "expected_e2e_ms": 62134.19,
             "expected_avg_denoise_ms": 1437.82,
             "expected_median_denoise_ms": 1416.85,
-            "load_peak_vram_mb": 6784.0,
-            "runtime_peak_vram_mb": 21450.0,
-            "load_peak_allocated_mb": 6499.0,
-            "runtime_peak_allocated_mb": 14775.0,
+            "load_peak_vram_mb": 60358.0,
+            "runtime_peak_vram_mb": 75188.0,
+            "load_peak_allocated_mb": 57561.0,
+            "runtime_peak_allocated_mb": 68559.0,
             "estimated_full_test_time_s": 576.3
         },
         "wan2_1_t2v_1_3b_lora_1gpu": {
