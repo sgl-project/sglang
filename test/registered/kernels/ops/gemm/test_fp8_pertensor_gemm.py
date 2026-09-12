@@ -45,8 +45,7 @@ def _test_accuracy_once(M, N, K, device):
 @pytest.mark.skipif(
     not is_sm120_supported(), reason="fp8_pertensor_scaled_mm requires SM120 (>= 12.0)"
 )
-# M=16 and M=32 straddle the M=24 tile split, so both compiled tiles are covered.
-@pytest.mark.parametrize("M", [16, 32])
+@pytest.mark.parametrize("M", [4, 16, 32, 33, 48, 64])
 @pytest.mark.parametrize("N,K", [(16384, 5120), (5120, 6144), (14336, 5120)])
 def test_accuracy(M, N, K):
     _test_accuracy_once(M, N, K, "cuda")
