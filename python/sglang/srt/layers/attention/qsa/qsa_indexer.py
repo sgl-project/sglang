@@ -38,6 +38,15 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     return min(rows, max_padded_rows)
 
 
+def _mask_padded_group_locs(
+    group_locs: torch.Tensor, write_locs: torch.Tensor
+) -> torch.Tensor:
+    """Redirect fixed-capacity padding reads to the reserved source slot 0."""
+    return torch.where(
+        write_locs.ne(0).unsqueeze(1), group_locs, torch.zeros_like(group_locs)
+    )
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -338,6 +347,11 @@ class QSAIndexer(MultiPlatformOp):
                 )
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
             source_rope = pool.qsa_rope_position_buffer
+        # The write plan has a fixed, shape-derived capacity. Entries without a
+        # completed group write the inert compressed slot 0, but their source
+        # indices must also be inert: a short extend can have fewer token rows
+        # than one full compression group.
+        group_locs = _mask_padded_group_locs(group_locs, compressed_locs)
         if self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,

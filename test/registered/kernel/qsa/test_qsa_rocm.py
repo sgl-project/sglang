@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa.mqa import HAS_TILELANG, qsa_mqa_decode
+from sglang.srt.layers.attention.qsa.qsa_indexer import _mask_padded_group_locs
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -25,6 +26,17 @@ def _fake_aiter(varlen_func):
     module = ModuleType("aiter")
     module.flash_attn_varlen_func = varlen_func
     return module
+
+
+def test_qsa_padded_group_reads_use_reserved_slot():
+    source = torch.arange(6).reshape(3, 1, 2)
+    group_locs = torch.tensor([[0, 1], [2, 3]])
+    write_locs = torch.tensor([7, 0], dtype=torch.int32)
+
+    safe_locs = _mask_padded_group_locs(group_locs, write_locs)
+
+    assert safe_locs.tolist() == [[0, 1], [0, 0]]
+    assert source[safe_locs].shape == (2, 2, 1, 2)
 
 
 @pytest.mark.parametrize("returns_tuple", [False, True], ids=["tensor", "tuple"])
