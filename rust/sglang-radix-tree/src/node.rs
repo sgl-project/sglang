@@ -175,6 +175,8 @@ pub struct Node<K: ChildKeyType> {
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
+    /// Whether this node is available through the direct external-cache linker.
+    pub external_cache_stored: bool,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
     /// Load-back anchor currently reading this node's host slots.
@@ -396,6 +398,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_uuid: None,
             swa_host_uuid: None,
             hash_value: Some(Vec::new()),
+            external_cache_stored: false,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
@@ -418,6 +421,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_uuid: None,
             swa_host_uuid: None,
             hash_value: None,
+            external_cache_stored: false,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
@@ -753,6 +757,24 @@ pub enum TreeCoreRuntimeError {
     #[cfg(any(test, feature = "inspection"))]
     #[error("{0}")]
     InspectionAssertion(String),
+    /// Direct external-cache linking does not support this tree component.
+    #[error("external cache linker does not support component {component_type:?}")]
+    ExternalCacheLinkerUnsupportedComponent { component_type: ComponentType },
+    /// The existing device anchor must be on the restored endpoint's root path.
+    #[error("node {until_node_id} is not an ancestor of node {from_node_id}")]
+    ExternalCachePathNotAncestor {
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    },
+    /// External offload lifecycle calls must observe valid state transitions.
+    #[error(
+        "invalid external offload state for node {node_id}: stored={stored}, pending={pending_id:?}"
+    )]
+    InvalidExternalCacheOffloadState {
+        node_id: NodeId,
+        stored: bool,
+        pending_id: Option<NodeId>,
+    },
 }
 
 // Unigram and bigram child keys.
@@ -1115,7 +1137,7 @@ impl<K: ChildKeyType> NodeArena<K> {
             .filter_map(|(idx, slot)| slot.as_ref().map(|_| NodeIdx_(idx)))
     }
 
-    /// Per-page hash values for a node's key, chained from its parent's last hash.
+    /// Chain page hashes from the parent, or seed a new chain with the namespace.
     pub fn compute_node_hash_values(&self, node_id: NodeIdx_, page_size: usize) -> Vec<String> {
         let node = self.node(node_id);
         let parent_hash = node.parent.and_then(|parent_id| {
@@ -1126,7 +1148,27 @@ impl<K: ChildKeyType> NodeArena<K> {
                 None
             }
         });
-        crate::node::get_hash_str::<K>(node.key.as_ref(), parent_hash, page_size)
+        let prior = parent_hash.map(str::to_owned).or_else(|| {
+            let namespace = node.namespace.as_ref();
+            if namespace == KeyNamespaceRef::default() {
+                return None;
+            }
+            // Match Python's storage_namespace_seed byte for byte.
+            let mut hasher = Sha256::new();
+            hasher.update(b"sglang-cache-namespace-v1");
+            for part in [namespace.extra_key, namespace.cache_salt] {
+                match part {
+                    None => hasher.update([0u8]),
+                    Some(part) => {
+                        hasher.update([1u8]);
+                        hasher.update((part.len() as u64).to_le_bytes());
+                        hasher.update(part.as_bytes());
+                    }
+                }
+            }
+            Some(digest_to_hex(&hasher.finalize().into()))
+        });
+        crate::node::get_hash_str::<K>(node.key.as_ref(), prior.as_deref(), page_size)
     }
 
     /// The ancestor chain's hash values ending at `node_id`, in root-to-node

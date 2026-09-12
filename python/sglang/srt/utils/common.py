@@ -106,6 +106,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -886,6 +887,17 @@ def is_mnnvl_fabric_device() -> bool:
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
+
+
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
 
 
 @lru_cache(maxsize=1)

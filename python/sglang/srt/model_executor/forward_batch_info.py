@@ -1330,7 +1330,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :,
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
                 ]
-                if mrope_positions.numel() == 0:
+                if (
+                    batch.reqs[batch_idx].session is not None
+                    and mrope_positions.shape[1] < extend_seq_len
+                ):
+                    # Session history includes generated and appended text that
+                    # is not covered by the saved prompt positions.
+                    tail_len = extend_seq_len - mrope_positions.shape[1]
+                    tail_start = extend_prefix_len + mrope_positions.shape[1]
+                    text_positions = self._expand_mrope_from_input(
+                        mm_input, tail_start + 1
+                    ) + torch.arange(tail_len)
+                    mrope_positions = torch.cat(
+                        [mrope_positions, text_positions], dim=1
+                    )
+                elif mrope_positions.numel() == 0:
                     mrope_positions = self._expand_mrope_from_input(
                         mm_input, seq_lens_cpu[batch_idx]
                     )

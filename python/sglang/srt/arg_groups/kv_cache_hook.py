@@ -66,7 +66,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -87,7 +86,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -384,7 +382,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap). cutlass_mla stays rejected (never exercised).
+    #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
     #   * Without the unified pool, plain page-major stays Triton-only.
