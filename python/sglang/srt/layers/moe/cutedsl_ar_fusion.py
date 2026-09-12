@@ -188,14 +188,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
 
     fusion_service: CuteDSLFusionService | None = None
 
-    # Both recorded by install_cutedsl_fusion(). Without either, the layer
-    # keeps the plain AR+RMSNorm pattern and never defers.
-    experts_can_defer_finalize: bool = False
-    handoff_has_consumer: bool = False
+    # Recorded by install_cutedsl_fusion(): this layer's MoE runner can hand
+    # back an unfinalized output AND something downstream consumes it. False
+    # keeps the layer on the plain AR+RMSNorm pattern.
+    may_defer_moe_finalize: bool = False
 
     # Whether the NEXT layer's prepare_attn exists to absorb a plain all-reduce.
-    # Unlike handoff_has_consumer this excludes the last layer: a model's final
-    # norm can close out a handoff, but it performs no all-reduce.
+    # Unlike may_defer_moe_finalize this excludes the last layer: a model's
+    # final norm can close out a handoff, but it performs no all-reduce.
     successor_absorbs_all_reduce: bool = False
 
     def prepare_attn(
@@ -333,7 +333,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         Stands in its own eligibility for the successor's; every fusion layer of
         a model shares its scatter modes and topology.
         """
-        if not (self.experts_can_defer_finalize and self.handoff_has_consumer):
+        if not self.may_defer_moe_finalize:
             return False
         if m is None:
             m = int(forward_batch.input_ids.shape[0])
@@ -412,8 +412,9 @@ def install_cutedsl_fusion(
                 successor.layer_communicator, CuteDSLFusionLayerCommunicator
             )
         communicator.fusion_service = service
-        communicator.experts_can_defer_finalize = bool(can_defer_finalize(layer))
-        communicator.handoff_has_consumer = has_consumer
+        communicator.may_defer_moe_finalize = (
+            bool(can_defer_finalize(layer)) and has_consumer
+        )
         communicator.successor_absorbs_all_reduce = successor is not None and (
             isinstance(successor.layer_communicator, CuteDSLFusionLayerCommunicator)
         )
@@ -423,11 +424,7 @@ def install_cutedsl_fusion(
         label,
         len(fusion_layers),
         len(layers),
-        sum(
-            layer.layer_communicator.experts_can_defer_finalize
-            and layer.layer_communicator.handoff_has_consumer
-            for layer in fusion_layers
-        ),
+        sum(layer.layer_communicator.may_defer_moe_finalize for layer in fusion_layers),
     )
     return service
 
