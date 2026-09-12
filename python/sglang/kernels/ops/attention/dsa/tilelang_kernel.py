@@ -44,6 +44,12 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
     pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
 _is_hip = is_hip()
+
+# Cache the physical CU count for non-gfx95 GPUs.  The previous code
+# hardcoded 304 (MI300X) but gfx942 also includes MI308X with only 80 CUs;
+# using the wrong CU count causes _pick_inner_iter to under- or over-launch
+# waves, hurting throughput or failing to saturate the device.
+_cu_count = torch.cuda.get_device_properties(0).multi_processor_count if _is_hip else 0
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -1344,7 +1350,7 @@ def tilelang_sparse_fwd(
             if _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
-                block_I, threads, block_per_cu, cu = 64, 256, 1, 304
+                block_I, threads, block_per_cu, cu = 64, 256, 1, _cu_count
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
@@ -1361,7 +1367,7 @@ def tilelang_sparse_fwd(
             if _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
-                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cu_count
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
@@ -2481,7 +2487,7 @@ def dpsk_v4_fp8_attention_fwd(
     if _is_gfx95_supported:
         block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
     else:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
+        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, _cu_count
 
     batch, seq_len, num_heads, _ = q.shape
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
