@@ -2060,6 +2060,12 @@ def init_unified_mamba_swa_pools(
         device=device,
     )
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
+    # HiCache moves Mamba states by PHYSICAL slot and sizes the host pool off the
+    # token cap, not the kernel-facing row count (same hooks as the Mamba-only path).
+    req_to_token_pool.mamba_pool.host_transfer_translate = (
+        mamba_slot_allocator.translate
+    )
+    token_to_kv_pool.full_kv_pool.host_capacity_tokens = full_max_total_num_tokens
 
     logger.info(
         "[unified-memory-pool] ============================================================"
