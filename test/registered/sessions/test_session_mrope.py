@@ -83,23 +83,27 @@ class TestSessionMrope(CustomTestCase):
                         sampling_params=sampling,
                     )
                     suffix = "<|im_end|>\n" + prompt
-                    # A separate cache namespace prevents the reference from warming the session.
-                    reference = self.post(
-                        "/generate",
-                        text=prompt + first["text"] + suffix,
-                        image_data=images,
-                        cache_salt=uuid.uuid4().hex,
-                        sampling_params=sampling,
-                    )
-                    appended = self.post(
-                        "/generate",
-                        text=suffix,
-                        image_data=images[1:],
-                        session_params={"id": sid, "rid": first["meta_info"]["id"]},
-                        cache_salt=salt,
-                        sampling_params=sampling,
-                    )
-                    self.assertEqual(appended["output_ids"], reference["output_ids"])
+                    # Regular mode also branches from the first turn after an append.
+                    for image in images[1:] + (images[:1] if not streaming else []):
+                        # A separate cache namespace prevents the reference from warming the session.
+                        reference = self.post(
+                            "/generate",
+                            text=prompt + first["text"] + suffix,
+                            image_data=[images[0], image],
+                            cache_salt=uuid.uuid4().hex,
+                            sampling_params=sampling,
+                        )
+                        appended = self.post(
+                            "/generate",
+                            text=suffix,
+                            image_data=[image],
+                            session_params={"id": sid, "rid": first["meta_info"]["id"]},
+                            cache_salt=salt,
+                            sampling_params=sampling,
+                        )
+                        self.assertEqual(
+                            appended["output_ids"], reference["output_ids"]
+                        )
                 finally:
                     self.post("/close_session", session_id=sid)
                 self.assertEqual(

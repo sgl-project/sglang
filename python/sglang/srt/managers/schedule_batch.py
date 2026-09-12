@@ -802,7 +802,7 @@ class MultimodalInputs:
                 video_tokens += num_tokens
         return image_tokens, audio_tokens, video_tokens
 
-    def merge(self, other: MultimodalInputs, prefix_len: Optional[int] = None):
+    def merge(self, other: MultimodalInputs):
 
         # args needed to be merged
         optional_args = [
@@ -814,38 +814,20 @@ class MultimodalInputs:
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
 
-        if prefix_len is not None and other.mrope_positions is not None:
-            # Preserve model-specific coordinates (including video timing and
-            # audio), then translate this turn after the retained history.
-            positions = other.mrope_positions
-            prefix = self.mrope_positions
-            if prefix is None:
-                prefix = positions.new_empty((3, 0))
-            prefix = prefix[:, :prefix_len]
-            next_position = prefix.max() + 1 if prefix.numel() else 0
-            text_len = prefix_len - prefix.shape[1]
-            text_positions = (
-                torch.arange(
-                    text_len, dtype=positions.dtype, device=positions.device
-                ).expand(3, -1)
-                + next_position
-            )
-            self.mrope_positions = torch.cat(
-                [prefix, text_positions, positions + next_position + text_len], dim=1
-            )
-            self.mrope_position_delta = (
-                self.mrope_positions.max() + 1 - self.mrope_positions.shape[1]
-            ).reshape(1, 1)
-            self.mrope_position_delta_repeated_cache = None
-        else:
-            if self.mrope_positions is not None and other.mrope_positions is not None:
+        mrope_positions = self.mrope_positions
+        if mrope_positions is not None:
+            if other.mrope_positions is None:
+                self.mrope_positions = mrope_positions
+            else:
                 self.mrope_positions = torch.cat(
                     [self.mrope_positions, other.mrope_positions], dim=1
                 )
-            if (
-                self.mrope_position_delta is not None
-                and other.mrope_position_delta is not None
-            ):
+
+        mrope_position_delta = self.mrope_position_delta
+        if mrope_position_delta is not None:
+            if other.mrope_position_delta is None:
+                self.mrope_position_delta = mrope_position_delta
+            else:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
@@ -1428,24 +1410,55 @@ class Req(ReqDllmMixin):
         self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
-        prefix_len = None
         if self.session is not None:
             # Padding can change token values without changing their count.
             self.full_untruncated_fill_ids = array("q")
-            if image_inputs.mrope_positions is not None:
-                prefix_len = (
-                    len(self.origin_input_ids) - image_inputs.mrope_positions.shape[1]
-                )
             if self.multimodal_inputs is not None:
-                # Branches and aborted streaming turns retain the old metadata.
+                # Keep branches and aborted streaming turns from changing the parent.
                 self.multimodal_inputs = dataclasses.replace(self.multimodal_inputs)
-            elif prefix_len:
-                self.multimodal_inputs = MultimodalInputs(mm_items=[])
+
+            positions = image_inputs.mrope_positions
+            if positions is not None:
+                prefix_len = len(self.origin_input_ids) - positions.shape[1]
+                prefix = (
+                    self.multimodal_inputs.mrope_positions
+                    if self.multimodal_inputs is not None
+                    else None
+                )
+                if prefix is None:
+                    prefix = positions.new_empty((3, 0))
+                prefix = prefix[:, :prefix_len]
+                next_position = prefix.max() + 1 if prefix.numel() else 0
+                text_len = prefix_len - prefix.shape[1]
+                text_positions = (
+                    torch.arange(
+                        text_len, dtype=positions.dtype, device=positions.device
+                    ).expand(3, -1)
+                    + next_position
+                )
+                # Preserve media coordinates and fill the generated/text gap.
+                positions = torch.cat(
+                    [prefix, text_positions, positions + next_position + text_len],
+                    dim=1,
+                )
+                if self.multimodal_inputs is None:
+                    self.multimodal_inputs = image_inputs
+                else:
+                    # Merge metadata without concatenating the old position tables.
+                    self.multimodal_inputs.mrope_positions = None
+                    self.multimodal_inputs.mrope_position_delta = None
+                    self.multimodal_inputs.merge(image_inputs)
+                self.multimodal_inputs.mrope_positions = positions
+                self.multimodal_inputs.mrope_position_delta = (
+                    positions.max() + 1 - positions.shape[1]
+                ).reshape(1, 1)
+                self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+                return
 
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
-            self.multimodal_inputs.merge(image_inputs, prefix_len=prefix_len)
+            self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
