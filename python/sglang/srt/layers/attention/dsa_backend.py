@@ -1311,9 +1311,7 @@ class DeepseekSparseAttnBackend(
 
         self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
 
-    def _multi_ctas_kv_counter_for(
-        self, num_query_rows: int
-    ) -> Optional[torch.Tensor]:
+    def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
         # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
         # rebinding would free the allocation the decode graphs captured.
         counter = grow_multi_ctas_kv_counter_buffer_if_needed(

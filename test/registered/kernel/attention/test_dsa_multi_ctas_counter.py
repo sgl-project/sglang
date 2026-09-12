@@ -24,9 +24,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large"
-)
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _NUM_Q_HEADS = 128
 _MAX_CTX_LEN = 64
@@ -134,9 +132,7 @@ class TestMultiCtasKvCounterLifetime(CustomTestCase):
 
         self.assertIsNotNone(captured_ref())
         self.assertIs(backend._multi_ctas_kv_counter_buffer, captured_ref())
-        self.assertEqual(
-            backend._multi_ctas_kv_counter_buffer.data_ptr(), captured_ptr
-        )
+        self.assertEqual(backend._multi_ctas_kv_counter_buffer.data_ptr(), captured_ptr)
 
     def test_within_capacity_eager_call_reuses_the_captured_allocation(self):
         backend = _make_backend()
