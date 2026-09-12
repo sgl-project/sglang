@@ -68,6 +68,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -1846,7 +1847,10 @@ def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
+
+    Records with a registered ceiling provider (see
+    ``register_prefill_buffer_ceiling``) answer through it."""
     cfg = resolving_view(server_args)
     chunked = (
         cfg.chunked_prefill_size
@@ -1856,7 +1860,10 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     tokens = chunked
     if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
         tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
-    return tokens
+    record = server_args
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        record = record_of(server_args)
+    return prefill_buffer_ceiling_of(record, tokens)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:
