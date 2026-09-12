@@ -428,6 +428,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
+            if storage_config is not None and storage_config.kv_cache_dtype:
+                config_prefix_parts.append(f"dtype_{storage_config.kv_cache_dtype}")
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")

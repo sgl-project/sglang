@@ -107,10 +107,13 @@ class HiCacheNixl(HiCacheStorage):
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
 
+        kv_cache_dtype = storage_config.kv_cache_dtype
         if self.is_mla_model:
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        if kv_cache_dtype is not None:
+            self.config_suffix += f"_dtype_{kv_cache_dtype}"
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
