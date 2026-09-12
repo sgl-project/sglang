@@ -567,6 +567,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -1449,7 +1450,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            if StateType.C128_STATE in state_types:
+            if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
@@ -1462,7 +1463,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }

@@ -186,6 +186,38 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_sampling_mask_max_tokens(self):
+        self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
+        self.assertEqual(
+            ServerArgs(
+                model_path="dummy", sampling_mask_max_tokens=8192
+            ).sampling_mask_max_tokens,
+            8192,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "--sampling-mask-max-tokens must be positive"
+        ):
+            prepare_server_args(
+                ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
+            ).resolve_once()
+
+    def test_legacy_sampling_mask_env_requires_migration(self):
+        """Legacy configuration must not silently disable PD sampling masks."""
+        for value in ("0", "128", "invalid", ""):
+            for enabled in (False, True):
+                with (
+                    self.subTest(value=value, enabled=enabled),
+                    envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.override(value),
+                    envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.*"
+                        "Unset it.*SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1.*"
+                        "--sampling-mask-max-tokens.*prefill and decode",
+                    ),
+                ):
+                    ServerArgs(model_path="dummy").resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3319,6 +3351,60 @@ class TestNoneMeansUnset(CustomTestCase):
             model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
         )
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
+
+
+class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
+    """The graph-captured TP LM-head all-to-all must not run with NCCL's
+    graph buffer registration: registered graph-pool temporaries deadlock the
+    exchange under DP-rank ramps."""
+
+    def _resolve(self, **kwargs):
+        # The handler reads the DP-adjusted prefill knobs the pipeline would
+        # have settled by then; the dummy-model pipeline itself returns early.
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_dp_attention=True,
+            tp_size=2,
+            dp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+            **kwargs,
+        )
+        parallel_hook.handle_data_parallelism(server_args)
+        return server_args
+
+    def test_pure_dp_decode_node_disables_nccl_graph_register(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(disaggregation_mode="decode")
+            self.assertTrue(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_explicit_nccl_graph_register_is_kept(self):
+        with patch.dict(os.environ, {"NCCL_GRAPH_REGISTER": "1"}, clear=False):
+            with self.assertLogs(parallel_hook.logger, level="WARNING") as logs:
+                self._resolve(disaggregation_mode="decode")
+            self.assertEqual(os.environ["NCCL_GRAPH_REGISTER"], "1")
+            self.assertIn("NCCL_GRAPH_REGISTER=1", "\n".join(logs.output))
+
+    def test_without_all_to_all_env_is_untouched(self):
+        # Unified serving keeps the all-to-all off by default, and a decode
+        # node with the DP LM head never takes the all-to-all.
+        for kwargs in (
+            {},
+            {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
+        ):
+            with self.subTest(**kwargs), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NCCL_GRAPH_REGISTER", None)
+                server_args = self._resolve(**kwargs)
+                self.assertFalse(
+                    resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+                )
+                self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
 
 
 if __name__ == "__main__":
