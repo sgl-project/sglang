@@ -117,7 +117,9 @@ class _DCPMetadataTests:
         backend._run_decode_kernel = real_path
         layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
         forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY, out_cache_loc=None
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=None,
+            out_cache_loc_id_space="virtual",
         )
         k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
         k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")

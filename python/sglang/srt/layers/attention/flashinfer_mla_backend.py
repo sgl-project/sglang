@@ -32,6 +32,7 @@ from sglang.srt.layers.dcp import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -713,9 +714,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, KVWriteLoc.for_batch(forward_batch, cache_loc), k, k_rope
+                    )
                 else:
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, KVWriteLoc.for_batch(forward_batch, cache_loc), k, v
+                    )
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -784,14 +789,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 if k_rope is not None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc.for_batch(forward_batch, cache_loc),
                         k,
                         k_rope,
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc.for_batch(forward_batch, cache_loc),
                         k,
                         v,
                     )

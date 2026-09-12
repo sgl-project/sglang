@@ -1436,7 +1436,11 @@ class FlashAttentionBackend(AttentionBackend):
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            cache_loc,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_scale,
@@ -1975,7 +1979,11 @@ class FlashAttentionBackend(AttentionBackend):
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            cache_loc,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_scale,
