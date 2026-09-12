@@ -468,7 +468,31 @@ pub struct AffinityConfig {
     /// Note the firing point scales with `dp_size`: the sample sums `waiting`
     /// across a worker's DP ranks while a request lands on one of them, so
     /// scale the limit with `--dp-size` on DP-attention deployments.
+    ///
+    /// The companion `saturation_queue_floor` cancels the gate's diversions
+    /// when they have no payoff (nothing in the fleet reads below the
+    /// floor).
     pub worker_queue_limit: Option<u64>,
+    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
+    /// diversions that have no payoff. When no cache candidate survives
+    /// both `worker_queue_limit` and hard admission, at least one was over
+    /// the limit, AND no worker in the routable fleet has a fresh queue
+    /// reading strictly below this floor, the diverted request would wait
+    /// wherever it lands — so it pins to the least-pressured prefix owner
+    /// instead of cold-prefilling on a non-owner (which evicts other
+    /// prefixes and manufactures the next round of misses). `None` — the
+    /// default — preserves the pure gate behavior.
+    ///
+    /// Polarity note: a worker with no fresh sample does NOT count as idle
+    /// — the opposite of the gate's fail-open, and deliberately so. The
+    /// gate keeps affinity because that is the safe default action; the
+    /// pin asks whether a *provably better* destination exists, and an
+    /// unknown queue is not proof. Both polarities leave the request with
+    /// its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker_queue_limit` and requires the
+    /// gate; like the limit, scale the floor with `dp_size`.
+    pub saturation_queue_floor: Option<u64>,
 }
 
 impl Default for AffinityConfig {
@@ -492,6 +516,7 @@ impl Default for AffinityConfig {
             cache_candidate_max_workers: 32,
             cache_switch_margin_tokens: 1_024,
             worker_queue_limit: None,
+            saturation_queue_floor: None,
         }
     }
 }

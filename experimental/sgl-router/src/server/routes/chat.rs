@@ -65,6 +65,13 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 const QUEUE_GATE_BLIND_LOG_SAMPLE: u64 = 64;
 static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The saturation-pin info log is sampled for the same reason as the
+/// queue-gate blind warn: it fires on a per-request path and the condition
+/// (a saturated fleet) persists for many requests, so 1-in-64 surfaces it
+/// without log flooding.
+const SATURATION_PIN_LOG_SAMPLE: u64 = 64;
+static SATURATION_PIN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Return the low-cardinality reason for the final Prefill decision.
 fn prefill_policy_reason(
     policy: PolicyKind,
@@ -95,6 +102,7 @@ fn prefill_policy_reason(
         PolicyKind::CacheAware => match (proposal, decision) {
             (_, DecisionReason::CacheCandidate)
             | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
+            (_, DecisionReason::SaturationPin) => "saturation_pin",
             (_, DecisionReason::Primary) => "no_cache_candidate",
             (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
             (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
@@ -110,6 +118,7 @@ fn prefill_policy_reason(
             DecisionReason::BackupPressureGuard => "pressure_backup",
             DecisionReason::RangeFallback => "range_fallback",
             DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
+            DecisionReason::SaturationPin => "saturation_pin",
         },
     }
 }
@@ -386,6 +395,12 @@ pub async fn chat_completions(
         .affinity
         .as_ref()
         .and_then(|config| config.worker_queue_limit);
+    let saturation_queue_floor = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.saturation_queue_floor);
     let worker = {
         let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
         // Set when the queue gate emptied the cache candidate set: how many
@@ -556,7 +571,7 @@ pub async fn chat_completions(
                 };
                 let bounded_candidate_count = proposal.candidates.len();
                 let cache_decision =
-                    resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
+                    resolve_cache_candidates(&proposal, request_input_tokens, snapshot, &workers);
                 ctx.metrics.record_cache_admission_evaluations(
                     cache_decision.admission_evaluated_candidates,
                 );
@@ -608,10 +623,44 @@ pub async fn chat_completions(
                     prefill_pressure_source = cache_decision.prefill_pressure_source,
                     "cache candidate winner",
                 );
-                ctx.metrics
-                    .record_policy_decision("cache_aware", "cache_candidate");
-                ctx.metrics
-                    .record_cache_aware_decision(&model_str, CacheAwareDecision::CacheHit);
+                ctx.metrics.record_policy_decision(
+                    "cache_aware",
+                    prefill_policy_reason(
+                        PolicyKind::CacheAware,
+                        ProposalKind::CacheAffinity,
+                        decision.reason,
+                        session_id.is_some_and(|value| !value.is_empty()),
+                        true,
+                    ),
+                );
+                if decision.reason == DecisionReason::SaturationPin {
+                    // The pin books the saturation label because it always
+                    // means affinity was kept under a queueing fleet. It does
+                    // not retire the off-owner draw below: when every
+                    // gate-rejected owner also fails capacity admission the
+                    // pin yields no decision, and the fallback records the
+                    // same label from an off-owner landing.
+                    ctx.metrics.record_cache_aware_decision(
+                        &model_str,
+                        CacheAwareDecision::CacheHitAllQueued,
+                    );
+                    if SATURATION_PIN_LOG_COUNTER
+                        .fetch_add(1, AtomicOrdering::Relaxed)
+                        .is_multiple_of(SATURATION_PIN_LOG_SAMPLE)
+                    {
+                        tracing::info!(
+                            model = %model_str,
+                            worker = %decision.selected.url,
+                            saturation_queue_floor,
+                            worker_queue_limit,
+                            "fleet saturated, keeping affinity with a queueing prefix owner \
+                             instead of diverting",
+                        );
+                    }
+                } else {
+                    ctx.metrics
+                        .record_cache_aware_decision(&model_str, CacheAwareDecision::CacheHit);
+                }
                 Some(decision.selected)
             })
             .flatten();
