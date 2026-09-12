@@ -36,9 +36,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_mnnvl_fabric_device
+from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
 
@@ -392,17 +392,6 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
-
-
-def is_fi_a2a_supported(
-    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
-    if not get_platform().is_sm100:
-        return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:

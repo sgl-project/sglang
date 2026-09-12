@@ -164,6 +164,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_context_parallelism,
         handle_data_parallelism,
         handle_dcp_validation,
+        handle_decode_context_parallelism,
         handle_dwdp,
         handle_elastic_ep,
         handle_eplb_and_dispatch,
@@ -171,6 +172,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
+    handle_decode_context_parallelism(server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
     # resolution (the declarative registry materializes too late to affect
