@@ -153,6 +153,26 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self._apply(old_name, _DEPRECATED_ENVS[old_name])
         self.assertIs(envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get(), False)
 
+    def test_legacy_sgl_prefix_chains_into_registry_forwarding(self):
+        # SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK must survive both hops:
+        # the SGL_ -> SGLANG_ prefix rewrite, then the registry's inverted
+        # forwarding to SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK. Needs a
+        # fresh import because _handle_deprecated_envs() runs at import.
+        command = [
+            sys.executable,
+            "-c",
+            "from sglang.srt.environ import envs; "
+            "print(envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get())",
+        ]
+        env = {k: v for k, v in os.environ.items() if "TP_MEMORY_INBALANCE" not in k}
+        env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] = "1"
+        output = (
+            subprocess.check_output(command, env=env, stderr=subprocess.DEVNULL)
+            .decode()
+            .strip()
+        )
+        self.assertEqual(output, "False")
+
     def test_ms_to_s_transform(self):
         old_name = "SGLANG_QUEUED_TIMEOUT_MS"
         os.environ[old_name] = "1500"
