@@ -22,6 +22,8 @@ spec:
             - "--service-discovery"
             - "--selector"
             - "app=fake-worker"
+            - "--service-discovery-resync-secs"
+            - "10"
             - "--service-discovery-port"
             - "8000"
             - "--service-discovery-namespace"

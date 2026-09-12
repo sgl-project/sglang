@@ -243,6 +243,22 @@ impl JobQueue {
         self.status_map.get(worker_url).map(|entry| entry.clone())
     }
 
+    /// Whether an AddWorker job for `worker_url` is pending or processing.
+    ///
+    /// `submit()` does not dedup by URL, so a caller that resubmits on a timer
+    /// needs this to avoid piling up jobs for a slow add — worker startup is
+    /// allowed 30 minutes by default.
+    ///
+    /// The `"AddWorker"` literal must match `Job::job_type()` and the status
+    /// literals must match the `JobStatus` constructors; both are plain
+    /// strings, so a rename on either side would disable this check silently.
+    pub fn has_add_worker_in_flight_for(&self, worker_url: &str) -> bool {
+        self.status_map.get(worker_url).is_some_and(|status| {
+            status.job_type == "AddWorker"
+                && matches!(status.status.as_str(), "pending" | "processing")
+        })
+    }
+
     /// Remove job status (called when worker is deleted)
     pub fn remove_status(&self, worker_url: &str) {
         self.status_map.remove(worker_url);
@@ -289,8 +305,6 @@ impl JobQueue {
 
         // Permit automatically released when dropped
     }
-
-    /// Execute a specific job
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
             Job::AddWorker { config } => {
@@ -794,5 +808,57 @@ impl JobQueue {
                 status_map.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_queue() -> Arc<JobQueue> {
+        JobQueue::new(JobQueueConfig::default(), Weak::new())
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_for_is_per_url() {
+        let queue = test_queue();
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::pending("AddWorker", "http://w1:8000"),
+        );
+
+        assert!(queue.has_add_worker_in_flight_for("http://w1:8000"));
+        assert!(
+            !queue.has_add_worker_in_flight_for("http://w2:8000"),
+            "another worker's add must not mask this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_for_covers_processing() {
+        let queue = test_queue();
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::processing("AddWorker", "http://w1:8000"),
+        );
+        assert!(queue.has_add_worker_in_flight_for("http://w1:8000"));
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_for_ignores_terminal_and_other_jobs() {
+        let queue = test_queue();
+        // A failed add is exactly the state a resubmitting caller must act on,
+        // so it must not read as in flight.
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w1:8000", "boom".to_string()),
+        );
+        assert!(!queue.has_add_worker_in_flight_for("http://w1:8000"));
+
+        queue.status_map.insert(
+            "http://w2:8000".to_string(),
+            JobStatus::pending("RemoveWorker", "http://w2:8000"),
+        );
+        assert!(!queue.has_add_worker_in_flight_for("http://w2:8000"));
     }
 }
