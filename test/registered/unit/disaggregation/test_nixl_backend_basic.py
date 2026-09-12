@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -719,6 +720,106 @@ class TestNixlTransferWorker(CustomTestCase):
             ],
         )
         self.assertEqual(submitted_counts_at_poll, [3, 3, 3])
+
+    def test_early_send_wait_event_is_synchronized_before_the_pages_are_read(self):
+        """A chunk carrying an early-send event is not read before that event.
+
+        Early-send issues the KV read before the step's forward is enqueued, so
+        the prior step's prefill forward may still be writing these pages. A read
+        that skips the wait ships partially written KV and still reports success.
+        """
+        room = 24
+        mgr = self._make_manager(room)
+        order = []
+
+        def record_read(*args, **kwargs):
+            order.append("read")
+            return "kv_handle"
+
+        mgr.send_kvcache = MagicMock(side_effect=record_read)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(order, ["wait", "read"])
+
+    def test_early_send_wait_event_is_synchronized_before_the_staging_gather(self):
+        """With staging on, the wait precedes the staging strategy build.
+
+        The staged path gathers the pages into the staging buffer before posting
+        the RDMA, so a wait that only covers the post leaves the gather racing the
+        prior step's writes. gather_all_layers_to_staging() syncs its own gather
+        stream, which does not order those writes against the gather.
+        """
+        room = 25
+        mgr = self._make_manager(room)
+        mgr.enable_staging = True
+        order = []
+
+        def stop_at_strategy(_staging_buffer):
+            order.append("gather")
+            raise SystemExit
+
+        def record_read(*args, **kwargs):
+            # SystemExit, not AssertionError: the worker's except Exception would
+            # swallow the latter and re-dequeue this chunk forever.
+            order.append("read")
+            raise SystemExit
+
+        mgr._try_create_staging_strategy = stop_at_strategy
+        mgr.send_kvcache = MagicMock(side_effect=record_read)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
+        # Bounded: a body that reaches neither probe must end the worker, not spin.
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, staging_buffer=object())
+
+        self.assertEqual(order, ["wait", "gather"])
+
+
+class TestNixlEarlySendWaitEvent(CustomTestCase):
+    def test_taking_the_early_send_wait_event_clears_it(self):
+        """The event is one-shot, so a later chunk cannot wait on a stale event.
+
+        It orders the prior step's writes against the chunk being enqueued now; a
+        later chunk that reuses it waits on writes that already landed and leaves
+        its own unordered.
+        """
+        sender = object.__new__(NixlKVSender)
+        event = object()
+        sender._early_send_wait_event = event
+
+        self.assertIs(sender._take_early_send_wait_event(), event)
+        self.assertIsNone(sender._take_early_send_wait_event())
+
+    def test_add_transfer_request_forwards_the_wait_event_to_the_queued_chunk(self):
+        """The worker only waits on TransferKVChunk.wait_event.
+
+        A backend that accepts the event but does not put it on the chunk drops
+        the wait with nothing failing: the transfer still reports success.
+        """
+        room = 31
+        mgr = object.__new__(NixlKVManager)
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_staging = False
+        mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
+        queue = SimpleNamespace(put=MagicMock())
+        mgr.transfer_queues = [queue]
+        event = object()
+
+        mgr.add_transfer_request(
+            room,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            False,
+            0,
+            wait_event=event,
+        )
+
+        self.assertIs(queue.put.call_args.args[0].wait_event, event)
 
 
 class TestNixlNotifications(CustomTestCase):

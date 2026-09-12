@@ -1663,8 +1663,7 @@ class MoriKVSender(CommonKVSender):
             else None
         )
         self._record_transfer_indices(kv_indices, transfer_state_indices)
-        wait_event = getattr(self, "_early_send_wait_event", None)
-        self._early_send_wait_event = None
+        wait_event = self._take_early_send_wait_event()
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
