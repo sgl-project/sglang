@@ -41,7 +41,11 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
+from sglang.srt.configs.model_config import (
+    REQUANTIZATION_METHODS,
+    ModelConfig,
+    is_qwen3_5_mtp_draft,
+)
 from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -61,6 +65,7 @@ from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -259,6 +264,37 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _quark_draft_online_quant_config(
+    model_config: ModelConfig, hf_quant_config: dict
+) -> Optional[QuantizationConfig]:
+    """Explicit ``--speculative-draft-model-quantization quark_mxfp4`` on a Quark
+    checkpoint whose MTP/NextN draft experts were exported in bf16 (listed under
+    ``exclude``): quantize the draft's routed experts online to MXFP4 instead of
+    running them through the bf16 MoE path. Only the draft model is affected; the
+    target model keeps its serialized Quark scheme."""
+    if not (
+        model_config.is_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "quark_mxfp4"
+        and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
+    ):
+        return None
+    excluded = hf_quant_config.get("exclude") or []
+    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+        return None
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    logger.info(
+        "Draft MTP experts are unquantized in the Quark checkpoint; "
+        "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
+    )
+    return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
 def _modelopt_quant_section(config: dict) -> dict:
     """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
 
@@ -313,7 +349,11 @@ def get_quant_config(
             # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
-
+            draft_online = _quark_draft_online_quant_config(
+                model_config, hf_quant_config
+            )
+            if draft_online is not None:
+                return draft_online
             return _resolve_explicit_draft_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
@@ -796,7 +836,10 @@ def filter_duplicate_safetensors_files(
             if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
                 files_to_validate.add(f)
 
-    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
+    if "://" in hf_folder:
+        missing_files = sorted(files_to_validate.difference(hf_weights_files))
+    else:
+        missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "
@@ -842,7 +885,16 @@ def maybe_add_mtp_safetensors(
 
     # Check if mtp.safetensors exists and is not already in the file list
     mtp_path = os.path.join(hf_folder, "mtp.safetensors")
-    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+    if mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+    if is_runai_obj_uri(hf_folder):
+        mtp_exists = mtp_path in list_safetensors(hf_folder)
+    else:
+        mtp_exists = os.path.isfile(mtp_path)
+    if not mtp_exists:
         return hf_weights_files
 
     # mtp.safetensors exists but not in index - this is a bug

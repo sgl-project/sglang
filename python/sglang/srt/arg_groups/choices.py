@@ -82,7 +82,6 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
-    "cutlass_mla",
     "fa3",
     "fa4",
     "flashinfer",
@@ -92,7 +91,6 @@ ATTENTION_BACKEND_CHOICES = [
     "cutedsl_mla",
     "tokenspeed_mla",
     "trtllm_mha",
-    "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
     "minicpm_flashinfer",
@@ -114,6 +112,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "intel_xpu",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -149,6 +148,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
@@ -162,6 +162,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
@@ -236,7 +237,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa4",
     "flashmla",
     "cutedsl_mla",
-    "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
 ]

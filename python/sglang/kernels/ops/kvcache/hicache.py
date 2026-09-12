@@ -3,14 +3,22 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_hip_runtime,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-DEFAULT_BLOCK_QUOTA = 2
+_is_hip = is_hip_runtime()
+
+# ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
+DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
 
 
 @cache_once
