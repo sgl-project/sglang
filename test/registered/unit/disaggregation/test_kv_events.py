@@ -7,9 +7,14 @@ the router can subscribe per replica (the `dp_size` it reads from
 `/server_info`).
 """
 
+import time
 import unittest
+from collections import OrderedDict, deque
+from queue import Queue
+from unittest.mock import patch
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     BlockStored,
@@ -222,6 +227,171 @@ class TestBlockStoredWireFormat(CustomTestCase):
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
         self.assertEqual(round_tripped.events[0].block_hashes, [123])
+
+
+class TestZmqReplayBackpressure(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ctx = zmq.Context()
+        self.addCleanup(self.ctx.destroy, linger=0)
+        # Exercise the real socket setup and replay loop on the test thread.
+        self.publisher = ZmqEventPublisher.__new__(ZmqEventPublisher)
+        self.publisher._ctx = self.ctx
+        self.publisher._pub = None
+        self.publisher._replay = None
+        self.publisher._endpoint = "inproc://live"
+        self.publisher._replay_endpoint = "inproc://replay"
+        self.publisher._hwm = 100
+        self.publisher._buffer = deque(maxlen=1024)
+        self.publisher._pending_replays = OrderedDict()
+        socket_factory = zmq.Context.socket
+
+        def low_hwm_socket(context, socket_type):
+            socket = socket_factory(context, socket_type)
+            if socket_type == zmq.ROUTER:
+                socket.setsockopt(zmq.SNDHWM, 1)
+            return socket
+
+        with patch.object(zmq.Context, "socket", low_hwm_socket):
+            self.publisher._socket_setup()
+
+    def _client(self, identity=b"reader"):
+        client = self.ctx.socket(zmq.DEALER)
+        client.setsockopt(zmq.IDENTITY, identity)
+        client.setsockopt(zmq.RCVHWM, 1)
+        client.connect("inproc://replay")
+        return client
+
+    def _request(self, client, start=0):
+        client.send_multipart((b"", start.to_bytes(8, "big")))
+        self.assertTrue(self.publisher._replay.poll(1000, zmq.POLLIN))
+        self.publisher._service_replay()
+
+    def _collect(self, client):
+        frames = []
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            while client.poll(0, zmq.POLLIN):
+                message = client.recv_multipart()
+                frames.append(message)
+                if message == [b"", self.publisher.END_SEQ, b""]:
+                    return frames
+            self.publisher._service_replay()
+            client.poll(1, zmq.POLLIN)
+        self.fail("Replay did not deliver its terminal marker")
+
+    def test_full_queue_retries_tail_and_pins_requested_history(self):
+        batches = [(seq, f"batch-{seq}".encode()) for seq in range(1024)]
+        self.publisher._buffer.extend(batches)
+        client = self._client()
+        self._request(client)
+        self.assertIn(b"reader", self.publisher._pending_replays)
+
+        # New live events can evict every original batch during a slow replay.
+        self.publisher._buffer.extend((seq, b"new") for seq in range(1024, 2048))
+        frames = self._collect(client)
+        self.assertEqual(
+            frames,
+            [[b"", seq.to_bytes(8, "big"), payload] for seq, payload in batches]
+            + [[b"", self.publisher.END_SEQ, b""]],
+        )
+        self.assertFalse(self.publisher._pending_replays)
+
+    def test_terminal_marker_is_retried_when_queue_is_full(self):
+        # Inproc capacity is the sender HWM + receiver HWM, both set to one.
+        self.publisher._buffer.extend([(0, b"first"), (1, b"second")])
+        client = self._client()
+        self._request(client)
+        self.assertIn(b"reader", self.publisher._pending_replays)
+        self.assertFalse(self.publisher._pending_replays[b"reader"].batches)
+        self.assertEqual(
+            self._collect(client),
+            [
+                [b"", (0).to_bytes(8, "big"), b"first"],
+                [b"", (1).to_bytes(8, "big"), b"second"],
+                [b"", self.publisher.END_SEQ, b""],
+            ],
+        )
+
+    def test_stalled_reader_does_not_block_another_reader(self):
+        self.publisher._buffer.extend((seq, b"data") for seq in range(16))
+        stalled = self._client(b"stalled")
+        self._request(stalled)
+        healthy = self._client(b"healthy")
+        self._request(healthy)
+        frames = self._collect(healthy)
+        self.assertEqual(len(frames), 17)
+        self.assertEqual(
+            [int.from_bytes(frame[1], "big") for frame in frames[:-1]],
+            list(range(16)),
+        )
+        self.assertIn(b"stalled", self.publisher._pending_replays)
+
+    def test_stalled_replay_does_not_block_live_publication(self):
+        self.publisher._buffer.extend((seq, b"data") for seq in range(16))
+        client = self._client()
+        self._request(client)
+        subscriber = self.ctx.socket(zmq.SUB)
+        subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+        subscriber.connect("inproc://live")
+        publisher = self.publisher
+        publisher._running = True
+        publisher._seq_gen = iter([16])
+        publisher._topic_bytes = b""
+        publisher._event_queue = Queue()
+        publisher._event_queue.put(KVEventBatch(ts=1.0, events=[]))
+        publisher._event_queue.put(None)
+        publisher._publisher_thread()
+        self.assertTrue(subscriber.poll(1000, zmq.POLLIN))
+        frames = subscriber.recv_multipart()
+        self.assertEqual(frames[:2], [b"", (16).to_bytes(8, "big")])
+        self.assertEqual(msgspec.msgpack.decode(frames[2], type=KVEventBatch).ts, 1.0)
+        self.assertIn(b"reader", publisher._pending_replays)
+
+    def test_send_budget_yields_before_finishing_replay(self):
+        self.publisher.REPLAY_SEND_BUDGET = 1
+        self.publisher._buffer.extend([(0, b"old"), (1, b"first"), (2, b"second")])
+        client = self._client()
+        self._request(client, start=1)
+        self.assertEqual(
+            list(self.publisher._pending_replays[b"reader"].batches), [(2, b"second")]
+        )
+        self.assertEqual(
+            self._collect(client),
+            [
+                [b"", (1).to_bytes(8, "big"), b"first"],
+                [b"", (2).to_bytes(8, "big"), b"second"],
+                [b"", self.publisher.END_SEQ, b""],
+            ],
+        )
+
+    def test_idle_replay_expires_and_releases_admission_slot(self):
+        self.publisher.MAX_PENDING_REPLAYS = 1
+        self.publisher._buffer.extend((seq, b"data") for seq in range(16))
+        stalled = self._client(b"stalled")
+        self._request(stalled)
+        healthy = self._client(b"healthy")
+        self._request(healthy)
+        self.assertEqual(list(self.publisher._pending_replays), [b"stalled"])
+        state = self.publisher._pending_replays[b"stalled"]
+        with patch(
+            "sglang.srt.disaggregation.kv_events.time.monotonic",
+            return_value=state.last_progress + self.publisher.REPLAY_IDLE_TIMEOUT,
+        ):
+            self.publisher._service_replay()
+        self.assertNotIn(b"stalled", self.publisher._pending_replays)
+        self.assertEqual(len(self._collect(healthy)), 17)
+
+    def test_disconnected_reader_does_not_retain_replay(self):
+        self.publisher._buffer.extend((seq, b"data") for seq in range(16))
+        client = self._client()
+        self._request(client)
+        client.close(linger=0)
+        deadline = time.monotonic() + 1
+        while self.publisher._pending_replays and time.monotonic() < deadline:
+            self.publisher._service_replay()
+            time.sleep(0.001)
+        self.assertFalse(self.publisher._pending_replays)
 
 
 if __name__ == "__main__":

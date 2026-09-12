@@ -24,7 +24,7 @@ import queue
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
 from itertools import count
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
@@ -345,10 +345,18 @@ class NullEventPublisher(EventPublisher):
         return
 
 
+class _ReplayState(msgspec.Struct):
+    batches: deque[tuple[int, bytes]]
+    last_progress: float
+
+
 class ZmqEventPublisher(EventPublisher):
     """Reliable PUB/ROUTER publisher with an in-memory replay buffer.
 
     Spawns a separate thread to handle publishing from a queue.
+    Replay sends are nonblocking and resume after backpressure. Pending replays
+    retain a bounded number of history snapshots and expire after 30 seconds
+    without send progress; abandoned replays do not send a completion marker.
 
     Parameters
     ----------
@@ -371,6 +379,9 @@ class ZmqEventPublisher(EventPublisher):
 
     SHUTDOWN_TIMEOUT: float = 1.0
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
+    MAX_PENDING_REPLAYS = 16
+    REPLAY_SEND_BUDGET = 256
+    REPLAY_IDLE_TIMEOUT = 30.0
 
     def __init__(
         self,
@@ -385,6 +396,7 @@ class ZmqEventPublisher(EventPublisher):
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
+        self._pending_replays: OrderedDict[bytes, _ReplayState] = OrderedDict()
 
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
@@ -484,6 +496,8 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            # Default ROUTER sends silently drop messages at the peer's HWM.
+            self._replay.setsockopt(zmq.ROUTER_MANDATORY, 1)
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
@@ -497,7 +511,7 @@ class ZmqEventPublisher(EventPublisher):
 
         while self._running or self._event_queue.qsize() > 0:
             # --- replay (non-critical) ---------------------------------
-            if self._replay is not None and self._replay.poll(0):
+            if self._replay is not None:
                 try:
                     self._service_replay()
                 except Exception as e:
@@ -527,7 +541,50 @@ class ZmqEventPublisher(EventPublisher):
                 time.sleep(0.1)
 
     def _service_replay(self) -> None:
-        """If a replay request is waiting, send buffered batches."""
+        """Advance bounded replay work without blocking live publication."""
+        assert self._replay is not None
+
+        if len(self._pending_replays) < self.MAX_PENDING_REPLAYS and self._replay.poll(
+            0, zmq.POLLIN
+        ):
+            self._receive_replay_request()
+
+        budget = self.REPLAY_SEND_BUDGET
+        for _ in range(len(self._pending_replays)):
+            if budget == 0:
+                break
+            client_id, state = self._pending_replays.popitem(last=False)
+            if time.monotonic() - state.last_progress >= self.REPLAY_IDLE_TIMEOUT:
+                logger.warning("Replay expired without send progress for %r", client_id)
+                continue
+
+            while budget > 0:
+                budget -= 1
+                if state.batches:
+                    seq, payload = state.batches[0]
+                    seq_bytes = seq.to_bytes(8, "big")
+                else:
+                    seq_bytes, payload = self.END_SEQ, b""
+                try:
+                    self._replay.send_multipart(
+                        (client_id, b"", seq_bytes, payload), flags=zmq.DONTWAIT
+                    )
+                except zmq.Again:
+                    # Keep the unsent batch (including the terminal marker).
+                    self._pending_replays[client_id] = state
+                    break
+                except zmq.ZMQError as error:
+                    logger.warning("Abandoning replay for %r: %s", client_id, error)
+                    break
+
+                state.last_progress = time.monotonic()
+                if not state.batches:
+                    break  # The terminal marker was accepted by the socket.
+                state.batches.popleft()
+            else:
+                self._pending_replays[client_id] = state
+
+    def _receive_replay_request(self) -> None:
         assert self._replay is not None  # narrows type for mypy
 
         frame = self._replay.recv_multipart()
@@ -537,17 +594,12 @@ class ZmqEventPublisher(EventPublisher):
         client_id, _, start_seq_bytes = frame
         start_seq = int.from_bytes(start_seq_bytes, "big")
 
-        for seq, buf in self._buffer:
-            if seq >= start_seq:
-                # [identity, empty_delim, seq_bytes, payload]
-                # (identity, empty_delim) are stripped off by the router
-                # receiving payload is (seq_bytes, payload)
-                self._replay.send_multipart(
-                    (client_id, b"", seq.to_bytes(8, "big"), buf)
-                )
-        # Send end of sequence marker
-        # receiving payload is (-1, b""")
-        self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
+        # Pin this request's retained payloads while live events rotate the buffer.
+        # Admission and idle limits bound the number and lifetime of snapshots.
+        self._pending_replays[client_id] = _ReplayState(
+            batches=deque((seq, buf) for seq, buf in self._buffer if seq >= start_seq),
+            last_progress=time.monotonic(),
+        )
 
     @staticmethod
     def offset_endpoint_port(
