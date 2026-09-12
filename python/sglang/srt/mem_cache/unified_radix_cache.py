@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -1922,6 +1923,15 @@ class UnifiedRadixCache(BasePrefixCache):
             # overwriting would leak its staging slots.
             return
 
+        # Recompute last_hash from the full matched prefix so the hash chain
+        # is correct regardless of which node was selected as anchor.  The
+        # anchor's hash_value may be at a different position than matched_len
+        # when the anchor has no host_value (async backup not yet complete).
+        if matched_prefix_tokens and len(matched_prefix_tokens) >= self.page_size:
+            prefix_hashes = get_hash_str(matched_prefix_tokens, None, self.page_size)
+            if prefix_hashes:
+                last_hash = prefix_hashes[-1]
+
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
         anchor_lock_params = (
@@ -2105,6 +2115,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
+        # The check may have degraded the result (fail-soft): re-read the
+        # retained KV prefix length and hash chain off the operation.
+        completed_tokens = operation.completed_tokens
+        hash_value = operation.hash_value
 
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
@@ -2241,50 +2255,106 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
-            # Drop the KV beliefs from the first page any pool failed to serve;
-            # the next insert then re-writes that span through one FULL check,
-            # restoring the missing aux pages.
-            keep_pages = completed_tokens // self.page_size
-            for transfer, count in zip(pool_transfers, pool_hit_pages):
-                if transfer.keys is None:
-                    keep_pages = 0
-                elif count < len(transfer.keys):
-                    # Aux transfers key the chain's trailing pages.
-                    keep_pages = min(
-                        keep_pages, max(0, len(hash_value) - len(transfer.keys))
-                    )
+            # Identify which non-KV components fell short.  KV-derived
+            # sidecars (indices_from_pool == KV) are excluded — they share
+            # the KV hit length and are always covered when KV succeeds.
+            comp_xfers = self.ongoing_prefetch[req_id].comp_xfers
+            failed_components = [
+                ct
+                for ct, xfers in comp_xfers.items()
+                if any(x.indices_from_pool != PoolName.KV for x in xfers)
+            ]
+            # Only SWA has a cheap rebuild path (_translate_full_to_swa);
+            # the missing window is rebuilt at load-back via
+            # SWARebuild/RecoverSWAWithLockedFull.  Mamba SSM states require
+            # O(seq_len) recompute — not degradable.
+            rebuildable = all(ct != ComponentType.MAMBA for ct in failed_components)
+
+            if completed_tokens == 0 or not rebuildable:
+                # Full discard — nothing usable from any pool, or a
+                # non-rebuildable pool (Mamba) fell short so the whole
+                # result is unusable.
+                # Drop the KV beliefs from the first page any pool failed to serve;
+                # the next insert then re-writes that span through one FULL check,
+                # restoring the missing aux pages.
+                keep_pages = completed_tokens // self.page_size
+                for transfer, count in zip(pool_transfers, pool_hit_pages):
+                    if transfer.keys is None:
+                        keep_pages = 0
+                    elif count < len(transfer.keys):
+                        # Aux transfers key the chain's trailing pages.
+                        keep_pages = min(
+                            keep_pages, max(0, len(hash_value) - len(transfer.keys))
+                        )
+                self.storage_existence_cache.invalidate_beyond(
+                    PoolName.KV, hash_value, keep_pages=keep_pages
+                )
+                # The controller's prefetch IO thread already releases the untransferred
+                # tail (host_indices[completed_tokens:])
+                self.cache_controller.append_host_mem_release(
+                    host_indices=host_indices[:completed_tokens],
+                    extra_pools=pool_transfers if operation.pool_transfers_done else None,
+                )
+                self._finish_storage_prefetch(
+                    req_id, fulfilled_tokens=0, reason="storage_transfer"
+                )
+                if anchor_lock_params is not None:
+                    self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+                if self.buffer_pipeline is not None:
+                    self.buffer_pipeline.pop_prefix_ctx(req_id)
+                    self.buffer_pipeline.release_anchor_lock(req_id)
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= (
+                    self._prefetch_occupied_span(prefetch_key, host_indices)
+                )
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+                self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
+                logger.warning(
+                    "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
+                    "kv_beliefs_kept_pages=%d",
+                    req_id,
+                    completed_tokens,
+                    expected_tokens,
+                    keep_pages,
+                )
+                return False
+
+            # Fail-soft degrade: retain the Full KV (+ KV-derived sidecar)
+            # result and discard **only** the failed non-KV independent
+            # pools (SWA) whose storage fetch fell short.  Their host
+            # buffers are released here and their component entries are
+            # removed from comp_xfers so the caller's normal commit /
+            # staging path never touches the freed memory.  At load-back
+            # time the missing SWA window is rebuilt via the existing
+            # RecoverSWAWithLockedFull / SWARebuild path in swa_component.py.
+            # Belief self-heal is scoped to the retained KV prefix.
             self.storage_existence_cache.invalidate_beyond(
-                PoolName.KV, hash_value, keep_pages=keep_pages
+                PoolName.KV,
+                hash_value,
+                keep_pages=completed_tokens // self.page_size,
             )
-            # The controller's prefetch IO thread already releases the untransferred
-            # tail (host_indices[completed_tokens:])
             self.cache_controller.append_host_mem_release(
-                host_indices=host_indices[:completed_tokens],
                 extra_pools=pool_transfers if operation.pool_transfers_done else None,
             )
-            self._finish_storage_prefetch(
-                req_id, fulfilled_tokens=0, reason="storage_transfer"
-            )
-            if anchor_lock_params is not None:
-                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
-            if self.buffer_pipeline is not None:
-                self.buffer_pipeline.pop_prefix_ctx(req_id)
-                self.buffer_pipeline.release_anchor_lock(req_id)
-            del self.ongoing_prefetch[req_id]
-            self.cache_controller.prefetch_tokens_occupied -= (
-                self._prefetch_occupied_span(prefetch_key, host_indices)
-            )
-            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
-            self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
+            # Remove failed non-KV components from comp_xfers (same dict as
+            # the caller's) so the commit / staging path won't touch freed
+            # host buffers.
+            for ct in failed_components:
+                del comp_xfers[ct]
+            # Retain only the KV-fetched prefix; the caller re-reads these
+            # off the operation after the check passes.
+            operation.completed_tokens = completed_tokens
+            operation.hash_value = hash_value[: completed_tokens // self.page_size]
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d",
+                "HiCache hybrid prefetch degraded req=%s completed=%d "
+                "requested=%d retained_kv=%d discarded_components=%s",
                 req_id,
                 completed_tokens,
                 expected_tokens,
-                keep_pages,
+                completed_tokens,
+                [ct.value for ct in failed_components],
             )
-            return False
+            return True
         return True
 
     def _record_storage_prefetch_hit(self, req_id: str, num_tokens: int) -> None:

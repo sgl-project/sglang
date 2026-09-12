@@ -321,6 +321,14 @@ class SWAComponent(TreeComponent):
                 state["len"] = 0
                 if swa_req_ring and (node.backuped or not node.evicted):
                     return True
+                # Fail-soft: a backuped node whose SWA is absent on *both*
+                # layers (device tombstone plus no L3 backup — the hole a
+                # degraded prefetch can graft) still has Full KV on host.
+                # Treat only that case as a valid match boundary — SWA will
+                # be rebuilt from Full KV at load-back via
+                # SWARebuild/RecoverSWAWithLockedFull.
+                if cd.host_value is None and node.backuped:
+                    return True
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
@@ -1057,7 +1065,12 @@ class SWAComponent(TreeComponent):
                 cur is not self.tree_core.root_node and n_swa < self.sliding_window_size
             ):
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
+                # Fail-soft: a degraded prefetch may insert a backuped node
+                # whose SWA was never backed up (tombstoned before backup).
+                # Stop collecting — SWA will be rebuilt from Full KV at
+                # load-back via SWARebuild/RecoverSWAWithLockedFull.
+                if cd.host_value is None and cd.value is None:
+                    break
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)

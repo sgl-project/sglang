@@ -4673,7 +4673,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(self._host_avail_sizes(cons3), avail3)
         cons3.sanity_check()
 
-    # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
+    # ---------- TP consistency for SWA prefetch (fail-soft degrade) ----------
 
     def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
         """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
@@ -4760,9 +4760,11 @@ class UnifiedRadixCacheSuite:
             self.skipTest("fixture does not exercise SWA L3 prefetch")
         return storage_dir, seq
 
-    def test_tp_swa_prefetch_dropped_when_peer_misses(self):
-        """A peer rank missing the SWA window drops the whole prefetch result
-        on every rank (TP-consistent all-or-nothing)."""
+    def test_tp_swa_prefetch_degrades_to_kv_only_when_peer_misses(self):
+        """A peer rank missing the SWA window degrades the prefetch to KV-only
+        on every rank (TP-consistent fail-soft: the fetched KV prefix is
+        retained, only the failed SWA pool is discarded and rebuilt at
+        load-back)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -4774,7 +4776,10 @@ class UnifiedRadixCacheSuite:
         self._consume_prefetch(cons, seq, "drop")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        self.assertEqual(m.host_hit_length, 0)
+        # Fail-soft: the KV pool fetched a usable prefix and it is retained.
+        self.assertEqual(m.host_hit_length, len(seq))
+        # TP consistency: every rank agrees SWA itself is missing — the
+        # degraded span carries no SWA host mirror (rebuilt from Full KV).
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
@@ -4801,9 +4806,11 @@ class UnifiedRadixCacheSuite:
         )
         cons.sanity_check()
 
-    def test_tp_swa_prefetch_drop_frees_host_pool(self):
-        """A dropped SWA prefetch must return its whole host buffer to the pool
-        (no leak, no over-free)."""
+    def test_tp_swa_prefetch_degrade_frees_failed_swa_host_pool(self):
+        """A degraded prefetch (peer missing SWA) must return the failed SWA
+        pool's host buffer to the pool (no leak, no over-free) while the
+        retained KV span stays occupied — the fail-soft degrade never
+        double-frees the kept side (TP-consistent on every rank)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -4812,18 +4819,25 @@ class UnifiedRadixCacheSuite:
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
-        avail_before = cons.swa_kv_pool_host.available_size()
+        avail_before = self._host_avail_sizes(cons)
         self._consume_prefetch(cons, seq, "drop")
 
         self.assertEqual(
             cons.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", seq)))
             ).host_hit_length,
-            0,
+            len(seq),
         )
-        # Whole window dropped -> its host buffer is fully released back.
         cons.drain_storage_control_queues()  # Drain the release queue.
-        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
+        avail_after = self._host_avail_sizes(cons)
+        # Failed pool: its whole SWA window is released back (no leak).
+        self.assertEqual(
+            cons.swa_kv_pool_host.available_size(), avail_before[PoolName.SWA]
+        )
+        # Retained side: the KV graft keeps its host buffer occupied — the
+        # degrade must not release the KV it just decided to keep.
+        self.assertLess(avail_after[PoolName.KV], avail_before[PoolName.KV])
+        cons.sanity_check()
 
     def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
         """Write-back eviction will keep freeing device KV when the host pool
@@ -7071,10 +7085,17 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(xfer.nodes_to_load, [y])
         self.assertEqual(int(xfer.host_indices.numel()), ps)
 
-        with self.assertRaises(AssertionError):
-            cache.tree_core.build_hicache_transfers(
-                ComponentType.SWA, y, CacheTransferPhase.LOAD_BACK
-            )
+        # Anchored on Y, the walk reaches N's both-layers-absent SWA hole:
+        # the fail-soft LOAD_BACK builder stops collecting there instead of
+        # asserting — the missing SWA window is rebuilt from Full KV at
+        # load-back via SWARebuild/RecoverSWAWithLockedFull.
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.SWA, y, CacheTransferPhase.LOAD_BACK
+        )
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.nodes_to_load, [y])
+        self.assertEqual(int(xfer.host_indices.numel()), ps)
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
