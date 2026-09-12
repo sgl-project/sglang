@@ -4,7 +4,6 @@ rounding differences can change the downstream indexer's top-k selection.
 
 import pytest
 import torch
-
 from sglang.kernels.ops.attention.dsv4.pair_pool_decode import pair_pool_decode
 from sglang.test.ci.ci_register import register_cuda_ci
 

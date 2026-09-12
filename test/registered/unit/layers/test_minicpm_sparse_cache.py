@@ -182,6 +182,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_full_pool(
@@ -272,6 +273,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_mamba_pool(

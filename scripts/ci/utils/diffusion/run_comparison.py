@@ -1,7 +1,7 @@
 """Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches an SGLang-Diffusion server for each test case, sends a single
-request, measures end-to-end latency, and writes comparison-results.json.
+Launches an SGLang-Diffusion server for each test case, sends repeated
+requests, measures median end-to-end latency, and writes comparison-results.json.
 The runner still supports extra frameworks via --frameworks, but the nightly
 config tracks SGLang-Diffusion only.
 
@@ -24,8 +24,10 @@ import base64
 import io
 import json
 import os
+import shlex
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -84,12 +86,29 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     ]
     if case["num_gpus"] > 1:
         cmd += ["--num-gpus", str(case["num_gpus"])]
-    if fw_cfg.get("serve_args", "").strip():
-        cmd += fw_cfg["serve_args"].strip().split()
-    # No explicit --warmup-resolutions: server-based warmup now defaults to the
-    # model's sampling-default resolution (see warmup_request_builder), which
-    # already matches these single-resolution cases — the default warmup is
-    # sufficient, so we don't pin a resolution here.
+    serve_args = shlex.split(fw_cfg.get("serve_args", ""))
+    cmd += serve_args
+
+    def has_option(name: str) -> bool:
+        return any(arg == name or arg.startswith(f"{name}=") for arg in serve_args)
+
+    server_warmup = any(
+        arg == "--warmup-mode=server"
+        or (
+            arg == "--warmup-mode"
+            and index + 1 < len(serve_args)
+            and serve_args[index + 1] == "server"
+        )
+        for index, arg in enumerate(serve_args)
+    )
+    if server_warmup and not has_option("--warmup-resolutions"):
+        cmd += ["--warmup-resolutions", f"{case['width']}x{case['height']}"]
+    if (
+        server_warmup
+        and case.get("num_frames") is not None
+        and not has_option("--warmup-num-frames")
+    ):
+        cmd += ["--warmup-num-frames", str(case["num_frames"])]
     return cmd
 
 
@@ -375,8 +394,8 @@ def _build_sglang_payload(case: dict) -> dict:
     return payload
 
 
-def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> float | None:
-    """Read total_duration_ms from a perf dump JSON written by the server.
+def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> dict | None:
+    """Read a perf dump JSON written by the server.
 
     The server writes the file asynchronously after the HTTP response,
     so we poll briefly.
@@ -386,9 +405,8 @@ def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> float | None:
         try:
             with open(perf_dump_path) as f:
                 data = json.load(f)
-            total_ms = data.get("total_duration_ms")
-            if total_ms is not None:
-                return total_ms / 1000.0
+            if data.get("total_duration_ms") is not None:
+                return data
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         time.sleep(0.5)
@@ -415,16 +433,6 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
-    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
-    # cross-framework comparison); server-side perf_dump is diagnostic only.
-    if perf_dump_path:
-        server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Image generated in {client_latency:.2f}s (client e2e; "
-                f"server-side {server_latency:.2f}s, diagnostic)"
-            )
-            return client_latency
     print(f"  Image generated in {client_latency:.2f}s")
     return client_latency
 
@@ -468,16 +476,6 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
-    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
-    # cross-framework comparison); server-side perf_dump is diagnostic only.
-    if perf_dump_path:
-        server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Video generated in {client_latency:.2f}s (client e2e; "
-                f"server-side {server_latency:.2f}s, diagnostic)"
-            )
-            return client_latency
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
 
@@ -556,16 +554,6 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
-    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
-    # cross-framework comparison); server-side perf_dump is diagnostic only.
-    if perf_dump_path:
-        server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Generated in {client_latency:.2f}s (client e2e; "
-                f"server-side {server_latency:.2f}s, diagnostic)"
-            )
-            return client_latency
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
 
@@ -730,6 +718,39 @@ def send_request(
 # ---------------------------------------------------------------------------
 
 
+def _summarize_perf_dumps(perf_dumps: list[dict]) -> dict:
+    server_latency_samples_s = [
+        round(dump["total_duration_ms"] / 1000.0, 3) for dump in perf_dumps
+    ]
+    stage_samples: dict[str, list[float]] = {}
+    denoise_step_samples: list[float] = []
+    for dump in perf_dumps:
+        for stage in dump.get("steps", []):
+            name = stage.get("name")
+            duration_ms = stage.get("duration_ms")
+            if name and duration_ms is not None:
+                stage_samples.setdefault(name, []).append(float(duration_ms))
+        denoise_step_samples.extend(
+            float(step["duration_ms"])
+            for step in dump.get("denoise_steps_ms", [])
+            if step.get("duration_ms") is not None
+        )
+
+    summary = {
+        "server_latency_samples_s": server_latency_samples_s,
+        "server_latency_s": round(statistics.median(server_latency_samples_s), 3),
+        "server_stage_medians_ms": {
+            name: round(statistics.median(values), 3)
+            for name, values in sorted(stage_samples.items())
+        },
+    }
+    if denoise_step_samples:
+        summary["median_denoise_step_ms"] = round(
+            statistics.median(denoise_step_samples), 3
+        )
+    return summary
+
+
 def run_single(
     case: dict,
     framework: str,
@@ -737,6 +758,7 @@ def run_single(
     port: int,
     log_dir: Path,
     config: dict | None = None,
+    measurement_repeats: int = 1,
 ) -> dict:
     """Run a single (case, framework) combination. Returns result dict."""
     result = {
@@ -745,6 +767,8 @@ def run_single(
         "model": case["model"],
         "task": case["task"],
         "latency_s": None,
+        "latency_samples_s": [],
+        "measurement_count": 0,
         "error": None,
     }
 
@@ -753,11 +777,6 @@ def run_single(
 
     env = os.environ.copy()
     env.update(fw_cfg.get("extra_env", {}))
-
-    # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
-    perf_dump_path = None
-    if framework == "sglang":
-        perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
     log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
@@ -811,26 +830,54 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # No client-side warmup: each framework relies on its own server-side
-        # warmup before traffic. sglang's serve_args pass --warmup-mode server,
-        # which primes kernels with a synthetic request at startup, before the
-        # health check passes. This goes through the internal
-        # warmup path that bypasses sampling-param preset validation (e.g.
-        # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
-        # special-casing is needed here.
+        # SGLang server warmup uses the measured shape added by
+        # _build_sglang_cmd. The repeated requests below absorb any remaining
+        # request-path cold effects, including image-conditioned preprocessing.
         # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
         # cross-framework comparison is restored, they must add their own warmup
         # to stay on equal footing — otherwise their measured request pays the
         # full cold-start.
 
-        # Measured request — pass perf_dump_path for SGLang server-side timing
-        if perf_dump_path and os.path.exists(perf_dump_path):
-            os.remove(perf_dump_path)
-        print("  Sending measured request...")
-        latency = send_request(
-            base_url, case, framework, config, perf_dump_path=perf_dump_path
-        )
-        result["latency_s"] = round(latency, 3)
+        latency_samples: list[float] = []
+        perf_dumps: list[dict] = []
+        for sample_index in range(measurement_repeats):
+            perf_dump_path = None
+            if framework == "sglang":
+                sample_suffix = "" if sample_index == 0 else f"_{sample_index + 1}"
+                perf_dump_path = str(
+                    (
+                        log_dir / f"perf_{case['id']}_measured{sample_suffix}.json"
+                    ).resolve()
+                )
+                if os.path.exists(perf_dump_path):
+                    os.remove(perf_dump_path)
+
+            print(
+                f"  Sending measured request {sample_index + 1}/"
+                f"{measurement_repeats}..."
+            )
+            latency = send_request(
+                base_url, case, framework, config, perf_dump_path=perf_dump_path
+            )
+            latency_samples.append(round(latency, 3))
+
+            if perf_dump_path:
+                perf_dump = _read_perf_dump(perf_dump_path)
+                if perf_dump is None:
+                    raise RuntimeError(
+                        f"Server did not write performance data to {perf_dump_path}"
+                    )
+                perf_dumps.append(perf_dump)
+                print(
+                    "  Server-side latency: "
+                    f"{perf_dump['total_duration_ms'] / 1000.0:.2f}s"
+                )
+
+        result["latency_samples_s"] = latency_samples
+        result["measurement_count"] = len(latency_samples)
+        result["latency_s"] = round(statistics.median(latency_samples), 3)
+        if perf_dumps:
+            result.update(_summarize_perf_dumps(perf_dumps))
 
     except Exception as e:
         result["error"] = server_error.get("message", str(e))
@@ -889,6 +936,7 @@ def run_comparison(
     port: int = DEFAULT_PORT,
     output: str = "comparison-results.json",
     dry_run: bool = False,
+    measurement_repeats: int | None = None,
 ) -> dict:
     """Run all comparison cases, grouped by framework to minimize installs.
 
@@ -898,6 +946,13 @@ def run_comparison(
     timestamp = datetime.now(timezone.utc).isoformat()
     commit_sha = _get_checkout_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    repeats = (
+        measurement_repeats
+        if measurement_repeats is not None
+        else int(config.get("measurement_repeats", 1))
+    )
+    if repeats <= 0:
+        raise ValueError("measurement_repeats must be a positive integer")
 
     log_dir = Path("comparison-logs")
     log_dir.mkdir(exist_ok=True)
@@ -962,7 +1017,15 @@ def run_comparison(
                 )
                 continue
 
-            result = run_single(case, fw_name, fw_cfg, port, log_dir, config)
+            result = run_single(
+                case,
+                fw_name,
+                fw_cfg,
+                port,
+                log_dir,
+                config,
+                measurement_repeats=repeats,
+            )
             results.append(result)
 
             # Wait for GPU memory to clear
@@ -973,6 +1036,7 @@ def run_comparison(
         "timestamp": timestamp,
         "commit_sha": commit_sha,
         "run_id": run_id,
+        "measurement_repeats": repeats,
         "results": results,
     }
 
@@ -986,7 +1050,11 @@ def run_comparison(
     print("SUMMARY")
     print(f"{'=' * 60}")
     for r in results:
-        lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
+        lat = (
+            f"{r['latency_s']:.2f}s median (n={r.get('measurement_count', 1)})"
+            if r["latency_s"]
+            else r.get("error", "N/A")
+        )
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")
 
     return output_data
@@ -1034,6 +1102,12 @@ def main():
         action="store_true",
         help="Parse config and print commands without launching servers",
     )
+    parser.add_argument(
+        "--measurement-repeats",
+        type=int,
+        default=None,
+        help="Measured requests per case (default: value from config)",
+    )
 
     args = parser.parse_args()
 
@@ -1049,6 +1123,7 @@ def main():
         port=args.port,
         output=args.output,
         dry_run=args.dry_run,
+        measurement_repeats=args.measurement_repeats,
     )
 
     # Exit with non-zero if any case had an error

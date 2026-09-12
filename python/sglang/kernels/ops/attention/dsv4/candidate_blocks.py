@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 @triton.jit
 def _maximum_with_nan(a, b):
@@ -16,10 +18,8 @@ def _candidate_scores_kernel(
     LENS,
     OUT,
     SCORES,
-    BLOCK_LENS,
     WIDTH: tl.constexpr,
     STRIDE: tl.constexpr,
-    SCORE_STRIDE: tl.constexpr,
     BLOCKS: tl.constexpr,
     GROUP: tl.constexpr,
     GROUP_PAD: tl.constexpr,
@@ -41,12 +41,7 @@ def _candidate_scores_kernel(
     scores = tl.where(
         (length > 0) & (blocks == (length - 1) // GROUP), float("inf"), scores
     )
-    tl.store(SCORES + row * SCORE_STRIDE + blocks, scores, blocks < BLOCKS)
-    tl.store(
-        BLOCK_LENS + row,
-        (length + GROUP - 1) // GROUP,
-        mask=tl.program_id(1) == 0,
-    )
+    tl.store(SCORES + row * BLOCKS + blocks, scores, blocks < BLOCKS)
 
 
 @triton.jit
@@ -69,6 +64,29 @@ def _candidate_mask_kernel(
         tl.float32
     )
     tl.store(OUT + row * WIDTH + cols, values, cols < WIDTH)
+
+
+@triton.jit
+def _publish_candidate_mask_kernel(
+    INDICES,
+    VALUES,
+    KEEP,
+    WIDTH: tl.constexpr,
+    GROUP: tl.constexpr,
+    TOPK: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    selected = tl.load(INDICES + row * TOPK + i // GROUP, i < TOPK * GROUP, 0)
+    score = tl.load(VALUES + row * TOPK + i // GROUP, i < TOPK * GROUP, -float("inf"))
+    cols = selected * GROUP + i % GROUP
+    # torch.topk returns unique block indices: each output position has one writer.
+    tl.store(
+        KEEP + row * WIDTH + cols,
+        score > -float("inf"),
+        (i < TOPK * GROUP) & (cols < WIDTH),
+    )
 
 
 @triton.jit
@@ -148,23 +166,16 @@ def _finalize_candidate_topk_kernel(
             other=0,
         )
         logical = block * CANDIDATE_BLOCK_SIZE + within
-        req = tl.load(REQ + row).to(tl.int64)
-        slot = tl.load(
-            REQ_TO_TOKEN + req * REQ_STRIDE + logical * RATIO,
-            mask=valid,
-            other=0,
-        )
-        slot = slot // RATIO
     else:
         logical = safe
-        req = tl.load(REQ + row).to(tl.int64)
-        slot = tl.load(
-            REQ_TO_TOKEN + req * REQ_STRIDE + logical * RATIO,
-            mask=valid,
-            other=0,
-        )
-        slot = slot // RATIO
 
+    req = tl.load(REQ + row).to(tl.int64)
+    slot = tl.load(
+        REQ_TO_TOKEN + req * REQ_STRIDE + logical * RATIO,
+        mask=valid,
+        other=0,
+    )
+    slot = slot // RATIO
     tl.store(
         PAGE_INDICES + row * OUTPUT_STRIDE + offsets,
         tl.where(valid, slot, -1),
@@ -208,7 +219,6 @@ def candidate_block_logits(
 
     blocks = triton.cdiv(width, block_size)
     scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)
-    block_lens = torch.empty(rows, dtype=torch.int32, device=logits.device)
     group_pad = triton.next_power_of_2(block_size)
     tile = max(1, 1024 // group_pad)
     _candidate_scores_kernel[(rows, triton.cdiv(blocks, tile))](
@@ -216,21 +226,30 @@ def candidate_block_logits(
         seq_lens,
         output,
         scores,
-        block_lens,
         width,
         logits.stride(0),
-        scores.stride(0),
         blocks,
         block_size,
         group_pad,
         tile,
         True,
     )
-    top = scores.topk(min(topk_blocks, blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+    # Publication only needs membership; sorting the selected pairs is unused.
+    top = scores.topk(min(topk_blocks, blocks), dim=-1, sorted=False)
+    keep = torch.zeros((rows, width), dtype=torch.bool, device=logits.device)
+    _publish_candidate_mask_kernel[
+        (rows, triton.cdiv(top.indices.shape[1] * block_size, 256))
+    ](
+        top.indices,
+        top.values,
+        keep,
+        width,
+        block_size,
+        top.indices.shape[1],
+        256,
+        num_warps=4,
     )
-    return output, keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return output, keep
 
 
 def candidate_block_indices(
@@ -243,13 +262,7 @@ def candidate_block_indices(
     """Select candidate blocks without copying or masking the full logits tensor."""
     rows, width = logits.shape
     blocks = triton.cdiv(width, block_size)
-    score_storage = torch.empty(
-        (rows, triton.cdiv(blocks, 4) * 4),
-        dtype=torch.float32,
-        device=logits.device,
-    )
-    scores = score_storage[:, :blocks]
-    block_lens = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)
     group_pad = triton.next_power_of_2(block_size)
     tile = max(1, 1024 // group_pad)
     _candidate_scores_kernel[(rows, triton.cdiv(blocks, tile))](
@@ -257,10 +270,8 @@ def candidate_block_indices(
         seq_lens,
         logits,
         scores,
-        block_lens,
         width,
         logits.stride(0),
-        scores.stride(0),
         blocks,
         block_size,
         group_pad,
@@ -362,3 +373,60 @@ def finalize_candidate_topk(
         raw_indices is not None,
         num_warps=8,
     )
+
+
+@triton.jit
+def _candidate_row_lens_kernel(
+    LENS,
+    NBLOCKS,
+    VALID,
+    ROWS,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TILE: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    rows = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    mask = rows < ROWS
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()  # LENS is the previous kernel's output
+    length = tl.load(LENS + rows, mask, 0).to(tl.int32)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    nblocks = (length + (BLOCK - 1)) // BLOCK
+    kept = tl.minimum(nblocks, TOPK)
+    # the kept blocks laid out back to back, the newest one possibly partial
+    valid = BLOCK * (kept - 1) + (length - 1) % BLOCK + 1
+    valid = tl.where(length > 0, valid, 0)
+    tl.store(NBLOCKS + rows, nblocks, mask)
+    tl.store(VALID + rows, valid, mask)
+
+
+def candidate_row_lens(
+    seq_lens: torch.Tensor, topk_blocks: int, block_size: int = 8
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per row: its number of blocks ``ceil(seq_len / block_size)`` and the
+    length of its sparse logits row once the ``min(topk_blocks, blocks)`` kept
+    blocks are laid out back to back (the newest block possibly partial):
+    ``block_size * (kept - 1) + (seq_len - 1) % block_size + 1``. Both int32
+    ``[rows]``; a zero-length row gets 0 for both."""
+    assert seq_lens.dim() == 1 and seq_lens.is_contiguous()
+    rows = seq_lens.numel()
+    nblocks = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
+    valid = torch.empty_like(nblocks)
+    tile = 256
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+    _candidate_row_lens_kernel[(triton.cdiv(rows, tile),)](
+        seq_lens,
+        nblocks,
+        valid,
+        rows,
+        topk_blocks,
+        block_size,
+        tile,
+        use_pdl,
+        num_warps=4,
+        **pdl_kwargs,
+    )
+    return nblocks, valid

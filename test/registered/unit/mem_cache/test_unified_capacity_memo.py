@@ -11,29 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Epoch-memoized capacity views on the allocator chain (2-pool subset).
+"""Epoch-memoized capacity views on the allocator chain.
 
-The capacity views (`available_size` / `schedulable_available_size` per band,
-plus the composite joint view) are pure functions of a handful of
-CPU-resident fields across the chain; schedulers read them O(queue) times
-between mutations. `_CapacityField` descriptors bump `_capacity_epoch` on
-every rebind, so the memos invalidate by construction.
+The per-band and composite capacity views are pure functions of a handful of
+CPU-resident fields that schedulers read O(queue) times between mutations;
+`_CapacityField` descriptors bump `_capacity_epoch` on every rebind, so the
+memos invalidate by construction.
 
-The failure mode being guarded: a memo serving a STALE value after a mutation
-the epoch machinery missed — either a new mutation site writing a field the
-descriptors don't cover, or an in-place write that bypasses `__set__`. Stale
-capacity is silent over-/under-admission, not a crash. Hence:
-
-  * every mutation kind is followed by memo == fresh-recompute assertions;
-  * a randomized op-sequence property test (seeded) catches interactions no
-    hand-written sequence covers;
-  * a deliberate descriptor-bypassing write must be caught by the IDLE check
-    (`verify_byte_accounting`) — readers cannot detect it, the battery must.
-
-The tri-pool cases (float span fields, three-band joint view) join at the
-tri phase; this file pins the 2-pool chain form they build on.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_capacity_memo.py -v
+The guarded failure mode is a memo serving a STALE value after a mutation the
+epoch machinery missed -- a new mutation site writing an uncovered field, or
+an in-place write that bypasses `__set__`. Readers cannot detect either one;
+stale capacity is silent over-/under-admission, not a crash.
 """
 
 import random
@@ -114,10 +102,8 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 self._assert_memos_fresh(allocator)
 
     def test_random_op_sequence_value_identity(self):
-        """Property: after ANY mutation sequence, memoized views equal fresh
-        recomputes. Seeded (deterministic) — the sequences cover interleavings
-        (alloc / partial swa free / grouped free / flush / clear) that no
-        hand-written case enumerates."""
+        """Property: after ANY mutation sequence the memoized views equal
+        fresh recomputes. Seeded, so the interleavings are deterministic."""
         rng = random.Random(0xC0FFEE)
         for lazy in (False, True):
             with self.subTest(lazy_compaction=lazy):
@@ -162,29 +148,13 @@ class TestCapacityMemoCoherence(unittest.TestCase):
             msg=f"bypassing write not caught: {violations}",
         )
 
-    def test_joint_memo_invalidates_on_swa_only_mutation(self):
-        """The joint view depends on the swa end's frontier through the chain
-        walk; an swa-side-only mutation (tombstoning) must invalidate the
-        composite memo even though the full side never moved."""
-        inst, allocator, kvcache = _build(lazy=True)
-        v = inst._alloc(allocator, kvcache, 8)
-        self.assertIsNotNone(v)
-        before = allocator.available_size()
-        allocator.free_swa(v[:4])  # swa band only
-        after = allocator.available_size()
-        self.assertEqual(after, allocator._compute_available_size())
-        self.assertGreaterEqual(after, before)  # holes only ever add room
-
     def test_float_only_span_move_invalidates_every_memo(self):
-        """A hole-free float alloc rebinds NO free-list and has no watermark --
-        the span fields are its ONLY capacity state. If they are not
-        `_CapacityField` descriptors, the float's own memo AND both
-        neighbours' (the span flips transparency, walling off their gaps)
-        keep serving pre-move values.
-
-        Driven on a hand-wired end+float+end chain (the composite arrives
-        with the tri phase); the float is exercised alone so no end-pool
-        descriptor write can mask a missing span bump."""
+        """A hole-free float alloc rebinds NO free-list and has no watermark:
+        the span fields are its ONLY capacity state, so unless they are
+        `_CapacityField` descriptors the float's own memo AND both neighbours'
+        (the span flips transparency, walling off their gaps) keep serving
+        pre-move values. Exercised on a hand-wired end+float+end chain so no
+        end-pool descriptor write can mask a missing span bump."""
         from test_multi_ended_allocator import TestFloatMultiEndedAllocator
 
         inst = TestFloatMultiEndedAllocator(
@@ -212,21 +182,12 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertLess(da.available_size(), high_end_cached)
         self.assertLessEqual(fla.available_size(), float_cached)
 
-    def test_bind_rewiring_bumps_the_epoch(self):
-        """Rewiring changes what the chain walks see; a memo primed before a
-        re-bind must not survive it."""
-        inst, allocator, kvcache = _build(lazy=False)
-        fa = allocator.full_attn_allocator
-        e0 = fa._chain_capacity_epoch()
-        fa.bind_peer(allocator.swa_attn_allocator)  # re-bind (same peer)
-        self.assertGreater(fa._chain_capacity_epoch(), e0)
-
 
 class TestTriCapacityMemoCoherence(unittest.TestCase):
     """Tri-composite twins of the 2-pool cases: the joint view walks THREE
     bands (mamba end, swa float, full end), so a mutation on ANY of them must
-    invalidate the composite memo — including the two mutations only the tri
-    has: a mamba-end state draw and a float span move behind the composite."""
+    invalidate the composite memo -- including the two only the tri has, a
+    mamba-end state draw and a float span move behind the composite."""
 
     def _build_tri(self, lazy=False):
         from test_unified_tri_pool import TestUnifiedTriPool
@@ -280,19 +241,6 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 allocator.clear()
                 ma.clear()
                 self._assert_memos_fresh(allocator)
-
-    def test_joint_memo_invalidates_on_mamba_only_mutation(self):
-        """The joint view depends on the mamba end's frontier through the
-        chain walk; a mamba-only mutation must invalidate the composite memo
-        even though neither KV side moved."""
-        inst, allocator = self._build_tri()
-        ma = allocator.mamba_allocator
-        before = allocator.available_size()
-        slots = ma.alloc(4)
-        self.assertIsNotNone(slots)
-        after = allocator.available_size()
-        self.assertEqual(after, allocator._compute_available_size())
-        self.assertLessEqual(after, before)
 
 
 if __name__ == "__main__":

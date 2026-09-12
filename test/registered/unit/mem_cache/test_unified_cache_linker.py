@@ -150,8 +150,8 @@ def test_async_offload_pins_node_until_completion():
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False,
-            mark_write_through_pending=lambda value: setattr(
-                node, "write_through_pending_id", value
+            mark_write_through_pending=lambda node_ids, ack_id: (
+                setattr(node, "write_through_pending_id", ack_id) or list(node_ids)
             ),
         ),
         _components_tuple=(_Component(),),
@@ -243,8 +243,10 @@ def test_failed_offload_rolls_back_split_fragments():
     )
     nodes = {child.id: child, parent.id: parent}
 
-    def mark_pending(node_id):
-        nodes[node_id].write_through_pending_id = node_id
+    def mark_pending(node_ids, ack_id):
+        for node_id in node_ids:
+            nodes[node_id].write_through_pending_id = ack_id
+        return list(node_ids)
 
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
@@ -317,8 +319,8 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False,
-            mark_write_through_pending=lambda value: setattr(
-                node, "write_through_pending_id", value
+            mark_write_through_pending=lambda node_ids, ack_id: (
+                setattr(node, "write_through_pending_id", ack_id) or list(node_ids)
             ),
         ),
         _components_tuple=(_Component(),),

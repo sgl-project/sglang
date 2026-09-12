@@ -21,6 +21,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class FakeBacking(Enum):
     Anonymous = 0
     AnonymousHugetlb = 1
+    AnonymousShm = 2
+    AnonymousShmHugetlb = 3
 
 
 class FakeHandle:
@@ -64,7 +66,10 @@ class FakeHostMemAllocator:
             mapped_size=size,
             actual_backing=backing,
             actual_alignment=(
-                hugepage_size if backing == FakeBacking.AnonymousHugetlb else 4096
+                hugepage_size
+                if backing
+                in (FakeBacking.AnonymousHugetlb, FakeBacking.AnonymousShmHugetlb)
+                else 4096
             ),
         )
         self.alloc_calls.append(
@@ -141,6 +146,37 @@ class TestUMBPHostAllocator(unittest.TestCase):
 
         tensor.fill_(3.0)
         self.assertEqual(float(tensor[0, 0]), 3.0)
+
+    def test_standalone_process_uses_shareable_backing(self):
+        self._install_fake_mori()
+
+        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+            UMBPHostTensorAllocator,
+        )
+
+        cases = (
+            ("0", FakeBacking.AnonymousShm),
+            ("1", FakeBacking.AnonymousShmHugetlb),
+        )
+        for use_hugepage, expected in cases:
+            with (
+                self.subTest(use_hugepage=use_hugepage),
+                mock.patch.dict(
+                    "os.environ",
+                    {
+                        "UMBP_STANDALONE_ADDRESS": "unix:///tmp/umbp-test.sock",
+                        "SGLANG_HICACHE_HOST_HUGEPAGE": use_hugepage,
+                    },
+                ),
+            ):
+                allocator = UMBPHostTensorAllocator()
+                tensor = allocator.allocate((16,), dtype=torch.uint8, device="cpu")
+
+                self.assertEqual(
+                    allocator._allocator.alloc_calls[0]["backing"], expected
+                )
+                del tensor
+                allocator.__del__()
 
     def test_umbp_allocator_del_calls_free_once(self):
         self._install_fake_mori()

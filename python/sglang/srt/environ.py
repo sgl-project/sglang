@@ -433,6 +433,10 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    # profile_by_stage: do not start the decode-stage capture until a decode batch
+    # reaches this many requests (0 = first decode batch). Lets a batch-size bench
+    # capture steady-state full-admission decode steps instead of the ramp-up.
+    SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_NVTX"
     )
@@ -541,6 +545,9 @@ class Envs:
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
+    # Per-call move cap on a non-urgent lazy-compaction flush, so a large
+    # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
+    SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -1033,6 +1040,15 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
+    # cached-prefix shapes. Validated at 98% GSM8K accuracy.
+    SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
+    # Route Triton MLA prefill that carries a cached prefix through dense
+    # (non-absorbed) one-shot MHA: up-project the prefix out of the latent KV
+    # cache and run a single dense FP8 kernel instead of the absorbed 576/512
+    # prefill. Materializes K/V for the whole batch, so it only engages when
+    # the batch fits the chunk budget.
+    SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
@@ -1403,6 +1419,12 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 two-level indexer on DeepGEMM's paged sparse MQA logits for the
+    # index-source layers after the candidate source (decode). Needs a DeepGEMM
+    # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
+    # use multistream to overlap the publish-side with other computation
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

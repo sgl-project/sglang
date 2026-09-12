@@ -1037,6 +1037,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
+            dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -1167,6 +1168,29 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(resolution_result(args, "enable_dsa_prefill_context_parallel"))
         self.assertEqual(
             resolution_result(args, "dsa_prefill_cp_mode"), "round-robin-split"
+        )
+
+    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attention_backend="dsa",
+        )
+
+        handle_legacy_cp_runtime_compatibility(server_args)
+        handle_context_parallelism(server_args)
+
+        self.assertTrue(
+            resolution_result(server_args, "enable_dsa_prefill_context_parallel")
+        )
+        self.assertFalse(
+            resolution_result(server_args, "enable_prefill_context_parallel")
+        )
+        self.assertEqual(
+            resolution_result(server_args, "dsa_prefill_cp_mode"), "round-robin-split"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "prefill_cp_mode"), "round-robin-split"
         )
 
     def test_context_parallel_handler_initializes_cp_strategy(self):

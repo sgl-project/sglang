@@ -15,7 +15,6 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
@@ -388,7 +387,6 @@ def topk_transform_flashinfer_unfused(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     import flashinfer
-
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
     )
@@ -420,7 +418,6 @@ def topk_transform_flashinfer_fused(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     import flashinfer
-
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
     )
@@ -837,14 +834,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -868,7 +865,7 @@ class C4IndexerBackendMixin:
                     indexer_metadata.c4_page_size,
                     row_raw_indices,
                 )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+            elif self.dsa_topk_backend.should_use_topk_v2():
                 topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
@@ -882,6 +879,7 @@ class C4IndexerBackendMixin:
                         if rows == all_rows or not is_hip()
                         else plan_topk_v2(c4_seq_lens[rows])
                     ),
+                    row_raw_indices,
                 )
             else:
                 topk_transform_paged(
@@ -1128,6 +1126,64 @@ class C4Indexer(nn.Module):
         )
 
 
+def fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
+    reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
+def fp32_jit_paged_topk(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
+    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
+    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            raw_indices,
+        )
+
+
 def select_candidate_block_indices(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,
@@ -1179,7 +1235,10 @@ def select_candidate_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Return a position mask covering selected reachable blocks and the newest block."""
+    """Level one of the two-level top-k: a bool mask over positions keeping the
+    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
+    in logits, so an all -inf block means not reachable yet; the block holding the
+    query's newest position is always kept."""
     indices, valid = select_candidate_block_indices(
         logits, compress_lens, topk_blocks, block_size
     )
@@ -1187,5 +1246,9 @@ def select_candidate_blocks(
     num_blocks = (width + block_size - 1) // block_size
     keep = torch.zeros(
         (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
-    ).scatter_(-1, indices, valid)
+    ).scatter_(
+        -1,
+        indices,
+        valid,
+    )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]

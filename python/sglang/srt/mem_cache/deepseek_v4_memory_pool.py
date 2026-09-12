@@ -275,7 +275,13 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
 # Low-ratio indexer-K pool page, in compressed slots: the DeepGEMM indexer reads
 # K in blocks of at most 128 and sglang's JIT metadata builder asserts 64.
-DSV41_INDEX_PAGE_SIZE = 64
+def dsv41_index_page_size() -> int:
+    if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
+        return 128
+    return 64
+
+
+DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 
 
 class DeepSeekV4IndexerPool(KVCache):
@@ -608,6 +614,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         num_req_slots: Optional[int] = None,
         kv_source_layers: Sequence[int] = (),
         full_size: Optional[int] = None,
+        is_draft_worker: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -696,7 +703,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._unified_kv = is_unified_kv_triton()
 
         self.request_window = None
-        if get_exec().features.enable_encoder_swa_bounded_replay:
+        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+        # Note(Oasis-Git): Keep DSpark's paged SWA cache because removing its
+        # history hurts speculative decoding acceptance length. The draft shares
+        # the target's full-to-SWA mapping, so the target still needs the allocator.
+        self.needs_paged_swa_allocator = (
+            not encoder_replay
+            or is_draft_worker
+            or get_spec().speculative_algorithm is not None
+        )
+        if encoder_replay and not is_draft_worker:
             from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
 
             def make_window_pool(size, layers):
@@ -722,7 +738,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(chunk, self.num_req_slots + 1),
+                + max(
+                    chunk,
+                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
+                ),
             )
         elif self._unified_kv:
             self.swa_kv_pool = None
@@ -759,6 +778,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 global_page_size=swa_page_size,
             )
 
+        logger.info(
+            "DSV4 SWA storage: worker=%s, storage=%s, paged_allocator=%s",
+            "draft" if is_draft_worker else "target",
+            "request_window" if self.request_window is not None else "paged",
+            self.needs_paged_swa_allocator,
+        )
         self.kv_source_layers = list(kv_source_layers)
         self.sources_by_ratio = self._collect_sources_by_ratio()
         self._init_compressed_pools(

@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
     wo_a_bf16_small_batch,
+    wo_a_bf16_small_batch_mxfp8,
 )
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
@@ -117,6 +118,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -457,8 +459,12 @@ if _is_hip:
 
 
 def _apply_wo_a_bf16_matmul(
-    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool, is_target_verify: bool = False
-) -> torch.Tensor:
+    o: torch.Tensor,
+    wo_a: torch.Tensor,
+    is_decode: bool,
+    is_target_verify: bool = False,
+    fuse_mxfp8_quant: bool = False,
+) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
@@ -492,6 +498,8 @@ def _apply_wo_a_bf16_matmul(
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
         if 2 <= o.shape[0] <= 8:
+            if fuse_mxfp8_quant:
+                return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
@@ -669,7 +677,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         output.zero_()
@@ -1158,6 +1166,20 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
+            if (
+                _is_cuda
+                and q_out is not None
+                and 0 < q.shape[0] <= 8
+                and self.head_dim == 512
+                and self.qk_rope_head_dim == 64
+                and q.dtype == q_out.dtype == torch.bfloat16
+                and q.stride(1) == q_out.stride(1) == 512
+                and q.stride(2) == q_out.stride(2) == 1
+            ):
+                from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
+
+                q_rope_store(q, q_out, self.freqs_cis, positions)
+                return q_out
             fused_rope_inplace(
                 q[..., -self.qk_rope_head_dim :],
                 None,
@@ -2107,6 +2129,17 @@ class MQALayer(MqaAttentionBase):
                         wo_a,
                         is_decode=forward_batch.forward_mode.is_decode(),
                         is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                        fuse_mxfp8_quant=(
+                            not get_forward().sp_active
+                            and getattr(
+                                self.wo_b.quant_method, "mxfp8_dense_backend", None
+                            )
+                            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                            and (
+                                getattr(self.wo_b.quant_method, "use_mxfp8", False)
+                                or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+                            )
+                        ),
                     )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2116,7 +2149,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        o, _ = self.wo_b(o.flatten(1))
+        o, _ = self.wo_b(o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 

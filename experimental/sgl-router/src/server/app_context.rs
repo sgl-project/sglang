@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
@@ -19,17 +20,16 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
-    /// Per-worker active-load bookkeeping. Shared between the proxy
-    /// (which mints guards on the request hot path), the cache-aware
-    /// policy (which reads per-worker load when scoring candidates), and
-    /// the stale-request janitor (which sweeps expired entries).
+    /// Per-worker active-load bookkeeping shared by the proxy, policies,
+    /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
-    /// (active_load gauge + stale_requests_total), and PD resolver
-    /// (decode_affinity_total).
+    /// (active_load gauge + stale_requests_total), and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
+    /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
+    pub engine_load: Arc<EngineLoadTable>,
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
@@ -86,6 +86,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -116,6 +117,7 @@ impl AppContext {
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
+                    affinity: None,
                     fused: None,
                     eligibility: None,
                 },
@@ -135,6 +137,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
     }

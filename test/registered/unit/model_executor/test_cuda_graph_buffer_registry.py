@@ -46,7 +46,8 @@ class _MiniForwardBatch:
     encoder_lens: Optional[torch.Tensor] = None
     mrope_positions: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
-    num_token_non_padded_cpu: Optional[int] = None
+    global_num_token_non_padded: Optional[torch.Tensor] = None
+    global_num_token_non_padded_cpu: Optional[int] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
@@ -818,8 +819,9 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
-        # Gathered (DP) path: post_fill overwrites the FB copy with the local
-        # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
+        # Sharded (SP-on) forward: post_fill derives the LOCAL count from the
+        # invariant GLOBAL scalar. Pin attn-TP (size=2, rank=0) so the result
+        # is deterministic.
         with get_parallel().override(attn_tp_size=2, attn_tp_rank=0):
             reg = build_decode_registry(
                 device=torch.device("cpu"),
@@ -829,17 +831,66 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 cache_loc_dtype=torch.int64,
                 enable_num_token_non_padded=True,
                 require_gathered_buffer=True,
+                attn_tp_sharded_fn=lambda num_tokens: True,
                 source=src,
             )
             fb = _MiniForwardBatch(
-                num_token_non_padded=torch.tensor([100], dtype=torch.int32),
+                global_num_token_non_padded=torch.tensor([100], dtype=torch.int32),
             )
             reg.fill_from(
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
         # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
-        # local = clamp(100 - rank*4, 0, 4) = 4  (NOT the raw FB copy of 100).
+        # local = clamp(global(100) - rank*4, 0, 4) = 4.
         self.assertEqual(int(src.num_token_non_padded.item()), 4)
+
+    def test_num_token_non_padded_bypass_carries_local_count(self):
+        # Regression: the dense SBD draft and TBO sub-batches bypass
+        # ForwardBatch.init_new -- they leave global_num_token_non_padded None and
+        # set the replicated LOCAL count directly. The decode post_fill must carry
+        # that value through verbatim, not derive from the absent global (which
+        # crashed on None - rank_offset).
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        ntnp = torch.full((1,), 99, dtype=torch.int32)  # poisoned static buffer
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            num_token_non_padded=ntnp,
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        # attn_tp_sharded_fn=True pins rank 1: were shard math applied it would
+        # clamp to 3; carrying the local count verbatim proves the bypass
+        # short-circuits before any sharding.
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=1):
+            reg = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=8,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=True,
+                attn_tp_sharded_fn=lambda num_tokens: True,
+                source=src,
+            )
+            fb = _MiniForwardBatch(
+                num_token_non_padded=torch.tensor([7], dtype=torch.int32),
+                global_num_token_non_padded=None,
+            )
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        self.assertEqual(int(src.num_token_non_padded.item()), 7)
 
     def test_register_global_num_tokens_false_carries_fb_values(self):
         # register_global_num_tokens=False (eager) excludes the computed
@@ -1107,7 +1158,11 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
-    def test_num_token_non_padded_scalar_copy(self):
+    def test_num_token_non_padded_prefill_buffer_adoption(self):
+        # The prefill num_token_non_padded slot adopts the source's static
+        # buffer (shared storage), and its post_fill writes the LOCAL count
+        # derived from the invariant global host int in place — so the static
+        # buffer exposed by extract_buffer is the same storage.
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
@@ -1131,9 +1186,11 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
             positions=torch.tensor([4, 5, 6], dtype=torch.int64),
             out_cache_loc=torch.tensor([8, 9, 10], dtype=torch.int64),
-            num_token_non_padded=torch.tensor([3], dtype=torch.int32),
+            global_num_token_non_padded_cpu=3,
         )
         reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        # Not sequence-sharded (default predicate): passthrough of the global
+        # count into the adopted static buffer.
         self.assertTrue(
             torch.equal(
                 reg.get_slot("num_token_non_padded").buffer,
@@ -1379,11 +1436,16 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
     rows of attn-TP rank 0 — REAL tokens — zeroing their MoE output
     in-graph. The slot's post_fill must instead recompute the local count
     against ``ctx.padded_num_tokens`` from the batch's un-adjusted global
-    count (``num_token_non_padded_cpu``), exactly like the decode registry's
+    count (``global_num_token_non_padded_cpu``), exactly like the decode registry's
     post_fill does.
+
+    Localization is gated solely on the per-forward sharding decision
+    (``attn_tp_sharded_fn``): a sharded bucket re-derives the rank-local
+    count; a replicated one passes the global count through. The cases below
+    drive that predicate directly via ``sharded``.
     """
 
-    def _fill(self, *, attn_tp_rank, attn_tp_size, require_gathered_buffer=True):
+    def _fill(self, *, attn_tp_rank, attn_tp_size, sharded=True, global_count=1018):
         from unittest import mock
 
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -1396,14 +1458,14 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
             max_num_token=2048,
             cache_loc_dtype=torch.int64,
             enable_num_token_non_padded=True,
-            require_gathered_buffer=require_gathered_buffer,
+            attn_tp_sharded_fn=lambda num_tokens: sharded,
         )
         # FB tensor carries the RAW-length-localized (stale) value; the CPU
         # field carries the un-adjusted global count.
         fb = _MiniForwardBatch(
             batch_size=1,
             num_token_non_padded=torch.tensor([509], dtype=torch.int32),
-            num_token_non_padded_cpu=1018,
+            global_num_token_non_padded_cpu=global_count,
         )
         with mock.patch(
             "sglang.srt.model_executor.forward_batch_info.get_parallel",
@@ -1431,11 +1493,18 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
         # pads. local = clamp(1018 - 512, 0, 512).
         self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
 
-    def test_non_gathered_uses_raw_token_count(self):
-        # Full prefill graphs need the live raw boundary even without a
-        # gathered buffer so model layers can discard the padded bucket tail.
+    def test_not_sharded_passes_through_global_count(self):
+        # A replicated forward owns every row, so the global count is kept.
         self.assertEqual(
-            self._fill(attn_tp_rank=0, attn_tp_size=2, require_gathered_buffer=False),
+            self._fill(attn_tp_rank=0, attn_tp_size=2, sharded=False),
+            1018,
+        )
+
+    def test_absent_global_count_falls_back_to_raw_tokens(self):
+        # Full prefill graphs still need the live raw boundary when the batch
+        # carries no global count, so layers can discard the bucket tail.
+        self.assertEqual(
+            self._fill(attn_tp_rank=0, attn_tp_size=2, global_count=None),
             1018,
         )
 
@@ -1471,10 +1540,10 @@ class TestFillOncePolicy(unittest.TestCase):
 
 
 class TestComputedSlots(unittest.TestCase):
-    """num_token_non_padded (copy_from_fb + post_fill) and global_num_tokens
+    """num_token_non_padded and global_num_tokens are both computed slots
     (copy_from_fb=False + post_fill fill)."""
 
-    def test_num_token_non_padded_copy_path(self):
+    def test_num_token_non_padded_passthrough_path(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
@@ -1491,10 +1560,11 @@ class TestComputedSlots(unittest.TestCase):
         self.assertTrue(reg.has_slot("num_token_non_padded"))
         fb = _MiniForwardBatch(
             batch_size=2,
-            num_token_non_padded=torch.tensor([7], dtype=torch.int32),
+            global_num_token_non_padded=torch.tensor([7], dtype=torch.int32),
         )
-        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
-        # Non-gathered: plain FB copy, post_fill is a no-op.
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=7, padded_num_tokens=8)
+        # Not sequence-sharded (default predicate): post_fill passes the global
+        # scalar (7) through to the local buffer unchanged (clamped to bucket 8).
         self.assertTrue(
             torch.equal(
                 reg.get_slot("num_token_non_padded").buffer,

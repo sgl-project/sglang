@@ -50,12 +50,19 @@ constexpr uint32_t kC2VecSize = 2;
 /// An odd position completes a group with its even predecessor; an even one
 /// parks itself in the state.
 ///
+/// Target-verify runs that same schedule with `draft_len` consecutive positions
+/// per request instead of one, so a row's partner is usually the row before it
+/// in `kv_input` rather than the ring. That is the whole difference, and a 2D
+/// grid answers it without arithmetic: `blockIdx.x` is the position inside the
+/// block, `blockIdx.y` the request.
+///
 /// The three reductions below have three different widths and are not
 /// interchangeable: the RMSNorm statistic spans the row, an fp8 store scale
 /// spans 64 elements, an fp4 block spans 16. All asserted.
 template <
     bool kUsePDL,
     bool kStore,
+    bool kVerify,
     int64_t kHeadDim,
     int64_t kRopeDim,
     int32_t kPageBits,
@@ -85,7 +92,8 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   using bf16_vec_t = AlignedVector<bf16x2_t, kVecSize / 2>;
 
   const auto tx = threadIdx.x;
-  const auto row = blockIdx.x;
+  // Verify gives each request a CTA column; decode a flat grid of one row each.
+  const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
   // Slots fit in int32 whatever width the scheduler hands them in.
   const auto raw_out_loc = static_cast<int32_t>(static_cast<const LocT*>(params.raw_out_loc)[row]);
   const auto pos = static_cast<const PosT*>(params.positions)[row];
@@ -101,8 +109,17 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   score_new.load(params.kv_input + row * kStride, tx + kCTASize);
 
   fp32_vec_t kv_old, score_old;
-  kv_old.load(params.kv_state + read_row * kStride, tx);
-  score_old.load(params.kv_state + read_row * kStride, tx + kCTASize);
+  // Only a verify block's first row carries over from the ring; the rest pair
+  // with the row before them, which is already in `kv_input` under the same
+  // `| kv | score |` layout as the state, so this is a pointer swap. Taking the
+  // in-block partner from the input is also what keeps it race-free: the CTA
+  // that publishes that ring slot belongs to this very launch.
+  const float* partner = params.kv_state + read_row * kStride;
+  if constexpr (kVerify) {
+    if (blockIdx.x != 0) partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
+  }
+  kv_old.load(partner, tx);
+  score_old.load(partner, tx + kCTASize);
 
   if ((pos & 1) == 0) {
     // padded case
@@ -256,14 +273,15 @@ struct FlashC2DecodeKernel {
   static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = host::div_ceil(584ll * kPageSize, 576) * 576;
-  template <bool kStore, typename PosT, typename LocT>
-  static constexpr auto kernel = flash_c2_decode_kernel<kUsePDL, kStore, kHeadDim, kRopeDim, kPageBits, PosT, LocT>;
+  template <bool kStore, bool kVerify, typename PosT, typename LocT>
+  static constexpr auto kernel =
+      flash_c2_decode_kernel<kUsePDL, kStore, kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT>;
 
   /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <bool kStore>
+  template <bool kStore, bool kVerify>
   static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kStore, int32_t, int32_t> : kernel<kStore, int32_t, int64_t>;
-    return loc_i32 ? kernel<kStore, int64_t, int32_t> : kernel<kStore, int64_t, int64_t>;
+    if (pos_i32) return loc_i32 ? kernel<kStore, kVerify, int32_t, int32_t> : kernel<kStore, kVerify, int32_t, int64_t>;
+    return loc_i32 ? kernel<kStore, kVerify, int64_t, int32_t> : kernel<kStore, kVerify, int64_t, int64_t>;
   }
 
   // The sum of squares is reduced through a fixed-size shared array, so the CTA
@@ -312,6 +330,38 @@ struct FlashC2DecodeKernel {
     launch(kv_input, kv_state, kv_output, norm_weight, positions, req, raw_out_loc, eps, ring_size, freqs_cis, kvcache);
   }
 
+  /// \brief `run_decode_fusion` for a target-verify block.
+  ///
+  /// `draft_len` consecutive positions per request, request-major, which the
+  /// grid reproduces as `draft_len x batch`.
+  static void run_verify_fusion(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t ring_size,
+      const int64_t draft_len) {
+    launch(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        draft_len);
+  }
+
  private:
   using MaybeTensor = std::optional<tvm::ffi::TensorView>;
 
@@ -326,7 +376,8 @@ struct FlashC2DecodeKernel {
       const float eps,
       const int64_t ring_size,
       const MaybeTensor freqs_cis,
-      const MaybeTensor kvcache) {
+      const MaybeTensor kvcache,
+      const int64_t draft_len = 1) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -358,6 +409,19 @@ struct FlashC2DecodeKernel {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
     RuntimeCheck(ring_size > 0, "the pair-state ring must have at least one position");
+    RuntimeCheck(draft_len >= 1, "the draft length ", draft_len, " must be positive");
+    const auto is_verify = draft_len > 1;
+    RuntimeCheck(!is_verify || num_tokens % draft_len == 0, "verify rows must be a whole number of blocks");
+    // A block publishes its own even positions, so the slot its first row reads
+    // stays out of the launch's reach only while the ring is wider than the
+    // block. `get_compress_state_ring_size` satisfies this by construction.
+    RuntimeCheck(
+        !is_verify || ring_size > draft_len,
+        "the pair-state ring (",
+        ring_size,
+        ") must be wider than the draft length (",
+        draft_len,
+        ")");
 
     const auto params = C2Params{
         .kv_input = static_cast<const float*>(kv_input.data_ptr()),
@@ -375,12 +439,17 @@ struct FlashC2DecodeKernel {
     // `LaunchKernel` is move-only, so each arm builds its own.
     const auto pos_i32 = pos_dtype.is_type<int32_t>();
     const auto loc_i32 = loc_dtype.is_type<int32_t>();
-    if (store) {
-      const auto k = select<true>(pos_i32, loc_i32);
+    if (is_verify) {
+      const auto block = static_cast<uint32_t>(draft_len);
+      const auto k = select<true, true>(pos_i32, loc_i32);
+      LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(k, params);
+    } else if (store) {
+      const auto k = select<true, false>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     } else {
-      const auto k = select<false>(pos_i32, loc_i32);
+      const auto k = select<false, false>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }

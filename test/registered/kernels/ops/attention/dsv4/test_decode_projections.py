@@ -4,7 +4,6 @@ import unittest
 
 import torch
 import torch.nn.functional as F
-
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -177,8 +176,8 @@ class TestDecodeProjections(CustomTestCase):
 
     def test_candidate_block_indices_matches_torch(self):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-            candidate_block_state,
             candidate_block_indices,
+            candidate_block_state,
         )
 
         torch.manual_seed(29)

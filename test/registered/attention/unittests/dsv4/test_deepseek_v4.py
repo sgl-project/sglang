@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -699,19 +698,24 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
 
 class TestDSV41SM90CandidateSlots(CustomTestCase):
-    def test_target_verify_uses_decode_compressor_path(self):
+    def test_hopper_target_verify_uses_decode_compressor_path(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
 
         backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.is_dspark_draft = False
         backend._low_ratio_compress_decode = mock.Mock()
         backend._low_ratio_compress_torch = mock.Mock()
-        layer = SimpleNamespace()
-        x = torch.empty(6, 1)
+        layer = SimpleNamespace(
+            compress_ratio=2,
+            compressor=SimpleNamespace(use_fused_compress=False),
+        )
+        x = SimpleNamespace(is_cuda=True)
         req = torch.empty(6, dtype=torch.int64)
         pos = torch.empty(6, dtype=torch.int64)
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
 
-        backend._low_ratio_compress(layer, x, req, pos, forward_batch)
+        with mock.patch.object(module.torch.version, "cuda", "12.0"):
+            backend._low_ratio_compress(layer, x, req, pos, forward_batch)
 
         backend._low_ratio_compress_decode.assert_called_once_with(layer, x, req, pos)
         backend._low_ratio_compress_torch.assert_not_called()
@@ -966,7 +970,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 backend._low_ratio_index_topk_sm90(layer, q, q, req, pos, forward_batch)
                 self.assertEqual(full_logits.call_count, 1)
                 self.assertEqual(compact_logits.call_count, 0)
-                self.assertIsNone(backend.forward_metadata.sm90_candidates)
+                self.assertIsNone(backend.forward_metadata.candidate_metadata)
                 full_logits.reset_mock()
                 full_topk.reset_mock()
 
@@ -996,12 +1000,13 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                         raw_indices, chosen.masked_fill(~valid, -1).to(torch.int32)
                     )
                     if i == 0:
-                        published = backend.forward_metadata.sm90_candidates
+                        published = backend.forward_metadata.candidate_metadata
                     else:
                         self.assertIs(
-                            backend.forward_metadata.sm90_candidates, published
+                            backend.forward_metadata.candidate_metadata, published
                         )
-                        blocks, counts, _ = published
+                        blocks = published.blocks
+                        counts = published.valid_lens
                         self.assertIs(compact_logits.call_args.args[4], blocks)
                         positions = (blocks[:, :, None] * 4 + torch.arange(4)).flatten(
                             1

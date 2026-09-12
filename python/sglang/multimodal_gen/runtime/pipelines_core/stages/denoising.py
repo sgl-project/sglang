@@ -25,6 +25,7 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_gate_rmsnorm,
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
+    mount_helios_gated_residual,
     mount_hunyuan_qknorm,
     mount_lingbot_video_gated_residual,
     mount_lingbot_video_rmsnorm,
@@ -36,6 +37,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
+    unmount_helios_gated_residual,
     unmount_hunyuan_qknorm,
     unmount_lingbot_video_gated_residual,
     unmount_lingbot_video_rmsnorm,
@@ -221,6 +223,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "LingBot Video per-token gated residual",
         mount_lingbot_video_gated_residual,
         unmount_lingbot_video_gated_residual,
+    ),
+    (
+        "Helios per-token gated residual",
+        mount_helios_gated_residual,
+        unmount_helios_gated_residual,
     ),
     (
         "SANA-Video BF16-input linear attention",

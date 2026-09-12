@@ -31,6 +31,9 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -45,9 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import (
@@ -568,10 +568,23 @@ class MambaRadixCache(BasePrefixCache):
                 # donate to the last flush boundary (where temporal is current)
                 # and reset the cursor, keeping the donated checkpoint consistent
                 # with its key length. page_size is asserted == 1, so no realign.
-                write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
+                mamba_pool = self.req_to_token_pool.mamba_pool
+                write_pos_buf = mamba_pool.replayssm_write_pos
+                cursor_idx = req.kv.mamba_pool_idx
+                if write_pos_buf is None:
+                    write_pos_buf = getattr(
+                        mamba_pool, "replayssm_spec_write_pos", None
+                    )
+                    cursor_idx = req.kv.req_pool_idx
                 if write_pos_buf is not None:
-                    cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
-                    write_pos_buf[req.kv.mamba_pool_idx] = 0
+                    cache_len -= int(write_pos_buf[cursor_idx].item())
+                    write_pos_buf[cursor_idx] = 0
+                    if (
+                        getattr(mamba_pool, "replayssm_spec_write_pos", None)
+                        is not None
+                    ):
+                        mamba_pool.replayssm_cache_base[cursor_idx] = 0
+                        mamba_pool.replayssm_is_flush[cursor_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -688,6 +701,11 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
+        spec_write_pos = getattr(
+            self.req_to_token_pool.mamba_pool, "replayssm_spec_write_pos", None
+        )
+        if not self.enable_mamba_extra_buffer and spec_write_pos is not None:
+            cache_len -= int(spec_write_pos[req.kv.req_pool_idx].item())
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 

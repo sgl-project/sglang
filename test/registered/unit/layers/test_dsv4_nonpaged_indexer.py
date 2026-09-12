@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
@@ -181,6 +182,78 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                         "out_raw_indices": out_raw_indices,
                     },
                 )
+
+
+class TestDSV4TopKDispatch(CustomTestCase):
+    def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
+        page_table = torch.zeros((1, 1), dtype=torch.int32)
+        c4_seq_lens = torch.ones(1, dtype=torch.int32)
+        page_indices = torch.full((1, 512), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        topk_metadata = torch.zeros((2, 2), dtype=torch.int32)
+
+        indexer_metadata = object.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.page_table = page_table
+        indexer_metadata.c4_seq_lens = c4_seq_lens
+        indexer_metadata.topk_metadata = topk_metadata
+
+        logits = torch.empty((1, 65), dtype=torch.float32)
+        backend = C4IndexerBackendMixin()
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_mapping={0: SimpleNamespace(compress_layer_id=7)}
+        )
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=indexer_metadata,
+            core_metadata=SimpleNamespace(
+                positions=torch.arange(1, dtype=torch.int64),
+                page_table=page_table,
+                c4_sparse_page_indices=page_indices,
+                c4_sparse_raw_indices=raw_indices,
+            ),
+        )
+        backend.hisparse_coordinator = None
+        backend._forward_prepare_normal = MagicMock(
+            return_value=(
+                torch.empty((1, 1, 128)),
+                torch.empty((1, 1, 1)),
+            )
+        )
+        backend._get_nonpaged_indexer_plan = MagicMock(return_value=object())
+        backend._forward_nonpaged_indexer = MagicMock(return_value=logits)
+
+        indexer_capturer = MagicMock()
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            patch(
+                f"{_INDEXER}.get_global_indexer_capturer",
+                return_value=indexer_capturer,
+            ),
+            patch(f"{_INDEXER}.topk_transform_paged") as topk_v1,
+            patch(f"{_INDEXER}.topk_transform_paged_v2") as topk_v2,
+        ):
+            backend.forward_c4_indexer(
+                x=torch.empty((1, 1)),
+                q_lora=torch.empty((1, 1)),
+                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+            )
+
+        topk_v2.assert_called_once()
+        args = topk_v2.call_args.args
+        self.assertIs(args[0], logits)
+        torch.testing.assert_close(args[1], c4_seq_lens)
+        torch.testing.assert_close(args[2], page_table)
+        torch.testing.assert_close(args[3], page_indices)
+        self.assertEqual(args[4], 64)
+        self.assertIs(args[5], topk_metadata)
+        self.assertEqual(args[6].data_ptr(), raw_indices.data_ptr())
+        topk_v1.assert_not_called()
+        indexer_capturer.capture.assert_called_once_with(7, raw_indices)
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
