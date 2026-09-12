@@ -4474,21 +4474,27 @@ class PortArgs:
             dist_init_overridden = bool(
                 envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
             )
+            # Peers connect to these TCP sockets on dist_init_host. A local
+            # process using the same port number is not a bind conflict.
+            # Scale joiners retain their separately derived port checks.
+            check_primary_ports = (
+                server_args.node_rank == 0 or server_args.is_ep_scale_joiner
+            )
             try:
-                if dp_rank is None:
+                if dp_rank is None and not dist_init_overridden:
+                    wait_port_available(nccl_port, "nccl_port")
+                if dp_rank is None and check_primary_ports:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
-                    if not dist_init_overridden:
-                        wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if check_primary_ports and (dp_rank is None or worker_ports is None):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
