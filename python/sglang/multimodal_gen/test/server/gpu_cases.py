@@ -1153,7 +1153,6 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
-        run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
