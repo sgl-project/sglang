@@ -934,6 +934,59 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def _insert_mamba_interior_checkpoint(
+        self,
+        req: Req,
+        token_ids: Sequence[int],
+        kv_indices: torch.Tensor,
+        effective_cache_len: int,
+        chunked: bool = False,
+    ) -> int:
+        """Unified-tree port of MambaRadixCache._insert_interior_checkpoint
+        (issue #22935): donate the interior grid-boundary state tracked during
+        the last prefill extend as its own checkpointed node before the main
+        insert. Returns the prev_prefix_len the main insert must pass: the
+        tree owns KV up to the checkpoint after this insert, and a smaller
+        prev would make the main insert free that segment as a duplicate."""
+        interior_len = req.kv.mamba_interior_ckpt_seqlen
+        interior_idx = req.kv.mamba_interior_ckpt_idx
+        req.kv.mamba_interior_ckpt_idx = None
+        req.kv.mamba_interior_ckpt_seqlen = None
+        if interior_idx is None or interior_len is None:
+            return req.kv.cache_protected_len
+
+        # Plain mamba_allocator slot: the track builder in schedule_batch
+        # refuses to arm when the int8 checkpoint pool is enabled.
+        if not (
+            req.kv.cache_protected_len
+            < interior_len
+            <= min(effective_cache_len, len(kv_indices))
+        ):
+            # Stale checkpoint beyond what this insert still owns.
+            self.req_to_token_pool.mamba_allocator.free(interior_idx.unsqueeze(0))
+            return req.kv.cache_protected_len
+
+        radix_key = RadixKey(
+            token_ids[:interior_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        result = self.insert(
+            InsertParams(
+                key=radix_key,
+                value=kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True),
+                mamba_value=interior_idx.unsqueeze(0),
+                prev_prefix_len=req.kv.cache_protected_len,
+                chunked=chunked,
+            )
+        )
+        if result.mamba_exist:
+            # A checkpointed node already covers this depth; the tracked
+            # slot is a duplicate.
+            self.req_to_token_pool.mamba_allocator.free(interior_idx.unsqueeze(0))
+        return interior_len
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
@@ -972,6 +1025,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+
+            # Donate before the main insert so the interior node's KV segment
+            # becomes tree-owned (issue #22935).
+            if req.kv.mamba_interior_ckpt_idx is not None:
+                insert_params.prev_prefix_len = self._insert_mamba_interior_checkpoint(
+                    req=req,
+                    token_ids=token_ids,
+                    kv_indices=kv_indices,
+                    effective_cache_len=effective_cache_len,
+                )
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -1091,6 +1154,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=False, insert_params=insert_params
                 )
             return
+
+        # Donate before the main insert so the interior node's KV segment
+        # becomes tree-owned (issue #22935).
+        if req.kv.mamba_interior_ckpt_idx is not None:
+            insert_params.prev_prefix_len = self._insert_mamba_interior_checkpoint(
+                req=req,
+                token_ids=token_ids,
+                kv_indices=kv_indices_orig,
+                effective_cache_len=effective_cache_len,
+                chunked=chunked,
+            )
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
