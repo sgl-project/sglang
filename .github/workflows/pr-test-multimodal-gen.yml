@@ -203,6 +203,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          SGLANG_DIFFUSION_DIAGNOSTICS_DIR: ${{ github.workspace }}/diffusion-diagnostics
         run: |
           python3 test/run_suite.py \
             --hw cuda \
@@ -217,6 +218,15 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
+          retention-days: 7
+
+      - name: Upload diffusion performance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-diagnostics-1gpu-5090-${{ github.run_attempt }}
+          path: diffusion-diagnostics/
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Upload diffusion failure artifacts
