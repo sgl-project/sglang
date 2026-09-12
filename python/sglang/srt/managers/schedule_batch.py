@@ -1452,18 +1452,17 @@ class Req(ReqDllmMixin):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
-            if positions is not None:
-                # Merge metadata only; the full position table is already built above.
-                self.multimodal_inputs.mrope_positions = None
-                self.multimodal_inputs.mrope_position_delta = None
+            # Use the full table above, or let the scheduler compute missing positions.
+            self.multimodal_inputs.mrope_positions = None
+            self.multimodal_inputs.mrope_position_delta = None
             self.multimodal_inputs.merge(image_inputs)
 
+        self.multimodal_inputs.mrope_position_delta_repeated_cache = None
         if positions is not None:
             self.multimodal_inputs.mrope_positions = positions
             self.multimodal_inputs.mrope_position_delta = (
                 positions.max() + 1 - positions.shape[1]
             ).reshape(1, 1)
-            self.multimodal_inputs.mrope_position_delta_repeated_cache = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition

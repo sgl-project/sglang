@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 import unittest
 import uuid
 
@@ -82,6 +83,7 @@ class TestSessionMrope(CustomTestCase):
                         cache_salt=salt,
                         sampling_params=sampling,
                     )
+                    self.assertEqual(len(first["output_ids"]), 8)
                     suffix = "<|im_end|>\n" + prompt
                     # Regular mode also branches from the first turn after an append.
                     for image in images[1:] + (images[:1] if not streaming else []):
@@ -101,8 +103,26 @@ class TestSessionMrope(CustomTestCase):
                             cache_salt=salt,
                             sampling_params=sampling,
                         )
+                        self.assertEqual(len(appended["output_ids"]), 8)
                         self.assertEqual(
                             appended["output_ids"], reference["output_ids"]
+                        )
+                        print(
+                            "Session replay example: "
+                            + json.dumps(
+                                {
+                                    "streaming": streaming,
+                                    "new_image": "red"
+                                    if image == images[0]
+                                    else "blue",
+                                    "first_reply": first["text"],
+                                    "session_reply": appended["text"],
+                                    "replay_reply": reference["text"],
+                                    "session_ids": appended["output_ids"],
+                                    "replay_ids": reference["output_ids"],
+                                }
+                            ),
+                            flush=True,
                         )
                 finally:
                     self.post("/close_session", session_id=sid)

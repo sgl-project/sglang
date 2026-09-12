@@ -108,6 +108,55 @@ def test_appends_match_full_history(model, first, streaming, reply):
         saved = req.multimodal_inputs
 
 
+def test_image_reply_image_positions():
+    """Eight image-prompt tokens + two reply tokens + eight new prompt tokens."""
+    req = Req(
+        "image-reply-image",
+        None,
+        array("q", IMAGE_IDS + [3, 4] + IMAGE_IDS),
+        SamplingParams(),
+        session=SimpleNamespace(streaming=False),
+    )
+    req.multimodal_inputs = multimodal(IMAGE_IDS, "qwen2_5_vl", "image")
+    req.extend_image_inputs(multimodal(IMAGE_IDS, "qwen2_5_vl", "image"))
+
+    # The reply occupies positions 6 and 7; the next prompt starts at 8.
+    expected = torch.tensor(
+        [
+            [0, 1, 2, 2, 2, 2, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 12, 13],
+            [0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 13],
+            [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 10, 11, 12, 13],
+        ]
+    )
+    torch.testing.assert_close(req.multimodal_inputs.mrope_positions, expected)
+    assert req.multimodal_inputs.mrope_position_delta.item() == -4
+
+
+def test_missing_positions_allow_scheduler_recompute():
+    req = Req(
+        "missing-positions",
+        None,
+        array("q", IMAGE_IDS + IMAGE_IDS),
+        SamplingParams(),
+        session=SimpleNamespace(streaming=False),
+    )
+    parent = multimodal(IMAGE_IDS, "qwen2_5_vl", "image")
+    parent.mrope_position_delta_repeated_cache = torch.ones(3, 1)
+    req.multimodal_inputs = parent
+    incoming = multimodal(IMAGE_IDS, "qwen2_5_vl", "image")
+    incoming.mrope_positions = incoming.mrope_position_delta = None
+    req.extend_image_inputs(incoming)
+
+    # A stale table would make _maybe_compute_mrope_positions skip recomputation.
+    assert req.multimodal_inputs.mrope_positions is None
+    assert req.multimodal_inputs.mrope_position_delta is None
+    assert req.multimodal_inputs.mrope_position_delta_repeated_cache is None
+    assert len(req.multimodal_inputs.mm_items) == 2
+    assert parent.mrope_positions is not None
+    assert parent.mrope_position_delta_repeated_cache is not None
+    assert len(parent.mm_items) == 1
+
+
 def test_non_session_keeps_precomputed_input():
     req = Req("normal", None, array("q", IMAGE_IDS), SamplingParams())
     mm = multimodal(IMAGE_IDS, "qwen2_5_vl", "image")
