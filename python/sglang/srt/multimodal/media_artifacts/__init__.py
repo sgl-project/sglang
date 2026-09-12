@@ -22,10 +22,12 @@ from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifact,
     MediaArtifactCacheMixin,
     MediaArtifactInput,
+    MediaArtifactLookup,
 )
 
 __all__ = [
     "MediaArtifact",
     "MediaArtifactCacheMixin",
     "MediaArtifactInput",
+    "MediaArtifactLookup",
 ]

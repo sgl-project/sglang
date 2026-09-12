@@ -11,11 +11,19 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.mem_cache.multimodal_cache import (
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 from sglang.srt.multimodal.cache import (
     CacheMiss,
     MultimodalPreprocessCache,
     build_artifact_key,
+    build_feature_hash,
+    build_feature_identity,
+    build_mm_radix_cache_namespace,
     build_processor_fingerprint,
+    compact_feature_hash,
     estimate_cache_size_bytes,
     parse_content_hash,
     resolve_multimodal_item_hash,
@@ -264,6 +272,19 @@ class TestMediaIdentity(unittest.TestCase):
             resolve_multimodal_item_hash(existing_hash=1, namespace=first),
             resolve_multimodal_item_hash(existing_hash=2, namespace=first),
         )
+        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(second, 1))
+        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(first, 2))
+        self.assertNotEqual(
+            build_feature_identity(first, 1), build_feature_identity(second, 1)
+        )
+        self.assertNotEqual(
+            build_feature_identity(first, 1), build_feature_identity(first, 2)
+        )
+        self.assertEqual(
+            build_feature_hash(first, 1),
+            compact_feature_hash(build_feature_identity(first, 1)),
+        )
+        self.assertIsInstance(build_feature_hash(first, 1 << 128), int)
         with self.assertRaises(ValueError):
             resolve_multimodal_item_hash(existing_hash=-1, namespace=first)
 
@@ -275,6 +296,26 @@ class TestMediaIdentity(unittest.TestCase):
         item.set_pad_value()
 
         self.assertEqual(item.hash, expected)
+
+    def test_radix_namespace_uses_full_ordered_artifact_identities(self):
+        first = "sha256:" + "01" * 32
+        second = "sha256:" + "02" * 32
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(None, [("image", first)]),
+            build_mm_radix_cache_namespace(None, [("image", second)]),
+        )
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(
+                "caller", [("image", first), ("image", second)]
+            ),
+            build_mm_radix_cache_namespace(
+                "caller", [("image", second), ("image", first)]
+            ),
+        )
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(None, [("image", first)]),
+            build_mm_radix_cache_namespace("caller", [("image", first)]),
+        )
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):
@@ -517,6 +558,73 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
         self.assertNotIn("key", cache)
         cache.complete_miss(new, b"new")
         self.assertEqual(cache.get("key"), b"new")
+
+
+class TestMultimodalEmbeddingCacheLease(unittest.TestCase):
+    @staticmethod
+    def _embedding(value: int) -> EmbeddingResult:
+        return EmbeddingResult(embedding=torch.tensor([value], dtype=torch.int64))
+
+    def test_lease_pins_entry_until_consumed(self):
+        cache = MultiModalStaticCache(max_size=8)
+        self.assertTrue(cache.set(1, self._embedding(1)))
+        self.assertEqual(cache.acquire_many("lease", [1], ttl_s=300), [True])
+        self.assertFalse(cache.set(2, self._embedding(2)))
+        self.assertEqual(cache.consume("lease", 1).embedding.item(), 1)
+        self.assertTrue(cache.set(2, self._embedding(2)))
+        self.assertFalse(cache.has(1))
+
+    def test_duplicate_hashes_are_consumed_individually(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        self.assertEqual(
+            cache.acquire_many("lease", [1, 1, None], ttl_s=300),
+            [True, True, False],
+        )
+        self.assertIsNotNone(cache.consume("lease", 1))
+        self.assertTrue(cache.lease_contains("lease", 1))
+        self.assertIsNotNone(cache.consume("lease", 1))
+        self.assertFalse(cache.lease_contains("lease", 1))
+
+    def test_expiry_and_clear_release_pins(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        with patch(
+            "sglang.srt.mem_cache.multimodal_cache.time.monotonic",
+            side_effect=[10.0, 10.0, 12.0],
+        ):
+            cache.acquire_many("expired", [1], ttl_s=1)
+            self.assertFalse(cache.lease_contains("expired", 1))
+
+        cache.acquire_many("cleared", [1], ttl_s=300)
+        cache.clear()
+        self.assertEqual(cache.lease_stats(), (0, 0))
+        self.assertEqual(len(cache), 0)
+
+    def test_admitted_lease_does_not_expire_while_request_is_queued(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        with patch(
+            "sglang.srt.mem_cache.multimodal_cache.time.monotonic",
+            side_effect=[10.0, 10.0, 10.5, 12.0, 12.0],
+        ):
+            cache.acquire_many("admitted", [1], ttl_s=1)
+            self.assertTrue(cache.admit_lease("admitted"))
+            self.assertTrue(cache.lease_contains("admitted", 1))
+            self.assertEqual(cache.consume("admitted", 1).embedding.item(), 1)
+
+    def test_admitted_lease_stays_pinned_across_chunk_lookups(self):
+        cache = MultiModalStaticCache(max_size=8)
+        cache.set(1, self._embedding(1))
+        cache.acquire_many("admitted", [1], ttl_s=300)
+        self.assertTrue(cache.admit_lease("admitted"))
+
+        self.assertEqual(cache.get_leased("admitted", 1).embedding.item(), 1)
+        self.assertEqual(cache.get_leased("admitted", 1).embedding.item(), 1)
+        self.assertFalse(cache.set(2, self._embedding(2)))
+
+        cache.release_lease("admitted")
+        self.assertTrue(cache.set(2, self._embedding(2)))
 
 
 if __name__ == "__main__":

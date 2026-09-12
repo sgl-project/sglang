@@ -7,8 +7,11 @@ reaching the client is covered by scheduler/test_scheduler_control.py.
 
 import time
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,7 +19,19 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -27,8 +42,11 @@ class _FakeReq:
         self.to_finish = None
         self.beam_group = None
         self._finished = is_finished
+        self.multimodal_inputs = None
+        self.session = None
         self.output_ids = []
         self.weight_version_events = []
+        self.kv = SimpleNamespace(holds_mamba=False)
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -60,6 +78,11 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.ps = SimpleNamespace(pp_size=1)
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
+    s.chunked_req = None
+    s.mm_receiver = None
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s.dllm_config = None
+    s.grammar_manager = MagicMock()
     return s
 
 
@@ -105,6 +128,55 @@ class TestWaitingTimeout(CustomTestCase):
         self.assertEqual(aborts[0].finished_reason["type"], "abort")
         # The poll emits only; removal happens on every rank via the broadcast.
         self.assertEqual([r.rid for r in s.waiting_queue], ["stale", "fresh"])
+
+    def test_timeout_abort_releases_multimodal_lease_after_poll(self):
+        stale = _req("stale", wait_entry=time.perf_counter() - 10)
+        cache = MultiModalStaticCache(max_size=1024)
+        cache.set(11, EmbeddingResult(embedding=torch.tensor([1])))
+        self.assertEqual(cache.acquire_many("lease", [11], ttl_s=300), [True])
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    model_specific_data={MM_EMBEDDING_CACHE_LEASE_ID_KEY: "lease"},
+                )
+            ]
+        )
+        stale.multimodal_inputs = mm_inputs
+        s = _scheduler([stale])
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+        self.assertEqual(s.waiting_queue, [stale])
+        self.assertIs(stale.multimodal_inputs, mm_inputs)
+        self.assertTrue(cache.lease_contains("lease", 11))
+
+        with (
+            patch.object(mm_schedule, "embedding_cache", cache),
+            patch.object(cache, "release_lease", wraps=cache.release_lease) as release,
+            patch(
+                "sglang.srt.managers.scheduler.get_serving",
+                return_value=SimpleNamespace(weight_version="v0"),
+            ),
+        ):
+            s.abort_request(aborts[0])
+            s.abort_request(aborts[0])
+            release.assert_called_once_with("lease")
+
+        self.assertFalse(cache.lease_contains("lease", 11))
+        self.assertIsNone(stale.multimodal_inputs)
+        self.assertEqual(s.waiting_queue, [])
+        output = s.ipc_channels.send_to_tokenizer.send_output
+        output.assert_called_once()
+        self.assertEqual(
+            output.call_args.args[0].finished_reason, aborts[0].finished_reason
+        )
+        self.assertEqual(
+            output.call_args.args[0].finished_reason["status_code"],
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
 
     def test_unset_entry_time_is_never_emitted(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.
