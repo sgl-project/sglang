@@ -59,6 +59,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.pre_sampled_video import PreSampledVideo
 
 logger = logging.getLogger(__name__)
 
@@ -845,6 +846,8 @@ def _encoder_media_item(mm_item: dict):
         for key, value in mm_item.items()
         if key != "modality" and value is not None
     }
+    if isinstance(item.get("url"), PreSampledVideo):
+        item["url"] = item["url"].to_wire()
     return item["url"] if set(item) == {"url"} else item
 
 

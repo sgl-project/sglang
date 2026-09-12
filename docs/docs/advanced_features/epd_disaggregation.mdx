@@ -19,6 +19,20 @@ When launching a language-only model, you must additionally specify the encoder 
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 
+### Pre-sampled videos
+
+For Qwen3-VL, Qwen3.5, and GLM video models, the HTTP encoder path accepts
+[pre-sampled RGB frames with timeline metadata](/docs/basic_usage/native_api#pre-sampled-video-input)
+from the native `/generate` API. This lets an upstream service own video decoding
+and frame selection while the encoder runs model-specific spatial preprocessing
+and the vision model. Send the same `video_data` object to a language-only server;
+it forwards the frames and metadata to the encoder. In-process `PreSampledVideo`
+objects are serialized as lossless PNG data URLs for that HTTP transfer.
+
+The supplied frames are not sampled again. For GLM, this path keeps each video's
+frames together instead of using the encoded-video decoder's sharding path.
+The gRPC encoder currently accepts images only.
+
 ### Encoder transfer with Mooncake
 
 `--encoder-transfer-backend mooncake` controls **how encoder outputs are transferred** between encoder and language/prefill services. It is an encoder transfer option and can be used independently of the global multimodal embedding cache.

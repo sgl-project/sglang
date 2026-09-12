@@ -44,6 +44,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils.pre_sampled_video import PreSampledVideo
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -210,6 +211,10 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
 ) -> torch.Tensor:
+    if isinstance(vr, PreSampledVideo):
+        frames, metadata = vr.to_processor_inputs()
+        return torch.from_numpy(frames).permute(0, 3, 1, 2), metadata
+
     # preprocessed video
     is_video_obj = isinstance(vr, VideoDecoderWrapper)
     if not is_video_obj:
@@ -308,6 +313,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.supports_pre_sampled_video = self.model_type in {
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        }
         if self.model_type in (
             "qwen2_vl",
             "qwen2_5_vl",
@@ -751,6 +762,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
+        has_pre_sampled_video = any(
+            isinstance(video, PreSampledVideo) for video in base_output.videos or []
+        )
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
             videos_processed = [
@@ -783,6 +797,22 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
+
+        if has_pre_sampled_video:
+            if not video_metadata or any(item is None for item in video_metadata):
+                raise ValueError(
+                    "Pre-sampled videos cannot be mixed with frame arrays lacking timeline metadata"
+                )
+            # The model processor still owns spatial preprocessing. Only temporal
+            # sampling is disabled for this new input contract.
+            processor_kwargs["processor_video_config"] = {
+                key: value
+                for key, value in self.video_config.items()
+                if key not in {"fps", "nframes", "min_frames", "max_frames"}
+            }
+            processor_kwargs["processor_video_config"]["do_sample_frames"] = False
+            processor_kwargs.pop("do_sample_frames", None)
+            processor_kwargs["video_metadata"] = video_metadata
 
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens, **processor_kwargs

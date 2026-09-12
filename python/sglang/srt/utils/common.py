@@ -2027,6 +2027,14 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
 
 
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+    from sglang.srt.utils.pre_sampled_video import (
+        is_pre_sampled_video,
+        load_pre_sampled_video,
+    )
+
+    if is_pre_sampled_video(video_file):
+        return load_pre_sampled_video(video_file)
+
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url

@@ -17,6 +17,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
+from sglang.srt.utils.pre_sampled_video import PreSampledVideo
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
@@ -406,6 +407,11 @@ def glm_decode_frames_at(vr, indices, video_config=None):
 
 
 def glm_sample_and_decode_sync(vr, video_config=None, video_processor=None):
+    if isinstance(vr, PreSampledVideo):
+        return vr.to_processor_inputs()
+    if isinstance(vr, list):
+        frames, metadata = preprocess_video_frames_sync(vr)
+        return np.stack(frames) if isinstance(frames, list) else frames, metadata
     video_config = video_config or {}
     fps = vr.avg_fps
     if not fps or fps <= 0:
@@ -435,6 +441,7 @@ def _passthrough_video_metadata(video, video_config):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
+    supports_pre_sampled_video = True
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [
@@ -557,6 +564,9 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
+        has_pre_sampled_video = any(
+            isinstance(video, PreSampledVideo) for video in base_output.videos or []
+        )
         video_metadata = None
         videos_kwargs = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
@@ -574,7 +584,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                     video_configs[index] if index < len(video_configs) else {},
                     effective_max_image_tokens,
                 )
-                if isinstance(video, VideoDecoderWrapper):
+                if isinstance(video, PreSampledVideo):
+                    decode_tasks.append(
+                        asyncio.sleep(0, result=video.to_processor_inputs())
+                    )
+                elif isinstance(video, VideoDecoderWrapper):
                     decode_tasks.append(
                         loop.run_in_executor(
                             self.io_executor,
@@ -626,6 +640,9 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             }
             if videos_kwargs is not None:
                 processor_video_config.update(videos_kwargs)
+            if has_pre_sampled_video:
+                processor_video_config["do_sample_frames"] = False
+                combine_kwargs.pop("do_sample_frames", None)
             combine_kwargs["processor_video_config"] = processor_video_config
 
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(

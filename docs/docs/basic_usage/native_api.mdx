@@ -51,6 +51,79 @@ response = requests.post(url, json=data)
 print_highlight(response.json())
 ```
 
+### Pre-sampled video input
+
+You can decode and sample a video in an upstream service, then send its selected
+RGB frames through `video_data`. SGLang preserves their order and original
+constant-frame-rate timeline, skips video codec decoding and temporal sampling,
+and runs the model processor's spatial resizing, normalization, patchification,
+and prompt expansion.
+
+This input is supported by Qwen3-VL, Qwen3.5, and GLM video processors, including
+[HTTP encoder disaggregation](/docs/advanced_features/epd_disaggregation).
+Other processors reject this input. The OpenAI `video_url` interface and the
+gRPC encoder do not accept this representation.
+
+On Linux with one NVIDIA CUDA GPU, start a supported video model:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3-VL-2B-Instruct --port 30000
+```
+
+The following example assumes an upstream decoder saved four RGB PNG frames at
+indices 0, 3, 17, and 29 of a 60-frame, 30 FPS video. Select frames according to
+your model's sampling policy and input budget before constructing the request.
+
+```python
+import numpy as np
+import requests
+from PIL import Image
+from transformers import AutoProcessor
+from sglang.srt.utils.pre_sampled_video import PreSampledVideo
+
+indices = [0, 3, 17, 29]
+frames = np.stack([
+    np.asarray(Image.open(f"frame_{index:03d}.png").convert("RGB"))
+    for index in indices
+])
+video = PreSampledVideo(
+    frames=frames,
+    source_fps=30.0,
+    total_num_frames=60,
+    frame_indices=indices,
+    do_sample_frames=False,
+)
+processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+prompt = processor.apply_chat_template(
+    [{"role": "user", "content": [
+        {"type": "video"},
+        {"type": "text", "text": "Describe what happens in this video."},
+    ]}],
+    tokenize=False,
+    add_generation_prompt=True,
+)
+response = requests.post("http://localhost:30000/generate", json={
+    "text": prompt,
+    "video_data": video.to_wire(),
+    "sampling_params": {"temperature": 0, "max_new_tokens": 64},
+})
+response.raise_for_status()
+print(response.json()["text"])
+```
+
+`PreSampledVideo` accepts a `uint8` array or CPU tensor in `[frames, height,
+width, 3]` layout, or RGB PIL images with equal dimensions. For `Engine.generate`,
+pass the object directly as `video_data`; for HTTP, `to_wire()` produces a JSON
+object with `format: "pre_sampled_video"` and losslessly encoded PNG data URLs
+in `frames`. Frame URLs and file paths are not accepted inside that JSON object.
+
+`source_fps` must be finite and positive. `total_num_frames` is the original
+video's frame count. `frame_indices` must have one nondecreasing index per supplied
+frame, within the original video; repeated indices are preserved. Optional
+`timestamps` must equal `frame_indices / source_fps`. Variable-frame-rate
+timelines are not supported. `do_sample_frames` must be `false`.
+The model may still pad its last temporal patch as required by its architecture.
+
 ## Get Model Info
 
 Get the information of the model.
