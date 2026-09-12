@@ -1541,7 +1541,9 @@ def get_generate_fn(
                 require_chunk_stats=True,
             )
         )
-        record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_perf_stats(
+            case_id, realtime_output.chunk_stats, realtime_output.e2e_ms
+        )
         record_realtime_key_frames(case_id, realtime_output.frames)
         fps = int(sampling_params.fps or 24)
         video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)

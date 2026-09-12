@@ -6,6 +6,7 @@ import asyncio
 import os
 import statistics
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,9 +51,11 @@ class RealtimeChunkStats:
 class RealtimeCollectionResult:
     frames: list[np.ndarray]
     chunk_stats: list[RealtimeChunkStats]
+    e2e_ms: float
 
 
 _REALTIME_CHUNK_STATS_BY_CASE: dict[str, list[RealtimeChunkStats]] = {}
+_REALTIME_E2E_MS_BY_CASE: dict[str, float] = {}
 _REALTIME_KEY_FRAMES_BY_CASE: dict[str, list[np.ndarray]] = {}
 
 
@@ -217,13 +220,18 @@ def validate_realtime_perf_stats(
 
 
 def record_realtime_perf_stats(
-    case_id: str, chunk_stats: list[RealtimeChunkStats]
+    case_id: str, chunk_stats: list[RealtimeChunkStats], e2e_ms: float
 ) -> None:
     _REALTIME_CHUNK_STATS_BY_CASE[case_id] = list(chunk_stats)
+    _REALTIME_E2E_MS_BY_CASE[case_id] = e2e_ms
 
 
 def pop_realtime_perf_stats(case_id: str) -> list[RealtimeChunkStats]:
     return _REALTIME_CHUNK_STATS_BY_CASE.pop(case_id, [])
+
+
+def pop_realtime_e2e_ms(case_id: str) -> float | None:
+    return _REALTIME_E2E_MS_BY_CASE.pop(case_id, None)
 
 
 def select_realtime_key_frames(frames: list[np.ndarray]) -> list[np.ndarray]:
@@ -357,6 +365,8 @@ async def collect_realtime_output(
             sent_event_indices.add(event_idx)
 
     async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
+        # exclude server startup, warmup and the later mp4 consistency encoding
+        request_start = time.perf_counter()
         await ws.send(msgspec.msgpack.encode(init_payload))
         await send_events_for_boundary(ws, -1)
 
@@ -399,5 +409,8 @@ async def collect_realtime_output(
             if header.get("is_final_frame_batch", True):
                 received_chunks.add(chunk_index)
                 await send_events_for_boundary(ws, chunk_index)
+        e2e_ms = (time.perf_counter() - request_start) * 1000
 
-    return RealtimeCollectionResult(frames=frames, chunk_stats=chunk_stats)
+    return RealtimeCollectionResult(
+        frames=frames, chunk_stats=chunk_stats, e2e_ms=e2e_ms
+    )

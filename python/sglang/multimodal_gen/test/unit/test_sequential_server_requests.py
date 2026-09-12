@@ -111,16 +111,28 @@ def test_each_request_failure_fails_case(harness, monkeypatch, bad_request, fail
     monkeypatch.setattr(runner, "run_and_collect", generate)
     ctx = object()
 
-    with pytest.raises(pytest.fail.Exception, match=f"request {bad_request + 1}/2"):
+    terminal = failure in {"performance", "load_peak", "runtime_peak", "missing_memory"}
+    error_type = (
+        test_server_common.PerformanceValidationError
+        if terminal
+        else pytest.fail.Exception
+    )
+    with pytest.raises(error_type, match=f"request {bad_request + 1}/2"):
         runner.test_diffusion_generation(case, ctx)
 
-    assert generate.call_count == 2
+    expected_requests = bad_request + 1 if terminal else 2
+    assert generate.call_count == expected_requests
     assert all(call.args[0] is ctx for call in generate.call_args_list)
-    assert runner._validate_consistency.call_count == (
-        1 if failure == "generation" else 2
+    expected_consistency = (
+        bad_request if terminal else (1 if failure == "generation" else 2)
     )
+    assert runner._validate_consistency.call_count == expected_consistency
     # Even failed performance measurements must survive in the report.
-    expected = [i + 1 for i in range(2) if failure != "generation" or i != bad_request]
+    expected = [
+        i + 1
+        for i in range(expected_requests)
+        if failure != "generation" or i != bad_request
+    ]
     assert [r["request_index"] for r in runner._perf_results] == expected
 
 
@@ -138,6 +150,37 @@ def test_both_requests_pass(harness, monkeypatch):
         b"second",
     ]
     assert [r["request_index"] for r in runner._perf_results] == [1, 2]
+
+
+@pytest.mark.parametrize("run_perf_check", [False, True])
+@pytest.mark.parametrize("e2e_ms", [None, 0, -1, float("nan"), float("inf")])
+def test_e2e_is_required_even_without_threshold_checks(
+    harness, monkeypatch, run_perf_check, e2e_ms
+):
+    runner, case = harness
+    case = replace(case, run_perf_check=run_perf_check)
+    record = _perf_record()
+    record.total_duration_ms = e2e_ms
+    generate = Mock(return_value=(record, b"output"))
+    monkeypatch.setattr(runner, "run_and_collect", generate)
+
+    with pytest.raises(
+        test_server_common.PerformanceValidationError,
+        match="E2E duration missing or invalid",
+    ):
+        runner.test_diffusion_generation(case, object())
+    assert generate.call_count == 1
+    assert not runner._perf_results
+
+
+def test_disabled_threshold_checks_still_record_e2e(harness, monkeypatch):
+    runner, case = harness
+    case = replace(case, run_perf_check=False)
+    monkeypatch.setattr(
+        runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
+    )
+    runner.test_diffusion_generation(case, object())
+    assert [r["e2e_ms"] for r in runner._perf_results] == [100, 100]
 
 
 def test_request_artifacts_do_not_overwrite_each_other(harness, monkeypatch, tmp_path):

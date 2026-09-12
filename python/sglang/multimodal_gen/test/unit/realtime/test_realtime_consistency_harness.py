@@ -24,13 +24,20 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
     prepare_realtime_first_frame,
     realtime_ws_url,
     record_realtime_key_frames,
+    record_realtime_perf_stats,
     select_realtime_key_frames,
     summarize_realtime_perf_stats,
     validate_realtime_perf_stats,
 )
+from sglang.multimodal_gen.test.server.test_server_common import (
+    DiffusionServerBase,
+    PerformanceValidationError,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
+    DiffusionServerArgs,
+    DiffusionTestCase,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
@@ -340,6 +347,18 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
     np.testing.assert_array_equal(result.frames[1], second)
     assert [stat.chunk_index for stat in result.chunk_stats] == [0, 1]
     assert [stat.chunk_total_ms for stat in result.chunk_stats] == [31.0, 32.0]
+    assert result.e2e_ms > 0
+    record_realtime_perf_stats("stream-e2e", result.chunk_stats, result.e2e_ms)
+    case = DiffusionTestCase(
+        "stream-e2e",
+        DiffusionServerArgs(model_path="test", modality="video"),
+        DiffusionSamplingParams(prompt="test"),
+        run_perf_check=False,
+    )
+    runner = DiffusionServerBase()
+    runner._perf_results = []
+    runner._validate_realtime_performance(None, case, result.chunk_stats)
+    assert runner._perf_results[0]["e2e_ms"] == result.e2e_ms
     assert websocket.sent == [
         {"type": "init", "prompt": "test"},
         {
@@ -348,6 +367,24 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
             "payload": [["w"]],
         },
     ]
+
+
+@pytest.mark.parametrize("e2e_ms", [None, 0, -1, float("nan"), float("inf")])
+def test_realtime_requires_e2e_without_threshold_checks(e2e_ms):
+    case = DiffusionTestCase(
+        "missing-stream-e2e",
+        DiffusionServerArgs(model_path="test", modality="video"),
+        DiffusionSamplingParams(prompt="test"),
+        run_perf_check=False,
+    )
+    runner = DiffusionServerBase()
+    runner._perf_results = []
+    if e2e_ms is not None:
+        record_realtime_perf_stats(case.id, [], e2e_ms)
+    with pytest.raises(
+        PerformanceValidationError, match="E2E duration missing or invalid"
+    ):
+        runner._validate_realtime_performance(None, case, [])
 
 
 def test_collect_realtime_output_accepts_combined_frame_batch(monkeypatch):

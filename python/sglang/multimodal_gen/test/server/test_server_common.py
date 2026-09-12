@@ -8,6 +8,7 @@ Each collected request prints a performance log before validation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import threading
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.perf_diagnostics import record_request
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
+    pop_realtime_e2e_ms,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -100,6 +102,10 @@ _SERVER_FATAL_LOG_PATTERNS = (
     "Aborted (core dumped)",
 )
 _CASE_LOG_SEPARATOR = "=" * 88
+
+
+class PerformanceValidationError(AssertionError):
+    """A terminal performance failure, including across repeated requests."""
 
 
 def _print_case_log_separator(case_id: str, state: str) -> None:
@@ -387,6 +393,10 @@ class DiffusionServerBase:
         request_index: int = 1,
     ) -> None:
         """Validate metrics and record results."""
+        if perf_record is None:
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: request performance record is missing"
+            )
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
@@ -413,8 +423,8 @@ class DiffusionServerBase:
         )
 
         summary = validator.collect_metrics(perf_record)
-        self._print_performance_log(case, summary, scenario)
         self._record_performance_result(case, summary, request_index)
+        self._print_performance_log(case, summary, scenario)
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
@@ -477,6 +487,40 @@ class DiffusionServerBase:
         chunk_stats: list[RealtimeChunkStats],
         request_index: int = 1,
     ) -> None:
+        e2e_ms = pop_realtime_e2e_ms(case.id)
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        summary = PerformanceSummary(e2e_ms, 0, 0, {}, [], {}, {})
+        check_memory = case.run_perf_check and current_platform.is_cuda()
+        if check_memory:
+            request_id = next(
+                (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+                None,
+            )
+            if request_id is None:
+                pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+            perf_record = wait_for_req_perf_record(
+                request_id, ctx.perf_log_path, timeout=30
+            )
+            if perf_record is None:
+                pytest.fail(
+                    f"{case.id}: realtime request performance record is missing"
+                )
+            if scenario is None:
+                pytest.fail(
+                    f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+                )
+            validator = PerformanceValidator(
+                scenario=scenario,
+                tolerances=BASELINE_CONFIG.tolerances,
+                step_fractions=BASELINE_CONFIG.step_fractions,
+            )
+            summary = validator.collect_metrics(perf_record)
+            # the last chunk's record supplies memory peaks, not the session's e2e
+            summary.e2e_ms = e2e_ms
+
+        self._record_performance_result(case, summary, request_index)
+        self._print_performance_log(case, summary, scenario)
         validate_realtime_perf_stats(
             case.id,
             chunk_stats,
@@ -485,38 +529,8 @@ class DiffusionServerBase:
                 case.sampling_params.realtime_perf_ignore_initial_chunks
             ),
         )
-        if not case.run_perf_check or not current_platform.is_cuda():
+        if not check_memory:
             return
-
-        request_id = next(
-            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
-            None,
-        )
-        if request_id is None:
-            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
-
-        perf_record = wait_for_req_perf_record(
-            request_id,
-            ctx.perf_log_path,
-            timeout=30,
-        )
-        if perf_record is None:
-            pytest.fail(f"{case.id}: realtime request performance record is missing")
-
-        scenario = BASELINE_CONFIG.scenarios.get(case.id)
-        if scenario is None:
-            pytest.fail(
-                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
-            )
-
-        validator = PerformanceValidator(
-            scenario=scenario,
-            tolerances=BASELINE_CONFIG.tolerances,
-            step_fractions=BASELINE_CONFIG.step_fractions,
-        )
-        summary = validator.collect_metrics(perf_record)
-        self._print_performance_log(case, summary, scenario)
-        self._record_performance_result(case, summary, request_index)
 
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
             logger.info(
@@ -556,6 +570,13 @@ class DiffusionServerBase:
         summary: PerformanceSummary,
         request_index: int = 1,
     ) -> None:
+        if not isinstance(summary.e2e_ms, (int, float)) or not (
+            math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0
+        ):
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: E2E duration missing or invalid: "
+                f"{summary.e2e_ms!r}"
+            )
         result = {
             "class_name": type(self).__name__,
             "test_name": case.id,
@@ -1587,6 +1608,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                             str(Path(artifact_dir) / f"request-{request_index}"),
                         )
                     self._test_diffusion_request(case, diffusion_server, request_index)
+            except PerformanceValidationError as exc:
+                _print_case_log_separator(case.id, f"FAILED {label}")
+                raise PerformanceValidationError(f"[{label}] {exc}") from exc
             except pytest.skip.Exception as exc:
                 if request_index == 1:
                     raise
@@ -1636,6 +1660,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
+                if name == "performance" and isinstance(
+                    exc, (AssertionError, pytest.fail.Exception)
+                ):
+                    raise PerformanceValidationError(f"[performance] {exc}") from exc
                 failures.append((name, str(exc)))
 
         if is_realtime_case:

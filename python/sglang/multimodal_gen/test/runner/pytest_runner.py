@@ -165,8 +165,7 @@ def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
     for line in summary_lines:
         lowered = line.lower()
         if (
-            "[performance]" in line
-            or "SafetensorError" in line
+            "SafetensorError" in line
             or "FileNotFoundError" in line
             or "TimeoutError" in line
             or "out of memory" in lowered
@@ -190,14 +189,11 @@ def _is_consistency_failure(full_output: str) -> bool:
 
 
 def _is_retryable_failure(full_output: str) -> bool:
-    if _is_consistency_failure(full_output):
+    # a performance failure must survive even a concurrent infrastructure failure
+    if "[performance]" in full_output or _is_consistency_failure(full_output):
         return False
 
     summary_lines = _extract_short_test_summary(full_output)
-    is_perf_assertion = (
-        "multimodal_gen/test/server/test_server_utils.py" in full_output
-        and "AssertionError" in full_output
-    )
     is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)
 
     is_flaky_ci_assertion = (
@@ -210,12 +206,7 @@ def _is_retryable_failure(full_output: str) -> bool:
         "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
     )
 
-    return (
-        is_perf_assertion
-        or is_aggregated_retryable_failure
-        or is_flaky_ci_assertion
-        or is_oom_error
-    )
+    return is_aggregated_retryable_failure or is_flaky_ci_assertion or is_oom_error
 
 
 def _print_attempt_tail_summary(
