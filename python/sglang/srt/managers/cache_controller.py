@@ -596,6 +596,7 @@ class HiCacheController:
                 in [
                     "hf3fs",
                     "mooncake",
+                    "npu_memcache",
                     "eic",
                     "nixl",
                     "simm",
@@ -874,6 +875,24 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+                to_device_no_sync,
+            )
+
+            if ascendc_io_enabled():
+                # The fused acc_offload kv_exchange kernel reads the token
+                # indices directly on the device; keeping them there avoids
+                # the D2H sync that would serialize the layer-group pipeline.
+                # (The legacy memcpy2d exchange op still wants CPU indices and
+                # converts them itself.)
+                # Upload through pinned memory: host_indices comes from the
+                # radix-tree match as a pageable CPU tensor, and a pageable
+                # .to(device) completes with a stream synchronize that drains
+                # all compute queued on the current (default) stream.
+                if host_indices.device != self.device:
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
