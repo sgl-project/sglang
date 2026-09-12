@@ -259,6 +259,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="video",
+            # the latency baseline measures the warmed, resident transformer
+            extras=["--component-residency transformer=resident"],
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
