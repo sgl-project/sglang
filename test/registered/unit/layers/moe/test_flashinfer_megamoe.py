@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,6 +44,7 @@ def _load_megamoe_module(monkeypatch):
         "deep_gemm.utils.math": types.ModuleType("deep_gemm.utils.math"),
     }
     fake_modules["sglang.srt.environ"].envs = types.SimpleNamespace(
+        SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=types.SimpleNamespace(get=lambda: False),
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
@@ -214,7 +216,165 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
     assert dgm.pack_ue8m0_to_int is original
 
 
-if __name__ == "__main__":
-    import pytest
+def test_w4a16_keeps_weight_scale_storage_without_activation_scales(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    monkeypatch.setattr(
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
+    )
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = types.SimpleNamespace
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    monkeypatch.setattr(
+        module, "_ensure_flashinfer_megamoe_layer", lambda layer, **kwargs: kwargs
+    )
+    # No activation-scale fields: W4A16 consumes only weight decode scales.
+    layer = types.SimpleNamespace(
+        intermediate_size_per_partition=64,
+        top_k=2,
+        moe_runner_config=types.SimpleNamespace(swiglu_limit=None),
+        w13_weight=torch.zeros(2, 128, 16, dtype=torch.uint8).transpose(1, 2),
+        w2_weight=torch.zeros(2, 32, 32, dtype=torch.uint8).transpose(1, 2),
+        w13_weight_scale=torch.zeros(2, 512, dtype=torch.float8_e4m3fn),
+        w2_weight_scale=torch.zeros(2, 512, dtype=torch.float8_e4m3fn),
+        g1_alphas=torch.tensor([0.25, 0.5], dtype=torch.float32),
+        g2_alphas=torch.tensor([0.75, 1.0], dtype=torch.float32),
+    )
 
+    result = module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+    fc1, fc2 = result["transformed_weights"]
+    for actual, expected in zip(
+        (*fc1, *fc2),
+        (
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.g1_alphas,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.g2_alphas,
+        ),
+        strict=True,
+    ):
+        assert actual.data_ptr() == expected.data_ptr()
+
+    # The prepared backend must observe in-place scale updates on graph replay.
+    layer.g1_alphas.fill_(2.0)
+    layer.g2_alphas.fill_(3.0)
+    torch.testing.assert_close(fc1[2], torch.full((2,), 2.0))
+    torch.testing.assert_close(fc2[2], torch.full((2,), 3.0))
+
+
+@pytest.mark.parametrize("is_gated,activation", [(False, "silu"), (True, "gelu")])
+def test_w4a16_rejects_non_swiglu(monkeypatch, is_gated, activation):
+    module = _load_megamoe_module(monkeypatch)
+    monkeypatch.setattr(
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
+    )
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEWeightPack = types.SimpleNamespace
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    layer = types.SimpleNamespace(
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=is_gated, activation=activation
+        )
+    )
+    with pytest.raises(ValueError, match="only supports SwiGLU"):
+        module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+
+
+@pytest.mark.parametrize("use_w4a16", [False, True], ids=["w4a4", "w4a16"])
+def test_nvfp4_reload_preserves_prepared_weight_storage(monkeypatch, use_w4a16):
+    module = _load_megamoe_module(monkeypatch)
+    monkeypatch.setattr(
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
+    )
+    # Import the real parameter-binding helper without the full runtime.
+    spec = importlib.util.spec_from_file_location(
+        "sglang.srt.layers.utils.common",
+        Path(module.__file__).parents[1] / "utils/common.py",
+    )
+    common = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, common)
+    spec.loader.exec_module(common)
+    hidden, intermediate = (32, 64) if use_w4a16 else (128, 128)
+    layer = torch.nn.Module()
+    layer.hidden_size = hidden
+    layer.intermediate_size_per_partition = intermediate
+    layer.num_local_experts = layer.num_experts = 2
+    layer.moe_ep_size = 1
+    layer.quant_config = types.SimpleNamespace(use_per_token_activation=use_w4a16)
+    layer.moe_runner_config = types.SimpleNamespace(
+        is_gated=True,
+        activation="silu",
+        swiglu_limit=None,
+        apply_router_weight_on_input=False,
+    )
+    layer.g1_alphas = layer.g1_alphas_up = torch.ones(2)
+    layer.g2_alphas = layer.w13_input_scale_quant = torch.ones(2)
+    for prefix, rows, columns in (
+        ("w13", 2 * intermediate, hidden),
+        ("w2", hidden, intermediate),
+    ):
+        for suffix, divisor, dtype in (
+            ("weight", 2, torch.uint8),
+            ("weight_scale", 16, torch.float8_e4m3fn),
+        ):
+            layer.register_parameter(
+                f"{prefix}_{suffix}",
+                torch.nn.Parameter(
+                    torch.zeros(2, rows, columns // divisor, dtype=dtype),
+                    requires_grad=False,
+                ),
+            )
+    canonical = {name: (p.shape, p.dtype) for name, p in layer.named_parameters()}
+
+    def preprocess(weights, **kwargs):
+        result = []
+        for weight, scale in (
+            (weights.w13, weights.w13_scale),
+            (weights.w2, weights.w2_scale),
+        ):
+            # Model the prepared ABI: transposed FP4 bytes and padded flat scales.
+            padded = torch.zeros(
+                2, ((scale[0].numel() + 511) // 512) * 512, dtype=scale.dtype
+            )
+            padded[:, : scale[0].numel()].copy_(scale.flatten(1))
+            parts = (
+                weight.clone().view(torch.float4_e2m1fn_x2).transpose(1, 2),
+                padded,
+            )
+            result.append((*parts, torch.ones(2)) if use_w4a16 else parts)
+        return tuple(result)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEWeightPack = types.SimpleNamespace
+    fake_moe_ep.preprocess_w4a16_cutedsl_mega_weights = preprocess
+    fake_moe_ep.preprocess_nvfp4_cutedsl_mega_weights = preprocess
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+    prepared = {
+        name: (p.shape, p.stride(), p.dtype, p.data_ptr())
+        for name, p in layer.named_parameters()
+    }
+
+    def load(param, value):
+        for name, p in layer.named_parameters():
+            assert (p.shape, p.dtype) == canonical[name]
+        param.data.fill_(value)
+
+    loader = module.make_nvfp4_megamoe_weight_loader(layer, load)
+    for value in (1, 2):
+        for param in layer.parameters():
+            loader(param, value)
+        layer._flashinfer_megamoe_layer = object()
+        module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+        assert layer._flashinfer_megamoe_layer is None
+        for name, p in layer.named_parameters():
+            assert (p.shape, p.stride(), p.dtype, p.data_ptr()) == prepared[name]
+            if p.dtype == torch.float4_e2m1fn_x2:
+                assert (p.view(torch.uint8) == value).all()
+            else:
+                assert (p.float()[:, : canonical[name][0].numel() // 2] == value).all()
+
+
+if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
