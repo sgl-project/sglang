@@ -648,6 +648,14 @@ mod responses_endpoint_tests {
 
     use super::*;
 
+    fn background_responses_config() -> RouterConfig {
+        RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .max_concurrent_requests(-1)
+            .build_unchecked()
+    }
+
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -730,13 +738,16 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_get() {
-        let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 18952,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
+        let ctx = AppTestContext::new_with_config(
+            background_responses_config(),
+            vec![MockWorkerConfig {
+                port: 18952,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
         .await;
 
         let app = ctx.create_app().await;
@@ -779,13 +790,16 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_cancel() {
-        let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 18953,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
+        let ctx = AppTestContext::new_with_config(
+            background_responses_config(),
+            vec![MockWorkerConfig {
+                port: 18953,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
         .await;
 
         let app = ctx.create_app().await;
@@ -925,22 +939,25 @@ mod responses_endpoint_tests {
     #[tokio::test]
     async fn test_v1_responses_get_multi_worker_fanout() {
         // Start two mock workers
-        let ctx = AppTestContext::new(vec![
-            MockWorkerConfig {
-                port: 18960,
-                worker_type: WorkerType::Regular,
-                health_status: HealthStatus::Healthy,
-                response_delay_ms: 0,
-                fail_rate: 0.0,
-            },
-            MockWorkerConfig {
-                port: 18961,
-                worker_type: WorkerType::Regular,
-                health_status: HealthStatus::Healthy,
-                response_delay_ms: 0,
-                fail_rate: 0.0,
-            },
-        ])
+        let ctx = AppTestContext::new_with_config(
+            background_responses_config(),
+            vec![
+                MockWorkerConfig {
+                    port: 18960,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 0.0,
+                },
+                MockWorkerConfig {
+                    port: 18961,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 0.0,
+                },
+            ],
+        )
         .await;
 
         let app = ctx.create_app().await;

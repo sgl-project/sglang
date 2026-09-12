@@ -12,6 +12,7 @@
 // Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
 pub use crate::protocols::UNKNOWN_MODEL_ID;
 
+pub mod admission;
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
@@ -28,6 +29,7 @@ pub mod worker_registry;
 pub mod worker_service;
 
 // Re-export commonly used types for convenience
+pub use admission::{AdmissionError, AdmissionLease, AdmissionLimiter, AdmissionSnapshot};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};

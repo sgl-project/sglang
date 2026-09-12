@@ -840,7 +840,7 @@ mod tests {
 
     async fn create_test_app_context() -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            app_context::request_limiters_from_config, config::RouterConfig, core::WorkerService,
             observability::inflight_tracker::InFlightRequestTracker,
         };
 
@@ -850,13 +850,15 @@ mod tests {
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
+        let request_limiters = request_limiters_from_config(&router_config);
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
+            admission_limiter: request_limiters.admission_limiter,
+            rate_limiter: request_limiters.rate_limiter,
             worker_registry: worker_registry.clone(),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
