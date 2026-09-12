@@ -1,6 +1,8 @@
 pub mod cli;
+pub mod sampling;
 pub mod types;
 pub use cli::Cli;
+pub use sampling::*;
 pub use types::*;
 
 use anyhow::{anyhow, Result};
@@ -18,6 +20,7 @@ impl Config {
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
         }
+        self.model.sampling_overrides.validate()?;
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -223,6 +226,7 @@ mod tests {
                 affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
