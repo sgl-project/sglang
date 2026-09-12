@@ -1532,18 +1532,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
-            shape_key,
-            run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=(
-                forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
-                else None
-            ),
-            post_warmup_hook=post_warmup_hook,
-        )
+        trace_ctx = nullcontext()
+        if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+            from sglang.srt.layers.moe.alphamoe_trace import observe_alphamoe_capture
+
+            trace_ctx = observe_alphamoe_capture(self.backend, shape_key)
+        with trace_ctx:
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                # DP padding can install capture-only tensors on this dummy batch;
+                # BCG retains it so their recorded addresses remain valid.
+                capture_inputs=(
+                    forward_batch
+                    if forward_batch.global_num_tokens_gpu is not None
+                    else None
+                ),
+                post_warmup_hook=post_warmup_hook,
+            )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1965,5 +1971,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     execution="prefill_graph_replay",
                     padded_tokens=static_num_tokens,
+                    backend=self.backend,
+                    graph_key=shape_key,
                 )
             return self._finalize_execute_output(output)

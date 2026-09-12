@@ -1854,18 +1854,24 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                trace_ctx = contextlib.nullcontext()
                 if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                     from sglang.srt.layers.moe.alphamoe_trace import (
+                        observe_alphamoe_submissions,
                         record_alphamoe_execution,
                     )
 
+                    trace_ctx = observe_alphamoe_submissions()
+                with trace_ctx as submissions:
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
+                if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                     record_alphamoe_execution(
                         forward_batch,
                         execution="eager",
                         padded_tokens=len(forward_batch.input_ids),
+                        submissions=submissions,
                     )
 
             if (
