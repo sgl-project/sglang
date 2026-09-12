@@ -325,7 +325,33 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
-class CompletionRequest(BaseModel):
+class OpenAISglangRoutingFields(BaseModel):
+    bootstrap_host: Optional[Union[List[str], str]] = Field(
+        default=None,
+        description="[SGLang extension] PD disaggregation: prefill host address",
+    )
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = Field(
+        default=None, description="[SGLang extension] PD disaggregation: prefill port"
+    )
+    bootstrap_room: Optional[Union[List[int], int]] = Field(
+        default=None,
+        description="[SGLang extension] PD disaggregation: bootstrap room ID",
+    )
+    routed_dp_rank: Optional[int] = Field(
+        default=None,
+        description="[SGLang extension] DP routing: external router assigns a specific DP worker",
+    )
+    disagg_prefill_dp_rank: Optional[int] = Field(
+        default=None,
+        description="[SGLang extension] PD disaggregation: hint telling decode which prefill DP worker has the KV cache",
+    )
+    data_parallel_rank: Optional[int] = Field(
+        default=None,
+        description="[SGLang extension] Deprecated: use routed_dp_rank instead",
+    )
+
+
+class CompletionRequest(OpenAISglangRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str = Field(
@@ -377,18 +403,6 @@ class CompletionRequest(BaseModel):
     custom_logit_processor: Optional[str] = None
 
     images_config: Optional[Dict] = None
-
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -840,7 +854,7 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(OpenAISglangRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -956,18 +970,6 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
-
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1596,7 +1598,7 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesRequest(OpenAISglangRoutingFields):
     """Request body for v1/responses endpoint."""
 
     # Core OpenAI API fields (ordered by official documentation)
@@ -1651,18 +1653,6 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
-
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
