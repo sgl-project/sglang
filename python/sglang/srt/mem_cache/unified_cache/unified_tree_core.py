@@ -16,6 +16,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 from array import array
@@ -377,6 +378,189 @@ class UnifiedLRUList:
 
 
 # WALK (one node per step) -> COMMIT (leaf + commit hooks) -> TAIL (refresh + backup).
+class _LazyLeafHeap:
+    """Persistent min-heap over one evictable-leaf set with lazy invalidation.
+
+    Replaces rebuilding ``[(key(n), n) for n in leaves]`` + ``heapify`` on every
+    eviction call (O(#leaves)) with a heap that survives across calls:
+
+    * ``_live`` maps every member of ``members`` to the key it was last pushed
+      with; a heap entry ``(key, node)`` is *valid* iff ``_live[node] == key``,
+      everything else is stale and skipped on pop (lazy deletion).
+    * ``refresh``/``touch`` re-push a node when its key input changed,
+      ``forget`` drops it when it leaves the set, ``promote`` is the walk-time
+      parent push. Stale entries are bounded by compaction (``_compact``).
+    * A walk (``begin_walk``/``pop_next``/``end_walk``) sees exactly what the
+      rebuilt heap used to see: the keys frozen at ``begin_walk``, nodes that
+      enter the set during the walk stay invisible (parked in ``_pending``)
+      unless explicitly ``promote``d, and a yielded node loses its live entry
+      until ``end_walk`` re-keys it if it is still a member. Eviction order is
+      therefore identical to the per-call rebuild for every eviction strategy.
+
+    Entries keep the legacy ``(key, node)`` shape so ``UnifiedTreeNode.__lt__``
+    remains the tie-break. The key function is resolved lazily on first use.
+    """
+
+    __slots__ = (
+        "_members",
+        "_key_provider",
+        "_key_fn",
+        "_heap",
+        "_live",
+        "_pending",
+        "_yielded",
+        "rebuild_each_walk",
+    )
+
+    def __init__(
+        self,
+        members: set,
+        key_provider: Callable[[], Callable[[Any], Any]],
+        rebuild_each_walk: bool = False,
+    ) -> None:
+        self._members = members
+        self._key_provider = key_provider
+        self._key_fn: Optional[Callable[[Any], Any]] = None
+        self._heap: list = []
+        self._live: dict = {}
+        # ``None`` outside a walk; lists while a walk is in progress.
+        self._pending: Optional[list] = None
+        self._yielded: Optional[list] = None
+        # Kill switch: re-key every member at ``begin_walk`` (legacy cost,
+        # identical order) through the same code path.
+        self.rebuild_each_walk = rebuild_each_walk
+
+    def _key(self, node):
+        key_fn = self._key_fn
+        if key_fn is None:
+            key_fn = self._key_fn = self._key_provider()
+        return key_fn(node)
+
+    @property
+    def walking(self) -> bool:
+        return self._pending is not None
+
+    def __len__(self) -> int:
+        return len(self._live)
+
+    def refresh(self, node) -> None:
+        """Membership hook: (re-)key ``node`` if it is a member of the set."""
+        if node not in self._members:
+            return
+        if self._pending is not None:
+            self._pending.append(node)
+            return
+        self._upsert(node)
+
+    def touch(self, node) -> None:
+        """Key-mutation hook: one dict lookup for non-members."""
+        if node in self._live:
+            self.refresh(node)
+
+    def promote(self, node) -> None:
+        """Walk-time explicit push (the evicted leaf's parent), visible now."""
+        if node in self._members:
+            self._upsert(node)
+
+    def forget(self, node) -> None:
+        """Membership-removal hook."""
+        if self._live.pop(node, None) is not None:
+            self._maybe_compact()
+
+    def _upsert(self, node) -> None:
+        key = self._key(node)
+        live = self._live
+        if live.get(node) == key:
+            return
+        live[node] = key
+        heapq.heappush(self._heap, (key, node))
+        self._maybe_compact()
+
+    def begin_walk(self) -> None:
+        assert self._pending is None, "eviction walk already in progress"
+        if self.rebuild_each_walk:
+            for node in self._members:
+                self._upsert(node)
+        self._pending = []
+        self._yielded = []
+
+    def pop_next(self):
+        """Next valid victim in key order, or ``None`` when exhausted."""
+        heap = self._heap
+        live = self._live
+        members = self._members
+        while heap:
+            key, node = heapq.heappop(heap)
+            if live.get(node) != key:
+                continue  # superseded, forgotten or already yielded
+            del live[node]
+            if node not in members:
+                continue  # defensive: should have been forgotten
+            self._yielded.append(node)
+            return node
+        return None
+
+    def end_walk(self) -> None:
+        pending, yielded = self._pending, self._yielded
+        self._pending = None
+        self._yielded = None
+        # Declined victims regain a live entry; entrants born during the walk
+        # and members touched mid-walk get their fresh key.
+        for node in yielded:
+            self.refresh(node)
+        for node in pending:
+            self.refresh(node)
+        # A yielded victim that the caller destroyed drops its live entry
+        # without passing a bound check; a walk leaves one stale entry per evicted leaf.
+        self._maybe_compact()
+
+    def _compact_threshold(self) -> int:
+        return 2 * len(self._live) + 64
+
+    def _maybe_compact(self) -> None:
+        if len(self._heap) > self._compact_threshold():
+            self._compact()
+
+    def _compact(self) -> None:
+        # Filter ``_live`` in place: the tree core keeps direct references to
+        # it for its inlined membership checks.
+        live = self._live
+        members = self._members
+        for node in [n for n in live if n not in members]:
+            del live[node]
+        self._heap = [(k, n) for n, k in live.items()]
+        heapq.heapify(self._heap)
+
+    def check_invariants(self, report: Callable[[str], Any], name: str) -> None:
+        """Append invariant violations via ``report``; only meaningful
+        outside a walk (a walk is allowed to have yielded members)."""
+        if self._pending is not None:
+            return
+        members = self._members
+        live = self._live
+        extra = [n for n in live if n not in members]
+        missing = [n for n in members if n not in live]
+        if extra:
+            report(f"[{name}] live but not member: {[n.id for n in extra[:5]]}")
+        if missing:
+            report(f"[{name}] member without live entry: {[n.id for n in missing[:5]]}")
+        stale_key = [n for n in members if n in live and live[n] != self._key(n)]
+        if stale_key:
+            report(f"[{name}] live key out of date: {[n.id for n in stale_key[:5]]}")
+        heap_keys: dict = {}
+        for key, node in self._heap:
+            heap_keys.setdefault(node, []).append(key)
+        no_entry = [n for n, k in live.items() if k not in heap_keys.get(n, ())]
+        if no_entry:
+            report(
+                f"[{name}] live entry missing from heap: {[n.id for n in no_entry[:5]]}"
+            )
+        if len(self._heap) > self._compact_threshold():
+            report(
+                f"[{name}] heap not compacted: {len(self._heap)} entries for {len(live)} live"
+            )
+
+
 class _InsertPhase(Enum):
     WALK = auto()
     COMMIT = auto()
@@ -457,6 +641,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return None
         return lambda node: node.component_data[ct].session_ref > 0
 
+    def _full_eviction_key_fn(self) -> Callable[[UnifiedTreeNode], Any]:
+        """Eviction key of the Full component (session-ref tuple when session
+        radix cache is on, else the strategy priority). Bound lazily because
+        the component binds its strategy only after the tree attaches."""
+        full = self.components_by_type[BASE_COMPONENT_TYPE]
+        ensure = getattr(full, "_ensure_eviction_strategy", None)
+        if ensure is not None:
+            ensure()
+        key_fn = getattr(full, "session_ref_eviction_strategy", None)
+        return key_fn if key_fn is not None else self.eviction_strategy.get_priority
+
+    def _touch_full_eviction_key(self, node: UnifiedTreeNode) -> None:
+        """Call after any write to a Full eviction-key input
+        (last_access_time, hit_count, priority, Full session_ref).
+        One dict lookup for the common non-leaf case."""
+        if node in self._full_device_live:
+            self.full_device_heap.refresh(node)
+        elif node in self._full_host_live:
+            self.full_host_heap.refresh(node)
+
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
@@ -488,6 +692,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        # Persistent lazy heaps over the Full component's evictable leaves
+        # (see _LazyLeafHeap). Keys are resolved lazily on first use.
+        rebuild_each_walk = not envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.get()
+        self.full_device_heap = _LazyLeafHeap(
+            self.evictable_device_leaves,
+            self._full_eviction_key_fn,
+            rebuild_each_walk=rebuild_each_walk,
+        )
+        self.full_host_heap = _LazyLeafHeap(
+            self.evictable_host_leaves,
+            self._full_eviction_key_fn,
+            rebuild_each_walk=rebuild_each_walk,
+        )
+        # Direct references for the inlined "is this node live?" checks on the
+        # match/insert/lock hot paths (the heaps filter these dicts in place).
+        self._full_device_live = self.full_device_heap._live
+        self._full_host_live = self.full_host_heap._live
         self.host_lru_lists = {
             ct: UnifiedLRUList(
                 ct,
@@ -891,6 +1112,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cur_time = get_and_increase_time_counter()
         while node_update:
             node_update.last_access_time = cur_time
+            self._touch_full_eviction_key(node_update)
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -959,6 +1181,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        self._touch_full_eviction_key(node)
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -974,6 +1197,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.is_write_back:
             return False
         node.hit_count += 1
+        self._touch_full_eviction_key(node)
 
         if self.enable_external_cache_linker:
             return (
@@ -1159,6 +1383,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 step_actions.append(action)
         node.priority = max(node.priority, state.priority)
+        self._touch_full_eviction_key(node)
 
         if node.evicted:
             self._unevict_node_on_insert(node, state.value[:prefix_len])
@@ -1406,13 +1631,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Update both device and host leaf sets for a node."""
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
+            self.full_device_heap.refresh(node)
         else:
             self.evictable_device_leaves.discard(node)
+            if node in self._full_device_live:
+                self.full_device_heap.forget(node)
 
         if self._is_host_leaf(node):
             self.evictable_host_leaves.add(node)
+            self.full_host_heap.refresh(node)
         else:
             self.evictable_host_leaves.discard(node)
+            if node in self._full_host_live:
+                self.full_host_heap.forget(node)
 
     def _update_duplicate_tracking(self, node: UnifiedTreeNode) -> None:
         """Register where duplicates are born (acks, split, unevict);
@@ -1602,6 +1833,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         self.evictable_device_leaves.discard(node)
         self.evictable_host_leaves.discard(node)
+        self.full_device_heap.forget(node)
+        self.full_host_heap.forget(node)
 
     def _delete_unbacked_device_leaf(
         self,
@@ -1751,6 +1984,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
+        self.full_host_heap.forget(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker, device_frees, host_frees)
 
@@ -1997,6 +2231,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     )
 
             self.evictable_host_leaves.discard(cur)
+            self.full_host_heap.forget(cur)
             self._remove_leaf_from_parent(cur)
             parent = cur.parent
             self._update_evictable_leaf_sets(parent)
@@ -2624,6 +2859,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             E(
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
+
+        # Persistent eviction heaps mirror the leaf sets with fresh keys.
+        self.full_device_heap.check_invariants(E, "D-heap")
+        self.full_host_heap.check_invariants(E, "H-heap")
 
         if self.enable_session_radix_cache:
             for component in self.components:
