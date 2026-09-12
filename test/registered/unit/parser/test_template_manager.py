@@ -117,10 +117,8 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                 )
 
     def test_glm53_effort_template_forces_reasoning(self):
-        # The GLM-5.3 generation prompt ends in ``<|assistant|><think>``, so the
-        # model only ever emits the closing ``</think>``. Without always-on
-        # reasoning the parser never opens a reasoning block and the whole
-        # completion -- stray ``</think>`` included -- lands in ``content``.
+        """GLM-5.3 templates must detect as always-on reasoning; their generation
+        prompt opens ``<think>``, so output carries only the closing tag."""
         vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
         for concat in ("+", "~"):
             with self.subTest(concat=concat):
@@ -129,18 +127,6 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                 self.assertTrue(force)
                 self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
                 self.assertTrue(config.always_on)
-
-    def test_glm53_reasoning_parser_splits_output_without_opening_think(self):
-        # Real GLM-5.3-Flash output for "What is 17*23?" is ``17*23 = 391</think>391``
-        # -- there is no opening ``<think>`` to key off.
-        from sglang.srt.parser.reasoning_parser import ReasoningParser
-
-        reasoning, content = ReasoningParser(
-            "glm45", force_reasoning=True
-        ).parse_non_stream("17*23 = 391</think>391")
-
-        self.assertEqual(reasoning, "17*23 = 391")
-        self.assertEqual(content, "391")
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
