@@ -357,6 +357,28 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         )
         self.assertEqual(streamed, "Answer<|e")
 
+    def test_skipped_think_answer_streams_as_output_text_on_stop(self):
+        """GLM output that ends on EOS without closing the template-opened
+        <think> streams live as reasoning and is re-emitted as output text
+        when the stream finishes, so the answer reaches the client."""
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        answer = '```json\n{"kind": "tool", "operation": "alerts"}\n```'
+        fixture = StreamFixture(serving, request, require_reasoning=True)
+        events = fixture.run(
+            [engine_chunk(answer[:10], 4), engine_chunk(answer, 9, finish=True)]
+        )
+
+        streamed = "".join(
+            p["delta"]
+            for ev, p in zip(event_types(events), event_payloads(events))
+            if ev == "response.output_text.delta"
+        )
+        self.assertEqual(streamed, answer)
+
 
 class HarmonyStreamLifecycleTestCase(CustomTestCase):
     def test_truncated_harmony_arguments_close_the_emitted_item(self):
