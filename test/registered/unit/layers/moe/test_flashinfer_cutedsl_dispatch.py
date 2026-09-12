@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_flashinfer_prefill_returns_standard_combine_input():

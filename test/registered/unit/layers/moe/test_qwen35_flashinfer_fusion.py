@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen3_5_text import Qwen3_5ForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 @dataclass(frozen=True)

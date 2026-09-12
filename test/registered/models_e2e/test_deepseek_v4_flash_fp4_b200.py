@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=624, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MTP_MODEL = "deepseek-ai/DeepSeek-V4-Flash"

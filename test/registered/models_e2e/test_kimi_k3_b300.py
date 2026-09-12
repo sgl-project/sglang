@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=578, stage="base-c", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3"
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"

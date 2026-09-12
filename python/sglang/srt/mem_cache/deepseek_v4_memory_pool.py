@@ -266,16 +266,24 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
 # Low-ratio indexer-K pool page, in compressed slots: the DeepGEMM indexer reads
 # K in blocks of at most 128 and sglang's JIT metadata builder asserts 64.
-DSV41_INDEX_PAGE_SIZE = 64
+def dsv41_index_page_size() -> int:
+    if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
+        return 128
+    return 64
+
+
+DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 
 
 class DeepSeekV4IndexerPool(KVCache):

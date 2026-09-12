@@ -837,14 +837,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -868,7 +868,7 @@ class C4IndexerBackendMixin:
                     indexer_metadata.c4_page_size,
                     row_raw_indices,
                 )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+            elif self.dsa_topk_backend.should_use_topk_v2():
                 topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
@@ -882,6 +882,7 @@ class C4IndexerBackendMixin:
                         if rows == all_rows or not is_hip()
                         else plan_topk_v2(c4_seq_lens[rows])
                     ),
+                    row_raw_indices,
                 )
             else:
                 topk_transform_paged(
@@ -1125,6 +1126,64 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+        )
+
+
+def fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
+    reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
+def fp32_jit_paged_topk(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
+    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
+    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            raw_indices,
         )
 
 

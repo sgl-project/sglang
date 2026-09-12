@@ -27,18 +27,17 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
-    _adopt_plain_weight_norm_state,
     _assign_direct_gpu_vae_state,
     _backfill_ltx2_audio_vae_latent_stats,
     _consume_vae_checkpoint_arch_metadata,
     _direct_gpu_vae_state_slots,
-    _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     checkpoint_bytes,
     keep_checkpoint_mapped,
+    load_model_state_dict,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
@@ -47,6 +46,7 @@ from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeServerArgs:
@@ -131,28 +131,26 @@ class TestKeepCheckpointMapped(unittest.TestCase):
             )
 
 
-class TestMatchCheckpointDtypes(unittest.TestCase):
+class TestMatchCheckpointDtypes(CustomTestCase):
     """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
 
-    def test_a_matching_tensor_is_left_alone(self):
-        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
-        before = loaded["w"]
-        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.float32)})
-        self.assertIs(loaded["w"], before)
-
-    def test_a_mismatched_tensor_is_converted(self):
-        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
-        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.bfloat16)})
-        self.assertEqual(loaded["w"].dtype, torch.bfloat16)
-
-    def test_a_tensor_the_module_does_not_want_is_left_alone(self):
-        loaded = {"extra": torch.zeros(4, dtype=torch.float32)}
-        before = loaded["extra"]
-        _match_checkpoint_dtypes(loaded, {})
-        self.assertIs(loaded["extra"], before)
+    def test_assignment_preserves_mixed_dtypes_and_matching_storage(self):
+        model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        model.register_buffer("scale", torch.zeros(4, dtype=torch.float32))
+        weights = {
+            "weight": torch.ones(4, 4, dtype=torch.float32),
+            "scale": torch.ones(4, dtype=torch.float32),
+        }
+        checkpoint_weight = weights["weight"]
+        load_model_state_dict(model, weights, assign=True)
+        self.assertEqual(model.weight.dtype, torch.bfloat16)
+        self.assertEqual(model.scale.dtype, torch.float32)
+        self.assertEqual(model.scale.data_ptr(), weights["scale"].data_ptr())
+        self.assertNotEqual(model.weight.data_ptr(), checkpoint_weight.data_ptr())
+        self.assertTrue(torch.equal(model.weight.float(), checkpoint_weight))
 
 
-class TestPlainWeightNormCheckpoint(unittest.TestCase):
+class TestPlainWeightNormCheckpoint(CustomTestCase):
     def test_adopts_a_folded_weight_without_reconstructing_it(self):
         module = nn.Sequential(
             torch.nn.utils.parametrizations.weight_norm(
@@ -162,8 +160,7 @@ class TestPlainWeightNormCheckpoint(unittest.TestCase):
         expected = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) / 19
         loaded = {"0.weight": expected}
 
-        self.assertEqual(_adopt_plain_weight_norm_state(module, loaded), 1)
-        module.load_state_dict(loaded, strict=True)
+        load_model_state_dict(module, loaded)
 
         self.assertEqual(set(module.state_dict()), {"0.weight"})
         self.assertTrue(torch.equal(module[0].weight, expected))
@@ -180,8 +177,7 @@ class TestPlainWeightNormCheckpoint(unittest.TestCase):
             "0.weight_v": original_state["0.parametrizations.weight.original1"].clone(),
         }
 
-        self.assertEqual(_adopt_plain_weight_norm_state(module, loaded), 0)
-        module.load_state_dict(loaded, strict=True)
+        load_model_state_dict(module, loaded)
 
         self.assertIn("0.parametrizations.weight.original0", module.state_dict())
 

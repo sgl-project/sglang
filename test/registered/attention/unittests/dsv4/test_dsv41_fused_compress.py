@@ -1,7 +1,9 @@
 """Check decode numerics and packed writes through the real cache pool."""
 
+import os
 import types
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -194,6 +196,14 @@ def _reference(t, ratio: int):
         read = t.req * t.ring_size + (t.pos - 1) % t.ring_size
         partner_kv = t.pair_state[read, :HEAD_DIM]
         partner_score = t.pair_state[read, HEAD_DIM:]
+        if hasattr(t, "draft_len"):
+            # In-block predecessors come from this projection, not stale ring
+            # slots. This reference deliberately uses the unfused torch chain.
+            in_block = torch.arange(t.pos.numel(), device="cuda") % t.draft_len != 0
+            partner_kv = torch.where(in_block[:, None], kv.roll(1, 0), partner_kv)
+            partner_score = torch.where(
+                in_block[:, None], score.roll(1, 0), partner_score
+            )
         pooled = (
             torch.stack([partner_kv, kv], dim=1)
             * torch.stack([partner_score, score], dim=1).softmax(dim=1)
@@ -261,7 +271,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
             DeepseekV4AttnBackend,
         )
 
-        DeepseekV4AttnBackend._low_ratio_compress_decode_fused(
+        DeepseekV4AttnBackend._low_ratio_compress_fused(
             t.backend, t.layer, t.x, t.req, t.pos
         )
         ref_kv, ref_index = _reference(t, ratio)
@@ -322,6 +332,79 @@ class TestFusedLowRatioCompress(CustomTestCase):
             for n in (1, 64):
                 with self.subTest(ratio=ratio, n=n):
                     self._check_step(_build(n, ratio, seed=100 + n + ratio), ratio)
+
+    def test_static_verify_dispatch_and_real_pool_writes(self):
+        from sglang.kernels.ops.attention.dsv4.c2 import c2_verify_norm_rope_store
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            _low_ratio_compression_metadata,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path="dummy",
+                page_size=POOL_PAGE_SIZE,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                speculative_dspark_block_size=5,
+            )
+        )
+        try:
+            t = _build(12, 2, seed=418)
+            t.draft_len = 6
+            t.req.copy_(torch.arange(2, device="cuda").repeat_interleave(6))
+            t.pos.copy_(
+                (
+                    torch.tensor([31, 32], device="cuda")[:, None]
+                    + torch.arange(6, device="cuda")
+                ).flatten()
+            )
+            core = t.backend.forward_metadata.core_metadata
+            t.out_loc, _ = _low_ratio_compression_metadata(
+                2, t.pos + 1, core.raw_out_loc
+            )
+            core.c2_out_loc = t.out_loc
+            angles = torch.randn(64, ROPE_DIM // 2, device="cuda")
+            t.freqs = t.layer.freqs_cis = torch.polar(torch.ones_like(angles), angles)
+            backend = t.backend
+            backend.is_dspark_draft = False
+            backend.speculative_num_draft_tokens = 6
+            backend._low_ratio_compress_fused = types.MethodType(
+                DeepseekV4AttnBackend._low_ratio_compress_fused, backend
+            )
+            backend._low_ratio_compress_torch = Mock()
+            batch = types.SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY, batch_size=2
+            )
+            with (
+                patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.c2.c2_verify_norm_rope_store",
+                    wraps=c2_verify_norm_rope_store,
+                ) as fused,
+            ):
+                DeepseekV4AttnBackend._low_ratio_compress(
+                    backend, t.layer, t.x, t.req, t.pos, batch
+                )
+                fused.assert_called_once()
+                self.assertEqual(fused.call_args.kwargs["draft_len"], 6)
+            backend._low_ratio_compress_torch.assert_not_called()
+            ref_kv, ref_index = _reference(t, 2)
+            self.assertTrue(torch.equal(t.kv_cache.view(torch.uint8), ref_kv))
+            self.assertTrue(torch.equal(t.index_cache, ref_index))
+
+            # A compact graph can happen to have a divisible row count. It must
+            # still use the variable-length fallback rather than the 2D grid.
+            with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}):
+                DeepseekV4AttnBackend._low_ratio_compress(
+                    backend, t.layer, t.x, t.req, t.pos, batch
+                )
+            backend._low_ratio_compress_torch.assert_called_once()
+        finally:
+            set_global_server_args_for_scheduler(
+                ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
+            )
 
 
 if __name__ == "__main__":

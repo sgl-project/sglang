@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-b-e2e-mlx, which the
 # macOS CI lane (pr-test-mlx.yml) only dispatches via a gated workflow_dispatch.
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-b-e2e-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

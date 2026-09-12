@@ -23,7 +23,7 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
     :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
     (:meth:`rust_json`) and the drain adapter
-    (:meth:`RustMmProcessor.build_output`)."""
+    (:meth:`RustMmProcessor.wrap_encoded`)."""
 
     family: str
     feature_shm: bool
@@ -119,7 +119,7 @@ class RustMmProcessor:
     TokenizerManager would build — not to process requests (the Rust worker pool
     does that, GIL-free) but as the source of truth
     :meth:`resolve_spec` resolves the pipeline parameters from. At drain
-    time :meth:`build_output` wraps the Rust-produced buffers into the
+    time :meth:`wrap_encoded` wraps the Rust-produced buffers into the
     scheduler's ``MultimodalProcessorOutput``.
 
     There is no Python fallback: a model without a Rust MM spec fails at launch,
@@ -174,17 +174,17 @@ class RustMmProcessor:
         )
         if family is None:
             return None
-        ip = getattr(self._processor, "image_processor", None)
-        resample = family.image_processors.get(type(ip).__name__)
+        image_processor = getattr(self._processor, "image_processor", None)
+        resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
             return None
         # The Rust pipeline always resizes, rescales by 1/255 and normalizes;
         # Rust's fused normalize constants assume that factor. Anything else
         # would silently produce different features.
         stages = ("do_resize", "do_rescale", "do_normalize")
-        if not all(getattr(ip, stage, True) for stage in stages):
+        if not all(getattr(image_processor, stage, True) for stage in stages):
             return None
-        if getattr(ip, "rescale_factor", None) != 1 / 255:
+        if getattr(image_processor, "rescale_factor", None) != 1 / 255:
             return None
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
@@ -193,25 +193,27 @@ class RustMmProcessor:
         if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
             return None
 
-        size = getattr(ip, "size", None) or {}
+        size = getattr(image_processor, "size", None) or {}
         min_pixels = image_overrides.get(
-            "min_pixels", getattr(ip, "min_pixels", None) or size.get("shortest_edge")
+            "min_pixels",
+            getattr(image_processor, "min_pixels", None) or size.get("shortest_edge"),
         )
         max_pixels = image_overrides.get(
-            "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
+            "max_pixels",
+            getattr(image_processor, "max_pixels", None) or size.get("longest_edge"),
         )
         try:
             spec = RustMmSpec(
                 family=family.name,
                 feature_shm=self._use_feature_shm(),
                 image_token_id=hf_config.image_token_id,
-                patch_size=ip.patch_size,
-                merge_size=ip.merge_size,
-                temporal_patch_size=ip.temporal_patch_size,
+                patch_size=image_processor.patch_size,
+                merge_size=image_processor.merge_size,
+                temporal_patch_size=image_processor.temporal_patch_size,
                 min_pixels=int(min_pixels),
                 max_pixels=int(max_pixels),
-                image_mean=tuple(float(x) for x in ip.image_mean),
-                image_std=tuple(float(x) for x in ip.image_std),
+                image_mean=tuple(float(x) for x in image_processor.image_mean),
+                image_std=tuple(float(x) for x in image_processor.image_std),
                 resample=resample,
                 vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
                 vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
@@ -247,10 +249,11 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def build_output(spec: RustMmSpec, entry):
-        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmEncodeResult``
-        into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
-        resize, patchify, token expansion and M-RoPE all ran in Rust.
+    def wrap_encoded(spec: RustMmSpec, encoded):
+        """Drain-time adapter: wrap the Rust-produced buffers of one
+        ``MmEncodedResult`` into the scheduler's ``MultimodalProcessorOutput``.
+        Wrapping only — load, resize, patchify, token expansion and M-RoPE all
+        ran in Rust.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         ``take_mm_result``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -267,13 +270,13 @@ class RustMmProcessor:
             MultimodalProcessorOutput,
         )
 
-        shm_names = entry.shm_names
+        shm_names = encoded.shm_names
         if shm_names is None:
-            features = torch.from_numpy(entry.features.reshape(-1, spec.feature_dim))
+            features = torch.from_numpy(encoded.features.reshape(-1, spec.feature_dim))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(entry.grids, entry.hashes, entry.offsets)
+            zip(encoded.grids, encoded.hashes, encoded.offsets)
         ):
             n = t * h * w
             if shm_names is None:
@@ -314,6 +317,8 @@ class RustMmProcessor:
             im_start_id=spec.vision_start_token_id,
             im_end_id=spec.vision_end_token_id,
             video_token_id=spec.video_token_id,
-            mrope_positions=torch.from_numpy(entry.mrope.reshape(3, -1)),
-            mrope_position_delta=torch.tensor([[entry.mrope_delta]], dtype=torch.long),
+            mrope_positions=torch.from_numpy(encoded.mrope.reshape(3, -1)),
+            mrope_position_delta=torch.tensor(
+                [[encoded.mrope_delta]], dtype=torch.long
+            ),
         )

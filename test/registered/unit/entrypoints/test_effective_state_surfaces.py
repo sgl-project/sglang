@@ -31,7 +31,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 _PACKAGE_ROOT = pathlib.Path(sglang.__file__).resolve().parent
 _RUST_MODEL_INFO = (

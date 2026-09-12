@@ -940,8 +940,10 @@ class CPUGraphRunner:
             )
             captured_forward_batch.encoder_out_cache_loc = None
         if enable_num_token_non_padded():
+            # CPUGraphRunner asserts not require_gathered_buffer, so this path is
+            # never attn-TP sharded: LOCAL == GLOBAL.
             captured_forward_batch.num_token_non_padded.copy_(
-                forward_batch.num_token_non_padded
+                forward_batch.global_num_token_non_padded
             )
 
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)

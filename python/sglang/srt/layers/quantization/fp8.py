@@ -72,6 +72,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -91,6 +92,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -963,9 +965,20 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
+                # On SM120 (Blackwell RTX 50) the per-tensor FP8 path dispatches
+                # to the fast cudnn/nvjet SM120 kernel, which beats the
+                # channelwise cutlass GemmUniversal by ~1.2-2.7x across the
+                # decode/prefill M range (matches vLLM's per-tensor SM120
+                # choice). Requantize per-channel -> per-tensor (max scale)
+                # there instead.
+                use_sm120_fp8_pertensor = (
+                    self.cutlass_fp8_supported
+                    and not self.use_marlin
+                    and get_device_capability()[0] == 12
+                )
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    self.cutlass_fp8_supported
+                    (self.cutlass_fp8_supported and not use_sm120_fp8_pertensor)
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -1047,9 +1060,16 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8 or (
             self.block_fp8_as_mxfp8
             and getattr(layer, "block_fp8_mxfp8_ready", False)
-            and not isinstance(x, tuple)
+            and (not isinstance(x, tuple) or isinstance(x, Mxfp8SwizzledInput))
         ):
             backend = self.mxfp8_dense_backend
+            if isinstance(x, Mxfp8SwizzledInput):
+                if not (
+                    backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
+                ):
+                    raise ValueError(
+                        "128x4 MXFP8 input requires a FlashInfer CUTLASS backend"
+                    )
             extra_kwargs = {}
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
@@ -2057,6 +2077,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_cutlass():
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2611,6 +2636,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=use_mxfp8,
                 output=symm_output,
                 enable_es=(use_mxfp8, use_mxfp8),
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
 

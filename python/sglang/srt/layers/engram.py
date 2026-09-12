@@ -29,6 +29,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_VERIFY,
     engram_commit_history,
     engram_hash_ids,
+    engram_hash_ids_and_commit,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -280,7 +281,7 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
-        req_slots = forward_batch.req_pool_indices.to(torch.int64)
+        req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
         # Which request each token belongs to and where its run starts; tokens at or
@@ -314,6 +315,23 @@ class EngramHasher(nn.Module):
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
         if input_ids.is_cuda and torch.version.cuda is not None:
+            if kmode == MODE_DECODE:
+                # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
+                assert forward_batch.out_cache_loc is not None
+                return engram_hash_ids_and_commit(
+                    input_ids,
+                    forward_batch.positions,
+                    history=self.history,
+                    req_slots=req_slots,
+                    out_cache_loc=forward_batch.out_cache_loc,
+                    token_map=self.token_map,
+                    multipliers=self.multipliers,
+                    primes=self.primes,
+                    offsets=self.offsets,
+                    pad_id=self.pad_id,
+                    image_token_id=self.image_token_id,
+                    mm_pad_shift=MM_PAD_SHIFT_VALUE,
+                )
             hash_ids, tokens = engram_hash_ids(
                 input_ids,
                 forward_batch.positions,
