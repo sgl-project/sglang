@@ -7,9 +7,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torchvision.transforms.functional import to_pil_image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -25,7 +25,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.runtime_context import get_mm
-from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
+
+_FORCE_CPU_IMAGE_PREPROCESSING = envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -391,8 +392,7 @@ class KimiGPUProcessorWrapper:
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
-        backend = resolve_image_processor_backend(get_mm())
-        if images and backend != "pil" and torch.cuda.is_available():
+        if images and not _FORCE_CPU_IMAGE_PREPROCESSING and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
@@ -459,13 +459,6 @@ class KimiGPUProcessorWrapper:
         input_text = text[0] if isinstance(text, list) else text
 
         if images:
-            # GPU JPEG decoding returns CHW tensors; the HF CPU path needs PIL.
-            images = [
-                to_pil_image(image.cpu()).convert("RGB")
-                if isinstance(image, torch.Tensor)
-                else image
-                for image in images
-            ]
             # Token expansion via media_tokens_calculator
             image_token_counts = [
                 int(
@@ -520,7 +513,7 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    gpu_image_decode = not _FORCE_CPU_IMAGE_PREPROCESSING
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     # The GPU wrapper expands placeholders from the request's own token IDs.
