@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.speculative.eagle import compact_eagle_swa_mask
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -85,6 +86,8 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
+        sliding_window_size: int = -1,
     ):
         device = req_pool_indices.device
         batch_size = len(req_pool_indices)
@@ -112,7 +115,7 @@ class EagleVerifyInput(SpecInput):
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None,
+            kv_start_idx,
             kv_indices,
             req_to_token.size(1),
         )
@@ -120,6 +123,35 @@ class EagleVerifyInput(SpecInput):
             paged_kernel_lens_sum * self.draft_token_num
             + (self.draft_token_num**2) * batch_size
         )
+        if sliding_window_size >= 0:
+            assert kv_start_idx is not None
+            # Each original row includes the dropped prefix. Its batch offset
+            # also includes all prefix tokens dropped by preceding requests.
+            full_kv_indptr = cum_kv_seq_len.clone()
+            full_kv_indptr[1:] += torch.cumsum(kv_start_idx, dim=0)
+            custom_mask = torch.empty(mask_numel, dtype=torch.bool, device=device)
+            positions = self.positions
+            if positions is None:
+                # Capture uses a dummy verify input without positions. Its
+                # output is discarded; replay supplies the real tree positions.
+                positions = torch.zeros(
+                    batch_size * self.draft_token_num, dtype=torch.int64, device=device
+                )
+            compact_eagle_swa_mask[(batch_size, self.draft_token_num)](
+                self.custom_mask,
+                positions,
+                cum_kv_seq_len,
+                full_kv_indptr,
+                kv_start_idx,
+                custom_mask,
+                self.custom_mask.numel(),
+                positions.numel(),
+                self.draft_token_num,
+                sliding_window_size,
+                256,
+            )
+            return kv_indices, cum_kv_seq_len, qo_indptr, custom_mask
+
         if self.custom_mask.numel() < mask_numel:
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
             self.custom_mask = torch.cat(

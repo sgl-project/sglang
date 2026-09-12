@@ -1064,11 +1064,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            # SWA and full-attention wrappers plan different packed masks.
+            # Each must keep its own buffer through capture and replay.
+            self.cuda_graph_custom_mask = [
+                torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                for _ in range(self.num_wrappers)
+            ]
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -1114,7 +1119,7 @@ class FlashInferAttnBackend(AttentionBackend):
         for i in range(self.num_wrappers):
             extra = (
                 {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "custom_mask_buf": self.cuda_graph_custom_mask[i],
                     "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
                 }
                 if use_custom_mask
@@ -2001,6 +2006,9 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                spec_sliding_window_size=(
+                    sliding_window_size if wrapper_id == 0 else -1
+                ),
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2125,6 +2133,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        spec_sliding_window_size: int = -1,
     ):
         bs = len(seq_lens)
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
@@ -2180,6 +2189,20 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens_sum,
                         self.req_to_token,
                         kv_start_idx=kv_start_idx,
+                    )
+                )
+            elif (
+                spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+                and spec_sliding_window_size >= 0
+            ):
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        req_pool_indices,
+                        paged_kernel_lens,
+                        paged_kernel_lens_sum,
+                        self.req_to_token,
+                        kv_start_idx=kv_start_idx,
+                        sliding_window_size=spec_sliding_window_size,
                     )
                 )
             else:

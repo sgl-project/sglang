@@ -155,6 +155,57 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    EAGLE_VERIFY_CASES = tuple(
+        DenseAttentionCase(
+            name=f"eagle_swa_{prefix_lens}_{draft_tokens}_{window}",
+            backend="flashinfer",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=prefix_lens,
+            extend_lens=(draft_tokens,) * len(prefix_lens),
+            sliding_window_size=window,
+        )
+        for prefix_lens, draft_tokens, window in (
+            ((2,), 3, 4),
+            ((3, 4, 5), 3, 4),
+            ((9, 2), 3, 4),
+            ((2, 9), 3, 4),
+            ((12, 7), 3, 4),
+            ((0, 9), 3, 4),
+            ((9, 2), 7, 2),
+            ((1220, 325), 8, 1023),
+            ((325, 1220), 8, 1023),
+        )
+    )
+
+    def test_eagle_swa_verify(self):
+        for case in self.EAGLE_VERIFY_CASES:
+            for topk in (1, 2) if case.extend_lens[0] == 3 else (1,):
+                with self.subTest(case=case.name, topk=topk):
+                    run_dense_spec_verify_case(
+                        self,
+                        case,
+                        topk=topk,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        max_context_len=2048,
+                    )
+
+    def test_eagle_swa_verify_cuda_graph(self):
+        for case in self.EAGLE_VERIFY_CASES:
+            for topk in (1, 2) if case.extend_lens[0] == 3 else (1,):
+                with self.subTest(case=case.name, topk=topk):
+                    run_dense_spec_verify_cuda_graph_case(
+                        self,
+                        case,
+                        topk=topk,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        max_context_len=2048,
+                    )
+
     def test_projected_swa_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):

@@ -11,6 +11,52 @@ if _is_cpu:
 
 
 @triton.jit
+def compact_eagle_swa_mask(
+    mask,
+    positions,
+    kv_indptr,
+    full_kv_indptr,
+    kv_start_idx,
+    output,
+    mask_numel,
+    positions_numel,
+    NUM_DRAFT: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Gather full-prefix tree masks into windowed rows using logical positions."""
+    req = tl.program_id(0)
+    query = tl.program_id(1)
+    dst_begin = tl.load(kv_indptr + req).to(tl.int64)
+    row_len = tl.load(kv_indptr + req + 1) - dst_begin
+    src_begin = tl.load(full_kv_indptr + req).to(tl.int64)
+    full_row_len = tl.load(full_kv_indptr + req + 1) - src_begin
+    start = tl.load(kv_start_idx + req)
+    query_pos = tl.load(
+        positions + req * NUM_DRAFT + query,
+        mask=req * NUM_DRAFT + query < positions_numel,
+        other=0,
+    )
+    for block in range(tl.cdiv(row_len, BLOCK_SIZE)):
+        col = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = col < row_len
+        src = src_begin * NUM_DRAFT + query * full_row_len + start + col
+        # Graph padding can add requests beyond the original tree-mask buffer.
+        visible = tl.load(mask + src, mask=valid & (src < mask_numel), other=1)
+        draft_idx = col - (row_len - NUM_DRAFT)
+        key_pos = tl.load(
+            positions + req * NUM_DRAFT + draft_idx,
+            mask=valid
+            & (draft_idx >= 0)
+            & (req * NUM_DRAFT + draft_idx < positions_numel),
+            other=0,
+        )
+        key_pos = tl.where(draft_idx >= 0, key_pos, start + col)
+        visible = visible & (key_pos >= query_pos - WINDOW_LEFT)
+        tl.store(output + dst_begin * NUM_DRAFT + query * row_len + col, visible, valid)
+
+
+@triton.jit
 def fill_bonus_tokens(
     accept_tokens,
     accept_lens,

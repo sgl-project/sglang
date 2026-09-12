@@ -42,6 +42,7 @@ class SpeculativeCudaGraphAdapter:
     prepare_inputs: Callable[..., None]
     run_forward: Callable[[Any, Any, dict[str, Any]], torch.Tensor]
     expected_output: Callable[[Any, Any, dict[str, Any], Any], torch.Tensor]
+    prepare_capture_batch: Callable[[Any, Any], None] | None = None
     max_num_tokens: Callable[[Any, int], int] | None = None
     clone_state: Callable[[Any], Any] = lambda _: None
     restore_state: Callable[[Any, Any], None] = lambda _fixture, _state: None
@@ -226,7 +227,9 @@ def run_speculative_cuda_graph_case(
         max_context_len=max_context_len,
         device=device,
     )
-    adapter.prepare_batch(capture_case, capture_batch)
+    (adapter.prepare_capture_batch or adapter.prepare_batch)(
+        capture_case, capture_batch
+    )
     adapter.prepare_inputs(
         graph_fixture,
         capture_case,

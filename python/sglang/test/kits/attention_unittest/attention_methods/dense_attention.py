@@ -1231,13 +1231,20 @@ def prepare_dense_runner_inputs(
     *,
     max_context_len: int,
 ) -> None:
-    del batch
+    # The eager fixture can use shuffled pages, while capture/replay batches
+    # rebuild their mapping. Refill the cache at the current batch's locations.
+    req_to_token = (
+        fixture.runner.req_to_token_pool.req_to_token[batch.req_pool_indices]
+        .cpu()
+        .tolist()
+    )
     _populate_prefix_kv(
         fixture.actual_module,
         case,
         fixture.runner,
         inputs["prefix_hidden"],
         max_context_len=max_context_len,
+        loc_fn=lambda req_idx, pos: req_to_token[req_idx][pos],
     )
 
 
