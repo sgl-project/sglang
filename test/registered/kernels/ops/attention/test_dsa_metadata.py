@@ -21,7 +21,17 @@ def _cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _dsa_seqlens(seqlens: torch.Tensor, topk: int) -> torch.Tensor:
+def _dsa_seqlens(
+    seqlens: torch.Tensor, topk: int, index_kpool: int = 1
+) -> torch.Tensor:
+    if index_kpool > 1:
+        full_pool_tokens = (
+            torch.div(seqlens, index_kpool, rounding_mode="floor") * index_kpool
+        )
+        return (
+            torch.minimum(full_pool_tokens, torch.tensor(topk, device=seqlens.device))
+            + seqlens % index_kpool
+        )
     return torch.minimum(
         seqlens.to(torch.int32), torch.tensor(topk, device=seqlens.device)
     )
@@ -60,6 +70,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         max_len: int,
         dsa_index_topk: int,
         real_page_size: int,
+        index_kpool: int = 1,
     ):
         bs = len(seq_lens_values)
         pool_size = max(bs + 3, 8)
@@ -96,11 +107,12 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_len=max_len,
             dsa_index_topk=dsa_index_topk,
             real_page_size=real_page_size,
+            index_kpool=index_kpool,
         )
 
         expected_cache = seq_lens.to(torch.int32)
         expected_page_table = req_to_token[req_pool_indices, :max_len].contiguous()
-        expected_dsa = _dsa_seqlens(expected_cache, dsa_index_topk)
+        expected_dsa = _dsa_seqlens(expected_cache, dsa_index_topk, index_kpool)
 
         # Compare only the live prefix [:seq_len]: whole blocks starting past
         # the kv length are skipped (keep stale values), while the last
@@ -142,6 +154,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         real_page_size: int,
         next_n: int,
         fill_ctx_lens: bool,
+        index_kpool: int = 1,
     ):
         bs = len(seq_lens_values)
         expanded_size = bs * next_n
@@ -198,6 +211,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             dsa_index_topk=dsa_index_topk,
             real_page_size=real_page_size,
             next_n=next_n,
+            index_kpool=index_kpool,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
         )
 
@@ -209,7 +223,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         draft_offsets = torch.arange(next_n, dtype=torch.int32, device=self.device)
         expected_expanded = seq_lens.to(torch.int32).view(-1, 1) + draft_offsets + 1
         expected_expanded = expected_expanded.reshape(-1).contiguous()
-        expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
+        expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk, index_kpool)
 
         # Compare only the live prefix [:seq_len + next_n] per expanded row:
         # whole blocks starting past the kv length are skipped, the last
@@ -260,6 +274,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         max_extend_len: int,
         max_total_len: int,
         static_extend_len: bool,
+        index_kpool: int = 1,
     ):
         bs = len(seq_lens_values)
         total_len = sum(extend_seq_lens_values)
@@ -315,6 +330,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_extend_len=max_extend_len,
             max_total_len=max_total_len,
             static_extend_len=static_extend_len,
+            index_kpool=index_kpool,
         )
 
         expected_cache = seq_lens.to(torch.int32)
@@ -337,7 +353,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             if expanded_parts
             else torch.empty(0, dtype=torch.int32, device=self.device)
         )
-        expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk)
+        expected_dsa = _dsa_seqlens(expected_expanded, dsa_index_topk, index_kpool)
 
         # Compare only the live prefix [:kv_len]: whole blocks starting past
         # kv_len are skipped, the last partially live block may still write
@@ -440,6 +456,38 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_total_len=16,
             static_extend_len=False,
         )
+
+    def test_kpool_live_tails_across_pool_page_and_topk_boundaries(self):
+        for index_kpool in (2, 4):
+            with self.subTest(index_kpool=index_kpool):
+                lengths = [1, 3, 4, 63, 64, 65, 255, 256, 257, 2048, 2049, 4099]
+                self._check_decode(
+                    lengths,
+                    max_len=4609,
+                    dsa_index_topk=2048,
+                    real_page_size=64,
+                    index_kpool=index_kpool,
+                )
+                self._check_target_verify(
+                    lengths,
+                    max_seqlen_k=4609,
+                    dsa_index_topk=2048,
+                    real_page_size=64,
+                    next_n=4,
+                    fill_ctx_lens=True,
+                    index_kpool=index_kpool,
+                )
+                self._check_draft_extend(
+                    [66, 257, 2050, 4099],
+                    [4, 4, 4, 4],
+                    max_seqlen_k=4609,
+                    dsa_index_topk=2048,
+                    real_page_size=64,
+                    max_extend_len=4,
+                    max_total_len=16,
+                    static_extend_len=True,
+                    index_kpool=index_kpool,
+                )
 
     def test_empty_batch(self):
         self._check_decode(
