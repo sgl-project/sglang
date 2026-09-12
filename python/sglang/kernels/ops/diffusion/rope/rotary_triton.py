@@ -125,9 +125,45 @@ def apply_rotary_embedding(
     return output
 
 
+def apply_rotary_embedding_cpu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool = False,
+) -> torch.Tensor:
+    supported_dtypes = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    }
+
+    # Preserve the previous fallback behavior for unsupported dtypes
+    # or mismatched cos/sin dtypes.
+    if (
+        x.dtype not in supported_dtypes
+        or cos.dtype not in supported_dtypes
+        or sin.dtype not in supported_dtypes
+        or cos.dtype != sin.dtype
+    ):
+        return lazy_fallback("torch", "apply_rotary_embedding_native")(
+            x, cos, sin, interleaved
+        )
+    head_size = x.shape[-1]
+    assert head_size % 2 == 0, "head_size must be divisible by 2"
+
+    if interleaved and cos.shape[-1] == head_size:
+        cos = cos[..., ::2].contiguous()
+        sin = sin[..., ::2].contiguous()
+    else:
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+
+    return torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
+
+
 apply_rotary_embedding = select_impl(
     apply_rotary_embedding,
     npu=lazy_fallback("npu", "apply_rotary_embedding_native"),
     mps=lazy_fallback("torch", "apply_rotary_embedding_native"),
-    cpu=lazy_fallback("torch", "apply_rotary_embedding_native"),
+    cpu=apply_rotary_embedding_cpu,
 )
