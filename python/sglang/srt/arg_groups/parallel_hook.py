@@ -115,11 +115,8 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def handle_dcp_defaults(server_args: Any):
+def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
-
-
-def handle_dcp_validation(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(

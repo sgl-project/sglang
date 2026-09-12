@@ -3410,7 +3410,7 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 class TestDcpCommBackendDefault(CustomTestCase):
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)
-        parallel_hook.handle_dcp_defaults(args)
+        parallel_hook.handle_decode_context_parallelism(args)
         return resolution_result(args, "dcp_comm_backend")
 
     def test_no_dcp_is_ag_rs(self):
