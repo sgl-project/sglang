@@ -493,6 +493,12 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             self.precomputed_embeddings = (
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
+        # Parallel sampling can shallow-copy the item and share this dictionary.
+        if any(
+            isinstance(value, CudaIpcTensorTransportProxy)
+            for value in self.model_specific_data.values()
+        ):
+            self.model_specific_data = dict(self.model_specific_data)
         for extra_key in self.model_specific_data:
             if isinstance(
                 self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
