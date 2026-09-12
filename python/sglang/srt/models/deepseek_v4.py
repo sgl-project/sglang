@@ -722,7 +722,7 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host: run them outside
     # the prefill CUDA graph on the live batch, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -745,6 +745,35 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
+
+
+def _mooncake_engram_capture(model, input_ids, forward_batch):
+    layout = model.engram_layout
+    for layer_id in layout.layer_ids:
+        model.layers[layer_id].engram.embed.buffer(input_ids.shape[0])
+    return torch.zeros(
+        (
+            input_ids.shape[0],
+            len(layout.layer_ids),
+            (layout.max_ngram_size - 1) * layout.n_heads,
+        ),
+        dtype=torch.int64,
+        device=input_ids.device,
+    )
+
+
+@eager_on_graph(True, capture_stub=_mooncake_engram_capture)
+def _prefetch_mooncake_engram(model, input_ids, forward_batch):
+    from sglang.srt.model_executor.runner_utils import capture_mode
+
+    if capture_mode.is_capture_mode:
+        return _mooncake_engram_capture(model, input_ids, forward_batch)
+    if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+        forward_batch = get_tc_piecewise_forward_context().forward_batch
+    hash_ids = model.engram_hasher(input_ids, forward_batch)
+    for index, layer_id in enumerate(model.engram_layout.layer_ids):
+        model.layers[layer_id].engram.embed.prefetch(hash_ids[:, index])
+    return hash_ids
 
 
 class MqaAttentionBase(nn.Module):
@@ -3627,7 +3656,9 @@ class DeepseekV4Model(nn.Module):
             is_cp_v2_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
         if self.engram_hasher is not None:
-            if cp_extend:
+            if envs.SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG.get():
+                hash_ids = _prefetch_mooncake_engram(self, input_ids, forward_batch)
+            elif cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
                 hash_ids = self.engram_hasher(

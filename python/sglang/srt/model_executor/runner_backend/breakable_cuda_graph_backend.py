@@ -26,6 +26,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -129,7 +130,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
-        if self._shared_output_buffer is None:
+        # Decode returns a structured logits object. Retain its captured tensors
+        # per shape, as the full graph backend does; prefill shares a tensor buffer.
+        keep_output = isinstance(warmup_out, LogitsProcessorOutput)
+        if not keep_output and self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with (
             graph_pool_capture_scope(),
@@ -142,10 +146,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if not keep_output:
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = (
+            out
+            if keep_output
+            else self._slice_output(self._shared_output_buffer, out_rows)
+        )
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.

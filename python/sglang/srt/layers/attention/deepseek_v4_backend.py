@@ -284,7 +284,9 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
         get_tc_piecewise_forward_context,
     )
 
-    real = get_tc_piecewise_forward_context().forward_batch.num_token_non_padded_cpu
+    real = (
+        get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
+    )
     if real is None:
         real = x.shape[0]
 

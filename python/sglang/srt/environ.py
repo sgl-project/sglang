@@ -1428,6 +1428,8 @@ class Envs:
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Optional JSON connection/layout manifest for the Mooncake host backend.
+    SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG = EnvStr("")
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
     # Pin and map the host table with cudaHostRegister. False leaves the plain

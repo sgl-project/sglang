@@ -24,6 +24,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -649,6 +650,25 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 use_multithread = False
 
+            skip_tensor_names = None
+            if envs.SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG.get():
+                if (
+                    weight_loader_disable_mmap
+                    or self.load_config.load_format == LoadFormat.FASTSAFETENSORS
+                ):
+                    raise ValueError(
+                        "Mooncake Engram requires the mmap safetensors loader"
+                    )
+                manifest = json.loads(
+                    Path(envs.SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG.get()).read_text()
+                )
+                skip_tensor_names = {
+                    f"layers.{layer}.engram.embed.{part}"
+                    for layer in manifest["layers"]
+                    for part in ("weight", "scale")
+                }
+                use_multithread = False
+
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -670,6 +690,7 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
+                    skip_tensor_names=skip_tensor_names,
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
