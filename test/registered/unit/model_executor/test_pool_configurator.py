@@ -940,6 +940,53 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_dp_attention_budgets_draft_pool_at_attention_tp(self):
+        """Under DP-attention the draft pool is budgeted at the attention
+        group's width, not the global TP group's. The global tp_size shards
+        the draft heads across ranks that never share them, so the budget
+        under-counts the pool each rank allocates and boot OOMs at
+        mem-fraction-static values the target alone fits.
+        """
+        import torch
+
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            _resolve_dflash_draft_cell_size,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        # 8 kv heads sharded the way ModelConfig.get_num_kv_heads does.
+        draft = SimpleNamespace(
+            get_num_kv_heads=lambda tp_size, dcp_size=1: max(1, 8 // tp_size),
+            head_dim=128,
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+
+        def _cell(**parallel_fields):
+            _publish_config(
+                self,
+                tp_size=8,
+                attn_cp_size=1,
+                kv_cache_dtype="auto",
+                **parallel_fields,
+            )
+            return _resolve_dflash_draft_cell_size(
+                server_args=get_server_args(),
+                draft_model_config=draft,
+                draft_num_layers=5,
+            )
+
+        # tp8/dp8: attn_tp=1, the rank keeps all 8 heads.
+        self.assertEqual(
+            _cell(dp_size=8, enable_dp_attention=True),
+            8 * (128 + 128) * 5 * KV_SIZE,
+        )
+        # Without DP-attention the attention group is the whole TP group.
+        self.assertEqual(
+            _cell(dp_size=1, enable_dp_attention=False),
+            1 * (128 + 128) * 5 * KV_SIZE,
+        )
+
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240

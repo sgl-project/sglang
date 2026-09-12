@@ -7,8 +7,10 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
     configured_tp_size,
     get_model,
+    get_parallel,
     get_spec,
 )
 
@@ -238,11 +240,20 @@ def _resolve_dflash_draft_cell_size(
                 get_spec().speculative_draft_attention_backend
             ),
         )
+        # Configured sizes, not live ones: this runs before dist init. The
+        # draft pool is later built at the attention group's width (attn_tp),
+        # and under DP-attention that is narrower than the global TP group —
+        # tp_size shards the draft heads across ranks that never share them,
+        # under-counting the pool each rank actually allocates.
+        attn_dp_size = (
+            get_parallel().dp_size if get_parallel().enable_dp_attention else 1
+        )
+        attn_tp_size = configured_tp_size() // attn_dp_size // configured_attn_cp_size()
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=configured_tp_size(),
+            tp_size=attn_tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
