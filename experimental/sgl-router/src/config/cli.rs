@@ -135,6 +135,16 @@ pub struct Cli {
     /// Maximum uncached-work difference that pressure may override.
     #[arg(long)]
     pub cache_switch_margin_tokens: Option<u64>,
+    /// Queue gate for cache affinity: a worker whose engine reports at least
+    /// this many waiting (queued) requests cannot win a selection on cache
+    /// affinity. The request goes to another worker holding the same prefix,
+    /// or failing that to the least-loaded worker that is not queueing; when
+    /// every worker is queueing the least-loaded worker overall keeps the
+    /// fleet routable. Unset disables the gate. Requires
+    /// `--policy cache_aware`; scale with the engine's `--dp-size` because
+    /// the published queue sums across a worker's DP ranks.
+    #[arg(long)]
+    pub worker_queue_limit: Option<u64>,
 
     // ---- score composition ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -321,11 +331,15 @@ impl Cli {
             || self.cache_candidate_min_workers.is_some()
             || self.cache_candidate_ratio.is_some()
             || self.cache_candidate_max_workers.is_some()
-            || self.cache_switch_margin_tokens.is_some();
+            || self.cache_switch_margin_tokens.is_some()
+            || self.worker_queue_limit.is_some();
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
             ));
+        }
+        if self.worker_queue_limit == Some(0) {
+            return Err(anyhow!("--worker-queue-limit must be at least 1"));
         }
         if (self.pressure_abs_threshold_tokens.is_some()
             || self.pressure_abs_threshold_ms.is_some()
@@ -545,6 +559,7 @@ impl Cli {
                 cache_switch_margin_tokens: self
                     .cache_switch_margin_tokens
                     .unwrap_or(d.cache_switch_margin_tokens),
+                worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
             })
         } else {
             None
@@ -1779,6 +1794,51 @@ mod tests {
                 .expect_err("Cache-Aware has no stable backup")
                 .to_string();
         assert!(err.contains("--stable-pair"), "got: {err}");
+    }
+
+    #[test]
+    fn worker_queue_limit_requires_cache_aware_and_a_positive_value() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .worker_queue_limit,
+            Some(4)
+        );
+
+        // Unset, the gate is disabled.
+        let defaults =
+            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051").unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .worker_queue_limit,
+            None
+        );
+
+        let err = cfg_of("--policy power_of_two --worker-queue-limit 4")
+            .expect_err("the gate only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
+
+        let err = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 0",
+        )
+        .expect_err("a zero limit would reject every queue reading")
+        .to_string();
+        assert!(err.contains("--worker-queue-limit"), "got: {err}");
     }
 
     #[test]

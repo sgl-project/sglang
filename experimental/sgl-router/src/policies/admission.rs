@@ -6,6 +6,12 @@
 //! Native Cache-Aware uses monitor-backed admission only when every expected
 //! DP rank has a fresh, complete #34608 ZMQ sample. Otherwise it falls back to
 //! Router-local load.
+//!
+//! The optional queue gate (`--worker-queue-limit`) is the one criterion here
+//! that reads the basic #34608 sample (`num_waiting_reqs`) rather than the
+//! native monitor fields: a worker already making requests wait cannot win on
+//! cache affinity. It fails open on a missing sample — see
+//! [`queue_gate_admits`].
 
 use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use crate::policies::power_of_two::select_with_snapshot;
@@ -124,10 +130,46 @@ pub struct FinalDecision {
 pub struct CacheCandidateResolution {
     pub decision: Option<FinalDecision>,
     pub prefill_pressure_source: &'static str,
+    /// Candidates actually put through KV-capacity / pending-prefill
+    /// admission. Queue-gate rejections are excluded: the gate runs first and
+    /// they are never evaluated, so counting them here would silently deflate
+    /// the rejected/evaluated ratio whenever the gate is armed.
     pub admission_evaluated_candidates: u64,
+    /// Candidates rejected by KV-capacity / pending-prefill admission. Does
+    /// not include queue-gate rejections — those are counted separately so a
+    /// busy fleet never reads as a capacity problem.
     pub admission_rejected_candidates: u64,
+    /// Candidates rejected by the queue gate: their engine queue is at or
+    /// over `--worker-queue-limit`. The gate runs BEFORE hard admission, so
+    /// these candidates were never evaluated against capacity and are
+    /// disjoint from `admission_rejected_candidates` by construction.
+    pub queue_gate_rejected_candidates: u64,
+    /// Deepest matched prefix, in blocks, among the queue-gate-rejected
+    /// candidates — the locality a diversion gave up. 0 when the gate
+    /// rejected nothing.
+    pub queue_gate_best_rejected_blocks: u32,
     pub pressure_guard_compared_pairs: u64,
     pub pressure_guard_overrides: u64,
+}
+
+/// The queue gate, in one place. Both subtle decisions live here: the
+/// boundary is `<` (a worker AT the limit is already making this request
+/// wait), and an unknown queue ADMITS. The gate reads the basic #34608
+/// sample because `num_waiting_reqs` is what the request cares about, and
+/// the router-side in-flight counter cannot separate a running request from
+/// a waiting one — so there is no honest substitute, and the gate fails open
+/// rather than comparing the limit against a different quantity.
+pub(crate) fn queue_gate_admits(
+    snapshot: &EngineLoadSnapshot,
+    worker: &Worker,
+    limit: Option<u64>,
+) -> bool {
+    let Some(limit) = limit else {
+        return true;
+    };
+    snapshot
+        .fresh_load_for_url(&worker.url)
+        .is_none_or(|load| load.num_waiting_reqs < limit)
 }
 
 /// Selects a worker from bounded cache candidates and records guard coverage.
@@ -143,13 +185,28 @@ pub fn resolve_cache_candidates(
             .iter()
             .map(|candidate| &candidate.worker),
     );
-    let admitted: Vec<&CacheCandidate> = proposal
-        .candidates
+    // The queue gate runs before hard admission so a busy worker never
+    // pollutes the capacity-rejection counters, and so the diverted-overlap
+    // audit below sees exactly the candidates the gate removed. One pass:
+    // the gate answer per candidate is what splits the set, so asking twice
+    // would re-read the snapshot for every candidate on every request.
+    let (queue_gate_admitted, queue_gate_rejected): (Vec<&CacheCandidate>, Vec<&CacheCandidate>) =
+        proposal.candidates.iter().partition(|candidate| {
+            queue_gate_admits(snapshot, &candidate.worker, proposal.worker_queue_limit)
+        });
+    let queue_gate_rejected_candidates = queue_gate_rejected.len() as u64;
+    let queue_gate_best_rejected_blocks = queue_gate_rejected
         .iter()
+        .map(|candidate| candidate.matched_prefix_blocks)
+        .max()
+        .unwrap_or(0);
+    let admission_evaluated_candidates = queue_gate_admitted.len() as u64;
+    let admitted: Vec<&CacheCandidate> = queue_gate_admitted
+        .into_iter()
         .filter(|candidate| is_cache_candidate_admitted(candidate, request_input_tokens, &loads))
         .collect();
     let admission_rejected_candidates =
-        proposal.candidates.len().saturating_sub(admitted.len()) as u64;
+        admission_evaluated_candidates.saturating_sub(admitted.len() as u64);
     let Some(work_floor) = admitted
         .iter()
         .copied()
@@ -158,8 +215,10 @@ pub fn resolve_cache_candidates(
         return CacheCandidateResolution {
             decision: None,
             prefill_pressure_source: loads.prefill_pressure_source(),
-            admission_evaluated_candidates: proposal.candidates.len() as u64,
+            admission_evaluated_candidates,
             admission_rejected_candidates,
+            queue_gate_rejected_candidates,
+            queue_gate_best_rejected_blocks,
             pressure_guard_compared_pairs: 0,
             pressure_guard_overrides: 0,
         };
@@ -201,8 +260,10 @@ pub fn resolve_cache_candidates(
             load_snapshot_version: snapshot.version,
         }),
         prefill_pressure_source: loads.prefill_pressure_source(),
-        admission_evaluated_candidates: proposal.candidates.len() as u64,
+        admission_evaluated_candidates,
         admission_rejected_candidates,
+        queue_gate_rejected_candidates,
+        queue_gate_best_rejected_blocks,
         pressure_guard_compared_pairs,
         pressure_guard_overrides,
     }
@@ -213,27 +274,30 @@ pub fn resolve_prefill(
     proposal: &SelectionProposal,
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
+    queue_limit: Option<u64>,
 ) -> Option<FinalDecision> {
-    resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot).or_else(|| {
-        if !contains_worker(range, &proposal.primary) {
-            return None;
-        }
-        let backup = proposal
-            .backup
-            .as_ref()
-            .filter(|worker| contains_worker(range, worker))
-            .cloned();
-        let legal = legal_prefill_candidates(range, proposal);
-        let selected = select_with_snapshot(&legal, Some(snapshot))?;
-        Some(FinalDecision {
-            selected,
-            primary: Arc::clone(&proposal.primary),
-            backup,
-            reason: DecisionReason::CapacityFallbackPowerOfTwo,
-            candidate_range_id: range.id.to_string(),
-            load_snapshot_version: snapshot.version,
-        })
-    })
+    resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot, queue_limit).or_else(
+        || {
+            if !contains_worker(range, &proposal.primary) {
+                return None;
+            }
+            let backup = proposal
+                .backup
+                .as_ref()
+                .filter(|worker| contains_worker(range, worker))
+                .cloned();
+            let legal = legal_prefill_candidates(range, proposal);
+            let selected = select_with_snapshot(&legal, Some(snapshot))?;
+            Some(FinalDecision {
+                selected,
+                primary: Arc::clone(&proposal.primary),
+                backup,
+                reason: DecisionReason::CapacityFallbackPowerOfTwo,
+                candidate_range_id: range.id.to_string(),
+                load_snapshot_version: snapshot.version,
+            })
+        },
+    )
 }
 
 /// Resolves prefill admission without overcommitting a full candidate range.
@@ -242,6 +306,7 @@ pub fn resolve_prefill_admitted(
     proposal: &SelectionProposal,
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
+    queue_limit: Option<u64>,
 ) -> Option<FinalDecision> {
     if !contains_worker(range, &proposal.primary) {
         return None;
@@ -251,11 +316,20 @@ pub fn resolve_prefill_admitted(
         .as_ref()
         .filter(|worker| contains_worker(range, worker))
         .cloned();
+    // The queue gate demotes an admitted primary or backup exactly as it
+    // demotes a cache candidate: a worker already making requests wait must
+    // not win on proposal position alone, or the fallback the gate diverted
+    // to hands the request straight back to it. Demotion is not rejection —
+    // `range_fallback` below is two-tier, and its second tier returns the
+    // least-pressured admitted worker (the demoted one included) when every
+    // admitted worker is queueing, so an all-queueing fleet still routes.
     let primary_admitted = is_proposal_worker_eligible(proposal, &proposal.primary)
-        && is_prefill_admitted(range, &proposal.primary, request_input_tokens, snapshot);
+        && is_prefill_admitted(range, &proposal.primary, request_input_tokens, snapshot)
+        && queue_gate_admits(snapshot, &proposal.primary, queue_limit);
     let backup_admitted = backup.as_ref().is_some_and(|worker| {
         is_proposal_worker_eligible(proposal, worker)
             && is_prefill_admitted(range, worker, request_input_tokens, snapshot)
+            && queue_gate_admits(snapshot, worker, queue_limit)
     });
 
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
@@ -275,7 +349,7 @@ pub fn resolve_prefill_admitted(
         (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
         _ => {
             let legal = legal_prefill_candidates(range, proposal);
-            range_fallback(range, &legal, request_input_tokens, snapshot)?
+            range_fallback(range, &legal, request_input_tokens, snapshot, queue_limit)?
         }
     };
     Some(FinalDecision {
@@ -662,6 +736,7 @@ fn range_fallback(
     legal: &[Arc<Worker>],
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
+    queue_limit: Option<u64>,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
     let admitted = legal
         .iter()
@@ -670,8 +745,27 @@ fn range_fallback(
         .cloned()
         .collect::<Vec<_>>();
     let loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
+    // Two-tier under the queue gate: least-pressured worker that is not
+    // queueing, and only when every admitted worker is queueing,
+    // least-pressured overall. Both tiers are load-bearing. Pressure ranks by
+    // queue tokens / depth while the gate reads queue length, and those
+    // disagree exactly where the gate earns its keep — a shallow worker with
+    // a backlog is the fleet minimum BY PRESSURE, so a single-tier fallback
+    // hands the request straight back to the cache home the gate just
+    // rejected. The second tier is what keeps an all-queueing fleet routable
+    // instead of failing every request.
+    let unqueued = admitted
+        .iter()
+        .filter(|worker| queue_gate_admits(snapshot, worker, queue_limit))
+        .cloned()
+        .collect::<Vec<_>>();
+    let pool = if unqueued.is_empty() {
+        admitted
+    } else {
+        unqueued
+    };
     loads
-        .min_by_pressure_key(admitted, FreshLoadLookup::compare_prefill_keys)
+        .min_by_pressure_key(pool, FreshLoadLookup::compare_prefill_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -866,11 +960,12 @@ mod tests {
             &range,
             &SelectionProposal::primary(Arc::clone(&full)),
             20,
-            &loads
+            &loads,
+            None,
         )
         .is_some());
         assert_eq!(
-            resolve_prefill(&range, &SelectionProposal::primary(full), 20, &loads)
+            resolve_prefill(&range, &SelectionProposal::primary(full), 20, &loads, None)
                 .expect("fallback selects the admitted worker")
                 .selected
                 .id,
@@ -896,8 +991,14 @@ mod tests {
             (&filtered, 0, 0, 0, 100),
         ]);
 
-        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &loads)
-            .expect("capacity exhaustion must degrade within the legal domain");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            None,
+        )
+        .expect("capacity exhaustion must degrade within the legal domain");
 
         assert!(matches!(
             decision.selected.id.0.as_str(),
@@ -918,8 +1019,14 @@ mod tests {
             .expect("the opposite snapshot has the same legal workers");
         assert_eq!(opposite_decision.id, backup.id);
 
-        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &explicit)
-            .expect("capacity exhaustion must degrade to Power-of-Two");
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &explicit,
+            None,
+        )
+        .expect("capacity exhaustion must degrade to Power-of-Two");
 
         assert_eq!(decision.selected.id, primary.id);
         assert_eq!(decision.load_snapshot_version, explicit.version);
@@ -951,6 +1058,7 @@ mod tests {
                     worker: Arc::clone(&congested),
                     matched_prefix_tokens: 90,
                     uncached_tokens: 10,
+                    matched_prefix_blocks: 9,
                     candidate_range_id: "global".into(),
                     max_pending_prefill_tokens: None,
                 },
@@ -958,6 +1066,7 @@ mod tests {
                     worker: Arc::clone(&idle),
                     matched_prefix_tokens: 80,
                     uncached_tokens: 20,
+                    matched_prefix_blocks: 8,
                     candidate_range_id: "global".into(),
                     max_pending_prefill_tokens: None,
                 },
@@ -967,6 +1076,7 @@ mod tests {
             pressure_abs_threshold_tokens: 100,
             pressure_abs_threshold_ms: None,
             pressure_rel_threshold: 1.5,
+            worker_queue_limit: None,
         };
         let loads = snapshot(&[
             (&congested, 1, 1_000, 10, 10_000),
@@ -986,5 +1096,272 @@ mod tests {
         assert_eq!(resolution.admission_rejected_candidates, 0);
         assert_eq!(resolution.pressure_guard_compared_pairs, 1);
         assert_eq!(resolution.pressure_guard_overrides, 1);
+    }
+
+    fn candidate(
+        worker: &Arc<Worker>,
+        uncached_tokens: u64,
+        matched_blocks: u32,
+    ) -> CacheCandidate {
+        CacheCandidate {
+            worker: Arc::clone(worker),
+            matched_prefix_tokens: 100 - uncached_tokens,
+            uncached_tokens,
+            matched_prefix_blocks: matched_blocks,
+            candidate_range_id: "global".into(),
+            max_pending_prefill_tokens: None,
+        }
+    }
+
+    fn queue_gate_proposal(
+        candidates: Vec<CacheCandidate>,
+        limit: Option<u64>,
+    ) -> CacheCandidateProposal {
+        CacheCandidateProposal {
+            candidates,
+            worker_queue_limit: limit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn queue_gate_diverts_off_an_owner_over_the_limit() {
+        let owner = worker("owner");
+        let other = worker("other");
+        let proposal = queue_gate_proposal(
+            vec![
+                // The owner holds the deeper prefix and would always win
+                // without the gate.
+                candidate(&owner, 10, 9),
+                candidate(&other, 60, 4),
+            ],
+            Some(4),
+        );
+        // The owner is at the limit (4 waiting >= 4); the other is idle.
+        let loads = snapshot(&[(&owner, 1, 4, 10, 10_000), (&other, 1, 0, 10, 10_000)]);
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads);
+
+        assert_eq!(
+            resolution
+                .decision
+                .expect("the unqueued candidate remains admitted")
+                .selected
+                .id,
+            other.id
+        );
+        assert_eq!(resolution.queue_gate_rejected_candidates, 1);
+        assert_eq!(resolution.queue_gate_best_rejected_blocks, 9);
+        // A gate rejection must not read as a capacity rejection.
+        assert_eq!(resolution.admission_rejected_candidates, 0);
+    }
+
+    #[test]
+    fn queue_gate_disabled_keeps_the_deepest_owner() {
+        let owner = worker("owner");
+        let other = worker("other");
+        let proposal = queue_gate_proposal(
+            vec![candidate(&owner, 10, 9), candidate(&other, 60, 4)],
+            None,
+        );
+        let loads = snapshot(&[(&owner, 1, 40, 10, 10_000), (&other, 1, 0, 10, 10_000)]);
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads);
+
+        assert_eq!(
+            resolution
+                .decision
+                .expect("no gate, owner wins")
+                .selected
+                .id,
+            owner.id
+        );
+        assert_eq!(resolution.queue_gate_rejected_candidates, 0);
+    }
+
+    #[test]
+    fn queue_gate_missing_snapshot_admits() {
+        let unknown = worker("unknown");
+        let proposal = queue_gate_proposal(vec![candidate(&unknown, 10, 9)], Some(4));
+        // The worker never published a load sample: the gate fails open.
+        let loads = snapshot(&[]);
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads);
+
+        assert_eq!(
+            resolution
+                .decision
+                .expect("an unknown queue admits")
+                .selected
+                .id,
+            unknown.id
+        );
+        assert_eq!(resolution.queue_gate_rejected_candidates, 0);
+    }
+
+    #[test]
+    fn queue_gate_exhausted_candidates_returns_no_decision_with_audit() {
+        let owner = worker("owner");
+        let proposal = queue_gate_proposal(vec![candidate(&owner, 10, 9)], Some(4));
+        let loads = snapshot(&[(&owner, 1, 9, 10, 10_000)]);
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads);
+
+        assert!(resolution.decision.is_none());
+        assert_eq!(resolution.queue_gate_rejected_candidates, 1);
+        assert_eq!(resolution.queue_gate_best_rejected_blocks, 9);
+        assert_eq!(resolution.admission_rejected_candidates, 0);
+    }
+
+    #[test]
+    fn range_fallback_prefers_an_unqueued_worker_over_a_shallower_queueing_one() {
+        // The primary fails KV-capacity admission so selection reaches the
+        // range fallback. The queueing worker is the fallback minimum BY
+        // PRESSURE (1 waiting uncached token), so a single-tier fallback
+        // would pick it — handing the request straight back to a worker the
+        // gate just rejected.
+        let primary = worker("primary");
+        let shallow_queued = worker("shallow_queued");
+        let busy_unqueued = worker("busy_unqueued");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&shallow_queued),
+            Arc::clone(&busy_unqueued),
+        ];
+        let proposal = SelectionProposal::primary(Arc::clone(&primary));
+        let load = |waiting: u64, waiting_uncached: u64, total: u64, max_total: u64| {
+            NativeCacheWorkerLoad {
+                num_running_reqs: 0,
+                num_waiting_reqs: waiting,
+                num_waiting_uncached_tokens: waiting_uncached,
+                num_used_tokens: total,
+                num_total_tokens: total,
+                max_total_num_tokens: max_total,
+                max_running_requests: 64,
+                prefill_throughput_tokens_per_s: None,
+                estimated_prefill_queue_ms: None,
+                captured_at: Instant::now(),
+            }
+        };
+        // Queue depth and pressure disagree by construction: shallow_queued
+        // waits 5 (over the limit) behind 1 uncached token, busy_unqueued
+        // waits 3 (under the limit) behind 1000 uncached tokens. The primary
+        // is KV-full, so it is not admitted at all.
+        let loads = EngineLoadSnapshot::from_native_cache_workers(
+            7,
+            [
+                (primary.url.clone(), load(0, 0, 10_000, 10_000)),
+                (shallow_queued.url.clone(), load(5, 1, 10, 10_000)),
+                (busy_unqueued.url.clone(), load(3, 1_000, 10, 10_000)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            Some(4),
+        )
+        .expect("an admitted worker exists");
+
+        assert_eq!(
+            decision.selected.id, busy_unqueued.id,
+            "the fallback must prefer the unqueued worker even though the \
+             queueing one is the pressure minimum"
+        );
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
+    }
+
+    #[test]
+    fn queue_gate_demotes_a_queueing_primary_that_capacity_would_admit() {
+        // The whole point of the gate is that the cache-affinity fallback
+        // must not hand the request back to a queueing worker. The primary
+        // here has plenty of KV capacity, so without the gate the
+        // `(true, _, _)` arm returns it unconditionally and the gate is
+        // bypassed on the single most common path.
+        let queued_primary = worker("queued_primary");
+        let unqueued = worker("unqueued");
+        let workers = vec![Arc::clone(&queued_primary), Arc::clone(&unqueued)];
+        let proposal = SelectionProposal::primary(Arc::clone(&queued_primary));
+        let loads = snapshot(&[
+            (&queued_primary, 0, 6, 10, 10_000),
+            (&unqueued, 0, 0, 10, 10_000),
+        ]);
+
+        let ungated = resolve_prefill_admitted(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            None,
+        )
+        .expect("without a limit the primary is admitted");
+        assert_eq!(ungated.selected.id, queued_primary.id);
+        assert_eq!(ungated.reason, DecisionReason::Primary);
+
+        let gated = resolve_prefill_admitted(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            Some(4),
+        )
+        .expect("the unqueued worker takes over");
+        assert_eq!(gated.selected.id, unqueued.id);
+        assert_eq!(gated.reason, DecisionReason::RangeFallback);
+    }
+
+    #[test]
+    fn queue_gate_still_routes_when_the_only_admitted_worker_is_queueing() {
+        // Demotion must never become rejection: with every admitted worker
+        // over the limit, the second fallback tier keeps the request routable.
+        let only = worker("only");
+        let workers = vec![Arc::clone(&only)];
+        let proposal = SelectionProposal::primary(Arc::clone(&only));
+        let loads = snapshot(&[(&only, 0, 9, 10, 10_000)]);
+
+        let decision = resolve_prefill_admitted(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            Some(4),
+        )
+        .expect("an all-queueing fleet must still route");
+
+        assert_eq!(decision.selected.id, only.id);
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
+    }
+
+    #[test]
+    fn range_fallback_keeps_an_all_queueing_fleet_routable() {
+        let primary = worker("primary");
+        let left = worker("left");
+        let right = worker("right");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&left), Arc::clone(&right)];
+        let proposal = SelectionProposal::primary(Arc::clone(&primary));
+        // The primary is KV-full; both fallback workers are over the limit.
+        // The second tier takes the least-pressured one instead of failing
+        // the request.
+        let loads = snapshot(&[
+            (&primary, 0, 0, 10_000, 10_000),
+            (&left, 0, 9, 10, 10_000),
+            (&right, 0, 5, 10, 10_000),
+        ]);
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &proposal,
+            32,
+            &loads,
+            Some(4),
+        )
+        .expect("an all-queueing fleet must still route");
+
+        assert_eq!(decision.selected.id, right.id);
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
     }
 }
