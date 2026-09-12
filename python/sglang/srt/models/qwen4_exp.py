@@ -977,13 +977,23 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=x.dtype
                 )
                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
-            conv_output = F.conv1d(
-                conv_input,
-                self.conv1d.weight.to(dtype=x.dtype),
-                bias=None,
-                dilation=self.short_conv_dilation,
-                groups=self.conv_channels,
-            ).squeeze(-1)
+            # On NPU, F.conv1d dispatches to aclop Conv2D, which cannot be
+            # captured inside torch.npu.graph. The strided slice + mul +
+            # sum below computes the same convolution (with possible rounding
+            # differences) and uses only basic aclnn ops that are capturable.
+            if _is_npu:
+                conv_weight = self.conv1d.weight.to(dtype=x.dtype).squeeze(1)  # [C, k]
+                conv_output = (
+                    conv_input[:, :, :: self.short_conv_dilation] * conv_weight
+                ).sum(dim=-1)
+            else:
+                conv_output = F.conv1d(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    bias=None,
+                    dilation=self.short_conv_dilation,
+                    groups=self.conv_channels,
+                ).squeeze(-1)
             next_state = conv_input[:, :, batch.row_width :]
             if not fused_state:
                 conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
@@ -1000,13 +1010,35 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        conv_output = F.conv1d(
-            conv_input,
-            self.conv1d.weight.to(dtype=x.dtype),
-            bias=None,
-            dilation=self.short_conv_dilation,
-            groups=self.conv_channels,
-        ).transpose(1, 2)
+        # F.conv1d dispatches to aclop Conv2D, which cannot be captured inside
+        # torch.npu.graph (same reason as the decode fast path above). Target
+        # verify / decode rows are narrow, so decompose the depthwise dilated
+        # conv into per-tap strided slices + mul + sum (basic aclnn ops,
+        # capturable).
+        if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
+            conv_weight = self.conv1d.weight.to(dtype=x.dtype).squeeze(1)  # [C, k]
+            dilation = self.short_conv_dilation
+            out_len = conv_input.shape[-1] - (self.conv_kernel_size - 1) * dilation
+            conv_output = (
+                torch.stack(
+                    [
+                        conv_input[:, :, i * dilation : i * dilation + out_len]
+                        * conv_weight[:, i].unsqueeze(-1)
+                        for i in range(self.conv_kernel_size)
+                    ],
+                    dim=0,
+                )
+                .sum(dim=0)
+                .transpose(1, 2)
+            )
+        else:
+            conv_output = F.conv1d(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=self.conv_channels,
+            ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
             intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
