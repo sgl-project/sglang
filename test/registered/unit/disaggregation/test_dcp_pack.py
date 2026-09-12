@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
+    dcp_pack_buffer_bytes_for_args,
     try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -198,6 +199,20 @@ class TestDcpPackBufferBytes(CustomTestCase):
             ),
             4 * 3 * (16 + 16),
         )
+
+    def test_for_args_excludes_draft_tail(self):
+        kv_args = SimpleNamespace(
+            kv_item_lens=[64 * 16, 64 * 16, 64 * 8],
+            num_draft_entries=1,
+            page_size=64,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.max_prefill_buffer_tokens",
+            return_value=10,
+        ):
+            size = dcp_pack_buffer_bytes_for_args(kv_args, dcp_size=4)
+
+        self.assertEqual(size, 4 * 3 * (16 + 16))
 
     def test_rejects_invalid_item_lens(self):
         with self.assertRaisesRegex(ValueError, "at least one page"):

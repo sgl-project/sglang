@@ -351,14 +351,22 @@ class TestMoriDCPTransfer(unittest.TestCase):
         self.assertEqual(second_plan.remote_offsets, [448, 464])
         self.assertEqual(second_plan.sizes, [16, 16])
 
-    def test_send_kvcache_dcp_rejects_draft_rows(self):
+    def test_send_kvcache_dcp_keeps_draft_rows_replicated_and_unpacked(self):
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.kv_mem_descs = ["target-src", "draft-src"]
         manager.kv_args = SimpleNamespace(num_draft_entries=1)
-        manager._submit_batch_transfer_plan = MagicMock()
+        submitted_statuses = iter(("target-status", "draft-status"))
+
+        def submit_plan(*args, status_sink=None):
+            result = [next(submitted_statuses)]
+            if status_sink is not None:
+                status_sink.extend(result)
+            return result
+
+        manager._submit_batch_transfer_plan = MagicMock(side_effect=submit_plan)
         peer_info = SimpleNamespace(
-            dst_kv_mem_descs=["target-dst", "draft-dst"],
-            dcp_dst_region_indices=[0, 1],
+            dst_kv_mem_descs=["draft-dst", "target-dst"],
+            dcp_dst_region_indices=[1, 0],
             dcp_token_item_lens=[8, 16],
         )
         plan = build_dcp_token_transfer_plan(
@@ -369,10 +377,117 @@ class TestMoriDCPTransfer(unittest.TestCase):
             dcp_rank=0,
             num_kv_tokens=4,
         )
+        packed_src = MoriPackedDCPSource(
+            mem_desc="target-pack",
+            layer_offsets=[128],
+            token_indices=np.arange(2, dtype=np.int64),
+        )
 
-        with self.assertRaisesRegex(RuntimeError, "draft KV transfer is not supported"):
-            manager.send_kvcache_dcp(peer_info, plan)
+        statuses = manager.send_kvcache_dcp(peer_info, plan, packed_src)
+
+        self.assertEqual(statuses, ["target-status", "draft-status"])
+        target_call, draft_call = manager._submit_batch_transfer_plan.call_args_list
+        self.assertEqual(target_call.args[:2], ("target-pack", "target-dst"))
+        self.assertEqual(target_call.args[2].local_offsets, [128])
+        self.assertEqual(target_call.args[2].remote_offsets, [112])
+        self.assertEqual(target_call.args[2].sizes, [16])
+        self.assertEqual(draft_call.args[:2], ("draft-src", "draft-dst"))
+        self.assertEqual(draft_call.args[2].local_offsets, [96])
+        self.assertEqual(draft_call.args[2].remote_offsets, [448])
+        self.assertEqual(draft_call.args[2].sizes, [64])
+
+    def test_send_kvcache_dcp_submits_draft_when_target_plan_is_empty(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_mem_descs = ["target-src", "draft-src"]
+        manager.kv_args = SimpleNamespace(num_draft_entries=1)
+
+        def submit_plan(*args, status_sink=None):
+            result = ["draft-status"]
+            if status_sink is not None:
+                status_sink.extend(result)
+            return result
+
+        manager._submit_batch_transfer_plan = MagicMock(side_effect=submit_plan)
+        peer_info = SimpleNamespace(
+            dst_kv_mem_descs=["target-dst", "draft-dst"],
+            dcp_dst_region_indices=[0, 1],
+            dcp_token_item_lens=[8, 16],
+        )
+        plan = build_dcp_token_transfer_plan(
+            np.array([3], dtype=np.int32),
+            np.array([7], dtype=np.int32),
+            physical_page_size=2,
+            dcp_size=4,
+            dcp_rank=3,
+            num_kv_tokens=2,
+        )
+        self.assertEqual(plan.target_src_token_indices.size, 0)
+
+        statuses = manager.send_kvcache_dcp(peer_info, plan)
+
+        self.assertEqual(statuses, ["draft-status"])
+        draft_call = manager._submit_batch_transfer_plan.call_args
+        self.assertEqual(draft_call.args[:2], ("draft-src", "draft-dst"))
+        self.assertEqual(draft_call.args[2].local_offsets, [96])
+        self.assertEqual(draft_call.args[2].remote_offsets, [896])
+        self.assertEqual(draft_call.args[2].sizes, [32])
+
+    def test_send_kvcache_dcp_empty_plan_preserves_status_sink(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_args = SimpleNamespace(num_draft_entries=1)
+        manager._submit_batch_transfer_plan = MagicMock()
+        plan = build_dcp_token_transfer_plan(
+            np.empty((0,), dtype=np.int32),
+            np.empty((0,), dtype=np.int32),
+            physical_page_size=2,
+            dcp_size=2,
+            dcp_rank=0,
+            num_kv_tokens=0,
+        )
+        statuses = ["existing-status"]
+
+        result = manager.send_kvcache_dcp(SimpleNamespace(), plan, status_sink=statuses)
+
+        self.assertIs(result, statuses)
+        self.assertEqual(result, ["existing-status"])
         manager._submit_batch_transfer_plan.assert_not_called()
+
+    def test_send_kvcache_dcp_retains_submitted_parts_on_later_failure(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_mem_descs = ["target-src", "draft0-src", "draft1-src"]
+        manager.kv_args = SimpleNamespace(num_draft_entries=2)
+        submitted_statuses = iter(("target-status", "draft0-status"))
+
+        def submit_plan(*args, status_sink=None):
+            try:
+                result = [next(submitted_statuses)]
+            except StopIteration:
+                raise RuntimeError("draft submit failed")
+            if status_sink is not None:
+                status_sink.extend(result)
+            return result
+
+        manager._submit_batch_transfer_plan = MagicMock(side_effect=submit_plan)
+        peer_info = SimpleNamespace(
+            dst_kv_mem_descs=["target-dst", "draft0-dst", "draft1-dst"],
+            dcp_dst_region_indices=[0, 1, 2],
+            dcp_token_item_lens=[8, 16, 16],
+        )
+        plan = build_dcp_token_transfer_plan(
+            np.array([3, 4], dtype=np.int32),
+            np.array([7], dtype=np.int32),
+            physical_page_size=2,
+            dcp_size=2,
+            dcp_rank=0,
+            num_kv_tokens=4,
+        )
+        statuses = []
+
+        with self.assertRaisesRegex(RuntimeError, "draft submit failed"):
+            manager.send_kvcache_dcp(peer_info, plan, status_sink=statuses)
+
+        self.assertEqual(statuses, ["target-status", "draft0-status"])
+        self.assertEqual(manager._submit_batch_transfer_plan.call_count, 3)
 
     def test_add_remote_peer_resolves_dcp_destination_layers(self):
         manager = MoriKVManager.__new__(MoriKVManager)
@@ -577,6 +692,43 @@ class TestMoriDCPPackedTransfer(unittest.TestCase):
         self.assertIsNone(pack_buffer)
         self.assertEqual(manager._dcp_pack_disabled_workers, {1})
         self.assertIsNone(manager._get_or_init_dcp_pack_buffer(1))
+
+    def test_pack_dcp_rank_excludes_draft_tail(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x2000, 0x3000],
+            num_draft_entries=1,
+        )
+        manager._dcp_pack_mem_descs = {0x1000: "pack-desc"}
+        pack_buffer = SimpleNamespace(
+            get_size=lambda: 1024,
+            get_ptr=lambda: 0x1000,
+        )
+        peer_info = SimpleNamespace(
+            dst_dcp_rank=0,
+            dst_dcp_size=2,
+            dcp_token_item_lens=[8, 16],
+        )
+        src_indices = np.array([1, 3], dtype=np.int64)
+        packed_by_rank = {}
+
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+            return_value=([0x1080], np.arange(2, dtype=np.int64)),
+        ) as pack_mock:
+            packed = manager._pack_dcp_rank_once(
+                pack_buffer,
+                peer_info,
+                src_indices,
+                packed_by_rank,
+            )
+
+        self.assertIsNotNone(packed)
+        self.assertEqual(packed.mem_desc, "pack-desc")
+        self.assertEqual(packed.layer_offsets, [128])
+        pack_mock.assert_called_once()
+        self.assertEqual(pack_mock.call_args.kwargs["kv_data_ptrs"], [0x2000])
+        self.assertEqual(pack_mock.call_args.kwargs["token_item_lens"], [8])
 
     def test_packed_source_collapses_to_one_block_per_layer(self):
         manager = MoriKVManager.__new__(MoriKVManager)

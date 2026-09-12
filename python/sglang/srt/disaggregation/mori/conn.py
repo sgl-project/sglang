@@ -1813,9 +1813,7 @@ class MoriKVManager(CommonKVManager):
         status_sink: Optional[List[TransferStatus]] = None,
     ) -> List[TransferStatus]:
         statuses = status_sink if status_sink is not None else []
-        if getattr(self.kv_args, "num_draft_entries", 0):
-            raise RuntimeError("MORI DCP1-to-DCP-N draft KV transfer is not supported")
-        if plan.target_src_token_indices.size == 0:
+        if plan.empty():
             return statuses
         if (
             peer_info.dcp_dst_region_indices is None
@@ -1838,15 +1836,32 @@ class MoriKVManager(CommonKVManager):
                 f"item_lens={len(peer_info.dcp_token_item_lens)}"
             )
 
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+        num_target = len(self.kv_mem_descs) - num_draft
+        if num_target < 0:
+            raise RuntimeError(
+                f"MORI DCP has num_draft_entries={num_draft} but only "
+                f"{len(self.kv_mem_descs)} KV regions"
+            )
+
         self._submit_dcp_part(
-            self.kv_mem_descs,
-            dst_descs,
-            peer_info.dcp_token_item_lens,
+            self.kv_mem_descs[:num_target],
+            dst_descs[:num_target],
+            peer_info.dcp_token_item_lens[:num_target],
             plan.target_src_token_indices,
             plan.target_dst_token_indices,
             statuses,
             packed_src=packed_src,
         )
+        if num_draft:
+            self._submit_dcp_part(
+                self.kv_mem_descs[num_target:],
+                dst_descs[num_target:],
+                peer_info.dcp_token_item_lens[num_target:],
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
+                statuses,
+            )
         return statuses
 
     def _pack_dcp_rank_once(
@@ -1859,6 +1874,9 @@ class MoriKVManager(CommonKVManager):
         rank = peer_info.dst_dcp_rank
         token_item_lens = peer_info.dcp_token_item_lens
         assert token_item_lens is not None
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+        num_target = len(self.kv_args.kv_data_ptrs) - num_draft
+        token_item_lens = token_item_lens[:num_target]
         signature = (
             peer_info.dst_dcp_size,
             tuple(token_item_lens),
@@ -1884,7 +1902,7 @@ class MoriKVManager(CommonKVManager):
         rank_stride = pack_buffer.get_size() // peer_info.dst_dcp_size
         packed = try_pack_dcp_src(
             pack_buffer=pack_buffer,
-            kv_data_ptrs=self.kv_args.kv_data_ptrs,
+            kv_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens,
             pack_offset_bytes=rank * rank_stride,
