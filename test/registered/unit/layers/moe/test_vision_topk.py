@@ -1,4 +1,4 @@
-"""Unit tests for srt/multimodal/dsv41/vl_routing"""
+"""Unit tests for srt/layers/moe/vision_topk"""
 
 import unittest
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.topk import TopKConfig
-from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.layers.moe.vision_topk import vision_topk
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -44,7 +44,7 @@ def _make_moe(
 
 
 class TestDsv41VisionTopK(CustomTestCase):
-    @patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False)
+    @patch("sglang.srt.layers.moe.vision_topk.is_cuda", return_value=False)
     def test_fused_shared_expert_slot(self, _mock_is_cuda):
         torch.manual_seed(0)
         logits = torch.randn(8, NUM_EXPERTS)
@@ -64,7 +64,7 @@ class TestDsv41VisionTopK(CustomTestCase):
         torch.testing.assert_close(fused.topk_ids[:, :-1], unfused.topk_ids)
         torch.testing.assert_close(fused.topk_weights[:, :-1], unfused.topk_weights)
 
-    @patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False)
+    @patch("sglang.srt.layers.moe.vision_topk.is_cuda", return_value=False)
     def test_fused_shared_expert_ep_scaling(self, _mock_is_cuda):
         torch.manual_seed(0)
         logits = torch.randn(8, NUM_EXPERTS)
