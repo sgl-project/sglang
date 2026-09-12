@@ -14,6 +14,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.kernels.ops.quantization.fp8_utils import (
+    use_fp8_e4b15_for_e4m3fn,
+)
 from sglang.kernels.ops.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
@@ -387,6 +390,7 @@ def fused_moe_kernel(
     FUSE_SWIGLU: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     GDC_EARLY: tl.constexpr = False,
+    USE_FP8_E4B15: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -415,6 +419,15 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if USE_FP8_E4B15:
+        # A100/SM86 Triton exposes OCP e4m3fn storage as fp8e4b15, not
+        # fp8e4nv. The caller passes data pointers for this specialization so
+        # the original fp8e4nv tensor type never reaches Triton's signature.
+        a_ptr = a_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4b15))
+        b_ptr = b_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4b15))
+
+    fp8_scale_correction = 256.0 if USE_FP8_E4B15 else 1.0
+
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
         if GDC_EARLY:
@@ -526,10 +539,14 @@ def fused_moe_kernel(
             # Load per-token scale for activations
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+            a_scale *= fp8_scale_correction
+            b_scale *= fp8_scale_correction
         # tensor-wise
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+            a_scale *= fp8_scale_correction
+            b_scale *= fp8_scale_correction
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -580,6 +597,8 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                a_scale *= fp8_scale_correction
+                b_scale *= fp8_scale_correction
                 if swap_ab:
                     a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale
@@ -888,6 +907,19 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    use_fp8_e4b15 = use_fp8_w8a8 and use_fp8_e4b15_for_e4m3fn(device=A.device)
+    if use_fp8_e4b15:
+        if a_use_tma or b_use_tma:
+            raise ValueError("SM80 FP8 MoE does not support TMA descriptors")
+        # Pass raw data pointers for the SM80 specialization. The Triton
+        # kernel reinterprets the bytes as fp8e4b15 and applies the exponent
+        # bias correction to both activation and weight scales.
+        A_arg = A.data_ptr()
+        B_arg = B.data_ptr()
+    else:
+        A_arg = A
+        B_arg = B
+
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -997,9 +1029,9 @@ def invoke_fused_moe_kernel(
             else {}
         )
         fused_moe_kernel[grid](
-            A,
+            A_arg,
             a_desc,
-            B,
+            B_arg,
             b_desc,
             bias,
             C,
@@ -1047,6 +1079,7 @@ def invoke_fused_moe_kernel(
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
+            USE_FP8_E4B15=use_fp8_e4b15,
             **pdl_kwargs,
             **config,
         )

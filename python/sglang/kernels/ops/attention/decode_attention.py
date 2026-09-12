@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
+from sglang.kernels.ops.quantization.fp8_utils import load_fp8_e4m3fn
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_core_count,
@@ -39,6 +40,18 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_FP8_KV_DTYPES = (torch.float8_e4m3fn,)
+
+
+def _should_upcast_fp8_kv(k_buffer, v_buffer):
+    """Use raw-byte FP8 decoding before dots on pre-SM89 CUDA devices."""
+    return (
+        not _is_hip
+        and k_buffer.is_cuda
+        and (k_buffer.dtype in _FP8_KV_DTYPES or v_buffer.dtype in _FP8_KV_DTYPES)
+        and torch.cuda.get_device_capability(k_buffer.device) < (8, 9)
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +272,7 @@ def _fwd_kernel_stage1(
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    UPCAST_FP8_KV: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
     aux0_stride_t=0,
@@ -288,6 +302,10 @@ def _fwd_kernel_stage1(
         _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
         xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
+    if UPCAST_FP8_KV:
+        k_buffer_fp8 = K_Buffer.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        v_buffer_fp8 = V_Buffer.to(tl.int64).to(tl.pointer_type(tl.uint8))
+
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
     kv_len_per_split = (
@@ -302,6 +320,8 @@ def _fwd_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+        if UPCAST_FP8_KV:
+            q = q.to(tl.float16)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
@@ -327,11 +347,19 @@ def _fwd_kernel_stage1(
                     + cur_kv_head * stride_buf_kh
                     + offs_d[None, :]
                 )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                other=0.0,
-            )
+            if UPCAST_FP8_KV:
+                k = load_fp8_e4m3fn(
+                    k_buffer_fp8,
+                    offs_buf_k,
+                    (offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    tl.float16,
+                )
+            else:
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=0.0,
+                )
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale_withk
 
@@ -370,11 +398,19 @@ def _fwd_kernel_stage1(
                     + cur_kv_head * stride_buf_vh
                     + offs_dv[None, :]
                 )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+            if UPCAST_FP8_KV:
+                v = load_fp8_e4m3fn(
+                    v_buffer_fp8,
+                    offs_buf_v,
+                    (offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    tl.float16,
+                )
+            else:
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -462,11 +498,13 @@ def _decode_att_m_fwd(
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
         score_mod, aux_tensors
     )
-
+    upcast_fp8_kv = _should_upcast_fp8_kv(k_buffer, v_buffer)
+    k_buffer_kernel = k_buffer.view(torch.uint8) if upcast_fp8_kv else k_buffer
+    v_buffer_kernel = v_buffer.view(torch.uint8) if upcast_fp8_kv else v_buffer
     _fwd_kernel_stage1[grid](
         q,
-        k_buffer,
-        v_buffer,
+        k_buffer_kernel,
+        v_buffer_kernel,
         sm_scale_withk,
         kv_indptr,
         kv_indices,
@@ -498,6 +536,7 @@ def _decode_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         PAGE_SIZE=page_size,
+        UPCAST_FP8_KV=upcast_fp8_kv,
         SCORE_MOD=score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
@@ -546,6 +585,7 @@ def _fwd_grouped_kernel_stage1(
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
+    UPCAST_FP8_KV: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -592,6 +632,10 @@ def _fwd_grouped_kernel_stage1(
         _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
         xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
+    if UPCAST_FP8_KV:
+        k_buffer_fp8 = K_Buffer.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        v_buffer_fp8 = V_Buffer.to(tl.int64).to(tl.pointer_type(tl.uint8))
+
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
     if BLOCK_DPE > 0:
@@ -620,14 +664,18 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+        if UPCAST_FP8_KV:
+            q = q.to(tl.float16)
+        # gfx1250 and pre-SM89 CUDA: avoid FP8 dot operands. On gfx1250,
+        # triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction;
+        # on pre-SM89 CUDA, the fp8e4nv dot operand is unsupported.
         # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
         # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
         # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
         # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
         # On all other platforms keep the original downcast of q to the KV dtype.
-        # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-        if IS_GFX1250:
+        # TODO: remove the gfx1250 branch once its fp8 tl.dot issue is resolved.
+        if IS_GFX1250 or UPCAST_FP8_KV:
             q_k = q
         else:
             q_k = q.to(K_Buffer.dtype.element_ty)
@@ -635,6 +683,8 @@ def _fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
+            if UPCAST_FP8_KV:
+                qpe = qpe.to(tl.float16)
         for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
@@ -653,12 +703,20 @@ def _fwd_grouped_kernel_stage1(
                     + tok_in_p[None, :] * stride_buf_ktok
                     + base_offs_k
                 )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
-            if IS_GFX1250:
+            if UPCAST_FP8_KV:
+                k = load_fp8_e4m3fn(
+                    k_buffer_fp8,
+                    offs_buf_k,
+                    (offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    tl.float16,
+                )
+            else:
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=0.0,
+                )
+            if IS_GFX1250 or UPCAST_FP8_KV:
                 qk = tl.dot(q_k, k.to(q_k.dtype))
             else:
                 qk = tl.dot(q_k, k)
@@ -671,12 +729,23 @@ def _fwd_grouped_kernel_stage1(
                         + tok_in_p[None, :] * stride_buf_ktok
                         + base_offs_kpe
                     )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                    other=0.0,
-                )
-                qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                if UPCAST_FP8_KV:
+                    kpe = load_fp8_e4m3fn(
+                        k_buffer_fp8,
+                        offs_buf_kpe,
+                        (offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        tl.float16,
+                    )
+                else:
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                    )
+                if IS_GFX1250 or UPCAST_FP8_KV:
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                else:
+                    qk += tl.dot(qpe, kpe)
             qk *= sm_scale_withk
 
             if logit_cap > 0:
@@ -713,11 +782,19 @@ def _fwd_grouped_kernel_stage1(
                         + tok_in_p[:, None] * stride_buf_vtok
                         + base_offs_v
                     )
-                v = tl.load(
-                    V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=0.0,
-                )
+                if UPCAST_FP8_KV:
+                    v = load_fp8_e4m3fn(
+                        v_buffer_fp8,
+                        offs_buf_v,
+                        (offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        tl.float16,
+                    )
+                else:
+                    v = tl.load(
+                        V_Buffer + offs_buf_v,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -730,6 +807,8 @@ def _fwd_grouped_kernel_stage1(
             # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            elif UPCAST_FP8_KV:
+                acc += tl.dot(p.to(q_k.dtype), v.to(q_k.dtype))
             else:
                 acc += tl.dot(p.to(v.dtype), v)
 
@@ -847,11 +926,13 @@ def _decode_grouped_att_m_fwd(
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
         score_mod, aux_tensors
     )
-
+    upcast_fp8_kv = _should_upcast_fp8_kv(k_buffer, v_buffer)
+    k_buffer_kernel = k_buffer.view(torch.uint8) if upcast_fp8_kv else k_buffer
+    v_buffer_kernel = v_buffer.view(torch.uint8) if upcast_fp8_kv else v_buffer
     _fwd_grouped_kernel_stage1[grid](
         q,
-        k_buffer,
-        v_buffer,
+        k_buffer_kernel,
+        v_buffer_kernel,
         sm_scale_withk,
         kv_indptr,
         kv_indices,
@@ -888,6 +969,7 @@ def _decode_grouped_att_m_fwd(
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,
+        UPCAST_FP8_KV=upcast_fp8_kv,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,

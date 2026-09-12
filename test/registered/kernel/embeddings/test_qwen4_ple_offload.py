@@ -109,6 +109,23 @@ def test_qwen4_ple_pinned_gather_tp1(input_dtype, embedding_dim):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_qwen4_ple_pinned_gather_fp8_weights():
+    source = _make_source_embedding(dtype=torch.float8_e4m3fn, embedding_dim=64)
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    rows = (
+        (torch.arange(8 * 64, dtype=torch.bfloat16, device="cuda").reshape(8, 64) - 256)
+        / 16
+    ).to(torch.float8_e4m3fn)
+    _load_rows(offloaded, rows)
+
+    ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=torch.int64, device="cuda")
+    expected = rows.float().index_select(0, ids.flatten()).reshape(*ids.shape, 64)
+    actual = offloaded(ids)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
 def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
     embedding_dim = 13
     source = _make_source_embedding(
