@@ -633,6 +633,11 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Run PP tensor communication on a dedicated stream so asynchronous sends
+    # do not fence the next forward through the scheduler stream.
+    SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # vLLM-style nonblocking current-activation receive with lazy synchronization.
+    SGLANG_PP_VLLM_ASYNC_RECV = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================
@@ -1039,6 +1044,9 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
+    # layout. The scheduler continues to allocate 256-token logical pages.
+    SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

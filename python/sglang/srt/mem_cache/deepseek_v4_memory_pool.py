@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -697,6 +698,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.swa_size = swa_size
         self.swa_page_size = swa_page_size
+        # The allocator and compressor state keep 256-token logical pages, but
+        # FlashInfer's SM120 DSV4 kernel consumes a 64-token physical SWA page.
+        # Storing in that layout directly removes the per-layer 256 -> 64 page
+        # split while preserving the flat token indices produced by the
+        # allocator.
+        self.swa_kv_page_size = (
+            64
+            if is_sm120_supported() and envs.SGLANG_OPT_SM120_DIRECT_SWA_KV.get()
+            else swa_page_size
+        )
+        assert swa_page_size % self.swa_kv_page_size == 0
+        if self.swa_kv_page_size != swa_page_size:
+            logger.info(
+                "DeepSeek-V4 SM120 direct SWA KV layout enabled: "
+                "logical_page_size=%d physical_page_size=%d",
+                swa_page_size,
+                self.swa_kv_page_size,
+            )
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -737,7 +756,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
-                page_size=swa_page_size,
+                page_size=self.swa_kv_page_size,
                 dtype=dtype,
                 layer_num=stage_layer_num,
                 device=device,
@@ -875,11 +894,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         if not self._unified_kv:
+            physical_pages_per_logical_page = (
+                self.swa_page_size // self.swa_kv_pool.page_size
+            )
             for buf in self.swa_kv_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+                item_lens.append(buf[0].nbytes * physical_pages_per_logical_page)
 
         for pools in [
             self.compress_state_pools,

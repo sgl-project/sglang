@@ -1756,60 +1756,92 @@ class GroupCoordinator:
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
-        """Recv the input tensor dictionary.
-        NOTE: `src` is the local rank of the source rank.
+        """Receive a tensor dictionary and wait for all payload transfers."""
+        tensor_dict, works, postprocess = self.irecv_tensor_dict(
+            src=src, all_gather_group=all_gather_group
+        )
+        for p2p_work in works:
+            p2p_work.work.wait()
+        for fn in postprocess:
+            fn()
+        return tensor_dict
+
+    def irecv_tensor_dict(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Tuple[
+        Optional[Dict[str, Union[torch.Tensor, Any]]],
+        List[P2PWork],
+        List[Callable[[], None]],
+    ]:
+        """Post nonblocking payload receives after synchronously receiving metadata.
+
+        The returned buffers remain alive through P2PWork. Callers must wait all
+        works and run postprocess callbacks before consuming tensors on another
+        CUDA stream. This mirrors vLLM's lazy PP receive handle lifecycle.
         """
-        # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
-            return None
+            return None, [], []
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-
         group = self.device_group
         metadata_group = self.cpu_group
-
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
         tensor_dict: Dict[str, Any] = {}
+        works: List[P2PWork] = []
+        postprocess: List[Callable[[], None]] = []
         for key, value in recv_metadata_list:
-            if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
-                    continue
-
-                # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (
-                    all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
-                )
-
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
-                # We have to use irecv here to make it work for both isend and send.
-                comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
-
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
-            else:
+            if not isinstance(value, TensorMetadata):
                 tensor_dict[key] = value
-        return tensor_dict
+                continue
+
+            full_tensor = torch.empty(
+                value.size, dtype=value.dtype, device=value.device
+            )
+            if full_tensor.numel() == 0:
+                tensor_dict[key] = full_tensor
+                continue
+
+            use_all_gather = (
+                all_gather_group is not None
+                and full_tensor.numel() % all_gather_size == 0
+            )
+            recv_tensor = full_tensor
+            if use_all_gather:
+                orig_shape = tuple(full_tensor.shape)
+                recv_tensor = full_tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            comm_group = metadata_group if recv_tensor.is_cpu else group
+            work = torch.distributed.irecv(
+                recv_tensor, src=self.ranks[src], group=comm_group
+            )
+            works.append(P2PWork(work, recv_tensor))
+            tensor_dict[key] = recv_tensor
+
+            if use_all_gather:
+
+                def _postprocess(
+                    key: str = key,
+                    recv_tensor: torch.Tensor = recv_tensor,
+                    orig_shape: Tuple[int, ...] = orig_shape,
+                    all_gather_group: Optional["GroupCoordinator"] = all_gather_group,
+                ) -> None:
+                    assert all_gather_group is not None
+                    tensor_dict[key] = all_gather_group.all_gather(
+                        recv_tensor, dim=0
+                    ).reshape(orig_shape)
+
+                postprocess.append(_postprocess)
+
+        return tensor_dict, works, postprocess
 
     def send_recv_tensor_dict(
         self,
@@ -2164,6 +2196,7 @@ get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
 _SELF_PP: Optional[GroupCoordinator] = None
+_PP_PROXY: Optional[GroupCoordinator] = None
 
 
 def get_self_pp_group() -> GroupCoordinator:
@@ -2174,6 +2207,11 @@ def get_self_pp_group() -> GroupCoordinator:
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def get_pp_proxy_group() -> GroupCoordinator:
+    assert _PP_PROXY is not None, "pipeline proxy group is not initialized"
+    return _PP_PROXY
 
 
 # kept for backward compatibility
@@ -2833,6 +2871,21 @@ def initialize_model_parallel(
             group_name="self_pp",
         )
 
+    global _PP_PROXY
+    assert _PP_PROXY is None, "pipeline proxy group is already initialized"
+    if envs.SGLANG_PP_VLLM_ASYNC_RECV.get():
+        _PP_PROXY = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="pp_proxy_async_recv",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     get_parallel().stamp_derived_widths(**derived_widths)
 
 
@@ -3098,6 +3151,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _PP_PROXY
+    if _PP_PROXY:
+        _PP_PROXY.destroy()
+    _PP_PROXY = None
 
     global _DCP
     if _DCP:
