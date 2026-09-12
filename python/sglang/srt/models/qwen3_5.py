@@ -1672,22 +1672,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     f"{unsupported_layers}"
                 )
             from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-                CuteDSLFusionLayerCommunicator,
                 install_cutedsl_fusion,
             )
 
-            wrong_communicator = [
-                layer.layer_id
-                for layer in self.layers
-                if not isinstance(
-                    layer.layer_communicator, CuteDSLFusionLayerCommunicator
-                )
-            ]
-            if wrong_communicator:
-                raise RuntimeError(
-                    "Qwen3.5 fusion-enabled layers have the wrong communicator: "
-                    f"{wrong_communicator}"
-                )
             self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
                 self.layers,
                 hidden_size=config.hidden_size,
