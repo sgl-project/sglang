@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +12,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
-@pytest.mark.parametrize("num_tokens", [0, 1, 8, 17, 32, 64])
+@pytest.mark.parametrize("num_tokens", [0, 1, 6, 8, 17, 32, 64])
 @pytest.mark.parametrize("use_norm", [False, True])
 def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch, hidden_size, num_tokens, use_norm
@@ -95,6 +96,18 @@ def test_mhc_fused_post_pre_matches_unfused(
         norm_eps=norm_eps,
     )
 
+    if hidden_size == 4096 and num_tokens in (0, 1, 6, 17):
+        _check_glm_boundary(
+            x,
+            residual,
+            post_prev,
+            comb_prev,
+            fn,
+            hc_scale,
+            hc_base,
+            use_norm=use_norm,
+        )
+
     torch.cuda.synchronize()
     if num_tokens == 0:
         assert residual_out.shape == residual.shape
@@ -122,6 +135,52 @@ def test_mhc_fused_post_pre_matches_unfused(
     layer_atol = 2e-2 if use_norm else 2e-3
     layer_rtol = 2e-2 if use_norm else 2e-3
     torch.testing.assert_close(layer_out, layer_ref, atol=layer_atol, rtol=layer_rtol)
+
+
+def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.communicator_mhc import MHCState
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
+
+    layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(
+        mhc=True,
+        hc_mult=4,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_sinkhorn_iters=20,
+    )
+    layer.hc_ffn_fn = torch.nn.Parameter(fn)
+    layer.hc_ffn_scale = torch.nn.Parameter(scale)
+    layer.hc_ffn_base = torch.nn.Parameter(base)
+    norm = RMSNorm(x.shape[-1], eps=1e-6).to(x) if use_norm else None
+    states = [
+        MHCState(
+            hc_mult=4,
+            hc_attn_pre=layer.hc_attn_pre,
+            hc_ffn_pre=layer.hc_ffn_pre,
+            hc_post=layer.hc_post,
+            hc_ffn_post_pre=callback,
+            h_res=comb.flatten(1),
+            h_post=post.flatten(1),
+        )
+        for callback in (None, layer.hc_ffn_post_pre)
+    ]
+    with envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True):
+        outputs = [s.attn_to_mlp(x, residual.flatten(1), norm) for s in states]
+    torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=0, rtol=0)
+    torch.testing.assert_close(states[0].h_res, states[1].h_res, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(states[0].h_post, states[1].h_post, atol=1e-3, rtol=1e-3)
+    # The next combine must consume the FFN mixing matrices, not attention's.
+    torch.testing.assert_close(
+        states[0].mlp_combine(x, outputs[0][1]),
+        states[1].mlp_combine(x, outputs[1][1]),
+        atol=2e-3,
+        rtol=2e-2,
+    )
 
 
 if __name__ == "__main__":

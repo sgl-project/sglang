@@ -75,6 +75,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
+)
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -116,6 +120,10 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE and the post_mult_value=2.0 that
+# Glm5NextDecoderLayer._hc_pre passes to the unfused hc_pre.
+_MHC_POST_MULT_VALUE = 2.0
 
 
 @torch.compile
@@ -698,6 +706,13 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                # Resolved once: env and platform are frozen after startup,
+                # and None keeps the dispatch off the per-boundary path.
+                hc_ffn_post_pre=(
+                    self.hc_ffn_post_pre
+                    if is_cross_layer_mhc_fusion_enabled()
+                    else None
+                ),
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -742,6 +757,45 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             out_norm_weight,
             out_norm_eps,
+        )
+
+    def hc_ffn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        # hc_post then the FFN hc_pre in one launch instead of three. The
+        # shared dispatcher returns None when no fused kernel covers this
+        # platform or shape, and the caller keeps the unfused chain.
+        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            hidden_states,
+            residual.view(num_tokens, hc_mult, hidden_size),
+            h_post.view(num_tokens, hc_mult),
+            h_res.view(num_tokens, hc_mult, hc_mult),
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            hc_mult,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+            _MHC_POST_MULT_VALUE,
+            self.config.hc_sinkhorn_iters,
+            out_norm_weight,
+            out_norm_eps,
+            # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
+            # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        next_residual, layer_input, post, comb, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.reshape(num_tokens, -1),
+            comb.reshape(num_tokens, hc_mult * hc_mult),
+            post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):

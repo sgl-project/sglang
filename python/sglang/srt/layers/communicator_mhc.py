@@ -72,6 +72,7 @@ class MHCState:
     hc_attn_pre: Callable
     hc_ffn_pre: Callable
     hc_post: Callable
+    hc_ffn_post_pre: Optional[Callable] = None
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
@@ -94,9 +95,26 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
+            # Fused hc_post + FFN hc_pre; returns None when no fused kernel
+            # covers this platform/shape, and the unfused chain below runs.
+            fused = self.hc_ffn_post_pre(
+                hidden_states,
+                residual,
+                self.h_res,
+                self.h_post,
+                out_norm_weight,
+                out_norm_eps,
+            )
+            if fused is not None:
+                hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                if out_norm is not None and not norm_fused:
+                    hidden_states = out_norm(hidden_states)
+                return hidden_states, residual
+
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -406,6 +424,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        hc_ffn_post_pre: Optional[Callable] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -413,6 +432,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            hc_ffn_post_pre=hc_ffn_post_pre,
         )
 
         super().__init__(
