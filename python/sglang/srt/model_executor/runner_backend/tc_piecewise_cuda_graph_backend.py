@@ -71,6 +71,33 @@ def _suppress_lru_cache_dynamo_warning() -> None:
     warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 
 
+def _may_add_dumper_split_op(config: CompilationConfig) -> None:
+    """Make the tensor-dump tap a piece boundary, when the T3 tap is armed.
+
+    A forward hook cannot serve `tc_piecewise`: reaching the eager writer from
+    inside a `fullgraph=True` trace is a hard dynamo error. The dumper therefore
+    emits an opaque custom op instead; declaring it a split op is what turns that
+    op into a piece boundary, so its body -- and the `copy_` inside it -- runs
+    within a captured piece.
+
+    `SPLIT_OPS` is snapshotted in `CompilationConfig.__init__`, so this has to
+    happen here rather than at import time. Gated on the T3 tap specifically,
+    not just on dumping being on: the import registers a torch custom op as a
+    side effect, and every injected op costs inductor a fusion barrier plus a
+    piece boundary. Both are paid at compile time, so `DUMPER_CUDA_GRAPH_TAPS=t1`
+    is the only way to not pay them -- a runtime filter cannot help.
+    """
+    from sglang.srt.debug_utils.cuda_graph import cuda_graph_dump
+    from sglang.srt.debug_utils.cuda_graph.config import TAP_COMPILED
+
+    cuda_graph_dump.configure()
+    if not cuda_graph_dump.arms(TAP_COMPILED):
+        return
+    from sglang.srt.debug_utils.cuda_graph.split_op import DUMPER_TAP_OP_NAME
+
+    config.add_split_op(DUMPER_TAP_OP_NAME)
+
+
 def _toggle_fused_ops(
     model: torch.nn.Module, *, reverse: bool, num_tokens: int
 ) -> None:
@@ -130,6 +157,8 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             config.add_split_op("sglang.moe_forward_piecewise_cuda_graph_impl")
+
+        _may_add_dumper_split_op(config)
 
         return config
 

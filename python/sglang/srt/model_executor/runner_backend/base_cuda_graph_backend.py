@@ -53,6 +53,17 @@ class BaseCudaGraphBackend(ABC):
         backend must retain when its graph records their tensor addresses.
     """
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        # Arms CUDA-graph-compatible tensor dumping: a forward hook's
+        # `buffer.copy_` is only *recorded* if the dumper knows a capture
+        # session is open, and the buffers can only be read back after
+        # `replay()` returns. See sglang.srt.debug_utils.cuda_graph. The seam is
+        # inert (a few getattrs per call) unless DUMPER_CUDA_GRAPH_ENABLE is set.
+        super().__init_subclass__(**kwargs)
+        from sglang.srt.debug_utils.cuda_graph.seams import install_backend_seam
+
+        install_backend_seam(cls)
+
     @abstractmethod
     def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
 
