@@ -252,11 +252,11 @@ class TestEmbeddingCorrectness:
         and HuggingFace implementations within tolerance.
         """
         backend, model_path, client, gateway = setup_backend
-        # Scores are cosine similarity * 100, gateway fp16 GPU kernels vs a
-        # CPU sentence-transformers reference: 0.5 = 5e-3 cosine, loose enough
-        # for cross-implementation fp16 drift, tight enough to catch a wrong
-        # pooling or a missing normalization (>1e-2 cosine).
-        tolerance = 0.5
+        # Scores are cosine * 100, fp16 GPU kernels vs a CPU
+        # sentence-transformers reference: allow 2.5e-3 cosine of
+        # cross-implementation drift (~2x the level observed from kernel
+        # changes); a wrong pooling or missing normalization is >1e-2.
+        tolerance = 0.25
 
         # Format query with instruction (for e5-mistral)
         query = f"Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: {RELEVANCE_TEST_DATA['sample_query']}"
