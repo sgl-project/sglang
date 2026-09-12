@@ -351,7 +351,6 @@ class MambaPoolHost(HostKVCache):
                 src_layout_dim=item_size * num_layers,
             )
         elif io_backend == "direct":
-            # Use the Mamba state transfer kernel even with direct KV I/O.
             if src_indices.device.type != "cuda":
                 src_indices = src_indices.to(dst.device, non_blocking=True)
             if dst_indices.device.type != "cuda":
@@ -401,7 +400,6 @@ class MambaPoolHost(HostKVCache):
                 num_layers=num_layers,
             )
         elif io_backend == "direct":
-            # Use the Mamba state transfer kernel even with direct KV I/O.
             if src_indices.device.type != "cuda":
                 src_indices = src_indices.to(src_layers.device, non_blocking=True)
             if dst_indices.device.type != "cuda":
