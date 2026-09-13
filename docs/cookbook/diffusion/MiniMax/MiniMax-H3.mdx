@@ -812,28 +812,33 @@ forward and backward over frames) that covers exactly the rest. The released
 `stage-dmd-step-250` checkpoint is an 8-NFE DMD2 distill and adds a 4.3 GB
 linear branch plus two small LoRA adapters on top of the untouched MiniMax-H3
 backbone. The weights are the FL2VA partition, so the deployment serves `t2va`
-and `fl2va` (first / last keyframes); the keyframe rows are attended densely,
-like text and audio. `ref2va` was not trained and is rejected. The weights
-inherit the MiniMax-H3 Community License, including its territorial exclusions.
+and `fl2va` (first, last, or both keyframes, as OpenVDN's own stack does); the
+keyframe rows are attended densely, like text and audio. `ref2va` was not
+trained and is rejected. The weights inherit the MiniMax-H3 Community License,
+including its territorial exclusions.
 
 Pass the repository directly to `--model-path`. A registered model overlay
 materializes the base-H3 layout once: both LoRA adapters are prefused into the
 transformer weights (a real 62 GB write), the linear branch is attached as an
 extra shard, the Qwen3-VL conditioner is linked from `MiniMaxAI/MiniMax-H3`,
 and the video VAE is re-serialized as for FastH3. Point
-`SGLANG_DIFFUSION_CACHE_ROOT` at a volume with at least 90 GB free before the
-first launch.
+`SGLANG_DIFFUSION_CACHE_ROOT` at a volume with at least 90 GB free on the same
+filesystem as the Hugging Face cache before the first launch (the conditioner
+and VAEs are hard-linked, not copied).
 
-```bash 4×B200 hybrid window attention
+```bash 8×B200 hybrid window attention
 sglang serve \
   --model-path OpenVDN/vdn-minimax-h3 \
-  --num-gpus 4 \
+  --num-gpus 8 \
   --attention-backend hybrid_window_attn_h3 \
   --performance-mode speed \
   --warmup-num-frames 345 \
   --warmup-resolutions 1344x768 \
   --port 30010
 ```
+
+`--num-gpus 4`, `2` or `1` gives the smaller Ulysses recipes in the benchmark
+table; `sglang generate` takes the same flags.
 
 `--warmup-num-frames` / `--warmup-resolutions` make the startup warmup run
 at the clip length and canvas you will serve (here the 14.375 s paper
@@ -852,14 +857,13 @@ request default is `num_inference_steps: 9`: nine points on the standard
 shift-12/shift-3 sigma grid, i.e. the eight distilled DiT evaluations (VDN
 counts NFEs, SGLang counts grid points). Any other step count is rejected. The
 paper workload is 1344×768 at 24 fps for 14.375 s: 345 frames, already 17n+5
-aligned, 102 latent frames and about 104.5k packed rows.
+aligned, 102 latent frames and about 104k packed rows.
 
 `hybrid_window_attn_h3` is required for the transformer: a dense backend on
 these weights would silently skip the linear branch and the softmax gates and
-produce the wrong model, so it is rejected. The window softmax runs as a union
-of dense FlashAttention varlen calls, exact to bf16 rounding. The
-linear branch runs on fused Triton kernels (temporal conv + SiLU + L2 norm,
-statistics prologue, gated RMSNorm epilogue). On Blackwell (SM100 / SM103,
+produce the wrong model, so it is rejected. The window softmax is computed
+exactly with FlashAttention (no sparse approximation); the linear branch runs
+on fused Triton kernels. On Blackwell (SM100 / SM103,
 and SM120 such as the RTX PRO 6000) the transformer defaults to online MXFP8
 (`--quantization fp8` selects it too, `--quantization bf16` opts out); the
 gates, beta, alpha and the conv stay bf16. Before SM100 `--quantization fp8`
@@ -873,7 +877,7 @@ are enabled but not benchmarked. Ulysses sequence parallelism is supported;
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for the
 backend options.
 
-Measured latencies for the 4× B200 recipe are in
+Measured latencies for 1, 2, 4 and 8 B200s are in
 [VDN-H3 on B200](#vdn-h3-on-b200); single-card and PCIe multi-card numbers
 for the RTX PRO 6000 are in [VDN-H3 on RTX PRO 6000](#vdn-h3-on-rtx-pro-6000).
 
@@ -1548,12 +1552,12 @@ about 3% across nodes, so treat smaller differences as noise:
 
 | Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
 | --- | ---: | ---: | ---: | ---: |
-| OpenVDN published, FP8, 8× B200 Ulysses 5+3 ([openvdn.github.io](https://openvdn.github.io/)) | 1.40 | 11.2 s | – | – |
-| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.66 | 61.2 s | – | – |
-| OpenVDN reference, FP8, 1× B200 | 6.25 | 50.0 s | – | – |
-| OpenVDN reference, FP8, 2× B200 Ulysses (standard / 1+1 branch-parallel) | 4.87 / 5.04 | 39.0 / 40.3 s | – | – |
-| OpenVDN reference, FP8, 4× B200 Ulysses (3+1 branch-parallel) | 2.59 | 20.7 s | – | – |
-| OpenVDN reference, FP8, 8× B200 Ulysses (5+3 / 4+4 / standard) | 1.40 / 1.47 / 1.52 | 11.2 / 11.7 / 12.2 s | – | – |
+| OpenVDN published, FP8, 8× B200 Ulysses 5+3 ([openvdn.github.io](https://openvdn.github.io/)) | 1.40 | 11.2 s | — | — |
+| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.66 | 61.2 s | — | — |
+| OpenVDN reference, FP8, 1× B200 | 6.25 | 50.0 s | — | — |
+| OpenVDN reference, FP8, 2× B200 Ulysses (standard / 1+1 branch-parallel) | 4.87 / 5.04 | 39.0 / 40.3 s | — | — |
+| OpenVDN reference, FP8, 4× B200 Ulysses (3+1 branch-parallel) | 2.59 | 20.7 s | — | — |
+| OpenVDN reference, FP8, 8× B200 Ulysses (5+3 / 4+4 / standard) | 1.40 / 1.47 / 1.52 | 11.2 / 11.7 / 12.2 s | — | — |
 | SGLang, `--quantization bf16`, 1× B200 | 7.45 | 58.8 s | 8.8 s | 156,298 MB |
 | SGLang, `--quantization fp8` (→ online `mxfp8` on SM100+), 1× B200 | 6.03 | 47.6 s | 8.7 s | 128,418 MB |
 | SGLang default (online `mxfp8`), 2× B200 Ulysses2, `--performance-mode speed`, served-shape warmup | **3.30** | **25.9 s** | 4.7 s | 106,738 MB |
@@ -1565,7 +1569,7 @@ about 3% across nodes, so treat smaller differences as noise:
 On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.88 s/NFE
 (7.0 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
 branch-parallel layout; the whole request (text encoding, 8 forwards, joint
-decode) completes in 9.0 s after warmup. At this GPU count the step is
+decode) completes in about 8.7 s after warmup. At this GPU count the step is
 launch- and copy-bound in the linear branch rather than FLOP-bound: the scans
 fold the 102 frames into per-chunk composites plus one chain over the chunks
 with both directions per launch (the chunked window only reads states at
