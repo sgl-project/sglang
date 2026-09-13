@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+def format_kv_cache_dtype(dtype: Any) -> Optional[str]:
+    """Normalize a torch dtype or string into a stable storage-namespace tag."""
+    if dtype is None:
+        return None
+    value = str(dtype).strip()
+    if value.startswith("torch."):
+        value = value[len("torch.") :]
+    return value or None
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -38,6 +48,7 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass

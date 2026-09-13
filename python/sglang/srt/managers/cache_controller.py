@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     count_pool_hits,
+    format_kv_cache_dtype,
 )
 
 if TYPE_CHECKING:
@@ -80,7 +81,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -720,9 +723,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
-                "tp_lcm_size must be divisible by tp_size."
-            )
+            assert (
+                tp_lcm_size % self.tp_size == 0
+            ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -746,6 +749,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            kv_cache_dtype=format_kv_cache_dtype(self.mem_pool_host.dtype),
         )
 
     def reset(self):
