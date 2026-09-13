@@ -36,7 +36,9 @@ namespace sglang {
  *       (`x ^ (x < 0 ? 0xFFFF : 0x8000)`, negatives below positives, -0 below +0). The
  *       histograms are indexed by the *raw* byte instead, and the pivot search undoes the
  *       permutation once per lane, so no element pays the distortion.
- * \note NaN inputs are not supported (same as DeepSelect, which traps on them).
+ * \note NaN scores are not selected: the ordered compares never match them, so a row with n
+ *       positive NaNs yields its top (k - n) real scores and -1 in the remaining slots (a
+ *       negative NaN orders below -inf and is simply never picked).
  */
 struct TopKBF16Config {
   static constexpr uint32_t kBlockSize = 512;
@@ -372,9 +374,14 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
 
+  // Slots past the census total were never staged. That only happens with NaN scores (the
+  // histogram counts them, no ordered compare ever selects them); write -1 there rather than
+  // whatever shared memory held before.
+  const uint32_t totals = smem.count_gt_eq;
+  const uint32_t num_staged = (totals >> 16) + min(totals & 0xFFFFu, eq_total);
   // TODO: pragma unroll this one, if real topk > 512
   for (uint32_t t = tx; t < topk; t += C::kBlockSize) {
-    out[t] = transform(smem.stage[t]);
+    out[t] = t < num_staged ? transform(smem.stage[t]) : -1;
   }
 }
 

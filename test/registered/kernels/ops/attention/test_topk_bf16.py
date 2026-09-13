@@ -217,5 +217,48 @@ def test_topk_bf16_bit_patterns(seq: int, k: int) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "nan_bits,n_nan", [(0x7FC0, 5), (0x7FC0, 100), (0x7FC0, 600), (0xFFC0, 600)]
+)
+def test_topk_bf16_nan_scores(nan_bits: int, n_nan: int) -> None:
+    """NaN scores are never selected: the slots they would have taken are -1, the
+    rest are the top of the real scores, and nothing reads stale shared memory."""
+    torch.manual_seed(nan_bits + n_nan)
+    batch, seq, k = 8, MAX_SEQ, 512
+    scores = (torch.randn(batch, seq, device="cuda") * 2).to(torch.bfloat16)
+    bits = scores.view(
+        torch.int16
+    )  # write the NaN by bit pattern: .item() would lose its sign
+    for b in range(batch):
+        bits[b, torch.randperm(seq, device="cuda")[:n_nan]] = nan_bits - (
+            0x10000 if nan_bits >= 0x8000 else 0
+        )
+    lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    table = _identity_table(batch)
+    out = torch.full((batch, k), -7, dtype=torch.int32, device="cuda")
+    topk_transform_bf16_small(scores, lens, table, out, 8)
+    torch.cuda.synchronize()
+    for b in range(batch):
+        real = scores[b][~scores[b].isnan()].float()
+        n_real = (
+            max(0, k - n_nan) if nan_bits < 0x8000 else k
+        )  # positive NaNs eat slots
+        chosen = out[b] >= 0
+        assert int(chosen.sum()) == n_real, (
+            f"row {b}: {int(chosen.sum())} selected, want {n_real}"
+        )
+        assert bool((out[b][~chosen] == -1).all()), (
+            f"row {b}: unselected slots are not -1"
+        )
+        idx = out[b][chosen].long()
+        assert bool((idx < seq).all()) and idx.unique().numel() == n_real, (
+            f"row {b}: bad index"
+        )
+        got = scores[b, idx].float().sort(descending=True).values
+        assert torch.equal(got, real.topk(n_real).values), (
+            f"row {b}: not the top real scores"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
