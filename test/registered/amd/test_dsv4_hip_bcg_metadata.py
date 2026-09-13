@@ -50,7 +50,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         )
         next_offset = fill_optional_tensors(metadata, 10)
         fill_optional_tensors(metadata.unified, next_offset)
-        metadata.c1_flashmla_metadata = None
+        metadata.c0_flashmla_metadata = None
         metadata.c4_flashmla_metadata = None
         metadata.c128_flashmla_metadata = None
         return metadata
@@ -99,7 +99,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 seq_lens=torch.tensor([1, 3], dtype=torch.int32),
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 num_tokens=3,
-                repeat_output_size=3,
+                exact_num_tokens=True,
             )
 
         repeat_interleave.assert_called_once()
@@ -109,18 +109,12 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
 
-    def test_eager_prefill_uses_host_proven_repeat_output_size(self):
+    def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
         extend_start_loc = torch.tensor([0, 1], dtype=torch.int32)
-        backend.expand_prefill_casually = mock.Mock(
-            return_value=(
-                core.seq_lens_casual,
-                torch.tensor([7, 9, 9], dtype=torch.int32),
-            )
-        )
         backend.make_core_attn_metadata = mock.Mock(return_value=core)
         backend._attach_unified_kv_prefill_meta = mock.Mock()
         backend.init_forward_metadata_indexer = mock.Mock(return_value=None)
@@ -153,17 +147,14 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 extend_seq_lens_cpu=[1, 2],
                 extend_start_loc=extend_start_loc,
                 use_prefill_cuda_graph=False,
+                exact_num_tokens=False,
             )
 
         self.assertIs(
             expand_prefill.call_args.kwargs["extend_start_loc"], extend_start_loc
         )
-        backend.expand_prefill_casually.assert_not_called()
-        self.assertEqual(
-            backend._attach_unified_kv_prefill_meta.call_args.kwargs[
-                "repeat_output_size"
-            ],
-            3,
+        self.assertTrue(
+            backend._attach_unified_kv_prefill_meta.call_args.kwargs["exact_num_tokens"]
         )
 
     def test_prefill_bcg_uses_bucket_sized_gpu_compressor_plans(self):
@@ -172,12 +163,6 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
         core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
-        backend.expand_prefill_casually = mock.Mock(
-            return_value=(
-                core.seq_lens_casual,
-                torch.tensor([7, 9, 9, 9], dtype=torch.int32),
-            )
-        )
         backend.make_core_attn_metadata = mock.Mock(return_value=core)
         backend._attach_unified_kv_prefill_meta = mock.Mock()
         backend.init_forward_metadata_indexer = mock.Mock(return_value=None)

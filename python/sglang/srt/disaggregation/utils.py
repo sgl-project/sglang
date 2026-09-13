@@ -122,6 +122,14 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
+    """Return the request-pool row that owns a QSA pending-state ring."""
+    req_pool_idx = req.kv.req_pool_idx
+    if req_pool_idx is None:
+        raise ValueError("QSA pending-state transfer requires an allocated request row")
+    return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -762,6 +770,41 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def should_send_replicated_state(
+    *,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    local_tp_rank_in_group: int,
+) -> bool:
+    """Elect writers for state replicated within an attention-TP group.
+
+    Scatter (one source rank to several destination ranks) is a broadcast, so
+    the source sends to every destination registration. Aggregation has several
+    equivalent source copies targeting one destination; only the first source
+    in each aggregation group writes it.
+    """
+    if src_attn_tp_size <= 0 or dst_attn_tp_size <= 0:
+        raise ValueError(
+            "Attention TP sizes must be positive for replicated-state transfer"
+        )
+    larger_tp_size = max(src_attn_tp_size, dst_attn_tp_size)
+    smaller_tp_size = min(src_attn_tp_size, dst_attn_tp_size)
+    if larger_tp_size % smaller_tp_size != 0:
+        raise ValueError(
+            "One attention TP size must divide the other for replicated-state "
+            f"transfer: src={src_attn_tp_size}, dst={dst_attn_tp_size}"
+        )
+    if not 0 <= local_tp_rank_in_group < src_attn_tp_size:
+        raise ValueError(
+            "Source attention TP rank is out of range for replicated-state "
+            f"transfer: rank={local_tp_rank_in_group}, size={src_attn_tp_size}"
+        )
+    if src_attn_tp_size <= dst_attn_tp_size:
+        return True
+    writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+    return local_tp_rank_in_group % writers_per_decode == 0
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -851,8 +894,28 @@ def compute_mamba_state_slice_byte_blocks(
 
     ``outer_count`` is one for the usual ``[slice_dim, ...]`` layout. Kimi
     conv state is ``[K - 1, slice_dim]``, so each logical channel slice expands
-    into one byte block per convolution row.
+    into one byte block per convolution row. A zero src/dst dim marks an item
+    replicated across attention TP and copies the whole item from an elected
+    source rank.
     """
+    if (src_dim == 0) != (dst_dim == 0):
+        raise ValueError(
+            "Mamba state replication metadata differs between prefill and decode"
+        )
+    if src_dim == 0:
+        if src_item_len != dst_item_len:
+            raise ValueError(
+                "Replicated Mamba state item lengths differ between prefill and "
+                f"decode: {src_item_len} != {dst_item_len}"
+            )
+        if not should_send_replicated_state(
+            src_attn_tp_size=src_attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            local_tp_rank_in_group=local_tp_rank_in_group,
+        ):
+            return []
+        return [(0, 0, src_item_len)]
+
     src_bytes_per_dim = src_item_len // (src_dim * outer_count)
     dst_bytes_per_dim = dst_item_len // (dst_dim * outer_count)
     logical_blocks = compute_mamba_state_slice_blocks(
@@ -1281,6 +1344,7 @@ def setup_state_kv_args(
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
@@ -1422,6 +1486,29 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+            if isinstance(token_to_kv_pool, QSATokenToKVPool):
+                qsa_ptrs, qsa_lens, qsa_item_lens = (
+                    token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_PENDING,
+                    qsa_ptrs,
+                    qsa_lens,
+                    qsa_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                )
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_COMPRESSED,
+                    compressed_ptrs,
+                    compressed_lens,
+                    compressed_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):
