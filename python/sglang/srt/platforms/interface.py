@@ -12,7 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Any, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
@@ -59,6 +59,10 @@ class SRTPlatform(DeviceMixin):
     def get_graph_runner_cls(self) -> type:
         """Return the graph runner class for this platform."""
         raise NotImplementedError
+
+    def get_full_graph_backend_cls(self) -> type[Any]:
+        """Return the full device-graph backend class for this platform."""
+        return None
 
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""

@@ -37,9 +37,8 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
     TcPiecewiseCudaGraphBackend,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-)
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -99,8 +98,17 @@ def resolve_decode_backend(
                 "falling back to 'full'."
             )
             _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
-    return FullCudaGraphBackend(
-        cuda_graph_runner, enable_memory_saver=enable_memory_saver
+
+    full_backend_cls = None
+    if current_platform.is_out_of_tree():
+        full_backend_cls = current_platform.get_full_graph_backend_cls()
+
+    if full_backend_cls is None:
+        full_backend_cls = FullCudaGraphBackend
+
+    return full_backend_cls(
+        cuda_graph_runner,
+        enable_memory_saver=enable_memory_saver,
     )
 
 
