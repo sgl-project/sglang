@@ -950,6 +950,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             body,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1319,35 +1320,20 @@ async fn streaming_active_load_drops_on_client_disconnect() {
         Duration::from_millis(100),
     )
     .await;
-    let ctx = build_ctx_with_worker(&worker.url);
+    let (ctx, body) = stream_chat(&worker.url).await;
     let active_load = Arc::clone(&ctx.active_load);
-    let app = build_router(ctx);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true,
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
 
     // Read one chunk to confirm the stream is live, then drop the body.
     use futures::StreamExt;
-    let mut data_stream = res.into_body().into_data_stream();
+    let mut data_stream = body.into_data_stream();
     let _first = data_stream.next().await;
     drop(data_stream);
 
-    // Wait long enough for the SSE pump to notice the receiver-drop and
-    // exit (per `bytes_stream_to_body_breaks_on_client_disconnect` test
-    // in sse.rs, that takes well under 200 ms).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="client_disconnect"}} 1"#,
+        worker.url,
+    );
+    wait_for_metric(&ctx, &expected).await;
 
     assert_eq!(
         active_load.inflight_count(),
@@ -1476,4 +1462,112 @@ async fn non_streaming_error_path_drops_active_load_guard() {
         0,
         "error path must drop the active-load guard",
     );
+}
+
+fn has_metric_line(metrics: &str, expected: &str) -> bool {
+    metrics.lines().any(|line| line == expected)
+}
+
+/// Send a streaming request and wait for the expected metric.
+async fn stream_chat_and_render(
+    worker_url: &str,
+    expected_metric: &str,
+) -> (Arc<AppContext>, String) {
+    let (ctx, body) = stream_chat(worker_url).await;
+    body.collect().await.unwrap();
+    let metrics = wait_for_metric(&ctx, expected_metric).await;
+    (ctx, metrics)
+}
+
+async fn stream_chat(worker_url: &str) -> (Arc<AppContext>, Body) {
+    let ctx = build_ctx_with_worker(worker_url);
+    let app = build_router(ctx.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    (ctx, res.into_body())
+}
+
+async fn wait_for_metric(ctx: &AppContext, expected_metric: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = ctx.metrics.render();
+        if has_metric_line(&metrics, expected_metric) {
+            return metrics;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for `{expected_metric}`; got:\n{metrics}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A post-200 SSE error event is classified without affecting routing health.
+#[tokio::test]
+async fn streaming_error_event_records_outcome_without_tripping_breaker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="stream_error_event"}} 1"#,
+        worker.url,
+    );
+    let (ctx, metrics) = stream_chat_and_render(&worker.url, &expected).await;
+    assert!(has_metric_line(
+        &metrics,
+        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+    ));
+    assert!(
+        ctx.registry
+            .all()
+            .iter()
+            .all(|worker| worker.breaker.would_allow()),
+        "SSE error event must not trip the circuit breaker",
+    );
+}
+
+#[tokio::test]
+async fn streaming_clean_completion_records_ok() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 1"#,
+        worker.url,
+    );
+    stream_chat_and_render(&worker.url, &expected).await;
+}
+
+#[tokio::test]
+async fn streaming_error_event_then_transport_failure_records_upstream_error() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: {\"error\": {\"code\": 503}}\n\n",
+    )
+    .await;
+    let (ctx, body) = stream_chat(&worker.url).await;
+    assert!(body.collect().await.is_err());
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="upstream_error"}} 1"#,
+        worker.url,
+    );
+    wait_for_metric(&ctx, &expected).await;
 }
