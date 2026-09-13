@@ -373,6 +373,10 @@ class QuarkConfig(QuantizationConfig):
             expanded.append(name)
             if name.startswith("language_model."):
                 expanded.append(name.removeprefix("language_model."))
+            parent, separator, module_name = name.rpartition(".")
+            fused_alias = module_name + "_proj"
+            if separator and fused_alias in self.packed_modules_mapping:
+                expanded.append(f"{parent}.{fused_alias}")
         self.exclude_layers = list(dict.fromkeys(expanded))
 
     def get_quant_method(

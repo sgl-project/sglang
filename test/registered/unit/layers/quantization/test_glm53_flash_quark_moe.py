@@ -41,6 +41,22 @@ class _CapturingRunner:
 
 
 class TestGLM53FlashQuarkMoE(CustomTestCase):
+    def test_flash_fused_qkv_exclusion_maps_to_runtime_proj_name(self):
+        config = object.__new__(QuarkConfig)
+        config.exclude_layers = ["model.visual.blocks.0.attn.qkv"]
+        config.packed_modules_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        }
+        mapper = SimpleNamespace(
+            apply_list=lambda names: [
+                name.replace("model.visual.", "visual.") for name in names
+            ]
+        )
+
+        config.apply_weight_name_mapper(mapper)
+
+        self.assertIn("visual.blocks.0.attn.qkv_proj", config.exclude_layers)
+
     def test_flash_layer_config_matches_runtime_prefix_without_language_model(self):
         config = object.__new__(QuarkConfig)
         fp8_config = {
