@@ -805,6 +805,7 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens_int = seq_lens_cpu[:bs].int()
             else:
                 seq_lens_int = seq_lens[:bs].int()
+            seq_lens_int = seq_lens_int.to(self.device)
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
             start_exp = starts.unsqueeze(1)

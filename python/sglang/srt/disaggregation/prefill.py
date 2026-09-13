@@ -242,11 +242,18 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-        kv_args.prefill_end_layer = (
-            kv_args.prefill_start_layer + len(kv_data_ptrs)
-            if layer_shard_enabled
-            else getattr(self.token_to_kv_pool, "end_layer", None)
-        )
+        if layer_shard_enabled:
+            # Bucket-layout pools (e.g. DSV4) expose the owned global layer
+            # range directly; len() covers one-buffer-per-layer pools.
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool,
+                "layer_shard_end",
+                kv_args.prefill_start_layer + len(kv_data_ptrs),
+            )
+        else:
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool, "end_layer", None
+            )
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool

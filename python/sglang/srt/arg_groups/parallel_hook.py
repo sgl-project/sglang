@@ -612,12 +612,10 @@ def handle_expert_distribution_metrics(server_args: Any):
 
 
 def validate_prefill_cp_platform(server_args: Any):
-    """Reject deprecated platform CP before resolving models or CP topology."""
+    """Reject deprecated platform CP; NPU prefill CP stays supported."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    ):
+    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
         raise ValueError(
-            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
         )

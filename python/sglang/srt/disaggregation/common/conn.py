@@ -1284,7 +1284,9 @@ class CommonKVManager(BaseKVManager):
                 f"(kv_data) or swa_L + {2 * c4_full} "
                 f"(state_data) given compression_ratios "
                 f"(c4={c4_full}, c128={c128_full}, "
-                f"total={len(mla_ratios)})."
+                f"total={len(mla_ratios)}); "
+                f"state_type={getattr(state_type, 'value', state_type)}, "
+                f"src_len={len(src_kv_ptrs)}."
             )
 
         swa_s = min(start_layer, swa_L)

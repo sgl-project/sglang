@@ -86,6 +86,7 @@ def handle_model_specific_adjustments(server_args: Any):
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_deepseek_v4,
     )
 
     if cfg.enable_deterministic_inference:
@@ -120,10 +121,12 @@ def handle_model_specific_adjustments(server_args: Any):
                 "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
             )
 
-    if cfg.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
+    if cfg.enable_dsa_cache_layer_split and not (
+        is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+    ):
         raise ValueError(
             "--enable-dsa-cache-layer-split is only supported for DSA "
-            "(DeepSeek Sparse Attention) models."
+            "(DeepSeek Sparse Attention) models, including DeepSeek V4."
         )
 
     if cfg.enable_cp_decode_attn_tp:
@@ -374,10 +377,12 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
+            validate_deepseek_v4_layer_split,
             validate_deepseek_v4_mega_moe_token_budget,
         )
 
         validate_deepseek_v4_cp(server_args)
+        validate_deepseek_v4_layer_split(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
