@@ -2074,19 +2074,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices[: insert_result.prefix_len]
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
-            # Cache mode has only completed L3 -> L2 here. Keep the usable
-            # storage span unresolved until admission proves that L2 -> L1
-            # load-back actually materialized it for this request.
-            self._resolve_storage_prefetch_tokens(req_id, insert_result.prefix_len)
+            # Resolve the full completed span at admission, including tokens
+            # concurrently inserted by another request.
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-        if loaded_from_storage > 0:
+        self.prefetch_loaded_tokens_by_reqid[req_id] = (
+            0 if insert_result.host_insert_dropped else completed_tokens
+        )
+        if not insert_result.host_insert_dropped and completed_tokens > 0:
             self.prefetch_loaded_storage_start_by_reqid[req_id] = (
-                operation.storage_start + insert_result.prefix_len
+                operation.storage_start
             )
         else:
             self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)

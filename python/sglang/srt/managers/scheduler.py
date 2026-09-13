@@ -3878,12 +3878,9 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
-                    req.storage_hit_length = held_tokens
-                    req.storage_hit_start = len(req.prefix_indices)
+                    # Preserve the completed L3 span, including peer-covered KV.
                     req.host_hit_is_storage = True
                 elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                    req.storage_hit_length = 0
-                    req.storage_hit_start = None
                     req.host_hit_is_storage = False
             res = adder.add_one_req(
                 req,
