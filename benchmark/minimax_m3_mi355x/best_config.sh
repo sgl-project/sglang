@@ -23,3 +23,12 @@ export ENVS2="$ENVS2 SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1"
 # Track L: chunked-prefill fairness (waiting short extends share the chunk budget with a long in-flight prefill);
 # c=24 900 s windows: TTFT p90 4.50->3.96 s, p99 12.7->10.3 s, throughput within noise; gsm8k-500 0.870 on the real-acceptance cfg.
 export ENVS2="$ENVS2 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5"
+
+# Track P: ATOM-style online PTPC-FP8 for the quark-excluded bf16 linears (attention q/k/v/o, index projections, 3 dense MLPs;
+# router gate + lm_head stay bf16) with tuned aiter a8w8_bpreshuffle rows for the M3 shapes and the fused add-RMSNorm fp8
+# emission consumed by the following GEMM (51e758ee57). Quality: GSM8K-1000 0.863 (bf16 dense: 0.854), GSM8K-500 0.862/0.864.
+# Speed: fresh 197K prefill 5.62-5.73 s (bf16 dense 5.7-5.8), steady decode unchanged (dense GEMMs are ~1% of the verify step).
+# Tuned rows: /scratch/run/tuned_a8w8_bpreshuffle_m3_gfx950.csv (repo copy: benchmark/minimax_m3_mi355x/); aiter merges the
+# colon-separated files, lowest us wins. Draft-model fp8 (--speculative-draft-model-quantization fp8) was neutral: not enabled.
+export ENVS2="$ENVS2 SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1 SGLANG_USE_AITER_FP8_PER_TOKEN=1 SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES=gate,lm_head SGLANG_FUSED_NORM_FP8_QUANT_MAX_M=16384"
+export ENVS2="$ENVS2 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE=/sgl-workspace/aiter/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:/scratch/run/tuned_a8w8_bpreshuffle_m3_gfx950.csv"
