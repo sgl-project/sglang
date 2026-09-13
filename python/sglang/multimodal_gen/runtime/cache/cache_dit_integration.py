@@ -307,6 +307,40 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+def _build_db_cache_config(
+    config: CacheDitConfig,
+    *,
+    num_inference_steps: int | None = None,
+    scm_preset: str | None = None,
+) -> DBCacheConfig:
+    """Translate the SGLang config without dropping Cache-DiT fields."""
+    steps = (
+        config.num_inference_steps
+        if num_inference_steps is None
+        else num_inference_steps
+    )
+    if steps is None:
+        raise ValueError("num_inference_steps is required for DBCacheConfig.")
+    steps_computation_mask = config.steps_computation_mask
+    steps_computation_policy = config.steps_computation_policy
+    if scm_preset is not None:
+        steps_computation_mask = cache_dit.steps_mask(
+            mask_policy=scm_preset, total_steps=steps
+        )
+        steps_computation_policy = scm_preset
+
+    return DBCacheConfig(
+        num_inference_steps=steps,
+        Fn_compute_blocks=config.Fn_compute_blocks,
+        Bn_compute_blocks=config.Bn_compute_blocks,
+        max_warmup_steps=config.max_warmup_steps,
+        residual_diff_threshold=config.residual_diff_threshold,
+        max_continuous_cached_steps=config.max_continuous_cached_steps,
+        steps_computation_mask=steps_computation_mask,
+        steps_computation_policy=steps_computation_policy,
+    )
+
+
 @dataclass(frozen=True)
 class DualTransformerBlockAdapterSpec:
     """BlockAdapter metadata for dual-transformer DiT pipelines.
@@ -348,6 +382,7 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 class CustomBlockAdapterSpec:
     blocks_attr: str
     forward_pattern: ForwardPattern
+    module_prefix: str | None = None
 
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
@@ -364,6 +399,20 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    # SenseNova's Qwen3 backbones have Pattern_3 block loops, but their decoder
+    # blocks also receive model-specific keyword arguments.  The model keeps
+    # those arguments in its original forward and selects cached blocks only
+    # for pure image-generation calls (see modeling_qwen3.py).
+    "Qwen3Model": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+    ),
+    "Qwen3MoeModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+    ),
 }
 
 
@@ -376,6 +425,11 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
+    if (
+        spec.module_prefix is not None
+        and not transformer.__class__.__module__.startswith(spec.module_prefix)
+    ):
+        return None
     blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
@@ -385,6 +439,11 @@ def _build_custom_block_adapter(
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
+        # Always identify the attribute explicitly.  Some integrations keep an
+        # unregistered alias to the native ModuleList; cache-dit's automatic
+        # identity scan could otherwise select that alias and patch the wrong
+        # attribute during forward.
+        blocks_name=spec.blocks_attr,
         forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
@@ -439,18 +498,8 @@ def enable_cache_on_transformer(
                 "define a custom BlockAdapter."
             )
 
-    # Build cache config (including SCM fields if provided)
-    cache_config = DBCacheConfig(
-        num_inference_steps=config.num_inference_steps,
-        Fn_compute_blocks=config.Fn_compute_blocks,
-        Bn_compute_blocks=config.Bn_compute_blocks,
-        max_warmup_steps=config.max_warmup_steps,
-        residual_diff_threshold=config.residual_diff_threshold,
-        max_continuous_cached_steps=config.max_continuous_cached_steps,
-        # SCM fields
-        steps_computation_mask=config.steps_computation_mask,
-        steps_computation_policy=config.steps_computation_policy,
-    )
+    # Build cache config (including SCM fields if provided).
+    cache_config = _build_db_cache_config(config)
 
     # Build calibrator config if TaylorSeer is enabled
     calibrator_config = None
@@ -713,20 +762,35 @@ def refresh_context_on_transformer(
     num_inference_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    config: CacheDitConfig | None = None,
 ) -> None:
-    """Refresh cache-dit context for transformer."""
-    steps_computation_mask = None
-    if scm_preset is not None:
-        steps_computation_mask = cache_dit.steps_mask(
-            mask_policy=scm_preset, total_steps=num_inference_steps
+    """Refresh cache-dit context for transformer.
+
+    When ``config`` is provided, preserve the DBCache knobs used to mount the
+    transformer.  Creating a bare ``DBCacheConfig`` here would otherwise reset
+    request-level overrides on the next context refresh (for example, the
+    second output of a sequential multi-output request).
+    """
+    if config is not None:
+        db_cache_config = _build_db_cache_config(
+            config,
+            num_inference_steps=num_inference_steps,
+            scm_preset=scm_preset,
         )
-    cache_dit.refresh_context(
-        transformer,
-        cache_config=DBCacheConfig().reset(
+    else:
+        steps_computation_mask = None
+        if scm_preset is not None:
+            steps_computation_mask = cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_inference_steps
+            )
+        db_cache_config = DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
             steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_preset,
-        ),
+        )
+    cache_dit.refresh_context(
+        transformer,
+        cache_config=db_cache_config,
         verbose=verbose,
     )
     logger.debug(f"cache-dit refreshed on transformer (steps={num_inference_steps})")

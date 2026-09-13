@@ -2473,6 +2473,17 @@ class NEOChatModel(PreTrainedModel):
                 timesteps, token_h * token_w, timestep_shift
             )
 
+        # Noise scale is fixed for this request; only the timestep changes.
+        noise_embeddings = None
+        if self.add_noise_scale_embedding and num_steps > 0:
+            noise_scale_tensor = timesteps.new_full(
+                (batch_size * token_h * token_w,),
+                noise_scale / self.noise_scale_max_value,
+            )
+            noise_embeddings = self.fm_modules["noise_scale_embedder"](
+                noise_scale_tensor
+            ).view(batch_size, token_h * token_w, -1)
+
         for step_i in range(num_steps):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
@@ -2490,13 +2501,7 @@ class NEOChatModel(PreTrainedModel):
             timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
                 batch_size, token_h * token_w, -1
             )
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(
-                    t_expanded, noise_scale / self.noise_scale_max_value
-                )
-                noise_embeddings = self.fm_modules["noise_scale_embedder"](
-                    noise_scale_tensor
-                ).view(batch_size, token_h * token_w, -1)
+            if noise_embeddings is not None:
                 timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
 
