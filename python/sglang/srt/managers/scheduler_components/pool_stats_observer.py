@@ -12,10 +12,6 @@ from typing import (
 )
 
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-    supports_swa_byte_budget,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -291,28 +287,12 @@ class SchedulerPoolStatsObserver:
             mamba_evictable_size=mamba_evictable_size,
         )
 
-    def _swa_capacity_and_available(self) -> tuple[tuple[int, int], tuple[int, int]]:
-        allocator = self.token_to_kv_pool_allocator
-        if supports_swa_byte_budget(allocator):
-            return (
-                (allocator.current_full_capacity, allocator.full_available_size()),
-                (allocator.current_swa_capacity, allocator.swa_available_size()),
-            )
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            # The tri-pool reports static capacities paired with conserve views.
-            full_available_size = allocator.conserve_full_available_size()
-            swa_available_size = allocator.conserve_swa_available_size()
-        else:
-            full_available_size = allocator.full_available_size()
-            swa_available_size = allocator.swa_available_size()
-        return (
-            (self.full_tokens_per_layer, full_available_size),
-            (self.swa_tokens_per_layer, swa_available_size),
-        )
-
     def _get_swa_token_info(self) -> PoolStats:
         (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
-            self._swa_capacity_and_available()
+            self.token_to_kv_pool_allocator.swa_capacity_and_available(
+                full_capacity=self.full_tokens_per_layer,
+                swa_capacity=self.swa_tokens_per_layer,
+            )
         )
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()

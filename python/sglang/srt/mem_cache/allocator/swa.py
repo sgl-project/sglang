@@ -158,6 +158,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_attn_allocator.available_size(),
         )
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        full_shortfall = max(0, num_tokens - self.full_available_size())
+        swa_shortfall = max(0, num_tokens - self.swa_available_size())
+        if full_shortfall or swa_shortfall:
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+            )
+
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
 
@@ -671,6 +696,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def available_size(self):
         return self.swa_attn_allocator.available_size()
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self,
+            tree_cache,
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
+            all_swa=True,
+        )
 
     def full_available_size(self):
         return self.swa_attn_allocator.available_size()
