@@ -1,4 +1,4 @@
-"""Unit tests for ``DecodeCudaGraphRunner`` capture-phase profiling — CPU-only.
+"""CPU tests for ``DecodeCudaGraphRunner`` profiling and ragged capture geometry.
 
 Two capture-trace modes plus their precedence:
 
@@ -28,10 +28,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -291,6 +294,111 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestRaggedVerifyCaptureGeometry(CustomTestCase):
+    """Capture, admission and staging must agree on each token tier's rows."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _runner(self, capture_bs, width):
+        runner = SimpleNamespace(
+            capture_bs=capture_bs,
+            captured_req_width=width,
+            max_bs=max(capture_bs),
+            ragged_verify_mode=True,
+            device=torch.device("cpu"),
+            _captured_ragged_layouts={},
+            attn_backend=SimpleNamespace(supports_ragged_verify_graph=True),
+            require_mlp_sync=False,
+            is_encoder_decoder=False,
+            capture_hidden_mode=0,
+        )
+        for name in (
+            "_build_ragged_verify_token_buckets",
+            "_ragged_capture_slots",
+            "_capture_ragged_verify_layout",
+            "_stage_ragged_verify_layout",
+            "_can_run_ragged_verify_graph",
+        ):
+            setattr(runner, name, getattr(DecodeCudaGraphRunner, name).__get__(runner))
+        runner.capture_num_tokens = runner._build_ragged_verify_token_buckets()
+        return runner
+
+    def _admitted(self, runner, layout):
+        batch = SimpleNamespace(batch_size=layout.bs, capture_hidden_mode=0)
+        return runner._can_run_ragged_verify_graph(batch, layout)
+
+    def test_42_token_tier_has_seven_complete_requests(self):
+        runner = self._runner([1, 2, 4, 7, 8], width=6)
+        layout = runner._capture_ragged_verify_layout(42)
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.verify_lens.tolist(), [6] * 7)
+        self.assertEqual(layout.bs, 7)
+        self.assertEqual(layout.total_verify_tokens, 42)
+        self.assertEqual(layout.qo_indptr_device.tolist(), list(range(0, 43, 6)))
+
+    def test_capture_tiers_preserve_request_geometry(self):
+        for width in (1, 2, 6, 8):
+            runner = self._runner([1, 2, 4, 7, 8], width=width)
+            for bs, tier in zip(runner.capture_bs, runner.capture_num_tokens):
+                with self.subTest(bs=bs, width=width, tier=tier):
+                    layout = runner._capture_ragged_verify_layout(tier)
+                    self.assertEqual(layout.bs, bs)
+                    self.assertEqual(layout.verify_lens.tolist(), [width] * bs)
+                    self.assertEqual(int(layout.verify_lens.sum()), tier)
+                    self.assertEqual(int(layout.qo_indptr_device[-1]), tier)
+
+    def test_historical_192_token_capture_matches_uniform_replay(self):
+        runner = self._runner([1, 32, 192], width=6)
+        capture = runner._capture_ragged_verify_layout(192)
+        live = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[6] * 32,
+            device=runner.device,
+            grid=runner.capture_num_tokens,
+        )
+        self.assertTrue(self._admitted(runner, live))
+        captured_lens = capture.verify_lens.clone()
+        runner._stage_ragged_verify_layout(live, live.graph_num_tokens)
+        self.assertEqual(capture.verify_lens.tolist(), captured_lens.tolist())
+        self.assertEqual(capture.verify_lens.tolist(), [6] * 32)
+
+    def test_rejects_more_requests_than_captured_tier_can_hold(self):
+        runner = self._runner([1, 32, 192], width=6)
+        live = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[5] * 33,
+            device=runner.device,
+            grid=runner.capture_num_tokens,
+        )
+        self.assertEqual(live.graph_num_tokens, 192)
+        self.assertFalse(self._admitted(runner, live))
+
+    def test_replay_padding_preserves_capture_buffers(self):
+        runner = self._runner([1, 2, 4, 8], width=6)
+        capture = runner._capture_ragged_verify_layout(48)
+        lens_ptr = capture.verify_lens.data_ptr()
+        indptr_ptr = capture.qo_indptr_device.data_ptr()
+        for lens in ([6] * 7, [6, 6, 6, 6, 6, 6, 1, 6]):
+            with self.subTest(verify_lens=lens):
+                live = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=lens,
+                    device=runner.device,
+                    grid=runner.capture_num_tokens,
+                )
+                self.assertEqual(live.graph_num_tokens, 48)
+                self.assertTrue(self._admitted(runner, live))
+                runner._stage_ragged_verify_layout(live, 48)
+                expected = lens + [6] * (8 - len(lens))
+                self.assertEqual(capture.verify_lens.tolist(), expected)
+                self.assertEqual(int(capture.qo_indptr_device[-1]), sum(expected))
+                self.assertEqual(capture.verify_lens.data_ptr(), lens_ptr)
+                self.assertEqual(capture.qo_indptr_device.data_ptr(), indptr_ptr)
 
 
 if __name__ == "__main__":
