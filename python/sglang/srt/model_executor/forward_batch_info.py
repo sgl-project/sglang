@@ -1087,29 +1087,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
         return (lens_to_track // chunk_size) * chunk_size
 
-    def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
-        """
-        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
-
-        Returns:
-            if none, current batch contains no multimodal input
-
-        """
-        if not self.mm_inputs or all(x is None for x in self.mm_inputs):
-            return None
-        # Filter out None values
-        valid_inputs = [x for x in self.mm_inputs if x is not None]
-
-        # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
-        merged = valid_inputs[0].__class__(mm_items=[])
-
-        # Merge remaining inputs
-        for mm_input in valid_inputs:
-            merged.merge(mm_input)
-
-        return merged
-
     def contains_image_inputs(self) -> bool:
         if self.mm_inputs is None:
             return False

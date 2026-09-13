@@ -1347,24 +1347,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
-    def _validate_input_ids_in_vocab(
-        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
-    ) -> None:
-        # Handle both single sequence and batch of sequences
-        if isinstance(input_ids[0], list):
-            # Batch of sequences
-            for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
-                    raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
-                    )
-        else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-                )
-
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
