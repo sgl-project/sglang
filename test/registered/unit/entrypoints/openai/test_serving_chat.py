@@ -42,7 +42,11 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
-from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_detection import (
+    ReasoningToggleConfig,
+    detect_reasoning_pattern,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
@@ -268,6 +272,17 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+
+# Minimal GLM-5.3 detection signature; the absent ``enable_thinking`` toggle
+# is part of it, not an omission for brevity.
+_GLM53_TEMPLATE = (
+    "[gMASK]<sop>"
+    "<|system|>Reasoning Effort: {{ reasoning_effort | capitalize }}"
+    "{{- '<tool_call>' + tc.name -}}"
+    "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value></tool_call>"
+    "<|assistant|>{{- '<think>' -}}"
+)
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -799,6 +814,40 @@ class ServingChatTestCase(unittest.TestCase):
             processed = self.chat._process_messages(request, is_multimodal=False)
 
         self.assertTrue(processed.require_reasoning)
+
+    def test_glm53_keeps_reasoning_split_when_request_disables_thinking(self):
+        """A request that disables thinking must not un-split GLM-5.3 reasoning;
+        the template opens ``<think>`` regardless, so content would keep the
+        closing tag."""
+        force, config = detect_reasoning_pattern(_GLM53_TEMPLATE)
+        self.template_manager.force_reasoning = force
+        self.template_manager.reasoning_config = config
+        self.chat.reasoning_parser = "glm45"
+        self.chat._reasoning_detector = ReasoningParser("glm45").detector
+
+        for kwargs in (
+            {"reasoning_effort": "none"},
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        ):
+            with self.subTest(**kwargs):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 17*23?"}],
+                    **kwargs,
+                )
+                require_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self.chat._get_reasoning_from_request(request)
+                )
+                reasoning, content = ReasoningParser(
+                    self.chat.reasoning_parser,
+                    force_reasoning=require_reasoning,
+                    request=request,
+                ).parse_non_stream("17*23 = 391</think>391")
+
+                self.assertTrue(require_reasoning)
+                self.assertEqual(reasoning, "17*23 = 391")
+                self.assertEqual(content, "391")
 
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
