@@ -459,10 +459,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 # content would drop-newest and punch storage holes.
                 write_backlog_cap=2 * self.token_to_kv_pool_allocator.size_full,
             )
-            self.cache_controller.host_write_staged_tokens_fn = lambda: (
-                self.buffer_pipeline.write_staged_tokens_
-            )
-
         # State initialization
         if self.buffer_pipeline is not None:
             self.cache_controller.host_write_staged_tokens_fn = lambda: (

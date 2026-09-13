@@ -1004,9 +1004,7 @@ class UMBPStore(HiCacheStorage):
 
         # A logical anchor owns indices; side pools carry the data.
         self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
-        self._kv_anchor_is_page_envelope = bool(
-            getattr(self.mem_pool_host, "stores_page_envelope", False)
-        )
+        self._kv_anchor_is_page_envelope = self.mem_pool_host.stores_page_envelope
         self._zero_copy_registered = False
 
         # Side-pool registration needs the mode even for a logical anchor.

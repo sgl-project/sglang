@@ -42,7 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -1101,6 +1101,8 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
+                    if not get_memory().enable_unified_memory:
+                        raise
                     logger.exception(
                         "HiCache prefetch transfer failed for request %s",
                         operation.request_id,
@@ -1261,6 +1263,8 @@ class HiCacheController:
                             operation
                         )
                 except Exception:
+                    if not get_memory().enable_unified_memory:
+                        raise
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,
