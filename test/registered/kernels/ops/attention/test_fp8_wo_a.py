@@ -25,8 +25,72 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _GROUP_SIZE = 128
+
+
+class TestDeepSeekV4FP8WoAFp32(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or get_device_sm() < 90:
+            raise unittest.SkipTest("FP8 einsum requires SM90 or newer")
+        try:
+            import deep_gemm
+        except ImportError as exc:
+            raise unittest.SkipTest("deep_gemm is required") from exc
+        cls.deep_gemm = deep_gemm
+
+    def test_fp32_activation_scales_and_einsum(self):
+        """The FP32 branch must also survive DeepGEMM's UE8M0 conversion."""
+        torch.manual_seed(39193)
+        D, R = 4096, 256
+        for T in (1, 7, 128):
+            for G in (8, 16):
+                with self.subTest(T=T, G=G):
+                    o = torch.randn(T, G, D, device="cuda").clamp(-1, 1).bfloat16()
+                    raw_scale = o.float().unflatten(-1, (-1, 128)).abs().amax(-1) / 448
+                    self.assertTrue(
+                        (raw_scale.view(torch.int32) & 0x7FFFFF).ne(0).any()
+                    )
+                    q, s = sglang_per_token_group_quant_fp8(
+                        o.view(T * G, D), 128, scale_ue8m0=True
+                    )
+                    self.assertEqual(s.dtype, torch.float32)
+                    self.assertEqual(s.shape, (T * G, D // 128))
+                    self.assertEqual(s.stride(), (D // 128, 1))
+                    self.assertTrue(torch.isfinite(s).all())
+                    self.assertTrue((s >= torch.finfo(torch.float32).tiny).all())
+                    self.assertTrue((s.view(torch.int32) & 0x7FFFFF).eq(0).all())
+                    o_dequant = (
+                        q.float().unflatten(-1, (-1, 128)) * s.unsqueeze(-1)
+                    ).view(T, G, D)
+                    torch.testing.assert_close(
+                        o_dequant, o.float(), rtol=0.063, atol=s.max().item() * 2**-10
+                    )
+
+                    weight = torch.randn(G, R, D, device="cuda").bfloat16()
+                    weight_q, weight_s = quant_weight_ue8m0(
+                        weight, weight_block_size=[128, 128]
+                    )
+                    out = torch.empty(T, G, R, device="cuda", dtype=torch.bfloat16)
+                    self.deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (q.view(T, G, D), s.view(T, G, D // 128)),
+                        (weight_q, weight_s),
+                        out,
+                        recipe=(1, 128, 128),
+                    )
+                    weight_dequant = block_quant_dequant(
+                        weight_q, weight_s, block_size=[128, 128], dtype=torch.float32
+                    )
+                    ref = torch.einsum("tgd,grd->tgr", o_dequant, weight_dequant)
+                    # Normalize globally: per-element relative error is unstable
+                    # near zero. These bounds leave room for BF16 output rounding
+                    # but reject the large error from dropping scale mantissas.
+                    diff = out.float() - ref
+                    self.assertLess((diff.abs().max() / ref.abs().max()).item(), 0.01)
+                    self.assertLess((diff.norm() / ref.norm()).item(), 0.005)
 
 
 class TestDeepSeekV4FP8WoA(CustomTestCase):

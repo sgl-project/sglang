@@ -1847,11 +1847,12 @@ class MQALayer(MqaAttentionBase):
                     o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                     recipe = (1, 1, 128)
                 else:
-                    # sm90 (Hopper): fp32 scales.
+                    # Keep row-major FP32 storage, but use power-of-two scale values:
+                    # some fp8_einsum backends convert these scales to UE8M0.
                     o_fp8, o_s = sglang_per_token_group_quant_fp8(
                         o.reshape(T * G, D).contiguous(),
                         group_size=128,
-                        scale_ue8m0=False,
+                        scale_ue8m0=True,
                     )
                     o_fp8 = o_fp8.view(T, G, D)
                     o_s = o_s.view(T, G, -1)
