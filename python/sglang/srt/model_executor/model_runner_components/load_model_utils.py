@@ -116,6 +116,12 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
     if kv_cache_dtype == "fp8_e4m3":
+        if getattr(model, "kv_cache_scale_mode", None) == "dynamic":
+            logger.info(
+                "Using FP8 KV cache with scales generated dynamically by %s.",
+                model.__class__.__name__,
+            )
+            return
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(get_model().quantization_param_path)
