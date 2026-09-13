@@ -64,6 +64,7 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
 from sglang.srt.arg_groups.validation_hook import (
     check_two_batch_overlap,
 )
@@ -2802,6 +2803,76 @@ class TestDeepEPv2Args(CustomTestCase):
         args._resolved_overrides = [("test", {"moe_a2a_backend": "deepep"})]
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
             validate_deepep_v2_dispatch_token_budget(args)
+
+
+class TestDeepseekV4Hook(CustomTestCase):
+    """DeepSeek-V4 model-specific argument adjustments."""
+
+    def setUp(self):
+        # apply_deepseek_v4_defaults writes environment variables.
+        super().setUp()
+        environment = dict(os.environ)
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(environment)
+
+        self.addCleanup(restore)
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy")
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
+        )
+        server_args._resolved_overrides = []
+        valid = {f.name for f in dataclasses.fields(ServerArgs)}
+        for key, value in overrides.items():
+            assert key in valid, f"{key} is not a ServerArgs field"
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_nextn_alias_accepted(self):
+        args = self._args(
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+        )
+        apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+    def test_eagle_accepted(self):
+        args = self._args(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+        )
+        apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+    def test_dspark_accepted(self):
+        args = self._args(speculative_algorithm="DSPARK")
+        apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+    def test_unsupported_algorithm_rejected(self):
+        args = self._args(speculative_algorithm="NGRAM")
+        with self.assertRaisesRegex(AssertionError, "Only EAGLE and DSPARK"):
+            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+    def test_eagle_topk_greater_than_one_rejected(self):
+        args = self._args(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=2,
+        )
+        with self.assertRaisesRegex(AssertionError, "topk == 1"):
+            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+    def test_nextn_topk_greater_than_one_rejected(self):
+        args = self._args(
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=2,
+        )
+        with self.assertRaisesRegex(AssertionError, "topk == 1"):
+            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):
