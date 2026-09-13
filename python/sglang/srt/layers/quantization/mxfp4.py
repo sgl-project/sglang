@@ -677,9 +677,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # (keeping both layouts OOMs: 92 layers double the experts).
                 from deep_gemm import transform_weights_for_mega_moe
 
-                from sglang.srt.layers.moe.mega_moe import _mega_moe_mma_type
+                from sglang.srt.layers.moe.mega_moe import (
+                    _mega_moe_mma_type,
+                    check_mega_moe_shapes,
+                )
 
                 mma_type = _mega_moe_mma_type()
+                check_mega_moe_shapes(
+                    hidden=layer.w13_weight.shape[2] * 2,
+                    intermediate=layer.w13_weight.shape[1] // 2,
+                    mma_type=mma_type,
+                )
                 l1_pair, l2_pair = transform_weights_for_mega_moe(
                     (layer.w13_weight.data, layer.w13_weight_scale.data),
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
