@@ -820,12 +820,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
+            self._compute_decode_logprobs(batch, logits_output, accept)
 
         if on_publish is not None:
             if confidence is not None:
@@ -882,6 +877,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _compute_decode_logprobs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        accept: AcceptOuts,
+    ) -> None:
+        """Per-token logprobs of the emitted chain onto ``logits_output``;
+        a subclass whose verify tail already produced them overrides this."""
+        compute_spec_logprobs(
+            batch,
+            logits_output,
+            accept.out_tokens.reshape(-1),
+            chain_stride=self.verify_num_draft_tokens,
         )
 
     def _build_decode_result(
