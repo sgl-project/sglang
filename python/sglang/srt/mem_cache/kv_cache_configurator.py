@@ -55,7 +55,10 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    select_dsv4_kv_layout,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -1323,8 +1326,15 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
+            kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
+            # 584-byte V4 pages, or the V4.1 fp8 / fp4 pages of the SM100 FlashMLA
+            # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            kv_layout_kwargs = dict(
+                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+            )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1356,6 +1366,7 @@ class KVCacheConfigurator:
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            **kv_layout_kwargs,
         )
         return token_to_kv_pool
 

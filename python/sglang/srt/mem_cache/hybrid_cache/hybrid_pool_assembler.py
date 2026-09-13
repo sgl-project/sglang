@@ -470,6 +470,17 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _dsv4_page_aligned_only(pool: Any) -> bool:
+    """
+    Whether a DeepSeek V4 paged pool may only move whole pages: the
+    token-granular copy (``transfer_cache_dsv4_mla``) splits a token into the
+    576-byte data row and 8-byte scale row of the V4 layout, so pools in the
+    V4.1 fp8 / fp4 layouts (512 + 16 and 256 + 32 bytes) must stay page aligned.
+    """
+    layout = getattr(pool, "kv_layout", None)
+    return layout is not None and layout.value != "v4"
+
+
 @dataclass(frozen=True)
 class _IndexerRegion:
     """One page-contiguous indexer buffer group to mirror on the host."""
@@ -703,6 +714,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -730,6 +742,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
         entries.append(
             build_pool_entry(
@@ -814,6 +827,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.

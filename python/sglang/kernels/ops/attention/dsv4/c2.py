@@ -8,7 +8,7 @@ Positions and state-ring indices describe the per-request decode schedule.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 if TYPE_CHECKING:
@@ -26,10 +27,18 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_c2_module(head_dim: int, rope_dim: int = 64, page_size: int = 128) -> Module:
-    # rope_dim / page_size only shape the store half; the norm-only wrapper is
-    # unaffected by them and just takes the defaults.
+def _jit_c2_module(
+    head_dim: int,
+    rope_dim: int = 64,
+    page_size: int = 128,
+    layout: KVLayout = KVLayout.V4,
+) -> Module:
+    # rope_dim / page_size / layout only shape the store half; the norm-only
+    # wrapper is unaffected by them and just takes the defaults.
     args = make_cpp_args(head_dim, rope_dim, page_size, is_arch_support_pdl())
+    if layout is not KVLayout.V4:
+        # Trailing template argument; V4 keeps the default and its build key.
+        args = make_cpp_args(*args, layout.cpp_name)
     return load_jit(
         make_name("c2"),
         *args,
@@ -118,6 +127,7 @@ def c2_decode_norm_rope_store(
     *,
     page_size: int,
     ring_size: int,
+    layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``c2_decode_norm`` plus the whole main-KV write, in the same launch.
@@ -131,13 +141,18 @@ def c2_decode_norm_rope_store(
                       stands for, so there is no gather launch.
     :param k_cache: the compressed KV pool buffer for this layer.
     :param page_size: slots per page of that pool (``page_size // ratio``).
+    :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
+                   ``V41``) store the fp4 fake-quantized value; ``V41_FP4``
+                   stores the e2m1 codes themselves, rounding once.
     """
     num_tokens, fused_dim = kv_input.shape
     head_dim = fused_dim // 2
     if out is None:
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
-    _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size).decode_fusion(
+    _jit_c2_module(
+        head_dim, freqs_cis.shape[-1], page_size, KVLayout.parse(layout)
+    ).decode_fusion(
         kv_input,
         kv_state,
         out,
@@ -167,6 +182,7 @@ def c2_verify_norm_rope_store(
     page_size: int,
     ring_size: int,
     draft_len: int,
+    layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``c2_decode_norm_rope_store`` for a target-verify block.
@@ -186,13 +202,16 @@ def c2_verify_norm_rope_store(
     latents, the same ring and the same cache bytes.
 
     :param draft_len: rows per request, ``speculative_num_draft_tokens``.
+    :param layout: the pool's :class:`KVLayout`, as for ``c2_decode_norm_rope_store``.
     """
     num_tokens, fused_dim = kv_input.shape
     head_dim = fused_dim // 2
     if out is None:
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
-    _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size).verify_fusion(
+    _jit_c2_module(
+        head_dim, freqs_cis.shape[-1], page_size, KVLayout.parse(layout)
+    ).verify_fusion(
         kv_input,
         kv_state,
         out,
