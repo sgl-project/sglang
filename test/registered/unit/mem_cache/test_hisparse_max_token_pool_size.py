@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,6 +30,7 @@ def _make_model_runner(**attrs):
     raise AttributeError on the internal `self.effective_max_total_num_tokens`
     read inside `max_token_pool_size`."""
     instance = object.__new__(ModelRunner)
+    instance.kv_cache_configurator = object.__new__(KVCacheConfigurator)
     for name, value in attrs.items():
         setattr(instance, name, value)
     return instance
