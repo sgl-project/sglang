@@ -920,7 +920,9 @@ class TestTritonAttention(CustomTestCase):
 
         self.assertTrue(torch.isfinite(o).all())
 
-    def _test_extend_attention_unified_vs_regular_once(self, B, N_CTX, H_Q, H_KV, D):
+    def _test_extend_attention_unified_vs_regular_once(
+        self, B, N_CTX, H_Q, H_KV, D, xai_temperature_len=-1
+    ):
         """Test that unified kernel produces same results as 2-stage kernel."""
         dtype = torch.bfloat16
         device = get_device()
@@ -1001,6 +1003,7 @@ class TestTritonAttention(CustomTestCase):
             max_len_extend=max_len_extend,
             k_scale=1.0,
             v_scale=1.0,
+            xai_temperature_len=xai_temperature_len,
         )
 
         # Build unified KV indices
@@ -1041,6 +1044,7 @@ class TestTritonAttention(CustomTestCase):
             sm_scale=None,
             logit_cap=0.0,
             is_causal=True,
+            xai_temperature_len=xai_temperature_len,
         )
 
         # Compare results
@@ -1060,15 +1064,23 @@ class TestTritonAttention(CustomTestCase):
     def test_extend_attention_unified_vs_regular(self):
         """Test unified kernel matches 2-stage kernel across different configs."""
         configs = [
-            (4, 512, 32, 8, 128),  # Standard config
-            (2, 2048, 32, 8, 128),  # Long sequence (test 2048 specifically)
-            (8, 256, 64, 8, 80),  # Non-standard head dim
+            (4, 512, 32, 8, 128, -1),  # Standard config
+            (2, 2048, 32, 8, 128, -1),  # Long sequence (test 2048 specifically)
+            (8, 256, 64, 8, 80, -1),  # Non-standard head dim
+            (2, 512, 32, 8, 128, 4),  # Grok/xAI temperature scaling
         ]
 
-        for B, N_CTX, H_Q, H_KV, D in configs:
-            with self.subTest(B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D):
+        for B, N_CTX, H_Q, H_KV, D, xai_temperature_len in configs:
+            with self.subTest(
+                B=B,
+                N_CTX=N_CTX,
+                H_Q=H_Q,
+                H_KV=H_KV,
+                D=D,
+                xai_temperature_len=xai_temperature_len,
+            ):
                 self._test_extend_attention_unified_vs_regular_once(
-                    B, N_CTX, H_Q, H_KV, D
+                    B, N_CTX, H_Q, H_KV, D, xai_temperature_len=xai_temperature_len
                 )
 
     def test_build_unified_kv_indices(self):
