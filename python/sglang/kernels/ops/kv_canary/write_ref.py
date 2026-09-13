@@ -10,6 +10,7 @@ from sglang.kernels.ops.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     _to_signed_int64,
     compute_slot_hash,
+    materialize_real_kv_sources_on_host,
     splitmix64_mix3,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
@@ -96,6 +97,12 @@ def launch_canary_write_kernel_torch_reference(
         expected_input_tokens_host = None
         expected_input_positions_host = None
 
+    host_real_kv_sources = materialize_real_kv_sources_on_host(
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+        work_device=work_device,
+    )
+
     violation_rows: list[list[int]] = []
     total_slots_written = 0
 
@@ -129,9 +136,7 @@ def launch_canary_write_kernel_torch_reference(
 
             real_kv_hash_u64 = _compute_real_kv_hash_scalar(
                 slot_idx=slot,
-                real_kv_sources=real_kv_sources,
-                real_kv_hash_mode=real_kv_hash_mode,
-                work_device=work_device,
+                host_sources=host_real_kv_sources,
             )
 
             if enable_write_input_assert:

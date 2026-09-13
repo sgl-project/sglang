@@ -71,7 +71,7 @@ class SingleForwardManager:
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
         token_oracle_manager: Optional[TokenOracleManager],
         swa_divergence_report: Optional[SwaDivergenceReporter],
         is_eagle_draft_decode: bool,
