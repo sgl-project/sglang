@@ -1118,7 +1118,11 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = self._process_messages(
+            request,
+            is_multimodal,
+            effort_from_template_kwargs=reasoning_effort is not None,
+        )
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1204,12 +1208,28 @@ class OpenAIServingChat(OpenAIServingBase):
         return adapted_request, request
 
     def _process_messages(
-        self, request: ChatCompletionRequest, is_multimodal: bool
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
+        effort_from_template_kwargs: bool = False,
     ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template"""
+        """Process chat messages and apply chat template.
+
+        ``effort_from_template_kwargs`` says the request itself sent
+        ``chat_template_kwargs["reasoning_effort"]``, which
+        ``_convert_to_internal_request`` has already popped onto
+        ``request.reasoning_effort``. Without it the ``setdefault`` below cannot
+        tell a request that chose an effort from one that did not, inserts the
+        server default, and ``_apply_jinja_template``'s
+        ``extra_template_kwargs.update(request.chat_template_kwargs)`` then
+        renders with the default -- the one ``chat_template_kwargs`` key where
+        the server would outrank the request.
+        """
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
+                if k == "reasoning_effort" and effort_from_template_kwargs:
+                    continue
                 ctk.setdefault(k, v)
             request.chat_template_kwargs = ctk
             effort = ctk.get("reasoning_effort")

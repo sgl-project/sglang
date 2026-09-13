@@ -773,6 +773,83 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(adapted.require_reasoning)
 
+    def _render_template_kwargs(self, request) -> dict:
+        """Drive the real request path and return the kwargs the template got."""
+        self.template_manager.chat_template_name = None
+        captured = {}
+
+        def fake_apply(messages, **kwargs):
+            captured.update(kwargs)
+            return "PROMPT"
+
+        self.chat.tokenizer_manager.tokenizer.apply_chat_template = fake_apply
+        self.chat.tokenizer_manager.tokenizer.encode = lambda text, **kw: [1, 2, 3]
+        self.chat._convert_to_internal_request(request, None)
+        return captured
+
+    # `_convert_to_internal_request` pops `reasoning_effort` out of
+    # `chat_template_kwargs` and onto `request.reasoning_effort`, so the
+    # `--default-chat-template-kwargs` merge cannot otherwise tell a request that
+    # chose an effort from one that did not. These pin the value that actually
+    # reaches `apply_chat_template`.
+    def test_request_chat_template_kwargs_effort_beats_the_server_default(self):
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"reasoning_effort": "xhigh"},
+        )
+
+        captured = self._render_template_kwargs(request)
+
+        self.assertEqual(captured.get("reasoning_effort"), "xhigh")
+        self.assertEqual(request.reasoning_effort, "xhigh")
+
+    def test_other_defaults_still_merge_when_the_request_pins_the_effort(self):
+        self.chat.default_chat_template_kwargs = {
+            "reasoning_effort": "medium",
+            "thinking": True,
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"reasoning_effort": "xhigh"},
+        )
+
+        captured = self._render_template_kwargs(request)
+
+        self.assertEqual(captured.get("reasoning_effort"), "xhigh")
+        self.assertIs(captured.get("thinking"), True)
+
+    def test_default_reasoning_effort_applies_when_the_request_is_silent(self):
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+
+        captured = self._render_template_kwargs(request)
+
+        self.assertEqual(captured.get("reasoning_effort"), "medium")
+        self.assertEqual(request.reasoning_effort, "medium")
+
+    def test_top_level_reasoning_effort_still_loses_to_the_server_default(self):
+        # Characterization, not an endorsement. The OpenAI top-level field never
+        # passes through `chat_template_kwargs`, so the server default still wins
+        # for it -- the same precedence
+        # `test_k2_output_parser_reuses_effective_template_default` pins for the
+        # Responses API's `reasoning.effort`. Flipping it is a separate decision.
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            reasoning_effort="xhigh",
+        )
+
+        captured = self._render_template_kwargs(request)
+
+        self.assertEqual(captured.get("reasoning_effort"), "medium")
+
     def test_process_messages_records_template_reasoning_state(self):
         self.chat.default_chat_template_kwargs = {"thinking": True}
         self.template_manager.reasoning_config = ReasoningToggleConfig(
