@@ -10,6 +10,9 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
 )
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+)
 
 __all__ = [
     "SamplingParams",
@@ -18,4 +21,5 @@ __all__ = [
     "Ideogram4SamplingParams",
     "Pi05SamplingParams",
     "LingBotVideoMoESamplingParams",
+    "SenseNovaU1SamplingParams",
 ]

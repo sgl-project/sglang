@@ -30,7 +30,7 @@ from sglang.kernels.ops.layernorm.norm import (
     fused_inplace_qknorm,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -296,7 +296,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
-        and not is_cp_v2_active(forward_batch)
+        and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
 

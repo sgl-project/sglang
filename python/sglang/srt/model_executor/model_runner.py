@@ -76,8 +76,8 @@ from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
-    is_cp_v2_active,
-    is_mla_prefill_cp_enabled,
+    is_cp_active,
+    is_mla_cp_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -193,7 +193,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
-    get_global_server_args,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
@@ -266,8 +265,8 @@ def _prefill_cuda_graph_allows_context_parallel(
 ) -> bool:
     """Allow CP only through a runner that captured the validated CP body."""
     return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
-        and is_cp_v2_active(forward_batch)
+        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
+        and is_cp_active(forward_batch)
     )
 
 
@@ -967,8 +966,8 @@ class ModelRunner:
             ),
         )
 
-    def post_capture_resize_kv_pool(self):
-        resize = compute_post_capture_kv_resize(self)
+    def post_capture_resize_kv_pool(self, *, draft_runners=()):
+        resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
         self.max_total_num_tokens = resize.max_total_num_tokens
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = resize.full_max_total_num_tokens
@@ -1082,6 +1081,19 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        # from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        # if get_moe_runner_backend().is_flashinfer_megamoe():
+        #     # Warmup's dummy batches aren't guaranteed to route through every
+        #     # MoE layer; a layer that first builds mid-capture instead of
+        #     # during warmup hits a hard RuntimeError (capture forbids the
+        #     # lazy build's blocking device sync). Force every layer to build
+        #     # here, eagerly, outside any graph.
+        #     from sglang.srt.layers.moe.flashinfer_megamoe import (
+        #         warmup_all_flashinfer_megamoe_layers,
+        #     )
+
+        #     warmup_all_flashinfer_megamoe_layers(self.model)
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1509,6 +1521,10 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
+        forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
+            forward_batch._forward_num_tokens()
+        )
         return forward_batch
 
     def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
@@ -1544,7 +1560,7 @@ class ModelRunner:
                 sharded=(
                     forward_batch.attn_tp_sequence_sharded
                     and not is_dsa_enable_prefill_cp()
-                    and not is_mla_prefill_cp_enabled()
+                    and not is_mla_cp_enabled()
                 ),
             )
 

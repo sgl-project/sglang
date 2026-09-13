@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -111,7 +112,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
-        swa_uuid_for_lock=None,
+        lock_receipt=DecLockRefParams(),
         swa_prefix_lock_released=False,
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),

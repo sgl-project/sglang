@@ -11,7 +11,11 @@ import pathlib as _pathlib
 import shutil
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
+
+import msgspec
+import msgspec.structs
 
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
@@ -246,9 +250,32 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         # Identity, not equality: the slot holds the very object published.
         sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
-        self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
+
+    def test_the_retired_accessor_raises_and_names_the_replacement(self):
+        """`get_global_server_args` is retired: it answered with the record,
+        so a caller reading a field resolution had decided got a stale value
+        and no error at all.
+
+        `RuntimeError` unconditionally, not a warning first: a
+        `DeprecationWarning` is filtered by default outside `__main__`, so no
+        production caller would have seen it, and under
+        `-W error::DeprecationWarning` it would have changed the exception a
+        caller catches. The message has to name where to read instead, since
+        the answer differs by what the caller wanted.
+        """
+        with self.assertRaises(RuntimeError) as cm:
+            server_args_module.get_global_server_args()
+        message = str(cm.exception)
+        self.assertIn("runtime_context", message)
+        self.assertIn("get_server_args()", message)
+
+        # And the type does not change when warnings are errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with self.assertRaises(RuntimeError):
+                server_args_module.get_global_server_args()
 
     def test_tokenizer_alias_is_distinct_role_shim(self):
         # Deliberately NOT an alias: the two legacy setters publish with
@@ -260,10 +287,9 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
 
     def test_pre_publish_error_verbatim(self):
         reset_context()
-        for accessor in (get_server_args, server_args_module.get_global_server_args):
-            with self.assertRaises(ValueError) as cm:
-                accessor()
-            self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+        with self.assertRaises(ValueError) as cm:
+            get_server_args()
+        self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
         first = ServerArgs(model_path="dummy")
@@ -415,7 +441,7 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         from sglang.srt.runtime_context import get_spec
 
         name = "_speculative_draft_quantization_explicitly_set"
-        self.assertIn(name, ServerArgs.__dataclass_fields__)
+        self.assertIn(name, ServerArgs.__struct_fields__)
 
         published = get_context().override_server_args(**{name: True}).install()
         # The record keeps the operator's input, as it does for every other
@@ -450,7 +476,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
             override.install()
 
 
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 
@@ -1350,7 +1375,8 @@ class TestParallelLeafReads(_IsolatedServerArgs):
 
 
 class TestDerivedWidths(_IsolatedOverrides):
-    """The widths no flag sets are computed from the leaves and stamped.
+    """The widths no flag sets are computed from the leaves and permanently
+    overridable.
 
     `attn_tp_size` and its siblings used to be read back off the group
     coordinator that was built from them, which made the answer depend on
@@ -1365,7 +1391,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.addCleanup(
             lambda: (
                 parallel.clear_derived_widths(),
-                parallel.stamp_derived_widths(**self._saved_derived),
+                parallel.override_permanently(**self._saved_derived),
             )
         )
 
@@ -1414,13 +1440,14 @@ class TestDerivedWidths(_IsolatedOverrides):
             get_parallel().attn_tp_size
         self.assertIn("not available", str(caught.exception))
 
-    def test_a_stamp_and_a_live_group_both_win_over_the_leaves(self):
-        """Order is stamp, then live group, then the leaves. Where a group
-        exists it is the truth -- elastic scale-up moves the group without
-        restamping -- so the leaf derivation only answers where there is none.
+    def test_a_permanent_override_and_a_live_group_both_win_over_the_leaves(self):
+        """Order is permanent override, then live group, then the leaves.
+        Where a group exists it is the truth -- elastic scale-up moves the
+        group without a fresh override -- so the leaf derivation only
+        answers where there is none.
         """
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_tp_size=7)
+        parallel.override_permanently(attn_tp_size=7)
         self.addCleanup(parallel.clear_derived_widths)
         with parallel.override(tp_size=8, attn_dp_size=2):
             self.assertEqual(parallel.attn_tp_size, 7)
@@ -1439,9 +1466,9 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.assertEqual(widths["moe_tp_size"], 8 // 4 // 2)
         self.assertEqual(widths["attn_dcp_size"], 1)
 
-    def test_the_world_size_is_not_stamped(self):
+    def test_the_world_size_is_not_permanently_overridden(self):
         """It is not a quotient, and the live getter is right at every moment.
-        A stamp taken when the groups are built would answer with the launch
+        A value fixed when the groups are built would answer with the launch
         count after `try_admit_scale_ranks` expands WORLD, and with the joining
         cohort's own width on a scale-joiner, which lays its groups out at
         `tp * pp` while WORLD spans `ep_join_rank_offset + tp * pp`."""
@@ -1456,31 +1483,30 @@ class TestDerivedWidths(_IsolatedOverrides):
         )
         self.assertNotIn("world_size", widths)
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         with patch(f"{_PS}.get_world_size", return_value=9):
             self.assertEqual(parallel.world_size, 9)
 
-    def test_a_stamped_width_is_what_the_reader_answers_with(self):
+    def test_a_permanently_overridden_width_is_what_the_reader_answers_with(self):
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_tp_size=4, moe_tp_size=1)
+        parallel.override_permanently(attn_tp_size=4, moe_tp_size=1)
         with patch(
             f"{_PS}.get_attn_tensor_model_parallel_world_size",
             side_effect=AssertionError("the group must not be asked"),
         ):
             self.assertEqual(parallel.attn_tp_size, 4)
 
-    def test_an_override_still_wins_over_the_stamp(self):
+    def test_a_scoped_override_still_wins_over_the_permanent_one(self):
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         with parallel.override(attn_tp_size=1):
             self.assertEqual(parallel.attn_tp_size, 1)
         self.assertEqual(parallel.attn_tp_size, 4)
 
     def test_the_group_is_never_consulted(self):
-        """There is no third source. A quotient comes from an override, a stamp
-        or the published leaf -- never from a group coordinator, which could
-        only ever agree, since `initialize_model_parallel` stamps as its last
-        statement."""
+        """There is no third source. A quotient comes from a scoped override, a
+        permanent override, or the published leaf -- never from a group
+        coordinator."""
         reset_context()
         self.addCleanup(reset_context)
         with patch(
@@ -1503,50 +1529,51 @@ class TestDerivedWidths(_IsolatedOverrides):
             with self.assertRaisesRegex(RuntimeError, r"derived parallel width"):
                 get_parallel().attn_tp_size
 
-    def test_a_temporary_disable_beats_the_stamp(self):
+    def test_a_temporary_disable_beats_the_permanent_override(self):
         """`disable_dp_size()` runs a draft scope without DP attention. It moves
         the module global the legacy getter reads, so it has to move the derived
-        width too -- the stamp wins over the live group, and a scope that left
-        it alone would answer with the target model's width for its duration."""
+        width too -- the scoped override wins over the permanent one, and a
+        scope that left it alone would answer with the target model's width
+        for its duration."""
         from sglang.srt.layers import dp_attention
 
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_dp_size=4)
+        parallel.override_permanently(attn_dp_size=4)
         with patch.object(dp_attention, "_ATTN_DP_SIZE", 4):
             with dp_attention.disable_dp_size():
                 self.assertEqual(dp_attention.get_attention_dp_size(), 1)
                 self.assertEqual(parallel.attn_dp_size, 1)
             self.assertEqual(parallel.attn_dp_size, 4)
 
-    def test_the_stamp_is_cleared_and_restamped(self):
+    def test_the_permanent_override_is_cleared_and_reset(self):
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_dp_size=2)
+        parallel.override_permanently(attn_dp_size=2)
         self.assertEqual(parallel.attn_dp_size, 2)
-        # Elastic scaling restamps where it updates the live width.
-        parallel.stamp_derived_widths(attn_dp_size=4)
+        # Elastic scaling overrides again where it updates the live width.
+        parallel.override_permanently(attn_dp_size=4)
         self.assertEqual(parallel.attn_dp_size, 4)
         parallel.clear_derived_widths()
         with parallel.override(tp_size=8, attn_dp_size=1):
             self.assertEqual(parallel.attn_dp_size, 1)
 
-    def test_reset_context_drops_the_stamp(self):
-        """The stamp belongs to the lifecycle that made it.
+    def test_reset_context_drops_the_permanent_override(self):
+        """The permanent override belongs to the lifecycle that made it.
 
-        `_derived_width` prefers the stamp over the published leaf, so a stamp
-        that outlived `reset_context()` would let the next test read the
-        previous topology.
+        `_derived_width` prefers it over the published leaf, so one that
+        outlived `reset_context()` would let the next test read the previous
+        topology.
         """
         parallel = get_parallel()
-        parallel.stamp_derived_widths(attn_tp_size=4)
+        parallel.override_permanently(attn_tp_size=4)
         self.assertEqual(parallel.attn_tp_size, 4)
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", tp_size=1), role="test")
         self.assertEqual(get_parallel().attn_tp_size, 1)
 
-    def test_the_rank_helper_agrees_with_the_stamp(self):
+    def test_the_rank_helper_agrees_with_the_override(self):
         """`compute_dp_attention_world_info` keeps the ranks and takes the
-        widths from the same derivation the stamp uses."""
+        widths from the same derivation `override_permanently`'s callers use."""
         from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 
         for tp_size, dp_size, attn_cp_size in ((8, 2, 1), (8, 2, 2), (16, 4, 2)):
@@ -1564,6 +1591,126 @@ class TestDerivedWidths(_IsolatedOverrides):
             )
             self.assertEqual(attn_tp_size, widths["attn_tp_size"])
             self.assertEqual(attn_dp_size, widths["attn_dp_size"])
+
+    def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
+        """`initialize_model_parallel` no longer overrides anything -- see
+        `test_initialize_model_parallel_no_longer_touches_the_bag` below --
+        which makes this the load-bearing half of 16-field-registry-design.md
+        §6e: every real caller must forward leaves that already match its own
+        published config, because nothing corrects a mismatch anymore.
+        `scheduler.py`'s `ps.attn_dp_size`/`ps.moe_ep_size`/etc, and the
+        weight-cache daemon's own already-published config, both do -- this
+        pins that the formula they'd recompute from those leaves
+        (`derive_attention_widths`, `derive_parallel_widths`, the same ones
+        `publish` itself used) agrees with what's already in the bag, across
+        the widths `test_the_rank_helper_agrees_with_the_override` does not
+        vary -- moe_ep_size, moe_dp_size, and dcp_size -- using real
+        `publish()`.
+
+        A caller that does NOT keep the two in sync is a bug in that caller,
+        not something this framework silently corrects: two real ones existed
+        (`test/registered/eplb/test_lplb_distributed.py` and
+        `test/manual/ep/test_flashinfer_dispatcher.py`, both publishing a
+        placeholder config and then building real groups at a width it never
+        reflected) and were fixed by publishing the actual width instead of
+        relying on a correction to paper over the mismatch.
+        """
+        shapes = (
+            dict(tp_size=8),
+            dict(tp_size=8, dp_size=2, enable_dp_attention=True),
+            dict(tp_size=8, ep_size=4, moe_dp_size=2),
+            dict(tp_size=8, dcp_size=8),
+        )
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                reset_context()
+                self.addCleanup(reset_context)
+                publish(ServerArgs(model_path="dummy", **shape), role="test")
+                parallel = get_parallel()
+                published = {
+                    "attn_tp_size": parallel.attn_tp_size,
+                    "attn_dp_size": parallel.attn_dp_size,
+                    "moe_ep_size": parallel.moe_ep_size,
+                    "moe_tp_size": parallel.moe_tp_size,
+                    "dcp_enabled": parallel.dcp_enabled,
+                    "attn_dcp_size": parallel.attn_dcp_size,
+                }
+                # What every real `initialize_model_parallel` caller forwards:
+                # its own already-published leaves, through the same two
+                # functions the bag was projected with.
+                recomputed = derive_parallel_widths(
+                    tp_size=parallel.tp_size,
+                    attn_cp_size=parallel.attn_cp_size,
+                    attn_dp_size=(
+                        parallel.dp_size if parallel.enable_dp_attention else 1
+                    ),
+                    moe_ep_size=parallel.ep_size,
+                    moe_dp_size=parallel.moe_dp_size,
+                    dcp_size=parallel.dcp_size,
+                    dcp_enabled=parallel.dcp_size > 1,
+                )
+                self.assertEqual(published, recomputed)
+
+    def test_initialize_model_parallel_no_longer_touches_the_bag(self):
+        """§6e, landed: `initialize_model_parallel` used to recompute and
+        permanently override the six derived widths on `get_parallel()`
+        after building its groups; that call is gone. Publish a placeholder
+        config (tp_size defaults to 1), then build real groups at a
+        different width -- the published leaf must now stay exactly what it
+        was, because nothing corrects it. This is the behavior a caller
+        relies on being told about, loudly, the first time it publishes and
+        builds inconsistently -- see
+        `test_recomputing_from_published_leaves_matches_the_publish_bag`
+        for why every real caller must not do that.
+        """
+        from unittest.mock import Mock
+
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.assertEqual(get_parallel().attn_tp_size, 1)
+        self.assertEqual(get_parallel().moe_ep_size, 1)
+
+        world_size = 8
+        with (
+            patch.object(parallel_state, "_WORLD", None),
+            patch.object(parallel_state, "_TP", None),
+            patch.object(parallel_state, "_DCP", None),
+            patch.object(parallel_state, "_ATTN_CP", None),
+            patch.object(parallel_state, "_ATTN_TP", None),
+            patch.object(parallel_state, "_MOE_DP", None),
+            patch.object(parallel_state, "_MOE_EP", None),
+            patch.object(parallel_state, "_MOE_TP", None),
+            patch.object(parallel_state, "_PP", None),
+            patch.object(parallel_state, "_SELF_PP", None),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_backend", return_value="nccl"),
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                return_value=Mock(device_group=Mock()),
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
+            mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+                expert_model_parallel_size=world_size,
+            )
+        self.addCleanup(parallel_state.destroy_model_parallel)
+
+        self.assertEqual(
+            get_parallel().attn_tp_size,
+            1,
+            "initialize_model_parallel must not touch the published leaf -- "
+            "a caller that needs it corrected must publish a config that "
+            "already matches the width it is about to build",
+        )
+        self.assertEqual(get_parallel().moe_ep_size, 1)
 
 
 class TestTheDerivedHalfIsDeclared(CustomTestCase):
@@ -1616,13 +1763,12 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
         a process boundary."""
-        import dataclasses
 
         from sglang.srt.arg_groups.arg_utils import Derived
         from sglang.srt.arg_groups.fields.parallel import Parallel
         from sglang.srt.server_args import ServerArgs
 
-        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        fields = {f.name for f in msgspec.structs.fields(ServerArgs)}
         for name, value in vars(Parallel).items():
             if isinstance(value, Derived):
                 self.assertNotIn(name, fields)

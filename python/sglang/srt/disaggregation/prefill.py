@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_qsa_pending_state_indices,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -56,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -246,7 +248,11 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        draft_kv_pool = (
+            self.draft_token_to_kv_pool
+            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            else None
+        )
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -262,6 +268,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
@@ -481,6 +488,9 @@ class PrefillBootstrapQueue:
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
+                    req.arrival_processed_tokens = (
+                        self.scheduler.processed_tokens_counter
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -491,6 +501,7 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+                req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -745,6 +756,10 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             logits_output=logits_output,
         )
+        if logits_output is not None and logits_output.sampling_mask_output is not None:
+            self.batch_result_processor.materialize_sampling_mask_output(
+                batch.reqs, logits_output
+            )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -771,6 +786,27 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                sampling_mask_finish_reason = None
+                if req.return_sampling_mask:
+                    assert logits_output is not None
+                    statuses = logits_output.next_token_sampling_mask_status
+                    status = None if statuses is None else statuses[i]
+                    sampling_mask_finish_reason = (
+                        self.batch_result_processor.get_sampling_mask_finish_reason(
+                            status=status
+                        )
+                    )
+                if sampling_mask_finish_reason is not None:
+                    req.to_finish = sampling_mask_finish_reason
+                    req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": sampling_mask_finish_reason.message}
+                    )
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -1311,6 +1347,11 @@ class SchedulerDisaggregationPrefillMixin:
                     seq_len,
                 )
 
+            def _qsa_pending_payload():
+                # Raw index-K/RoPE state is one full compression-group ring per
+                # request, addressed by the request-pool slot rather than KV pages.
+                return get_qsa_pending_state_indices(req)
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1345,12 +1386,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             payloads = {
                 StateType.MAMBA: _mamba_payload,
+                StateType.QSA_PENDING: _qsa_pending_payload,
+                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1452,4 +1495,5 @@ class SchedulerDisaggregationPrefillMixin:
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
             self.waiting_queue.insert(0, req)

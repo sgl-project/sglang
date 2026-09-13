@@ -96,8 +96,8 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// restart. The deep-probe handler is built once with
 /// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
-/// Python) decides whether `/health` shares it or is a plain 200 (routing the
-/// request already proves the frontend is up).
+/// Python) decides whether `/health` shares it or, after startup warmup, is a
+/// plain 200 (routing the request proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
@@ -106,11 +106,19 @@ fn health_routes() -> Router<Arc<AppState>> {
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
     } else {
-        get(|| async { StatusCode::OK.into_response() })
+        get(health_without_generation)
     };
     Router::new()
         .route("/health", health)
         .route("/health_generate", probe)
+}
+
+async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
+    if state.startup_readiness.is_ready() {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
 }
 
 /// Sentinel host that makes the KV connector no-op. Parity with
@@ -120,7 +128,8 @@ const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 if the response heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
-/// (`/health` uses the same handler when its env gate is on.)
+/// It also returns 503 until startup warmup completes. (`/health` uses the same
+/// handler when its env gate is on.)
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
@@ -131,6 +140,10 @@ async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
 ) -> Response {
+    if !state.startup_readiness.is_ready() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     let baseline = state
         .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -607,6 +620,21 @@ mod tests {
                 e2e_latency: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn health_is_unavailable_before_startup_warmup_finishes() {
+        let state = Arc::new(AppState {
+            senders: senders(),
+            response_buf: 8,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+            response_activity: Default::default(),
+            startup_readiness: Default::default(),
+        });
+
+        let response = health_generate(State(state), Duration::ZERO).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

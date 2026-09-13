@@ -24,7 +24,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -450,6 +450,20 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc if mapping is not None else None
             ),
         )
+
+    @property
+    def supports_draft_extend_metadata_staging(self) -> bool:
+        return (
+            self.topk == 1
+            and not self.kv_index_translator.is_translating
+            and self.draft_extend_metadata_captured_in_graph()
+        )
+
+    def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
+        self.forward_metadata.max_seq_len_k = self.max_context_len
+        self.forward_metadata_spec_decode_expand = None
+        self.init_forward_metadata_in_graph(forward_batch)
 
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
         # The in-graph SWA translation needs the raw mapping tensor; v2p-table
@@ -1243,7 +1257,7 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
-        cp_active = is_cp_v2_active(forward_batch)
+        cp_active = is_cp_active(forward_batch)
 
         if k is not None:
             assert v is not None

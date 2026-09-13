@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
     validate_declarations,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -548,12 +549,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "intel_xpu",
             "intel_amx",
+            "aiter",
         )
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
-            f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override
@@ -592,6 +594,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         # The quantization/moe_runner_backend resolution moved to the
         # override registry (arg_groups/overrides.py:
@@ -784,7 +787,11 @@ def handle_model_capability_adjustments(server_args: Any):
                 "_handle_model_capability_adjustments",
                 prefill_only_disable_kv_cache=True,
             )
-            validate_prefill_only_disable_kv_cache_args(server_args)
+            # Through the registry, not a bare call: an out-of-tree
+            # replacement registered at this validator's own pipeline
+            # position must also win here, at this later re-validation after
+            # the Hopper/Blackwell no-KV-pool default declares itself.
+            run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",

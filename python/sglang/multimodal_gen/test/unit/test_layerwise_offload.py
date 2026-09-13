@@ -1,3 +1,5 @@
+import gc
+import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -23,7 +25,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
     ComponentUse,
+    ResidencyState,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -468,6 +472,147 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
         "so the stepped DiT must claim the pin budget before the "
         "once-per-request encoder"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
+    transformer = _NestedDummyModel()
+    vae = torch.nn.Linear(4, 4, bias=False)
+    encoder = torch.nn.Linear(32, 32, bias=False)
+    modules = {"transformer": transformer, "vae": vae, "text_encoder": encoder}
+    pipeline = SimpleNamespace(
+        modules=modules, _stage_name_mapping={}, component_residency_strategies={}
+    )
+    args = _server_args(
+        component_residency={
+            "transformer": "layerwise-offload",
+            "vae": "snapshot-offload",
+            "text_encoder": "snapshot-offload",
+        },
+        pin_cpu_memory=True,
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    budget = manager.host_pin_budget
+    budget.available_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    budget.reserve_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES
+    configured = configure_layerwise_offload_modules(modules, args, pin_budget=budget)
+    assert configured == ["transformer"]
+    layerwise = transformer.layerwise_offload_managers[0]
+    assert layerwise._pin_budget is budget
+    booked = budget.committed_bytes
+    assert 0 < booked < 1024 - 64
+    for name in ("vae", "text_encoder"):
+        module = modules[name]
+        strategy = manager.strategy_for(name, module)
+        use = ComponentUse("encode", name)
+        strategy.prepare_for_use(module, use, ResidencyState())
+        strategy.finish_use(module, use, ResidencyState())
+        assert budget.committed_bytes == booked + 64
+        assert module.weight.is_pinned() == (name == "vae")
+    transformer.disable_offload()
+    layerwise.release_host_stores()
+    assert budget.committed_bytes == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 76
+    )
+    for _ in range(2):
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3)])
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
+            pin_cpu_memory=True,
+            pin_budget=budget,
+        )
+        # 36 bytes of weights, 28 bytes of alignment, then a 12-byte bias
+        assert budget.committed_bytes == 76
+        host_alias = manager._consolidated_cpu_weights[0][torch.float32].detach()
+        manager.remove_forward_hooks()
+        manager.load_all_layers()
+        torch.cuda.synchronize()
+        manager.enabled = False
+        manager.release_host_stores()
+        assert budget.committed_bytes == 76
+        del host_alias, manager, model
+        gc.collect()
+        assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("stride,allocation_bytes", [(1, 16), (3, 40)])
+def test_layerwise_budget_uses_view_allocation_not_the_backing_storage(
+    stride, allocation_bytes
+):
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    source = torch.arange(32, dtype=torch.float32)[1 : 1 + 4 * stride : stride]
+    expected = source.clone()
+    block.weight = torch.nn.Parameter(source)
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + allocation_bytes
+    )
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    assert budget.committed_bytes == allocation_bytes
+    manager.load_all_layers()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(block.weight.cpu(), expected, rtol=0, atol=0)
+    manager.remove_forward_hooks()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypatch):
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3) for _ in range(2)])
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    empty = torch.empty
+    allocations = 0
+
+    def fail_second_pin(*args, **kwargs):
+        nonlocal allocations
+        if kwargs.get("pin_memory"):
+            allocations += 1
+            if allocations == 2:
+                raise RuntimeError("pin allocation failed")
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_second_pin)
+    with pytest.raises(RuntimeError, match="pin allocation failed"):
+        manager.initialize()
+    assert allocations == 2
+    gc.collect()
+    assert budget.committed_bytes == 64 + 76
+    del manager, model
+    gc.collect()
+    assert budget.committed_bytes == 64
 
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
@@ -2122,3 +2267,187 @@ def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
             on_gpu = idx in manager._gpu_layers
             assert _layer_weight_ok(model.blocks[idx]) is on_gpu, (kind, idx)
         manager.prepare_for_next_req(non_blocking=False)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+
+    # the page cache cannot hold the mapping: it is re-read from the drive every pass
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._ensure_mapped_courier().direct_read
+
+    # the same mapping on a host that can cache it keeps the page-cache path
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: False
+    )
+    manager._mapped_courier = None
+    assert not manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_sees_the_pages_the_cache_holds(tmp_path):
+    path = tmp_path / "cached.bin"
+    path.write_bytes(b"\x01" * (16 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=16 << 20, dtype=torch.uint8)
+    mapped.sum()  # touch every page
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr(), mapped.numel()
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # the page cache holds the layer: shipping it is a memcpy, not a drive read
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers
+    assert courier.stats["cached_layers"] >= 1
+    assert courier.stats["direct_read_bytes"] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_blocking_loads_of_cold_mapped_layers_go_through_the_courier(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 0.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    # a blocking load (how a resident set is armed) is shipped by the courier too
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert courier.stats["layers"] == 1
+    assert torch.equal(manager.model.blocks[0].weight.detach().cpu(), torch.zeros(8, 8))
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_a_fully_resident_small_component_may_still_read_directly(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # far below the size floor, but every layer is resident: it is armed once
+    # per request, so there is no re-streamed pass for the floor to protect
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 1 << 20
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=2)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+        resident_layers=2,
+    )
+    assert manager._mapped_cpu_weights[0] and not manager._streamed_order
+    assert manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_samples_a_large_mapping_at_page_aligned_offsets(tmp_path):
+    # large enough that the sampling stride exceeds one window: every window
+    # must start on a page boundary or mincore rejects it and the answer is -1
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"\x01" * (96 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=96 << 20, dtype=torch.uint8)
+    mapped.sum()
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr() + 1000, (96 << 20) - 1000
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_large_pinned_stores_are_registered_in_place_at_exact_size(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    nbytes = layerwise_offload_mod._REGISTER_MIN_BYTES + 4096
+    tensor = layerwise_offload_mod._pinned_empty(nbytes, dtype=torch.uint8)
+    # locked where it was allocated: pinned, no pool block, no rounding
+    assert tensor.is_pinned()
+    assert tensor.untyped_storage().nbytes() == nbytes
+    assert pooled == []
+    del tensor
+    gc.collect()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
+    assert tensor.is_pinned()
+    assert len(pooled) == 1
