@@ -119,6 +119,7 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        self._mlx_finished_rids: set[str] = set()
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -157,7 +158,15 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+        """Remove MLX state for requests that are no longer running."""
+        # If a batch drains completely the cache won't clear until the next decode,
+        # after the prefill
+        finished = self._mlx_finished_rids & self._mlx_active_rids
+        for rid in finished:
+            self._mlx_runner.remove_request(rid)
+        self._mlx_active_rids -= finished
+        self._mlx_finished_rids.clear()
+
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
@@ -169,6 +178,7 @@ class MlxTpModelWorker(TpModelWorker):
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
         if self._mlx_runner.has_request(req.rid):
+            self._mlx_finished_rids.add(req.rid)
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
