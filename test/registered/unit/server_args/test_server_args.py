@@ -1375,6 +1375,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Glm4MoeForCausalLM",
+            "GlmMoeDsaForCausalLM",
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
             "Qwen2MoeForCausalLM",
@@ -1383,6 +1384,15 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         for architecture in supported:
             with self.subTest(architecture=architecture):
                 handle_a2a_moe(self._make_args(architecture))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_glm_dsa_w4a16(self, _):
+        import torch
+
+        args = self._make_args("GlmMoeDsaForCausalLM")
+        args._model_config.dtype = torch.bfloat16
+        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+            handle_a2a_moe(args)
 
     def test_megamoe_rejects_unaudited_model_architecture(self):
         with self.assertRaisesRegex(

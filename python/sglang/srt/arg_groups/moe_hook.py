@@ -210,6 +210,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "Qwen2MoeForCausalLM",
