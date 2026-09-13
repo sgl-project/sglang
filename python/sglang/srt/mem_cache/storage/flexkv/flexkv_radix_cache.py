@@ -404,6 +404,7 @@ class FlexKVRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        kv_committed_len = min(kv_committed_len, kv_len_to_handle)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
