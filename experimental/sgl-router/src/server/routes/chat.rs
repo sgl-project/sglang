@@ -877,12 +877,27 @@ pub async fn chat_completions(
                     bootstrap_room,
                     "prefill side completed",
                 ),
-                Err(e) => tracing::warn!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    error = %e,
-                    "prefill request failed; decode will time out on bootstrap_room",
-                ),
+                Err(e) => {
+                    // Source-carrying variants keep their diagnostic payload
+                    // (e.g. the concrete OS error behind an
+                    // `UpstreamSocketTimeout`) in `source`, which Display does
+                    // not render — and this detached task never reaches
+                    // `into_response`, the one place that chain is logged.
+                    // Render it here or the errno vanishes silently.
+                    let detail = match &e {
+                        ApiError::UpstreamUnreachable { source, .. }
+                        | ApiError::UpstreamSocketTimeout { source, .. } => {
+                            format!("{e}: {source:#}")
+                        }
+                        _ => e.to_string(),
+                    };
+                    tracing::warn!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        error = %detail,
+                        "prefill request failed; decode will time out on bootstrap_room",
+                    );
+                }
             }
         });
 

@@ -41,12 +41,39 @@ pub enum ApiError {
     UpstreamStatus { status: StatusCode },
 
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
-    /// response (per-request `request_timeout`).
+    /// response — one of the router's own budgets (per-request
+    /// `request_timeout` or `connect_timeout`) elapsed.
     ///
     /// `worker` is the typed `reqwest::Url` for the same reason as
     /// `UpstreamUnreachable`.
     #[error("upstream timed out: worker {worker}")]
     UpstreamTimeout { worker: reqwest::Url },
+
+    /// The SOCKET timed out, not our budget: the error chain carried an
+    /// OS-raised `io::ErrorKind::TimedOut` (POSIX `ETIMEDOUT`). The kernel
+    /// (or a middlebox) gave up on the connection under us — typically with
+    /// the router's own budget still having room, though the classifier
+    /// checks the socket question first, so a chain carrying both still
+    /// reports this variant.
+    ///
+    /// Shares its HTTP status with [`UpstreamTimeout`](Self::UpstreamTimeout)
+    /// — same class, deliberately distinct `error_code` — because the two
+    /// demand opposite responses: `upstream_timeout` means "raise the budget
+    /// or shorten the ask", this one means "the network path broke" and no
+    /// budget change will help.
+    ///
+    /// Carries `source` — like `UpstreamUnreachable`, and unlike
+    /// `UpstreamTimeout` — because the concrete OS error is the whole
+    /// diagnostic value here, and this is the one variant where nothing else
+    /// records it. Logged exactly once per path: in `into_response` on
+    /// client-facing paths, and at the detached-PD-prefill warn site in
+    /// `chat.rs`, which never produces a response.
+    #[error("upstream socket timed out: worker {worker}")]
+    UpstreamSocketTimeout {
+        worker: reqwest::Url,
+        #[source]
+        source: anyhow::Error,
+    },
 
     /// No healthy worker is available for `model`: either none were ever
     /// registered, or every candidate's circuit breaker is open.  Clients
@@ -120,6 +147,11 @@ impl ApiError {
             }
             ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
             ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
+            // Status parity with `UpstreamTimeout` is deliberate — see the
+            // variant doc.
+            ApiError::UpstreamSocketTimeout { .. } => {
+                (StatusCode::BAD_GATEWAY, "upstream_socket_timeout")
+            }
             ApiError::NoHealthyWorkers { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "no_healthy_workers")
             }
@@ -199,6 +231,17 @@ impl IntoResponse for ApiError {
             }
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
+                "upstream request timed out".to_string()
+            }
+            ApiError::UpstreamSocketTimeout { worker, source } => {
+                tracing::warn!(
+                    upstream = %worker,
+                    error = %format_args!("{source:#}"),
+                    "upstream socket timed out before the router's request budget",
+                );
+                // Prose parity with `UpstreamTimeout` is deliberate — the
+                // operator signal rides `x-router-error-code` only; see the
+                // variant doc.
                 "upstream request timed out".to_string()
             }
             ApiError::NoHealthyWorkers { model } => {
@@ -365,6 +408,69 @@ mod tests {
             !body.contains(worker_str),
             "client body must NOT leak worker URL; got: {body}",
         );
+    }
+
+    /// The socket-timeout split is an OPERATOR signal, not a client-visible
+    /// change: same status as `UpstreamTimeout`, same client prose, distinct
+    /// `x-router-error-code`.
+    ///
+    /// Pinning both halves matters. If the status drifted apart from
+    /// `UpstreamTimeout`'s the split would silently change client retry
+    /// behaviour; if the code collapsed back to `upstream_timeout` the split
+    /// would stop distinguishing "raise the budget" from "the network path
+    /// broke" — which is its entire point.
+    #[test]
+    fn upstream_socket_timeout_shares_status_but_not_the_error_code() {
+        let worker_str = "http://10.0.0.42:30000/";
+        let worker = reqwest::Url::parse(worker_str).unwrap();
+
+        let budget_resp = ApiError::UpstreamTimeout {
+            worker: worker.clone(),
+        }
+        .into_response();
+        let budget_status = budget_resp.status();
+        let budget_body = collect_body(budget_resp);
+
+        let socket_resp = ApiError::UpstreamSocketTimeout {
+            worker,
+            source: anyhow::anyhow!("kernel ETIMEDOUT at 10.0.0.42"),
+        }
+        .into_response();
+        assert_eq!(socket_resp.status(), budget_status);
+        assert_eq!(
+            socket_resp
+                .headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream_socket_timeout"),
+        );
+        let socket_body = collect_body(socket_resp);
+        assert!(
+            socket_body.contains("\"code\":\"upstream_socket_timeout\""),
+            "{socket_body}"
+        );
+        assert!(
+            socket_body.contains("\"type\":\"server_error\""),
+            "{socket_body}"
+        );
+        assert!(
+            !socket_body.contains(worker_str),
+            "client body must NOT leak worker URL; got: {socket_body}",
+        );
+        assert!(
+            !socket_body.contains("kernel ETIMEDOUT"),
+            "client body must NOT leak the source chain; got: {socket_body}",
+        );
+
+        // Same client-facing message as the budget timeout — the operator
+        // signal rides the code header, not the prose.
+        let msg_of = |b: &str| {
+            serde_json::from_str::<serde_json::Value>(b).unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(msg_of(&socket_body), msg_of(&budget_body));
     }
 
     #[test]
