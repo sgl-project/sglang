@@ -3515,7 +3515,10 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
-        if self.enable_fpm:
+        collect_forward_pass_timing = (
+            self.enable_fpm or self.metrics_reporter.forward_pass_metrics_enabled
+        )
+        if collect_forward_pass_timing:
             self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
@@ -3652,7 +3655,7 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
+            if collect_forward_pass_timing:
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
@@ -4593,6 +4596,7 @@ class Scheduler(
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        self.metrics_reporter.observe_forward_pass_interference(batch)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:

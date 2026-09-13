@@ -167,6 +167,17 @@ class _SchedulerTimeAccountingSnapshot:
         self.is_idle = is_idle
 
 
+def _forward_pass_phase(prefill_tokens: int, decode_reqs: int) -> str:
+    """Label the scheduling composition of one forward pass."""
+    if prefill_tokens > 0 and decode_reqs > 0:
+        return "mixed"
+    if prefill_tokens > 0:
+        return "prefill_only"
+    if decode_reqs > 0:
+        return "decode_only"
+    return "other"
+
+
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
@@ -185,6 +196,18 @@ class SchedulerMetricsReporter:
         )
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
+        )
+        # Per-forward-pass Prometheus series are emitted from the same single
+        # canonical rank FPM uses (attention TP rank 0 on the final PP stage),
+        # so one logical engine step contributes exactly one sample. Without the
+        # PP condition every stage of a pp_size=N deployment exports its own
+        # stage-local timing under the same series, and queries that aggregate
+        # over pp_rank silently blend partial-stage timings and inflate the
+        # sample count N-fold. pp_size == 1 is unaffected.
+        self.forward_pass_metrics_enabled = (
+            self.current_scheduler_metrics_enabled
+            and self.is_stats_logging_rank
+            and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         )
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
@@ -283,6 +306,7 @@ class SchedulerMetricsReporter:
             )
 
         self._init_fpm()
+        self._init_forward_pass_prometheus_timing()
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
@@ -354,6 +378,48 @@ class SchedulerMetricsReporter:
                 self.scheduler._fpm_dp_rank,
                 self.scheduler._fpm_uses_device_timer,
             )
+
+    def _init_forward_pass_prometheus_timing(self):
+        """Subscribe the Prometheus forward-pass series to the device timer.
+
+        The device timer brackets the model forward itself, so it is the only
+        source here whose interval is bounded by the batch's own forward. A
+        monotonic clock read from the scheduler loop cannot be: on the steady
+        state overlap path the loop selects and launches batch n+1 before it
+        processes n's result, so any wall interval ending at result processing
+        carries n+1's scheduling and launch work.
+
+        Must run after `_init_fpm`, which installs the timer when FPM is on but
+        the metrics device timer env flag is not.
+        """
+        self._forward_pass_gpu_time_acc = 0.0
+        self._forward_pass_uses_device_timer = False
+        if not self.forward_pass_metrics_enabled:
+            return
+        if self.forward_pass_device_timer is None:
+            return
+
+        def _forward_pass_prometheus_reporter(t, **_kwargs):
+            self._forward_pass_gpu_time_acc += t
+
+        self.forward_pass_device_timer.add_reporter(_forward_pass_prometheus_reporter)
+        self._forward_pass_uses_device_timer = True
+
+    def _take_forward_pass_device_time(self) -> Optional[float]:
+        """Drain and return the device time this batch's forward pass took.
+
+        Returns None when no device-timed forward is available; the caller then
+        exports no forward duration at all rather than substituting a
+        scheduler-loop interval that would carry the next batch's work.
+        """
+        if not self._forward_pass_uses_device_timer:
+            return None
+        self.forward_pass_device_timer._report()
+        elapsed = self._forward_pass_gpu_time_acc
+        self._forward_pass_gpu_time_acc = 0.0
+        if elapsed <= 0.0:
+            return None
+        return elapsed
 
     def _build_scheduled_request_metrics(self, batch: ScheduleBatch):
         from sglang.srt.observability.forward_pass_metrics import (
@@ -1108,6 +1174,59 @@ class SchedulerMetricsReporter:
                     forward_mode=batch.forward_mode.name.lower(),
                     balancedness=balancedness,
                 )
+
+    def observe_forward_pass_interference(self, batch: ScheduleBatch):
+        """Export this batch's two per-step timings as separate metrics.
+
+        They are separate because they measure different things and only one of
+        them is forward time:
+
+        * forward pass duration (and its decode-side view, decode step latency)
+          is the device-timed duration of *this* batch's forward. It stays
+          bounded by that forward on both `event_loop_overlap` branches, so it
+          answers "did co-scheduled prefill stretch the model step".
+        * schedule-to-result latency runs from the start of this batch's
+          scheduling decision to the end of its result processing. Under
+          overlap that span also covers the next batch's scheduling and launch,
+          which is a real pipeline cost worth watching but must never be read
+          as forward time.
+        """
+        if not self.forward_pass_metrics_enabled:
+            return
+
+        # Drain unconditionally once the timer is subscribed: device time left
+        # in the accumulator would be charged to the next batch's sample.
+        forward_seconds = self._take_forward_pass_device_time()
+        if self.metrics_collector is None:
+            return
+
+        schedule_to_result_seconds = (
+            max(0.0, time.monotonic() - batch.fpm_start_time)
+            if batch.fpm_start_time > 0
+            else None
+        )
+        if forward_seconds is None and schedule_to_result_seconds is None:
+            return
+
+        scheduled_requests = self._build_scheduled_request_metrics(batch)
+        prefill_tokens = scheduled_requests.sum_prefill_tokens
+        decode_reqs = scheduled_requests.num_decode_requests
+        phase = _forward_pass_phase(prefill_tokens, decode_reqs)
+
+        if forward_seconds is not None:
+            self.metrics_collector.observe_forward_pass_interference(
+                duration_seconds=forward_seconds,
+                phase=phase,
+                prefill_tokens=prefill_tokens,
+                decode_reqs=decode_reqs,
+            )
+        if schedule_to_result_seconds is not None:
+            self.metrics_collector.observe_schedule_to_result_latency(
+                duration_seconds=schedule_to_result_seconds,
+                phase=phase,
+                prefill_tokens=prefill_tokens,
+                decode_reqs=decode_reqs,
+            )
 
     def _emit_forward_pass_metrics(
         self,
