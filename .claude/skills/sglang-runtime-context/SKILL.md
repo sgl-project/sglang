@@ -47,8 +47,11 @@ with what the operator typed, not with what resolution decided.**
   compilation disabled before restricting a role), and
   `=enforce` fails closed on bag reads outside the role's `ROLE_NAMESPACE_SETS` entry
   (`None` = full tree; only audited roles are restricted).
-- Bag membership is metadata on the dataclass: every `ServerArgs` field carries
-  `NS("path")` (e.g. `NS("exec.moe")`); coverage is linted two-way
+- Bag membership is **where the field is declared**: one class per namespace under
+  `arg_groups/fields/`, each carrying the `_NS_PATH` it stands for, and `ServerArgs`
+  is assembled from them (`collect_input_fields`). The per-field `NS("path")` marker
+  survives only for a class that cannot express this — an ad-hoc dataclass spanning
+  namespaces, which is what the config-bag tests build. Coverage is linted two-way
   (`test_server_args_namespaces.py`, `test_runtime_context_config_bags.py`).
 - **Reading config**: `get_<ns>()[.sub].field` — e.g.
   `get_exec().moe.moe_a2a_backend`, `get_schedule().max_running_requests`. Bag leaves
@@ -253,10 +256,18 @@ A process-global seed field-read of one of these sizes
 (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
 `server_args` the object was *handed* is a different thing and not a ratchet
 matter — see "Reads that legitimately stay on a ServerArgs instance".
-Fail-loud is narrower: before dist init, a live size/group read raises — except
-the DCP pair, which degrades instead (`dcp_enabled` → `False`,
-`attn_dcp_size` → `1` when no group is installed;
-`test_attn_dcp_defaults_when_group_is_uninitialized` pins this). After init,
+Fail-loud is narrower: before dist init, a live *rank/group* read raises. The six
+parallel quotients are not live reads at all — `attn_tp_size`, `attn_dp_size`,
+`attn_dcp_size`, `moe_ep_size`, `moe_tp_size`, `dcp_enabled` are a function of the
+configured leaves, computed once at publish into bag leaves, and answered
+override → stamp → published leaf. So `dcp_enabled` means "the launch configured
+DCP" (`dcp_size > 1`), not "a DCP group is installed here"; in a scheduler the
+stamp makes the two identical, in a process that publishes without dist init they
+differ. `test_a_topology_is_stated_by_naming_the_width` and its neighbours in
+`test_runtime_context.py` pin this; they replaced
+`test_attn_dcp_defaults_when_group_is_uninitialized`. One consequence for tests:
+overriding a leaf no longer moves its quotient — state a topology by publishing a
+config, or by naming the width. After init,
 only the DCP group is optional (`_DCP` exists only when `dcp_size > 1`; attn-CP and
 moe-DP always install, as size-1 aliases if unused). The `config` hop is
 deliberately dynamo-traceable (a plain property over a slot, no
@@ -283,13 +294,21 @@ where an object was handed one; it is not a global accessor.
   raises on a non-leaf. A call site that knows its field reads the bag leaf.
 - **the live topology** → `get_parallel()` (bare names).
 - **a value derived from published leaves** → an accessor in `runtime_context` that
-  derives it *from the bags*: `mamba_extra_buffer_enabled()` /
-  `mamba_extra_buffer_lazy_enabled()` read `get_memory()` and `get_exec()`, so
-  they see post-publish overrides. Prefer this shape whenever the inputs are
-  leaves; the same-named `ServerArgs` members are the pre-publish equivalents the
-  resolution pipeline uses, and wrapping one of those instead would quietly cost
-  you override visibility. `is_ep_joiner()` / `is_ep_scale_joiner()` are the same
-  shape over `exec.moe.ep_join_mode`, `attention_backends()` derives the
+  derives it *from the bags*. The strongest form of this is a `Derived(fn=...)`
+  declared beside the leaves it is computed from, in the namespace's own
+  `arg_groups/fields/` class: `publish` computes it once and stores it as an
+  ordinary bag leaf, so the read is a plain attribute load and it sees
+  post-publish overrides. `enable_mamba_extra_buffer`, `is_ep_joiner`,
+  `is_ep_scale_joiner` and `is_startup_weight_load_overlap` are declared that way
+  now — read them where they are declared:
+  `get_exec().mamba.enable_mamba_extra_buffer`, `get_exec().moe.is_ep_joiner`,
+  `get_model().is_startup_weight_load_overlap`. (The namespace is the class that
+  declares the field, not the namespaces its `fn` happens to read: the mamba one
+  spans `exec.mamba` and `memory`, which is exactly why it could not be a method
+  on either bag.) The
+  old `mamba_extra_buffer_enabled()` / `is_ep_joiner()` functions and the
+  same-named `ServerArgs` members are gone. The pre-publish helpers that remain
+  exist for resolution, which has no bag to read yet. `attention_backends()` derives the
   `(prefill, decode)` pair from the three `exec.kernel` leaves, and
   `max_speculative_num_draft_tokens()` / `cutedsl_moe_max_num_tokens()` derive
   theirs from `spec` / `schedule` / `exec.graph`.
@@ -548,8 +567,9 @@ ONE thread — do not design for TBO threads that don't exist.
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
 7. **Namespace coverage** (`test_server_args_namespaces.py`,
-   `test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
-   metadata and the projected bags must cover the fields exactly (two-way).
+   `test_runtime_context_config_bags.py`): every `ServerArgs` field resolves to a
+   namespace — from the `arg_groups/fields/` class that declares it — and the
+   projected bags must cover the fields exactly (two-way).
 
 Never module-skip a test "until the migration settles" — seed the context instead
 (the deferral ratchet that once pinned this is retired; the rule stands).

@@ -23,6 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -406,6 +407,13 @@ class Fp8Config(QuantizationConfig):
                 )
                 return fp8_method
 
+            if self.is_fp4_experts and is_npu_arch35():
+                from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+                    NPUW4A4Fp4MoEMethod,
+                )
+
+                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
@@ -711,6 +719,17 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
+            return
+        elif _is_npu and is_npu_arch35():
+            from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
+                process_npu_arch35_mxfp8_linear_weights,
+            )
+
+            process_npu_arch35_mxfp8_linear_weights(
+                layer,
+                self.weight_block_size,
+                scale_fmt=getattr(self.quant_config, "scale_fmt", None),
+            )
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:

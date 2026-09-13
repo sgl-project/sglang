@@ -2,6 +2,37 @@
 title: "CI Performance Baselines"
 description: "Generate and update diffusion performance baselines used in CI."
 ---
+## Sequential Request Checks
+
+Server cases can exercise request-to-request state without restarting the server:
+
+```python
+DiffusionTestCase(
+    id="image_t2i",
+    server_args=server_args,
+    sampling_params=sampling_params,
+    perf_repeat_requests=2,
+)
+```
+
+Every request is checked, including the first one. Performance checks include
+load/runtime peak memory; consistency checks include audio when
+`expect_audio_output=True`. A failure in either request fails the case, even if
+the other succeeds. Reports retain the request index instead of overwriting the
+first result with the second.
+
+Keep workloads small, but regenerate baselines and GT whenever sampling
+parameters change. MiniMax-H3 T2VA and ref2va use different checkpoint
+partitions, so they remain separate cases, each issuing two requests to its
+own server.
+The T2VA case includes VAE layerwise offload to exercise weight restoration
+between requests; ref2va retains the resident VAE path.
+
+Use `SGLANG_GEN_BASELINE=1 pytest -s ... -k <case_id>` to collect baselines in
+the same sequential order, retaining the worst observed value of each metric.
+`SGLANG_GEN_GT=1` with `SGLANG_GT_OUTPUT_DIR` saves
+GT; repeated requests share one GT.
+
 ## Perf Baseline Generation Script
 
 `python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py` starts a local diffusion server, issues requests for selected test cases, aggregates stage/denoise-step/E2E timings from the perf log, and writes the results back to the `scenarios` section of `perf_baselines.json`.

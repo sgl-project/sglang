@@ -125,7 +125,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         config = CompilationConfig(
             num_tokens,
             compiler,
-            server_args.enable_torch_compile_debug_mode,
+            get_exec().graph.enable_torch_compile_debug_mode,
         )
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():

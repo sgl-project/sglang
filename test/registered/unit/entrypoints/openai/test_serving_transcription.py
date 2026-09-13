@@ -10,7 +10,7 @@ The tests mock ``TokenizerManager.generate_request`` to yield synthetic
 ``text`` chunks for each of the happy, abort, and boundary cases.
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import enter_override, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -32,6 +32,8 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,6 +103,16 @@ def _deltas_from_sse(sse_lines: List[str]) -> List[str]:
 
 class TestStreamingFusedAutodetect(CustomTestCase):
     """_generate_transcription_stream with _fused_autodetect=True."""
+
+    def setUp(self):
+        # The transcription serving layer reads its config from the bags, so
+        # the fixture publishes one instead of hanging values off a mock.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", asr_max_concurrent_sessions=32),
+            role="tokenizer",
+        )
 
     def _run_stream(
         self, chunks: List[dict], fused: bool = True, ts_variant: bool = False
@@ -318,6 +330,16 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
     requests and the transcripts stitched in order — without chunking the
     feature extractor silently truncates everything past 30 s."""
 
+    def setUp(self):
+        # The transcription serving layer reads its config from the bags, so
+        # the fixture publishes one instead of hanging values off a mock.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", asr_max_concurrent_sessions=32),
+            role="tokenizer",
+        )
+
     def _create_transcription(self, tm, audio_bytes, language="en", **kwargs):
         serving = OpenAIServingTranscription(tm)
         loop = get_or_create_event_loop()
@@ -510,6 +532,16 @@ class TestLongAudioChunkedStreaming(CustomTestCase):
     """_generate_long_audio_stream: chunks transcribed sequentially, deltas
     emitted in audio order, exactly one finish frame."""
 
+    def setUp(self):
+        # The transcription serving layer reads its config from the bags, so
+        # the fixture publishes one instead of hanging values off a mock.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", asr_max_concurrent_sessions=32),
+            role="tokenizer",
+        )
+
     def _run_stream(self, results_per_request, fused=False, n_chunks=2):
         tm = _MockChunkTokenizerManager(results_per_request)
         serving = OpenAIServingTranscription(tm)
@@ -679,6 +711,16 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
     server already sent as a delta.
     """
 
+    def setUp(self):
+        # The transcription serving layer reads its config from the bags, so
+        # the fixture publishes one instead of hanging values off a mock.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", asr_max_concurrent_sessions=32),
+            role="tokenizer",
+        )
+
     def _run_incremental_stream(self, chunk_deltas, fused=False):
         """Server in incremental mode: yield per-chunk delta, not cumulative."""
         chunks = [
@@ -686,9 +728,8 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
             for i, d in enumerate(chunk_deltas)
         ]
         tm = _MockTokenizerManager(chunks)
-        tm.server_args = Mock(
-            incremental_streaming_output=True,
-            asr_max_concurrent_sessions=32,
+        enter_override(
+            self, get_context().override_server_args(incremental_streaming_output=True)
         )
         serving = OpenAIServingTranscription(tm)
 

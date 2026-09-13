@@ -1467,10 +1467,16 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        # Broadcast.
-        torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
-        )
+
+        # Always use pynccl to avoid capturing hip graph failure on torch
+        # version smaller than or equal to 2.11
+        if is_hip() and self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+            self.pynccl_comm.broadcast(input_, src=src)
+        else:
+            # Broadcast.
+            torch.distributed.broadcast(
+                input_, src=self.ranks[src], group=self.device_group
+            )
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):

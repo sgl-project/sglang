@@ -10,6 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.arg_groups.model_override_base import (
+    ep_scale_joiner_of,
+    resolving_view,
+)
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
@@ -392,7 +396,12 @@ def initialize_dp_attention(
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
-        if server_args.is_ep_scale_joiner:
+        # Reads the resolution, not a bag: this runs under
+        # `initialize_dp_attention`, which the weight-cache daemon calls from
+        # `_init_distributed` -- and other callers reach it from processes
+        # whose publish is not guaranteed to have happened yet. (The daemon
+        # itself publishes first, at `daemon.py:284`, before `:320`.)
+        if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(

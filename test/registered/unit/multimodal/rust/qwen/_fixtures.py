@@ -94,6 +94,11 @@ def make_processor(case, config, image_processor_cls=None):
     publish(
         ServerArgs(
             model_path="dummy",
+            # Mirrored for the same reason the stub sets it: `get_mm_processor_cls`
+            # reads `model_impl` from this bag now, and "auto" would send it into
+            # `get_resolved_model_impl`, which chokes on the SimpleNamespace
+            # `model_config` these tests hand it.
+            model_impl=server_args.model_impl,
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,

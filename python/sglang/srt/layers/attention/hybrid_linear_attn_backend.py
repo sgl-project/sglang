@@ -64,21 +64,17 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
         # model_config must not be touched here: backend selection reads the
         # linear_attn_backends stamp first, and that guard test constructs
         # backends on runners without a real model_config.
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
+        pool = self.req_to_token_pool
         self._fused_state_indices_ok = (
-            str(self.device).startswith("cuda")
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-            and type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
+            torch.device(self.device).type == "cuda"
+            and isinstance(pool, HybridReqToTokenPool)
+            and pool.mamba_translate_is_fusable
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -643,6 +639,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 out_state_indices=self.state_indices_list[bs - 1],
                 valid_bs=bs - int(num_padding),
                 total_bs=bs,
+                v2p=self.req_to_token_pool.mamba_v2p_table,
             )
         else:
             # Make sure forward metadata is correctly handled for padding reqs
@@ -929,14 +926,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
 
-        if model_runner.server_args.enable_mamba_extra_buffer():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
                 f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
             )
-            assert (
-                model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), (
-                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            assert get_exec().mamba.mamba_track_interval >= self.mamba_chunk_size, (
+                f"mamba_track_interval ({get_exec().mamba.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
             )
 
     def init_forward_metadata_out_graph(

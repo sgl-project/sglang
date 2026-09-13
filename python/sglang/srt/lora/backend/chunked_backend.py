@@ -17,6 +17,7 @@ from sglang.srt.lora.utils import (
     merge_and_chunk_segments,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_lora
 from sglang.srt.server_args import ServerArgs
 
 MIN_CHUNK_SIZE = 16
@@ -42,7 +43,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         server_args: ServerArgs,
     ):
         super().__init__(max_loras_per_batch, device)
-        self.max_chunk_size = server_args.max_lora_chunk_size
+        self.max_chunk_size = get_lora().max_lora_chunk_size
 
     def run_lora_a_embedding(
         self,

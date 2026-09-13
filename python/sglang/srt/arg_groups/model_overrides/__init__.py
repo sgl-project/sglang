@@ -5,8 +5,7 @@ Importing this package is what registers them. An architecture may be claimed
 by more than one module here -- one supplies its attention shape, another its
 MoE runner -- but two of them must never declare the *same* field for it:
 nobody would own that value, and which module supplied it would come down to
-the order of the imports below. ``test_model_override_split.py`` forbids the
-overlap, which is why this list needs no particular order.
+the order of the imports below. Keep each field owned by one family module.
 """
 
 from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401

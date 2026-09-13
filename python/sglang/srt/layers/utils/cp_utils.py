@@ -1,6 +1,8 @@
+"""Legacy prefill CP helpers retained for HIP, NPU, and MUSA callers."""
+
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -64,13 +66,6 @@ class ContextParallelMetadata:
 
 def is_prefill_context_parallel_enabled():
     return get_parallel().enable_prefill_context_parallel
-
-
-def is_prefill_cp_in_seq_split():
-    return (
-        is_prefill_context_parallel_enabled()
-        and get_parallel().prefill_cp_mode == "in-seq-split"
-    )
 
 
 def is_mla_prefill_cp_enabled() -> bool:
@@ -475,48 +470,6 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=
         layer.k_scale,
         layer.v_scale,
     )
-
-
-def cp_attn_forward_extend(
-    forward_batch,
-    q: torch.Tensor,
-    device: torch.device,
-    attn_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
-) -> torch.Tensor:
-    """
-    Split q into prev/next zigzag halves based on CP metadata, call the
-    backend-specific attention function twice with appropriate per-half
-    metadata, and concatenate the results.
-
-    For bs > 1, q is laid out as [all_prev_tokens_across_seqs,
-    all_next_tokens_across_seqs]; the split point is total_q_prev_tokens.
-    cu_seqlens_q_prev/next tensors have shape [bs+1] and carry the
-    per-sequence boundaries through FlashAttention's variable-length API.
-
-    attn_fn signature:
-        attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q) -> result
-    where only these four CP-varying parameters differ between halves.
-    All other backend-specific args should be captured in the closure.
-    """
-    cp_meta = forward_batch.attn_cp_metadata
-
-    q_prev = q[: cp_meta.total_q_prev_tokens]
-    q_next = q[cp_meta.total_q_prev_tokens :]
-
-    result_prev = attn_fn(
-        q_prev,
-        cp_meta.cu_seqlens_q_prev_tensor,
-        cp_meta.kv_len_prev_tensor,
-        cp_meta.max_seqlen_q_prev,
-    )
-    result_next = attn_fn(
-        q_next,
-        cp_meta.cu_seqlens_q_next_tensor,
-        cp_meta.kv_len_next_tensor,
-        cp_meta.max_seqlen_q_next,
-    )
-
-    return torch.concat([result_prev, result_next], dim=0)
 
 
 def prepare_context_parallel_metadata(

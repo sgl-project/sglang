@@ -17,6 +17,7 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
+    fused_silu_mul_quant_fp8,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -123,6 +124,41 @@ def _validate_fused_swiglu_interleaved(
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+
+
+def _can_use_fused_silu_mul_quant_fp8(
+    *,
+    hidden_size: int,
+    hidden_dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    block_shape: Optional[List[int]],
+    filter_expert: bool,
+    activation: str,
+    is_gated: bool,
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    hooks: Optional[Any],
+    fuse_swiglu_interleaved: bool,
+) -> bool:
+    """Whether the fused activation/quantization kernel is a safe replacement."""
+    if block_shape is None or len(block_shape) != 2 or block_shape[1] <= 0:
+        return False
+
+    activation_size = hidden_size // 2
+    return (
+        _is_cuda
+        and hidden_dtype in (torch.bfloat16, torch.float16)
+        and use_fp8_w8a8
+        and hidden_size % 2 == 0
+        and activation_size % block_shape[1] == 0
+        and not filter_expert
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and hooks is None
+        and not fuse_swiglu_interleaved
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -582,6 +618,26 @@ def _fused_moe_kernel_sequence(
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
+    # Automatically fuse the activation and down-input quantization when the
+    # CUDA block-wise FP8 path satisfies every kernel and caller contract.
+    # Unsupported shapes, activation modifiers, expert filtering, and LoRA
+    # hooks keep using the existing two-kernel path below. DeepSeek-V4's
+    # swiglu_limit is supported and applied inside the fused kernel.
+    use_fused_silu_mul_quant_fp8 = _can_use_fused_silu_mul_quant_fp8(
+        hidden_size=N,
+        hidden_dtype=hidden_states.dtype,
+        use_fp8_w8a8=use_fp8_w8a8,
+        block_shape=block_shape,
+        filter_expert=filter_expert,
+        activation=activation,
+        is_gated=is_gated,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        hooks=hooks,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+    )
+    fused_a2_scale = None
+
     use_fused_moe_sum_all_reduce = (
         get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
@@ -660,14 +716,24 @@ def _fused_moe_kernel_sequence(
         )
 
     if not fuse_swiglu_interleaved:
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        if not use_fused_silu_mul_quant_fp8:
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
     # Activation function with multiplication
-    if fuse_swiglu_interleaved:
+    if use_fused_silu_mul_quant_fp8:
+        # Fused path: silu_and_mul + fp8_quant in one kernel launch.
+        # Pass swiglu_limit so the DeepSeek-V4 clamp is applied inside the
+        # Triton kernel before silu(gate)*up, matching the non-fused path.
+        intermediate_cache2, fused_a2_scale = fused_silu_mul_quant_fp8(
+            intermediate_cache1.view(-1, N),
+            block_shape[1],
+            swiglu_limit=swiglu_limit if swiglu_limit is not None else 0.0,
+        )
+    elif fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
     elif activation == "silu" and is_gated:
@@ -834,7 +900,7 @@ def _fused_moe_kernel_sequence(
                 else out_hidden_states.unsqueeze(0)
             )
         ),
-        a2_scale,
+        fused_a2_scale if use_fused_silu_mul_quant_fp8 else a2_scale,
         w2_scale,
         w2_zp,
         topk_weights,

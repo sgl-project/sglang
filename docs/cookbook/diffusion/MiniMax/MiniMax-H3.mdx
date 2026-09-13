@@ -28,7 +28,8 @@ reload the model.
 The Docker form installs the platform-specific diffusion extra from the source
 bundled in the image. For conditioned requests, set **Host media directory**
 under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
-AMD currently offers the Python form, while NVIDIA also offers Docker.
+AMD and Grace Blackwell currently offer the Python form; the other NVIDIA
+recipes also offer Docker.
 
 To use ModelScope through the same normal `sglang serve` path, prefix the copied
 command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
@@ -71,6 +72,29 @@ The builder accepts legal custom GPU counts and topologies, marking them
 **Unverified** until the exact recipe has completed end-to-end validation.
 Static H3 head or partition violations disable Copy before they reach
 `sglang serve`.
+
+### Grace Blackwell
+
+Select **GB300** or **GB200** in the builder. The default is one Linux ARM64
+host with four GPUs, Ulysses4, and resident weights. This follows the
+[four-GPU compute-tray layout](https://docs.nvidia.com/dgx/dgxgb200-user-guide/hardware.html);
+an NVL72 rack is not a single 72-GPU process host.
+
+For two four-GPU hosts, set **Nodes = 2** and **GPUs / node = 4**. The builder
+emits Ulysses4 inside each host, Ring2 across hosts, and replicated encoders.
+Set the same reachable **Head address** on both hosts and use node ranks 0 and
+1. Run the generated command once per host, with the same SGLang revision and
+dependencies. Let `sglang serve` resolve and download the selected weights.
+
+GB200 is a **derived, unverified recipe**, not a measured GB300-equivalent
+performance claim. Keep the native precision and platform-default attention
+for the baseline; the B200/B300 quantization measurements and H200 Cache-DiT
+quality audit do not establish coverage on Grace Blackwell.
+
+GB300 end-to-end coverage currently includes single-host FL2VA text-to-video
+with audio, native precision, eager execution, and `quality="lossless"`.
+Ref2VA and multi-host commands remain **Unverified**. See the
+[GB300 measurements](#gb300-single-host) for the tested workload.
 
 ### Checkpoint and adapter formats
 
@@ -1181,12 +1205,41 @@ the configurations with collected measurements:
 | --- | --- | --- |
 | B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
+| GB300 | 4× Ulysses4 resident (FL2VA T2VA) | 2 nodes × 4× Ulysses4×Ring2 is unverified. |
+| GB200 | 4× Ulysses4 resident, derived/unverified | No performance measurements. |
 | H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
 | RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
+
+### GB300 single-host
+
+Four requests on **1 host × 4 NVIDIA GB300**, using Linux ARM64, SGLang main
+[`15d2cbcc90fc`](https://github.com/sgl-project/sglang/commit/15d2cbcc90fc66b4d08745994cc707a45b067ffc),
+PyTorch 2.13.0+cu130, and NCCL 2.29.7. The source checkout was installed with
+`python3 -m pip install -e "python[diffusion]" --upgrade` inside
+`lmsysorg/sglang:latest`; this is a source-validation environment, not a claim
+that the image's bundled release contains that revision.
+
+The command matches the GB300 default in the builder: Ulysses4, resident
+weights, automatic encoder folding, native BF16/FP32, platform-default
+Dynamic cuDNN/FA attention, and eager execution. The model was downloaded by
+`sglang serve` from `MiniMaxAI/MiniMax-H3`.
+
+The workload uses the builder's cat-band prompt, FL2VA T2VA, a 5-second request
+at a 768-pixel short edge, 50 inference steps, `quality="lossless"`, one output,
+and seed 1101. Every MP4 contained video and audio and passed a full decode check.
+
+| First full request after server warmup | Following three requests | Warm median |
+| ---: | --- | ---: |
+| 35.16 s | 33.11 / 33.10 / 33.10 s | **33.10 s** |
+
+These are client-observed completion times, including up to one second of
+status-polling delay. Download, model loading, and server warmup are excluded.
+This is a deployment smoke/latency measurement, not a cross-framework quality
+audit, a minimum-GPU claim, or an extrapolation to GB200/NVL72 scaling.
 
 ### Ascend NPU topology comparison
 

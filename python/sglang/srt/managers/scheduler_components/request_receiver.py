@@ -37,7 +37,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -179,7 +179,7 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
+                or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)

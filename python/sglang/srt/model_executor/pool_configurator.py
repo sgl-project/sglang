@@ -42,9 +42,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_spec,
     max_speculative_num_draft_tokens,
 )
@@ -875,11 +877,12 @@ DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
-    """The operator's --swa-full-tokens-ratio, or None if it is still the default."""
-    from sglang.srt.server_args import ServerArgs
+    """The operator's --swa-full-tokens-ratio, or None when it was not given.
 
-    ratio = get_schedule().swa_full_tokens_ratio
-    return None if ratio == ServerArgs.swa_full_tokens_ratio else ratio
+    Read from the pristine record: the resolved schedule bag carries the
+    declared fallback for an unset ratio, which must not count as a request.
+    """
+    return get_server_args().swa_full_tokens_ratio
 
 
 @dataclass
@@ -913,7 +916,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # keeps the FP8 estimate.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
-            _is_hip and kvc.server_args.enable_deepseek_v4_fp4_indexer,
+            _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
