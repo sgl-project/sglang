@@ -76,6 +76,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
         )
+        .route(
+            "/abort_request",
+            post(crate::server::routes::abort::abort_request),
+        )
         // After routing, so MatchedPath is set for every route.
         .layer(middleware::from_fn_with_state(ctx.clone(), count_requests))
         .with_state(ctx)
