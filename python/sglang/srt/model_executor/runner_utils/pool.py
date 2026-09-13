@@ -45,6 +45,7 @@ class GraphPoolBorrowState:
     active_user: Optional[str] = None
     stub: Optional[BumpArenaStub] = None
     mem_pool: Optional[torch.cuda.MemPool] = None
+    stream: Optional[torch.cuda.Stream] = None
     disabled_reason: Optional[str] = None
     static_runs: Optional[list[tuple[int, int]]] = None
     check_pending: bool = False
@@ -279,6 +280,7 @@ def _teardown_borrow_pool() -> None:
     torch.cuda.synchronize()
     torch.empty(1, device="cuda")
     state.mem_pool = None
+    state.stream = None
 
 
 _PRECARVE_MIN_RUN_BYTES = 64 << 20
@@ -286,6 +288,16 @@ _PRECARVE_MIN_RUN_BYTES = 64 << 20
 _PRECARVE_SMALL_RESERVE_BYTES = 32 << 20
 # The caching allocator rounds large segment requests up to 2 MiB.
 _PRECARVE_GRANULARITY = 2 << 20
+
+
+def graph_pool_borrow_can_fit(nbytes: int) -> bool:
+    """Whether one free run fits the payload plus allocator padding and reserve."""
+    if nbytes <= 0:
+        return False
+    required = (
+        nbytes + _PRECARVE_GRANULARITY - 1
+    ) // _PRECARVE_GRANULARITY * _PRECARVE_GRANULARITY + _PRECARVE_SMALL_RESERVE_BYTES
+    return graph_pool_borrow_largest_run() >= required
 
 
 def _precarve_run_segments(runs: list[tuple[int, int]]) -> None:
@@ -302,6 +314,8 @@ def _precarve_run_segments(runs: list[tuple[int, int]]) -> None:
 def borrow_graph_pool(user: str) -> Iterator[None]:
     """Route this thread's torch allocations onto the graph pool's free runs.
 
+    All borrows must use the stream that first creates the borrow pool, so
+    the caching allocator can reuse its pre-carved segments.
     Tensors allocated inside must be released before the next graph replay,
     which rewrites their bytes; the next replay (or pool teardown) raises if
     any are still referenced. An allocation no run can hold raises the
@@ -312,7 +326,13 @@ def borrow_graph_pool(user: str) -> Iterator[None]:
         yield
         return
     with graph_pool_user_scope(user):
+        stream = torch.cuda.current_stream()
         if state.mem_pool is not None:
+            if stream != state.stream:
+                raise RuntimeError(
+                    "Graph-pool borrow must use the stream that created the borrow pool: "
+                    f"expected {state.stream}, got {stream}"
+                )
             # Return completed cross-stream frees to the cache. The allocator
             # processes their events on a later allocation.
             torch.empty(1, device="cuda")
@@ -336,6 +356,7 @@ def borrow_graph_pool(user: str) -> Iterator[None]:
             # stream-ordered deferred frees remain allocator-managed. Capture
             # retires it because capture changes the underlying free extents.
             state.mem_pool = torch.cuda.MemPool(state.stub.allocator)
+            state.stream = stream
             with torch.cuda.use_mem_pool(state.mem_pool):
                 _precarve_run_segments(runs)
             # Only growth beyond the precarve is worth another log line.

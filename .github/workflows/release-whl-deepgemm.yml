@@ -204,6 +204,9 @@ jobs:
           echo "COMPUTE_SANITIZER=${sanitizer}" >> "${GITHUB_ENV}"
 
       - name: Run DeepGEMM test suite
+        env:
+          # Each runner is a single NVLink domain; DeepEP references do not need RDMA/GIN.
+          EP_DISABLE_GIN: "1"
         run: |
           chmod +x "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
           "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh" --release
