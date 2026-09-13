@@ -350,6 +350,7 @@ class DraftBlockProposer:
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
         idle_batch = ForwardBatch(
             forward_mode=ForwardMode.IDLE,
+            out_cache_loc_id_space="kernel",
             batch_size=0,
             input_ids=empty_long,
             req_pool_indices=empty_long,
@@ -419,6 +420,7 @@ class DraftBlockProposer:
         draft_num_tokens = bs * query_token_num
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,

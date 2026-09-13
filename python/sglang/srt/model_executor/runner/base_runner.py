@@ -596,6 +596,7 @@ class BaseRunner(ABC):
 
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
+            out_cache_loc_id_space="kernel",
             batch_size=batch_size,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,

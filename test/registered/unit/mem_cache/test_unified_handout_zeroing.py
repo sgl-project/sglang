@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 
 
-def _build(device, page_size=1, kernel_page_multiplier=None):
+def _build(device, page_size=1):
     """A tiny MLA+mamba unified pool + full-side allocator.
 
     Mirrors init_unified_mamba_pools' construction just enough for the
@@ -61,9 +61,6 @@ def _build(device, page_size=1, kernel_page_multiplier=None):
         device=device,
         is_id_owner=True,
         page_size=page_size,
-        kernel_page_multiplier=(
-            layer_num if kernel_page_multiplier is None else kernel_page_multiplier
-        ),
     )
     return buf, kvcache, allocator
 
@@ -113,12 +110,11 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         pages2 = self._phys_pages(allocator, out2)
         self.assertTrue((env[pages2] == 0).all().item())
 
-    def test_zeroing_enabled_for_single_layer_multiplier(self):
-        # A shard owning exactly ONE full-attention MLA layer has
-        # kernel_page_multiplier == 1 but its pool is still
-        # UnifiedMLATokenToKVPool with the same NaN-unsafe partial-page
-        # reads — zeroing must key on the pool type, not on multiplier > 1.
-        buf, kvcache, allocator = _build("cuda", kernel_page_multiplier=1)
+    def test_zeroing_keys_on_pool_type(self):
+        # UnifiedMLATokenToKVPool has NaN-unsafe partial-page reads whatever
+        # its geometry — zeroing must key on the pool type, not on any
+        # id-space scale.
+        buf, kvcache, allocator = _build("cuda")
         self.assertTrue(allocator._zero_pages_on_alloc)
         self._poison(buf)
         out = allocator.alloc(8)
