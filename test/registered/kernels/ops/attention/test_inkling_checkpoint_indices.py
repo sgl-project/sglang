@@ -416,18 +416,79 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     backend._translate_mamba_indices(slots[1:2].to(torch.int32)),
                 )
 
-    def test_missing_tracking_field_still_refreshes_active_slots(self):
+    def test_explicit_none_tracking_still_refreshes_active_slots(self):
         backend, allocator, _, slots = self.make_backend()
         allocator.free(slots[:1].clone())
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             req_pool_indices=torch.tensor([0], device="cuda"),
+            mamba_track_indices=None,
         )
         backend.init_forward_metadata_out_graph(batch)
+        self.assertIsNone(backend.sconv_metadata.track_cache_indices)
         torch.testing.assert_close(
             backend._cache_indices,
             backend._translate_mamba_indices(slots[1:2]).to(torch.int32),
         )
+
+    def test_missing_tracking_field_rejects_incomplete_metadata_view(self):
+        for static in (False, True):
+            with self.subTest(static=static):
+                backend, _, _, slots = self.make_backend(static=static)
+                batch = self.batch(slots[-1:].clone())
+                backend._prepare_slot_indices(batch)
+                del batch.mamba_track_indices
+                with self.assertRaisesRegex(AttributeError, "mamba_track_indices"):
+                    backend._prepare_slot_indices(batch)
+
+    def test_multilayer_staging_provides_checkpoint_ids_or_none(self):
+        from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
+        )
+
+        _, backend, _, pool, slots, buffers = self._make_draft_checkpoint_runner(
+            multilayer=True, static=True, tracking=True
+        )
+        wrapper = InklingShortConvHybridAttnBackend.__new__(
+            InklingShortConvHybridAttnBackend
+        )
+        wrapper.short_conv_backend = backend
+        wrapper.full_attn_backend = Mock(supports_draft_extend_metadata_staging=True)
+        composite = MultiLayerEagleMultiStepDraftExtendCudaGraphRunner.__new__(
+            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
+        )
+        composite.buffers = buffers
+        composite.captured_req_width = 4
+        composite.draft_extend_attn_backend_list = [wrapper]
+        for step, tracking in enumerate((True, False, True)):
+            with self.subTest(tracking=tracking, step=step):
+                ids = slots[-4:].roll(step).clone()
+                original = ids.clone()
+                buffers.mamba_track_indices = ids if tracking else None
+                composite._stage_metadata(bs=3, raw_bs=2)
+                torch.testing.assert_close(
+                    backend._cache_indices,
+                    torch.cat([slots[1:3], slots.new_zeros(1)]).to(torch.int32),
+                )
+                if tracking:
+                    torch.testing.assert_close(
+                        backend.sconv_metadata.track_cache_indices, ids[:3]
+                    )
+                    self.assertEqual(
+                        backend.sconv_metadata.track_cache_indices.data_ptr(),
+                        ids.data_ptr(),
+                    )
+                    batch = self.batch(
+                        ids[:3], mask=torch.tensor([True, True, False], device="cuda")
+                    )
+                    cache = pool.mamba_cache.conv[0][0]
+                    expected = cache.clone()
+                    hidden = self.scatter(backend, batch, cache)
+                    expected[ids[:2].long()] = hidden
+                    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(ids, original, rtol=0, atol=0)
+                else:
+                    self.assertIsNone(backend.sconv_metadata.track_cache_indices)
 
     def test_draft_eager_preplan_and_repeated_steps_preserve_virtual_source(self):
         from sglang.srt.speculative import eagle_worker_common as common
