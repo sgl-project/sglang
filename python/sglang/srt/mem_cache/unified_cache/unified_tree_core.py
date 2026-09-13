@@ -1448,36 +1448,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
-        """Write-back fallback when a D-leaf's D->H backup fails under host
-        memory pressure: drop the subtree rooted at the unbacked leaf so
-        device eviction keeps making progress instead of leaving its KV
-        unevictable until host space frees up."""
+        """Drop an unlocked subtree when its write-back cannot reserve host KV."""
         result = DropSubtreeNoHostResult(is_dropped=False)
         node = self.node_by_id(node_id)
-        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
-            return result
-        descendants: list[UnifiedTreeNode] = []
-        stack = list(node.children.values())
+        subtree: list[UnifiedTreeNode] = []
+        stack = [node]
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
-            descendants.append(cur)
+            subtree.append(cur)
             stack.extend(cur.children.values())
-        for desc in reversed(descendants):
-            # Host-only by construction: a device descendant would contradict
-            # this node being a D-leaf, and D-leaves evict before ancestors.
-            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
-            assert desc.write_through_pending_id is None
+        for desc in reversed(subtree[1:]):
+            if not desc.evicted and desc.backuped:
+                self.kv_events.record_remove(desc, medium=StorageMedium.CPU)
             self._release_all_component_layers(
                 desc,
-                StorageMedium.CPU,
+                StorageMedium.CPU if desc.evicted else StorageMedium.GPU,
                 result.tracker,
                 result.device_frees,
                 result.host_frees,

@@ -1,10 +1,13 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
+from test_unified_byte_budget_sizing import _swa_factory
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -55,6 +58,74 @@ class TestSWACpuCopyFilter(unittest.TestCase):
             _pool()._filter_swa_cpu_copy(original, torch.tensor([True] * ROWS)),
             original,
         )
+
+
+class TestUnifiedSWATransfers(CustomTestCase):
+    def test_offload_uses_physical_swa_pages(self):
+        from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+            DecodeKVCacheOffloadManager,
+        )
+
+        for tombstone_tokens in (0, 4, 12):
+            with self.subTest(tombstone_tokens=tombstone_tokens):
+                bundle = _swa_factory(page_size=4)
+                allocator = bundle.token_to_kv_pool_allocator
+                indices = allocator.alloc(12)
+                allocator.free_swa(indices[:tombstone_tokens])
+                raw = bundle.unified_memory_pool._raw
+                raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
+                manager = object.__new__(DecodeKVCacheOffloadManager)
+                manager.token_to_kv_pool_allocator = allocator
+                manager.kv_cache = bundle.token_to_kv_pool
+                full, transfers = manager._resolve_offload_transfers(indices)
+                self.assertTrue(
+                    torch.equal(
+                        full, allocator.translate_kv_indices_for_transfer(indices)
+                    )
+                )
+                if tombstone_tokens == len(indices):
+                    self.assertEqual(transfers, [])
+                    continue
+                expected_pages = allocator.swa_v2p_page_table[
+                    indices[tombstone_tokens::4] // 4
+                ]
+                pages = transfers[0].device_indices[::4] // 4
+                buffer = manager.kv_cache.swa_kv_pool.get_page_envelope_buffer()
+                self.assertTrue(
+                    torch.equal(buffer[pages].clone(), buffer[expected_pages])
+                )
+                self.assertTrue(torch.equal(pages, expected_pages))
+
+    def test_cpu_copy_round_trip_with_request_index_and_swa_tombstone(self):
+        bundle = _swa_factory(page_size=4)
+        allocator = bundle.token_to_kv_pool_allocator
+        pool = bundle.token_to_kv_pool
+        indices = allocator.alloc(12)
+        allocator.free_swa(indices[:4])
+        raw = bundle.unified_memory_pool._raw
+        raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
+        full_pages = allocator.translate_kv_indices_for_transfer(indices)[::4] // 4
+        swa_pages = allocator.translate_swa_indices_for_transfer(indices[4:])[::4] // 4
+        full_buffer, swa_buffer = (
+            raw[: side.num_pages * side.entry_bytes_per_page].view(
+                side.num_pages, side.entry_bytes_per_page
+            )
+            for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator)
+        )
+        expected_full = full_buffer[full_pages].clone()
+        expected_swa = swa_buffer[swa_pages].clone()
+
+        # The buffers are CPU tensors; no device synchronization is needed.
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool.current_platform.synchronize"
+        ):
+            saved = pool.get_cpu_copy(indices, req_pool_index=0)
+            raw.zero_()
+            pool.load_cpu_copy(saved, indices, req_pool_index=0)
+
+        self.assertTrue(torch.equal(full_buffer[full_pages], expected_full))
+        self.assertTrue(torch.equal(swa_buffer[swa_pages], expected_swa))
+        self.assertEqual(saved["swa_mask"].tolist(), [False] * 4 + [True] * 8)
 
 
 if __name__ == "__main__":

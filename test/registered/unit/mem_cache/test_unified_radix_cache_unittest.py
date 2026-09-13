@@ -743,6 +743,36 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
             self.assertIsNotNone(_device_value(cache, node_id, ComponentType.FULL))
         return cache, first, second, leaf
 
+    def test_swa_write_back_host_full_preserves_pins_and_continues(self):
+        ct = ComponentType.SWA
+        for session in _session_radix_cache_test_values():
+            for pinned in (False, True):
+                with self.subTest(session=session, pinned=pinned):
+                    cache, first, second, leaf = self._build_internal_chain(ct, session)
+                    cache.tree_core.is_write_back = True
+                    cache.tree_core.has_swa_host_pool = True
+                    cache.tree_core.enable_swa_write_back_eviction_barrier()
+                    if pinned:
+                        receipt = cache.inc_host_lock_ref(first).to_dec_params()
+                        expected = _device_value(cache, first, ct).clone()
+                    tracker = {ComponentType.FULL: 0, ct: 0}
+                    # Only host allocation fails; tree walking and freeing are real.
+                    with mock.patch.object(
+                        cache, "_execute_and_commit_kv_backup", return_value=0
+                    ):
+                        cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)
+                    self.assertGreaterEqual(tracker[ct], 2)
+                    self.assertEqual(tracker[ct], tracker[ComponentType.FULL])
+                    if pinned:
+                        self.assertTrue(
+                            torch.equal(_device_value(cache, first, ct), expected)
+                        )
+                        cache.dec_host_lock_ref(first, receipt)
+                        self.assertEqual(tracker[ct], 4)
+                    else:
+                        self.assertEqual(tracker[ct], 6)
+                    cache.sanity_check()
+
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}

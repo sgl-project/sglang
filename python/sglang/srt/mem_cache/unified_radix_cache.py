@@ -475,9 +475,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
-        # Pre-seed the logical dropped-tokens series.
-        if self.host_memory_mode == "cache" and self.tree_core.has_swa_host_pool:
+        if (
+            get_memory().enable_unified_memory
+            and self.host_memory_mode == "cache"
+            and self.tree_core.has_swa_host_pool
+        ):
             self.tree_core.enable_swa_write_back_eviction_barrier()
+        # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
             if self._tracks_write_through_unbacked_evictions():
@@ -745,13 +749,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 result.backup_kv, write_back=True
             )
             if written <= 0:
+                node_id = result.backup_kv.node_ids[0]
+                dropped = self._drop_subtree_no_host(node_id, tracker)
                 logger.warning(
-                    "write_back: backup failed before auxiliary component "
-                    "eviction; leaving the component device-resident "
-                    "(component=%s)",
+                    "write_back: auxiliary backup failed under host pressure "
+                    "(component=%s, node=%d, subtree_dropped=%s)",
                     component_type.name,
+                    node_id,
+                    dropped,
                 )
-                return None, False
+                # A protected subtree stays intact. The component skips a
+                # failed backup on resume so later victims can still progress.
+                continue
             self.writing_check(write_back=True)
 
     def _evict_device_leaf(
