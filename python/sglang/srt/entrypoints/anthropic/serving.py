@@ -621,17 +621,15 @@ class AnthropicServing:
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+        # ``reasoning_effort`` knob. Preserve the tier exactly: chat templates
+        # may distinguish ``xhigh`` from the SGLang-specific ``max`` tier.
         # ``task_budget`` is a soft hint forwarded as a custom param so the
         # model can see it without it becoming a hard cap (``max_tokens``
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
             if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
+                chat_request.reasoning_effort = oc.effort
             if oc.task_budget is not None:
                 # Custom params are silently ignored by backends that
                 # don't recognise them; logging it makes the propagation
@@ -768,6 +766,13 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            logger.warning("Invalid Anthropic request: %s", e)
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -813,6 +818,13 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            logger.warning("Invalid streaming Anthropic request: %s", e)
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
