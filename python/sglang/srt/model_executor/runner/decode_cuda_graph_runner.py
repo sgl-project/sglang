@@ -582,9 +582,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
-        return min(num_tokens, self.max_bs)
+        # Token tiers are built as capture_bs * captured_req_width. Preserve
+        # that request geometry for capture, replay padding and admission.
+        assert num_tokens % self.captured_req_width == 0, (
+            f"ragged token tier {num_tokens} is not divisible by "
+            f"captured request width {self.captured_req_width}"
+        )
+        return num_tokens // self.captured_req_width
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
