@@ -4481,7 +4481,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
 
-
     # ------------- include_reasoning -------------
     def _build_reasoning_response(self, include_reasoning):
         """Build a non-stream response whose reasoning parser splits think text."""
@@ -4524,9 +4523,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
 
     def test_include_reasoning_default_keeps_reasoning_content(self):
         resp = self._build_reasoning_response(None)
-        self.assertEqual(
-            resp.choices[0].message.reasoning_content, "想了一下"
-        )
+        self.assertEqual(resp.choices[0].message.reasoning_content, "想了一下")
         self.assertEqual(resp.choices[0].message.content, "正式回答")
 
 
