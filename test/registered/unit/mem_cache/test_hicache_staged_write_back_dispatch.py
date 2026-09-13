@@ -290,7 +290,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         self.assertEqual(pipeline.plan_staged_splice("r", device_prefix_len=6), (0, 0))
         pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with("r", 4)
-        pipeline.release_staged_hold.assert_called_once_with("r", reason="shrunk")
+        pipeline.release_staged_hold.assert_called_once_with(
+            "r", reason="aux_window_trim"
+        )
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()

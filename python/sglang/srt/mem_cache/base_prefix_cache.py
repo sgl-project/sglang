@@ -24,9 +24,10 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
@@ -323,7 +324,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        labels = {"cache_type": self.__class__.__name__}
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__, get_parallel(), is_dp_attention_enabled()
+        )
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(

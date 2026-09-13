@@ -166,6 +166,18 @@ def staged_splice_tokens(f: _StagedPrefetch, device_prefix_len: int) -> int:
     return splice_tokens
 
 
+def _staged_splice_discard_reason(
+    f: _StagedPrefetch, device_prefix_len: int, partial_reason: str
+) -> Optional[str]:
+    # None only when the live prefix covers the whole span: nothing loaded
+    # from L3 went unused. A span tail the request now recomputes is a loss.
+    if device_prefix_len < f.matched_len:
+        return "anchor_lost"
+    if device_prefix_len < f.matched_len + f.num_tokens:
+        return partial_reason
+    return None
+
+
 def validate_buffer_only_stack(
     sidecar_pool_specs: list[SidecarPoolSpec],
     host_pool_group: HostPoolGroup,
@@ -945,7 +957,7 @@ class BufferModePipeline:
             return 0, 0
         splice_tokens = staged_splice_tokens(f, device_prefix_len)
         if splice_tokens == 0:
-            covered_tokens = self._resolve_staged_device_coverage(f, device_prefix_len)
+            self._resolve_staged_device_coverage(f, device_prefix_len)
             logger.info(
                 "HiCache staged prefetch released req=%s matched=%d "
                 "device_prefix=%d tokens=%d",
@@ -954,8 +966,12 @@ class BufferModePipeline:
                 device_prefix_len,
                 f.num_tokens,
             )
-            reason = None if covered_tokens == f.num_tokens else "shrunk"
-            self.release_staged_hold(req_id, reason=reason)
+            self.release_staged_hold(
+                req_id,
+                reason=_staged_splice_discard_reason(
+                    f, device_prefix_len, "aux_window_trim"
+                ),
+            )
             return 0, 0
         return splice_tokens, self.staged_prefetch_swa_tokens(req_id)
 
@@ -1030,7 +1046,7 @@ class BufferModePipeline:
         splice_base = len(req.prefix_indices)
         splice_tokens = staged_splice_tokens(f, splice_base)
         if splice_tokens == 0:
-            covered_tokens = self._resolve_staged_device_coverage(f, splice_base)
+            self._resolve_staged_device_coverage(f, splice_base)
             logger.warning(
                 "HiCache staged prefetch dropped req=%s matched=%d now=%d "
                 "tokens_wasted=%d locked=%s",
@@ -1040,8 +1056,9 @@ class BufferModePipeline:
                 f.num_tokens,
                 req.rid in self.anchor_locks,
             )
-            reason = None if covered_tokens == f.num_tokens else "shrunk"
-            return _drop(reason)
+            return _drop(
+                _staged_splice_discard_reason(f, splice_base, "aux_window_trim")
+            )
         trim_tokens = splice_base - f.matched_len
         assert trim_tokens % cache.page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "
@@ -1084,7 +1101,9 @@ class BufferModePipeline:
             )
             available_overlap = max(0, available_end - splice_base)
             cache._resolve_storage_prefetch_tokens(req.rid, available_overlap)
-            return _drop(None if available_overlap == splice_tokens else "shrunk")
+            return _drop(
+                _staged_splice_discard_reason(f, available_end, "device_overlap")
+            )
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
