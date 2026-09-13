@@ -132,6 +132,13 @@ def _update_expert_weights_with_canary(
             f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
         )
 
+    # A silent pass is indistinguishable from never running: log once per update.
+    logger.info(
+        "[Elastic EP] canary verified %d slot(s) across %d layer(s)",
+        num_local_physical_experts,
+        len(update_layer_ids),
+    )
+
     return missing_logical_experts_by_layers
 
 
@@ -227,6 +234,9 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
+    # Destination slot per p2p recv entry, so dropping a recv drops its copy too.
+    recv_dst_by_info_index: Dict[int, int] = {}
+
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -235,7 +245,7 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
-        _filter_p2p_ops(p2p_op_infos)
+        _filter_p2p_ops(p2p_op_infos, buffer2weight_copy_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
@@ -348,6 +358,7 @@ def update_expert_weights_single_layer(
         src_rank: int,
         dst_expert_location: int,
     ):
+        recv_dst_by_info_index[len(p2p_op_infos)] = dst_expert_location
         p2p_op_infos.append(
             (
                 logical_expert_id,
@@ -457,11 +468,12 @@ def update_expert_weights_single_layer(
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
-    def _filter_p2p_ops(p2p_op_infos):
+    def _filter_p2p_ops(p2p_op_infos, buffer2weight_copy_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
             is_active = elastic_ep_state.active_ranks_cpu
+            unreceived_slots = set()
             for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
                 has_isend = any(op.op == torch.distributed.isend for op in ops)
                 has_irecv = any(op.op == torch.distributed.irecv for op in ops)
@@ -479,6 +491,17 @@ def update_expert_weights_single_layer(
                     if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
+                        unreceived_slots.add(recv_dst_by_info_index[i])
+
+            # Dropping a recv leaves its buffer->weight copy behind, and temp_buffers is
+            # empty_like reused across layers, so publishing one overwrites a live slot
+            # with garbage. Free-riders share the buffer, so key on the source slot.
+            if unreceived_slots:
+                buffer2weight_copy_infos[:] = [
+                    (src, dst)
+                    for src, dst in buffer2weight_copy_infos
+                    if src not in unreceived_slots
+                ]
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])

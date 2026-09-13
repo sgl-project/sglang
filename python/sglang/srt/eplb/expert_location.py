@@ -38,12 +38,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _scale_published_ep_size() -> bool:
+    from sglang.srt.runtime_context import get_context
+
+    return any(
+        src.startswith("elastic_ep.") and "ep_size" in fields
+        for src, fields in get_context().overrides_log()
+    )
+
+
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
 
-    return (
-        get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
-    )
+    # Offset joiners: single-rank subprocess -> divide-by-zero in _find_nearest_expert.
+    if get_exec().moe.is_ep_offset_joiner:
+        return False
+    # A scale-published width no longer tiles the launch nodes: ep_size // nnodes is a
+    # nonexistent split, or zero when ep_size < nnodes; reshuffle_for_scale likewise.
+    if _scale_published_ep_size():
+        return False
+    return not elastic_expanded_world_enabled()
 
 
 def _compute_elastic_expert_layout(
@@ -63,7 +77,8 @@ def _compute_elastic_expert_layout(
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     physical_to_logical_map_cpu: torch.Tensor
-    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    # (layers, num_logical_experts, X), X padded to physical_capacity
+    logical_to_all_physical_map: torch.Tensor
     logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     ep_size: int
@@ -92,7 +107,7 @@ class ExpertLocationMetadata:
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
-        num_layers_1, num_logical_experts_0, num_physical_experts_1 = (
+        num_layers_1, num_logical_experts_0, physical_capacity = (
             self.logical_to_all_physical_map.shape
         )
         num_layers_2, num_logical_experts_1 = (
@@ -100,7 +115,10 @@ class ExpertLocationMetadata:
         )
         assert num_layers_0 == num_layers_1 == num_layers_2
         assert num_logical_experts_0 == num_logical_experts_1
-        assert num_physical_experts_0 == num_physical_experts_1
+        assert physical_capacity >= num_physical_experts_0, (
+            f"fan-out {physical_capacity} narrower than the live width "
+            f"{num_physical_experts_0}"
+        )
 
     # -------------------------------- construction ------------------------------------
 
@@ -171,6 +189,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             moe_ep_rank=moe_ep_rank,
+            physical_capacity=common["physical_capacity"],
         )
 
     @staticmethod
@@ -219,6 +238,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 get_device().device
             ),
+            physical_capacity=common["physical_capacity"],
         )
 
     @staticmethod
@@ -240,7 +260,9 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            if get_exec().moe.ep_join_mode == "scale":
+            # Offset joiners size to the post-join cohort until a scale publishes a
+            # width: its launch floor clamps a shrink, leaving the map indivisible.
+            if get_exec().moe.is_ep_offset_joiner and not _scale_published_ep_size():
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + get_parallel().tp_size,
@@ -256,11 +278,20 @@ class ExpertLocationMetadata:
             assert num_physical_experts % ep_size == 0
             num_local_physical_experts = num_physical_experts // ep_size
 
+        # Fixed for the process lifetime so a scale rewrites the dispatch tensors in
+        # place: captured CUDA graphs hold their data pointers. Per-rank width is
+        # scale-invariant (whole ranks join/retire); without --elastic-ep-initial-size
+        # the width is the model's own expert count, which no scale moves.
+        physical_capacity = num_physical_experts
+        if initial_ep_size is not None:
+            physical_capacity = num_local_physical_experts * get_parallel().max_ep_size
+
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
             base_num_physical_experts=base_num_physical_experts,
             num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
+            physical_capacity=physical_capacity,
             ep_size=ep_size,
         )
 
@@ -269,14 +300,18 @@ class ExpertLocationMetadata:
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
+        physical_capacity: int,
         moe_ep_rank: Optional[int] = None,
     ):
-
         _, num_physical_experts = physical_to_logical_map.shape
 
+        # Pad the replica fan-out, not physical_to_logical_map: the latter indexes
+        # expert weights, and a -1 tail faults the EPLB reshuffle's gather. The
+        # -1 columns here are never selected, since a dispatch index is drawn
+        # modulo num_valid.
         logical_to_all_physical_map_padded = F.pad(
             logical_to_all_physical_map,
-            (0, num_physical_experts - logical_to_all_physical_map.shape[-1]),
+            (0, physical_capacity - logical_to_all_physical_map.shape[-1]),
             value=-1,
         )
 
@@ -338,6 +373,32 @@ class ExpertLocationMetadata:
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
+    def adopt_scaled_in_place(self, other: ExpertLocationMetadata) -> None:
+        """Take ``other``'s placement and width without moving any storage.
+
+        Unlike ``update``, which merges a rebalance at a constant width, this
+        replaces all layers and does move ``ep_size``. ``copy_`` below raises if a
+        scale ever resized the fixed-capacity dispatch tensors.
+        """
+        # Held still: a captured graph replays against exactly these.
+        for field in [
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_cpu",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            self_field = getattr(self, field)
+            other_field = getattr(other, field)
+            assert (self_field is not None) == (other_field is not None), field
+            if self_field is not None:
+                self_field.copy_(other_field)
+
+        # Rebound rather than written: these index expert weights at the live
+        # width, and nothing inside a graph holds a pointer to them.
+        self.physical_to_logical_map = other.physical_to_logical_map
+        self.physical_to_logical_map_cpu = other.physical_to_logical_map_cpu
+        self.ep_size = other.ep_size
+
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
@@ -353,19 +414,22 @@ class ExpertLocationMetadata:
         # rebalancing for those layers) instead of indexing out of range.
         if layer_id >= cpu_map.shape[0]:
             if require_global_experts:
-                num_physical_experts = cpu_map.shape[-1]
                 return list(
                     range(
                         logical_expert_id,
-                        num_physical_experts,
+                        self.num_physical_experts,
                         self.num_logical_experts,
                     )
                 )
             return [logical_expert_id]
         if require_global_experts:
-            num_physical_experts = cpu_map[layer_id].shape[-1]
+            # Live width, not cpu_map.shape[-1]: the fan-out is padded to capacity.
             return list(
-                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
+                range(
+                    logical_expert_id,
+                    self.num_physical_experts,
+                    self.num_logical_experts,
+                )
             )
         return [
             physical_expert_id
@@ -516,10 +580,26 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    from sglang.srt.elastic_ep.elastic_ep import share_expert_map_via_store
+
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
-    torch.distributed.broadcast(
-        metadata.physical_to_logical_map, src=src_rank, group=group
-    )
+    # Both callers are elastic EP, where the group's own broadcast can wedge the
+    # cohort; see share_expert_map_via_store. Without a store this is the old path.
+    rank_in_group = torch.distributed.get_rank(group=group)
+    if not share_expert_map_via_store(
+        metadata.physical_to_logical_map,
+        is_src=rank_in_group == src_rank,
+        cohort_size=torch.distributed.get_world_size(group=group),
+        group_rank=rank_in_group,
+    ):
+        torch.distributed.broadcast(
+            metadata.physical_to_logical_map, src=src_rank, group=group
+        )
+
+    # Src already rebuilt: skip redundant O(layers*experts*ep_size) recomputation.
+    if torch.distributed.get_rank(group=group) == src_rank:
+        return metadata
+
     metadata = ExpertLocationMetadata.init_by_mapping(
         model_config,
         metadata.physical_to_logical_map,
@@ -550,6 +630,11 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            if not (0 <= logical_expert_id < num_logical_experts):
+                raise IndexError(
+                    f"p2l[{layer_id},{physical_expert_id}]={logical_expert_id} "
+                    f"not in [0,{num_logical_experts}); ep_size={ep_size} rank={moe_ep_rank}"
+                )
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )

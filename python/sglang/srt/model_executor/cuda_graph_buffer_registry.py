@@ -31,10 +31,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.dp_attention import dp_capacity_for
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -689,11 +691,17 @@ def build_decode_registry(
 
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
-            if require_gathered_buffer:
-                buf.fill_(ctx.padded_num_tokens)
+            if not require_gathered_buffer:
+                return
+            # Retired slots must read as ranks contributing nothing, or the stale rows
+            # in their region count as real tokens. Retirees are the contiguous tail.
+            live = min(get_parallel().dp_size, buf.shape[0])
+            buf[:live].fill_(ctx.padded_num_tokens)
+            buf[live:].zero_()
 
+        _dp_capacity = dp_capacity_for(dp_size)
         _global_shape = (
-            (lambda _bs, _mt: (dp_size,))
+            (lambda _bs, _mt: (_dp_capacity,))
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )

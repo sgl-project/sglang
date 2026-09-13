@@ -273,6 +273,18 @@ def ep_scale_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode == "scale"
 
 
+def ep_offset_joiner_of(cfg: Any) -> bool:
+    """Joiner taking a specific global rank: scale, or recover into a retired slot.
+
+    Wider than :func:`ep_scale_joiner_of`, which a plain fault recovery also satisfies
+    at offset 0. Anything keyed on owning a rank the launch cohort already numbered
+    wants this one.
+    """
+    return cfg.ep_join_mode == "scale" or (
+        cfg.ep_join_mode == "recover" and cfg.ep_join_rank_offset > 0
+    )
+
+
 def startup_weight_load_overlap_of(cfg: Any) -> bool:
     """Whether weight loading overlaps startup."""
     return cfg.startup_weight_load_mode == "overlap"
