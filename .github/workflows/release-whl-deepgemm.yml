@@ -20,6 +20,11 @@ on:
         type: string
         required: false
         default: 'dev'
+      validation_only:
+        description: "Build and test without publishing wheels"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
@@ -100,11 +105,11 @@ jobs:
           - arch_label: sm90
             runner: 8-gpu-h200
             wheel_arch: x86_64
-            timeout: 120
+            timeout: 60
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
-            timeout: 240
+            timeout: 60
           # The sm120 tests require a runner with RTX 6000. It causes OOM on 5090 runners.
           # - arch_label: sm120
           #   runner: 1-gpu-5090
@@ -112,7 +117,7 @@ jobs:
           - arch_label: sm100-aarch64
             runner: 4-gpu-gb300
             wheel_arch: aarch64
-            timeout: 240
+            timeout: 60
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -141,9 +146,32 @@ jobs:
           # deep_gemm imports torch before loading _C.so, so torch must preload the
           # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
           python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
-          python3 -m pip install numpy
+          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.2"
           python3 -m pip install dist/*.whl
+          # Torch pins NCCL 2.29.7, but this DeepEP wheel requires 2.30.7.
+          # Override it after every dependency-resolving pip command.
+          python3 -m pip install "nvidia-nccl-cu13==2.30.7" --force-reinstall --no-deps
+          nccl_lib=$(python3 -c "from importlib.metadata import distribution; print(distribution('nvidia-nccl-cu13').locate_file('nvidia/nccl/lib'))")
+          export LD_LIBRARY_PATH="${nccl_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
+          python3 - <<'PY'
+          import ctypes
+          import sys
+          import torch
+          import deep_ep
+          from tile_kernels.moe import top2_sum_gate
+
+          # torch.cuda.nccl.version() reports Torch's compiled version, not the loaded library.
+          nccl_version = ctypes.c_int()
+          assert ctypes.CDLL("libnccl.so.2").ncclGetVersion(ctypes.byref(nccl_version)) == 0
+          assert nccl_version.value == 23007, nccl_version.value
+          assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is required"
+          sys.path.insert(0, "DeepGEMM/third-party")
+          from tilelang_ops import ref_mhc
+          assert ref_mhc.has_baseline(), "Mega mHC reference operators are unavailable"
+          print("DeepGEMM test dependencies ready; NCCL:", nccl_version.value)
+          PY
 
       - name: Install Compute Sanitizer 2025.4.1
         env:
@@ -176,11 +204,15 @@ jobs:
           echo "COMPUTE_SANITIZER=${sanitizer}" >> "${GITHUB_ENV}"
 
       - name: Run DeepGEMM test suite
+        env:
+          # Each runner is a single NVLink domain; DeepEP references do not need RDMA/GIN.
+          EP_DISABLE_GIN: "1"
         run: |
           chmod +x "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
-          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh" --release
 
   release-cu130:
+    if: ${{ !inputs.validation_only }}
     needs: [build-cu130-matrix, test-cu130]
     runs-on: ubuntu-latest
     steps:
