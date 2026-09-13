@@ -448,6 +448,20 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
 
+    def prepare_buffer(self) -> None:
+        """Build the process-wide ElasticBuffer now, outside CUDA graph capture.
+
+        ``ElasticBuffer.__init__`` allocates, synchronises and calls into the
+        driver, none of which is legal during stream capture, so the lazy build
+        inside :meth:`dispatch` cannot be left to run for the first time on a
+        captured graph. Delegates to the impl's own accessor rather than
+        re-deriving the constructor arguments: ``DeepEPv2Buffer.get_buffer()``
+        caches on an exact 7-element key, so a call assembled from recomputed
+        arguments risks missing the cache and constructing a *second* buffer at
+        exactly the moment this is meant to prevent.
+        """
+        self._impl._get_buffer()
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
