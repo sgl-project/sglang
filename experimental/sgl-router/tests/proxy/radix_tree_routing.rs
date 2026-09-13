@@ -14,7 +14,7 @@ use sgl_router::policies::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
 };
 use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
-use sgl_router::policies::request_tokens_for;
+use sgl_router::policies::resolve_request_tokens;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -44,7 +44,7 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
         "model": MODEL,
         "messages": [{"role": "user", "content": "local radix cache hit"}],
     });
-    let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
+    let tokens = resolve_request_tokens(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes");
     let hashes = compute_block_hashes(&tokens.ids, 1);
     assert!(!hashes.is_empty());

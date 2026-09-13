@@ -1,17 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end at the HTTP layer: the router tokenizes the prompt once at
-//! ingress and forwards the ids to the engine as `input_ids` (so the engine
-//! skips re-tokenizing the same prompt). Asserts the gating contract through
-//! the real chat handler + a MockWorker backend:
-//!
-//! * A plain text chat request on the engine-equivalent chat-encoder path →
-//!   the forwarded body carries `input_ids` AND retains `messages`.
-//! * A request carrying `tools` → `input_ids` omitted (the router's encoder
-//!   doesn't render tool schemas, so its ids would diverge from the engine).
-//! * A request with multimodal (array) content → `input_ids` omitted (a text
-//!   tokenizer can't represent image content).
+//! Verify forwarding eligibility and message preservation through the HTTP handler.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -35,8 +25,8 @@ fn build_ctx(url: String) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+        tokenizers.has_chat_formatter(MODEL),
+        "deepseek-v4 model id must auto-attach the built-in chat formatter"
     );
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
@@ -79,73 +69,116 @@ fn captured(mock: &MockWorker) -> Value {
 async fn plain_chat_forwards_input_ids_and_keeps_messages() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello there friend"}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    for messages in [
+        json!([{"role": "user", "content": "hello there friend"}]),
+        json!([
+            {"role": "user", "content": "U1"},
+            {"role": "user", "content": "U2"},
+            {"role": "system", "content": "S", "name": "instruction"},
+            {"role": "assistant", "content": "A", "name": "bot"},
+            {"role": "user", "content": "U3"}
+        ]),
+    ] {
+        let status = send(
+            Arc::clone(&ctx),
+            json!({
+                "model": MODEL,
+                "messages": messages,
+                "input_ids": null,
+                "chat_template_kwargs": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
 
-    let body = captured(&mock);
-    let ids = body.get("input_ids").and_then(|v| v.as_array());
-    assert!(
-        ids.is_some_and(|a| !a.is_empty()),
-        "engine must receive non-empty input_ids; got {body}"
-    );
-    assert!(
-        body.get("messages").is_some(),
-        "messages must be retained alongside input_ids; got {body}"
-    );
+        let body = captured(&mock);
+        let ids = body.get("input_ids").and_then(|v| v.as_array());
+        assert!(
+            ids.is_some_and(|a| !a.is_empty()),
+            "engine must receive non-empty input_ids; got {body}"
+        );
+        assert_eq!(body["messages"], messages);
+    }
 }
 
 #[tokio::test]
-async fn tool_request_omits_input_ids() {
+async fn caller_input_ids_are_used_for_routing_and_preserved() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
+    for (ids, expected) in [
+        (json!([7, 8]), Some(vec![7, 8])),
+        (json!([]), Some(vec![])),
+        (json!([7, -1]), None),
+    ] {
+        let request = json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
+            "input_ids": ids,
+        });
+        let tokens = sgl_router::policies::resolve_request_tokens(
+            &ctx.tokenizers,
+            &ModelId(MODEL.into()),
+            &request,
+        );
+        assert!(!tokens.as_ref().is_some_and(|t| t.chat_rendered));
+        assert_eq!(tokens.map(|t| t.ids), expected, "input_ids: {ids}");
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        assert_eq!(captured(&mock), request);
+    }
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
+}
+
+#[tokio::test]
+async fn guarded_requests_render_without_forwarding_ids() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    for options in [
+        json!({"tools": [{"type": "function", "function": {"name": "f"}}]}),
+        json!({"chat_template_kwargs": {"thinking": true}}),
+        json!({"reasoning_effort": "none"}),
+        json!({"chat_template": "custom"}),
+    ] {
+        let mut request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let tokens = sgl_router::policies::resolve_request_tokens(
+            &ctx.tokenizers,
+            &ModelId(MODEL.into()),
+            &request,
+        )
+        .expect("request renders for routing");
+        assert!(tokens.chat_rendered);
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        assert_eq!(captured(&mock), request);
+    }
+}
+
+#[tokio::test]
+async fn reasoning_history_omits_input_ids_and_preserves_messages() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let messages = json!([
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1", "reasoning_content": "R1"},
+        {"role": "user", "content": "U2"}
+    ]);
+    let status = send(ctx, json!({"model": MODEL, "messages": messages})).await;
     assert_eq!(status, StatusCode::OK);
 
     let body = captured(&mock);
     assert!(
         body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids; got {body}"
+        "the engine must render reasoning history with its own template; got {body}"
     );
-}
-
-#[tokio::test]
-async fn thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode, which the
-    // router's encoder renders in the default mode only — forwarding ids would
-    // silently run the wrong mode, so the handler must omit them.
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids; got {body}"
-    );
+    assert_eq!(body["messages"], messages);
 }
 
 #[tokio::test]

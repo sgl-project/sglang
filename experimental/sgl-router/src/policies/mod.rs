@@ -33,8 +33,8 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
-    pub engine_equivalent: bool,
+    /// Whether the IDs came from chat rendering rather than the caller or raw text.
+    pub chat_rendered: bool,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -44,28 +44,32 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-encoder tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
-pub fn request_tokens_for(
+/// Use caller IDs or render/tokenize for routing; check forwarding separately.
+pub fn resolve_request_tokens(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_encoder(&model_id.0) {
-        if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
-                return Some(RequestTokens {
-                    ids,
-                    engine_equivalent: true,
-                });
-            }
+    // Caller IDs take precedence; malformed values are left for engine validation.
+    if let Some(ids) = value.get("input_ids").filter(|v| !v.is_null()) {
+        return Some(RequestTokens {
+            ids: serde_json::from_value(ids.clone()).ok()?,
+            chat_rendered: false,
+        });
+    }
+    if value.get("messages").is_some_and(|m| m.is_array()) {
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                chat_rendered: true,
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
-        engine_equivalent: false,
+        chat_rendered: false,
     })
 }
 
@@ -491,15 +495,10 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Whether this policy's routing decision needs request tokens (i.e.
-    /// it routes by prompt prefix). Ingress tokenization itself is no longer
-    /// gated on this — that is a model property (`has_chat_encoder`) decided at
-    /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
-    /// keeps the cache-aware policy's RAW-prompt routing path alive: a
-    /// cache-aware model with no chat encoder still wants its `/v1/completions`
-    /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`
-    /// alone would not trigger. Default `false` for load-only and sticky
-    /// routes; only the cache-aware policy overrides it.
+    /// Whether this policy needs request tokens for prefix matching. Bucket
+    /// selection and eligible engine forwarding can independently request IDs.
+    /// Formatter availability affects how IDs are produced, not whether this
+    /// policy needs them. Default `false` for load-only and sticky routes.
     fn needs_request_tokens(&self) -> bool {
         false
     }

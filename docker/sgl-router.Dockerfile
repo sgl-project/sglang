@@ -28,7 +28,7 @@
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
 
 ######################## STAGE 1 — chef recipe ##########################

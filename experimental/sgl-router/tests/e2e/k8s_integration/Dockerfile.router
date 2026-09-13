@@ -3,14 +3,14 @@
 # Context root: repo root (one level above experimental/sgl-router/).
 
 # Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
 # Pin to the exact toolchain pre-installed in the base image so rustup
 # doesn't try to sync the channel manifest when it sees rust-toolchain.toml's
-# `channel = "1.90"`.
-ENV RUSTUP_TOOLCHAIN=1.90.0
+# `channel = "1.92"`.
+ENV RUSTUP_TOOLCHAIN=1.92.0
 
-# libssl-dev + pkg-config ship with rust:1.90-bookworm already; protoc does not,
+# libssl-dev + pkg-config ship with rust:1.92-bookworm already; protoc does not,
 # and the Indexer's build script needs it to compile the KV-indexer protos.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \

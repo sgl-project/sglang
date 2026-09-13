@@ -20,7 +20,7 @@ use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
-use sgl_router::policies::request_tokens_for;
+use sgl_router::policies::resolve_request_tokens;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -55,7 +55,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
         "model": MODEL,
         "messages": [{"role": "user", "content": "hello there friend"}],
     });
-    let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
+    let tokens = resolve_request_tokens(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes");
     let hashes = compute_block_hashes(&tokens.ids, 1);
     assert!(!hashes.is_empty());

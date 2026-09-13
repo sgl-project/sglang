@@ -64,12 +64,9 @@ allow = ["LGPL-3.0-only"]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Git deps (e.g. dynamo-* pinned by SHA) have no semver version req and would
-# otherwise trip the wildcard check.  allow-wildcard-paths exempts non-registry
-# (git + path) sources so we only deny bare '*' on crates.io deps.
+# Workspace path dependencies have no semver requirement.
 allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "allow"  # dynamo git dep pinned by SHA in Cargo.toml.
-allow-git = ["https://github.com/ai-dynamo/dynamo"]
+unknown-git = "deny"

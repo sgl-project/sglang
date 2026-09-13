@@ -102,37 +102,11 @@ jobs:
       # of self-hosted-runner pip installs that compile Rust extensions.
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # Supply-chain guard: deny.toml allowlists the dynamo git source but
-      # cannot pin a SHA. Bumps to this constant must be a deliberate PR.
-      DYNAMO_TOKENIZERS_EXPECTED_REV: "1efdd4dcb901caeae636131321094090d252c8d6"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install protoc
         run: sudo bash scripts/ci/utils/install_protoc.sh
-
-      - name: Verify dynamo-* SHA pin
-        run: |
-          set -euo pipefail
-          revs=$(grep -E '^dynamo-[a-z]+[[:space:]]*=.*\brev[[:space:]]*=' experimental/sgl-router/Cargo.toml \
-            | sed -E 's/.*rev[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
-          if [ -z "${revs:-}" ]; then
-            echo "::error::no dynamo-* git deps with rev= found in experimental/sgl-router/Cargo.toml"
-            exit 1
-          fi
-          count=0
-          while IFS= read -r r; do
-            count=$((count + 1))
-            if [ "$r" != "$DYNAMO_TOKENIZERS_EXPECTED_REV" ]; then
-              echo "::error::dynamo-* SHA pin mismatch in experimental/sgl-router/Cargo.toml"
-              echo "  expected: $DYNAMO_TOKENIZERS_EXPECTED_REV"
-              echo "  actual:   $r"
-              echo "All revs found:"
-              echo "$revs" | sed 's/^/  /'
-              exit 1
-            fi
-          done <<< "$revs"
-          echo "dynamo-* SHA pin OK: $count entries all at $DYNAMO_TOKENIZERS_EXPECTED_REV"
 
       # sccache install is best-effort: the GitHub release CDN intermittently
       # returns 5xx and the action's built-in retry is shallow. If it fails,
