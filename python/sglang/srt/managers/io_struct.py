@@ -1068,6 +1068,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
+    # Internal PP control bit, set by PP0 before forwarding the request.
+    # Keep at the end to preserve the positional Rust wire schema.
+    pp_prefetch_ticketed: bool = False
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 

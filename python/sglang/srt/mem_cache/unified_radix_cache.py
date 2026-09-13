@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -938,6 +939,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        # Retraction also enters here: retain its ticket until actual finish.
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.pp_prefetch_command_group is not None
+            and req.finished()
+        ):
+            self.cache_controller.release_pp_prefetch(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -1879,9 +1887,13 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
+
+        submission = self.cache_controller.get_prefetch_submission(req_id)
+        if submission is not None:
+            return submission.decision
 
         buffer_mode = self.host_memory_mode == "buffer_only"
         # Key the span by the request's namespace, not the anchor's (a root
@@ -1982,18 +1994,28 @@ class UnifiedRadixCache(BasePrefixCache):
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        operation = self.cache_controller.prefetch(
+        submission = self.cache_controller.submit_prefetch(
             req_id,
             prefetch_key,
             last_hash,
             prefix_keys,
-            extra_pools=aux_xfers or None,
+            matched_prefix_tokens,
+            aux_xfers or None,
         )
+        operation = submission.operation
+        if operation is None:
+            assert submission.decision is not None
+            self.cache_controller.append_host_mem_release(extra_pools=aux_xfers or None)
+            return submission.decision
+
         stats["issued"] += 1
         # Snapshot the requested span for L3 miss-token accounting at the
         # rank-synchronized query outcome.
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = len(matched_prefix_tokens or [])
+        if submission.decision is not None:
+            return submission.decision
+
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
@@ -2049,8 +2071,69 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             return True
 
+    def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
+        # PP0 also records misses/skips; only hits travel with the request relay.
+        with self.cache_controller.pp_prefetch_state_lock:
+            self.cache_controller.pp_prefetch_decisions[req_id] = (
+                PPPrefetchDecision.TICKETED if decision else PPPrefetchDecision.SKIPPED
+            )
+
+    def _check_pp_prefetch_progress(self, req_id: str) -> bool:
+        ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
+        ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
+        self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
+        if ready_tensor.item() == 0:
+            return False
+
+        state = self.cache_controller.take_ready_pp_prefetch(req_id)
+        if state is None:
+            raise RuntimeError(
+                f"PP prefetch became ready before local state existed: {req_id}"
+            )
+
+        operation = state.operation
+        if operation.host_indices is None or operation.completed_tokens == 0:
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            return True
+
+        ticket = state.ticket
+        prefetch_key = ticket.prefetch_key
+        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            self.root_node_handle(prefetch_key.extra_key),
+            prefetch_key,
+            operation.host_indices,
+            operation,
+            None,
+            {
+                BASE_COMPONENT_TYPE: [
+                    transfer
+                    for transfer in operation.pool_transfers or []
+                    if transfer.indices_from_pool is None
+                ]
+            },
+        )
+        self.buffer_pipeline.set_prefix_ctx(
+            req_id,
+            ticket.matched_prefix_tokens,
+            extra_key=prefetch_key.extra_key,
+            cache_salt=prefetch_key.cache_salt,
+        )
+        self.buffer_pipeline.try_lock_anchor(req_id)
+        self.cache_controller.append_host_mem_release(
+            operation.host_indices[operation.completed_tokens :]
+        )
+        self._handle_prefetch_result(operation)
+        return True
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.pp_prefetch_decisions.get(req_id)
+            is PPPrefetchDecision.TICKETED
+        ):
+            return self._check_pp_prefetch_progress(req_id)
+
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -2422,6 +2505,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
+        if (
+            self.buffer_pipeline is not None
+            and self.cache_controller.pp_prefetch_command_group is not None
+            and self.cache_controller.release_pp_prefetch(rid)
+        ):
+            return
         if (
             self.buffer_pipeline is not None
             and self.buffer_pipeline.release_staged_hold(rid)
@@ -2901,7 +2990,7 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
-        if cc is None or self.pp_rank > 0:
+        if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
             # Zero placeholders shaped like PP0's slots: _pp_sync hands the
@@ -2939,7 +3028,10 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
