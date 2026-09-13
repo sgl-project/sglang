@@ -326,5 +326,261 @@ class TestCausalConv1d(CustomTestCase):
         )
 
 
+def chain_verify_window_ref(x, history, width):
+    """Per-token ancestor walk, transcribed from the Triton
+    ``_causal_conv1d_update_kernel`` tree branch.
+
+    The kernel stores the j-th ancestor of each step into window slot
+    ``W - j - 2``; once the walk runs off the front of the draft block it reads
+    the prior conv-state columns. Spelled out with Python loops so the CPU
+    path's window layout is checked against a different formulation. The
+    arithmetic itself is not modelled here -- the C++ kernel consumes a
+    VNNI-prepacked weight, so a plain-weight reference cannot reproduce it;
+    ``test_verify_matches_cpp_decode_kernel`` covers that instead.
+    """
+    batch, dim, seqlen = x.shape
+    window = torch.zeros((batch, seqlen, dim, width - 1), dtype=x.dtype)
+    for b in range(batch):
+        for t in range(seqlen):
+            for j in range(width):
+                idx = t - j
+                # idx < 0 walks off the block into the conv-state history.
+                val = x[b, :, idx] if idx >= 0 else history[b, :, idx + width - 1]
+                if width - j - 2 >= 0:
+                    window[b, t, :, width - j - 2] = val
+    final_state = torch.cat([history, x], dim=-1)[:, :, seqlen:]
+    return window, final_state
+
+
+class TestCausalConv1dChainVerify(CustomTestCase):
+    """Covers the DFlash target-verify path of ``causal_conv1d_update_cpu``.
+
+    DFlash drafts a linear chain, so the kernel's parent walk collapses into a
+    rolling window and the block becomes the decode kernel replayed token by
+    token. These cases pin the index math (window layout, state roll, parent
+    ids, cache-slot targeting) and the arithmetic against that kernel.
+    """
+
+    @parametrize(
+        batch=[1, 3],
+        dim=[96],
+        draft_token_num=[4, 16],
+        width=[4],
+        has_bias=[True, False],
+    )
+    def test_chain_verify_matches_ancestor_walk(
+        self, batch, dim, draft_token_num, width, has_bias
+    ):
+        from sgl_kernel.mamba import causal_conv1d_update_cpu
+
+        dtype = torch.bfloat16
+        state_len = width - 1
+        num_lines = batch + 5
+
+        x = torch.randn(batch, dim, draft_token_num, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype) if has_bias else None
+
+        conv_states = torch.randn(num_lines, dim, state_len, dtype=dtype)
+        # Non-contiguous, non-identity slots to catch index-vs-position bugs.
+        conv_state_indices = torch.arange(batch, dtype=torch.int32) + 2
+        history = conv_states[conv_state_indices.long()].clone()
+
+        window_buf = torch.zeros(
+            num_lines, draft_token_num, dim, width - 1, dtype=dtype
+        )
+        intermediate_state_indices = torch.arange(batch, dtype=torch.int32) + 1
+        retrieve_next_token = (
+            torch.arange(1, draft_token_num + 1).unsqueeze(0).repeat(batch, 1)
+        )
+        retrieve_next_token[:, -1] = -1
+        retrieve_next_sibling = torch.full((batch, draft_token_num), -1)
+        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+
+        causal_conv1d_update_cpu(
+            x,
+            conv_states,
+            weight,
+            bias,
+            "silu",
+            conv_state_indices,
+            intermediate_conv_window=window_buf,
+            intermediate_state_indices=intermediate_state_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+
+        window_ref, state_ref = chain_verify_window_ref(x, history, width)
+
+        torch.testing.assert_close(
+            window_buf[intermediate_state_indices.long()], window_ref
+        )
+        torch.testing.assert_close(conv_states[conv_state_indices.long()], state_ref)
+
+        expected_parent = (
+            torch.arange(-1, draft_token_num - 1).unsqueeze(0).repeat(batch, 1)
+        )
+        expected_parent[:, 0] = 0
+        torch.testing.assert_close(retrieve_parent_token, expected_parent)
+
+    def test_untouched_slots_are_not_written(self):
+        """The write must land only on the indexed cache lines; a bug that
+        ignores the index tensors would still pass an out-value-only check."""
+        from sgl_kernel.mamba import causal_conv1d_update_cpu
+
+        dtype = torch.bfloat16
+        batch, dim, draft_token_num, width = 2, 96, 8, 4
+
+        conv_states = torch.randn(6, dim, width - 1, dtype=dtype)
+        window_buf = torch.randn(6, draft_token_num, dim, width - 1, dtype=dtype)
+        before_states = conv_states.clone()
+        before_window = window_buf.clone()
+
+        conv_state_indices = torch.tensor([4, 1], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([3, 0], dtype=torch.int32)
+
+        causal_conv1d_update_cpu(
+            torch.randn(batch, dim, draft_token_num, dtype=dtype),
+            conv_states,
+            torch.randn(dim, width, dtype=dtype),
+            None,
+            "silu",
+            conv_state_indices,
+            intermediate_conv_window=window_buf,
+            intermediate_state_indices=intermediate_state_indices,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_parent_token=None,
+        )
+
+        untouched_states = [i for i in range(6) if i not in (4, 1)]
+        untouched_window = [i for i in range(6) if i not in (3, 0)]
+        torch.testing.assert_close(
+            conv_states[untouched_states], before_states[untouched_states]
+        )
+        torch.testing.assert_close(
+            window_buf[untouched_window], before_window[untouched_window]
+        )
+
+    def test_output_layout_allows_caller_transpose_view(self):
+        """The GDN backend does ``out.transpose(1, 2).view(seq_len, -1)``, which
+        only works if the output keeps the caller's transposed strides (the
+        Triton kernel returns ``torch.empty_like(x)``). A plain [B, D, T]
+        contiguous result raises "view size is not compatible"."""
+        from sgl_kernel.mamba import causal_conv1d_update_cpu
+
+        dtype = torch.bfloat16
+        batch, dim, draft_token_num, width = 2, 96, 8, 4
+        seq_len = batch * draft_token_num
+
+        # Exactly how gdn_backend builds the input.
+        packed = torch.randn(seq_len, dim, dtype=dtype)
+        mixed_qkv = packed.view(batch, draft_token_num, -1).transpose(1, 2)
+
+        out = causal_conv1d_update_cpu(
+            mixed_qkv,
+            torch.randn(4, dim, width - 1, dtype=dtype),
+            torch.randn(dim, width, dtype=dtype),
+            None,
+            "silu",
+            torch.zeros(batch, dtype=torch.int32),
+            intermediate_conv_window=torch.zeros(
+                4, draft_token_num, dim, width - 1, dtype=dtype
+            ),
+            intermediate_state_indices=torch.arange(batch, dtype=torch.int32),
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_parent_token=None,
+        )
+
+        self.assertEqual(out.transpose(1, 2).view(seq_len, -1).shape, (seq_len, dim))
+
+    def test_verify_matches_cpp_decode_kernel(self):
+        """Replaying the C++ decode kernel token by token is the only oracle for
+        the verify rewrite that shares no code with it."""
+        from sgl_kernel.mamba import causal_conv1d_update_cpu
+
+        torch.manual_seed(0)
+        dtype = torch.bfloat16
+        batch, dim, width, lines = 2, 128, 4, 6
+        cache_idx = torch.tensor([0, 3], dtype=torch.int32)
+
+        for draft_token_num in (1, 4):
+            with self.subTest(draft_token_num=draft_token_num):
+                x = torch.randn(batch, dim, draft_token_num, dtype=dtype)
+                base_state = torch.randn(lines, dim, width - 1, dtype=dtype)
+                weight = torch.randn(dim, width, dtype=dtype) * 0.5
+                bias = torch.randn(dim, dtype=dtype)
+
+                verify_state = base_state.clone()
+                window = torch.zeros(
+                    lines, draft_token_num, dim, width - 1, dtype=dtype
+                )
+                out = causal_conv1d_update_cpu(
+                    x,
+                    verify_state,
+                    weight,
+                    bias,
+                    "silu",
+                    cache_idx,
+                    intermediate_conv_window=window,
+                    intermediate_state_indices=torch.arange(batch, dtype=torch.int32),
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_parent_token=None,
+                )
+
+                decode_state = base_state.clone()
+                for t in range(draft_token_num):
+                    ref = causal_conv1d_update_cpu(
+                        x[:, :, t].contiguous(),
+                        decode_state,
+                        weight,
+                        bias,
+                        "silu",
+                        cache_idx,
+                    )
+                    torch.testing.assert_close(out[:, :, t], ref, rtol=5e-2, atol=5e-2)
+                    for req in range(batch):
+                        torch.testing.assert_close(
+                            window[req, t],
+                            decode_state[cache_idx[req]],
+                            rtol=5e-2,
+                            atol=5e-2,
+                        )
+                torch.testing.assert_close(
+                    verify_state, decode_state, rtol=5e-2, atol=5e-2
+                )
+
+    def test_tree_draft_is_rejected(self):
+        """The chain collapse is only valid without siblings; a real EAGLE tree
+        must not silently get chain semantics."""
+        from sgl_kernel.mamba import causal_conv1d_update_cpu
+
+        dtype = torch.bfloat16
+        batch, dim, draft_token_num, width = 1, 96, 8, 4
+
+        sibling = torch.full((batch, draft_token_num), -1)
+        sibling[0, 2] = 3
+
+        with self.assertRaises(NotImplementedError):
+            causal_conv1d_update_cpu(
+                torch.randn(batch, dim, draft_token_num, dtype=dtype),
+                torch.randn(4, dim, width - 1, dtype=dtype),
+                torch.randn(dim, width, dtype=dtype),
+                None,
+                "silu",
+                torch.zeros(batch, dtype=torch.int32),
+                intermediate_conv_window=torch.zeros(
+                    4, draft_token_num, dim, width - 1, dtype=dtype
+                ),
+                intermediate_state_indices=torch.zeros(batch, dtype=torch.int32),
+                retrieve_next_token=torch.zeros(batch, draft_token_num),
+                retrieve_next_sibling=sibling,
+                retrieve_parent_token=None,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
