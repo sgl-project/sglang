@@ -108,6 +108,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
             and self.topk == 1
         )
         self.dsa_index_topk = None
+        self.dsa_seed_topk_width = None
         self.seed_dsa_topk_from_draft_extend = False
         self.dsa_extend_topk_buf = None
 

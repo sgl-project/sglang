@@ -36,7 +36,7 @@ process. Run engine tests separately from layer tests.
 
 ```bash
 # Existing CPU mechanism regressions (no GPU).
-CUDA_VISIBLE_DEVICES="" python -m pytest -q \
+python -m pytest -q \
   test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py
 
 # Small GPU layer checks; no server or model download.
@@ -107,6 +107,14 @@ positive serial/replay regression; do not preserve the old failure expectation.
   work; an H100 check cannot establish a different GPU's conversion path.
 
 ## Coverage limits and development record
+
+After merging main `cebca698e` on 2026-09-13, all five retained GPU layer checks
+and the CPU-offload engine comparison passed again on H100, with no skips.
+The environment below was reused with `sgl-deep-gemm` 0.1.7 added as required by
+main. The engine comparison retained exact token parity and the `1e-5` logprob
+tolerance for batches 1, 3, and 3. The seven focused CPU test files covering
+startup, prefetching, GDN, and configuration migration passed 177 tests, each
+file run in its own process.
 
 On 2026-09-13, the pre-reduction revision `415412660` passed on H100 80 GB with
 PyTorch 2.13.0+cu130, FlashInfer 0.6.18, Transformers 5.12.1, and `sgl-kernel`

@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 def _fp8_linear(input_scale: float) -> nn.Module:

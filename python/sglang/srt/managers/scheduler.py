@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -290,6 +291,15 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_IDLE,
+    SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
+    SCHEDULER_STAGE_PROCESS_REQUESTS,
+    SCHEDULER_STAGE_RUN_BATCH,
+    SCHEDULER_STAGE_SANITY_CHECK_CACHE,
+    scheduler_stage_method,
+)
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -297,7 +307,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -337,7 +346,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
@@ -445,6 +453,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
+        self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog()
 
@@ -640,6 +650,7 @@ class Scheduler(
         self.init_diffusion_llm()
 
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
+        self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -670,6 +681,7 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+        self.init_dsa_kpool_truncation_align()
 
         self.init_weight_updater()
 
@@ -958,10 +970,11 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
-        config_to_check = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
+        config_to_check = self.model_config.hf_config
+        if hasattr(self.model_config.hf_config, "text_config"):
+            config_to_check = self.model_config.hf_config.text_config
+        elif hasattr(self.model_config, "hf_text_config"):
+            config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -979,7 +992,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()
         initialize_fp4_gemm_config()
-        initialize_bf16_gemm_config(self.server_args)
+        initialize_bf16_gemm_config()
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()
@@ -1093,20 +1106,42 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
-        with torch.get_device_module(model_runner.device).stream(
+        device_module = torch.get_device_module(model_runner.device)
+        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
+        forward_stream = (
             model_runner.forward_stream
-        ):
+            if self.enable_overlap or self.ps.pp_size > 1 or use_mlx()
+            else self.schedule_stream
+        )
+        with device_module.stream(forward_stream):
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
+            model_runner.post_capture_resize_kv_pool(
+                draft_runners=(
+                    self.draft_worker._draft_model_runners()
+                    if self.draft_worker is not None
+                    else ()
+                )
+            )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if startup_weight_load_active:
             self.tp_worker.finalize_startup_weight_load()
+
+        # Adaptive/speculative graphs and post-capture KV sizing can consume
+        # the headroom seen by the initial DeepGEMM layout budget. Refresh it
+        # after these allocations, before elastic EP rejoins healthy ranks
+        # that do not participate in this startup collective.
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            refresh_deep_gemm_layout_memory_budget,
+        )
+
+        refresh_deep_gemm_layout_memory_budget(model_runner, only_if_initialized=True)
 
         if (
             get_exec().moe.elastic_ep_backend is not None
@@ -1253,7 +1288,7 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
-        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -1479,6 +1514,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1525,6 +1561,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1541,6 +1578,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
+                scheduler_stage_metrics=self.scheduler_stage_metrics,
                 pp_rank=self.ps.pp_rank,
                 pp_size=self.ps.pp_size,
                 transfer_backend=self.transfer_backend,
@@ -1661,6 +1699,28 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+    def init_dsa_kpool_truncation_align(self):
+        """Kpool compress-write asserts chunked extends start on pool boundaries.
+        Use the LCM to preserve any existing deterministic-inference alignment."""
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_kpool,
+            is_deepseek_dsa,
+        )
+
+        if not is_deepseek_dsa(self.model_config.hf_config):
+            return
+
+        dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
+        if dsa_index_kpool <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = dsa_index_kpool
+        else:
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size, dsa_index_kpool
+            )
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -1761,21 +1821,6 @@ class Scheduler(
             ]
         )
 
-    def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
-        # NOTE: this should be called before a batch is launched.
-        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
-        if timeout_s <= 0:
-            return
-        if running_batch.is_empty():
-            return
-
-        deadline = time.perf_counter() - timeout_s
-        for req in running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
-                req.to_finish = FINISH_ABORT(
-                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
-                )
-
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1807,7 +1852,6 @@ class Scheduler(
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
-        Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
         # Engine init (graph capture, warmups) is done; from here on any
@@ -1818,13 +1862,13 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif is_cuda() or _is_hip:
+        elif (is_cuda() or _is_hip) and (self.enable_overlap or self.ps.pp_size > 1):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
@@ -1840,6 +1884,7 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -1863,9 +1908,9 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -1907,9 +1952,9 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -2013,7 +2058,26 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    @scheduler_nvtx_method("scheduler.process_input_requests")
+    def ingest_requests(self) -> List:
+        """Receive, broadcast and dispatch this iteration's external input.
+
+        The one place a new per-iteration input source belongs; the return
+        value exists for the pipeline stages that relay requests onward.
+        """
+        local_reqs = []
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self._poll_timeout_aborts()
+        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if recv_reqs:
+            self.metrics_reporter.record_scheduler_active()
+        self.process_input_requests(recv_reqs)
+        return recv_reqs
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2239,6 +2303,7 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2297,6 +2362,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -2660,6 +2726,8 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        if recv_req.bootstrap_port is None:
+            recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
             recv_req.session_id is not None and self.enable_session_radix_cache
@@ -2671,10 +2739,6 @@ class Scheduler(
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
-
-            if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
-                recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
@@ -2766,6 +2830,7 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                disagg_mode=self.disaggregation_mode,
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2829,30 +2894,29 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+        if req.return_sampling_mask:
+            if (
+                self.disaggregation_mode != DisaggregationMode.NULL
+                and not self.disagg_metadata_buffers.enable_sampling_mask
+            ):
+                self._reject_sampling_mask_request(
+                    req,
+                    "return_sampling_mask requires "
+                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
+                    "decode servers when using disaggregated serving.",
+                )
+                return
+            top_k = req.sampling_params.top_k
+            sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+                error_msg = (
+                    "return_sampling_mask requires top_k=1 for greedy sampling "
+                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+                    f"{top_k}. Lower top_k or increase "
+                    "--sampling-mask-max-tokens."
+                )
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -2861,9 +2925,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -2873,9 +2935,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3099,6 +3159,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3113,6 +3174,13 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
+        """Return a sampling-mask validation error without running the model."""
+        logger.error(f"{error_msg}, {req.rid=}")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3194,34 +3262,58 @@ class Scheduler(
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
-    def _abort_on_waiting_timeout(self):
-        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
-            return
+    def _poll_timeout_aborts(self) -> List[AbortReq]:
+        """Emit aborts only; every rank must drop the same requests in the
+        same iteration, or the extend-vs-decode decision splits and the
+        collectives hang.
+        """
+        aborts: List[AbortReq] = []
 
-        deleted_reqs = set()
-        deadline = time.perf_counter() - timeout_s
-        for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
-                self._release_aborted_request(req.rid)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(
-                        req,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
-                    ),
-                    req,
-                )
-                deleted_reqs.add(req)
-                self.beam_coordinator.retire_group(req)
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            for req in self.waiting_queue:
+                entry_time = req.time_stats.wait_queue_entry_time
+                if 0 < entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request waiting timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request waiting timeout reached.",
+                            },
+                        )
+                    )
 
-        if deleted_reqs:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in deleted_reqs
-            ]
+        if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            if self.ps.pp_size == 1:
+                inflight_batches = [self.running_batch, self.last_batch]
+            else:
+                inflight_batches = [*self.running_mbs, *self.mbs]
+            seen_rids = set()
+            for batch in inflight_batches:
+                if batch is None:
+                    continue
+                for req in batch.reqs:
+                    if req.rid in seen_rids or req.finished():
+                        continue
+                    seen_rids.add(req.rid)
+                    if 0 < req.time_stats.forward_entry_time < deadline:
+                        aborts.append(
+                            AbortReq(
+                                rid=req.rid,
+                                abort_message="Request running timeout reached.",
+                                finished_reason={
+                                    "type": "abort",
+                                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                    "message": "Request running timeout reached.",
+                                },
+                            )
+                        )
+
+        return aborts
 
     def handle_embedding_request(
         self,
@@ -3347,6 +3439,11 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
+                return
+            # The request moved to another scheduler queue after abort_request
+            # deferred it, so retry against its current location.
+            self._pending_chunked_abort_req = None
+            self.abort_request(AbortReq(rid=req.rid))
             return
 
         prepare_abort(req, "Aborted")
@@ -3410,7 +3507,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -3418,8 +3515,6 @@ class Scheduler(
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
-        self._abort_on_waiting_timeout()
-        self._abort_on_running_timeout(running_batch)
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3664,7 +3759,11 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        self.policy.calc_priority(
+            self.waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+        )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4108,18 +4207,23 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    @scheduler_nvtx_method("scheduler.run_batch")
+    @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -4452,7 +4556,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
-    @scheduler_nvtx_method("scheduler.process_batch_result")
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -4579,6 +4683,7 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
@@ -4591,7 +4696,9 @@ class Scheduler(
         # path spins without sleeping, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        if not self.is_fully_idle():
+        fully_idle = self.is_fully_idle()
+        if not fully_idle:
+            self.metrics_reporter.record_scheduler_active()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -4600,6 +4707,7 @@ class Scheduler(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             return
+        self.metrics_reporter.record_scheduler_idle()
 
         if self.enable_unified_memory:
             try:
@@ -4616,23 +4724,26 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
-        if not self.enable_hisparse and not deferred_pending:
-            has_leak, messages = self.invariant_checker._check_all_pools(
-                self.pool_stats_observer.get_pool_stats(),
-            )
-            if has_leak:
-                self.invariant_checker._report_leak("pool", "\n".join(messages))
-            self.invariant_checker._check_req_pool()
-            # Byte-conservation diagnostic (allocator-owned; static pools
-            # return [] — the token identity above can't see byte leaks).
-            byte_violations = self.token_to_kv_pool_allocator.verify_byte_accounting()
-            if byte_violations:
-                self.invariant_checker._report_leak(
-                    "pool-bytes", "\n".join(byte_violations)
+        with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
+            if not self.enable_hisparse and not deferred_pending:
+                has_leak, messages = self.invariant_checker._check_all_pools(
+                    self.pool_stats_observer.get_pool_stats(),
                 )
+                if has_leak:
+                    self.invariant_checker._report_leak("pool", "\n".join(messages))
+                self.invariant_checker._check_req_pool()
+                # Byte-conservation diagnostic (allocator-owned; static pools
+                # return [] — the token identity above can't see byte leaks).
+                byte_violations = (
+                    self.token_to_kv_pool_allocator.verify_byte_accounting()
+                )
+                if byte_violations:
+                    self.invariant_checker._report_leak(
+                        "pool-bytes", "\n".join(byte_violations)
+                    )
 
-        # tree cache sanity check
-        self.invariant_checker._check_tree_cache()
+            # tree cache sanity check
+            self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -4652,6 +4763,13 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        self.metrics_reporter.record_scheduler_idle()
+
+    def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.is_fully_idle():
+            self.metrics_reporter.record_scheduler_idle()
+        else:
+            self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -5086,7 +5204,11 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
-            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
+            self.ipc_channels.send_to_tokenizer.send_output(
+                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -5205,7 +5327,13 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                if recv_req.abort_message:
+                    # Timeout aborts carry an SLA message + 503 for the client.
+                    req.to_finish = FINISH_ABORT(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                else:
+                    req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

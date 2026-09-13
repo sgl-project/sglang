@@ -318,6 +318,8 @@ pub(crate) fn resolve_event_config(
         host,
         port_base: block.endpoint_port_base,
         topic: block.topic,
+        load_port_base: block.load_endpoint_port_base,
+        load_topic: block.load_topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -374,6 +376,12 @@ pub(crate) struct KvEventsBlock {
     pub endpoint_port_base: u16,
     #[serde(default)]
     pub topic: String,
+    /// Base port of the dedicated load-snapshot socket range. Absent on
+    /// workers that predate load publishing (`None` ⇒ no load subscriber).
+    #[serde(default)]
+    pub load_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    pub load_topic: Option<String>,
     pub block_size: u32,
     pub dp_size: u32,
 }

@@ -42,7 +42,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -56,6 +61,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.pool_host import HostPoolGroup
     from sglang.srt.mem_cache.unified_cache.components import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -161,18 +167,35 @@ def staged_splice_tokens(f: _StagedPrefetch, device_prefix_len: int) -> int:
 
 
 def validate_buffer_only_stack(
-    sidecar_pool_specs: list, swa_component: Optional[SWAComponent]
+    sidecar_pool_specs: list[SidecarPoolSpec],
+    host_pool_group: HostPoolGroup,
+    swa_component: Optional[SWAComponent],
 ) -> None:
     """Post-assembly buffer-mode fences.
 
-    Sidecar pools (DSv4 compressed regions) and unified_kv SWA (device-only
-    ring, never offloaded) have no per-pool staging path yet.
+    Sidecars reuse their source pool's transient slot ids, so every sidecar
+    host pool must expose the full source slot namespace.  unified_kv SWA
+    (device-only ring, never offloaded) still has no staging path.
     """
-    if sidecar_pool_specs:
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "sidecar storage pools (DeepSeek-V4 compressed regions)."
-        )
+    entry_map = host_pool_group.entry_map
+    for spec in sidecar_pool_specs:
+        source = entry_map.get(spec.indices_from_pool)
+        sidecar = entry_map.get(spec.pool_name)
+        if source is None or sidecar is None:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only sidecar pool mapping "
+                f"is incomplete: pool={spec.pool_name}, "
+                f"indices_from_pool={spec.indices_from_pool}."
+            )
+        source_size = source.host_pool.logical_size
+        sidecar_size = sidecar.host_pool.logical_size
+        if sidecar_size < source_size:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only sidecar host pool is "
+                "smaller than its index source: "
+                f"pool={spec.pool_name}, host_slots={sidecar_size}, "
+                f"source={spec.indices_from_pool}, source_slots={source_size}."
+            )
     swa = swa_component
     if swa is not None and swa._swa_kv_pool_host is None:
         # Only reachable on SWA models with the unified_kv layout (SWA as
@@ -547,6 +570,11 @@ class BufferModePipeline:
         cc = cache.cache_controller
         snapshot = intent.snapshot
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # Sidecars reuse the source pool's transient host/device indices.  This
+        # includes both KV-derived pools and SWA-derived DSV4 state pools.  They
+        # allocate no additional staging, but must ride the same D2H operation
+        # so their bytes are present when the storage write starts.
+        aux_xfers.extend(cache._build_backup_sidecar(device_value, comp_xfers))
         host_indices = cc.write(
             device_value,
             node_id=snapshot.node_id,
@@ -625,20 +653,46 @@ class BufferModePipeline:
         snapshot = intent.snapshot
         self._cache.dec_lock_ref(snapshot.node_id, entry.lock_params)
 
-        # Every aux pool writes a trailing snapshot keyed by the last KV page
-        # hashes it covers: the SWA window spans page_size-sized pages, the
-        # Mamba state is a single slot (host pool page_size 1 -> one key).
+        # Every independently staged aux pool writes a trailing snapshot keyed
+        # by the last KV page hashes it covers.  A derived sidecar writes the
+        # exact key span of its source pool while reusing that source's slots.
         storage_xfers: list[PoolTransfer] = []
+        storage_sources = {
+            PoolName.KV: PoolTransfer(
+                name=PoolName.KV,
+                host_indices=entry.host_indices,
+                keys=snapshot.hash_values,
+            )
+        }
         for staged in entry.aux_xfers:
+            if staged.indices_from_pool is not None:
+                continue
             keys = self._aux_window_keys(snapshot.hash_values, staged)
             if keys is None:
                 continue
+            transfer = PoolTransfer(
+                name=staged.name,
+                host_indices=staged.host_indices,
+                keys=keys,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+            storage_xfers.append(transfer)
+            storage_sources.setdefault(staged.name, transfer)
+        for staged in entry.aux_xfers:
+            if staged.indices_from_pool is None:
+                continue
+            source = storage_sources.get(staged.indices_from_pool)
+            if source is None:
+                raise AssertionError(
+                    "Buffer-mode storage sidecar source missing: "
+                    f"{staged.name} from {staged.indices_from_pool}."
+                )
             storage_xfers.append(
                 PoolTransfer(
                     name=staged.name,
-                    host_indices=staged.host_indices,
-                    keys=keys,
-                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    keys=source.keys,
+                    hit_policy=staged.hit_policy,
+                    indices_from_pool=staged.indices_from_pool,
                 )
             )
         operation_id = self._cache.cache_controller.write_storage(
@@ -832,6 +886,14 @@ class BufferModePipeline:
         prefix_ctx = self._prefetch_prefix_ctx.pop(req_id, None)
         prefix_tokens = prefix_ctx[0] if prefix_ctx is not None else None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # Component transfers are already present in comp_xfers.  Preserve the
+        # derived sidecars from the storage operation as well; cc.load resolves
+        # them against the freshly allocated source host/device indices.
+        aux_xfers.extend(
+            transfer
+            for transfer in operation.pool_transfers or ()
+            if transfer.indices_from_pool is not None
+        )
 
         if num_tokens == 0 or prefix_tokens is None:
             # Nothing usable fetched: recompute.

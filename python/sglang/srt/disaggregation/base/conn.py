@@ -16,14 +16,19 @@ if TYPE_CHECKING:
 
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
+    QSA_PENDING = "qsa_pending"
+    QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"
     DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
-    # DeepSeek-V4 online C128 request-scoped state.
-    C128_STATE = "c128_state"
+    # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
+    DSV4_REQUEST_STATE = "c128_state"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
@@ -71,6 +76,8 @@ class KVArgs:
     page_size: int
     # for system dp
     system_dp_rank: int
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
+    rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
@@ -87,7 +94,10 @@ class KVArgs:
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
-    total_kv_layers: int
+    hidden_kv_layers: int
+    # Only used of npu, for decode total kv layers
+    draft_kv_layers: int
+    num_draft_entries: int = 0
 
 
 class KVPoll:

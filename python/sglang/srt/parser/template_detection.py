@@ -29,7 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,15 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        name="hunyuan_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="hunyuan_effort"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("reasoning_mode_token")
+            and ctx.has_text("no_think")
+        ),
+    ),
+    DetectionRule(
         name="explicit_enable_thinking_default_false",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=False
@@ -305,6 +314,18 @@ def _is_k2_v3(ctx):
     )
 
 
+def _is_granite_thinking_parser(ctx):
+    # Nemotron-3 templates share the same <parameter= tool-call block, so it
+    # cannot discriminate; defer_loading is Granite's deferred tool loading.
+    return (
+        ctx.has_text("truncate_history_thinking")
+        and ctx.has_text("defer_loading")
+        and ctx.reasoning_config is not None
+        and ctx.reasoning_config.toggle_param == "enable_thinking"
+        and ctx.reasoning_config.default_enabled is True
+    )
+
+
 def _is_nemotron_3(ctx):
     return ctx.has_text("truncate_history_thinking") and (
         ctx.reasoning_config is not None
@@ -327,9 +348,26 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm53(ctx):
+    # GLM-5.3 keeps the GLM-4.5 prompt and tool-call format but replaces the
+    # enable_thinking toggle with an always-on "Reasoning Effort:" header.
+    return (
+        ctx.has_text("[gMASK]<sop>")
+        and ctx.has_text("Reasoning Effort:")
+        and not ctx.has_text("enable_thinking")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
+def _is_glm_family(ctx):
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
-    return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    return _is_glm_family(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
@@ -364,8 +402,16 @@ def _is_hunyuan(ctx):
     sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
         r"^<tool_sep(?::[^>]+)?>$"
     )
-    return (tc and sep) or (
-        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    return (
+        (tc and sep)
+        or (
+            tc
+            and ctx.reasoning_config
+            == ReasoningToggleConfig(special_case="hunyuan_effort")
+            and ctx.has_vocab_pattern(r"^<arg_key(?::[^>]+)?>$")
+            and ctx.has_vocab_pattern(r"^<arg_value(?::[^>]+)?>$")
+        )
+        or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
     )
 
 
@@ -468,8 +514,13 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+    DetectionRule(
+        name="granite_thinking_parser",
+        value="granite_thinking_parser",
+        predicate=_is_granite_thinking_parser,
+    ),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
@@ -509,7 +560,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
@@ -812,4 +863,4 @@ def resolve_auto_parsers(server_args) -> None:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
     if detected:
-        declare_late_resolution(server_args, "template-detection", **detected)
+        declare_resolution(server_args, "template-detection", **detected)

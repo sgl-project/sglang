@@ -55,6 +55,31 @@ class StageVerificationError(Exception):
     pass
 
 
+def record_default_workload_iterations(stage, batch) -> None:
+    """Record how often a stage's repeated unit ran, once per warmup request.
+
+    A stage whose loop length is a formula of the request's step count
+    declares it in ``default_workload_iterations``; the same formula at the
+    default workload's step count is the target. A stage that recorded
+    explicitly inside its loop (a count only known there) is left alone.
+    """
+    metrics = batch.metrics
+    if metrics is None or metrics.active_stage_name is None:
+        return
+    if metrics.active_stage_name in metrics.stage_iterations:
+        return
+    measured = stage.default_workload_iterations(batch, int(batch.num_inference_steps))
+    if measured is None:
+        return
+    target_steps = int(
+        batch.extra.get("warmup_target_num_inference_steps", batch.num_inference_steps)
+    )
+    target = stage.default_workload_iterations(batch, target_steps)
+    metrics.record_stage_iterations(
+        max(1, int(measured)), max(1, int(measured if target is None else target))
+    )
+
+
 class PipelineStage(StageDedupMixin, ABC):
     """
     Abstract base class for all pipeline stages.
@@ -162,6 +187,14 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def set_profile_stage_name(self, stage_name: str) -> None:
         self._profile_stage_name = stage_name
+
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        """How many times this stage's repeated unit runs for a request with
+        ``num_inference_steps`` steps; ``None`` means the stage is not repeated
+        (or records its count itself with ``batch.record_stage_iterations``)."""
+        return None
 
     def _component_stage_name(self, stage_name: str | None = None) -> str:
         return stage_name or self._registered_stage_name or self.__class__.__name__
@@ -383,7 +416,14 @@ class PipelineStage(StageDedupMixin, ABC):
 
         # Execute the actual stage logic with unified profiling.
         previous_batch_is_warmup = self._current_batch_is_warmup
+        metrics = batch.metrics
+        warmup_metrics = metrics if batch.is_warmup else None
+        previous_active_stage = (
+            warmup_metrics.active_stage_name if warmup_metrics is not None else None
+        )
         self._current_batch_is_warmup = batch.is_warmup
+        if warmup_metrics is not None:
+            warmup_metrics.active_stage_name = self._component_stage_name()
         try:
             with StageProfiler(
                 stage_name,
@@ -394,7 +434,11 @@ class PipelineStage(StageDedupMixin, ABC):
                 perf_dump_path_provided=batch.perf_dump_path is not None,
             ):
                 result = self.forward(batch, server_args)
+                if warmup_metrics is not None:
+                    record_default_workload_iterations(self, batch)
         finally:
+            if warmup_metrics is not None:
+                warmup_metrics.active_stage_name = previous_active_stage
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 

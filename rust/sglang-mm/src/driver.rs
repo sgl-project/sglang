@@ -8,10 +8,10 @@
 use crate::common::{self, fetch, par, token_layout};
 use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
-/// Per-request bounds: together with [`fetch::MAX_FETCH_BYTES`] they cap what
-/// one request can make the pipeline buffer.
+/// Per-request bounds. Every source consumes the aggregate budget;
+/// [`fetch::MAX_FETCH_BYTES`] additionally caps each remote I/O stream.
 pub const MAX_ITEMS_PER_REQUEST: usize = 64;
-pub const MAX_REQUEST_BYTES: u64 = 256 << 20;
+pub const MAX_REQUEST_BYTES: u64 = 1280 << 20;
 
 /// One raw image source from the request.
 #[derive(Debug)]
@@ -59,6 +59,16 @@ fn resolve(source: &ImageSource) -> Result<std::borrow::Cow<'_, [u8]>, String> {
     }
 }
 
+fn add_media_bytes(total: u64, next: usize) -> Result<u64, String> {
+    let total = total.saturating_add(next as u64);
+    if total > MAX_REQUEST_BYTES {
+        return Err(format!(
+            "multimodal request exceeds {MAX_REQUEST_BYTES} total media bytes"
+        ));
+    }
+    Ok(total)
+}
+
 /// Run one request through the pipeline. Any `Err` rejects the request back
 /// to the client — including inputs merely outside the pipeline's scope
 /// (video/audio, precomputed features, undecodable images), since there is
@@ -85,12 +95,7 @@ pub fn process(
     let mut total: u64 = 0;
     for source in &input.images {
         let bytes = resolve(source)?;
-        total += bytes.len() as u64;
-        if total > MAX_REQUEST_BYTES {
-            return Err(format!(
-                "multimodal request exceeds {MAX_REQUEST_BYTES} total media bytes"
-            ));
-        }
+        total = add_media_bytes(total, bytes.len())?;
         fetched.push(bytes);
     }
     let processed: Vec<(ProcessedItem, u64)> =
@@ -240,18 +245,8 @@ mod tests {
             .unwrap();
         assert!(err.contains("media items"), "{err}");
 
-        let chunk = (MAX_REQUEST_BYTES / 2 + 1) as usize;
-        let too_big = MmInput {
-            text: None,
-            input_ids: Some(vec![1, 1]),
-            images: vec![
-                ImageSource::Bytes(vec![0; chunk]),
-                ImageSource::Bytes(vec![0; chunk]),
-            ],
-        };
-        let err = process(family.as_ref(), too_big, |_| unreachable!())
-            .err()
-            .unwrap();
+        let err = add_media_bytes(MAX_REQUEST_BYTES / 2, (MAX_REQUEST_BYTES / 2 + 1) as usize)
+            .unwrap_err();
         assert!(err.contains("total media bytes"), "{err}");
     }
 

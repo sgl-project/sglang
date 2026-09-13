@@ -22,7 +22,7 @@ from sglang.srt.utils.invariants import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 # "test." namespace so the coverage meta-test isolates these from real invariants.

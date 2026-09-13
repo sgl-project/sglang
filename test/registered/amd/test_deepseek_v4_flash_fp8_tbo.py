@@ -105,7 +105,7 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
             "fp8_e4m3",
             "--max-running-requests",
             "512",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "512",
             "--page-size",
             "256",

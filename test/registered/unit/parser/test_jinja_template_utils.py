@@ -11,7 +11,7 @@ from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
@@ -29,7 +29,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         select_template = (
             "{{ messages | selectattr('tool_call_id', 'equalto', 'call-a') | list }}"
         )
-
         self.assertTrue(jinja_template_may_reorder_tool_results(attribute_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(item_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(get_template))
