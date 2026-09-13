@@ -48,6 +48,11 @@ on:
         required: false
         default: 'main'
         type: string
+      publish:
+        description: 'Publish the generated GT to sgl-project/ci-data-diffusion. false only uploads the run artifacts, which needs no GH_PAT_FOR_NIGHTLY_CI_DATA.'
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
@@ -73,6 +78,7 @@ jobs:
       case-count: ${{ steps.compute.outputs.case-count }}
     steps:
       - name: Verify write access to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -307,7 +313,7 @@ jobs:
 
       - name: Validate generated GT images
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
@@ -315,6 +321,7 @@ jobs:
             --check-only
 
       - name: Publish official GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -347,6 +354,7 @@ jobs:
           python-version: '3.10'
 
       - name: Verify write access to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -427,7 +435,7 @@ jobs:
 
       - name: Validate generated GT images
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
@@ -435,6 +443,7 @@ jobs:
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -504,7 +513,7 @@ jobs:
 
       - name: Validate generated GT images
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
@@ -512,6 +521,7 @@ jobs:
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -579,7 +589,7 @@ jobs:
 
       - name: Validate generated GT images
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
@@ -587,6 +597,7 @@ jobs:
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
