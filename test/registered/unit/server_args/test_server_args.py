@@ -789,11 +789,11 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
-            disaggregation_transfer_backend="mori",
+            disaggregation_transfer_backend="ascend",
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+            ValueError, "mooncake, nixl, mori, or fake for synthetic benchmarking"
         ):
             handle_pd_disaggregation(server_args)
 
