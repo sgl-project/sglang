@@ -329,6 +329,18 @@ class SchedulerMultiplexMixin:
         """
         self.process_batch_result(batch, prefill_result)
 
+        if all_segments_run:
+            assert batch.split_prefill_finished
+            # The persistent ForwardBatch owns the token inputs, intermediate
+            # mHC hidden state and DSpark auxiliary captures across segments.
+            # Release it before this ScheduleBatch can become the long-lived
+            # decode batch; otherwise those prefill activations remain pinned
+            # for the lifetime of the running batch and eventually cause OOM.
+            batch.split_forward_batch = None
+            batch.split_index = 0
+            batch.split_forward_count = 1
+            batch.split_prefill_finished = False
+
         # Mirror get_next_batch_to_run's chunked bookkeeping: a request that
         # only finished a middle chunk must stay out of the decode batch, and
         # its chunk KV must be stashed so the next chunk extends the cached
@@ -345,8 +357,6 @@ class SchedulerMultiplexMixin:
                 # it is only legal once every split segment has run. A standard
                 # prefill has no segments -- its single forward has already
                 # completed by the time this runs.
-                if all_segments_run:
-                    assert batch.split_prefill_finished
                 self.stash_chunked_request(self.chunked_req)
         if batch.chunked_req is not None:
             chunked_req_to_exclude.add(batch.chunked_req)

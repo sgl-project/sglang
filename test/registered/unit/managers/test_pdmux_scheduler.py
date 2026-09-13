@@ -542,6 +542,43 @@ class TestPDMuxScheduler(unittest.TestCase):
         self.assertIs(scheduler.running_batch, running_batch)
         self.assertIsNone(scheduler.split_prefill_batch)
 
+    def test_finished_prefill_releases_persistent_forward_batch(self):
+        split_forward_batch = object()
+        split_batch = Mock()
+        split_batch.chunked_req = None
+        split_batch.split_forward_batch = split_forward_batch
+        split_batch.split_index = 61
+        split_batch.split_forward_count = 4
+        split_batch.split_prefill_finished = True
+        split_batch.batch_size.side_effect = [1, 1]
+        split_batch.is_empty.return_value = False
+        running_batch = Mock()
+        running_batch.is_empty.return_value = True
+        running_batch.batch_is_full = True
+        prefill_stream, decode_stream, merge_done = self._make_merge_streams([])
+        scheduler = SimpleNamespace(
+            running_batch=running_batch,
+            split_prefill_batch=split_batch,
+            chunked_req=None,
+            process_batch_result=Mock(),
+        )
+
+        returned = SchedulerMultiplexMixin._merge_finished_prefill_batch(
+            scheduler,
+            prefill_result=object(),
+            prefill_stream=prefill_stream,
+            decode_stream=decode_stream,
+            running_batch=running_batch,
+        )
+
+        self.assertIs(returned, split_batch)
+        self.assertIsNone(split_batch.split_forward_batch)
+        self.assertEqual(split_batch.split_index, 0)
+        self.assertEqual(split_batch.split_forward_count, 1)
+        self.assertFalse(split_batch.split_prefill_finished)
+        self.assertIsNone(scheduler.split_prefill_batch)
+        decode_stream.wait_event.assert_called_once_with(merge_done)
+
     def test_merge_excludes_and_stashes_unfinished_chunked_request(self):
         """A request that only finished a middle chunk must be stashed and
         kept out of the decode batch; merging it would start decoding with a
