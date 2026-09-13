@@ -42,6 +42,14 @@ def expert_update_session(old, new):
     owner = get_nccl_ep_graph_resources()
     session = owner.submission_session("eplb") if owner is not None else nullcontext()
     with session:
+        from sglang.srt.runtime_context import get_resources
+
+        if any(
+            (state := get_resources().buffers.get(key)) is not None
+            and state.borrower is not None
+            for key in ("nccl_ep_state", "nccl_ep_state_1")
+        ):
+            raise RuntimeError("NCCL EP EPLB requires a completed EP transaction")
         if owner is not None:
             if owner.borrower is not None or owner.capturing:
                 raise RuntimeError("NCCL EP EPLB requires a completed EP transaction")

@@ -434,12 +434,15 @@ class TboDPAttentionPreparer:
                 token_num_per_seq=token_num_per_seq,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
+            # NCCL EP bounds chunked prefill to its LL token budget at setup.
+            # It can use the staged path without DeepEP's normal-mode adapter.
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
                 (
                     local_batch.forward_mode.is_extend()
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_a2a_moe
+                and not get_moe_a2a_backend().is_nccl_ep()
                 and (resolved_deepep_mode.is_low_latency())
             )
         else:
@@ -1092,6 +1095,13 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nccl_ep():
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+            self._inners = [
+                NcclEpDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
 
     @property

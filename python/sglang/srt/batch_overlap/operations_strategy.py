@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
@@ -104,7 +105,7 @@ def _compute_moe_deepseek_blog_prefill(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = None
-    if not _is_hip:
+    if not _is_hip and not get_moe_a2a_backend().is_nccl_ep():
         deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
 
     return OperationsStrategy(

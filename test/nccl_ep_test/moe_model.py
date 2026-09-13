@@ -19,8 +19,10 @@ class RoutedExperts(torch.nn.Module):
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, config)
 
     def forward(self, hidden_states, topk_output):
-        dispatched = self.dispatcher.dispatch(hidden_states, topk_output)
-        return self.dispatcher.combine(self.run_moe_core(dispatched))
+        dispatched = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        return self.dispatcher.combine(combine_input=self.run_moe_core(dispatched))
 
     def run_moe_core(self, dispatch_output):
         return self.runner.run(dispatch_output, self.quant)
@@ -52,7 +54,11 @@ def make_moe(
     model.is_nextn = False
     model.num_fused_shared_experts = 0
     model.layer_id = config.layer_id
-    model.ep_size = dispatcher.world_size
+    model.ep_size = (
+        dispatcher._inners[0].world_size
+        if hasattr(dispatcher, "_inners")
+        else dispatcher.world_size
+    )
     model.routed_scaling_factor = scale
     model.gate = lambda x, **kwargs: torch.zeros(
         len(x), config.num_experts, device=x.device

@@ -124,6 +124,44 @@ Local tests replace EP with a narrow external-library double. They verify
 ordering and numerical equivalence, not communication overlap or speedup.
 Profile the native gate on the target GPUs to measure the overlap benefit.
 
+For TBO, run the local staged executor, per-subbatch resource ownership, real
+Triton/shared-MLP and Graph tests:
+
+```bash
+PYTHONPATH=python:test python -m pytest -q \
+  test/registered/unit/layers/moe/test_nccl_ep_tbo.py
+```
+
+The tests use production split/pad/merge helpers and decode/prefill operation
+strategies with identity attention fixtures. They include non-LIFO completion,
+unequal/empty children, dynamic routing, EPLB/SBO composition and the decode
+runner's TBO input-count updates. They do not load a complete serving model.
+
+On the SM90+ pair, add `--tbo` to the EPLB gate. It uses two separate LL groups
+for the staged subbatches, real shared and routed experts, received-count and
+output oracles, eager decode/prefill interleaving and persistent decode Graphs:
+
+```bash
+timeout 15m torchrun --standalone --nproc-per-node=2 \
+  --module nccl_ep_test.eplb_pair --tbo \
+  --replays 100 --generations 2 --report-dir "$NCCL_EP_REPORT_DIR/eplb-tbo"
+```
+
+Repeat with `--sbo --tbo` for the combined configuration. Run Nsight separately
+from timing; for example:
+
+```bash
+nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none \
+  -o "$NCCL_EP_REPORT_DIR/eplb-tbo-trace" \
+  timeout 15m torchrun --standalone --nproc-per-node=2 \
+  --module nccl_ep_test.eplb_pair --tbo \
+  --replays 8 --generations 1 --report-dir "$NCCL_EP_REPORT_DIR/eplb-tbo-profile"
+```
+
+This correctness gate includes oracle checks and EPLB migration between replays;
+its wall time is not a serving throughput benchmark. Native results for the
+EPLB/SBO/TBO extensions have not yet been recorded.
+
 ## Matched measurement and profiling
 
 Run measurement after correctness passes. Keep JIT/debug logging and profiling

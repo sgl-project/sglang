@@ -122,10 +122,17 @@ def test_pp_dynamic_chunk_growth_is_rejected(model_path, supported_gpu):
         server_args(model_path, pp_size=2, enable_dynamic_chunking=True)
 
 
-@pytest.mark.parametrize("overlap", ["enable_two_batch_overlap"])
-def test_non_triton_overlap_is_rejected(model_path, supported_gpu, overlap):
-    with pytest.raises(ValueError, match="NCCL EP.*overlap"):
-        server_args(model_path, moe_runner_backend="deep_gemm", **{overlap: True})
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("runner", ["triton", "deep_gemm"])
+def test_tbo_public_configuration(model_path, supported_gpu, graph, runner):
+    args = server_args(
+        model_path,
+        moe_runner_backend=runner,
+        enable_two_batch_overlap=True,
+        enable_nccl_ep_cuda_graph=graph,
+    )
+    assert args.enable_two_batch_overlap
+    assert args.moe_a2a_backend == "nccl_ep"
 
 
 def test_triton_unavailable_fallback_uses_standard_dispatch(model_path, monkeypatch):

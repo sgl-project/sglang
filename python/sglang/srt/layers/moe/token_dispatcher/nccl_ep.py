@@ -149,21 +149,26 @@ def _load_nccl_ep():
 class NcclEpBuffer:
     """Process-wide NCCL EP group + static recv buffers (mirrors DeepEPBuffer).
 
-    State lives on ``ctx.resources.buffers["nccl_ep_state"]``; the group is
-    created once from the sglang EP group's ``ncclComm_t``.
+    State lives on ``ctx.resources.buffers["nccl_ep_state"]`` (and
+    ``nccl_ep_state_1`` for TBO's second subbatch). Each group is created once
+    from the SGLang EP group's ``ncclComm_t``.
     """
 
     @classmethod
-    def _state(cls):
+    def _state(cls, instance_id=0):
         from types import SimpleNamespace
 
         from sglang.srt.runtime_context import get_resources
 
+        if instance_id not in (0, 1):
+            raise ValueError("NCCL EP supports two TBO subbatches")
         buffers = get_resources().buffers
-        state = buffers.get("nccl_ep_state")
+        key = "nccl_ep_state" if instance_id == 0 else "nccl_ep_state_1"
+        state = buffers.get(key)
         if state is None:
             state = SimpleNamespace(
                 group=None,
+                borrower=None,
                 configuration=None,
                 num_experts=None,
                 num_local_experts=None,
@@ -177,7 +182,7 @@ class NcclEpBuffer:
                 recv_total=None,
                 combined=None,
             )
-            buffers["nccl_ep_state"] = state
+            buffers[key] = state
         return state
 
     @classmethod
@@ -188,8 +193,9 @@ class NcclEpBuffer:
         num_experts: int,
         num_local_experts: int,
         max_dispatch_tokens_per_rank: int,
+        instance_id: int = 0,
     ) -> NcclEpBuffer:
-        state = cls._state()
+        state = cls._state(instance_id)
         pynccl = ep_group.pynccl_comm
         if pynccl is None or not getattr(pynccl, "available", False):
             raise RuntimeError("NCCL EP requires a live PyNccl communicator")
@@ -337,11 +343,19 @@ class NcclEpBuffer:
 
     @classmethod
     def destroy(cls):
-        state = cls._state()
-        g = state.group
-        if g is not None:
-            g.destroy()
-            state.group = None
+        from sglang.srt.runtime_context import get_resources
+
+        states = [
+            get_resources().buffers[key]
+            for key in ("nccl_ep_state", "nccl_ep_state_1")
+            if key in get_resources().buffers
+        ]
+        if any(state.borrower is not None for state in states):
+            raise RuntimeError("NCCL EP eager group has an incomplete transaction")
+        for state in states:
+            if state.group is not None:
+                state.group.destroy()
+                state.group = None
 
 
 # ----------------------------- Dispatcher (LL path) -----------------------------
@@ -363,8 +377,17 @@ class NcclEpDispatcher(BaseDispatcher):
     after dispatch to feed ``apply_deepep_ll``.
     """
 
-    def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
+    def __init__(
+        self,
+        moe_runner_config: MoeRunnerConfig,
+        ep_group: GroupCoordinator,
+        *,
+        instance_id: int | None = None,
+    ):
         super().__init__()
+        if instance_id not in (None, 0, 1):
+            raise ValueError("NCCL EP supports two TBO subbatches")
+        self.instance_id = instance_id
         if moe_runner_config.params_dtype != torch.bfloat16:
             raise ValueError(
                 "NCCL EP LL requires bfloat16 parameters (--dtype bfloat16)"
@@ -427,6 +450,7 @@ class NcclEpDispatcher(BaseDispatcher):
             self.num_experts,
             self.num_local_experts,
             self.num_max_dispatch_tokens_per_rank,
+            instance_id=instance_id or 0,
         )
 
         self.handle = None
@@ -505,20 +529,28 @@ class NcclEpDispatcher(BaseDispatcher):
             )
             self._graph_resources = graph_owner
         else:
+            state = self.buffer
+            if state.borrower is not None:
+                raise RuntimeError("NCCL EP eager group has an incomplete transaction")
             if owner is not None:
-                session = owner.submission_session("transaction")
-                session.__enter__()
-                self._eager_session = session
+                if self.instance_id is not None:
+                    # TBO transactions finish in non-LIFO order. The runner's
+                    # outer eager session owns submission ordering for both.
+                    owner.require_session("eager")
+                else:
+                    session = owner.submission_session("transaction")
+                    session.__enter__()
+                    self._eager_session = session
             try:
                 if self.handle is not None:
                     self.handle.destroy()
-                state = self.buffer
                 handle = state.group.create_handle(
                     layout=nccl_ep.Layout.EXPERT_MAJOR,
                     topk_idx=nccl_ep.Tensor(topk_ids),
                     config=nccl_ep.HandleConfig(),
                     stream=stream.cuda_stream,
                 )
+                state.borrower = self
             except BaseException:
                 if self._eager_session is not None:
                     self._eager_session.__exit__(None, None, None)
@@ -670,7 +702,12 @@ class NcclEpDispatcher(BaseDispatcher):
             self._graph_resources.release(self)
             self._graph_resources = None
         else:
+            # A later staged layer can reuse this lane before op_output consumes
+            # the result. Preserve the output beyond the communication lease.
+            if self.instance_id is not None:
+                combined = combined.clone()
             self.handle.destroy()
+            self._active_buffer.borrower = None
             if self._eager_session is not None:
                 self._eager_session.__exit__(None, None, None)
                 self._eager_session = None

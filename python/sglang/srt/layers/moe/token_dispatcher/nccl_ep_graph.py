@@ -1,7 +1,8 @@
 """Generation-owned LL resources for serialized full decode CUDA Graphs.
 
-One handle owns a group's mutable communication state across all compatible
-layers and buckets. This is an ownership policy, not an API handle-count limit.
+Each in-flight subbatch owns a separate group and handle. Compatible layers
+and buckets reuse the resources of their subbatch serially. This is an
+ownership policy, not an API handle-count limit.
 """
 
 from __future__ import annotations
@@ -21,12 +22,8 @@ class NcclEpGraphResources:
             raise ValueError("NCCL EP Graph capacity must be in [1, 1024]")
         self.capacity = capacity
         self.shutdown = shutdown
-        self.state = None
-        self.handle = None
-        self.borrower = None
+        self._lanes = {}
         self.capturing = False
-        self.signature = None
-        self.rows = None
         self._lock = RLock()
         self._sessions = []
         self._last_stream = None
@@ -80,7 +77,10 @@ class NcclEpGraphResources:
                     # Recapture uses a child stream inside execute's replay
                     # session. Order it back before the parent's input writes.
                     self._order_stream(self._sessions[-1][1])
-                elif self.state is None and get_nccl_ep_graph_resources() is self:
+                elif (
+                    not any(lane.state is not None for lane in self._lanes.values())
+                    and get_nccl_ep_graph_resources() is self
+                ):
                     get_resources().buffers.pop("nccl_ep_graph_resources")
                 if not self._sessions:
                     self._session_thread = None
@@ -99,11 +99,70 @@ class NcclEpGraphResources:
             finally:
                 self.capturing = False
 
+    def lane(self, index):
+        if index not in (0, 1):
+            raise ValueError("NCCL EP supports two TBO subbatches")
+        if index not in self._lanes:
+            self._lanes[index] = _NcclEpGraphLane(self)
+        return self._lanes[index]
+
+    @property
+    def state(self):
+        return self.lane(0).state
+
+    @property
+    def handle(self):
+        return self.lane(0).handle
+
+    @property
+    def borrower(self):
+        return next(
+            (
+                lane.borrower
+                for lane in self._lanes.values()
+                if lane.borrower is not None
+            ),
+            None,
+        )
+
+    def prepare(self, dispatcher, x, ids, weights):
+        self.require_session("capture")
+        index = dispatcher.instance_id or 0
+        # Create both groups collectively, in identical order on every rank,
+        # before either subbatch can submit communication during warmup.
+        if dispatcher.instance_id is not None:
+            for lane_index in (0, 1):
+                lane = self.lane(lane_index)
+                if lane.state is None:
+                    lane.prepare(dispatcher, x, ids, weights)
+                    lane.release(dispatcher)
+        return self.lane(index).prepare(dispatcher, x, ids, weights)
+
+    def release(self, dispatcher):
+        self.lane(dispatcher.instance_id or 0).release(dispatcher)
+
+    def close(self):
+        # Preflight every lane before releasing any generation-owned state.
+        if self.borrower is not None:
+            raise RuntimeError("NCCL EP Graph has an incomplete transaction")
+        for lane in self._lanes.values():
+            lane.close()
+        if not self._sessions and get_nccl_ep_graph_resources() is self:
+            get_resources().buffers.pop("nccl_ep_graph_resources")
+
+
+class _NcclEpGraphLane:
+    def __init__(self, owner):
+        self.owner = owner
+        self.capacity = owner.capacity
+        self.state = self.handle = self.borrower = None
+        self.signature = self.rows = None
+
     def prepare(self, dispatcher, x, ids, weights):
         from .nccl_ep import NcclEpBuffer, _load_nccl_ep
 
-        self.require_session("capture")
-        if not self.capturing or self.borrower is not None:
+        self.owner.require_session("capture")
+        if not self.owner.capturing or self.borrower is not None:
             raise RuntimeError("NCCL EP Graph requires complete serial transactions")
         t = x.shape[0]
         if not 0 < t <= self.capacity:
@@ -213,8 +272,6 @@ class NcclEpGraphResources:
         if self.state is not None and self.state.group is not None:
             self.state.group.destroy()
         self.state = self.signature = self.rows = None
-        if not self._sessions and get_nccl_ep_graph_resources() is self:
-            get_resources().buffers.pop("nccl_ep_graph_resources")
 
 
 def get_nccl_ep_graph_resources():
@@ -237,8 +294,11 @@ def destroy_nccl_ep_resources():
     owner = get_nccl_ep_graph_resources()
     if owner is not None:
         owner.shutdown()
-    state = get_resources().buffers.get("nccl_ep_state")
-    if state is not None and state.group is not None:
+    if any(
+        (state := get_resources().buffers.get(key)) is not None
+        and state.group is not None
+        for key in ("nccl_ep_state", "nccl_ep_state_1")
+    ):
         from .nccl_ep import NcclEpBuffer
 
         torch.cuda.synchronize()

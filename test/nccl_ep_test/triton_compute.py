@@ -13,6 +13,8 @@ def configure_compute(*, graph_enabled=False, dispatch_algorithm=None):
 
     @dataclass
     class ComputeConfig:
+        device: Annotated[str, NS("device")] = "cuda"
+        moe_dense_tp_size: Annotated[int, NS("parallel")] = 1
         ep_dispatch_algorithm: Annotated[str | None, NS("exec.moe")] = (
             dispatch_algorithm
         )

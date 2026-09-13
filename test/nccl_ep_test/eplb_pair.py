@@ -23,10 +23,12 @@ from .oracle import RoutingBatch
 from .pair_followups import expected_output
 from .sglang_graph import backend_for, close_runtime
 from .shared_compute import make_shared_mlp
+from .tbo_model import forward_tbo
 from .triton_compute import configure_compute, make_compute_fixture
 
 
-def exercise(*, replays=100, generations=2, sbo=False):
+def exercise(*, replays=100, generations=2, sbo=False, tbo=False):
+    from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
     from sglang.srt.eplb.expert_distribution import ExpertDistributionRecorder
     from sglang.srt.eplb.expert_location_dispatch import (
         ExpertLocationDispatchInfo,
@@ -39,6 +41,7 @@ def exercise(*, replays=100, generations=2, sbo=False):
         nccl_ep_eager_session,
     )
     from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.runtime_context import get_flags, get_resources
 
@@ -48,6 +51,7 @@ def exercise(*, replays=100, generations=2, sbo=False):
     )
     configure_compute(graph_enabled=True, dispatch_algorithm="static")
     get_flags().moe.sbo_enabled = sbo
+    get_flags().moe.tbo_enabled = tbo
     layouts = [[0, 1, 2, 3, 0, 1], [3, 0, 0, 1, 2, 3], [1, 2, 3, 0, 1, 2]]
     old = metadata([layouts[0]] * 2, ep_size=2, rank=rank)
     get_resources().expert_location_metadata = old
@@ -105,30 +109,40 @@ def exercise(*, replays=100, generations=2, sbo=False):
         "sglang.srt.layers.linear.get_tp_group", return_value=coordinator
     ), EpAudit() as audit:
         dispatchers = [
-            NcclEpDispatcher(replace(config, layer_id=layer), coordinator)
+            (MaybeTboDeepEPDispatcher if tbo else NcclEpDispatcher)(
+                moe_runner_config=replace(config, layer_id=layer), ep_group=coordinator
+            )
             for layer in range(2)
         ]
-        shared = make_shared_mlp(hidden=2048) if sbo else None
+        shared = make_shared_mlp(hidden=2048) if sbo or tbo else None
 
         class Router:
+            start = 0
+
+            def set_subbatch(self, index, bounds):
+                self.start = bounds[0]
+
             def __call__(
                 self,
-                tokens,
-                logits,
+                hidden_states,
+                router_logits,
                 *,
                 expert_location_dispatch_info,
                 num_token_non_padded,
             ):
                 ids = topk_ids_logical_to_physical(
-                    logical_ids[: len(tokens)], expert_location_dispatch_info
+                    logical_ids[self.start : self.start + len(hidden_states)],
+                    expert_location_dispatch_info,
                 )
                 ids = torch.where(
-                    torch.arange(len(tokens), device="cuda")[:, None]
+                    torch.arange(len(hidden_states), device="cuda")[:, None]
                     < num_token_non_padded,
                     ids,
                     -1,
                 )
-                return StandardTopKOutput(factors[: len(tokens)], ids, None)
+                return StandardTopKOutput(
+                    factors[self.start : self.start + len(hidden_states)], ids, None
+                )
 
             def empty_topk_output(self, device, **kwargs):
                 return StandardTopKOutput(factors[:0], logical_ids[:0], None)
@@ -142,18 +156,18 @@ def exercise(*, replays=100, generations=2, sbo=False):
                     shared,
                     Router(),
                     scale=1.0,
-                    sbo=True,
+                    sbo=sbo,
                 )
                 for layer, dispatcher in enumerate(dispatchers)
             ]
-            if sbo
+            if sbo or tbo
             else []
         )
 
-        def forward(bucket):
+        def forward(bucket, mode=ForwardMode.DECODE):
             outputs = []
             for layer, dispatcher in enumerate(dispatchers):
-                if sbo:
+                if sbo or tbo:
                     # Native harness compares complete padded buckets. Zero the
                     # shared-MLP input on inactive rows, whose results serving
                     # would normally slice away after replay.
@@ -162,12 +176,28 @@ def exercise(*, replays=100, generations=2, sbo=False):
                         x[:bucket],
                         0,
                     )
-                    with recorder.with_current_layer(layer):
+                    if tbo:
+                        split = bucket // 2
+                        child_counts = torch.stack(
+                            (active.clamp(max=split), (active - split).clamp(min=0))
+                        )
                         outputs.append(
-                            models[layer].forward_deepep(
-                                tokens, SimpleNamespace(num_token_non_padded=active)
+                            forward_tbo(
+                                [models[layer]],
+                                tokens,
+                                split=split,
+                                padded=(split, bucket - split),
+                                counts=child_counts,
+                                mode=mode,
                             )
                         )
+                    else:
+                        with recorder.with_current_layer(layer):
+                            outputs.append(
+                                models[layer].forward_deepep(
+                                    tokens, SimpleNamespace(num_token_non_padded=active)
+                                )
+                            )
                     continue
                 ids = topk_ids_logical_to_physical(logical_ids[:bucket], infos[layer])
                 ids = torch.where(
@@ -254,7 +284,7 @@ def exercise(*, replays=100, generations=2, sbo=False):
                     batch,
                     rank,
                     global_quant,
-                    shared if sbo else lambda tokens: torch.zeros_like(tokens),
+                    shared if sbo or tbo else lambda tokens: torch.zeros_like(tokens),
                     1.0,
                     compute_backend="triton",
                 )
@@ -289,6 +319,16 @@ def exercise(*, replays=100, generations=2, sbo=False):
                         rtol=0.02,
                         atol=0.02,
                     )
+                if tbo:
+                    with nccl_ep_eager_session():
+                        prefill = forward(counts[rank], mode=ForwardMode.EXTEND)
+                    for output in prefill:
+                        torch.testing.assert_close(
+                            output.cpu().float(),
+                            expected[: counts[rank]],
+                            rtol=0.02,
+                            atol=0.02,
+                        )
                 checked += 1
             backend.cleanup()
         dist.barrier()
@@ -298,6 +338,7 @@ def exercise(*, replays=100, generations=2, sbo=False):
         checked=checked,
         generations=generations,
         sbo=sbo,
+        tbo=tbo,
         bindings=bindings,
         closure=closure,
     )
@@ -313,18 +354,28 @@ def main():
         help="Also run real DeepSeek shared-expert/dispatch overlap",
     )
     parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument(
+        "--tbo",
+        action="store_true",
+        help="Exercise two independent LL groups with staged subbatch execution",
+    )
     args = parser.parse_args()
     if args.replays < 4 or args.generations < 1:
         parser.error("use at least four replays and one generation")
     try:
         report = exercise(
-            replays=args.replays, generations=args.generations, sbo=args.sbo
+            replays=args.replays,
+            generations=args.generations,
+            sbo=args.sbo,
+            tbo=args.tbo,
         )
     except Unavailable as error:
         print(f"SKIP: {error}")
         raise SystemExit(77)
     args.report_dir.mkdir(parents=True, exist_ok=True)
     mode = "eplb-sbo" if args.sbo else "eplb"
+    if args.tbo:
+        mode += "-tbo"
     path = args.report_dir / f"{mode}-rank{report['rank']}.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
     print(path)

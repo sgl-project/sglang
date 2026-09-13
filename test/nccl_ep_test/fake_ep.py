@@ -241,7 +241,7 @@ def dispatcher_environment(*, capacity=32):
         )
         importlib.reload(module)
 
-        def dispatcher(*, layer_id):
+        def dispatcher(*, layer_id, instance_id=None):
             return module.NcclEpDispatcher(
                 MoeRunnerConfig(
                     num_experts=2,
@@ -252,6 +252,7 @@ def dispatcher_environment(*, capacity=32):
                     layer_id=layer_id,
                 ),
                 coordinator,
+                instance_id=instance_id,
             )
 
         library.dispatcher = dispatcher
@@ -262,6 +263,7 @@ def dispatcher_environment(*, capacity=32):
             torch.cuda.synchronize()
             module.NcclEpBuffer.destroy()
             get_resources().buffers.pop("nccl_ep_state", None)
+            get_resources().buffers.pop("nccl_ep_state_1", None)
             # Restore the import cache while the module remains importable.
             importlib.reload(module)
     assert all(group.destroyed for group in library.groups), "Unclosed fake EP group"

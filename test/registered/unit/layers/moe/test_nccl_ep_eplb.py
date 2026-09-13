@@ -79,7 +79,10 @@ def test_topology_change_rejected_before_any_weight_write(monkeypatch, change):
     )
 
 
-def test_relocation_rejects_incomplete_or_overlapping_graph_submission(monkeypatch):
+@pytest.mark.parametrize("lane_index", [0, 1])
+def test_relocation_rejects_incomplete_or_overlapping_graph_submission(
+    monkeypatch, lane_index
+):
     from sglang.srt.eplb.nccl_ep import expert_update_session
     from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
         NcclEpGraphResources,
@@ -88,11 +91,11 @@ def test_relocation_rejects_incomplete_or_overlapping_graph_submission(monkeypat
     owner = NcclEpGraphResources(8, shutdown=lambda: None)
     monkeypatch.setitem(get_resources().buffers, "nccl_ep_graph_resources", owner)
     old, new = metadata([[0, 1]]), metadata([[1, 0]])
-    owner.borrower = object()
+    owner.lane(lane_index).borrower = object()
     with pytest.raises(RuntimeError, match="completed EP transaction"):
         with expert_update_session(old, new):
             pytest.fail("Updated an incomplete transaction")
-    owner.borrower = None
+    owner.lane(lane_index).borrower = None
     # An uninitialized owner is removed when its last session exits.
     monkeypatch.setitem(get_resources().buffers, "nccl_ep_graph_resources", owner)
     with owner.submission_session("replay"):
