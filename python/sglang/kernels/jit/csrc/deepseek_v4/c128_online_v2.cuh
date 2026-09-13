@@ -682,7 +682,10 @@ inline std::tuple<uint32_t, uint32_t> _plan_prefill_partial(const OnlinePrefillS
   for (const auto i : irange(p.batch_size)) {
     const uint32_t seq_len = static_cast<uint32_t>(p.seq_lens[i]);
     const uint32_t extend_len = static_cast<uint32_t>(p.extend_lens[i]);
-    RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+    RuntimeCheck(extend_len <= seq_len, "extend_len ", extend_len, " exceeds seq_len ", seq_len, " at batch row ", i);
+    // Ragged CUDA-graph replay can pad the request dimension with empty rows.
+    // They own no query tokens and must not produce a state-pool plan.
+    if (extend_len == 0) continue;
     const uint32_t prefix_len = seq_len - extend_len;
     const uint32_t end_pos = prefix_len + extend_len;
 
