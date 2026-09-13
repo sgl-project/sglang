@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
+    supports_swa_byte_budget,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -640,12 +640,7 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
-        self.is_unified_swa = (
-            isinstance(
-                self.token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator
-            )
-            and self.token_to_kv_pool_allocator.supports_asymmetric_reservation
-        )
+        self.is_unified_swa = supports_swa_byte_budget(self.token_to_kv_pool_allocator)
 
         self.rem_swa_token_offset = (
             num_mixed_decode_tokens if self.is_unified_swa else 0
@@ -856,8 +851,6 @@ class PrefillAdder:
         *,
         empty_pool: bool = False,
     ) -> bool:
-        if not self.is_unified_swa:
-            return True
         allocator = self.token_to_kv_pool_allocator
         if empty_pool:
             full_evictable_tokens = 0
@@ -876,36 +869,14 @@ class PrefillAdder:
             require_token_slack=empty_pool,
         )
 
-    def _swa_chunk_cap(
+    def _unified_swa_chunk_cap(
         self,
         max_new_tokens: int,
         swa_host_hit_length: int = 0,
         *,
-        max_chunk_tokens: Optional[int] = None,
+        max_chunk_tokens: int,
     ) -> int:
-        """Largest page-aligned extend chunk the SWA pool can admit right now.
-
-        Split pools reserve headroom below rem_swa_tokens; unified pools use
-        the joint byte budget. Returns 0 if not even one page fits. Only valid
-        when is_hybrid_swa is True.
-
-        Escape hatch for a request whose budget can never pass the
-        _swa_budget_for_req gate (extend near/above the pool size, or a large
-        load-back charge): without shrinking its chunk it would be rejected
-        forever (head-of-line livelock). Shrinking is sound because past a
-        chunk boundary only the sliding window stays locked — the rest turns
-        evictable — so each pass's transient footprint fits the pool."""
-        if not self.is_unified_swa:
-            # extend_input_len=0: this solves for the extend chunk itself, so
-            # the reserved headroom is the post-chunk decode window only.
-            cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
-                0, max_new_tokens, swa_host_hit_length
-            )
-            if cap <= 0:
-                return 0
-            return cap // self.page_size * self.page_size
-
-        assert max_chunk_tokens is not None
+        """Largest page-aligned chunk that fits the joint FULL/SWA byte budget."""
         cap = max_chunk_tokens // self.page_size * self.page_size
         lo, hi = 0, cap // self.page_size
         while lo < hi:
@@ -921,14 +892,18 @@ class PrefillAdder:
                 hi = mid - 1
         return lo * self.page_size
 
+    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
+        """Largest chunk fitting the fixed SWA partition after decode headroom."""
+        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
+            0, max_new_tokens, swa_host_hit_length
+        )
+        return max(0, cap // self.page_size * self.page_size)
+
     def _swa_req_never_fits(
         self,
         extend_input_len: int,
         max_new_tokens: int,
         swa_host_hit_length: int = 0,
-        *,
-        full_tokens: Optional[int] = None,
-        unified_swa_tokens: Optional[int] = None,
     ) -> bool:
         """True when a request's SWA budget exceeds the *entire* SWA pool, so it
         can never be admitted whole no matter how far the pool drains.
@@ -943,71 +918,82 @@ class PrefillAdder:
         swa_tokens = self._swa_budget_for_req(
             extend_input_len, max_new_tokens, swa_host_hit_length
         )
-        if self.is_unified_swa:
-            assert full_tokens is not None
-            assert unified_swa_tokens is not None
-            return not self._unified_swa_reservation_fits(
-                full_tokens, unified_swa_tokens, empty_pool=True
-            )
         if self._swa_req_ring:
             return swa_tokens > self.token_to_kv_pool_allocator.size_swa
         return swa_tokens >= self.token_to_kv_pool_allocator.size_swa
 
-    def _check_swa_admission(
+    def _check_unified_swa_admission(
         self,
         req: Req,
         *,
         extend_input_len: int,
         total_tokens: int,
     ) -> tuple[bool, Optional[int]]:
-        """Check SWA pressure and return the usable chunk limit."""
-        if not self.is_unified_swa:
-            extend_input_len = self.ceil_paged_tokens(extend_input_len)
         max_new_tokens = self._swa_new_tokens(req)
         swa_needed = self._swa_budget_for_req(
             extend_input_len,
             max_new_tokens,
             swa_host_hit_length=req.swa_host_hit_length,
         )
-        reservation_fits = (
-            self._unified_swa_reservation_fits(total_tokens, swa_needed)
-            if self.is_unified_swa
-            else swa_needed <= self.rem_swa_tokens
-            if self._swa_req_ring
-            else swa_needed < self.rem_swa_tokens
-        )
-        if reservation_fits:
+        if self._unified_swa_reservation_fits(total_tokens, swa_needed):
             return True, self.rem_chunk_tokens
 
-        full_ever_tokens = unified_swa_tokens = None
-        if self.is_unified_swa:
-            full_input_tokens = len(req.full_untruncated_fill_ids)
-            full_ever_tokens = full_input_tokens + max_new_tokens + self.page_size
-            unified_swa_tokens = self._swa_budget_for_req(
-                full_input_tokens, max_new_tokens
-            )
-        if not self._swa_req_never_fits(
-            extend_input_len,
-            max_new_tokens,
-            req.swa_host_hit_length,
-            full_tokens=full_ever_tokens,
-            unified_swa_tokens=unified_swa_tokens,
+        # Only shrink requests that cannot fit even after the pool drains;
+        # transient pressure must wait instead of consuming decode headroom.
+        full_input_tokens = len(req.full_untruncated_fill_ids)
+        if self._unified_swa_reservation_fits(
+            full_input_tokens + max_new_tokens + self.page_size,
+            self._swa_budget_for_req(full_input_tokens, max_new_tokens),
+            empty_pool=True,
         ):
             return False, None
-
-        max_chunk_tokens = self.rem_chunk_tokens
-        chunk_max_new = max_new_tokens
-        if self.is_unified_swa:
-            max_chunk_tokens = min(max_chunk_tokens or 0, max(0, extend_input_len - 1))
-            chunk_max_new = 0
-        swa_cap = self._swa_chunk_cap(
-            chunk_max_new,
+        swa_cap = self._unified_swa_chunk_cap(
+            0,
             req.swa_host_hit_length,
-            max_chunk_tokens=max_chunk_tokens,
+            max_chunk_tokens=min(
+                self.rem_chunk_tokens or 0, max(0, extend_input_len - 1)
+            ),
         )
         if self.rem_chunk_tokens is None or swa_cap <= 0:
             return False, None
         return True, min(self.rem_chunk_tokens, swa_cap)
+
+    def _check_swa_admission(
+        self, req: Req, *, extend_input_len: int
+    ) -> tuple[bool, Optional[int]]:
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        max_new_tokens = self._swa_new_tokens(req)
+        swa_needed = self._swa_budget_for_req(
+            extend_input_len, max_new_tokens, req.swa_host_hit_length
+        )
+        # Ring-slot capacity is exact; the fixed token partition keeps slack.
+        if (
+            swa_needed <= self.rem_swa_tokens
+            if self._swa_req_ring
+            else swa_needed < self.rem_swa_tokens
+        ):
+            return True, self.rem_chunk_tokens
+        if not self._swa_req_never_fits(
+            extend_input_len, max_new_tokens, req.swa_host_hit_length
+        ):
+            return False, None
+        swa_cap = self._swa_chunk_cap(max_new_tokens, req.swa_host_hit_length)
+        if self.rem_chunk_tokens is None or swa_cap <= 0:
+            return False, None
+        return True, min(self.rem_chunk_tokens, swa_cap)
+
+    def _check_prefill_budget(
+        self, req: Req, *, extend_input_len: int, total_tokens: int
+    ) -> tuple[bool, Optional[int]]:
+        if self.is_unified_swa:
+            return self._check_unified_swa_admission(
+                req, extend_input_len=extend_input_len, total_tokens=total_tokens
+            )
+        if total_tokens >= self.rem_total_tokens:
+            return False, None
+        if self.is_hybrid_swa:
+            return self._check_swa_admission(req, extend_input_len=extend_input_len)
+        return True, self.rem_chunk_tokens
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
@@ -1215,6 +1201,25 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _unified_swa_chunk_limit(
+        self, req: Req, extend_input_len: int, max_chunk_tokens: int
+    ) -> Optional[int]:
+        candidate_tokens = min(extend_input_len, max_chunk_tokens)
+        candidate_finishes = candidate_tokens >= extend_input_len
+        max_new_tokens = self._swa_new_tokens(req) if candidate_finishes else 0
+        if self._unified_swa_reservation_fits(
+            self.ceil_paged_tokens(candidate_tokens) + max_new_tokens + self.page_size,
+            self._swa_budget_for_req(candidate_tokens, max_new_tokens),
+        ):
+            return max_chunk_tokens
+        max_partial = (
+            max(0, candidate_tokens - 1) if candidate_finishes else candidate_tokens
+        )
+        joint_cap = self._unified_swa_chunk_cap(0, max_chunk_tokens=max_partial)
+        if joint_cap <= 0:
+            return None
+        return min(max_chunk_tokens, joint_cap)
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -1223,17 +1228,11 @@ class PrefillAdder:
                 _rem_tokens = self.rem_chunk_tokens
             else:
                 _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if (
-                self.is_hybrid_swa
-                and not self.is_unified_swa
-                and not self._swa_req_ring
-            ):
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM.
-                # Ring mode skips it: rem_swa_tokens counts slots, not chunk tokens.
-                _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
-                )
+                if self.is_hybrid_swa and not self._swa_req_ring:
+                    # alloc_extend needs one extra page; ring mode counts slots.
+                    _rem_tokens = min(
+                        _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                    )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
@@ -1256,22 +1255,11 @@ class PrefillAdder:
             req.prefix_indices
         )
         if self.is_unified_swa:
-            candidate_tokens = min(cand_extend_input_len, _rem_tokens)
-            candidate_finishes = candidate_tokens >= cand_extend_input_len
-            candidate_max_new = self._swa_new_tokens(req) if candidate_finishes else 0
-            if not self._unified_swa_reservation_fits(
-                self.ceil_paged_tokens(candidate_tokens)
-                + candidate_max_new
-                + self.page_size,
-                self._swa_budget_for_req(candidate_tokens, candidate_max_new),
-            ):
-                max_partial = candidate_tokens
-                if candidate_finishes:
-                    max_partial = max(0, candidate_tokens - 1)
-                joint_cap = self._swa_chunk_cap(0, max_chunk_tokens=max_partial)
-                if joint_cap <= 0:
-                    return req
-                _rem_tokens = min(_rem_tokens, joint_cap)
+            _rem_tokens = self._unified_swa_chunk_limit(
+                req, cand_extend_input_len, _rem_tokens
+            )
+            if _rem_tokens is None:
+                return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1316,22 +1304,25 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
-        if self.is_hybrid_swa:
+        if self.is_unified_swa:
             max_new_tokens = self._swa_new_tokens(req)
             swa_needed = self._swa_budget_for_req(cand_extend_input_len, max_new_tokens)
-            if self.is_unified_swa:
-                if not self._unified_swa_reservation_fits(
-                    paged_input + max_new_tokens + self.page_size,
-                    swa_needed,
-                ):
-                    return AddReqResult.NO_TOKEN
-            elif (
-                paged_input > min(self.cur_rem_tokens, self.rem_total_tokens)
-                or swa_needed > self.rem_swa_tokens
+            if not self._unified_swa_reservation_fits(
+                paged_input + max_new_tokens + self.page_size,
+                swa_needed,
             ):
                 return AddReqResult.NO_TOKEN
-        elif paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
-            return AddReqResult.NO_TOKEN
+        else:
+            if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+                return AddReqResult.NO_TOKEN
+            if (
+                self.is_hybrid_swa
+                and self._swa_budget_for_req(
+                    cand_extend_input_len, self._swa_new_tokens(req)
+                )
+                > self.rem_swa_tokens
+            ):
+                return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1482,18 +1473,13 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(swa_extend_input_len)
         prefix_len = len(req.prefix_indices)
 
-        if not self.is_unified_swa and total_tokens >= self.rem_total_tokens:
+        can_admit, chunk_tokens_limit = self._check_prefill_budget(
+            req,
+            extend_input_len=swa_extend_input_len,
+            total_tokens=total_tokens,
+        )
+        if not can_admit:
             return AddReqResult.NO_TOKEN
-
-        chunk_tokens_limit = self.rem_chunk_tokens
-        if self.is_hybrid_swa:
-            can_admit, chunk_tokens_limit = self._check_swa_admission(
-                req,
-                extend_input_len=swa_extend_input_len,
-                total_tokens=total_tokens,
-            )
-            if not can_admit:
-                return AddReqResult.NO_TOKEN
 
         if (
             self.rem_chunk_tokens is None
@@ -1506,18 +1492,14 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if not self.is_unified_swa and total_tokens >= self.rem_total_tokens:
+            # Locking removes evictable capacity, so repeat the budget check.
+            can_admit, chunk_tokens_limit = self._check_prefill_budget(
+                req,
+                extend_input_len=swa_extend_input_len,
+                total_tokens=total_tokens,
+            )
+            if not can_admit:
                 return AddReqResult.NO_TOKEN
-
-            if self.is_hybrid_swa:
-                can_admit, chunk_tokens_limit = self._check_swa_admission(
-                    req,
-                    extend_input_len=swa_extend_input_len,
-                    total_tokens=total_tokens,
-                )
-                if not can_admit:
-                    return AddReqResult.NO_TOKEN
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
