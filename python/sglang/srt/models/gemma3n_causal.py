@@ -494,6 +494,8 @@ class Gemma3nAttention(nn.Module):
             save_kv_cache=not self.is_kv_shared_layer,
         )
 
+        if attn_output.dim() == 3:
+            attn_output = attn_output.flatten(-2, -1)
         output, _ = self.o_proj(attn_output)
         return output
 
