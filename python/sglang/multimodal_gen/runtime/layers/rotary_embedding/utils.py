@@ -68,6 +68,7 @@ def _apply_rotary_emb(
 def _apply_rotary_emb_complex(
     x: torch.Tensor,  # [b, s, h, d]
     freqs: torch.Tensor,  # [s, 1, d // 2]
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:  # [b, s, h, d]
     """
     Apply complex rotary positional embeddings designed for interleaved=True, neox_style=False.
@@ -77,16 +78,16 @@ def _apply_rotary_emb_complex(
     Args:
         x: Input activation tensor in bf16/fp16.
             Shape: [batch, num_tokens, num_heads, head_size]
-        freqs: Complex-valued frequency tensor in complex64 format.
+        freqs: Complex-valued frequency tensor, real/imag parts in `dtype`.
             Shape: [num_tokens, 1, head_size // 2]
+        dtype: Intermediate real dtype for the complex multiply.
 
     Returns:
         torch.Tensor: The same shape and dtype as x.
     """
     b, s, h, d = x.shape
-    dtype_c = torch.float64
 
-    x_complex = torch.view_as_complex(x.to(dtype_c).reshape(b, s, h, d // 2, 2))
+    x_complex = torch.view_as_complex(x.to(dtype).reshape(b, s, h, d // 2, 2))
     x_out = torch.view_as_real(x_complex * freqs)
     x_out = x_out.view(b, s, h, d)
     return x_out.to(x.dtype)
