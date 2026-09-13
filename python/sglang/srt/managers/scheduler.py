@@ -491,6 +491,7 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
@@ -2459,7 +2460,9 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hicache_storage=lambda: (
+                self.enable_hicache_storage or self.enable_lmcache
+            ),
             rust_server=self.rust_server,
         )
 
@@ -3075,7 +3078,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3215,6 +3218,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or self.enable_hicache_storage
             or self.enable_unified_cache_external_linker
+            or self.enable_lmcache
         ):
             self.tree_cache.release_aborted_request(rid)
 
@@ -3717,6 +3721,7 @@ class Scheduler(
 
         if (
             self.enable_hierarchical_cache
+            or self.enable_lmcache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
         ):
@@ -3855,7 +3860,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3912,6 +3917,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_lmcache
                         or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
@@ -4676,12 +4682,12 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
             if_success = True
         else:
-            logging.warning("Hierarchical cache is not enabled.")
+            logging.warning("Hierarchical cache or LMCache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
@@ -4833,6 +4839,8 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+            elif self.enable_lmcache:
+                idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle
 

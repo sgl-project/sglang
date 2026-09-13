@@ -140,6 +140,49 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
 
 def handle_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
+    if cfg.enable_lmcache:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-lmcache and --enable-hierarchical-cache are "
+                "mutually exclusive"
+            )
+        if cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-lmcache and --enable-unified-cache-external-linker "
+                "are mutually exclusive"
+            )
+        if cfg.disable_radix_cache:
+            raise ValueError("--enable-lmcache requires radix cache to be enabled")
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_eagle():
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support EAGLE bigram keys"
+            )
+        if cfg.enable_dp_attention:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support DP attention"
+            )
+        if cfg.dcp_size > 1:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation"
+            )
+        if cfg.enable_streaming_session:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support streaming sessions"
+            )
+        if cfg.hicache_host_memory_mode == "buffer_only":
+            raise ValueError(
+                "--hicache-host-memory-mode=buffer_only is a HiCache-only mode"
+            )
+        if cfg.disaggregation_mode != "null":
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache currently supports colocated "
+                "prefill/decode scheduling only"
+            )
+
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.disaggregation_mode != "decode"

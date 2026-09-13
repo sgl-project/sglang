@@ -2,9 +2,8 @@
 
 A `RadixCache` subclass that routes sglang's host-tier KV cache through a
 FlexKV [`KVManager`](https://github.com/taco-project/FlexKV) (CPU / SSD /
-Remote offload). Same integration pattern as
-[`LMCRadixCache`](../lmcache/README.md): `FlexKVRadixCache` overrides
-`match_prefix` / `init_load_back` / `cache_finished_req` / `evict`; a
+Remote offload). `FlexKVRadixCache` overrides `match_prefix` /
+`init_load_back` / `cache_finished_req` / `evict`; a
 `FlexKVConnector` façade talks to `KVManager`, `KVTPClient`, and a
 3-axis (PP × CP × TP) sync context.
 

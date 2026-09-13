@@ -36,6 +36,7 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
+    enable_unified_cache_external_linker=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
@@ -53,11 +54,17 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
-        enable_unified_cache_external_linker=False,
+        enable_unified_cache_external_linker=enable_unified_cache_external_linker,
     )
+    params = MagicMock()
+    params.is_eagle = False
+    params.mtp_draft_device_pools = ()
+    # A plain object accurately models a request pool without an optional
+    # C128 sidecar; MagicMock would make every hasattr() probe succeed.
+    params.req_to_token_pool = object()
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=params,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -430,25 +437,136 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def test_lmc_radix_cache_when_enable_lmcache(self):
+    def test_lmcache_unified_radix_cache_when_enable_lmcache(self):
         ctx = _make_ctx(self, enable_lmcache=True)
-        # The lmcache backend raises at import time when the `lmcache`
-        # package isn't installed, so inject a stand-in module instead
-        # of letting patch() trigger the real import.
         fake_module = MagicMock()
+        fake_components = MagicMock()
         with patch.dict(
             "sys.modules",
-            {"sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache": fake_module},
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
         ):
             result = default_radix_cache_factory(ctx)
-            fake_module.LMCRadixCache.assert_called_once_with(
-                params=ctx.params,
+            fake_module.LMCacheUnifiedRadixCache.assert_called_once_with(
+                ctx.params,
                 model_config=ctx.model_config,
                 tp_size=ctx.tp_size,
-                rank=ctx.tp_rank,
-                tp_group=ctx.tp_group,
+                tp_rank=ctx.tp_rank,
+                lmcache_config_file=None,
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
-            self.assertIs(result, fake_module.LMCRadixCache.return_value)
+            self.assertEqual(
+                ctx.params.tree_components,
+                (fake_components.ComponentType.FULL,),
+            )
+            self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
+
+    def test_lmcache_supports_hybrid_swa_components(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_swa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.SWA,
+            ),
+        )
+
+    def test_lmcache_supports_hybrid_ssm_components(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_ssm=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.MAMBA,
+            ),
+        )
+
+    def test_lmcache_supports_dsa_as_full_sidecar(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_dsa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.FULL,),
+        )
+
+    def test_lmcache_exposes_c128_as_unsupported_component(self):
+        ctx = _make_ctx(self, enable_lmcache=True)
+        ctx.params.req_to_token_pool = MagicMock(spec=["req_to_c128_sidecar"])
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.C128,
+            ),
+        )
+
+    def test_lmcache_pure_swa_omits_full_component(self):
+        ctx = _make_ctx(
+            self,
+            enable_lmcache=True,
+            is_hybrid_swa=True,
+            full_tokens_per_layer=0,
+        )
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.SWA,),
+        )
 
 
 if __name__ == "__main__":
