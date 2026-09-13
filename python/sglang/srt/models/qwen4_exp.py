@@ -61,7 +61,9 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.utils import get_bool_env_var, is_hip, logger
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -1786,12 +1788,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         ]
 
         num_experts = getattr(self.config, "num_experts", None)
+        # A fused shared expert lives in routed slot `num_experts`, so the
+        # mapping has to cover one more expert than the config declares.
+        num_fused_shared_experts = 0
+        if _use_aiter:
+            for module in self.modules():
+                fused = getattr(module, "num_fused_shared_experts", 0)
+                if fused:
+                    num_fused_shared_experts = fused
+                    break
         expert_params_mapping = (
             FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=num_experts,
+                num_experts=num_experts + num_fused_shared_experts,
             )
             if num_experts is not None
             else []
@@ -1986,6 +1997,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 layer_id < self.start_layer or layer_id >= self.end_layer
             ):
                 continue
+
+            if (
+                _use_aiter
+                and num_fused_shared_experts > 0
+                and "mlp.shared_expert." in name
+            ):
+                # Map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
 
             is_fused_expert = (
                 "experts.gate_up_proj" in name or "experts.down_proj" in name
