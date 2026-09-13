@@ -953,6 +953,7 @@ class ComponentResidencyManager:
         is_supported_platform = (
             current_platform.is_cuda()
             or current_platform.is_rocm()
+            or current_platform.is_xpu()
             or current_platform.is_npu()
             or current_platform.is_xpu()
         )
@@ -967,7 +968,7 @@ class ComponentResidencyManager:
         module: nn.Module,
         was_on_supported_device: bool,
     ) -> None:
-        if not use.memory_intensive:
+        if not use.memory_intensive and not current_platform.is_xpu():
             return
         released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
