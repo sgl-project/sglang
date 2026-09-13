@@ -215,12 +215,14 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
-        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
-        # and is gfx95-only; else fall back to extend_attention_fwd.
+        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1);
+        # else fall back to extend_attention_fwd. The kernel is NV-safe (HIP-only
+        # launch kwargs are gated inside verify_splitkv.py), and on CUDA the
+        # fallback extend kernel loops the whole prefix serially per (seq, head),
+        # so long-context verify degrades linearly with prefix length. Opt out
+        # with SGLANG_ENABLE_SPLITKV_VERIFY=0.
         self.use_verify_splitkv = (
-            is_gfx95_supported()
-            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and self.topk == 1
+            envs.SGLANG_ENABLE_SPLITKV_VERIFY.get() and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5

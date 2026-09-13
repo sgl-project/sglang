@@ -1320,7 +1320,7 @@ class Envs:
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
-    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
+    # Triton backend (ROCm and CUDA). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
