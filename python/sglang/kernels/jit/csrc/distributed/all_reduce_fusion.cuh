@@ -60,6 +60,7 @@
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <optional>
+#include <type_traits>
 
 namespace sglang {
 
@@ -79,12 +80,12 @@ SGL_DEVICE void barrier_cluster_wait() {
   asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
 }
 
-template <uint32_t kWorldSize>
+template <uint32_t kWorldSize, typename WeightT>
 struct FinalizeAllReduceParams {
   bf16_t* out;                // [num_tokens, kHiddenDim], output-only
   const bf16_t* gemm2;        // [P, kHiddenDim], permuted / padded rows
   const int32_t* idx;         // [num_tokens * kTopK], -1 = dropped slot
-  const bf16_t* weights;      // [num_tokens, kTopK], scaling already folded in
+  const WeightT* weights;     // [num_tokens, kTopK], scaling already folded in
   const bf16_t* shared;       // [num_tokens, kHiddenDim] (kHasShared only)
   const bf16_t* norm_weight;  // [kHiddenDim] (kNorm only)
   float norm_eps;             // kNorm only
@@ -122,15 +123,16 @@ struct AllReduceNormTrait {
 // is added with one more bf16 rounding (see the header: the unfused path's
 // numerics, preserving the rank-local rounding points).
 // Threads of the same token read the same kTopK indices / weights (a broadcast
-// load per warp). All arithmetic is on bf16 pairs: one cast converts two
-// elements.
-template <uint32_t kHiddenDim, uint32_t kTopK, bool kHasShared, bool kUsePDL, uint32_t kWorldSize>
-SGL_DEVICE StageVec finalize_vec(const FinalizeAllReduceParams<kWorldSize>& params, uint32_t token, uint32_t hvec) {
+// load per warp). FP32 routing weights retain their precision in the multiply;
+// bf16 weights can use Blackwell's mixed-precision FMA.
+template <uint32_t kHiddenDim, uint32_t kTopK, bool kHasShared, bool kUsePDL, uint32_t kWorldSize, typename WeightT>
+SGL_DEVICE StageVec
+finalize_vec(const FinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
   using namespace device;
   const auto* idx = params.idx + static_cast<int64_t>(token) * kTopK;
   const auto* weights = params.weights + static_cast<int64_t>(token) * kTopK;
   int32_t rows[kTopK];
-  bf16_t w[kTopK];
+  WeightT w[kTopK];
 #pragma unroll
   for (uint32_t k = 0; k < kTopK; ++k) {
     rows[k] = idx[k];
@@ -161,20 +163,23 @@ SGL_DEVICE StageVec finalize_vec(const FinalizeAllReduceParams<kWorldSize>& para
   for (uint32_t k = 0; k < kTopK; ++k) {
     if (rows[k] < 0) continue;
 #if SGL_ARCH_BLACKWELL_OR_GREATER
+    if constexpr (std::is_same_v<WeightT, bf16_t>) {
 #pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      acc[j].x = math::fma_f32_bf16(in[k][j].x, w[k], acc[j].x);
-      acc[j].y = math::fma_f32_bf16(in[k][j].y, w[k], acc[j].y);
-    }
-#else
-    const auto w_fp32 = cast<fp32_t>(w[k]);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      const auto [x, y] = cast<fp32x2_t>(in[k][j]);
-      acc[j].x = fmaf(x, w_fp32, acc[j].x);
-      acc[j].y = fmaf(y, w_fp32, acc[j].y);
-    }
+      for (uint32_t j = 0; j < 4; ++j) {
+        acc[j].x = math::fma_f32_bf16(in[k][j].x, w[k], acc[j].x);
+        acc[j].y = math::fma_f32_bf16(in[k][j].y, w[k], acc[j].y);
+      }
+    } else
 #endif
+    {
+      const auto w_fp32 = cast<fp32_t>(w[k]);
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const auto [x, y] = cast<fp32x2_t>(in[k][j]);
+        acc[j].x = fmaf(x, w_fp32, acc[j].x);
+        acc[j].y = fmaf(y, w_fp32, acc[j].y);
+      }
+    }
   }
   // Same rounding as the unfused path: TRT-LLM's finalize returns the routed
   // combine rounded to bf16, and `shared.add_(routed)` then rounds the bf16 +
@@ -209,10 +214,11 @@ template <
     uint32_t kClusterSize,
     bool kUsePDL,
     bool kHasShared,
-    bool kNorm>
+    bool kNorm,
+    typename WeightT>
 __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
-        const __grid_constant__ FinalizeAllReduceParams<kWorldSize> params) {
+        const __grid_constant__ FinalizeAllReduceParams<kWorldSize, WeightT> params) {
   namespace cg = cooperative_groups;
   using namespace device;
   using T = AllReduceNormTrait<kHiddenDim, kClusterSize>;
@@ -352,16 +358,23 @@ __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBloc
 
 // --- host --------------------------------------------------------------------
 
-template <uint32_t kWorldSize, uint32_t kHiddenDim, uint32_t kTopK, uint32_t kClusterSize, bool kUsePDL>
+template <
+    uint32_t kWorldSize,
+    uint32_t kHiddenDim,
+    uint32_t kTopK,
+    uint32_t kClusterSize,
+    bool kUsePDL,
+    typename WeightT>
 struct MoeFinalizeAllReduceKernel {
  private:
+  static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
   using TensorView = tvm::ffi::TensorView;
-  using Params = FinalizeAllReduceParams<kWorldSize>;
+  using Params = FinalizeAllReduceParams<kWorldSize, WeightT>;
   using Trait = AllReduceNormTrait<kHiddenDim, kClusterSize>;
 
   template <bool kHasShared, bool kNorm>
   static constexpr auto kernel =
-      moe_finalize_all_reduce_kernel<kWorldSize, kHiddenDim, kTopK, kClusterSize, kUsePDL, kHasShared, kNorm>;
+      moe_finalize_all_reduce_kernel<kWorldSize, kHiddenDim, kTopK, kClusterSize, kUsePDL, kHasShared, kNorm, WeightT>;
 
  public:
   /// out = [allreduce over ranks of] finalize(gemm2_out, idx, weights) [+ shared] [-> RMSNorm(norm_weight, eps)].
@@ -400,8 +413,8 @@ struct MoeFinalizeAllReduceKernel {
         .verify(gemm2_out);
     TensorMatcher({T, kTopK})
         .with_strides({kTopK, 1})
-        .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_dtype<WeightT>()
+        .template with_device<kDLCUDA>(device)
         .verify(expert_weights);
     TK.set_value(T.unwrap() * kTopK);
     TensorMatcher({TK}).with_strides({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
@@ -441,7 +454,7 @@ struct MoeFinalizeAllReduceKernel {
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .gemm2 = static_cast<const bf16_t*>(gemm2_out.data_ptr()),
         .idx = static_cast<const int32_t*>(permuted_idx.data_ptr()),
-        .weights = static_cast<const bf16_t*>(expert_weights.data_ptr()),
+        .weights = static_cast<const WeightT*>(expert_weights.data_ptr()),
         .shared = shared_output.has_value() ? static_cast<const bf16_t*>(shared_output.value().data_ptr()) : nullptr,
         .norm_weight = norm_weight.has_value() ? static_cast<const bf16_t*>(norm_weight.value().data_ptr()) : nullptr,
         .norm_eps = static_cast<float>(eps),

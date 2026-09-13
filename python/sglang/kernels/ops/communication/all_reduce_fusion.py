@@ -115,20 +115,24 @@ def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool
     return 0 < num_tokens * hidden_dim * 2 <= max_push_size
 
 
-# JIT module: one per (world_size, hidden_dim, top_k, cluster_size); the
+# JIT module: one per (world_size, hidden_dim, top_k, cluster_size, weight_dtype); the
 # shared-add and norm variants are compiled into it and picked at call time.
 
 
 @cache_once
 def _jit_module(
-    world_size: int, hidden_dim: int, top_k: int, cluster_size: int
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    weight_dtype: torch.dtype,
 ) -> Module:
     assert cluster_size in valid_cluster_sizes(hidden_dim), (
         f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}; "
         f"choose from {valid_cluster_sizes(hidden_dim)}"
     )
     args = make_cpp_args(
-        world_size, hidden_dim, top_k, cluster_size, is_arch_support_pdl()
+        world_size, hidden_dim, top_k, cluster_size, is_arch_support_pdl(), weight_dtype
     )
     return load_jit(
         "moe_finalize_all_reduce",
@@ -139,11 +143,19 @@ def _jit_module(
 
 
 def compile_moe_finalize_all_reduce(
-    world_size: int, hidden_dim: int, top_k: int, cluster_size: Optional[int] = None
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: Optional[int] = None,
+    weight_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
     """Warm the JIT module (tests / benches precompile in parallel)."""
     _jit_module(
-        world_size, hidden_dim, top_k, cluster_size or default_cluster_size(hidden_dim)
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size or default_cluster_size(hidden_dim),
+        weight_dtype,
     )
 
 
@@ -167,7 +179,7 @@ def _moe_finalize_all_reduce_op(
         f"no communicator registered for world_size={world_size}; call "
         "all_reduce_fusion.register_comm(comm.obj) first"
     )
-    _jit_module(world_size, hidden_dim, top_k, cluster_size).run(
+    _jit_module(world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype).run(
         comm,
         out,
         gemm2_out,
@@ -198,7 +210,7 @@ def moe_finalize_all_reduce(
 
     :param gemm2_out: ``[P, hidden_dim]`` bf16, trtllm-gen permuted / padded rows.
     :param expanded_idx_to_permuted_idx: ``[T * top_k]`` int32, ``-1`` = dropped slot.
-    :param expert_weights: ``[T, top_k]`` bf16; any routed scaling factor is
+    :param expert_weights: ``[T, top_k]`` bf16 or fp32; any routed scaling factor is
                            already folded in (nothing is rescaled here).
     :param shared_output: optional ``[T, hidden_dim]`` bf16 added before the reduce.
     :param norm_weight: optional ``[hidden_dim]`` bf16 RMSNorm weight; with
@@ -217,6 +229,7 @@ def moe_finalize_all_reduce(
     :returns: a new ``[T, hidden_dim]`` bf16 tensor (not in place).
     """
     num_tokens = expert_weights.shape[0]
+    assert expert_weights.dtype in (torch.bfloat16, torch.float32)
     assert expert_weights.shape[1] == top_k, (expert_weights.shape, top_k)
     assert (norm_weight is None) == (norm_eps is None), (
         "norm_weight and norm_eps must be given together"
