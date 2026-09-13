@@ -990,13 +990,13 @@ fn split_updates_the_leaf_sets() {
 }
 
 #[test]
-fn split_readmits_aux_lru_cells() {
+fn split_preserves_aux_lru_position() {
     let mut tc = core();
     tc.register_component_(Arc::new(SwaComponentForTest));
     let c = split_setup(&mut tc);
     tc.arena.node_mut(c).values[SWA.idx()].value = Some(Tensor::from_slice(&[0i64]));
     tc.device_lru_list_mut(SWA).insert_mru(c);
-    // A second listed node makes the child's detach-and-readmit observable.
+    // A newer node must stay ahead of the unmatched suffix after the split.
     let root = tc.arena.root();
     let s = tc
         .arena
@@ -1009,10 +1009,10 @@ fn split_readmits_aux_lru_cells() {
         .unwrap();
     tc.device_lru_list_mut(SWA).insert_mru(s);
     let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
-    // The child re-enters the SWA LRU at MRU; the value-less prefix node does not.
+    // The child stays cold; the value-less prefix node does not enter the LRU.
     assert!(tc.device_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.device_lru_list(SWA).in_list(Some(new_node)));
-    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(s));
+    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(c));
 }
 
 #[test]
@@ -1863,6 +1863,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -2202,6 +2203,248 @@ fn insert_threshold_crossing_emits_the_backup_kv_action() {
 }
 
 #[test]
+fn external_linker_hashes_new_nodes_and_triggers_offload_action() {
+    let params = CacheInitParams {
+        page_size: 2,
+        write_through_threshold: 1,
+        ..Default::default()
+    };
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL]);
+    tc.set_enable_external_cache_linker(true).unwrap();
+
+    let result = tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let leaf = result.last_device_node_id.unwrap();
+    assert!(result.cache_actions.iter().any(|action| {
+        matches!(action, CacheAction::BackupKV(backup) if backup.node_ids == vec![leaf])
+    }));
+
+    let transfers = tc
+        .build_external_linker_offload_transfers(leaf)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].name, PoolName::Kv);
+    assert_eq!(transfers[0].hit_policy, PoolHitPolicy::AllPages);
+    assert!(
+        transfers[0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[10i64, 11]))
+    );
+    assert_eq!(
+        transfers[0].keys,
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .hash_value
+            .clone()
+    );
+}
+
+#[test]
+fn external_linker_swa_offload_uses_complete_trailing_pages() {
+    let params = CacheInitParams {
+        page_size: 2,
+        swa_sliding_window_size: Some(4),
+        ..Default::default()
+    };
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, SWA]);
+    tc.set_enable_external_cache_linker(true).unwrap();
+    let root = tc.arena.root();
+    let node = tc.add_new_node_(
+        root,
+        vec![1, 2, 3, 4, 5, 6],
+        &Tensor::from_slice(&[10i64, 11, 12, 13, 14, 15]),
+        0,
+        None,
+    );
+    tc.arena.node_mut(node).values[SWA.idx()].value =
+        Some(Tensor::from_slice(&[20i64, 21, 22, 23, 24]));
+
+    let transfers = tc
+        .build_external_linker_offload_transfers(tc.arena.node(node).id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 2);
+    assert_eq!(transfers[0].name, PoolName::Kv);
+    assert_eq!(transfers[1].name, PoolName::Swa);
+    assert_eq!(transfers[1].hit_policy, PoolHitPolicy::TrailingPages);
+    assert!(
+        transfers[1]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[21i64, 22, 23, 24]))
+    );
+    assert_eq!(
+        transfers[1].keys.as_ref().unwrap(),
+        &tc.arena.node(node).hash_value.as_ref().unwrap()[1..]
+    );
+}
+
+#[test]
+fn external_linker_rejects_mamba_trees() {
+    let params = CacheInitParams {
+        mamba_cache_chunk_size: Some(1),
+        ..Default::default()
+    };
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
+    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
+    assert!(matches!(
+        &error,
+        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
+            component_type
+        } if *component_type == MAMBA
+    ));
+    assert!(error.to_string().contains("Mamba"));
+    assert!(!tc.enable_external_cache_linker);
+}
+
+#[test]
+fn external_linker_state_follows_load_offload_and_split_lifecycle() {
+    let mut tc = core();
+    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+    let anchor = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 3, 4]))
+        .best_match_node_id;
+
+    tc.mark_external_cache_stored_path(leaf, anchor).unwrap();
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(leaf).expect("live test node"))
+            .external_cache_stored
+    );
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(anchor).expect("live test node"))
+            .external_cache_stored
+    );
+    assert!(
+        tc.build_external_linker_offload_transfers(leaf)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        tc.mark_external_linker_offload_pending(leaf),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: true,
+            pending_id: None,
+        }) if node_id == leaf
+    ));
+
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    tc.arena.node_mut(leaf_idx).external_cache_stored = false;
+    tc.mark_external_linker_offload_pending(leaf).unwrap();
+    assert!(
+        tc.build_external_linker_offload_transfers(leaf)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        tc.mark_external_linker_offload_pending(leaf),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: false,
+            pending_id: Some(pending_id),
+        }) if node_id == leaf && pending_id == leaf
+    ));
+    let (new_parent, action) = tc.split_node_(leaf_idx, 1);
+    let new_parent_handle = tc.arena.node(new_parent).id;
+    assert!(action.is_some());
+    assert!(!tc.arena.node(new_parent).external_cache_stored);
+    assert!(!tc.arena.node(leaf_idx).external_cache_stored);
+
+    tc.insert(&insert_params(&vec![9], &[19]));
+    let independent = tc.match_prefix(&match_params(&vec![9])).best_match_node_id;
+    tc.mark_external_linker_offload_pending(independent)
+        .unwrap();
+    assert!(matches!(
+        tc.finish_external_linker_offload(&[independent, new_parent_handle], independent, false),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: false,
+            pending_id: Some(pending_id),
+        }) if node_id == new_parent_handle && pending_id == leaf
+    ));
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(independent).expect("live test node"))
+            .write_through_pending_id,
+        Some(independent)
+    );
+    for node_id in [new_parent_handle, leaf] {
+        let node = tc
+            .arena
+            .node(tc.arena.resolve(node_id).expect("live test node"));
+        assert_eq!(node.write_through_pending_id, Some(leaf));
+        assert!(!node.external_cache_stored);
+    }
+
+    tc.finish_external_linker_offload(&[independent], independent, false)
+        .unwrap();
+    tc.finish_external_linker_offload(&[new_parent_handle, leaf], leaf, false)
+        .unwrap();
+    for node_id in [new_parent_handle, leaf] {
+        let node = tc
+            .arena
+            .node(tc.arena.resolve(node_id).expect("live test node"));
+        assert_eq!(node.write_through_pending_id, None);
+        assert!(!node.external_cache_stored);
+    }
+}
+
+#[test]
+fn failed_external_offload_preserves_independently_confirmed_state() {
+    let mut tc = core();
+    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let anchor = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    tc.mark_external_linker_offload_pending(leaf).unwrap();
+    tc.mark_external_cache_stored_path(leaf, anchor).unwrap();
+    tc.finish_external_linker_offload(&[leaf], leaf, false)
+        .unwrap();
+
+    let leaf = tc
+        .arena
+        .node(tc.arena.resolve(leaf).expect("live test node"));
+    assert_eq!(leaf.write_through_pending_id, None);
+    assert!(leaf.external_cache_stored);
+}
+
+#[test]
+fn external_linker_path_validation_is_atomic() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![2], &[20]));
+    let left = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let right = tc.match_prefix(&match_params(&vec![2])).best_match_node_id;
+
+    assert!(matches!(
+        tc.mark_external_cache_stored_path(left, right),
+        Err(TreeCoreRuntimeError::ExternalCachePathNotAncestor {
+            from_node_id,
+            until_node_id,
+        }) if from_node_id == left && until_node_id == right
+    ));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(left).expect("live test node"))
+            .external_cache_stored
+    );
+}
+
+#[test]
 fn mark_write_through_pending_stamps_the_supplied_ack() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
@@ -2323,6 +2566,38 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
         /* write_back = */ true,
     );
     assert_eq!(action.node_ids, vec![c]);
+}
+
+#[test]
+fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
+    let mut tc = core();
+    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    let a = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let b = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+    let c = tc
+        .match_prefix(&match_params(&vec![1, 2, 3]))
+        .best_match_node_id;
+    let a_idx = tc.arena.resolve(a).expect("live test node");
+    tc.arena.node_mut(a_idx).external_cache_stored = true;
+
+    let action = tc.build_backup_kv_action_(
+        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
+        /* write_back = */ false,
+    );
+    assert_eq!(action.node_ids, vec![b, c]);
+
+    tc.arena.node_mut(a_idx).external_cache_stored = false;
+    tc.mark_external_linker_offload_pending(a).unwrap();
+    let action = tc.build_backup_kv_action_(
+        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
+        /* write_back = */ false,
+    );
+    assert_eq!(action.node_ids, vec![b, c]);
 }
 
 #[test]
@@ -2480,11 +2755,11 @@ fn insert_coalesces_parent_linked_block_stores() {
             .hash_value,
         Some(hashes)
     );
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
+fn namespaced_event_hashes_are_sparse_and_removed_with_the_node() {
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
     tc.insert(&insert_params_in_namespace(
@@ -2499,8 +2774,8 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         .match_prefix(&match_params_in_namespace(&key, None, Some("tenant-a")))
         .best_match_node_id;
     let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
-    assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
-    assert_eq!(
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(
         tc.arena.node(leaf_idx).hash_value,
         Some(crate::node::get_hash_str::<Vec<i64>>(&key, None, 2))
     );
@@ -2516,7 +2791,7 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     tc.evict_device_end(FULL);
     tc.take_events();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 
     tc.insert(&insert_params_in_namespace(
         &key,
@@ -2524,13 +2799,48 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         None,
         Some("tenant-a"),
     ));
-    assert!(!tc.salted_event_hashes.is_empty());
+    assert!(!tc.namespaced_event_hashes.is_empty());
     tc.reset();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_survive_node_split() {
+fn extra_key_nodes_publish_token_only_event_hashes() {
+    // Events omit extra_key; storage includes it.
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[10, 11, 12, 13],
+        Some("lora-a"),
+        None,
+    ));
+    let token_only = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: token_only
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key.clone(),
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+        }]
+    );
+
+    let leaf = tc
+        .match_prefix(&match_params_in_namespace(&key, Some("lora-a"), None))
+        .best_match_node_id;
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(tc.arena.node(leaf_idx).hash_value, Some(token_only));
+}
+
+#[test]
+fn namespaced_event_hashes_survive_node_split() {
     let mut tc = events_core(2);
     let original = vec![1, 2, 3, 4];
     tc.insert(&insert_params_in_namespace(
@@ -2546,7 +2856,7 @@ fn salted_event_hashes_survive_node_split() {
             Some("tenant-a"),
         ))
         .best_match_node_id;
-    let original_hashes = tc.salted_event_hashes[&original_leaf].clone();
+    let original_hashes = tc.namespaced_event_hashes[&original_leaf].clone();
     tc.take_events();
 
     let branch = vec![1, 2, 5, 6];
@@ -2570,8 +2880,14 @@ fn salted_event_hashes_survive_node_split() {
         .node(tc.arena.resolve(split_child).expect("live test node"))
         .parent();
     let split_parent = tc.arena.node(split_parent_idx).id;
-    assert_eq!(tc.salted_event_hashes[&split_parent], original_hashes[..1]);
-    assert_eq!(tc.salted_event_hashes[&split_child], original_hashes[1..]);
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_parent],
+        original_hashes[..1]
+    );
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_child],
+        original_hashes[1..]
+    );
 }
 
 #[test]
@@ -2589,9 +2905,9 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
             )
             .unwrap();
     }
-    assert!(tc.salted_event_hashes.is_empty());
-    tc.ensure_salted_event_hashes_(parent);
-    assert_eq!(tc.salted_event_hashes.len(), 1100);
+    assert!(tc.namespaced_event_hashes.is_empty());
+    tc.ensure_namespaced_event_hashes_(parent);
+    assert_eq!(tc.namespaced_event_hashes.len(), 1100);
 }
 
 #[test]
@@ -2736,6 +3052,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -3958,6 +4275,35 @@ fn fallible_node_boundaries_reject_stale_handles() {
         Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
             if node_id == stale_root
     ));
+    assert!(matches!(
+        tc.build_external_linker_offload_transfers(stale_root),
+        Err(NodeAccessError { node_id }) if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.mark_external_cache_stored_path(stale_root, live_root),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.mark_external_cache_stored_path(live_root, stale_root),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.mark_external_linker_offload_pending(stale_root),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.finish_external_linker_offload(&[live_root, stale_root], live_root, true),
+        Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
+            if node_id == stale_root
+    ));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(live_root).expect("live root"))
+            .external_cache_stored
+    );
     assert!(matches!(
         tc.get_hash_values(stale_root),
         Err(NodeAccessError { node_id }) if node_id == stale_root
@@ -7965,6 +8311,10 @@ fn inspection_rejects_stale_handles_without_panicking() {
     assert_eq!(tc.inspect_get_child_node_ids(stale_root), Err(expected));
     assert_eq!(tc.inspect_get_node_key_length(stale_root), Err(expected));
     assert_eq!(
+        tc.inspect_is_external_cache_stored(stale_root),
+        Err(expected)
+    );
+    assert_eq!(
         tc.inspect_set_node_hash_values(stale_root, None),
         Err(expected)
     );
@@ -7993,6 +8343,7 @@ fn inspection_rejects_stale_handles_without_panicking() {
     assert!(!tc.inspect_is_host_evictable_leaf(stale_root));
 
     assert_eq!(tc.inspect_get_parent_node_id(live_root), Ok(None));
+    assert_eq!(tc.inspect_is_external_cache_stored(live_root), Ok(false));
 }
 
 #[test]
@@ -8049,6 +8400,7 @@ fn sequence_insert_params<'k>(
         mamba_value,
         prev_prefix_len,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,

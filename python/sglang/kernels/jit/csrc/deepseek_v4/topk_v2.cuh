@@ -30,8 +30,9 @@ namespace impl = device::topk;
 using impl::TopKProblem;
 
 enum class TopKMode {
-  INDICES,     ///< raw selected indices into `out`; `page_table` unused
-  PAGE_TABLE,  ///< page-table-transformed indices into `out`
+  INDICES,      ///< raw selected indices into `out`; `page_table` unused
+  PAGE_TABLE,   ///< page-table-transformed indices into `out`
+  DUAL_OUTPUT,  ///< page-table-transformed indices into `out` and raw indices into `raw_indices`
 };
 
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
@@ -76,6 +77,7 @@ struct TopKPagedParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
+  int32_t* __restrict__ raw_indices;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
@@ -94,6 +96,9 @@ struct TopKPagedParams {
   }
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
+  }
+  SGL_DEVICE int32_t* get_raw_output_ptr(uint32_t batch_id) const {
+    return raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk);
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
@@ -156,7 +161,7 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
 }
 
 template <bool kPDL, TopKMode kMode>
-SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
+SGL_DEVICE void trivial_transform(const TopKProblem& problem, int32_t* raw_output_ptr) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
@@ -165,17 +170,23 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
       problem.emit(tx, idx);
     } else {
       problem.transform_output(tx, idx);
+      if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = idx;
     }
   });
 }
 
-SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
+template <TopKMode kMode>
+SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr, int32_t* raw_output_ptr) {
+  static_assert(kMode != TopKMode::INDICES, "problem_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t source_index[kNumElems];
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
   problem.out = output_ptr;
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { problem.transform_output(tx, source_index[i]); });
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
+    problem.transform_output(tx, source_index[i]);
+    if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = source_index[i];
+  });
 }
 
 /**
@@ -279,7 +290,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   constexpr bool kPDLEarly = kPDL && !kHandleCluster;
   constexpr bool kPDLFinal = kPDL && kHandleCluster;
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDLEarly, kMode>(problem);
+  if (problem.seq_len <= problem.topk)
+    return trivial_transform<kPDLEarly, kMode>(problem, params.get_raw_output_ptr(blockIdx.x));
 
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
@@ -310,7 +322,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    problem_transform(problem, params.get_output_ptr(blockIdx.x));
+    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
   }
 }
 
@@ -320,7 +332,8 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPag
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, kMode>(problem);
+  if (problem.seq_len <= problem.topk)
+    return trivial_transform<kPDL, kMode>(problem, params.get_raw_output_ptr(blockIdx.x));
 
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
@@ -359,7 +372,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPag
     // for sm_90a (issue #32830, previously worked around by copying `problem` in
     // #32910). Verified: dropping this line reproduces the crash on 13.1/13.2/13.3.
     __builtin_assume(problem.out == s_topk_indices);
-    problem_transform(problem, params.get_output_ptr(blockIdx.x));
+    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
   }
 }
 #endif  // !USE_ROCM
@@ -490,7 +503,8 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -532,6 +546,13 @@ struct TopKKernel {
         .with_device(device_)
         .verify(metadata);
 
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      RuntimeCheck(page_table.has_value(), "raw_indices requires a page table");
+      TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
+
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
@@ -555,6 +576,7 @@ struct TopKKernel {
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_indices_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
@@ -567,11 +589,15 @@ struct TopKKernel {
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
 #endif
     constexpr bool kUsePDL = true;
-    const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
+    const auto mode = raw_indices.has_value()  ? TopKMode::DUAL_OUTPUT
+                      : page_table.has_value() ? TopKMode::PAGE_TABLE
+                                               : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
       switch (mode) {
         case TopKMode::INDICES:
           return f.template operator()<TopKMode::INDICES>();
+        case TopKMode::DUAL_OUTPUT:
+          return f.template operator()<TopKMode::DUAL_OUTPUT>();
         default:
           return f.template operator()<TopKMode::PAGE_TABLE>();
       }

@@ -228,6 +228,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             prefix_len=step.result.prefix_len,
             last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
+            swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
             adopted_ranges=(
                 {
@@ -252,6 +253,7 @@ def _match_result_from_binding(result) -> MatchResult:
         best_match_node=result.best_match_node_id,
         host_hit_length=result.host_hit_length,
         swa_host_hit_length=result.swa_host_hit_length,
+        swa_branching_seqlen=result.swa_branching_seqlen,
         mamba_host_hit_length=result.mamba_host_hit_length,
         mamba_branching_seqlen=result.mamba_branching_seqlen,
         full_kv_hit_length=result.full_kv_hit_length,
@@ -589,6 +591,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
@@ -629,6 +632,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
+
+    def set_host_memory_buffer_only(self) -> None:
+        self._binding.set_host_memory_buffer_only()
+
+    @property
+    def is_host_memory_buffer_only(self) -> bool:
+        return self._binding.is_host_memory_buffer_only()
 
     @property
     def page_size(self) -> int:
@@ -679,15 +689,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def enable_external_cache_linker(self) -> bool:
-        return False
+        return self._binding.enable_external_cache_linker()
 
     @enable_external_cache_linker.setter
     def enable_external_cache_linker(self, value: bool) -> None:
-        # TODO(Jialin): Port external cache linker support from #37091 and #37151.
-        if value:
-            raise ValueError(
-                "External cache linker is not supported by the Rust TreeCore"
-            )
+        self._binding.set_enable_external_cache_linker(value)
 
     def insert_host(
         self,
@@ -912,6 +918,27 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def finish_load_back(self, anchor_node_id: NodeId) -> None:
         self._binding.finish_load_back(anchor_node_id)
+
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        transfers = self._binding.build_external_linker_offload_transfers(node_id)
+        if transfers is None:
+            return None
+        return [_transfer_from_binding(transfer) for transfer in transfers]
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        self._binding.mark_external_cache_stored_path(from_node_id, until_node_id)
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        self._binding.mark_external_linker_offload_pending(node_id)
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        self._binding.finish_external_linker_offload(list(node_ids), ack_id, success)
 
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
