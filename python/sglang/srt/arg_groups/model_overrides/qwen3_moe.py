@@ -39,7 +39,10 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["quantization"] = quant_method
             quantization = quant_method
         if (
-            (quantization in ("fp8", "modelopt_fp4") or quantization is None)
+            (
+                quantization in ("fp8", "modelopt_fp4", "modelopt_mixed")
+                or quantization is None
+            )
             and cfg.moe_a2a_backend == "none"
             and cfg.moe_runner_backend == "auto"
         ):

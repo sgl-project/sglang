@@ -661,6 +661,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
 
+    def test_qwen4_modelopt_config_json_selects_trtllm_moe_runner(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        mixed_ckpt = {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                },
+            }
+        }
+        with override_platform(is_cuda=True, is_sm100=True):
+            from_config_json = self._construct(*qwen4, config_extra=mixed_ckpt)
+            explicit_fp4 = self._construct(
+                *qwen4, config_extra=mixed_ckpt, quantization="modelopt_fp4"
+            )
+        self.assertEqual(
+            self._resolved(from_config_json, "quantization"), "modelopt_mixed"
+        )
+        for sa in (from_config_json, explicit_fp4):
+            self.assertEqual(
+                self._resolved(sa, "moe_runner_backend"), "flashinfer_trtllm"
+            )
+
+        with override_platform(is_sm100=True):
+            online = self._construct(
+                "Qwen3MoeForCausalLM", "qwen3_moe", quantization="modelopt"
+            )
+        self.assertEqual(self._resolved(online, "quantization"), "modelopt")
+        self.assertEqual(self._resolved(online, "moe_runner_backend"), "auto")
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))
