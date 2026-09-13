@@ -227,6 +227,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         ):
             return self._process_precomputed_image_data(image_data)
 
+        # This processor does not route through load_mm_data, so enforce the
+        # image count limit here before any image is fetched or decoded.
+        self.validate_image_num_limitation(image_data)
+
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (

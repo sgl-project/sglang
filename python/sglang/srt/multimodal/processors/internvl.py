@@ -34,6 +34,9 @@ class InternVLProcessor(BaseMultimodalProcessor):
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
     IMAGE_MAX_NUM = 12
+    # IMAGE_MAX_NUM bounds dynamic-patch tiling per image, not the image count;
+    # InternVL's own demos exercise up to 12 images per request.
+    IMAGE_NUM_LIMITATION = 12
 
     DEFAULT_VIDEO_NUM_FRAMES = 32
     VIDEO_MAX_NUM = 1
