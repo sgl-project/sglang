@@ -29,7 +29,12 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
+
+_GLM53_NOPE_FLASHINFER_TOPK = 2176
+_GLM53_NOPE_FLASHINFER_KV_DIMS = (528, 656)
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -675,6 +680,27 @@ def _flash_mla_flashinfer(
     return (output.unsqueeze(1), None)
 
 
+def _flashinfer_sparse_mla_max_tokens(
+    *,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    context_len: int,
+    max_running_requests: int,
+    speculative_num_draft_tokens: Optional[int],
+) -> int:
+    chunk_size = int(chunked_prefill_size or 0)
+    prefill_tokens = max(64, chunk_size, max_prefill_tokens)
+    if chunk_size <= 0:
+        # Unchunked admission can add one whole prompt before observing that
+        # the budget is exhausted (including ignore_eos without a radix cache).
+        # Reserve the budget plus one context-sized prompt for that overshoot.
+        prefill_tokens += context_len
+    # Mixed batches can add decode or verify tokens to the prefill budget.
+    return prefill_tokens + max_running_requests * max(
+        1, speculative_num_draft_tokens or 1
+    )
+
+
 def _validate_flashinfer_sparse_mla_backend(
     *,
     model_arch: str,
@@ -699,7 +725,10 @@ def _validate_flashinfer_sparse_mla_backend(
             f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
             f"decode_impl={decode_impl!r}."
         )
-    if is_glm_sm12_fp8:
+    # This validator owns only configurations that actually select the native
+    # FlashInfer backend.  Other GLM SM12 FP8 backend pairs (notably the raw
+    # TileLang path) have their own layout validation and must pass through.
+    if uses_flashinfer_sparse_mla and is_glm_sm12_fp8:
         unsupported = selected - {"flashinfer_sparse_mla"}
         if unsupported:
             raise ValueError(
@@ -710,12 +739,47 @@ def _validate_flashinfer_sparse_mla_backend(
     return uses_flashinfer_sparse_mla
 
 
+def create_flashinfer_sparse_mla_runner(
+    *,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    max_num_tokens: int,
+    max_num_heads: int,
+    device: str,
+) -> object | None:
+    """Use native NoPE kernels when available; preserve the existing RoPE API."""
+    if qk_rope_head_dim != 0 or kv_lora_rank != 512:
+        return None
+    from flashinfer import mla
+
+    wrapper = getattr(mla, "SparseMLASm120Wrapper", None)
+    configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
+    config = configs().get("glm53_nope") if configs is not None else None
+    # Require the canonical GLM NoPE payload. The FlashInfer dependency must
+    # also include the masked-read and eight-head fixes.
+    if wrapper is None or getattr(config, "bytes_per_token", None) != 528:
+        raise RuntimeError(
+            "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
+            "with compact GLM NoPE rows (glm53_nope). "
+            "Upgrade FlashInfer to a build including compact rows, "
+            "masked candidate reads, and eight-head decode support."
+        )
+    return wrapper(
+        max_num_tokens=max_num_tokens,
+        max_num_heads=max_num_heads,
+        d_v=kv_lora_rank,
+        kv_scale_format="arbitrary_fp32",
+        device=device,
+    )
+
+
 def flashinfer_sparse_mla_forward(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
     seq_lens: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    runner: object | None = None,
     *,
     page_size: int,
     kv_cache_dim: int,
@@ -725,26 +789,123 @@ def flashinfer_sparse_mla_forward(
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
 ) -> torch.Tensor:
-    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    """Run FlashInfer's persistent native SM120 sparse-MLA wrapper.
 
-    topk = indices.shape[1]
-    result = trtllm_batch_decode_with_kv_cache_mla(
-        query=q.unsqueeze(1),
-        kv_cache=kv_cache.view(torch.uint8)
-        .view(-1, page_size, kv_cache_dim)
-        .unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=indices.unsqueeze(1),
-        seq_lens=seq_lens,
-        max_seq_len=topk,
-        sparse_mla_top_k=topk,
-        bmm1_scale=float(sm_scale),
-        bmm2_scale=1.0,
-        kv_scale_format="arbitrary_fp32",
-        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    GLM-5.3 emits 2,051 candidates (2,048 selected plus its three-token KPool
+    tail).  FlashInfer's native NoPE kernels use the 2,176-wide physical
+    contract, so the unused right edge is padded with ``-1`` sentinels.  KV
+    rows contain 512 FP8 latent values and four inline FP32 scales. Both
+    compact 528-byte rows and the padded 656-byte fp8_ds_mla ABI are supported.
+    """
+    if runner is None:
+        if qk_rope_head_dim == 0 and kv_lora_rank == 512:
+            raise RuntimeError(
+                "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
+                "with the glm53_nope configuration."
+            )
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+        topk = indices.shape[1]
+        result = trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
+            kv_cache=kv_cache.view(torch.uint8)
+            .view(-1, page_size, kv_cache_dim)
+            .unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=seq_lens,
+            max_seq_len=topk,
+            sparse_mla_top_k=topk,
+            bmm1_scale=float(sm_scale),
+            bmm2_scale=1.0,
+            kv_scale_format="arbitrary_fp32",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+        return result.squeeze(1)
+
+    if skip_softmax_threshold_scale_factor is not None:
+        raise ValueError(
+            "flashinfer_sparse_mla does not support skip-softmax thresholds"
+        )
+
+    # GLM-5.3's configured qk_nope_head_dim is 256, while the absorbed query
+    # presented to sparse MLA is 512 wide. Detect the native kernel contract
+    # from that actual tensor/layout geometry; checking the pre-absorption
+    # config dimension silently skipped the required 2051 -> 2176 padding.
+    is_glm53_nope = (
+        q.shape[-1] == 512
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+        and kv_cache_dim in _GLM53_NOPE_FLASHINFER_KV_DIMS
     )
-    return result.squeeze(1)
+    if is_glm53_nope:
+        topk = indices.shape[-1]
+        if topk > _GLM53_NOPE_FLASHINFER_TOPK:
+            raise ValueError(
+                "GLM-5.3 native NoPE sparse MLA supports at most "
+                f"{_GLM53_NOPE_FLASHINFER_TOPK} candidates, got {topk}"
+            )
+        # A valid tail can follow -1 holes from defensive top-k selection.
+        # Bound by the last valid column, not the number of valid columns.
+        # FlashInfer must mask the invalid KV payload as well as its logit.
+        if topk:
+            columns = torch.arange(
+                1, topk + 1, device=indices.device, dtype=seq_lens.dtype
+            )
+            seq_lens = torch.where(indices >= 0, columns, 0).amax(dim=-1)
+        else:
+            seq_lens = torch.zeros_like(seq_lens)
+        if topk < _GLM53_NOPE_FLASHINFER_TOPK:
+            indices = torch.nn.functional.pad(
+                indices,
+                (0, _GLM53_NOPE_FLASHINFER_TOPK - topk),
+                value=-1,
+            )
+
+    kv_cache_u8 = kv_cache.view(torch.uint8).view(-1, page_size, kv_cache_dim)
+    output = torch.empty(
+        q.shape[0], q.shape[1], kv_lora_rank, dtype=torch.bfloat16, device=q.device
+    )
+
+    mid_out = None
+    mid_lse = None
+    if q.shape[0] <= 64:
+        scratch_heads = 8 if q.shape[1] == 8 else math.ceil(q.shape[1] / 16) * 16
+        num_splits = math.ceil(indices.shape[-1] / 64)
+        mid_out_numel = q.shape[0] * scratch_heads * num_splits * kv_lora_rank
+        mid_out_bytes = mid_out_numel * torch.bfloat16.itemsize
+        mid_lse_numel = q.shape[0] * scratch_heads * num_splits
+        mid_lse_bytes = mid_lse_numel * torch.float32.itemsize
+        required_bytes = mid_out_bytes + mid_lse_bytes
+        available_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+        if required_bytes > available_bytes:
+            raise ValueError(
+                "FlashInfer sparse-MLA decode workspace is too small: "
+                f"need {required_bytes} bytes, have {available_bytes}"
+            )
+        workspace_u8 = workspace_buffer.view(torch.uint8)
+        mid_out = (
+            workspace_u8[:mid_out_bytes]
+            .view(torch.bfloat16)
+            .view(q.shape[0], scratch_heads, num_splits, kv_lora_rank)
+        )
+        mid_lse = (
+            workspace_u8[mid_out_bytes : mid_out_bytes + mid_lse_bytes]
+            .view(torch.float32)
+            .view(q.shape[0], scratch_heads, num_splits)
+        )
+
+    runner.run(
+        q,
+        kv_cache_u8,
+        indices,
+        output,
+        float(sm_scale),
+        topk_length=seq_lens,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+    return output

@@ -2574,6 +2574,25 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
+    # NoPE needs 512 FP8 values and four FP32 scales. Use compact rows when
+    # FlashInfer advertises them; older kernels require 128 padding bytes.
+    uses_flashinfer_sparse_mla = (
+        get_exec().kernel.dsa_prefill_backend == "flashinfer_sparse_mla"
+        or get_exec().kernel.dsa_decode_backend == "flashinfer_sparse_mla"
+    )
+    if (
+        not _is_hip
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and qk_rope_head_dim == 0
+        and kv_lora_rank == 512
+        and uses_flashinfer_sparse_mla
+    ):
+        from flashinfer import mla
+
+        supported_configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
+        config = supported_configs().get("glm53_nope") if supported_configs else None
+        return getattr(config, "bytes_per_token", None) or 656
+
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
