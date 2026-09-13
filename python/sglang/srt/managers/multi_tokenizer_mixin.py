@@ -61,6 +61,10 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.trace import (
+    get_global_tracing_enabled,
+    process_tracing_init,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -437,6 +441,21 @@ class MultiHttpWorkerDetokenizerMixin:
             self.soft_watchdog.feed()
 
 
+def _init_router_tracing(server_args: ServerArgs) -> None:
+    """Init OTel in this router process if tracing is enabled.
+
+    Routers pickle request objects carrying a TraceReqContext; if this
+    process has no initialized tracer provider, __setstate__ permanently
+    disables tracing and all scheduler-side spans are dropped.
+    """
+    if server_args.enable_trace and not get_global_tracing_enabled():
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
+
+
 class MultiTokenizerRouter:
     """A router between tokenizer managers and the scheduler/detokenizer manager.
 
@@ -450,6 +469,7 @@ class MultiTokenizerRouter:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        _init_router_tracing(server_args)
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
@@ -641,6 +661,7 @@ def run_multi_detokenizer_router_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)
+    _init_router_tracing(server_args)
     parent_process = psutil.Process().parent()
 
     router = None
