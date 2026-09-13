@@ -275,6 +275,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Attention
     attention_backend: str = None
+    # Time the viable attention backends on the model's own tensors during
+    # warmup and keep the fastest per layer. Off by default: it has only been
+    # measured on sm90 and sm12x.
+    enable_attention_backend_autotune: bool = False
     attention_backend_config: addict.Dict | None = None
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict

@@ -95,6 +95,7 @@ fn insert_overlap_default_consumes_nothing() {
             mamba_value: None,
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
+            swa_branching_seqlen: None,
             chunked: false,
             priority: 0,
             track_adopted_ranges: false,

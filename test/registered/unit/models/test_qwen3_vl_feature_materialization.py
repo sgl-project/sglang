@@ -1,16 +1,24 @@
 """Regression tests for Qwen3-VL multimodal feature materialization."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,7 +77,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                     MultimodalDataItem(modality=Modality.AUDIO),
                 ]
 
-                processor._mark_dp_encoder_features_for_deferred_reconstruction(items)
+                processor._mark_cuda_ipc_features_for_deferred_reconstruction(items)
 
                 self.assertTrue(
                     items[0].model_specific_data[
@@ -87,18 +95,103 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 )
 
     def test_processor_does_not_defer_cpu_transport(self):
-        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-        processor.mm_feature_transport = "cpu"
-        processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
-        processor.model_type = "qwen3_vl"
-        item = MultimodalDataItem(modality=Modality.IMAGE)
+        with get_context().override_server_args(mm_enable_dp_encoder=True):
+            processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+            processor.mm_feature_transport = "cpu"
+            processor.model_type = "qwen3_vl"
+            item = MultimodalDataItem(modality=Modality.IMAGE)
 
-        processor._mark_dp_encoder_features_for_deferred_reconstruction([item])
+            processor._mark_cuda_ipc_features_for_deferred_reconstruction([item])
 
         self.assertNotIn(
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
             item.model_specific_data,
         )
+
+    def test_processor_defers_cuda_ipc_for_single_tp_qwen3_vl(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.mm_feature_transport = "cuda_ipc"
+        processor.model_type = "qwen3_vl"
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+
+        processor._mark_cuda_ipc_features_for_deferred_reconstruction([item])
+
+        self.assertTrue(
+            item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY]
+        )
+
+    def test_retract_reprefill_waits_for_preserved_visual_input(self):
+        visual = Mock()
+        visual.device = torch.device("cuda:0")
+        visual.dtype = torch.bfloat16
+        visual.side_effect = lambda pixel_values, *, grid_thw: pixel_values
+        model = self._model(visual, use_data_parallel=False)
+
+        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+        proxy.total_consumer_count = 1
+        borrowed_feature = torch.ones(2, 3)
+        packed_ready = Mock()
+        host_ready = Mock()
+        current_stream = Mock()
+        copy_stream = Mock()
+        proxy.reconstruct_on_target_device = Mock()
+        proxy.borrow_on_target_device = Mock(return_value=borrowed_feature)
+        proxy.release_borrowed_on_current_stream = Mock()
+        proxy.release_without_reconstruction = Mock()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=proxy,
+            model_specific_data={BORROW_CUDA_IPC_FEATURE_KEY: True},
+        )
+        item.image_grid_thw = torch.tensor([[1, 1, 2]])
+
+        with (
+            patch(
+                "sglang.srt.models.qwen3_vl.get_parallel",
+                return_value=SimpleNamespace(tp_size=1),
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
+                side_effect=lambda features, **_kwargs: torch.cat(features),
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.current_stream",
+                return_value=current_stream,
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.Event",
+                side_effect=(packed_ready, host_ready),
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.Stream",
+                return_value=copy_stream,
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.stream",
+                return_value=nullcontext(),
+            ),
+        ):
+            first = model.get_image_feature([item])
+            second = model.get_image_feature([item])
+
+        self.assertIsNot(item.feature, borrowed_feature)
+        self.assertTrue(torch.equal(item.feature, borrowed_feature))
+        self.assertTrue(torch.equal(first, second))
+        proxy.reconstruct_on_target_device.assert_not_called()
+        proxy.borrow_on_target_device.assert_called_once_with(0)
+        proxy.release_borrowed_on_current_stream.assert_called_once_with()
+        proxy.release_without_reconstruction.assert_not_called()
+        packed_ready.record.assert_called_once_with(current_stream)
+        copy_stream.wait_event.assert_called_once_with(packed_ready)
+        host_ready.record.assert_called_once_with(copy_stream)
+        current_stream.wait_event.assert_called_once_with(host_ready)
+        self.assertEqual(visual.call_count, 2)
+
+        MultimodalInputs(mm_items=[item]).release_features()
+
+        proxy.release_without_reconstruction.assert_not_called()
+        self.assertIsNone(item.feature)
+        self.assertNotIn(CUDA_IPC_FEATURE_COPY_EVENT_KEY, item.model_specific_data)
 
     def test_image_features_are_packed_on_the_visual_device(self):
         visual = _RecordingVisual()

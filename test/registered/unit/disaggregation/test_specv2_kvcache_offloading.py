@@ -26,6 +26,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +46,8 @@ def _make_mock_req(
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
     req.rid = rid
+    req.extra_key = None  # base traffic: storage hashes chain from tokens alone
+    req.cache_salt = None
     req.origin_input_ids = list(range(origin_len))
     req.kv = ReqKvInfo(
         req_pool_idx=req_pool_idx,
@@ -120,6 +124,26 @@ class _FinishedEvent:
 
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def test_decode_offload_hash_chain_matches_prefill(self):
+        """Decode pages must keep the prefill namespace across offload chunks."""
+        manager, _ = _make_manager(pool_size=8, page_size=2)
+        manager.cache_controller = MagicMock(get_hash_str=get_hash_str)
+        tokens = [1, 2, 3, 4, 5, 6]
+        for extra_key, cache_salt in [
+            (None, None),
+            ("lora-a", None),
+            (None, "tenant-a"),
+            ("lora-a", "tenant-a"),
+        ]:
+            with self.subTest(extra_key=extra_key, cache_salt=cache_salt):
+                namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
+                prefix = manager._compute_prefix_hash(tokens[:4], **namespace)
+                tail = manager._compute_prefix_hash(tokens[4:], prefix[-1], **namespace)
+                self.assertEqual(
+                    prefix + tail,
+                    get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),
+                )
 
     def test_no_overallocation(self):
         """Without spec v2, kv_committed == kv_allocated; no extra free."""
