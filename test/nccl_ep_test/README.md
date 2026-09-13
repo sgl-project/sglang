@@ -102,6 +102,28 @@ unpadded Triton experts, and checks handle reuse and resource closure. Eager
 interleaving uses true zero-length inputs. The native gate requires two SM90+
 GPUs; local tests alone do not certify native communication.
 
+For shared-expert/dispatch SBO, run the local model, hook and Graph tests:
+
+```bash
+PYTHONPATH=python:test python -m pytest -q \
+  test/registered/unit/layers/moe/test_nccl_ep_sbo.py
+```
+
+Add `--sbo` to the pair gate to execute DeepSeek's actual `forward_deepep`
+shared-expert hooks while rebalancing experts. The gate also interleaves eager
+execution and true zero-token ranks. Use a separate report directory to keep
+the serial and SBO results:
+
+```bash
+timeout 15m torchrun --standalone --nproc-per-node=2 \
+  --module nccl_ep_test.eplb_pair --sbo \
+  --replays 100 --generations 2 --report-dir "$NCCL_EP_REPORT_DIR/eplb-sbo"
+```
+
+Local tests replace EP with a narrow external-library double. They verify
+ordering and numerical equivalence, not communication overlap or speedup.
+Profile the native gate on the target GPUs to measure the overlap benefit.
+
 ## Matched measurement and profiling
 
 Run measurement after correctness passes. Keep JIT/debug logging and profiling

@@ -88,7 +88,7 @@ def test_model_keeps_shared_mlp_serial_and_scales_only_routed_output(
     model = DeepseekV2MoE.__new__(DeepseekV2MoE)
     torch.nn.Module.__init__(model)
     model.shared_experts = mlp
-    model._nccl_ep_serial_shared_experts = True
+    model._nccl_ep_shared_experts_on_current_stream = True
     model.alt_stream = torch.cuda.Stream()
     model._fuse_shared_experts_inside_sbo = False
     model.is_nextn = True
@@ -162,7 +162,7 @@ def test_shared_and_routed_compute_through_dispatcher_and_graph():
         model = DeepseekV2MoE.__new__(DeepseekV2MoE)
         torch.nn.Module.__init__(model)
         model.shared_experts = make_shared_mlp()
-        model._nccl_ep_serial_shared_experts = True
+        model._nccl_ep_shared_experts_on_current_stream = True
         model.alt_stream = torch.cuda.Stream()
         model._fuse_shared_experts_inside_sbo = False
         model.is_nextn = True

@@ -584,14 +584,16 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self._nccl_ep_serial_shared_experts = (
-            get_moe_a2a_backend().is_nccl_ep() and get_moe_runner_backend().is_triton()
+        self._nccl_ep_shared_experts_on_current_stream = (
+            get_moe_a2a_backend().is_nccl_ep()
         )
         if (
-            self._nccl_ep_serial_shared_experts
+            self._nccl_ep_shared_experts_on_current_stream
             and envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
         ):
-            raise ValueError("NCCL EP Triton requires serial shared experts")
+            raise ValueError(
+                "NCCL EP shared experts use the current stream; use SBO to overlap dispatch"
+            )
         self.is_nextn = is_nextn
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
@@ -1216,9 +1218,11 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         # Disabling SBO alone does not disable this model's auxiliary stream.
-        # The NCCL EP Triton compatibility path keeps shared MLP and EP work
-        # ordered on the current stream, including full Graph capture.
-        shared_stream = None if self._nccl_ep_serial_shared_experts else self.alt_stream
+        # NCCL EP issues shared MLP work on the current stream: before dispatch
+        # by default, or between send_only and complete when SBO is enabled.
+        shared_stream = (
+            None if self._nccl_ep_shared_experts_on_current_stream else self.alt_stream
+        )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1267,7 +1271,8 @@ class DeepseekV2MoE(nn.Module):
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                if hidden_states.shape[0] > 0:
+                    shared_output = self._forward_shared_experts(hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -1305,6 +1310,8 @@ class DeepseekV2MoE(nn.Module):
                     _deepep_dispatch_hook
                 )
             )
+            if isinstance(self.experts.dispatcher, NcclEpDispatcher):
+                deepep_dispatch_hook_handle = [deepep_dispatch_hook_handle]
             post_dispatch_hook_handle = (
                 self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
             )

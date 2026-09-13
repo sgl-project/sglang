@@ -4031,7 +4031,6 @@ class ServerArgs:
             name.replace("_", "-")
             for name in (
                 "enable_two_batch_overlap",
-                "enable_single_batch_overlap",
                 "enable_pdmux",
                 "elastic_ep_backend",
                 "enable_elastic_expert_backup",
@@ -6467,8 +6466,8 @@ class ServerArgs:
                 )
 
         if a2a_backend == "nccl_ep":
-            if self.enable_single_batch_overlap or self.enable_two_batch_overlap:
-                raise ValueError("NCCL EP LL does not support single/two batch overlap")
+            if self.enable_two_batch_overlap:
+                raise ValueError("NCCL EP LL does not support two batch overlap")
             if self.enable_eplb and (
                 self.elastic_ep_backend is not None
                 or self.enable_elastic_expert_backup

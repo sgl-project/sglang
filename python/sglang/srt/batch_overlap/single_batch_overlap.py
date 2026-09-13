@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.utils import is_blackwell
 
@@ -32,6 +32,7 @@ class SboFlags:
     def enable_combine_down_gemm_two_stream_overlap(cls):
         return (
             is_sbo_enabled()
+            and not get_moe_a2a_backend().is_nccl_ep()
             # currently only cutedsl backend supports it
             and (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
@@ -49,7 +50,11 @@ class SboFlags:
 
     @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
-        return is_sbo_enabled() and not is_blackwell()
+        # NCCL EP exposes send_only/complete on both Hopper and Blackwell.
+        # Its combine does not consume DeepEP/DeepGEMM overlap signals.
+        return is_sbo_enabled() and (
+            get_moe_a2a_backend().is_nccl_ep() or not is_blackwell()
+        )
 
     @classmethod
     def fuse_shared_experts_inside_sbo(cls):
