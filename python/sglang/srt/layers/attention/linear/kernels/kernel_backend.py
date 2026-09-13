@@ -51,7 +51,11 @@ class LinearAttnKernelBase(ABC):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> tuple: ...
+    ) -> "torch.Tensor | tuple":
+        """Return the output tensor, or ``(output, intermediate_states)`` when
+        ``return_intermediate_states=True`` (GDN kernels keep their own tuple
+        contract on GDNKernelDispatcher)."""
+        ...
 
     def target_verify(
         self,

@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=318, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=438, stage="base-b", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -96,6 +96,23 @@ class TestKimiLinearUnifiedMemory(
         "--chunked-prefill-size",
         "2048",
         "--enable-unified-memory",
+    ]
+
+
+class TestKimiLinearPrefillCP(GSM8KMixin, DefaultServerBase):
+    model = KIMI_LINEAR_MODEL
+    gsm8k_num_examples = 200
+    gsm8k_num_threads = 1
+    gsm8k_score_threshold = 0.88
+    other_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "2",
+        "--enable-prefill-cp",
+        "--attn-cp-size",
+        "2",
+        "--cp-strategy",
+        "zigzag",
     ]
 
 

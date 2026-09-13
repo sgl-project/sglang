@@ -49,7 +49,13 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_stream,
+    linear_attn_tp_rank,
+    linear_attn_tp_size,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -93,8 +99,9 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        # Linear attention uses CP ranks as additional head shards.
+        self.attn_tp_rank = linear_attn_tp_rank()
+        self.attn_tp_size = linear_attn_tp_size()
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -186,8 +193,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             torch.zeros(self.num_v_heads // self.attn_tp_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        for param in (self.A_log, self.dt_bias):
+            set_weight_attrs(
+                param,
+                {
+                    "weight_loader": sharded_weight_loader(
+                        0, tp_rank_getter=lambda: self.attn_tp_rank
+                    )
+                },
+            )
         self.norm = (
             RMSNormGated(
                 self.head_v_dim,
@@ -562,6 +576,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_linear_attention=True,
         )
 
     def forward(
@@ -937,14 +952,14 @@ class Qwen3NextModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         # mamba_cache_params: MambaCacheParams,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if input_embeds is not None:
+            hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
 
@@ -1066,10 +1081,10 @@ class Qwen3NextForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
