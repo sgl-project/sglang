@@ -1,6 +1,6 @@
 ---
 title: GLM-5.2
-description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
+description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, AMD MI300X/MI325X/MI355X, and Ascend Atlas 800I A3 NPUs."
 ---
 
 ## Deployment
@@ -36,6 +36,10 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 </Tab>
 
 </Tabs>
+
+<Note>
+  **Ascend NPU (Atlas 800I A3).** Use the CANN image `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16` instead of `lmsysorg/sglang` — pick **Atlas 800I A3** below and the Docker tab emits the full `docker run`, including the 16 `davinci` devices and the host driver/firmware mounts. To build from source instead, see [SGLang installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation).
+</Note>
 
 </Accordion>
 
@@ -125,6 +129,42 @@ import { Playground } from "/src/snippets/_playground.jsx";
 </Note>
 
 - **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910`. Choose **Low-Latency** for the GPU-resident TP8/EP1 topology, or **High-Throughput** for the TP4/EP4 topology. Both emit `--speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6` with the Triton DSA prefill and decode backends. The TP4/EP4 InferenceX benchmark adds HiCache DRAM offload, but those host-specific knobs are intentionally omitted from the portable cookbook command. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+
+<a id="ascend-npu-atlas-800i-a3" />
+
+**Ascend NPU (Atlas 800I A3).** One A3 node is 8 cards × 2 dies = **16 devices**, so every A3 recipe runs `--tp-size 16` per node. Pick **W8A8**, then use the **Nodes** row to choose the topology:
+
+| Nodes | Hardware | What it starts |
+| --- | --- | --- |
+| **Single Node** | 1 × A3 (16 dies) | one PD mixed server that prefills and decodes |
+| **PD Prefill** + **PD Decode** | 2 × A3 (32 dies) | one server per role (1P1D), fronted by a router |
+
+- **Weights.** The A3 recipes use the msModelSlim INT8 build [`Eco-Tech/GLM-5.2-w8a8`](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/) (774 GB), which fits one node's 16 × 64 GB. The cells set `SGLANG_USE_MODELSCOPE=1` so `--model-path` resolves against ModelScope; point it at a local directory instead once the weights are downloaded, and put that directory on shared storage for a two-node deployment. Quantization covers the main model only — the MTP (nextn) layer stays BF16, which is why every recipe passes `--speculative-draft-model-quantization unquant`. The BF16 checkpoint (`zai-org/GLM-5.2`, ~1.5 TB) needs two nodes and is not covered by the NPU recipes here.
+- **Prepare the host.** Put the CPUs in performance mode and keep the NUMA balancer out of the way before you start the server; the Ascend recipes assume it:
+
+  ```bash Command
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+  sysctl -w vm.swappiness=0
+  sysctl -w kernel.numa_balancing=0
+  sysctl -w kernel.sched_migration_cost_ns=50000
+  ```
+
+  Inside the container, source CANN first: `source /usr/local/Ascend/ascend-toolkit/set_env.sh` and `source /usr/local/Ascend/nnal/atb/set_env.sh`.
+- **Wire up the two nodes (PD only).** Set `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface that carries each node's own IP (`ifconfig`), and give both roles the **same** `ASCEND_MF_STORE_URL`, pointing at the prefill node — it is the rendezvous for the KV transfer. Start the prefill role first, then the decode role.
+- **Front the roles with a router (PD only).** Start it once both roles are up, and match the ports to what the Deploy panel emits (`--port`, plus the prefill role's `--disaggregation-bootstrap-port`):
+
+  ```bash Command
+  python3 -m sglang_router.launch_router \
+      --pd-disaggregation \
+      --policy round_robin \
+      --prefill http://<prefill-node-ip>:30000 8998 \
+      --decode http://<decode-node-ip>:30000 \
+      --host 0.0.0.0 --port 8000
+  ```
+
+  Send requests to the router's port, not to either role.
+- **NPU-specific knobs stay out of the Playground.** The Attention, PD Disagg and Hierarchical KV Cache cards are hidden on A3 and the EAGLE presets are greyed out: NPU prefill context parallelism uses `--enable-nsa-prefill-context-parallel` / `--nsa-prefill-cp-mode`, the NPU MTP path is `--speculative-algorithm NEXTN`, and the two PD roles are full recipes in the Deploy panel rather than a toggle on top of the PD mixed one.
+- **These recipes are still being verified.** They are transcribed from the [Ascend NPU GLM-5.2 tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) and marked **In progress** until they are verified on Atlas 800I A3 hardware, so the benchmark card carries no NPU numbers yet. For NPU tuning, accuracy and profiling, see [parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning), [accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) and [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing); for anything that fails to start, the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
 
 ## 3. Advanced Usage
 

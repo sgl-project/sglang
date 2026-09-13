@@ -7,6 +7,9 @@ export const config = {
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
     "mi355x", "mi325x", "mi300x",
+    // Ascend NPU. One Atlas 800I A3 node is 8 cards x 2 dies = 16 devices,
+    // so every A3 recipe runs --tp-size 16 per node.
+    "a3",
   ],
 
   // Single released checkpoint — no size/mode split.
@@ -18,6 +21,10 @@ export const config = {
     { id: "bf16", label: "BF16" },
     { id: "nvfp4", label: "NVFP4" },
     { id: "mxfp4", label: "MXFP4" },
+    // Ascend ships its own INT8 checkpoint (Eco-Tech/GLM-5.2-w8a8, quantized
+    // with msModelSlim and served with --quantization modelslim). The GPU
+    // quantizations have no NPU kernels, so this chip is NPU-only.
+    { id: "w8a8", label: "W8A8", showWhen: (s) => s.hw === "a3" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -25,8 +32,26 @@ export const config = {
     { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
-    { id: "single",  label: "Single Node" },
-    { id: "multi-2", label: "Multi-Nodes" },
+    // The A3 reasons below only fire on that hardware, so every GPU page keeps
+    // the plain single / multi-node pair.
+    { id: "single",  label: "Single Node",
+      disabled: (s) => s.hw === "a3" && s.strategy !== "balanced",
+      disableReason: "On Atlas 800I A3, the single-node PD mixed recipe is the Balanced one — switch Strategy to Balanced." },
+    { id: "multi-2", label: "Multi-Nodes",
+      disabled: (s) => s.hw === "a3",
+      disableReason: "Two A3 nodes serve GLM-5.2 with PD disaggregation (1P1D) — pick PD Prefill for the first node and PD Decode for the second." },
+    // Ascend PD disaggregation puts one role on each A3 node (1P1D = 2 nodes),
+    // and each role is its own server started with --nnodes 1 — so the role is
+    // part of the topology choice rather than a `multi-2` cell. Front both with
+    // sglang_router (see Configuration Tips).
+    { id: "pd-prefill", label: "PD Prefill (2 nodes)",
+      showWhen: (s) => s.hw === "a3",
+      disabled: (s) => s.strategy !== "high-throughput",
+      disableReason: "On Atlas 800I A3, PD disaggregation is the High-Throughput recipe — switch Strategy to High-Throughput first." },
+    { id: "pd-decode",  label: "PD Decode (2 nodes)",
+      showWhen: (s) => s.hw === "a3",
+      disabled: (s) => s.strategy !== "high-throughput",
+      disableReason: "On Atlas 800I A3, PD disaggregation is the High-Throughput recipe — switch Strategy to High-Throughput first." },
   ],
 
   modelNames: {
@@ -34,6 +59,8 @@ export const config = {
     "default|bf16": "zai-org/GLM-5.2",
     "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
     "default|mxfp4": "amd/GLM-5.2-MXFP4",
+    // ModelScope repo — pair with SGLANG_USE_MODELSCOPE=1 (set in the A3 cells).
+    "default|w8a8": "Eco-Tech/GLM-5.2-w8a8",
   },
 
   placeholders: {
@@ -41,6 +68,8 @@ export const config = {
     PORT:      { target: "command", label: "Bind port",         default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",      default: "<node0-ip>"   },
     NODE_RANK: { target: "command", label: "This node rank",    default: "<node-rank>"  },
+    NETWORK_IFACE: { target: "command", label: "Cross-node NIC",  default: "<your-nic>"       },
+    PREFILL_IP:    { target: "command", label: "Prefill node IP", default: "<prefill-node-ip>" },
     CURL_HOST: { target: "curl",    label: "Server host",       default: "localhost" },
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"     },
   },
@@ -100,7 +129,15 @@ sgl-eval run aime25 \\
     "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
+    // CANN 9.0.0 release image for Atlas 800I A3 (daily builds are tagged
+    // main-cann9.0.0-a3). See the Ascend NPU quickstart for the A2 image.
+    a3: "quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16",
   },
+
+  // Each PD role launches with --nnodes 1, so the multi-node branch does not
+  // fire, but prefill and decode still exchange bootstrap + KV traffic across
+  // nodes over HCCL/RDMA — that needs the host network, not a published port.
+  dockerHostNetworkWhen: (s) => s.nodes === "pd-prefill" || s.nodes === "pd-decode",
 
   github: {
     cookbookModel: "zai-org/glm-5.2",
@@ -121,6 +158,12 @@ sgl-eval run aime25 \\
     // experiment — the runtime auto-configures deepep + ep=tp for it and
     // restricts it to batch_size=1 (long-context single-request runs).
     attention: {
+      // Hidden on Atlas 800I A3: the NPU recipes are fixed at --tp-size 16
+      // (one node = 16 dies), NPU DP-Attention runs at the recipe's own degree
+      // (4 on prefill, 16 on decode), and NPU prefill context parallelism uses
+      // a different flag family (--enable-nsa-prefill-context-parallel /
+      // --nsa-prefill-cp-mode), so none of these knobs emits a valid NPU flag.
+      showWhen: (b) => b.hw !== "a3",
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
         { id: "cp", label: "CP (DSA prefill)",
@@ -157,7 +200,9 @@ sgl-eval run aime25 \\
           { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
         ],
       },
-      ep: { label: "EP", values: [null, 4, 8] },
+      // DeepEP is the NPU a2a backend too, so the backend select stays. The EP
+      // degrees do not: the A3 decode recipe runs EP16 across the node's dies.
+      ep: { label: "EP", values: [null, 4, 8], showWhen: (b) => b.hw !== "a3" },
     },
 
     // ----- Card 3: "Parsers" -----
@@ -183,12 +228,16 @@ sgl-eval run aime25 \\
               reason: "MTP/EAGLE speculative decoding is not yet validated for GLM-5.2 on MI300X or MI325X." },
             { when: { hw: ["mi355x"], quant: ["fp8", "bf16", "nvfp4"] },
               reason: "The five-step MI355X recipe is validated only with amd/GLM-5.2-MXFP4." },
+            { when: { hw: ["a3"] }, reason: "Ascend NPU drives the same MTP head through --speculative-algorithm NEXTN (plus --speculative-draft-model-quantization unquant), which every A3 recipe already carries — the EAGLE presets here are CUDA-only." },
           ] },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+            { when: { hw: ["a3"] }, reason: "Ascend NPU drives the same MTP head through --speculative-algorithm NEXTN (plus --speculative-draft-model-quantization unquant), which every A3 recipe already carries — the EAGLE presets here are CUDA-only." },
+          ] },
         { id: "mtp-314", label: "EAGLE / MTP 3-1-4 (agentic · MI355X MXFP4)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
@@ -203,6 +252,11 @@ sgl-eval run aime25 \\
     // engine also pins role-specific serving ports (spaced apart) so prefill +
     // decode don't collide on one host.
     pdDisagg: {
+      // Hidden on Atlas 800I A3: the NPU prefill and decode roles are whole
+      // recipes of their own (different parallelism, DeepEP mode, graph capture
+      // and MTP depth), so they ship as cells under the Deploy panel's Nodes row
+      // — PD Prefill / PD Decode — instead of being layered on the PD mixed recipe.
+      showWhen: (b) => b.hw !== "a3",
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -240,6 +294,8 @@ sgl-eval run aime25 \\
 
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
+      // Hierarchical KV cache is not part of the verified GLM-5.2 NPU matrix.
+      showWhen: (b) => b.hw !== "a3",
       backends: [
         { id: null,       label: "Auto" },
         { id: "file",     label: "File" },
@@ -1264,6 +1320,175 @@ sgl-eval run aime25 \\
         "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // Atlas 800I A3 (Ascend NPU) + W8A8 (msModelSlim INT8).
+    // One A3 node is 8 cards x 2 dies = 16 devices, so every recipe here runs
+    // --tp-size 16 per node. Transcribed from the Ascend NPU GLM-5.2 tutorial
+    // (/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2):
+    //   Single Node  -> PD Mixed on one A3 node (16 dies).
+    //   PD Prefill   -> the prefill half of a 1P1D pair (2 A3 nodes, 32 dies).
+    //   PD Decode    -> the decode half of the same pair.
+    // The NPU verification round is open, so all three render "In progress".
+    // ====================================================================
+    {
+      match: { hw: "a3", variant: "default", quant: "w8a8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_USE_MODELSCOPE=1",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "SGLANG_NPU_USE_MULTI_STREAM=1",
+        "HCCL_BUFFSIZE=1000",
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        // Single node: the rendezvous never leaves the host.
+        "HCCL_SOCKET_IFNAME=lo",
+        "GLOO_SOCKET_IFNAME=lo",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=72",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024",
+        "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device npu",
+        "--attention-backend ascend",
+        "--quantization modelslim",
+        "--tp-size 16",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--mem-fraction-static 0.7",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 280000",
+        "--cuda-graph-bs-decode 16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--speculative-draft-model-quantization unquant",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "a3", variant: "default", quant: "w8a8", strategy: "high-throughput", nodes: "pd-prefill" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "This is the **prefill half** of a 1P1D pair: run it on the first A3 node, run **PD Decode** on the second, then front both with the router. Both nodes need the same `ASCEND_MF_STORE_URL` — see [Ascend NPU (Atlas 800I A3)](#ascend-npu-atlas-800i-a3).",
+      env: [
+        "SGLANG_USE_MODELSCOPE=1",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "STREAMS_PER_DEVICE=32",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        // KV-transfer rendezvous. Same value on the prefill and decode node.
+        "ASCEND_MF_STORE_URL=tcp://{{PREFILL_IP}}:24707",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600",
+        "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "TASK_QUEUE_ENABLE=2",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=72",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024",
+        "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+        "TRANSFORMERS_VERBOSITY=error",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device npu",
+        "--attention-backend ascend",
+        "--quantization modelslim",
+        "--dtype bfloat16",
+        "--tp-size 16",
+        "--dp-size 4",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-dense-tp-size 1",
+        "--moe-a2a-backend deepep",
+        // Prefill is compute-bound and batches whole sequences: normal dispatch,
+        // no NPU graph capture.
+        "--deepep-mode normal",
+        "--disable-shared-experts-fusion",
+        "--cuda-graph-backend-decode disabled",
+        "--cuda-graph-backend-prefill disabled",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend ascend",
+        "--disaggregation-bootstrap-port 8998",
+        "--mem-fraction-static 0.8",
+        "--chunked-prefill-size 524288",
+        "--max-prefill-tokens 180000",
+        "--max-running-requests 64",
+        "--load-balance-method round_robin",
+        // One draft step on the prefill side; the decode role runs the deeper
+        // 3-1-4 MTP schedule.
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 2",
+        "--speculative-draft-model-quantization unquant",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "a3", variant: "default", quant: "w8a8", strategy: "high-throughput", nodes: "pd-decode" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "This is the **decode half** of a 1P1D pair: run it on the second A3 node, after **PD Prefill** is up on the first, then front both with the router. Both nodes need the same `ASCEND_MF_STORE_URL` — see [Ascend NPU (Atlas 800I A3)](#ascend-npu-atlas-800i-a3).",
+      env: [
+        "SGLANG_USE_MODELSCOPE=1",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "STREAMS_PER_DEVICE=32",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "ASCEND_MF_STORE_URL=tcp://{{PREFILL_IP}}:24707",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600",
+        "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "HCCL_BUFFSIZE=650",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "SGLANG_NPU_USE_MULTI_STREAM=1",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32",
+        "TASK_QUEUE_ENABLE=0",
+        "TRANSFORMERS_VERBOSITY=error",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device npu",
+        "--attention-backend ascend",
+        "--quantization modelslim",
+        "--dtype bfloat16",
+        "--tp-size 16",
+        "--dp-size 16",
+        "--ep-size 16",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        // Decode dispatches a few tokens per step: low-latency EP kernels plus
+        // a small captured graph range.
+        "--deepep-mode low_latency",
+        "--disable-shared-experts-fusion",
+        "--disaggregation-mode decode",
+        "--disaggregation-transfer-backend ascend",
+        "--mem-fraction-static 0.8",
+        "--max-running-requests 128",
+        "--cuda-graph-max-bs-decode 4",
+        "--context-length 180000",
+        "--tokenizer-worker-num 4",
+        "--load-balance-method round_robin",
+        // Weight load over 16 dies is slow; keep the watchdog out of the way.
+        "--watchdog-timeout 9000",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--speculative-draft-model-quantization unquant",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
