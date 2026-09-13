@@ -18,6 +18,8 @@ ALIGN = 128
 
 
 class TestDeepEPv2ContigScatter(CustomTestCase):
+    """BF16 and FP8 scatter must preserve routed rows and mask invalid experts."""
+
     # Local expert ids per (token, slot); -1 marks a route to a remote expert,
     # and 7 is out of this rank's expert range.
     RECV_TOPK = [

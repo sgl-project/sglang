@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import parallel_state as ps
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -25,8 +26,9 @@ def group():
     # Match --enable-deterministic-inference's CUDA collective settings.
     os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
     os.environ["NCCL_ALGO"] = "allreduce:tree"
-    os.environ["NCCL_MIN_NCHANNELS"] = "1"
-    os.environ["NCCL_MAX_NCHANNELS"] = "1"
+    nchannels = str(envs.SGLANG_DETERMINISTIC_NCCL_NCHANNELS.get())
+    os.environ["NCCL_MIN_NCHANNELS"] = nchannels
+    os.environ["NCCL_MAX_NCHANNELS"] = nchannels
     torch.cuda.set_device(local_rank)
     ps.set_custom_all_reduce(False)
     ps.init_distributed_environment(

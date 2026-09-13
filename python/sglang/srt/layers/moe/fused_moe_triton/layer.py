@@ -161,7 +161,7 @@ def _get_deepep_comm_group(a2a_backend):
 
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
-    quant_method: Optional[FusedMoEMethodBase] = None,
+    quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
