@@ -34,7 +34,13 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_all_reduce_module,
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+    _MULTINODE_PUSH_BANDS,
+    get_all_reduce_config,
+    get_supported_world_sizes,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    _ALIGN_BYTES,
     CustomAllReduceV2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -69,6 +75,7 @@ TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
+    AllReduceAlgo.TWO_SHOT_PUSH,
 ]
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
@@ -161,7 +168,11 @@ def _init_comm_once() -> CustomAllReduceV2:
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
     )
     comm = CustomAllReduceV2(
-        cpu_group, device, max_pull_size=max_size, max_push_size=max_size
+        cpu_group,
+        device,
+        max_pull_size=max_size,
+        max_push_size=max_size,
+        max_two_shot_push_size=max_size,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -228,6 +239,107 @@ def test_custom_all_reduce(
         # while triton's converts to numpy on the host (~0.6 s per 32 MB
         # tensor) and would dominate the test wall time.
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+
+
+def test_empty_input_dispatches_like_the_smallest_one() -> None:
+    """A zero-byte all-reduce must not take a different code path."""
+    comm = _init_comm_once()
+    for can_use_graph in (True, False):
+        empty, smallest = (
+            comm._pick_config(n, can_use_graph=can_use_graph) for n in (0, 16)
+        )
+        assert empty == smallest, (
+            f"{can_use_graph=}: empty input picked {empty}, 16 bytes picked "
+            f"{smallest}"
+        )
+
+
+def test_multinode_only_retunes_the_eager_scatter_band() -> None:
+    cuda_major, _ = torch.cuda.get_device_capability()
+    tuned = {
+        world_size: bands
+        for (major, world_size), bands in _MULTINODE_PUSH_BANDS.items()
+        if major == cuda_major
+    }
+    for world_size in get_supported_world_sizes():
+        single = get_all_reduce_config(world_size)
+        multi = get_all_reduce_config(world_size, multinode=True)
+        bands = tuned.get(world_size)
+        if bands is None:
+            assert multi == single, f"{world_size=} has no multi-node entry"
+            continue
+        assert multi.eager.two_shot_push == bands.two_shot_push
+        # the mc sub-band must stay inside the band whose fan-out it refines
+        assert bands.two_shot_push_mc.min_bytes >= bands.two_shot_push.min_bytes
+        assert bands.two_shot_push_mc.max_bytes <= bands.two_shot_push.max_bytes
+        assert multi == single._replace(
+            eager=single.eager._replace(**bands._asdict())
+        ), f"{world_size=} multi-node override reached past the eager bands"
+
+
+@torch.inference_mode()
+def test_2shot_push_shares_the_1shot_plane() -> None:
+    nccl_group = _init_nccl_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    dtype = torch.bfloat16
+    push_size = _ALIGN_BYTES // dtype.itemsize  # exactly fills a push slot
+    two_shot_size = 16 * push_size  # far more than the push slots hold
+    two_shot_bytes = two_shot_size * dtype.itemsize
+    comm = CustomAllReduceV2(
+        _init_cpu_group_once(),
+        device,
+        max_pull_size=two_shot_bytes,
+        max_push_size=_ALIGN_BYTES,
+        max_two_shot_push_size=two_shot_bytes,
+    )
+    if comm.disabled:
+        raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    register_comm_cleanup(comm)
+    # A whole 2shot_push message spans one enlarged push slot per peer, and
+    # the plane doubles its rows for the shard inbox. Keep the tuned 1shot
+    # limit smaller: physical capacity must not silently widen its dispatch
+    # range.
+    assert comm.push_slot_size * comm.world_size >= two_shot_bytes
+    assert comm.max_push_size * comm.world_size < two_shot_bytes
+    assert comm.push_slot_size > comm.max_push_size
+    assert comm.obj.push.has_scatter
+
+    plan = [(AllReduceAlgo.TWO_SHOT_PUSH, two_shot_size)] * TEST_LAYERS
+    plan += [(AllReduceAlgo.ONE_SHOT_PUSH, push_size)] * TEST_LAYERS
+    plan[::2], plan[1::2] = plan[:TEST_LAYERS], plan[TEST_LAYERS:]
+
+    # Exercise the shared epoch in eager mode before capturing the same
+    # alternating sequence. Separate push/scatter counters would let the two
+    # protocols select the same half of the aliased storage here.
+    for _ in range(TEST_LOOP):
+        for algo, size in plan:
+            inp = torch.randint(0, 16, (size,), dtype=dtype, device=device)
+            ref = inp.clone()
+            dist.all_reduce(ref, group=nccl_group)
+            comm.override_algo = algo
+            out = comm.custom_all_reduce(inp)
+            torch.testing.assert_close(ref, out, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    graph_inps = [torch.zeros((size,), dtype=dtype, device=device) for _, size in plan]
+    outs: list[torch.Tensor] = []
+    with comm.capture():
+        with torch.cuda.graph(graph):
+            for (algo, _), inp in zip(plan, graph_inps):
+                comm.override_algo = algo
+                outs.append(comm.custom_all_reduce(inp))
+    torch.cuda.synchronize()
+
+    for _ in range(TEST_LOOP):
+        refs = []
+        for (_, size), graph_inp in zip(plan, graph_inps):
+            inp = torch.randint(0, 16, (size,), dtype=dtype, device=device)
+            graph_inp.copy_(inp)
+            dist.all_reduce(inp, group=nccl_group)
+            refs.append(inp)
+        graph.replay()
+        for ref, out in zip(refs, outs):
+            torch.testing.assert_close(ref, out, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
