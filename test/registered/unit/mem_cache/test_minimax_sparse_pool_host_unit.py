@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import psutil
 import torch
@@ -69,6 +70,9 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
         pool = _make_cpu_minimax_sparse_pool()
         cache = object.__new__(HiRadixCache)
         cache.cache_controller = object.__new__(HybridCacheController)
+        cache.cache_controller.mem_pool_host = SimpleNamespace(
+            entry_map={PoolName.KV: object(), PoolName.INDEXER: object()}
+        )
         cache.kv_cache = pool
 
         extra = HiRadixCache._get_extra_pools(cache)
@@ -78,6 +82,17 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
         self.assertEqual(transfers[0].name, PoolName.INDEXER)
         self.assertEqual(transfers[0].indices_from_pool, PoolName.KV)
         self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.ALL_PAGES)
+
+    def test_hiradix_extra_pools_omit_unregistered_indexer(self):
+        pool = _make_cpu_minimax_sparse_pool()
+        cache = object.__new__(HiRadixCache)
+        cache.cache_controller = object.__new__(HybridCacheController)
+        cache.cache_controller.mem_pool_host = SimpleNamespace(
+            entry_map={PoolName.KV: object()}
+        )
+        cache.kv_cache = pool
+
+        self.assertEqual(HiRadixCache._get_extra_pools(cache), {})
 
     def test_index_k_waits_for_full_local_layer(self):
         pool = _make_cpu_minimax_sparse_pool()

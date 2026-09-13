@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -60,6 +60,7 @@ class DSAIndexerPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         is_dummy: bool = False,
+        device_layer_ids: Optional[list[int]] = None,
     ):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
@@ -71,9 +72,29 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
+        owned_start, owned_end = self._device_owned_layer_range()
+        if device_layer_ids is None:
+            device_layer_ids = list(range(device_pool.layer_num))
+        self.device_layer_ids = [
+            layer_id
+            for layer_id in device_layer_ids
+            if owned_start <= layer_id < owned_end
+        ]
+        self.host_layer_by_device = {
+            layer_id: host_layer
+            for host_layer, layer_id in enumerate(self.device_layer_ids)
+        }
+        self.target_layer_num = len(self.device_layer_ids)
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+
+        total_target_layers = owned_end - owned_start
+        if self.target_layer_num < total_target_layers:
+            logger.info(
+                "DSA indexer host sidecar restricted to %d producer layers of %d",
+                self.target_layer_num,
+                total_target_layers,
+            )
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -150,9 +171,13 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
         self.packed_device_index_buffers = [
-            buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
+            self.device_pool.index_k_with_scale_buffer[layer_id]
+            for layer_id in self.device_layer_ids
+        ] + [
+            buffer
+            for pool in self.mtp_draft_device_pools
+            for buffer in pool.index_k_with_scale_buffer
         ]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
@@ -217,6 +242,12 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
 
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> Optional[int]:
+        return self.host_layer_by_device.get(layer_id)
+
+    def _draft_host_layer_index(self, packed_layer_id: int) -> int:
+        return self.target_layer_num + packed_layer_id - self.device_pool.layer_num
+
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
             return host_indices, device_indices
@@ -248,7 +279,13 @@ class DSAIndexerPoolHost(HostKVCache):
             "load on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = (
+            self._draft_host_layer_index(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
+        if host_layer_id is None:
+            return
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -313,7 +350,13 @@ class DSAIndexerPoolHost(HostKVCache):
             "backup on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = (
+            self._draft_host_layer_index(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
+        if host_layer_id is None:
+            return
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -360,7 +403,7 @@ class DSAIndexerPoolHost(HostKVCache):
             "backup on a dummy (non-src DSA) host pool"
         )
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
+            for layer_id in self.device_layer_ids:
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )

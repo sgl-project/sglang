@@ -812,9 +812,15 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, DSATokenToKVPool) or (
-            isinstance(self.kv_cache, MiniMaxSparseKVPool)
-            and self.kv_cache.index_k_pool is not None
+        has_indexer_pool = (
+            PoolName.INDEXER in self.cache_controller.mem_pool_host.entry_map
+        )
+        if has_indexer_pool and (
+            isinstance(self.kv_cache, DSATokenToKVPool)
+            or (
+                isinstance(self.kv_cache, MiniMaxSparseKVPool)
+                and self.kv_cache.index_k_pool is not None
+            )
         ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
