@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -21,6 +23,51 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
+
+
+class TestHiRadixPrefetchAttribution(unittest.TestCase):
+    def make_completed_prefetch(self, matched_length=128):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        root = SimpleNamespace(parent=None)
+        parent = SimpleNamespace(parent=root, key=list(range(128)))
+        anchor = SimpleNamespace(
+            parent=parent, key=list(range(128)), release_host=MagicMock()
+        )
+        operation = SimpleNamespace(
+            request_id="prefetch",
+            completed_tokens=512,
+            host_indices=list(range(512)),
+            hash_value=["hash"] * 4,
+        )
+        cache.page_size = 128
+        cache.ongoing_prefetch = {"prefetch": (anchor, list(range(512)), operation)}
+        cache.cache_controller = MagicMock()
+        cache.cache_controller.prefetch_tokens_occupied = 512
+        cache.enable_storage_metrics = False
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_start_by_reqid = {}
+        cache._clamp_prefetch_result = MagicMock(return_value=512)
+        # Another request has already inserted the first 128 fetched tokens.
+        cache._insert_helper_host = MagicMock(return_value=matched_length)
+        cache._handle_prefetch_result(operation)
+        return cache
+
+    def test_storage_span_includes_concurrently_inserted_prefix(self):
+        for matched in (0, 128, 512):
+            with self.subTest(matched=matched):
+                cache = self.make_completed_prefetch(matched)
+                self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (512, 256))
+                self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (0, None))
+
+    def test_legacy_pop_cleans_up_span(self):
+        cache = self.make_completed_prefetch()
+        self.assertEqual(cache.pop_prefetch_loaded_tokens("prefetch"), 512)
+        self.assertEqual(cache.prefetch_loaded_start_by_reqid, {})
+
+    def test_abort_cleans_up_span(self):
+        cache = self.make_completed_prefetch()
+        cache.release_aborted_request("prefetch")
+        self.assertEqual(cache.pop_prefetch_loaded_span("prefetch"), (0, None))
 
 
 class TestHiRadixCacheKVEvents(CustomTestCase):

@@ -1009,8 +1009,10 @@ class BufferModePipeline:
             # Nothing spliced: keep the surfaced host-hit fields truthful.
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
-            req.storage_hit_length = 0
-            req.storage_hit_start = None
+            # A peer-covered prefix remains an L3 hit even if the tail drops.
+            req.storage_hit_length = req.fulfilled_storage_hit_len(
+                len(req.prefix_indices)
+            )
             req.host_hit_is_storage = False
             return unchanged
 
@@ -1018,6 +1020,7 @@ class BufferModePipeline:
         # must never splice (wrong-namespace publish = duplicate slot
         # ownership); unreachable while the prefetch key is request-derived.
         if f.extra_key != req.extra_key or f.cache_salt != req.cache_salt:
+            req.storage_hit_length = 0
             logger.error(
                 "HiCache staged prefetch dropped req=%s reason=namespace "
                 "staged=%s req=%s",

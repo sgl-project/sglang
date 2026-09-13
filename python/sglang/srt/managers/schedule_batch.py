@@ -221,6 +221,7 @@ def split_cached_prefix_by_tier(
     storage_hit_len: int,
     storage_hit_start: Optional[int] = None,
     host_hit_is_storage: bool = False,
+    host_loaded_spans: Optional[list[tuple[int, int]]] = None,
 ) -> tuple[int, int, int]:
     """Split a request's cached prefix into (device, host, storage) tokens.
 
@@ -228,28 +229,30 @@ def split_cached_prefix_by_tier(
     preserved after H2D promotion, while an evicted tail is clipped by
     ``prefix_len``. In buffer mode host memory is only L3 staging.
     """
-    host_hit_len = min(prefix_len, host_hit_len)
-    host_start = prefix_len - host_hit_len
+    spans = host_loaded_spans
+    if spans is None:
+        spans = [(max(0, prefix_len - host_hit_len), prefix_len)]
+    storage_start = prefix_len if storage_hit_start is None else storage_hit_start
+    storage_end = storage_start + storage_hit_len
+    host_hit_len = storage_in_host = previous_end = 0
+    # Merge overlapping H2D retries and clip spans to the admitted prefix.
+    for start, end in sorted(spans):
+        start, end = max(0, start, previous_end), min(prefix_len, end)
+        if end > start:
+            host_hit_len += end - start
+            storage_in_host += max(0, min(end, storage_end) - max(start, storage_start))
+            previous_end = end
+
     if storage_hit_start is None:
-        if host_hit_is_storage:
-            storage = host_hit_len
-            host = 0
-        else:
-            storage = min(host_hit_len, storage_hit_len)
-            host = host_hit_len - storage
+        storage = storage_in_host = min(host_hit_len, storage_hit_len)
     else:
-        storage_end = storage_hit_start + storage_hit_len
-        storage = max(
-            0,
-            min(prefix_len, storage_end) - max(0, storage_hit_start),
-        )
-        storage_in_host = max(
-            0,
-            min(prefix_len, storage_end) - max(host_start, storage_hit_start),
-        )
-        host = 0 if host_hit_is_storage else host_hit_len - storage_in_host
-    device = prefix_len - host - storage
-    return device, host, storage
+        storage = max(0, min(prefix_len, storage_end) - max(0, storage_start))
+    host = host_hit_len - storage_in_host
+    if host_hit_is_storage:
+        if host_loaded_spans is not None or storage_hit_start is None:
+            storage += host
+        host = 0
+    return prefix_len - host - storage, host, storage
 
 
 def _compute_pad_value(hash: int) -> int:
@@ -1126,6 +1129,8 @@ class Req(ReqDllmMixin):
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
         self.host_loaded_length = 0
+        # Absolute [start, end) H2D spans, independent of live prefix matches.
+        self.host_loaded_spans: list[tuple[int, int]] = []
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         # Storage prefetch retry state while queued
@@ -2693,6 +2698,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         storage_hit_len=req.storage_hit_length,
                         storage_hit_start=req.storage_hit_start,
                         host_hit_is_storage=req.host_hit_is_storage,
+                        host_loaded_spans=req.host_loaded_spans,
                     )
                     req._cache_breakdown_computed = True
 
