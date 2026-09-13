@@ -24,6 +24,55 @@ def reference_pages(scores, indices, pages, page_size):
 
 
 class TestIndexerPostprocess(CustomTestCase):
+    def test_unfiltered_verify_matches_candidate_chain(self):
+        from sglang.kernels.ops.attention.dsv4.topk import (
+            plan_topk_v2,
+            topk_transform_paged_v2,
+        )
+
+        # Six causal rows per request. The last request ends exactly at the
+        # candidate budget; capacity and unread logits extend well past it.
+        torch.manual_seed(123)
+        rows, width, page_size = 384, 32768, 64
+        base = torch.tensor([0, 506, 4096, 16378], device="cuda", dtype=torch.int32)
+        lens = (base.repeat(16)[:, None] + torch.arange(1, 7, device="cuda")).flatten()
+        lens = lens.to(torch.int32)
+        source = torch.randn(rows, width, device="cuda").relu_()
+        consumer = torch.randn_like(source).relu_()
+        cols = torch.arange(width, device="cuda")[None, :]
+        source.masked_fill_(cols >= lens[:, None], 1e6)
+        consumer.masked_fill_(cols >= lens[:, None], 1e6)
+        pages = torch.randint(
+            0, 100000, (rows, width // page_size), device="cuda", dtype=torch.int32
+        )
+        source_masked, keep = candidate_block_logits(
+            source, lens, topk_blocks=2048, block_size=8, published=None
+        )
+        consumer_masked, _ = candidate_block_logits(
+            consumer, lens, topk_blocks=2048, block_size=8, published=keep
+        )
+        plan = plan_topk_v2(lens)
+        for original, masked in ((source, source_masked), (consumer, consumer_masked)):
+            with self.subTest(source=original is source):
+                old = torch.empty((rows, 512), dtype=torch.int32, device="cuda")
+                new = torch.empty_like(old)
+                raw = torch.empty_like(old)
+                new_raw = torch.empty_like(old)
+                topk_transform_paged_v2(masked, lens, pages, old, page_size, plan, raw)
+                filter_topk_pages(masked, raw, pages, old, page_size)
+                topk_transform_paged_v2(
+                    original, lens, pages, new, page_size, plan, new_raw
+                )
+                # Top-k v2 uses a persistent work queue and does not promise
+                # output order. Compare the selected multiset, including -1
+                # padding, in both logical-position and physical-page space.
+                torch.testing.assert_close(
+                    new.sort(-1).values, old.sort(-1).values, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    new_raw.sort(-1).values, raw.sort(-1).values, rtol=0, atol=0
+                )
+
     def test_candidate_row_lens(self):
         lens = torch.tensor(
             [1, 7, 8, 9, 300, 16383, 16384, 16385, 16392, 40000, 1048576, 1048571],
