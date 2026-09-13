@@ -813,13 +813,13 @@ class PrefillAdder:
         if self._swa_req_ring:
             # One ring slot per request, in the same unit as swa_available_size.
             return allocator.swa_ring_cost_tokens
-        if self.rem_chunk_tokens is not None:
-            alloc = min(extend_input_len, self.rem_chunk_tokens)
-        else:
-            alloc = extend_input_len
-        window = self.tree_cache.sliding_window_size
-        return max(alloc - window, 0) + self._swa_reserved_tokens(
-            extend_input_len, max_new_tokens, swa_host_hit_length
+        return estimate_swa_kv_tokens(
+            extend_input_len,
+            max_new_tokens,
+            sliding_window_size=self.tree_cache.sliding_window_size,
+            page_size=self.page_size,
+            allocation_limit=self.rem_chunk_tokens,
+            host_hit_length=swa_host_hit_length,
         )
 
     def _swa_reserved_tokens(
@@ -1304,25 +1304,20 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
-        if self.is_unified_swa:
+        if self.is_hybrid_swa:
             max_new_tokens = self._swa_new_tokens(req)
             swa_needed = self._swa_budget_for_req(cand_extend_input_len, max_new_tokens)
-            if not self._unified_swa_reservation_fits(
+        if self.is_unified_swa:
+            fits = self._unified_swa_reservation_fits(
                 paged_input + max_new_tokens + self.page_size,
                 swa_needed,
-            ):
-                return AddReqResult.NO_TOKEN
+            )
         else:
-            if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
-                return AddReqResult.NO_TOKEN
-            if (
-                self.is_hybrid_swa
-                and self._swa_budget_for_req(
-                    cand_extend_input_len, self._swa_new_tokens(req)
-                )
-                > self.rem_swa_tokens
-            ):
-                return AddReqResult.NO_TOKEN
+            fits = paged_input <= min(self.cur_rem_tokens, self.rem_total_tokens) and (
+                not self.is_hybrid_swa or swa_needed <= self.rem_swa_tokens
+            )
+        if not fits:
+            return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (

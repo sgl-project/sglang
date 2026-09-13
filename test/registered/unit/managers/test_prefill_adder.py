@@ -636,7 +636,7 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 
         # Pre-fix: a constant sliding-window reservation rejects the resume.
-        with patch.object(adder, "_swa_reserved_tokens", return_value=WINDOW + PAGE):
+        with patch.object(adder, "_swa_budget_for_req", return_value=WINDOW + PAGE):
             self.assertIs(
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
