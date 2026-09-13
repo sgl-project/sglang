@@ -152,9 +152,23 @@ def _cache_actions_from_tagged(actions: Sequence[tuple]) -> list[CacheAction]:
 def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
+        node_id=result.node_id,
         swa_uuid_for_lock=result.swa_uuid_for_lock,
         swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-        skip_lock_node_ids=_skip_lock_node_ids_from_binding(result.skip_lock_node_ids),
+        skipped_lock_components=tuple(
+            ComponentType(ct) for ct in result.skipped_lock_components
+        ),
+    )
+
+
+def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
+    """Build the binding's params from the module that owns the core's binding
+    (the inspection build is a distinct extension module with its own types)."""
+    return bindings_module.DecLockRefParamsBinding(
+        node_id=params.node_id,
+        swa_uuid_for_lock=params.swa_uuid_for_lock,
+        swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
+        skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
     )
 
 
@@ -214,6 +228,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             prefix_len=step.result.prefix_len,
             last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
+            swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
             adopted_ranges=(
                 {
@@ -238,31 +253,12 @@ def _match_result_from_binding(result) -> MatchResult:
         best_match_node=result.best_match_node_id,
         host_hit_length=result.host_hit_length,
         swa_host_hit_length=result.swa_host_hit_length,
+        swa_branching_seqlen=result.swa_branching_seqlen,
         mamba_host_hit_length=result.mamba_host_hit_length,
         mamba_branching_seqlen=result.mamba_branching_seqlen,
         full_kv_hit_length=result.full_kv_hit_length,
         cache_actions=_cache_actions_from_tagged(result.cache_actions),
     )
-
-
-def _skip_lock_node_ids_from_binding(
-    skip_lock_node_ids: dict[int, set[int]],
-) -> dict[ComponentType, set[int]]:
-    """Rekey the binding's component-value skip map by ComponentType."""
-    return {
-        ComponentType(component): set(node_ids)
-        for component, node_ids in skip_lock_node_ids.items()
-    }
-
-
-def _skip_lock_node_ids_to_binding(
-    skip_lock_node_ids: dict[ComponentType, set[int]],
-) -> dict[int, set[int]]:
-    """Rekey a ComponentType skip map by the binding's component values."""
-    return {
-        int(component): set(node_ids)
-        for component, node_ids in skip_lock_node_ids.items()
-    }
 
 
 def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
@@ -332,6 +328,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         if params.eviction_policy_config:
             raise ValueError(
                 "Rust TreeCore does not support --radix-eviction-policy-config"
+            )
+        if ComponentType.SWA in self.tree_components and (
+            params.sliding_window_size is None or params.sliding_window_size <= 0
+        ):
+            raise ValueError(
+                "the SWA tree component requires a positive sliding_window_size"
             )
 
         self._page_size = params.page_size
@@ -415,45 +417,29 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_lock_components: Sequence[ComponentType] = (),
     ) -> IncLockRefResult:
         result = self._binding.inc_lock_ref(
-            node_id, [int(component) for component in skip_lock_components]
+            node_id, [int(ct) for ct in skip_lock_components]
         )
         return _inc_lock_ref_result_from_binding(result)
 
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        binding_params = (
-            self._bindings.DecLockRefParamsBinding(
-                swa_uuid_for_lock=params.swa_uuid_for_lock,
-                swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                skip_lock_node_ids=_skip_lock_node_ids_to_binding(
-                    params.skip_lock_node_ids
-                ),
-            )
-            if params is not None
-            else None
+        self._binding.dec_lock_ref(
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params), skip_swa
         )
-        self._binding.dec_lock_ref(node_id, binding_params, skip_swa)
         return DecLockRefResult()
 
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees = self._binding.dec_swa_lock_only(
-            node_id,
-            swa_uuid_for_lock,
-            (
-                _skip_lock_node_ids_to_binding(skip_lock_node_ids)
-                if skip_lock_node_ids
-                else None
-            ),
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
         )
         for component, tensors in new_device_frees.items():
             result.device_frees[ComponentType(component)].extend(tensors)
@@ -503,30 +489,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         result = self._binding.inc_host_lock_ref(node_id)
-        return IncLockRefResult(
-            delta=result.delta,
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-            skip_lock_node_ids=_skip_lock_node_ids_from_binding(
-                result.skip_lock_node_ids
-            ),
-        )
+        return _inc_lock_ref_result_from_binding(result)
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
-        binding_params = (
-            self._bindings.DecLockRefParamsBinding(
-                swa_uuid_for_lock=params.swa_uuid_for_lock,
-                swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                skip_lock_node_ids=_skip_lock_node_ids_to_binding(
-                    params.skip_lock_node_ids
-                ),
-            )
-            if params is not None
-            else None
+        self._binding.dec_host_lock_ref(
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
         )
-        self._binding.dec_host_lock_ref(node_id, binding_params)
         return DecLockRefResult()
 
     def evictable_size(self) -> int:
@@ -621,6 +591,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
@@ -661,6 +632,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
+
+    def set_host_memory_buffer_only(self) -> None:
+        self._binding.set_host_memory_buffer_only()
+
+    @property
+    def is_host_memory_buffer_only(self) -> bool:
+        return self._binding.is_host_memory_buffer_only()
 
     @property
     def page_size(self) -> int:
@@ -711,15 +689,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def enable_external_cache_linker(self) -> bool:
-        return False
+        return self._binding.enable_external_cache_linker()
 
     @enable_external_cache_linker.setter
     def enable_external_cache_linker(self, value: bool) -> None:
-        # TODO(Jialin): Port external cache linker support from #37091 and #37151.
-        if value:
-            raise ValueError(
-                "External cache linker is not supported by the Rust TreeCore"
-            )
+        self._binding.set_enable_external_cache_linker(value)
 
     def insert_host(
         self,
@@ -944,6 +918,27 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def finish_load_back(self, anchor_node_id: NodeId) -> None:
         self._binding.finish_load_back(anchor_node_id)
+
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        transfers = self._binding.build_external_linker_offload_transfers(node_id)
+        if transfers is None:
+            return None
+        return [_transfer_from_binding(transfer) for transfer in transfers]
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        self._binding.mark_external_cache_stored_path(from_node_id, until_node_id)
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        self._binding.mark_external_linker_offload_pending(node_id)
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        self._binding.finish_external_linker_offload(list(node_ids), ack_id, success)
 
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
