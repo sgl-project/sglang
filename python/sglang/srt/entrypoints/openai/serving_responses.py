@@ -85,7 +85,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -204,6 +204,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.msg_store: dict[str, Union[list[dict], list[OpenAIMessage]]] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+        self.enable_response_store = get_serving().enable_response_store
+        self.is_disaggregated = get_disagg().disaggregation_mode != "null"
 
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
@@ -245,6 +247,14 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _request_id_prefix(self) -> str:
         return "resp_"
 
+    def _response_store_disabled_error(self, param: str) -> ORJSONResponse:
+        return self.create_error_response(
+            "Response store is disabled. Stateful Responses require "
+            "--enable-response-store on a standalone server; response storage "
+            "is unavailable in PD mode.",
+            param=param,
+        )
+
     def _known_model_names(self) -> set[str]:
         """Model ids a caller may address, mirroring what ``/v1/models`` lists."""
         names = {self.tokenizer_manager.served_model_name}
@@ -280,6 +290,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
+
+        if not self.enable_response_store and request.previous_response_id is not None:
+            return self._response_store_disabled_error("previous_response_id")
+        if not self.enable_response_store and request.background:
+            return self._response_store_disabled_error("background")
+        if request.background and not request.store:
+            return self.create_error_response(
+                "background=true requires store=true.", param="store"
+            )
 
         model_error = self._validate_model(request.model)
         if model_error is not None:
@@ -335,6 +354,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "SGLang server to enable native Exa-backed web search, or "
                 "configure a browser MCP tool server. Create an Exa API key at "
                 "https://dashboard.exa.ai/api-keys."
+            )
+
+        if (
+            self.use_harmony
+            and self.tool_server is not None
+            and self.is_disaggregated
+            and self._has_response_tool(
+                request, "web_search", "web_search_preview", "code_interpreter"
+            )
+        ):
+            return self.create_error_response(
+                "built-in tools (web_search, code_interpreter) are not supported "
+                "with prefill-decode disaggregation",
+                param="tools",
             )
 
         # Handle the previous response ID
@@ -547,14 +580,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             (result_generator,) = generators
 
             # Store the input messages
-            if request.store:
+            persist = self.enable_response_store and bool(request.store)
+            if persist:
                 self.msg_store[request.request_id] = (
                     messages[2:]
                     if self.use_harmony
                     else self._response_input_history(request)
                 )
 
-            if request.background and not request.stream:
+            if request.background and not request.stream and persist:
                 created_time = int(time.time())
                 response = ResponsesResponse.from_request(
                     request,
@@ -832,7 +866,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         response.error = self._error_from_finish_reason(finish_reason)
-        if request.store:
+        if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
                 # If the response is already cancelled, don't update it
@@ -1552,6 +1586,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         response_id: str,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
+        if not self.enable_response_store:
+            return self._response_store_disabled_error("response_id")
         if not response_id.startswith("resp_"):
             return self._make_invalid_id_error(response_id)
 
@@ -1566,6 +1602,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         response_id: str,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
+        if not self.enable_response_store:
+            return self._response_store_disabled_error("response_id")
         if not response_id.startswith("resp_"):
             return self._make_invalid_id_error(response_id)
 
@@ -2601,7 +2639,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
         final_response.error = self._error_from_finish_reason(finish_reason)
-        if request.store:
+        if self.enable_response_store and request.store:
             async with self.response_store_lock:
                 stored = self.response_store.get(final_response.id)
                 if stored is None or stored.status != "cancelled":
@@ -2645,6 +2683,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
+
+            if self.is_disaggregated:
+                raise ValueError(
+                    "built-in tool calls are not supported with prefill-decode "
+                    "disaggregation"
+                )
 
             # Call the tool and update the context with the result.
             tool_output = await context.call_tool()
