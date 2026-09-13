@@ -288,7 +288,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _init_metadata_glue(self):
         config = self.model_runner.model_config.hf_text_config
         if (
-            not envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+            not envs.SGLANG_ENABLE_DSA_DRAFT_METADATA_GLUE_GRAPH.get()
             or not is_deepseek_dsa(config)
             or not get_dsa_index_kpool_compress(config)
             or self.topk != 1
