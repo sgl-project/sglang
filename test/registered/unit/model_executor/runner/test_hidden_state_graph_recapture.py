@@ -73,6 +73,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.capture_hidden_mode = capture_hidden_mode
         runner.capture_num_tokens = [4]
+        runner.max_context_size = None
         runner.max_num_tokens = 4
         return runner
 
