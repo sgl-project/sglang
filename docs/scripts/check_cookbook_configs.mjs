@@ -27,10 +27,16 @@ import { fileURLToPath } from "node:url";
 const SNIPPETS = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "snippets");
 const CONFIGS = join(SNIPPETS, "configs");
 const DIFFUSION_COOKBOOK = join(SNIPPETS, "..", "..", "cookbook", "diffusion");
+const QWEN38_COOKBOOK = join(
+  SNIPPETS, "..", "..", "cookbook", "autoregressive", "Qwen",
+  "Qwen3.8-Flash-Next.mdx");
 const COOKBOOK_MODEL_TEMPLATE = join(
   SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
   "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
+const QWEN38_GFX942_IMAGE = "rocm/sgl-dev@sha256:151005265cf3f4e98c41abc41f5cd317ab2e83085ec24d82f0bd36465f886457";
+const QWEN38_GFX950_IMAGE = "rocm/sgl-dev@sha256:9252e847c0ebcef375543d3bf61d935cbd80ef5ac86ed3ba16e31bb7e1f1be47";
+const QWEN38_SOURCE_MOUNT = "\"$PWD/python/sglang:/sgl-workspace/sglang/python/sglang:ro\"";
 
 const failures = [];
 const fail = (where, msg) => failures.push(`${where}: ${msg}`);
@@ -69,9 +75,18 @@ if (a && b && a !== b) {
 // current base cell from a true sibling. This previously made every cookbook
 // show a spurious "matches … / switch base" hint before the reader changed
 // anything.
+const deploymentSource = readFileSync(join(SNIPPETS, "_deployment.jsx"), "utf8");
 const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8");
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
+}
+for (const [engine, source] of [
+  ["_deployment.jsx", deploymentSource],
+  ["_playground.jsx", playgroundSource],
+]) {
+  if (!source.includes('typeof config.dockerMounts === "function"')) {
+    fail(engine, "does not resolve selection-dependent Docker mounts");
+  }
 }
 
 const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
@@ -90,13 +105,13 @@ if (!cookbookModelTemplate.includes("--enable-w4a4-mxfp4-megamoe")) {
 // --------------------------------------------------------------- 3/4. Configs
 // Configs are .jsx with a single `export const config` literal; import them
 // through a data: URL so no temp file is needed.
-const loadConfig = async (path) => {
+const loadModule = async (path) => {
   const src = readFileSync(path, "utf8");
-  const mod = await import(
+  return import(
     "data:text/javascript," + encodeURIComponent(src)
   );
-  return mod.config;
 };
+const loadConfig = async (path) => (await loadModule(path)).config;
 
 // Every combination of match dims + overlay dims the reader can produce.
 const selectionSpace = (config) => {
@@ -169,6 +184,183 @@ for (const path of walk(CONFIGS)) {
     // silently degrades a multi-node recipe to single-node.
     if (custom && !matchIds.includes("nodes") && cell.nnodes === undefined) {
       fail(where, `cells[${i}] has no \`nnodes\` and the config declares no nodes dim`);
+    }
+  }
+
+  // Qwen3.8-Flash-Next's AMD recipes use immutable official architecture-
+  // specific nightlies plus an exact PR #36601 source bind mount. Keep the
+  // matrix from drifting back to stale/custom images or plain TP8.
+  if (config.modelName === "Qwen3.8-Flash-Next") {
+    const cookbookSource = readFileSync(QWEN38_COOKBOOK, "utf8");
+    const benchmarkPath = path.replace(/\.jsx$/, "-benchmarks.jsx");
+    let benchmarks = [];
+    try {
+      benchmarks = (await loadModule(benchmarkPath)).benchmarks || [];
+    } catch (e) {
+      fail(where, `cannot load benchmark rows: ${e.message}`);
+    }
+    const amdImages = {
+      mi300x: QWEN38_GFX942_IMAGE,
+      mi325x: QWEN38_GFX942_IMAGE,
+      mi350x: QWEN38_GFX950_IMAGE,
+      mi355x: QWEN38_GFX950_IMAGE,
+    };
+    for (const image of new Set(Object.values(amdImages))) {
+      if (!/^rocm\/sgl-dev@sha256:[0-9a-f]{64}$/.test(image)) {
+        fail(where, `AMD image is not an immutable official ROCm nightly: ${image}`);
+      }
+      if (!cookbookSource.includes(`docker pull ${image}`)) {
+        fail(where, `cookbook install instructions do not pull ${image}`);
+      }
+    }
+    if (cookbookSource.includes("aigmkt/qwen3.8-flash-next")
+        || cookbookSource.includes("GFX942_DIGEST")
+        || cookbookSource.includes("GFX950_DIGEST")) {
+      fail(where, "cookbook must not depend on custom Docker Hub images or digest placeholders");
+    }
+    if (!cookbookSource.includes("git checkout --detach 0b4f96ff745b7b498e49e613dfeea046a60052fc")) {
+      fail(where, "cookbook must check out the exact validated PR #36601 head");
+    }
+    for (const [hw, image] of Object.entries(amdImages)) {
+      if (config.dockerImages?.[hw] !== image) {
+        fail(where, `${hw} must use its architecture-specific official ROCm nightly`);
+      }
+      const selection = { hw, variant: "default", quant: "fp8",
+        strategy: "low-latency", nodes: "single" };
+      if (config.runModes?.(selection)?.join(",") !== "docker") {
+        fail(where, `${hw} must expose only the validated Docker command`);
+      }
+      if (config.dockerRunCommand?.(selection) !== "python3 -m sglang.launch_server") {
+        fail(where, `${hw} must launch the image's embedded SGLang source`);
+      }
+      if (config.dockerGpuVendor?.(selection) !== "amd") {
+        fail(where, `${hw} must render ROCm device access in both command panels`);
+      }
+      if (config.dockerMounts?.(selection)?.join(",") !== QWEN38_SOURCE_MOUNT) {
+        fail(where, `${hw} must mount the exact checked-out PR source tree read-only`);
+      }
+    }
+    const nvidiaSelection = { hw: "h200", variant: "default", quant: "bf16",
+      strategy: "low-latency", nodes: "single" };
+    if ((config.dockerMounts?.(nvidiaSelection) || []).length !== 0) {
+      fail(where, "the AMD source overlay must not leak into NVIDIA commands");
+    }
+
+    const expected = [
+      ["mi300x", "bf16", "low-latency", false],
+      ["mi300x", "fp8", "low-latency", false],
+      ["mi325x", "bf16", "low-latency", true],
+      ["mi325x", "fp8", "low-latency", true],
+      ["mi350x", "bf16", "low-latency", true],
+      ["mi350x", "fp8", "low-latency", true],
+      ["mi350x", "mxfp4", "high-throughput", true],
+      ["mi350x", "mxfp4", "low-latency", true],
+      ["mi355x", "bf16", "low-latency", false],
+      ["mi355x", "fp8", "low-latency", false],
+      ["mi355x", "mxfp4", "high-throughput", false],
+      ["mi355x", "mxfp4", "low-latency", false],
+    ];
+    const amdCells = (config.cells || []).filter((cell) =>
+      Object.hasOwn(amdImages, cell.match?.hw));
+    if (amdCells.length !== expected.length) {
+      fail(where, `expected ${expected.length} AMD cells, found ${amdCells.length}`);
+    }
+    for (const [hw, quant, strategy, inherited] of expected) {
+      const cell = amdCells.find((entry) => entry.match.quant === quant
+        && entry.match.strategy === strategy && entry.match.hw === hw);
+      const label = `${hw}/${quant}/${strategy}`;
+      if (!cell) {
+        fail(where, `missing ${label} cell`);
+        continue;
+      }
+      if (cell.verified !== true) fail(where, `${label} must be marked supported`);
+      if (inherited && !cell.warn) {
+        fail(where, `${label} must state which architecture-identical GPU was measured`);
+      }
+      for (const flag of [
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+      ]) {
+        if (!cell.flags.includes(flag)) fail(where, `${label} is missing ${flag}`);
+      }
+      if (!cell.env.includes("SGLANG_USE_AITER=1")) {
+        fail(where, `${label} does not enable AITER`);
+      }
+      const revision = {
+        bf16: "--revision de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        fp8: "--revision 236dfdf285828023ca3bcd3f37366c58a3469b13",
+        mxfp4: "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
+      }[quant];
+      if (!cell.flags.includes(revision)) fail(where, `${label} is missing ${revision}`);
+      const speculative = cell.flags.some((flag) => flag.startsWith("--speculative-"));
+      if (strategy === "low-latency") {
+        for (const flag of [
+          "--speculative-algorithm EAGLE",
+          "--speculative-num-steps 3",
+          "--speculative-eagle-topk 1",
+          "--speculative-num-draft-tokens 4",
+        ]) {
+          if (!cell.flags.includes(flag)) fail(where, `${label} is missing ${flag}`);
+        }
+      } else if (speculative) {
+        fail(where, `${label} must remain the non-MTP control`);
+      }
+    }
+    for (const cell of amdCells) {
+      if (cell.flags.includes("--tp-size 8") && !cell.flags.includes("--ep-size 8")) {
+        fail(where, `${cell.match.hw}/${cell.match.quant}/${cell.match.strategy} exposes invalid plain TP8`);
+      }
+    }
+    for (const hw of ["mi300x", "mi325x"]) {
+      if (amdCells.some((cell) => cell.match.hw === hw && cell.match.quant === "mxfp4")) {
+        fail(where, `${hw} must not expose the MI35X-only MXFP4 checkpoint`);
+      }
+    }
+
+    const benchmarkKey = (match) => [
+      match.hw, match.quant, match.strategy, match.nodes,
+    ].join("|");
+    const amdBenchmarks = benchmarks.filter((row) =>
+      Object.hasOwn(amdImages, row.match?.hw));
+    if (amdBenchmarks.length !== expected.length) {
+      fail(where, `expected ${expected.length} AMD benchmark rows, found ${amdBenchmarks.length}`);
+    }
+    const benchmarkByKey = new Map(amdBenchmarks.map((row) => [
+      benchmarkKey(row.match), row,
+    ]));
+    if (benchmarkByKey.size !== amdBenchmarks.length) {
+      fail(where, "AMD benchmark rows contain duplicate hardware/quantization/strategy keys");
+    }
+    for (const [hw, quant, strategy] of expected) {
+      const key = [hw, quant, strategy, "single"].join("|");
+      if (!benchmarkByKey.has(key)) fail(where, `missing benchmark row for ${key}`);
+    }
+    const exactDirectScores = new Map([
+      ["mi300x|bf16|low-latency|single", 97.1842],
+      ["mi300x|fp8|low-latency|single", 96.4231],
+      ["mi355x|bf16|low-latency|single", 96.8798],
+      ["mi355x|fp8|low-latency|single", 96.8037],
+      ["mi355x|mxfp4|low-latency|single", 96.6514],
+    ]);
+    for (const [key, score] of exactDirectScores) {
+      const row = benchmarkByKey.get(key);
+      if (row?.accuracy?.gsm8k_pct !== score) {
+        fail(where, `${key} must retain direct GSM8K score ${score}`);
+      }
+      if (!row?.notes?.includes("1,314") || !row.notes.includes("zero request errors")) {
+        fail(where, `${key} must retain the direct full five-shot GSM8K evidence`);
+      }
+    }
+    for (const row of amdBenchmarks.filter((entry) =>
+      ["mi325x", "mi350x"].includes(entry.match.hw))) {
+      if (row.accuracy !== undefined) {
+        fail(where, `${benchmarkKey(row.match)} must not copy accuracy from another GPU`);
+      }
     }
   }
 
