@@ -4,11 +4,12 @@ import json
 import logging
 import os
 from collections import defaultdict
+from typing import Union
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, hugetlb_pool_free_bytes
 from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,17 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+    def free_hugetlb_bytes(self) -> int:
+        """Free hugetlb-pool bytes allocate() could map from, else 0.
+
+        Only the base allocate() maps MAP_HUGETLB (alloc_mmap honors
+        SGLANG_HUGEPAGE_SIZE). A subclass that overrides allocate() gets its
+        memory elsewhere and is credited nothing unless it overrides this too.
+        """
+        if type(self).allocate is not HostTensorAllocator.allocate:
+            return 0
+        return hugetlb_pool_free_bytes()
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
@@ -257,3 +269,11 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "musa": alloc_with_pin_memory,
     },
 )
+
+
+def device_uses_allocator(device: Union[str, torch.device]) -> bool:
+    """Whether allocations for ``device`` go through the HostTensorAllocator.
+
+    npu/musa allocate with torch.empty(pin_memory=True) and never see it.
+    """
+    return ALLOC_MEMORY_FUNCS[device] is alloc_with_host_register

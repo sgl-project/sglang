@@ -195,10 +195,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         memory_pool_host,
                         "host_memory_budget_bytes",
                         return_value=1024**3,
-                    ),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
                 ):
-                    DeepSeekV4PagedHostPool(
+                    pool = DeepSeekV4PagedHostPool(
                         pool_name="test",
                         device_buffers=device_buffers,
                         item_bytes=11,
@@ -207,6 +207,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                budget.assert_called_once_with(pool.allocator, torch.device("cpu"))
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     3 * 11,
@@ -228,10 +229,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         memory_pool_host,
                         "host_memory_budget_bytes",
                         return_value=1024**3,
-                    ),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
                 ):
-                    DeepSeekV4StateHostPool(
+                    pool = DeepSeekV4StateHostPool(
                         pool_name="test",
                         state_pools=state_pools,
                         num_host_pages=4,
@@ -239,6 +240,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                budget.assert_called_once_with(pool.allocator, torch.device("cpu"))
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     2 * 2 * 3,
