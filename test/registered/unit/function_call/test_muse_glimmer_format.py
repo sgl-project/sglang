@@ -51,12 +51,16 @@ class TestHasAtemMarkers(CustomTestCase):
         self.assertFalse(has_atem_markers(FUNCTION_CALLS_CLOSE))
 
     def test_similar_atem_tag_is_not_an_open_marker(self):
-        self.assertFalse(has_atem_markers('<atem:parameter name="city">SF</atem:parameter>'))
+        self.assertFalse(
+            has_atem_markers('<atem:parameter name="city">SF</atem:parameter>')
+        )
 
 
 class TestPartialMarkerLen(CustomTestCase):
     def test_empty_text_holds_nothing(self):
-        self.assertEqual(partial_marker_len("", _CHANNEL_MARKERS, MAX_CHANNEL_MARKER), 0)
+        self.assertEqual(
+            partial_marker_len("", _CHANNEL_MARKERS, MAX_CHANNEL_MARKER), 0
+        )
 
     def test_ordinary_text_holds_nothing(self):
         self.assertEqual(
@@ -186,9 +190,7 @@ class TestMarkerLengthInvariants(CustomTestCase):
         self.assertEqual(MAX_CHANNEL_MARKER, max(len(m) for m in _CHANNEL_MARKERS))
 
     def test_max_marker_covers_function_calls_open(self):
-        self.assertEqual(
-            MAX_MARKER, max(MAX_CHANNEL_MARKER, len(FUNCTION_CALLS_OPEN))
-        )
+        self.assertEqual(MAX_MARKER, max(MAX_CHANNEL_MARKER, len(FUNCTION_CALLS_OPEN)))
         self.assertGreaterEqual(MAX_MARKER, len(INVOKE_OPEN))
 
 
