@@ -1607,6 +1607,9 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL = EnvBool(True)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 disables sharing.
