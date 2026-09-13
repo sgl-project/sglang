@@ -24,6 +24,18 @@ if TYPE_CHECKING:
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
+    def prepare_weights_for_post_load(self, layer: nn.Module) -> None:
+        """Prepare registered state before post-load device staging.
+
+        This hook runs after checkpoint loading and before parameters are moved
+        to the device used by ``process_weights_after_loading``. Quantization
+        methods that rename registered parameters should do so here, allowing
+        the staging context to preserve the renamed slots' original devices.
+        Implementations must be idempotent because post-load processing may
+        invoke the hook again.
+        """
+        return
+
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
