@@ -360,8 +360,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
-                    # Determine and cache the value type at the start
-                    self._cached_value_type = self._get_value_type(
+                    # Cache only the declared type: _get_value_type falls back to
+                    # auto-detection from self._current_value, empty at this point.
+                    self._cached_value_type = get_argument_type(
                         func_name, self._current_key, tools
                     )
 
@@ -370,8 +371,11 @@ class Glm4MoeDetector(BaseFormatDetector):
                     final_value = self._xml_tag_buffer[:-12]
                     self._current_value += final_value
 
-                    # Use cached value type for consistency
-                    value_type = self._cached_value_type or "string"
+                    # An undeclared type can only be inferred from the finished
+                    # literal, which is complete exactly here.
+                    value_type = self._cached_value_type or self._get_value_type(
+                        func_name, self._current_key, tools
+                    )
 
                     if self._value_started:
                         # Output any remaining content
@@ -402,10 +406,12 @@ class Glm4MoeDetector(BaseFormatDetector):
                         closing_tag
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
-                    if not is_potential_closing:
+                    # With no declared type the literal must be seen whole
+                    # before it can be typed, so hold it in the tag buffer
+                    # instead of committing to a guess one character at a time.
+                    if not is_potential_closing and self._cached_value_type:
                         content = self._xml_tag_buffer
-                        # Use cached value type for consistency
-                        value_type = self._cached_value_type or "string"
+                        value_type = self._cached_value_type
 
                         if value_type == "string":
                             if not self._value_started:
