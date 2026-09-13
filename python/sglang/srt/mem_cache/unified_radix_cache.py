@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import math
 import threading
 import time
 from dataclasses import replace
@@ -121,6 +122,25 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+def _compressed_index_tree_params(params: CacheInitParams) -> CacheInitParams:
+    """Separate compressed-index ownership from physical KV transfer pages."""
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+
+    if params.disable or params.token_to_kv_pool_allocator is None:
+        return params
+    pool = params.token_to_kv_pool_allocator.get_kvcache()
+    if isinstance(pool, HybridLinearKVPool):
+        pool = pool.full_kv_pool
+    if not isinstance(pool, DSATokenToKVPool) or not pool.kpool_use_compress:
+        return params
+    # One compressed index row contains page_size pooled keys, stored in the
+    # first physical KV page of page_size * index_kpool logical tokens. A split
+    # inside that group would let children overwrite their parent's index row,
+    # including after that row has already been backed up to host memory.
+    tree_page = math.lcm(params.page_size, pool.page_size * pool.index_kpool)
+    return replace(params, page_size=tree_page)
+
+
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
 
@@ -153,6 +173,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: CacheInitParams,
     ):
+        # Only tree/component ownership is widened. init_hicache receives the
+        # original params, so host copies and the allocator still use physical
+        # KV pages, which need not be contiguous across a compression group.
+        self._transfer_page_size = params.page_size
+        params = _compressed_index_tree_params(params)
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
@@ -357,6 +382,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self.page_size != self._transfer_page_size:
+            raise ValueError(
+                "Compressed DSA does not support the external cache linker."
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -423,6 +452,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        if storage_backend is not None and self.page_size != params.page_size:
+            raise ValueError(
+                "Compressed DSA currently supports L2 HiCache only; "
+                "storage hashes and transfers require matching page sizes."
+            )
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -962,17 +996,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 rotation_base=req.kv_rotation_base,
             )
 
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
+            effective_cache_len = self._prepare_for_caching_req(
+                req, insert_params, len(token_ids), is_finished=True
+            )
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -1096,16 +1122,9 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=getattr(req, "priority", 0) or 0,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
+        effective_cache_len = self._prepare_for_caching_req(
+            req, insert_params, len(token_ids), is_finished=False
+        )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1215,6 +1234,51 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        *,
+        is_finished: bool,
+    ) -> int:
+        effective_cache_len = token_ids_len
+        checkpoint_component = None
+        for comp in self._components_tuple:
+            if comp.component_type == ComponentType.MAMBA:
+                checkpoint_component = comp
+                continue
+            cl = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=token_ids_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        # Resolve every other key cap before validating or donating an immutable
+        # recurrent checkpoint. An SWA branch may be shorter than the input and
+        # fall between available recurrent snapshots; its key cannot own a
+        # later state. This ordering must not depend on tree_components order.
+        if checkpoint_component is not None:
+            if (
+                not self.enable_mamba_extra_buffer
+                and effective_cache_len < token_ids_len
+            ):
+                # The no-buffer state belongs to the full processed prefix.
+                # Passing a shorter length would relabel it, not rewind it.
+                return 0
+            cl = checkpoint_component.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=effective_cache_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        return effective_cache_len
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
@@ -2856,6 +2920,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache is not initialized; launch with "
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
+        if self.page_size != self.cache_controller.page_size:
+            return False, "Compressed DSA currently supports L2 HiCache only."
         return self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,

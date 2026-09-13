@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -139,6 +140,17 @@ class DSAIndexerPoolHost(HostKVCache):
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        if getattr(self, "_destroyed", False):
+            return
+        # This pool keeps its registered backing tensor outside kv_buffer,
+        # which is the buffer released by HostKVCache.destroy().
+        buffer = self.index_k_with_scale_buffer
+        if buffer is not None and self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(buffer)
+        self.index_k_with_scale_buffer = None
+        super().destroy()
 
     def get_size_per_token(self):
         return (

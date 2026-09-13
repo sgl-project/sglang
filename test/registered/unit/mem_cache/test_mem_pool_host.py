@@ -7,12 +7,16 @@ import unittest.mock
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
@@ -277,6 +281,24 @@ class TestHostMemoryBudget(CustomTestCase):
             self.assertEqual(base.ranks_per_host(), 8)
 
 
+class TestDSAIndexerCleanup(CustomTestCase):
+    def test_destroy_releases_index_registration_once(self):
+        pool = object.__new__(DSAIndexerPoolHost)
+        buffer = torch.empty((2, 8448), dtype=torch.uint8)
+        pool.index_k_with_scale_buffer = buffer
+        pool.pin_memory = True
+        with (
+            unittest.mock.patch("sglang.srt.mem_cache.pool_host.dsa._is_cuda", True),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.pool_host.dsa._cuda_host_unregister"
+            ) as unregister,
+        ):
+            pool.destroy()
+            pool.destroy()
+        unregister.assert_called_once_with(buffer)
+        self.assertIsNone(pool.index_k_with_scale_buffer)
+
+
 class TestHostPoolGroup(CustomTestCase):
     @staticmethod
     def _group(**sizes):
@@ -313,6 +335,51 @@ class TestHostPoolGroup(CustomTestCase):
         group.release_transfers(transfers)
         self.assertEqual(group.available_size(), 4)
         self.assertEqual(group.available_size(PoolName.SWA), 2)
+
+    def test_controller_write_kv_derived_indexer_ownership_and_rollback(self):
+        # INDEXER borrows KV slots; MAMBA owns a separate allocation.
+        for mamba_capacity in (0, 1):
+            with self.subTest(mamba_capacity=mamba_capacity):
+                group = self._group(kv=4, indexer=4, mamba=mamba_capacity)
+                controller = object.__new__(HybridCacheController)
+                controller.mem_pool_host = group
+                controller.write_queue = []
+                controller.start_writing = unittest.mock.Mock()
+                source = torch.arange(2)
+                result = controller.write(
+                    source,
+                    extra_pools=[
+                        PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV),
+                        PoolTransfer(PoolName.MAMBA, device_indices=torch.tensor([3])),
+                    ],
+                )
+                if mamba_capacity:
+                    self.assertIsNotNone(result)
+                    op = controller.write_queue.pop()
+                    indexer = op.pool_transfers[0]
+                    self.assertIs(indexer.host_indices, result)
+                    self.assertIs(indexer.device_indices, source)
+                    self.assertEqual(group.available_size(), 2)
+                    self.assertEqual(group.available_size(PoolName.MAMBA), 0)
+                    self.assertEqual(group.available_size(PoolName.INDEXER), 4)
+                    self.assertEqual(group.release_transfers(op.pool_transfers), 1)
+                    group.free(result)
+                    controller.start_writing.assert_called_once()
+                else:
+                    self.assertIsNone(result)
+                    self.assertEqual(controller.write_queue, [])
+                    controller.start_writing.assert_not_called()
+                self.assertEqual(group.available_size(), 4)
+                self.assertEqual(group.available_size(PoolName.MAMBA), mamba_capacity)
+                self.assertEqual(group.available_size(PoolName.INDEXER), 4)
+                if mamba_capacity:
+                    recovered_mamba = group.get_pool(PoolName.MAMBA).alloc(1)
+                    self.assertEqual(recovered_mamba.tolist(), [0])
+                    self.assertIsNone(group.get_pool(PoolName.MAMBA).alloc(1))
+                # Capacity alone misses duplicate free-list entries.
+                recovered = group.alloc(4)
+                self.assertEqual(len(recovered.unique()), 4)
+                self.assertIsNone(group.alloc(1))
 
     def test_resolve_rolls_back_partial_allocation(self):
         group = self._group(kv=4, swa=2, mamba=1)
