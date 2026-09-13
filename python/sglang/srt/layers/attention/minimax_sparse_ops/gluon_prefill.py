@@ -15,6 +15,7 @@ position-ordered page range rounded up to whole sparse blocks.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -25,6 +26,9 @@ from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
 )
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 SPARSE_BLOCK_SIZE = 128
 # Gluon PS kernel supports kv_block_size in {16, 64}; 64 halves the block-table
@@ -36,11 +40,22 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# Hard cap on the gathered context span per forward (K and V buffers each):
-# 512 MiB per buffer at bf16 = 32768 pages = ~2.1M context tokens across the
-# batch; beyond that the entry point raises and the caller falls back to the
-# Triton kernel (which reads the pool in place).
-_MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
+# Hard cap on the gathered context span per forward (K and V buffers each),
+# SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB per buffer (default 2 GiB). The span
+# is the batch's total prefix + current-chunk length, so a prefill batch of many
+# long-prefix extends can exceed 2M tokens; the former fixed 512 MiB cap (32768
+# bf16 pages) made every such batch fall back to the Triton kernel for all
+# sparse layers. 2 GiB is 131072 pages (8.4M tokens) at bf16 and twice that for
+# an fp8 pool, above any KV pool this model is served with, while still
+# bounding the grow-only scratch; beyond it the entry point raises and the
+# caller falls back to the Triton kernel (which reads the pool in place).
+_LEGACY_SCRATCH_BYTES = 512 * 1024 * 1024
+_above_legacy_cap_count = 0
+
+
+def _max_scratch_pages(dtype: torch.dtype) -> int:
+    cap_bytes = int(envs.SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB.get()) << 20
+    return cap_bytes // (_PAGE_ELEMS * dtype.itemsize)
 
 
 @triton.jit
@@ -490,10 +505,21 @@ def gluon_sparse_prefill(
             cu_seqlens, prefix_lens, seq_lens, seq_lens_cpu, total_q
         )
     )
-    if total_pages > _MAX_SCRATCH_PAGES:
+    max_pages = _max_scratch_pages(k_cache.dtype)
+    if total_pages > max_pages:
         raise ValueError(
             f"gluon prefill context span too large for scratch: {total_pages} pages "
-            f"> cap {_MAX_SCRATCH_PAGES}"
+            f"> cap {max_pages}"
+        )
+    if total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize > _LEGACY_SCRATCH_BYTES:
+        global _above_legacy_cap_count
+        _above_legacy_cap_count += 1
+        logger.info(
+            "gluon prefill span %d pages (%d MiB per buffer) above the former "
+            "512 MiB cap; occurrence %d",
+            total_pages,
+            (total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize) >> 20,
+            _above_legacy_cap_count,
         )
 
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
