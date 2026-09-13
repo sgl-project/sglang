@@ -497,6 +497,9 @@ class TreeCacheNamespace(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
+    def evict_for_alloc(self, params: EvictParams):
+        pass
+
 
 @torch.no_grad
 def extend(reqs, model_runner):
