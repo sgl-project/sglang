@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     checkpoint_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
     RESIDENT,
     ComponentResidencyError,
 )
@@ -526,25 +527,52 @@ class ComponentLoader(ABC):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            resolved_component_name = component_name or "component"
+            start_on_cpu = bool(
+                component_name is not None
+                and server_args.should_start_component_on_cpu(resolved_component_name)
+            )
             if uses_native_transformers_quantization(
-                config, component_name or "component"
+                config, resolved_component_name
             ):
-                resolved_component_name = component_name or "component"
                 explicit_residency = server_args.explicit_residency_mode(
                     resolved_component_name
                 )
-                if explicit_residency is not None and explicit_residency != RESIDENT:
+                # Quant TE can component-offload; layerwise is unsupported.
+                if explicit_residency == LAYERWISE_OFFLOAD:
                     raise ComponentCheckpointUnsupportedError(
                         "Transformers-managed quantized component "
-                        f"{resolved_component_name!r} requires resident placement; "
-                        f"got explicit mode {explicit_residency!r}"
+                        f"{resolved_component_name!r} does not support "
+                        "layerwise offload; use component CPU offload or "
+                        "keep it resident"
                     )
-                server_args.require_component_resident(
-                    resolved_component_name,
-                    feature_name="Transformers quantized component",
-                )
+                if start_on_cpu:
+                    load_kwargs["device_map"] = {
+                        "": self.target_device(component_starts_on_cpu=True)
+                    }
+                else:
+                    if (
+                        explicit_residency is not None
+                        and explicit_residency != RESIDENT
+                    ):
+                        raise ComponentCheckpointUnsupportedError(
+                            "Transformers-managed quantized component "
+                            f"{resolved_component_name!r} requires resident "
+                            f"placement; got explicit mode {explicit_residency!r}"
+                        )
+                    server_args.require_component_resident(
+                        resolved_component_name,
+                        feature_name="Transformers quantized component",
+                    )
+                    load_kwargs["device_map"] = {
+                        "": self.target_device(component_starts_on_cpu=False)
+                    }
+                self._native_load_manages_placement = True
+            elif start_on_cpu:
+                # Native fallback used to ignore CPU-offload and materialize on
+                # CUDA during from_pretrained (#34772). Pin device_map to CPU.
                 load_kwargs["device_map"] = {
-                    "": self.target_device(component_starts_on_cpu=False)
+                    "": self.target_device(component_starts_on_cpu=True)
                 }
                 self._native_load_manages_placement = True
             model_class = self.resolve_native_transformers_model_class(config)
