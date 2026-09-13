@@ -13,7 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RecordingAttentionBackend:
@@ -69,7 +69,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         real_num_tokens=2,
     ):
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=real_num_tokens,
+            global_num_token_non_padded_cpu=real_num_tokens,
             out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
             positions=torch.arange(num_tokens, dtype=torch.int64),
             _attn_output=None,

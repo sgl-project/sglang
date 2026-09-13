@@ -8,6 +8,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cache
+from pkgutil import resolve_name
 from typing import NamedTuple, cast
 
 import torch
@@ -19,9 +20,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
 logger = init_logger(__name__)
+
+STR_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
 
 
 def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
@@ -173,8 +175,7 @@ def _log_component_attn_backend_summary(
             backend_parts.append(backend_name)
 
     logger.info_once(
-        f"Attention backends for {context.component_name}: "
-        f"{', '.join(backend_parts)}"
+        f"Attention backends for {context.component_name}: {', '.join(backend_parts)}"
     )
 
 
@@ -221,6 +222,13 @@ def get_attn_backend(
     default_attention_backend: AttentionBackendEnum | None = None,
     is_cross_attention: bool = False,
 ) -> type[AttentionBackend]:
+    """Resolve an attention backend for one layer.
+
+    ``supported_attention_backends`` constrains automatic selection only. An
+    explicitly requested backend may be newer than a model's preference set;
+    it is admitted when the platform resolves it and the backend satisfies the
+    layer's semantic requirements.
+    """
     requirements = attention_requirements or AttentionRequirements()
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -285,7 +293,7 @@ def get_attn_backend(
             if candidate not in candidate_backends:
                 candidate_backends.append(candidate)
 
-    supported_backends = set(be_tuple)
+    automatic_backends = set(be_tuple)
     attention_backend_cls = None
     fallback_reason = None
     selection_error = None
@@ -313,8 +321,11 @@ def get_attn_backend(
                     "cross-attention"
                 )
             continue
-        if supported_backends and not _is_backend_supported(
-            candidate_backend, supported_backends
+        explicit_candidate = selection_is_explicit and candidate_index == 0
+        if (
+            automatic_backends
+            and not explicit_candidate
+            and not _is_backend_supported(candidate_backend, automatic_backends)
         ):
             if selection_error is None:
                 selection_error = ValueError(
@@ -381,17 +392,6 @@ def _cached_get_attn_backend(
         pass
     elif selected_backend is None and len(supported_attention_backends) == 1:
         selected_backend = next(iter(supported_attention_backends))
-    elif selected_backend is not None and not _is_backend_supported(
-        selected_backend, supported_attention_backends
-    ):
-        supported_attention_backends_str = [
-            supported_attention_backend.__str__()
-            for supported_attention_backend in supported_attention_backends
-        ]
-        raise ValueError(
-            f"Attention backend '{selected_backend}' is not supported by this "
-            f"attention layer; supported backends: {supported_attention_backends_str}"
-        )
 
     attention_cls = current_platform.get_attn_backend_cls_str(
         selected_backend, head_size, dtype
@@ -400,7 +400,7 @@ def _cached_get_attn_backend(
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
         )
-    return cast(type[AttentionBackend], resolve_obj_by_qualname(attention_cls))
+    return cast(type[AttentionBackend], resolve_name(attention_cls))
 
 
 def _is_backend_supported(

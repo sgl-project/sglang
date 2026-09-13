@@ -32,7 +32,7 @@ from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _BASE_LOAD = msgspec.structs.replace(

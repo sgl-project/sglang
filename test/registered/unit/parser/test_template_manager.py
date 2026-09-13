@@ -4,6 +4,8 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
+
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
@@ -36,8 +38,27 @@ def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
     return patch.dict(sys.modules, {module.__name__: module})
 
 
-class TestTemplateManagerReasoningDetection(unittest.TestCase):
+def _glm53_template(concat):
+    """GLM-5.3 shape: always-on thinking behind a ``Reasoning Effort:`` header
+    (no ``enable_thinking`` toggle) and the compact GLM-4.7 tool-call format;
+    HF revisions differ only in the ``+`` / ``~`` concat operator."""
+    return (
+        "[gMASK]<sop>\n"
+        "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined "
+        "and reasoning_effort in ['low', 'high'] else 'max' -%}\n"
+        "<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}\n"
+        "{% for tc in m.tool_calls %}\n"
+        f"{{{{- '<tool_call>' {concat} tc.name -}}}}\n"
+        "{% set _args = tc.arguments %}"
+        "{% for k, v in _args.items() %}"
+        "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>"
+        "{% endfor %}</tool_call>\n"
+        "{% endfor %}\n"
+        "<|assistant|>{{- '<think>' -}}"
+    )
 
+
+class TestTemplateManagerReasoningDetection(unittest.TestCase):
     def _detect(self, template, vocab):
         force, config = detect_reasoning_pattern(template)
         parser = detect_reasoning_parser(
@@ -77,6 +98,23 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
         )
         self.assertEqual(parser, "glm45")
+
+    def test_glm53_effort_template_resolves_glm_parsers(self):
+        # Without an enable_thinking toggle the GLM-4.5 rule misses, and the
+        # template used to fall through to deepseek-r1 + the xml_kv fallback
+        # (glm45 tool parser), which cannot read the compact tool-call format.
+        vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
+        for concat in ("+", "~"):
+            template = _glm53_template(concat)
+            with self.subTest(concat=concat):
+                force, config, parser = self._detect(template, vocab)
+                self.assertEqual(parser, "glm45")
+                self.assertEqual(
+                    detect_tool_call_parser(
+                        template, _DummyTokenizer(vocab), config, force
+                    ),
+                    "glm47",
+                )
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
@@ -145,15 +183,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             # An explicit boolean=false second argument is equivalent to the
             # one-argument form.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(true, false) -%}",
+                "{%- set enable_thinking = enable_thinking | default(true, false) -%}",
                 True,
             ),
             # Boolean mode with a false default still maps False -> False and
             # True -> True, so it is a working default-off toggle.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(false, true) -%}",
+                "{%- set enable_thinking = enable_thinking | default(false, true) -%}",
                 False,
             ),
             (
@@ -242,6 +278,38 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "nemotron_3")
 
+    def test_nemotron_with_shared_parameter_block_not_misclassified_as_granite(self):
+        # Granite 4.2 and Nemotron-3 templates share the same
+        # <function=name>/<parameter=key> tool-call instruction block; without
+        # a Granite-only signature (defer_loading) this must stay nemotron_3.
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        {{- '<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n</function>\\n</tool_call>' }}
+        """
+        _, config, parser = self._detect(template, ["<|endoftext|>"])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "nemotron_3")
+
+    def test_granite_detected_via_defer_loading_signature(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        {%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}
+        {{- '<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n</function>\\n</tool_call>' }}
+        """
+        _, config, parser = self._detect(template, [])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "granite_thinking_parser")
+
     def test_minimax_uses_template_signature_without_toggle_config(self):
         template = """
         {%- set toolcall_begin_token = '<minimax:tool_call>' -%}
@@ -271,6 +339,42 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         """
         _, _, parser = self._detect(template, ["<minimax:tool_call>"])
         self.assertEqual(parser, "minimax")
+
+    HYV4_TEMPLATE = (
+        "{%- set reasoning_mode_token = '<｜reasoning_mode:opensource｜>' %}\n"
+        "{%- if not reasoning_effort is defined %}\n"
+        "    {%- set reasoning_effort = 'high' %}\n"
+        "{%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}\n"
+        "{%- endif %}\n"
+        "<tool_call:opensource>{{ name }}<arg_key:opensource>{{ k }}</arg_key:opensource>"
+    )
+
+    HYV4_VOCAB = [
+        "<tool_calls:opensource>",
+        "<tool_call:opensource>",
+        "<arg_key:opensource>",
+        "<arg_value:opensource>",
+    ]
+
+    def test_hyv4_effort_template_detected_with_special_case(self):
+        # Hy4 drops <tool_sep>; detection must key on the effort-mode template
+        # signature plus the suffixed arg tokens instead.
+        force, config, parser = self._detect(self.HYV4_TEMPLATE, self.HYV4_VOCAB)
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertEqual(parser, "hunyuan")
+        self.assertEqual(
+            detect_tool_call_parser(
+                self.HYV4_TEMPLATE, _DummyTokenizer(self.HYV4_VOCAB), config, force
+            ),
+            "hunyuan",
+        )
+
+    def test_hyv4_template_without_arg_tokens_not_hunyuan(self):
+        _, config, parser = self._detect(self.HYV4_TEMPLATE, ["<tool_call:opensource>"])
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertNotEqual(parser, "hunyuan")
 
 
 class TestTemplateDetectionRuleMatrix(unittest.TestCase):
@@ -486,6 +590,28 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
         self.assertEqual(config.toggle_param, "enable_thinking")
         self.assertTrue(config.default_enabled)
 
+    def test_k2_horizon_detects_always_on_reasoning_and_tool_parsers(self):
+        template = """
+        {% set tool_call_fmt = tool_call_format | default('xml') %}
+        {% set effort = reasoning_effort | default('high') %}
+        <ifm|think><ifm|think_fast><ifm|think_faster>
+        <ifm|tool_calls><ifm|tool_call>
+        """
+        force, config = detect_reasoning_pattern(template)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertTrue(force)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.special_case, "always")
+        self.assertEqual(
+            detect_reasoning_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+        self.assertEqual(
+            detect_tool_call_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+
 
 class TestToolCallParserDetection(unittest.TestCase):
     """Tests for detect_tool_call_parser() using real model tokenizers."""
@@ -660,6 +786,22 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "glm47",
             ),
             (
+                "glm47_tilde_concat_tool_call",
+                (
+                    "[gMASK]<sop>\n"
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n"
+                    "{% for tc in m.tool_calls %}\n"
+                    "{{- '<tool_call>' ~ tc.name -}}\n"
+                    "{% set _args = tc.arguments %}"
+                    "{% for k, v in _args.items() %}"
+                    "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>"
+                    "{% endfor %}</tool_call>\n"
+                    "{% endfor %}"
+                ),
+                ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
+                "glm47",
+            ),
+            (
                 "glm45_newline_tool_call",
                 (
                     "[gMASK]<sop>\n"
@@ -703,6 +845,9 @@ class TestToolCallParserDetection(unittest.TestCase):
             rule.name: i for i, rule in enumerate(REASONING_PARSER_RULES)
         }
         self.assertLess(reasoning_index["deepseek_v4"], reasoning_index["deepseek_v3"])
+        self.assertLess(
+            reasoning_index["glm45"], reasoning_index["deepseek_r1_think_tags"]
+        )
         self.assertLess(
             reasoning_index["hunyuan"], reasoning_index["deepseek_r1_think_tags"]
         )
@@ -837,7 +982,9 @@ class TestResolveAutoParsers(unittest.TestCase):
             reasoning_parser="auto",
             tool_call_parser="auto",
         )
-        object.__setattr__(args, "model_path", "nonexistent/model-does-not-exist-xyz")
+        msgspec.Struct.__setattr__(
+            args, "model_path", "nonexistent/model-does-not-exist-xyz"
+        )
         with _patch_hf_transformers_utils(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),

@@ -72,9 +72,9 @@ class _BeamSweepBase(CustomTestCase):
         cls.prompts = [r.prompt for r in rows if r.prompt_len < MAX_PROMPT_LEN][
             :NUM_PROMPTS
         ]
-        assert (
-            len(cls.prompts) == NUM_PROMPTS
-        ), f"only {len(cls.prompts)} short prompts sampled"
+        assert len(cls.prompts) == NUM_PROMPTS, (
+            f"only {len(cls.prompts)} short prompts sampled"
+        )
 
     @classmethod
     def tearDownClass(cls):

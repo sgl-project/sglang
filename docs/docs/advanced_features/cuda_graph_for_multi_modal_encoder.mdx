@@ -61,14 +61,17 @@ SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct
 ```
-Or you can run CUDA Graph for ViT together with Piecewise CUDA Graph feature by both setting env variable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` and setting `--enable-piecewise-cuda-graph`, for example:
+To run the ViT graph together with Piecewise CUDA Graph over the decoder's
+prefill, ask for the prefill backend explicitly. Qwen3-VL is on neither
+multimodal allowlist, so the default backend resolves prefill to `disabled` for
+it; naming a backend locks the choice and skips that rule:
 ```shell Command
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct \
-  --piecewise-cuda-graph-max-tokens 4096 \
-  --enable-piecewise-cuda-graph \
-  --piecewise-cuda-graph-compiler eager
+  --cuda-graph-backend-prefill tc_piecewise \
+  --cuda-graph-max-bs-prefill 4096 \
+  --cuda-graph-tc-compiler eager
 ```
 
 ## Known supported models

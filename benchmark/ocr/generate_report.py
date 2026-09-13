@@ -159,12 +159,12 @@ def _render_sample(sample: dict, failures_only: bool) -> str:
     if failures_only and passed == total and not error:
         return ""
 
-    pct = f"{100*passed//total}%" if total else "—"
+    pct = f"{100 * passed // total}%" if total else "—"
     header_cls = "fail" if (error or passed < total) else "pass"
 
     parts = [f'<div class="sample">']
     parts.append(
-        f'<details {"open" if (error or passed < total) else ""}>'
+        f"<details {'open' if (error or passed < total) else ''}>"
         f'<summary class="sample-header {header_cls}">'
         f"<span>📄 {html.escape(pdf)}  &nbsp;·&nbsp; page {page}</span>"
         f"<span>"
@@ -218,7 +218,7 @@ def _render_sample(sample: dict, failures_only: bool) -> str:
                         f'<div class="rendered">{_latex_to_display(latex)}</div>'
                     )
             elif ttype in ("present", "absent", "text_presence", "text_absence"):
-                parts.append(f'<pre>{html.escape(ti.get("text", ""))}</pre>')
+                parts.append(f"<pre>{html.escape(ti.get('text', ''))}</pre>")
             elif ttype in ("order", "natural_reading_order"):
                 before = ti.get("before", "")
                 after = ti.get("after", "")
@@ -236,7 +236,7 @@ def _render_sample(sample: dict, failures_only: bool) -> str:
                         parts.append(f'<div class="rendered">{m}</div>')
                     if len(matches) > 6:
                         parts.append(
-                            f'<p style="color:#888;font-size:0.8em">… and {len(matches)-6} more</p>'
+                            f'<p style="color:#888;font-size:0.8em">… and {len(matches) - 6} more</p>'
                         )
                 else:
                     parts.append(

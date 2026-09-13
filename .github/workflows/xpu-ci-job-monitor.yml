@@ -127,9 +127,9 @@ jobs:
         id: parse
         run: |
           # Parse pr-test-xpu.yml and extract job names (exclude utility jobs)
-          # Excluded: check-changes, pr-gate, wait-for-stage-a, finish
+          # Excluded: check-changes, pr-gate, finish
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-xpu.yml | \
-            grep -v -E '^(check-changes|pr-gate|wait-for-stage-a|finish)$' | \
+            grep -v -E '^(check-changes|pr-gate|finish)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
@@ -288,10 +288,10 @@ jobs:
           with open(snap_path) as f:
               snapshot = json.load(f)
 
-          # Only look at nightly-test-intel jobs
+          # Snapshot writer emits `workflow` (filename), not `workflow_path`.
           nightly = [
               j for j in snapshot.get("jobs", [])
-              if j.get("workflow_path", "").endswith("nightly-test-intel.yml")
+              if (j.get("workflow") or "").endswith("nightly-test-intel.yml")
           ]
 
           # status_summary style counts, per job name

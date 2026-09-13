@@ -27,7 +27,16 @@ on:
         type: string
         required: true
       restore_runs_on:
-        description: 'Runner label for the cache-hit path and the collect job. Wants free capacity and nothing else, since neither compiles nor imports the modules.'
+        description: >
+          Runner label for the cache-hit path. Only republishes bytes, so it wants
+          free capacity and is the one job here with no architecture requirement.
+        type: string
+        default: ubuntu-latest
+      collect_runs_on:
+        description: >
+          Runner label for the collect job. Must be runs_on's ARCHITECTURE: its GLIBC
+          gate reads the .so with objdump, and the hosted images ship a single-target
+          binutils.
         type: string
         default: ubuntu-latest
       artifact_name:
@@ -39,7 +48,10 @@ on:
         type: string
         default: rust-ext-x86_64-cp310-cp312
       max_glibc:
-        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
+        description: >
+          Highest GLIBC symbol version the built .so files may require. A ceiling set
+          by the oldest image that has to LOAD them, not by whoever builds them; the
+          pools are not all on one image, and x86_64's oldest is jammy at 2.35.
         type: string
         default: '2.35'
       git_ref:
@@ -76,10 +88,12 @@ jobs:
           ref: ${{ inputs.git_ref || github.sha }}
           # Just what the cache key hashes, plus the action and script this job
           # runs: the workspace is cold here and the rest of the tree is mostly
-          # docs. Both jobs must hash the same rust/** set, which this preserves.
+          # docs. Both jobs must hash the same Rust extension inputs, which this
+          # preserves.
           # Cone mode off is what allows naming a single file.
           sparse-checkout: |
             rust
+            proto
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
@@ -103,7 +117,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -298,7 +312,7 @@ jobs:
   # entry both cover the whole set, so they join in one job that sees all of it.
   collect:
     needs: compile
-    runs-on: ${{ inputs.restore_runs_on }}
+    runs-on: ${{ inputs.collect_runs_on }}
     timeout-minutes: 15
     name: Collect Rust Ext
     outputs:
@@ -312,6 +326,7 @@ jobs:
           # both have to check out the same set for hashFiles to agree.
           sparse-checkout: |
             rust
+            proto
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
@@ -347,7 +362,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4

@@ -28,7 +28,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
@@ -112,6 +112,61 @@ class TestCudaIpcTransport(CustomTestCase):
             # consumer exits quickly, so it must close the mapping before the
             # producer destroys the shared allocation.
             del reconstructed, proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                if producer_result is None:
+                    producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
+    def test_borrowed_tensor_keeps_lease_until_explicit_release(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = borrowed = consumed = None
+        producer_result = None
+        try:
+            try:
+                proxy, expected = proxy_queue.get(timeout=60)
+            except queue.Empty:
+                producer_result = producer_results.get(timeout=5)
+                _status, payload = producer_result
+                self.fail(
+                    f"CUDA IPC producer failed before sending its proxy: {payload}"
+                )
+
+            borrowed = proxy.borrow_on_target_device(0)
+            self.assertIsNotNone(borrowed)
+            consumed = borrowed + 1
+            torch.cuda.synchronize()
+
+            self.assertFalse(proxy._consumer_acknowledged)
+            proxy.release_without_reconstruction()
+            torch.cuda.synchronize()
+
+            self.assertEqual(
+                consumed.cpu().tolist(),
+                (torch.tensor(expected) + 1).tolist(),
+            )
+            self.assertTrue(proxy._consumer_acknowledged)
+            self.assertIsNone(proxy._borrowed_storage)
+        finally:
+            del consumed, borrowed, proxy
             _pool_handle_cache_clear()
             gc.collect()
             torch.cuda.ipc_collect()

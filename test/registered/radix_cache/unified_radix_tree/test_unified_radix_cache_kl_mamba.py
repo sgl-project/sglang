@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=742, stage="extra-b", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
@@ -56,7 +56,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
@@ -101,7 +101,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
@@ -160,7 +160,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),

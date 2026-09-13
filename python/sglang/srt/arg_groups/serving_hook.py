@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
+    is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
 from sglang.utils import is_in_ci
@@ -74,7 +75,7 @@ def handle_ssl_validation(server_args: Any):
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
             raise ValueError(
-                "--http2-max-concurrent-streams must be between 1 and " "4294967295."
+                "--http2-max-concurrent-streams must be between 1 and 4294967295."
             )
         if not 1024 <= cfg.http2_initial_connection_window_size < 2**31:
             raise ValueError(
@@ -342,8 +343,7 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
             raise ValueError(
-                "SGLANG_GRPC_WORKER_THREADS "
-                f"({cfg.grpc_worker_threads}) must be >= 1"
+                f"SGLANG_GRPC_WORKER_THREADS ({cfg.grpc_worker_threads}) must be >= 1"
             )
 
     # Native gRPC is incompatible with launch paths it doesn't wire into.
@@ -419,11 +419,11 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120
+        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-            "DeepGEMM FP4 indexer support."
+            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
     # it, mirroring the forward scale split: the ue8m0 path
@@ -481,8 +481,7 @@ def handle_other_validations(server_args: Any):
             )
         elif resolved_view(server_args).uses_mamba_radix_cache:
             logger.warning(
-                "Optimistic prefill does not support models that use "
-                "mamba radix cache."
+                "Optimistic prefill does not support models that use mamba radix cache."
             )
             declare_resolution(
                 server_args,
@@ -850,8 +849,7 @@ def handle_multimodal_feature_transport(server_args: Any):
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")
         if cfg.pp_size != 1:
             raise ValueError(
-                "--mm-feature-transport=cuda_vmm does not support pipeline "
-                "parallelism."
+                "--mm-feature-transport=cuda_vmm does not support pipeline parallelism."
             )
         if envs.SGLANG_RUST_SERVER.get():
             raise ValueError(

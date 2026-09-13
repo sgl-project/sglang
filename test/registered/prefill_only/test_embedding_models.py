@@ -35,7 +35,7 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
-register_cuda_ci(est_time=136, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=154, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_TO_CONFIG = {
     "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
@@ -57,7 +57,6 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestEmbeddingModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -122,9 +121,9 @@ class TestEmbeddingModels(CustomTestCase):
             print("similarity diff", abs(similarity - 1))
 
             if len(prompts[i]) <= 1000:
-                assert torch.all(
-                    abs(similarity - 1) < prefill_tolerance
-                ), "embeddings are not all close"
+                assert torch.all(abs(similarity - 1) < prefill_tolerance), (
+                    "embeddings are not all close"
+                )
 
     def test_prefill_logits(self):
         models_to_test = MODELS

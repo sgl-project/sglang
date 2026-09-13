@@ -196,7 +196,7 @@ def _validate_conditions(
             MINIMAX_H3_CONDITION_ROLE_REFERENCE,
         ):
             raise ValueError(
-                f"{cpath}.role must be keyframe or reference, " f"got {role!r}"
+                f"{cpath}.role must be keyframe or reference, got {role!r}"
             )
         cond_type = _require_str(cond.get("type"), f"{cpath}.type")
         try:

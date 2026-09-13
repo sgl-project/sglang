@@ -1,11 +1,11 @@
-// KDA provenance: BBuf/KDA-Pilot, merged in SGLang PR #29708.
+// KDA provenance: SGLang PR #29708.
 // CUDA fast path for LTX2 Q/K RMSNorm + split RoPE.
 //
 // Developed with MIT HAN Lab Kernel Design Agents:
 // https://github.com/mit-han-lab/kernel-design-agents
 //
-// This mirrors the LTX2 eager oracle: RMSNorm and split RoPE both run in
-// fp32, rounding to bf16 only once at the final attention input.
+// The original FP32 path rounds only at the final attention input. The
+// Hopper variant preserves the eager BF16 RMSNorm and cosine-product rounding.
 
 #pragma once
 
@@ -71,17 +71,29 @@ SGL_DEVICE float compute_rstd(
   return *s_rstd;
 }
 
+template <bool kRoundIntermediates>
 SGL_DEVICE float norm_value(float x, float weight, float rstd) {
-  return weight * (rstd * x);
+  const float value = weight * (rstd * x);
+  if constexpr (kRoundIntermediates) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+  }
+  return value;
 }
 
+template <bool kRoundIntermediates>
 SGL_DEVICE void rope_pair(float x0, float x1, float cos, float sin, float& y0, float& y1) {
-  const float p0 = x0 * cos;
-  const float p1 = x1 * cos;
+  float p0 = x0 * cos;
+  float p1 = x1 * cos;
+  if constexpr (kRoundIntermediates) {
+    // Hopper eager stores the BF16 cosine product before its addcmul update.
+    p0 = __bfloat162float(__float2bfloat16_rn(p0));
+    p1 = __bfloat162float(__float2bfloat16_rn(p1));
+  }
   y0 = fmaf(-sin, x1, p0);
   y1 = fmaf(sin, x0, p1);
 }
 
+template <bool kRoundIntermediates>
 __global__ void ltx2_qknorm_split_rope_kernel(
     const bf16_t* __restrict__ x,
     const bf16_t* __restrict__ cos,
@@ -119,19 +131,23 @@ __global__ void ltx2_qknorm_split_rope_kernel(
     const int64_t offset = pair - head * half_dim;
     const int64_t idx0 = head * head_dim + offset;
     const int64_t idx1 = idx0 + half_dim;
-    const float n0 = norm_value(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
-    const float n1 = norm_value(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
+    const float n0 =
+        norm_value<kRoundIntermediates>(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
+    const float n1 =
+        norm_value<kRoundIntermediates>(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
     const int64_t cos_offset = batch * stride_cos_b + head * stride_cos_h + token * stride_cos_t + offset;
     const int64_t sin_offset = batch * stride_sin_b + head * stride_sin_h + token * stride_sin_t + offset;
 
     float y0;
     float y1;
-    rope_pair(n0, n1, __bfloat162float(cos[cos_offset]), __bfloat162float(sin[sin_offset]), y0, y1);
+    rope_pair<kRoundIntermediates>(
+        n0, n1, __bfloat162float(cos[cos_offset]), __bfloat162float(sin[sin_offset]), y0, y1);
     outrow[idx0] = __float2bfloat16_rn(y0);
     outrow[idx1] = __float2bfloat16_rn(y1);
   }
 }
 
+template <bool kRoundIntermediates>
 inline void launch_one(
     const tvm::ffi::TensorView& x,
     const tvm::ffi::TensorView& cos,
@@ -155,7 +171,7 @@ inline void launch_one(
   }
   host::RuntimeCheck(num_rows <= static_cast<int64_t>(UINT32_MAX), "LTX2 QKNorm split-RoPE grid is too large");
   host::LaunchKernel(dim3(static_cast<uint32_t>(num_rows)), dim3(32, 4), device)(
-      ltx2_qknorm_split_rope_kernel,
+      ltx2_qknorm_split_rope_kernel<kRoundIntermediates>,
       reinterpret_cast<const bf16_t*>(data_ptr(x)),
       reinterpret_cast<const bf16_t*>(data_ptr(cos)),
       reinterpret_cast<const bf16_t*>(data_ptr(sin)),
@@ -174,6 +190,7 @@ inline void launch_one(
 }
 
 struct LTX2QKNormSplitRopeKernel {
+  template <bool kRoundIntermediates>
   static void
   run(tvm::ffi::TensorView q_out,
       tvm::ffi::TensorView k_out,
@@ -233,7 +250,7 @@ struct LTX2QKNormSplitRopeKernel {
 
     const int64_t batch_size = batch.unwrap();
     const DLDevice dl_device = device.unwrap();
-    launch_one(
+    launch_one<kRoundIntermediates>(
         q,
         q_cos,
         q_sin,
@@ -251,7 +268,7 @@ struct LTX2QKNormSplitRopeKernel {
         q_sin.stride(1),
         q_sin.stride(2),
         dl_device);
-    launch_one(
+    launch_one<kRoundIntermediates>(
         k,
         k_cos,
         k_sin,
