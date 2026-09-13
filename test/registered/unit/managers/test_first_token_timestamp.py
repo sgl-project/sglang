@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,6 +13,7 @@ from test_tokenizer_manager_rid_cleanup import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -20,6 +22,7 @@ from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -127,6 +130,35 @@ class TestFirstTokenFlush(unittest.TestCase):
         req = _FakeReq("test", [10], finished=True)
         req.check_match_stop_str_prefix = Mock(return_value=True)
         self.assertEqual(self.emit(req).output_ids, [[10]])
+        req.check_match_stop_str_prefix.assert_not_called()
+
+    def test_later_stop_prefix_defers_flush_without_advancing_offsets(self):
+        for count in (50, 53, 112):
+            with self.subTest(count=count):
+                req = _FakeReq("test", [0])
+                self.assertEqual(self.emit(req).output_ids, [[0]])
+                offsets = (req.send_token_offset, req.send_decode_id_offset)
+                req.output_ids = req.output_ids_through_stop = list(range(count))
+                req.check_match_stop_str_prefix = Mock(return_value=True)
+                self.assertIsNone(self.emit(req))
+                req.check_match_stop_str_prefix.assert_called_once()
+                self.assertEqual(
+                    (req.send_token_offset, req.send_decode_id_offset), offsets
+                )
+
+                # Flush the entire buffered delta when the prefix stops matching,
+                # without waiting for the next exact interval boundary.
+                req.output_ids = req.output_ids_through_stop = list(range(count + 1))
+                req.check_match_stop_str_prefix.return_value = False
+                self.assertEqual(self.emit(req).output_ids, [list(range(1, count + 1))])
+                self.assertEqual(req.send_token_offset, count + 1)
+
+    def test_non_output_steps_do_not_check_stop_prefix(self):
+        req = _FakeReq("test", [10])
+        self.emit(req)
+        req.output_ids = req.output_ids_through_stop = [10, 11]
+        req.check_match_stop_str_prefix = Mock(return_value=True)
+        self.assertIsNone(self.emit(req))
         req.check_match_stop_str_prefix.assert_not_called()
 
     def test_streaming_interval_and_stop_prefix_are_preserved(self):
@@ -304,6 +336,133 @@ class TestNonstreamMetrics(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(
             state.time_stats.get_e2e_latency(), 1.2 + (output_length - counts[0]) * 0.01
         )
+
+
+class TestNonstreamStopPrefix(unittest.IsolatedAsyncioTestCase):
+    async def test_later_stop_prefix_is_not_retained_in_final_response(self):
+        for mode in (DisaggregationMode.NULL, DisaggregationMode.DECODE):
+            for no_stop_trim in (False, True):
+                for prefix_len, counts in (
+                    (49, list(range(1, 54))),
+                    (51, [1, 49, 53, 55]),
+                    (110, [1, 112, 114]),
+                ):
+                    with self.subTest(
+                        mode=mode, no_stop_trim=no_stop_trim, counts=counts
+                    ):
+                        text = "a" * prefix_len + "STOP"
+                        await self._check_request(
+                            text,
+                            counts,
+                            [1, len(text)],
+                            text if no_stop_trim else "a" * prefix_len,
+                            mode=mode,
+                            no_stop_trim=no_stop_trim,
+                            expected_finish={"type": "stop", "matched": "STOP"},
+                        )
+
+    async def test_later_prefix_releases_without_losing_tokens(self):
+        for text, counts, flushes, stop in (
+            ("a" * 49 + "STXz", list(range(1, 54)), [1, 52, 53], ["STOP"]),
+            ("a" * 51 + "STXz", [1, 49, 53, 54, 55], [1, 54, 55], ["STOP"]),
+            (
+                "a" * 49 + "STXQz",
+                list(range(1, 55)),
+                [1, 53, 54],
+                ["STOP", "STXY"],
+            ),
+        ):
+            with self.subTest(counts=counts, stop=stop):
+                await self._check_request(text, counts, flushes, text, stop=stop)
+
+    async def test_length_finish_keeps_an_unmatched_stop_prefix(self):
+        text = "a" * 49 + "ST"
+        await self._check_request(text, list(range(1, 52)), [1, 51], text)
+
+    async def test_empty_metadata_with_configured_stop_is_still_sent(self):
+        tokenizer = self._tokenizer()
+        params = SamplingParams(stop=["STOP"])
+        params.normalize(tokenizer)
+        req = Req("test", "", array("q"), params)
+        req.tokenizer = tokenizer
+        acc = accumulator()
+        acc.accept(req=req)
+        payload = acc.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(list(payload.output_ids[0]), [])
+        self.assertEqual(payload.finished_reasons, [None])
+
+    @staticmethod
+    def _tokenizer():
+        return SimpleNamespace(
+            encode=lambda text, **kwargs: [ord(c) for c in text],
+            decode=lambda ids, **kwargs: "".join(chr(i) for i in ids),
+            eos_token_id=None,
+            additional_stop_token_ids=None,
+        )
+
+    async def _check_request(
+        self,
+        text,
+        counts,
+        expected_flushes,
+        expected_text,
+        *,
+        mode=DisaggregationMode.NULL,
+        no_stop_trim=False,
+        stop=None,
+        expected_finish=None,
+    ):
+        manager = _make_tokenizer_manager(self)
+        manager.disaggregation_mode = mode
+        state = _make_req_state("test")
+        state.obj = GenerateReqInput(
+            rid="test", text="", stream=False, sampling_params={}
+        )
+        manager.rid_to_state["test"] = state
+        tokenizer = self._tokenizer()
+        params = SamplingParams(
+            max_new_tokens=len(text),
+            stop=stop or ["STOP"],
+            no_stop_trim=no_stop_trim,
+        )
+        params.normalize(tokenizer)
+        req = Req("test", "", array("q"), params, stream=False)
+        req.tokenizer = tokenizer
+        detokenizer = DetokenizerManager.__new__(DetokenizerManager)
+        detokenizer.decode_status = {}
+        detokenizer.disable_tokenizer_batch_decode = True
+        detokenizer.is_tool_call_parser_gpt_oss = False
+        detokenizer.vocab_size = 256
+        detokenizer.tokenizer = tokenizer
+
+        flushes = []
+        for count in counts:
+            accepted = count - len(req.output_ids)
+            req.output_ids.extend(ord(c) for c in text[len(req.output_ids) : count])
+            req.update_finish_state(new_accepted_len=accepted)
+            acc = accumulator()
+            acc.disaggregation_mode = mode
+            acc.accept(req=req)
+            payload = acc.to_payload(dp_rank=0, is_idle_batch=False)
+            if payload is None:
+                continue
+            flushes.append(count)
+            await manager._handle_batch_output(
+                detokenizer.handle_batch_token_id_out(payload)
+            )
+            self.assertEqual(state.event.is_set(), req.finished())
+            self.assertEqual(len(state.out_list), int(req.finished()))
+
+        self.assertEqual(state.out_list[0]["text"], expected_text)
+        self.assertEqual(flushes, expected_flushes)
+        self.assertEqual(state.out_list[0]["output_ids"], [ord(c) for c in text])
+        self.assertEqual(
+            state.out_list[0]["meta_info"]["finish_reason"],
+            expected_finish or {"type": "length", "length": len(text)},
+        )
+        self.assertTrue(req.finished_output)
+        self.assertEqual(len(state.out_list), 1)
+        self.assertNotIn("test", detokenizer.decode_status)
 
 
 if __name__ == "__main__":

@@ -452,7 +452,9 @@ class _GenerationStreamAccumulator:
                     or output_len // self.default_force_stream_interval
                     > req.send_token_offset // self.default_force_stream_interval
                 )
-                if first_output:
+                if should_output:
+                    # Intermediate text accumulates downstream and cannot be
+                    # retracted if a partial stop string is completed later.
                     should_output &= not req.check_match_stop_str_prefix()
 
         if not should_output:
