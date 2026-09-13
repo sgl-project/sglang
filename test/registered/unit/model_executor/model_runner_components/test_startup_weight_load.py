@@ -1,7 +1,6 @@
 """Unit tests for the post-capture startup weight-loading component."""
 
 import dataclasses
-import re
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -42,7 +41,6 @@ from sglang.srt.model_loader.weight_utils import (
     restore_optional_checkpoint_parameter_values,
 )
 from sglang.srt.runtime_context import (
-    attention_backends,
     get_context,
     get_exec,
     publish,
@@ -73,47 +71,17 @@ def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
         is_cuda_platform=True,
-        cuda_device_capability=(9, 0),
         cuda_graph_enabled=True,
-        prefill_cuda_graph_backend=Backend.FULL,
-        is_draft_worker=False,
-        speculative_algorithm=None,
-        tp_size=1,
-        attn_cp_size=1,
-        dcp_size=1,
-        pp_size=1,
-        dp_size=1,
-        ep_size=1,
-        moe_dp_size=1,
+        has_speculative_token_map=False,
+        dcp_replicate_q_proj=False,
         moe_a2a_backend="none",
         moe_runner_backend="triton",
         fp8_gemm_runner_backend="triton",
-        prefill_attention_backend="dsa",
-        decode_attention_backend="dsa",
-        dsa_prefill_backend=None,
-        dsa_decode_backend=None,
-        kv_cache_dtype="bfloat16",
-        disable_shared_experts_fusion=False,
-        enable_dp_attention=False,
-        enable_two_batch_overlap=False,
-        enable_eplb=False,
-        ep_num_redundant_experts=0,
-        init_expert_location="trivial",
-        elastic_ep_backend=None,
-        enable_elastic_expert_backup=False,
         ep_join_mode=None,
-        max_ep_size=None,
-        linear_attn_backend="triton",
-        linear_attn_decode_backend=None,
-        linear_attn_prefill_backend=None,
+        uses_cached_gdn_parameters=False,
         cpu_offload_gb=0,
         offload_group_size=-1,
-        enable_memory_saver=False,
-        enable_weights_cpu_backup=False,
-        enable_lora=False,
-        has_lora_paths=False,
-        has_custom_weight_loader=False,
-        enable_torch_compile=False,
+        has_lora=False,
         prefetch_num_threads=4,
     )
     return dataclasses.replace(options, **overrides)
@@ -315,6 +283,11 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
         self.loader = DefaultModelLoader(self.load_config)
         self.device_config = DeviceConfig("cuda", 0)
+        publish(
+            ServerArgs(model_path="dummy", cuda_graph_config=CudaGraphConfig()),
+            role="test",
+        )
+        self.addCleanup(reset_context)
 
     def _create(
         self,
@@ -359,10 +332,6 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 prefetch_num_threads=4,
             ),
         )
-        self.assertIsInstance(
-            self._create(options=_make_options(tp_size=2)),
-            StartupWeightLoadManager,
-        )
 
     def test_profile_registry_is_complete_and_unambiguous(self):
         expected_profiles_by_architecture = {
@@ -376,7 +345,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM
             ),
             "Qwen3MoeForCausalLM": StartupWeightLoadProfile.QWEN3_MOE_EP,
-            "GlmMoeDsaForCausalLM": StartupWeightLoadProfile.GLM_5_2_DSA_FP8,
+            "GlmMoeDsaForCausalLM": StartupWeightLoadProfile.GLM_MOE_DSA,
         }
         registered_architectures = [
             architecture_spec.architecture
@@ -459,663 +428,8 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertIsInstance(manager, StartupWeightLoadManager)
         self.assertTrue(manager._fallback_to_serial)
 
-    def test_qwen35_family_hybrid_vlm_profile_is_admitted(self):
-        for tp_size in (2, 4):
-            for backend in (Backend.BREAKABLE, Backend.DISABLED):
-                with self.subTest(
-                    tp_size=tp_size,
-                    prefill_cuda_graph_backend=backend,
-                ):
-                    manager = self._create(
-                        options=_make_options(
-                            tp_size=tp_size,
-                            prefill_cuda_graph_backend=backend,
-                        ),
-                        model_config=_make_qwen35_hybrid_vlm_model_config(),
-                    )
-
-                    self.assertEqual(
-                        manager._plan.profile,
-                        StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM,
-                    )
-
-    def test_qwen35_family_hybrid_vlm_profile_rejects_near_misses(self):
-        cases = (
-            (
-                "tp1",
-                _make_options(tp_size=1),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "validated with TP2 or TP4",
-            ),
-            (
-                "fp16",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(dtype=torch.float16),
-                "validated with BF16",
-            ),
-            (
-                "quantized",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(quantization="fp8"),
-                "quantization is not supported",
-            ),
-            (
-                "modelopt",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(quantization="modelopt_fp4"),
-                "quantization is not supported",
-            ),
-            (
-                "expert_parallel",
-                _make_options(tp_size=2, ep_size=2),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "expert parallelism is not supported",
-            ),
-            (
-                "multimodal_disabled",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(is_multimodal=False),
-                "requires multimodal execution",
-            ),
-            (
-                "encoder_only",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(
-                    hf_config=SimpleNamespace(
-                        architectures=["Qwen3_5ForConditionalGeneration"],
-                        encoder_only=True,
-                        language_only=False,
-                        language_model_only=False,
-                    )
-                ),
-                "encoder-only execution is not supported",
-            ),
-            (
-                "language_only",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(
-                    hf_config=SimpleNamespace(
-                        architectures=["Qwen3_5ForConditionalGeneration"],
-                        encoder_only=False,
-                        language_only=True,
-                        language_model_only=False,
-                    )
-                ),
-                "language-only encoder disaggregation is not supported",
-            ),
-            (
-                "language_model_only",
-                _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(
-                    hf_config=SimpleNamespace(
-                        architectures=["Qwen3_5ForConditionalGeneration"],
-                        encoder_only=False,
-                        language_only=False,
-                        language_model_only=True,
-                    )
-                ),
-                "language-model-only execution is not supported",
-            ),
-            (
-                "flashinfer_linear_attention_base",
-                _make_options(
-                    tp_size=2,
-                    linear_attn_backend="flashinfer",
-                ),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "validated with Triton linear attention",
-            ),
-            (
-                "flashinfer_linear_attention_decode",
-                _make_options(
-                    tp_size=2,
-                    linear_attn_decode_backend="flashinfer",
-                ),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "validated with Triton linear attention",
-            ),
-            (
-                "flashinfer_linear_attention_prefill",
-                _make_options(
-                    tp_size=2,
-                    linear_attn_prefill_backend="flashinfer",
-                ),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "validated with Triton linear attention",
-            ),
-            (
-                "full_prefill_cuda_graph",
-                _make_options(
-                    tp_size=2,
-                    prefill_cuda_graph_backend=Backend.FULL,
-                ),
-                _make_qwen35_hybrid_vlm_model_config(),
-                "does not support full prefill CUDA graphs",
-            ),
-        )
-        for name, options, model_config, reason in cases:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, re.escape(reason)):
-                    self._create(options=options, model_config=model_config)
-
-    def test_qwen35_moe_hybrid_vlm_profile_is_admitted(self):
-        manager = self._create(
-            options=_make_options(
-                tp_size=2,
-                ep_size=2,
-                prefill_cuda_graph_backend=Backend.BREAKABLE,
-            ),
-            model_config=_make_qwen35_moe_hybrid_vlm_model_config(),
-        )
-
-        self.assertEqual(
-            manager._plan.profile,
-            StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM,
-        )
-
-    def test_qwen35_moe_hybrid_vlm_profile_rejects_near_misses(self):
-        cases = (
-            (
-                "fp16",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(dtype=torch.float16),
-                "validated with bfloat16",
-            ),
-            (
-                "tp4",
-                _make_options(
-                    tp_size=4,
-                    ep_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                "validated with TP2",
-            ),
-            (
-                "tp_only",
-                _make_options(
-                    tp_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                "validated with TP2/EP2",
-            ),
-            (
-                "quantized",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(quantization="fp8"),
-                "quantization is not supported",
-            ),
-            (
-                "text_only",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(is_multimodal=False),
-                "requires multimodal execution",
-            ),
-            (
-                "flashinfer_linear_attention",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    linear_attn_backend="flashinfer",
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                "validated with Triton linear attention",
-            ),
-            (
-                "full_prefill_cuda_graph",
-                _make_options(tp_size=2, ep_size=2),
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                "does not support full prefill CUDA graphs",
-            ),
-        )
-        for name, options, model_config, reason in cases:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, re.escape(reason)):
-                    self._create(options=options, model_config=model_config)
-
-    def test_qwen3_moe_ep_profile_is_admitted(self):
-        for dtype in (torch.float16, torch.bfloat16):
-            for backend in ("auto", "triton"):
-                for tp_size, ep_size in ((1, 1), (2, 1), (2, 2)):
-                    with self.subTest(
-                        dtype=dtype, backend=backend, tp=tp_size, ep=ep_size
-                    ):
-                        manager = self._create(
-                            options=_make_options(
-                                tp_size=tp_size,
-                                ep_size=ep_size,
-                                moe_runner_backend=backend,
-                            ),
-                            model_config=_make_qwen3_moe_model_config(dtype=dtype),
-                        )
-                        self.assertEqual(
-                            manager._plan.profile,
-                            StartupWeightLoadProfile.QWEN3_MOE_EP,
-                        )
-
-    def test_qwen3_moe_ep_profile_rejects_near_misses(self):
-        cases = (
-            ("ep_exceeds_tp", _make_options(ep_size=2), "TP1/EP1, TP2/EP1, TP2/EP2"),
-            (
-                "fp32",
-                _make_options(tp_size=2, ep_size=2),
-                "validated with float16 or bfloat16",
-                _make_qwen3_moe_model_config(dtype=torch.float32),
-            ),
-            (
-                "quantized",
-                _make_options(tp_size=2, ep_size=2),
-                "quantization is not supported",
-                _make_qwen3_moe_model_config(quantization="fp8"),
-            ),
-            (
-                "tp4",
-                _make_options(tp_size=4),
-                "TP1/EP1, TP2/EP1, TP2/EP2",
-            ),
-            (
-                "moe_dp",
-                _make_options(tp_size=2, ep_size=2, moe_dp_size=2),
-                "MoE data parallelism is not supported",
-            ),
-            (
-                "deepep",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    moe_a2a_backend="deepep",
-                ),
-                "requires the standard EP path",
-            ),
-            (
-                "flashinfer_runner",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    moe_runner_backend="flashinfer_trtllm",
-                ),
-                "requires the Triton MoE runner",
-            ),
-            (
-                "dp_attention",
-                _make_options(tp_size=2, ep_size=2, enable_dp_attention=True),
-                "DP attention is not supported",
-            ),
-            (
-                "two_batch_overlap",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    enable_two_batch_overlap=True,
-                ),
-                "two-batch overlap is not supported",
-            ),
-            (
-                "eplb",
-                _make_options(tp_size=2, ep_size=2, enable_eplb=True),
-                "EPLB is not supported",
-            ),
-            (
-                "redundant_experts",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    ep_num_redundant_experts=1,
-                ),
-                "redundant experts are not supported",
-            ),
-            (
-                "expert_placement",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    init_expert_location="random",
-                ),
-                "non-trivial expert placement is not supported",
-            ),
-            (
-                "elastic_ep_backend",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    elastic_ep_backend="nixl",
-                ),
-                "elastic expert parallelism is not supported",
-            ),
-            (
-                "elastic_expert_backup",
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    enable_elastic_expert_backup=True,
-                ),
-                "elastic expert parallelism is not supported",
-            ),
-            (
-                "ep_join",
-                _make_options(tp_size=2, ep_size=2, ep_join_mode="scale"),
-                "elastic expert parallelism is not supported",
-            ),
-            (
-                "max_ep_size",
-                _make_options(tp_size=2, ep_size=2, max_ep_size=4),
-                "elastic expert parallelism is not supported",
-            ),
-        )
-        default_model_config = _make_qwen3_moe_model_config()
-        for case in cases:
-            name, options, reason, *model_configs = case
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, re.escape(reason)):
-                    self._create(
-                        options=options,
-                        model_config=(
-                            model_configs[0] if model_configs else default_model_config
-                        ),
-                    )
-
-    def test_glm_moe_dsa_fp8_profile_is_admitted(self):
-        for tp_size in (8, 16):
-            with self.subTest(tp_size=tp_size):
-                manager = self._create(
-                    options=_make_options(
-                        tp_size=tp_size,
-                        prefill_cuda_graph_backend=Backend.DISABLED,
-                        dsa_prefill_backend="fa3",
-                        dsa_decode_backend="fa3",
-                        disable_shared_experts_fusion=True,
-                    ),
-                    model_config=_make_glm_moe_dsa_fp8_model_config(),
-                )
-
-                self.assertEqual(
-                    manager._plan.profile,
-                    StartupWeightLoadProfile.GLM_5_2_DSA_FP8,
-                )
-
-    def test_glm_moe_dsa_fp8_profile_rejects_near_misses(self):
-        valid_options = _make_options(
-            tp_size=16,
-            prefill_cuda_graph_backend=Backend.DISABLED,
-            dsa_prefill_backend="fa3",
-            dsa_decode_backend="fa3",
-            disable_shared_experts_fusion=True,
-        )
-        cases = (
-            (
-                "automatic_fp8_gemm",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, fp8_gemm_runner_backend="auto"
-                    )
-                ),
-                "set --fp8-gemm-backend triton",
-            ),
-            (
-                "unresolved_dsa_prefill",
-                dict(
-                    options=dataclasses.replace(valid_options, dsa_prefill_backend=None)
-                ),
-                "set --dsa-prefill-backend fa3 --dsa-decode-backend fa3",
-            ),
-            (
-                "unresolved_dsa_decode",
-                dict(
-                    options=dataclasses.replace(valid_options, dsa_decode_backend=None)
-                ),
-                "set --dsa-prefill-backend fa3 --dsa-decode-backend fa3",
-            ),
-            (
-                "glm5_config",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config_overrides={
-                            "index_topk_freq": None,
-                            "index_skip_topk_offset": None,
-                        }
-                    ),
-                ),
-                "validated only for the GLM-5.2 DSA architecture",
-            ),
-            (
-                "custom_index_topk_frequency",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config_overrides={"index_topk_freq": 2}
-                    ),
-                ),
-                "validated only for the GLM-5.2 DSA architecture",
-            ),
-            (
-                "custom_index_topk_offset",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config_overrides={"index_skip_topk_offset": 1}
-                    ),
-                ),
-                "validated only for the GLM-5.2 DSA architecture",
-            ),
-            (
-                "custom_index_topk_pattern",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config_overrides={"index_topk_pattern": [0, 1]}
-                    ),
-                ),
-                "validated only for the GLM-5.2 DSA architecture",
-            ),
-            (
-                "custom_cli_factor",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config_overrides={"cli_factor": 2}
-                    ),
-                ),
-                "validated only for the GLM-5.2 DSA architecture",
-            ),
-            (
-                "blackwell",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, cuda_device_capability=(10, 0)
-                    )
-                ),
-                "validated only on NVIDIA Hopper",
-            ),
-            (
-                "tp4",
-                dict(options=dataclasses.replace(valid_options, tp_size=4)),
-                "validated with TP8 or TP16",
-            ),
-            (
-                "fp16",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        dtype=torch.float16
-                    ),
-                ),
-                "set --dtype bfloat16",
-            ),
-            (
-                "unquantized",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(quantization=None),
-                ),
-                "requires its serialized dynamic E4M3 FP8 checkpoint",
-            ),
-            (
-                "checkpoint_quant_method",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config=SimpleNamespace(
-                            architectures=["GlmMoeDsaForCausalLM"],
-                            cli_factor=1,
-                            index_topk_pattern=None,
-                            index_skip_topk_offset=3,
-                            index_topk_freq=4,
-                            quantization_config={
-                                "activation_scheme": "dynamic",
-                                "fmt": "e4m3",
-                                "quant_method": "compressed-tensors",
-                                "weight_block_size": [128, 128],
-                            },
-                        )
-                    ),
-                ),
-                "requires its serialized dynamic E4M3 FP8 checkpoint",
-            ),
-            (
-                "wrong_block_size",
-                dict(
-                    options=valid_options,
-                    model_config=_make_glm_moe_dsa_fp8_model_config(
-                        hf_config=SimpleNamespace(
-                            architectures=["GlmMoeDsaForCausalLM"],
-                            cli_factor=1,
-                            index_topk_pattern=None,
-                            index_skip_topk_offset=3,
-                            index_topk_freq=4,
-                            quantization_config={
-                                "activation_scheme": "dynamic",
-                                "fmt": "e4m3",
-                                "quant_method": "fp8",
-                                "weight_block_size": [64, 128],
-                            },
-                        )
-                    ),
-                ),
-                "requires 128x128 block scales",
-            ),
-            (
-                "expert_parallelism",
-                dict(options=dataclasses.replace(valid_options, ep_size=16)),
-                "does not yet support expert parallelism",
-            ),
-            (
-                "deepep",
-                dict(
-                    options=dataclasses.replace(valid_options, moe_a2a_backend="deepep")
-                ),
-                "requires --moe-a2a-backend none",
-            ),
-            (
-                "flashinfer_moe",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, moe_runner_backend="flashinfer_trtllm"
-                    )
-                ),
-                "requires the Triton MoE runner",
-            ),
-            (
-                "deep_gemm",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, fp8_gemm_runner_backend="deep_gemm"
-                    )
-                ),
-                "set --fp8-gemm-backend triton",
-            ),
-            (
-                "base_attention_backend",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options,
-                        prefill_attention_backend="fa3",
-                        decode_attention_backend="fa3",
-                    )
-                ),
-                "requires DSA for prefill and decode attention",
-            ),
-            (
-                "split_attention_backend",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, prefill_attention_backend="fa3"
-                    )
-                ),
-                "requires DSA for prefill and decode attention",
-            ),
-            (
-                "flashmla_sparse",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, dsa_prefill_backend="flashmla_sparse"
-                    )
-                ),
-                "validated with FA3 for DSA prefill and decode",
-            ),
-            (
-                "dsa_decode_backend",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, dsa_decode_backend="flashmla_sparse"
-                    )
-                ),
-                "validated with FA3 for DSA prefill and decode",
-            ),
-            (
-                "fp8_kv_cache",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, kv_cache_dtype="fp8_e4m3"
-                    )
-                ),
-                "set --kv-cache-dtype bfloat16",
-            ),
-            (
-                "breakable_prefill_graph",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options,
-                        prefill_cuda_graph_backend=Backend.BREAKABLE,
-                    )
-                ),
-                "validated with prefill CUDA graphs disabled",
-            ),
-            (
-                "shared_experts_fusion",
-                dict(
-                    options=dataclasses.replace(
-                        valid_options, disable_shared_experts_fusion=False
-                    )
-                ),
-                "requires --disable-shared-experts-fusion",
-            ),
-        )
-        for name, kwargs, reason in cases:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, re.escape(reason)):
-                    create_kwargs = dict(
-                        model_config=_make_glm_moe_dsa_fp8_model_config()
-                    )
-                    create_kwargs.update(kwargs)
-                    self._create(**create_kwargs)
-
     def test_admission_collects_all_rejections_in_rule_order(self):
-        model_config = _make_model_config(quantization="fp8")
+        model_config = _make_model_config(quantization="modelopt_fp8")
         with (
             patch(
                 f"{_STARTUP_MODULE}.get_model_architecture",
@@ -1133,7 +447,6 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 options=_make_options(
                     device="cpu",
                     is_cuda_platform=False,
-                    tp_size=3,
                 ),
             )
 
@@ -1141,7 +454,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertIsNone(admission.plan)
         self.assertEqual(
             tuple(rejection.code for rejection in admission.rejections),
-            ("non_cuda", "tensor_parallelism", "quantization"),
+            ("non_cuda", "quantization"),
         )
         resolve_architecture.assert_not_called()
         get_canonical_model_class.assert_not_called()
@@ -1149,14 +462,14 @@ class TestStartupWeightLoadSelector(CustomTestCase):
     def test_create_formats_rejection_codes_and_messages(self):
         with self.assertRaisesRegex(
             ValueError,
-            "non_cuda: CUDA only; tensor_parallelism: native dense startup overlap is validated with TP1 or TP2",
+            "non_cuda: CUDA only; quantization: .*",
         ):
             self._create(
                 options=_make_options(
                     device="cpu",
                     is_cuda_platform=False,
-                    tp_size=3,
-                )
+                ),
+                model_config=_make_model_config(quantization="modelopt_fp8"),
             )
 
     def test_invalid_architectures_fail_without_resolution(self):
@@ -1199,162 +512,462 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 resolve_architecture.assert_not_called()
                 get_canonical_model_class.assert_not_called()
 
-    def test_cuda_standard_moe_auto_matches_triton(self):
-        cases = (
-            (
-                _make_qwen3_moe_model_config(),
-                _make_options(tp_size=2, ep_size=2),
-            ),
-            (
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                _make_options(
-                    tp_size=2,
-                    ep_size=2,
-                    prefill_cuda_graph_backend=Backend.BREAKABLE,
-                ),
-            ),
-            (
-                _make_glm_moe_dsa_fp8_model_config(),
-                _make_options(
-                    tp_size=16,
-                    prefill_cuda_graph_backend=Backend.DISABLED,
-                    dsa_prefill_backend="fa3",
-                    dsa_decode_backend="fa3",
-                    disable_shared_experts_fusion=True,
-                ),
-            ),
+    def _published_options(self, **changes):
+        graph_config = CudaGraphConfig()
+        graph_config.decode.backend = Backend.FULL
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            cuda_graph_config=graph_config,
+            **changes,
         )
-        for model_config, options in cases:
-            architecture = model_config.hf_config.architectures[0]
-            with self.subTest(architecture=architecture):
-                triton = self._create(model_config=model_config, options=options)
-                auto_options = dataclasses.replace(options, moe_runner_backend="auto")
-                auto = self._create(model_config=model_config, options=auto_options)
-                self.assertEqual(auto._plan, triton._plan)
+        publish(args, role="test")
+        with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=True):
+            return StartupWeightLoadOptions.from_published_config()
 
-                for changes, rejection_code in (
-                    ({"moe_a2a_backend": "deepep"}, "moe_a2a_backend"),
-                    ({"device": "cpu", "is_cuda_platform": False}, "non_cuda"),
-                    ({"moe_runner_backend": "deep_gemm"}, "moe_runner_backend"),
+    def test_ordinary_runtime_settings_are_not_overlap_admission_inputs(self):
+        cases = (
+            {"tp_size": 4, "pp_size": 2, "dp_size": 2},
+            {"tp_size": 4, "ep_size": 2, "moe_dp_size": 2},
+            {"tp_size": 4, "attn_cp_size": 2, "dcp_size": 2},
+            {"enable_dp_attention": True, "enable_two_batch_overlap": True},
+            {"enable_eplb": True, "ep_num_redundant_experts": 2},
+            {"init_expert_location": "random", "enable_elastic_expert_backup": True},
+            {"enable_memory_saver": True, "enable_weights_cpu_backup": True},
+            {"custom_weight_loader": ["example.loader"], "enable_torch_compile": True},
+            {"attention_backend": "flashinfer", "kv_cache_dtype": "fp8_e4m3"},
+            {"linear_attn_prefill_backend": "flashinfer"},
+            {"speculative_algorithm": "EAGLE3"},
+        )
+        expected = self._published_options()
+        for changes in cases:
+            with self.subTest(changes=changes):
+                options = self._published_options(**changes)
+                self.assertEqual(options, expected)
+                self.assertIsInstance(
+                    self._create(options=options), StartupWeightLoadManager
+                )
+
+    def test_unquantized_profiles_delegate_dtype_and_modality_validation(self):
+        profiles = (
+            (_make_model_config, StartupWeightLoadProfile.NATIVE_DENSE),
+            (_make_qwen3_moe_model_config, StartupWeightLoadProfile.QWEN3_MOE_EP),
+            (
+                _make_qwen35_hybrid_vlm_model_config,
+                StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM,
+            ),
+            (
+                _make_qwen35_moe_hybrid_vlm_model_config,
+                StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM,
+            ),
+            (_make_glm_moe_dsa_fp8_model_config, StartupWeightLoadProfile.GLM_MOE_DSA),
+        )
+        for make_config, profile in profiles:
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                with self.subTest(profile=profile, dtype=dtype):
+                    config = make_config(
+                        dtype=dtype,
+                        quantization=None,
+                        is_multimodal=False,
+                        is_generation=False,
+                    )
+                    config.hf_config.encoder_only = True
+                    config.hf_config.language_only = True
+                    config.hf_config.language_model_only = True
+                    self.assertEqual(
+                        self._create(model_config=config)._plan.profile, profile
+                    )
+
+    def test_graph_capture_backend_does_not_change_admission(self):
+        for backend in (Backend.FULL, Backend.BREAKABLE, Backend.TC_PIECEWISE):
+            with self.subTest(backend=backend):
+                self._published_options()
+                with get_exec().graph.override(enable_torch_compile=True):
+                    get_exec().graph.cuda_graph_config.prefill.backend = backend
+                    with patch(
+                        f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=True
+                    ):
+                        options = StartupWeightLoadOptions.from_published_config()
+                manager = self._create(
+                    options=options, model_config=_make_qwen35_hybrid_vlm_model_config()
+                )
+                self.assertEqual(
+                    manager._plan.profile, StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM
+                )
+
+    def test_hybrid_attention_blocks_only_cached_parameter_paths(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            resolve_linear_attn_backends,
+        )
+
+        for make_config in (
+            _make_qwen35_hybrid_vlm_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+        ):
+            for base, decode, prefill, verify, spec, rejected in (
+                ("triton", None, None, None, None, False),
+                ("cutedsl", None, None, None, None, False),
+                ("flashinfer", None, None, None, None, True),
+                ("flashinfer", "triton", None, None, None, False),
+                ("flashinfer", "cutedsl", None, None, "EAGLE3", False),
+                ("triton", "flashinfer", None, "triton", None, True),
+                ("triton", None, "flashinfer", None, "EAGLE3", False),
+                ("triton", None, "flashinfer", "flashinfer", None, False),
+                ("triton", None, "flashinfer", "flashinfer", "EAGLE3", True),
+                ("triton", None, "flashinfer", "flashinfer", "STANDALONE", True),
+                ("triton", None, "flashinfer", "triton", "EAGLE3", False),
+            ):
+                with self.subTest(
+                    model=make_config.__name__,
+                    base=base,
+                    decode=decode,
+                    prefill=prefill,
+                    verify=verify,
+                    spec=spec,
                 ):
-                    with self.subTest(changes=changes):
-                        admission = evaluate_startup_weight_load_admission(
-                            loader=self.loader,
-                            model_config=model_config,
-                            load_config=self.load_config,
-                            options=dataclasses.replace(auto_options, **changes),
-                        )
-                        self.assertFalse(admission.supported)
-                        self.assertIn(
-                            rejection_code,
-                            tuple(rejection.code for rejection in admission.rejections),
-                        )
+                    options = self._published_options(
+                        linear_attn_backend=base,
+                        linear_attn_decode_backend=decode,
+                        linear_attn_prefill_backend=prefill,
+                        linear_attn_verify_backend=verify,
+                        speculative_algorithm=spec,
+                    )
+                    backends = resolve_linear_attn_backends()
+                    self.assertEqual(
+                        options.uses_cached_gdn_parameters,
+                        backends.decode.is_flashinfer()
+                        or (spec is not None and backends.verify.is_flashinfer()),
+                    )
+                    self.assertEqual(options.uses_cached_gdn_parameters, rejected)
+                    if rejected:
+                        with self.assertRaisesRegex(
+                            ValueError, "linear_attention_backend: .*copies"
+                        ):
+                            self._create(options=options, model_config=make_config())
+                    else:
+                        self._create(options=options, model_config=make_config())
 
-    def test_modelopt_is_rejected_via_real_quantization_field(self):
+    def test_speculative_and_dcp_checks_follow_actual_weight_copy_paths(self):
         cases = (
-            (_make_model_config(), _make_options()),
+            ({"dcp_size": 1, "dcp_replicate_q_proj": True}, None),
+            ({"dcp_size": 2, "dcp_replicate_q_proj": False}, None),
+            ({"dcp_size": 2, "dcp_replicate_q_proj": True}, "dcp_replicated_q_proj"),
+            ({"speculative_algorithm": "EAGLE", "speculative_token_map": None}, None),
             (
-                _make_qwen35_hybrid_vlm_model_config(),
-                _make_options(tp_size=2),
+                {
+                    "speculative_algorithm": "EAGLE",
+                    "speculative_token_map": "/dummy/map",
+                },
+                "speculative_token_map",
             ),
             (
-                _make_qwen35_moe_hybrid_vlm_model_config(),
-                _make_options(tp_size=2, ep_size=2),
-            ),
-            (
-                _make_qwen3_moe_model_config(),
-                _make_options(tp_size=2, ep_size=2),
-            ),
-            (
-                _make_glm_moe_dsa_fp8_model_config(),
-                _make_options(tp_size=16),
+                {
+                    "speculative_algorithm": "EAGLE3",
+                    "speculative_token_map": "/dummy/map",
+                },
+                None,
             ),
         )
-        for model_config, options in cases:
+        for changes, rejection in cases:
+            with self.subTest(changes=changes):
+                options = self._published_options(**changes)
+                if rejection:
+                    with self.assertRaisesRegex(ValueError, rejection):
+                        self._create(options=options)
+                else:
+                    self._create(options=options)
+
+    def test_lora_detection_includes_uno_before_lora_initialization(self):
+        for changes in (
+            {"enable_lora": True},
+            {"lora_paths": ["adapter=/dummy/adapter"]},
+            {"speculative_algorithm": "UNO"},
+        ):
+            with self.subTest(changes=changes):
+                options = self._published_options(**changes)
+                self.assertTrue(options.has_lora)
+                self._create(options=options)
+                with self.assertRaisesRegex(ValueError, "lora"):
+                    self._create(
+                        options=options, model_config=_make_qwen3_moe_model_config()
+                    )
+
+    def test_unquantized_moe_rejects_only_non_reloadable_weight_layouts(self):
+        for make_config in (
+            _make_qwen3_moe_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            lambda: _make_glm_moe_dsa_fp8_model_config(quantization=None),
+        ):
+            for runner, rejected in (
+                ("auto", False),
+                ("triton", False),
+                ("deep_gemm", False),
+                ("flashinfer_cutlass", False),
+                ("flashinfer_trtllm_routed", False),
+                ("flashinfer_trtllm", True),
+                ("experimental_sgl_trtllm", True),
+            ):
+                with self.subTest(model=make_config, runner=runner):
+                    options = _make_options(
+                        moe_runner_backend=runner, moe_a2a_backend="deepep"
+                    )
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "moe_runner_backend"):
+                            self._create(model_config=make_config(), options=options)
+                    else:
+                        self._create(model_config=make_config(), options=options)
+
+    def test_glm_fp8_checks_layout_not_benchmark_configuration(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                config = _make_glm_moe_dsa_fp8_model_config(
+                    dtype=dtype,
+                    hf_config_overrides={
+                        "cli_factor": 3,
+                        "index_topk_pattern": "different",
+                    },
+                )
+                manager = self._create(model_config=config)
+                self.assertEqual(
+                    manager._plan.profile, StartupWeightLoadProfile.GLM_MOE_DSA
+                )
+        for quantization_config, rejection in (
+            (None, "quantization"),
+            (
+                {"quant_method": "modelopt", "weight_block_size": [128, 128]},
+                "quantization",
+            ),
+            (
+                {"quant_method": "fp8", "weight_block_size": [64, 128]},
+                "fp8_weight_block_size",
+            ),
+            ({"quant_method": "fp8"}, "quantization"),
+        ):
+            with self.subTest(quantization_config=quantization_config):
+                config = _make_glm_moe_dsa_fp8_model_config(
+                    hf_config_overrides={"quantization_config": quantization_config}
+                )
+                with self.assertRaisesRegex(ValueError, rejection):
+                    self._create(model_config=config)
+
+    def test_profiles_share_serialized_block_fp8_loading_rules(self):
+        factories = (
+            _make_model_config,
+            _make_qwen3_moe_model_config,
+            _make_qwen35_hybrid_vlm_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            _make_glm_moe_dsa_fp8_model_config,
+        )
+        for make_config in factories:
+            config = make_config(quantization="fp8")
+            for quantization_config, rejected in (
+                ({"quant_method": "fp8", "weight_block_size": [128, 128]}, False),
+                (None, True),
+                ({"weight_block_size": [128, 128]}, True),
+                ({"quant_method": "fp8"}, True),
+                ({"quant_method": "fp8", "weight_block_size": None}, True),
+                ({"quant_method": "fp8", "weight_block_size": [128]}, True),
+                ({"quant_method": "modelopt", "weight_block_size": [128, 128]}, True),
+            ):
+                with self.subTest(
+                    model=make_config.__name__, quantization_config=quantization_config
+                ):
+                    config.hf_config.quantization_config = quantization_config
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "quantization"):
+                            self._create(model_config=config)
+                    else:
+                        self._create(model_config=config)
+
+    def test_only_mla_requires_128_block_postprocessing(self):
+        for make_config in (
+            _make_model_config,
+            _make_qwen3_moe_model_config,
+            _make_qwen35_hybrid_vlm_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            _make_glm_moe_dsa_fp8_model_config,
+        ):
+            with self.subTest(model=make_config.__name__):
+                config = make_config(quantization="fp8")
+                config.hf_config.quantization_config = {
+                    "quant_method": "fp8",
+                    "weight_block_size": [64, 128],
+                }
+                if make_config is _make_glm_moe_dsa_fp8_model_config:
+                    with self.assertRaisesRegex(ValueError, "fp8_weight_block_size"):
+                        self._create(model_config=config)
+                else:
+                    self._create(model_config=config)
+
+    def test_fp8_linear_scale_conversion_guard_is_shared(self):
+        for make_config in (
+            _make_model_config,
+            _make_qwen3_moe_model_config,
+            _make_qwen35_hybrid_vlm_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            _make_glm_moe_dsa_fp8_model_config,
+        ):
+            config = make_config(quantization="fp8")
+            config.hf_config.quantization_config = {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            for requantize, backend, dtype, rejected in (
+                (True, "deep_gemm", torch.bfloat16, True),
+                (False, "deep_gemm", torch.bfloat16, False),
+                (True, "triton", torch.bfloat16, False),
+                (True, "deep_gemm", torch.float16, False),
+            ):
+                with (
+                    self.subTest(
+                        model=make_config.__name__,
+                        requantize=requantize,
+                        backend=backend,
+                        dtype=dtype,
+                    ),
+                    patch(
+                        "sglang.srt.model_loader.utils.should_deepgemm_weight_requant_ue8m0",
+                        return_value=requantize,
+                    ),
+                ):
+                    config.dtype = dtype
+                    options = _make_options(fp8_gemm_runner_backend=backend)
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "fp8_gemm_backend"):
+                            self._create(model_config=config, options=options)
+                    else:
+                        self._create(model_config=config, options=options)
+
+    def test_moe_fp8_rejects_scale_conversion_and_packed_caches(self):
+        cases = (
+            (False, "deep_gemm", "triton", "none", None),
+            (True, "deep_gemm", "triton", "none", "fp8_gemm_backend"),
+            (True, "triton", "deep_gemm", "none", "moe_runner_backend"),
+            (False, "triton", "hpc_ops", "none", "moe_runner_backend"),
+            (False, "triton", "triton", "megamoe", "moe_a2a_backend"),
+            (False, "triton", "flashinfer_trtllm", "none", None),
+        )
+        for make_config in (
+            _make_qwen3_moe_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            _make_glm_moe_dsa_fp8_model_config,
+        ):
+            config = make_config(quantization="fp8")
+            config.hf_config.quantization_config = {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            for requantize, linear, moe, a2a, rejection in cases:
+                with (
+                    self.subTest(
+                        requantize=requantize, linear=linear, moe=moe, a2a=a2a
+                    ),
+                    patch(
+                        "sglang.srt.model_loader.utils.should_deepgemm_weight_requant_ue8m0",
+                        return_value=requantize,
+                    ),
+                ):
+                    options = _make_options(
+                        fp8_gemm_runner_backend=linear,
+                        moe_runner_backend=moe,
+                        moe_a2a_backend=a2a,
+                    )
+                    if rejection:
+                        with self.assertRaisesRegex(ValueError, rejection):
+                            self._create(
+                                model_config=config,
+                                options=options,
+                            )
+                    else:
+                        self._create(
+                            model_config=config,
+                            options=options,
+                        )
+
+    def test_glm_fp8_auto_linear_checks_the_resolved_backend(self):
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        for backend, rejected in (
+            (deepgemm_w8a8_block_fp8_linear_with_fallback, True),
+            (object(), False),
+        ):
+            with (
+                self.subTest(rejected=rejected),
+                patch(
+                    "sglang.srt.model_loader.utils.should_deepgemm_weight_requant_ue8m0",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils._dispatch_auto_backend",
+                    return_value=backend,
+                ),
+            ):
+                options = _make_options(fp8_gemm_runner_backend="auto")
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "fp8_gemm_backend"):
+                        self._create(
+                            options=options,
+                            model_config=_make_glm_moe_dsa_fp8_model_config(),
+                        )
+                else:
+                    self._create(
+                        options=options,
+                        model_config=_make_glm_moe_dsa_fp8_model_config(),
+                    )
+
+    def test_modelopt_quantization_is_rejected_before_model_resolution(self):
+        for make_config in (
+            _make_model_config,
+            _make_qwen35_hybrid_vlm_model_config,
+            _make_qwen35_moe_hybrid_vlm_model_config,
+            _make_qwen3_moe_model_config,
+            _make_glm_moe_dsa_fp8_model_config,
+        ):
             for quantization in ("modelopt_fp8", "modelopt_fp4", "modelopt_mixed"):
                 with self.subTest(
-                    architecture=model_config.hf_config.architectures[0],
-                    quantization=quantization,
+                    model=make_config.__name__, quantization=quantization
                 ):
-                    model_config.quantization = quantization
-                    admission = evaluate_startup_weight_load_admission(
-                        loader=self.loader,
-                        model_config=model_config,
-                        load_config=self.load_config,
-                        options=options,
-                    )
-                    self.assertFalse(admission.supported)
-                    self.assertIn(
-                        "quantization",
-                        tuple(rejection.code for rejection in admission.rejections),
-                    )
+                    with self.assertRaisesRegex(ValueError, "quantization"):
+                        self._create(
+                            model_config=make_config(quantization=quantization)
+                        )
+
+    def test_draft_workers_remain_serial_without_admission_or_allocation(self):
+        for mode in ("auto", "overlap"):
+            with (
+                self.subTest(mode=mode),
+                patch(
+                    f"{_STARTUP_MODULE}.get_model",
+                    return_value=SimpleNamespace(startup_weight_load_mode=mode),
+                ),
+                patch.object(
+                    StartupWeightLoadOptions, "from_published_config"
+                ) as snapshot,
+                patch.object(
+                    StartupWeightLoadManager, "__init__", return_value=None
+                ) as allocate,
+            ):
+                manager = StartupWeightLoadManager.create_from_published_config(
+                    loader=self.loader,
+                    model_config=_make_model_config(),
+                    load_config=self.load_config,
+                    device_config=self.device_config,
+                    is_draft_worker=True,
+                )
+                self.assertIsNone(manager)
+                snapshot.assert_not_called()
+                allocate.assert_not_called()
 
     def test_options_accept_current_server_args_schema(self):
-        """Removed server options must not break overlap startup initialization."""
-        server_args = ServerArgs(
-            model_path="dummy", cuda_graph_config=CudaGraphConfig()
-        )
-        # The parallel sizes come from the bags, so the config has to be published.
-        publish(server_args, role="test")
-        self.addCleanup(reset_context)
-        with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False):
-            options = StartupWeightLoadOptions.from_published_config(
-                is_draft_worker=False,
-            )
-
-        self.assertIsInstance(options, StartupWeightLoadOptions)
-        self.assertEqual(options.linear_attn_backend, "triton")
-        self.assertIsNone(options.linear_attn_decode_backend)
-        self.assertIsNone(options.linear_attn_prefill_backend)
+        options = self._published_options(linear_attn_prefill_backend="flashinfer")
+        self.assertFalse(options.uses_cached_gdn_parameters)
         self.assertEqual(options.moe_a2a_backend, "none")
         self.assertEqual(options.moe_runner_backend, "auto")
-        self.assertEqual(
-            options.fp8_gemm_runner_backend, server_args.fp8_gemm_runner_backend
-        )
-        self.assertEqual(
-            (options.prefill_attention_backend, options.decode_attention_backend),
-            attention_backends(),
-        )
-        self.assertEqual(options.dsa_prefill_backend, server_args.dsa_prefill_backend)
-        self.assertEqual(options.dsa_decode_backend, server_args.dsa_decode_backend)
-        self.assertEqual(options.kv_cache_dtype, server_args.kv_cache_dtype)
-        self.assertEqual(
-            options.disable_shared_experts_fusion,
-            server_args.disable_shared_experts_fusion,
-        )
-        self.assertEqual(options.ep_join_mode, server_args.ep_join_mode)
-        self.assertIsNone(options.cuda_device_capability)
-
-        with (
-            patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=True),
-            patch(
-                f"{_STARTUP_MODULE}.current_platform.get_device_capability",
-                return_value=(9, 0),
-            ),
-        ):
-            cuda_options = StartupWeightLoadOptions.from_published_config(
-                is_draft_worker=False,
-            )
-        self.assertEqual(cuda_options.cuda_device_capability, (9, 0))
-
-        with (
-            get_exec().kernel.override(
-                attention_backend="dsa",
-                prefill_attention_backend="fa3",
-            ),
-            patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False),
-        ):
-            split_options = StartupWeightLoadOptions.from_published_config(
-                is_draft_worker=False
-            )
-        self.assertEqual(
-            (
-                split_options.prefill_attention_backend,
-                split_options.decode_attention_backend,
-            ),
-            ("fa3", "dsa"),
-        )
-
+        self.assertFalse(options.has_lora)
+        self.assertFalse(options.dcp_replicate_q_proj)
+        self.assertFalse(options.has_speculative_token_map)
         for mode, expected_overlap, expected_attempt in (
             ("serial", False, False),
             ("overlap", True, True),
@@ -1365,124 +978,34 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     startup_weight_load_mode=mode
                 ) as mode_args:
                     self.assertEqual(
-                        mode_args.is_startup_weight_load_overlap,
-                        expected_overlap,
+                        mode_args.is_startup_weight_load_overlap, expected_overlap
                     )
                     self.assertEqual(
                         mode_args.should_attempt_startup_weight_load_overlap,
                         expected_attempt,
                     )
 
-    def test_unsupported_overlap_is_rejected_instead_of_falling_back(self):
+    def test_non_deferred_loading_paths_are_rejected_in_explicit_mode(self):
         cases = (
             (
+                {"options": _make_options(device="cpu", is_cuda_platform=False)},
                 "non_cuda",
-                dict(options=_make_options(device="cpu", is_cuda_platform=False)),
-                "CUDA only",
             ),
             (
-                "graphs_disabled",
-                dict(options=_make_options(cuda_graph_enabled=False)),
-                "CUDA graph capture is disabled",
+                {"options": _make_options(cuda_graph_enabled=False)},
+                "cuda_graph_disabled",
             ),
-            (
-                "tc_piecewise_prefill",
-                dict(
-                    options=_make_options(
-                        prefill_cuda_graph_backend=Backend.TC_PIECEWISE
-                    )
-                ),
-                "tc_piecewise prefill CUDA graphs are not supported",
-            ),
-            (
-                "pt_checkpoint",
-                dict(load_config=LoadConfig(load_format=LoadFormat.PT)),
-                "load format must be auto or safetensors",
-            ),
-            (
-                "draft_worker",
-                dict(options=_make_options(is_draft_worker=True)),
-                "draft workers are not supported",
-            ),
-            (
-                "draft_model_checkpoint",
-                dict(
-                    load_config=LoadConfig(
-                        load_format=LoadFormat.SAFETENSORS,
-                        draft_model_idx=0,
-                    )
-                ),
-                "draft model loading is unsupported",
-            ),
-            (
-                "speculative_decoding",
-                dict(options=_make_options(speculative_algorithm="EAGLE")),
-                "speculative decoding is not supported",
-            ),
-            (
-                "tp3",
-                dict(options=_make_options(tp_size=3)),
-                "validated with TP1 or TP2",
-            ),
-            (
-                "attention_context_parallel",
-                dict(options=_make_options(tp_size=2, attn_cp_size=2)),
-                "attention context parallelism is not supported",
-            ),
-            (
-                "decode_context_parallel",
-                dict(options=_make_options(tp_size=2, dcp_size=2)),
-                "decode context parallelism is not supported",
-            ),
-            (
-                "quantized_model",
-                dict(model_config=_make_model_config(quantization="fp8")),
-                "quantization is not supported",
-            ),
-            (
-                "layer_group_offload",
-                dict(options=_make_options(offload_group_size=1)),
-                "layer-group offloading is not supported",
-            ),
-            (
-                "torch_compile",
-                dict(options=_make_options(enable_torch_compile=True)),
-                "torch.compile is not supported",
-            ),
-            (
-                "zero_prefetch_threads",
-                dict(options=_make_options(prefetch_num_threads=0)),
-                "checkpoint prefetch requires at least one thread",
-            ),
-            (
-                "transformers_model_impl",
-                dict(
-                    model_config=_make_model_config(
-                        model_impl=ModelImpl.TRANSFORMERS,
-                        _resolved_model_impl=ModelImpl.TRANSFORMERS,
-                    ),
-                    resolved_model_class=_ExternalModel,
-                ),
-                "the native SGLang model implementation is required",
-            ),
-            (
-                "external_model_implementation",
-                dict(resolved_model_class=_ExternalModel),
-                "the native SGLang model implementation is required",
-            ),
-            (
-                "unknown_architecture",
-                dict(
-                    model_config=_make_model_config(
-                        hf_config=SimpleNamespace(architectures=["OtherForCausalLM"])
-                    )
-                ),
-                "model architecture 'OtherForCausalLM' is not in the startup overlap registry",
-            ),
+            ({"loader": object()}, "loader"),
+            ({"load_config": LoadConfig(load_format=LoadFormat.PT)}, "load_format"),
+            ({"options": _make_options(cpu_offload_gb=1)}, "cpu_offload"),
+            ({"options": _make_options(offload_group_size=1)}, "layer_group_offload"),
+            ({"options": _make_options(ep_join_mode="scale")}, "elastic_ep_join"),
+            ({"options": _make_options(prefetch_num_threads=0)}, "prefetch_threads"),
+            ({"resolved_model_class": _ExternalModel}, "model_implementation"),
         )
-        for name, kwargs, reason in cases:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, re.escape(reason)):
+        for kwargs, rejection in cases:
+            with self.subTest(rejection=rejection):
+                with self.assertRaisesRegex(ValueError, rejection):
                     self._create(**kwargs)
 
 
@@ -1524,20 +1047,49 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIsNone(manager.finalize())
         self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
 
-    def test_auto_secondary_weights_fallback_reuses_initialized_model(self):
+    def test_multiple_safetensors_sources_share_the_overlap_lifecycle(self):
         trace = []
         loader = _RecordingLoader(_TiedWeightModel(), trace)
         loader.num_resolved_sources = 2
         manager = self._manager(loader, fallback_to_serial=True)
 
         manager.prepare()
+        self.assertEqual(len(manager._resolved_sources), 2)
+        manager.start_prefetch()
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+        ):
+            manager.finalize()
 
-        self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+        self.assertEqual(trace[:3], ["initialize", "resolve", "prepare_capture"])
+        self.assertNotIn("serial_load", trace)
+        self.assertEqual(trace.count("commit"), 1)
         self.assertEqual(manager.state, StartupWeightLoadState.READY)
-        self.assertFalse(manager.is_deferred)
-        self.assertIsNone(manager.finalize())
-        self.assertIsNone(manager.finalize())
-        self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+
+    def test_mixed_source_formats_fall_back_before_capture_mutation(self):
+        for auto in (False, True):
+            with self.subTest(auto=auto):
+                trace = []
+                model = _TiedWeightModel()
+                loader = _RecordingLoader(model, trace)
+                loader.num_resolved_sources = 2
+                resolve = loader.resolve_model_weights
+
+                def mixed_sources(model_config, model):
+                    sources = resolve(model_config, model)
+                    sources[1].use_safetensors = False
+                    return sources
+
+                loader.resolve_model_weights = mixed_sources
+                manager = self._manager(loader, fallback_to_serial=auto)
+                if auto:
+                    self.assertIs(manager.prepare(), model)
+                    self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+                else:
+                    with self.assertRaisesRegex(ValueError, "requires safetensors"):
+                        manager.prepare()
+                    self.assertEqual(trace, ["initialize", "resolve"])
 
     def test_auto_supported_safetensors_source_overlaps_regardless_of_path(self):
         for hf_folder in ("/local/model", "/remote/model"):
@@ -1676,7 +1228,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             self.assertRaisesRegex(
                 RuntimeError,
-                "changed graph-visible tensor storage: parameter:tied_weight",
+                "changed graph-visible storage or constants: parameter:tied_weight",
             ),
         ):
             manager.finalize()
@@ -1701,7 +1253,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
             patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
             self.assertRaisesRegex(
                 RuntimeError,
-                "changed graph-visible tensor storage: derived:graph_weight",
+                "changed graph-visible storage or constants: derived:graph_weight",
             ),
         ):
             manager.finalize()
@@ -2027,6 +1579,44 @@ class TestStartupWeightLoadPolicyRouting(CustomTestCase):
 
 
 class TestModelStorageManifest(CustomTestCase):
+    def test_kv_cache_post_load_detects_changed_capture_constants(self):
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        for checkpoint_scale in (None, 0.5):
+            with self.subTest(checkpoint_scale=checkpoint_scale):
+                model = nn.Module()
+                model.attn = RadixAttention.__new__(RadixAttention)
+                nn.Module.__init__(model.attn)
+                method = BaseKVCacheMethod(quant_config=None)
+                method.create_weights(model.attn)
+                optional_values = initialize_capture_safe_weights(model)
+                method.process_weights_after_loading(model.attn)
+                manifest = ModelStorageManifest.capture(model)
+                pointers = (
+                    model.attn.k_scale.data_ptr(),
+                    model.attn.v_scale.data_ptr(),
+                )
+
+                restore_optional_checkpoint_parameter_values(optional_values)
+                if checkpoint_scale is not None:
+                    model.attn.k_scale.copy_(checkpoint_scale)
+                method.process_weights_after_loading(model.attn)
+
+                self.assertEqual(
+                    pointers,
+                    (model.attn.k_scale.data_ptr(), model.attn.v_scale.data_ptr()),
+                )
+                self.assertEqual(
+                    manifest.changed_names(model),
+                    ()
+                    if checkpoint_scale is None
+                    else (
+                        "constant:attn.k_scale_float",
+                        "constant:attn.v_scale_float",
+                    ),
+                )
+
     def test_in_place_updates_preserve_the_manifest(self):
         model = _TiedWeightModel()
         manifest = ModelStorageManifest.capture(model)
