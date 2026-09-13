@@ -869,7 +869,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel; "auto" resolves to aiter_sparse on gfx950, tilelang elsewhere
+    # (resolve_hip_flashmla_backend). Also: triton | torch | comparison | unified_kv_triton.
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
@@ -892,6 +894,15 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # gfx950 mHC: the boundary reduce + sinkhorn rides in the layer's next RMSNorm launch (0: alone)
+    SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM = EnvBool(True)
+    # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
+    SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
+    # HIP: fused decode glue launches (page table, index widening, image select); 0: torch
+    SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
+    # aiter_sparse decode: a pinned split-KV count keeps the fp32 combine order, hence the bits,
+    # the same at every batch size; 0 keeps aiter's cost model, which re-splits past 64 rows
+    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
 
     # ===================================================================
     # Apple Silicon and MLX
@@ -1454,9 +1465,9 @@ class Envs:
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
-    # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # tuned batched_gemm_bf16 (gfx95). ON on ROCm, OFF elsewhere; the call sites also
+    # require SGLANG_USE_AITER on gfx95. Set False to force the einsum.
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)

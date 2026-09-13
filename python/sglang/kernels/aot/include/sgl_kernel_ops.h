@@ -185,7 +185,8 @@ void deepseek_v4_topk_transform_512(
     const at::Tensor& page_table,
     at::Tensor& page_indices,
     int64_t page_size,
-    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt,
+    bool sort_output = false);
 #endif
 
 /*

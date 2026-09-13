@@ -6,15 +6,21 @@ from sglang.srt.layers.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_gfx95_supported
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 class TestCompressedKVQuant(CustomTestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and (torch.version.cuda is not None or is_gfx95_supported()),
+        "the C1 decode kernel serves CUDA and gfx95 ROCm",
+    )
     def test_cuda_compressor_scale_boundaries(self):
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
         from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
@@ -71,7 +77,7 @@ class TestCompressedKVQuant(CustomTestCase):
         )
         self.assertTrue(torch.equal(cache, expected))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipUnless(torch.cuda.is_available(), "requires a GPU")
     def test_triton_matches_torch_for_both_quantization_rules(self):
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,

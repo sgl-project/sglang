@@ -1,5 +1,7 @@
 """Compare decode and multimodal extend hashes with a per-token reference."""
 
+import sys
+
 import pytest
 import torch
 
@@ -9,13 +11,13 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.cuda is None,
-    reason="engram_hash_ids requires CUDA",
+    not torch.cuda.is_available(), reason="engram_hash_ids requires a GPU"
 )
 
 VOCAB = 1000
@@ -324,3 +326,7 @@ def test_extend_with_scheduler_history_and_image_spans():
         starts=starts,
         **_common(image=True),
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

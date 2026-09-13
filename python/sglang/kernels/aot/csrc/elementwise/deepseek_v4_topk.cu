@@ -46,6 +46,7 @@ constexpr size_t kSMEM = 48 * 1024;  // bytes
 #endif
 static_assert(kSMEM % (2 * sizeof(int32_t)) == 0, "kSMEM must be a multiple of 8 bytes.");
 
+// seq_lens[b] must not exceed scores.size(1) or page_table.size(1) << page_bits: a row reads up to its length
 struct TopKParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
@@ -57,6 +58,8 @@ struct TopKParams {
   uint32_t page_bits;
   uint32_t topk;
   int64_t output_stride;
+  // Emit each row's picks in ascending order (see bitonic_sort_u32).
+  bool sort_output;
 };
 
 __device__ __forceinline__ uint8_t convert_to_uint8(float x) {
@@ -251,6 +254,135 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32
   }
 }
 
+// Bitonic sort of n (a power of two, 64 <= n <= kMaxTopK) 32-bit keys, one per thread: strides
+// below the wavefront width exchange through lane shuffles, the wider ones through LDS.
+
+// lane ^ J's value in registers: DPP for J <= 8, gfx950 permlane swaps for J = 16, 32; __shfl_xor
+// is an LDS round trip on every stage's dependent chain.
+template <uint32_t J>
+__device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
+#if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+  if constexpr (J == 1) {  // quad_perm [1, 0, 3, 2]
+    return static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0xB1, 0xF, 0xF, true));
+  }
+  if constexpr (J == 2) {  // quad_perm [2, 3, 0, 1]
+    return static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0x4E, 0xF, 0xF, true));
+  }
+  if constexpr (J == 4 || J == 8) {
+    // within a 16-lane row: bit clear reads J lanes up (row_shl), bit set J lanes down (row_shr)
+    const uint32_t shl =
+        static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0x100 | J, 0xF, 0xF, true));
+    const uint32_t shr =
+        static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0x110 | J, 0xF, 0xF, true));
+    return (__lane_id() & J) ? shr : shl;
+  }
+#endif
+#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx950__)
+  if constexpr (J == 16) {
+    // rows 1 and 3 of the first operand swap with rows 0 and 2 of the second
+    const auto pair = __builtin_amdgcn_permlane16_swap(v, v, false, false);
+    return (__lane_id() & 16) ? pair[0] : pair[1];
+  }
+  if constexpr (J == 32) {
+    const auto pair = __builtin_amdgcn_permlane32_swap(v, v, false, false);
+    return (__lane_id() & 32) ? pair[0] : pair[1];
+  }
+#endif
+  return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), static_cast<int>(J), 64));
+}
+
+// One bitonic stage (merge size K, stride J); templated so the network unrolls with no stride switch.
+template <uint32_t K, uint32_t J>
+__device__ __forceinline__ uint32_t bitonic_stage(uint32_t v, uint32_t* __restrict__ s_vals, uint32_t tx, uint32_t n) {
+  const bool up = (tx & K) == 0;
+  const bool lower = (tx & J) == 0;
+  uint32_t w;
+  if constexpr (J >= 64) {
+    __syncthreads();
+    if (tx < n) s_vals[tx] = v;
+    __syncthreads();
+    w = tx < n ? s_vals[tx ^ J] : ~0u;
+  } else {
+    w = lane_xor<J>(v);
+  }
+  return (lower == up) ? min(v, w) : max(v, w);
+}
+
+template <uint32_t N, uint32_t K, uint32_t J>
+__device__ __forceinline__ uint32_t bitonic_network(uint32_t v, uint32_t* __restrict__ s_vals, uint32_t tx) {
+  v = bitonic_stage<K, J>(v, s_vals, tx, N);
+  if constexpr (J > 1) {
+    return bitonic_network<N, K, J / 2>(v, s_vals, tx);
+  } else if constexpr (K < N) {
+    return bitonic_network<N, K * 2, K>(v, s_vals, tx);
+  } else {
+    return v;
+  }
+}
+
+// Sort the N (a power of two, 64 <= N <= kBlockSize) values in s_vals ascending, one per thread.
+template <uint32_t N>
+__device__ void bitonic_sort_fixed(uint32_t* __restrict__ s_vals) {
+  static_assert(N >= 64 && N <= kBlockSize && (N & (N - 1)) == 0, "one value per thread");
+  const uint32_t tx = threadIdx.x;
+  uint32_t v = tx < N ? s_vals[tx] : ~0u;
+  v = bitonic_network<N, 2, 1>(v, s_vals, tx);
+  __syncthreads();
+  if (tx < N) s_vals[tx] = v;
+  __syncthreads();
+}
+
+__device__ void bitonic_sort_u32(uint32_t* __restrict__ s_vals, uint32_t n) {
+  const uint32_t tx = threadIdx.x;
+  if (n <= kBlockSize) {
+    switch (n) {
+      case 64:
+        bitonic_sort_fixed<64>(s_vals);
+        return;
+      case 128:
+        bitonic_sort_fixed<128>(s_vals);
+        return;
+      case 256:
+        bitonic_sort_fixed<256>(s_vals);
+        return;
+      case 512:
+        bitonic_sort_fixed<512>(s_vals);
+        return;
+      default:
+        if constexpr (kBlockSize >= 1024) {
+          bitonic_sort_fixed<1024>(s_vals);
+          return;
+        }
+        break;
+    }
+  }
+  // more values than threads (a smaller block than kMaxTopK): every stage through LDS
+  for (uint32_t k = 2; k <= n; k <<= 1) {
+    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tx; i < n; i += kBlockSize) {
+        const uint32_t partner = i ^ j;
+        if (partner > i) {
+          const uint32_t a = s_vals[i];
+          const uint32_t b = s_vals[partner];
+          const bool up = (i & k) == 0;
+          if ((a > b) == up) {
+            s_vals[i] = b;
+            s_vals[partner] = a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__device__ __forceinline__ uint32_t next_pow2_at_least_64(uint32_t x) {
+  uint32_t n = 64;
+  while (n < x)
+    n <<= 1;
+  return n;
+}
+
 __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(const TopKParams params) {
   const auto bid = blockIdx.x;
   const auto seq_len = params.seq_lens[bid];
@@ -261,15 +393,61 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
   const auto raw_indices_ptr =
       params.raw_indices != nullptr ? params.raw_indices + bid * params.output_stride : nullptr;
 
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+  __shared__ uint32_t s_sort_vals[kMaxTopK];
+
+  // key: the position when the row has raw indices, else the slot (sort_selection_rows' order)
+  const bool key_is_position = raw_indices_ptr != nullptr;
+  uint32_t count = topk;
   if (seq_len <= static_cast<int32_t>(topk)) {
-    naive_paged_transform(seq_len, topk, params.page_bits, page_ptr, indices_ptr, raw_indices_ptr);
+    if (!params.sort_output || key_is_position) {
+      // ascending positions with the -1 padding last: already the sorted row
+      naive_paged_transform(seq_len, topk, params.page_bits, page_ptr, indices_ptr, raw_indices_ptr);
+      return;
+    }
+    // every position is a pick; the slot order still has to be established
+    count = static_cast<uint32_t>(seq_len);
+    for (uint32_t i = threadIdx.x; i < count; i += kBlockSize) {
+      s_topk_indices[i] = static_cast<int32_t>(i);
+    }
+  } else {
+    radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk);
+  }
+  __syncthreads();
+
+  if (params.sort_output) {
+    const uint32_t n = next_pow2_at_least_64(count);
+    for (uint32_t i = threadIdx.x; i < n; i += kBlockSize) {
+      uint32_t key = ~0u;
+      if (i < count) {
+        const int32_t raw = s_topk_indices[i];
+        key = static_cast<uint32_t>(
+            key_is_position ? raw : page_to_slot(page_ptr, static_cast<uint32_t>(raw), params.page_bits));
+      }
+      s_sort_vals[i] = key;
+    }
+    __syncthreads();
+    bitonic_sort_u32(s_sort_vals, n);
+    for (uint32_t i = threadIdx.x; i < topk; i += kBlockSize) {
+      int32_t slot = -1;
+      int32_t raw = -1;
+      if (i < count) {
+        const int32_t key = static_cast<int32_t>(s_sort_vals[i]);
+        if (key_is_position) {
+          raw = key;
+          slot = page_to_slot(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+        } else {
+          slot = key;
+        }
+      }
+      indices_ptr[i] = slot;
+      if (raw_indices_ptr != nullptr) {
+        raw_indices_ptr[i] = raw;
+      }
+    }
     return;
   }
 
-  __shared__ int32_t s_topk_indices[kMaxTopK];
-  radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk);
-
-  __syncthreads();
   for (uint32_t i = threadIdx.x; i < topk; i += kBlockSize) {
     const auto raw = s_topk_indices[i];
     indices_ptr[i] = page_to_slot(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
@@ -304,7 +482,8 @@ void deepseek_v4_topk_transform_512(
     const at::Tensor& page_table,
     at::Tensor& page_indices,
     int64_t page_size,
-    std::optional<at::Tensor> raw_indices_opt) {
+    std::optional<at::Tensor> raw_indices_opt,
+    bool sort_output) {
   CHECK_CUDA(scores);
   CHECK_CUDA(seq_lens);
   CHECK_CUDA(page_table);
@@ -367,6 +546,7 @@ void deepseek_v4_topk_transform_512(
       .page_bits = page_bits,
       .topk = static_cast<uint32_t>(topk),
       .output_stride = topk,
+      .sort_output = sort_output,
   };
 
   const auto stream = at::cuda::getCurrentCUDAStream().stream();

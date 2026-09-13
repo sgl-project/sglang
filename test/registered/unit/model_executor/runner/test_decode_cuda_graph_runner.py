@@ -28,6 +28,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -291,6 +293,73 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestDsaVariantIsDpGlobal(CustomTestCase):
+    """Every attention-DP rank must replay the same captured graph (the in-graph
+    collectives pair buffers by capture order), so an idle rank or one in another
+    length class resolves the variant from the group-wide max."""
+
+    _LIMITS = [("candidate_all", 2048), ("candidate_unfiltered", 4096)]
+
+    def _runner(self, **overrides):
+        attrs = dict(
+            candidate_filter_span=4096,
+            candidate_graph_limits=list(self._LIMITS),
+            dsa_dual_graph=False,
+            dsa_index_topk=2048,
+            require_mlp_tp_gather=True,
+        )
+        attrs.update(overrides)
+        fake = SimpleNamespace(**attrs)
+        fake._dp_max_seq_len = lambda fb: DecodeCudaGraphRunner._dp_max_seq_len(
+            fake, fb
+        )
+        return lambda fb: DecodeCudaGraphRunner._resolve_dsa_variant(fake, fb)
+
+    @staticmethod
+    def _batch(seq_lens, dp_max_seq_len):
+        return SimpleNamespace(
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+            seq_lens=None,
+            dp_max_seq_len=dp_max_seq_len,
+        )
+
+    def test_idle_rank_follows_decoding_peer(self):
+        resolve = self._runner()
+        busy = self._batch([100], dp_max_seq_len=100)
+        idle = self._batch([], dp_max_seq_len=100)
+        self.assertEqual(resolve(busy), "candidate_all")
+        self.assertEqual(resolve(idle), resolve(busy))
+
+    def test_ranks_in_different_length_classes_agree(self):
+        resolve = self._runner()
+        short = self._batch([100], dp_max_seq_len=3000)
+        long = self._batch([3000], dp_max_seq_len=3000)
+        self.assertEqual(resolve(short), resolve(long))
+        self.assertEqual(resolve(long), "candidate_unfiltered")
+        above_span = self._batch([100], dp_max_seq_len=5000)
+        self.assertEqual(resolve(above_span), "candidate_filtered")
+
+    def test_dual_graph_family_uses_group_max(self):
+        resolve = self._runner(candidate_filter_span=None, dsa_dual_graph=True)
+        idle = self._batch([], dp_max_seq_len=100)
+        self.assertEqual(resolve(idle), "dense")
+        self.assertEqual(resolve(self._batch([100], dp_max_seq_len=100)), "dense")
+        self.assertEqual(resolve(self._batch([100], dp_max_seq_len=4096)), "sparse")
+
+    def test_without_dp_sync_keeps_local_lengths(self):
+        resolve = self._runner(require_mlp_tp_gather=False)
+        self.assertEqual(
+            resolve(self._batch([100], dp_max_seq_len=None)), "candidate_all"
+        )
+        self.assertEqual(
+            resolve(self._batch([], dp_max_seq_len=None)), "candidate_filtered"
+        )
+        resolve = self._runner()
+        self.assertEqual(
+            resolve(self._batch([100], dp_max_seq_len=None)), "candidate_all"
+        )
 
 
 if __name__ == "__main__":

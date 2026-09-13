@@ -6,10 +6,11 @@ import unittest
 import torch
 
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 def reference(x, kv, qw, kw, eps, clamp):
@@ -53,6 +54,31 @@ class TestEngramGate(CustomTestCase):
                 self.assertTrue(result.is_contiguous())
                 for value, original in zip((x, kv, qw, kw), originals):
                     self.assertTrue(torch.equal(value, original))
+
+    def test_image_select_keeps_the_input(self):
+        """``image_select`` folds the model's ``where(input_ids == image_id, x, gated)`` into
+        the launch, bitwise."""
+        torch.manual_seed(31)
+        for batch, dim in ((1, 5120), (64, 5120)):
+            with self.subTest(batch=batch, dim=dim):
+                x = torch.randn(batch, 4, dim, device="cuda", dtype=torch.bfloat16)
+                kv = torch.randn(batch, 5 * dim, device="cuda", dtype=torch.bfloat16)
+                qw = torch.rand(4, dim, device="cuda", dtype=torch.bfloat16)
+                kw = torch.rand_like(qw)
+                ids = torch.randint(0, 3, (batch,), device="cuda")
+                ids[0] = 2
+                gated = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6)
+                ref = torch.where((ids == 2)[:, None, None], x, gated)
+                got = fused_engram_gate(
+                    x, kv, qw, kw, 1e-6, 1e-6, image_select=(ids, 2)
+                )
+                self.assertTrue(torch.equal(got, ref))
+                self.assertTrue(torch.equal(got[0], x[0]))
+                # no image token in the batch: the plain gate
+                got = fused_engram_gate(
+                    x, kv, qw, kw, 1e-6, 1e-6, image_select=(ids, 99)
+                )
+                self.assertTrue(torch.equal(got, gated))
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -2132,7 +2132,9 @@ _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
-_HC_MIX_DOT_PRECISION = "tf32x3"
+_is_hip = is_hip()
+# CDNA has no TF32: Triton lowers "ieee" to the fp32 MFMA, one rounding per product at every M
+_HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
 # num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
 # short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
 _HC_MIX_NUM_STAGES = 2
@@ -2146,6 +2148,9 @@ _HC_MIX_MID_MAX_M = 2048
 
 def _block_m_for(m: int) -> int:
     """Row-tile choices preserve each row's arithmetic and may depend on M."""
+    if _is_hip:
+        # fp32 MFMA tile heights do not share a per-row reduction order, so one height serves every M
+        return _HC_MIX_BLOCK_M_MID
     if m <= _HC_MIX_BLOCK_M_SMALL:
         return _HC_MIX_BLOCK_M_SMALL
     if m <= _HC_MIX_MID_MAX_M:
@@ -2339,6 +2344,28 @@ def hc_mix_stats_sinkhorn(
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_num_stages_for(m, k),
     )
+    if _is_hip:
+        from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+            hc_mix_reduce_sinkhorn_vec,
+        )
+
+        hc_mix_reduce_sinkhorn_vec(
+            part_mix,
+            part_sq,
+            hc_scale,
+            hc_base,
+            pre,
+            post,
+            comb,
+            k=k,
+            rms_eps=rms_eps,
+            mix=mix,
+            hc_mult=hc_mult,
+            num_slices=num_slices,
+            sinkhorn_iters=sinkhorn_iters,
+            hc_eps=hc_eps,
+        )
+        return pre, post, comb
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
         part_sq,

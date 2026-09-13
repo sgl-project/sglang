@@ -321,6 +321,16 @@ class StandardTopKOutput(NamedTuple):
         return TopKOutputFormat.STANDARD
 
 
+class StandardTopKOutputDeferredPad(StandardTopKOutput):
+    """A STANDARD output whose rows at and past ``num_token_non_padded`` still hold the
+    router's values, which the aiter runner masks in its fused sorting launch."""
+
+    def __new__(cls, topk_weights, topk_ids, router_logits, num_token_non_padded):
+        self = super().__new__(cls, topk_weights, topk_ids, router_logits)
+        self.num_token_non_padded = num_token_non_padded
+        return self
+
+
 # Standard top-k output carrying, in addition, the FlashInfer routed-MoE packed
 # topk ``(id << 16) | bf16_bits(weight)`` that the gating kernel produced in the
 # same launch (the sqrtsoftplus Triton router under the flashinfer_mxfp4 runner
@@ -611,7 +621,10 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        router_logits_partials: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        if router_logits_partials is not None:
+            _reduce_router_logits_partials(router_logits, router_logits_partials)
         self.topk_config.torch_native = True
         topk_output = select_experts(
             hidden_states=hidden_states,
@@ -630,7 +643,11 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        router_logits_partials: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        """``router_logits_partials`` (ROCm decode router): fp32 split-K partials whose
+        fixed-order sum is the logits; ``router_logits`` is then a buffer the fused gate
+        fills, and any other reader first reduces the partials into it."""
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -653,6 +670,13 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
+
+        if (
+            router_logits_partials is not None
+            and output_format != TopKOutputFormat.STANDARD
+        ):
+            _reduce_router_logits_partials(router_logits, router_logits_partials)
+            router_logits_partials = None
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
@@ -694,6 +718,7 @@ class TopK(BaseFusedOp):
                     topk_config=self.topk_config,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
+                    router_logits_partials=router_logits_partials,
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -1348,6 +1373,15 @@ def biased_topk_impl(
     return topk_weights, topk_ids
 
 
+def _reduce_router_logits_partials(
+    router_logits: torch.Tensor, router_logits_partials: torch.Tensor
+) -> None:
+    """Fill ``router_logits`` with the split-K sum in the fused ROCm gate's order."""
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_reduce_partials
+
+    rocm_router_reduce_partials(router_logits_partials, router_logits)
+
+
 def biased_topk_jit_kernel_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1361,11 +1395,26 @@ def biased_topk_jit_kernel_impl(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     packed_out: Optional[torch.Tensor] = None,
+    router_logits_partials: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
+        if router_logits_partials is not None:
+            # ROCm decode router: split-K reduce + gate (+ the aiter sort for small batches) in one launch
+            from sglang.srt.layers.moe.rocm_fused_front import gate_partials
+
+            return gate_partials(
+                gating_output,
+                correction_bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                router_logits_partials,
+                num_token_non_padded,
+            )
+
         from aiter import topk_gating
 
         num_tokens = gating_output.shape[0]
@@ -1389,6 +1438,7 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
     else:
+        assert router_logits_partials is None
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
         # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
@@ -2164,6 +2214,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    defer_hip_pad_fill: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``padded_rows_masked``: the router already wrote id -1 / weight 0 into
     rows >= ``num_token_non_padded`` (see :func:`_fused_gate_masks_padded_rows`),
@@ -2243,7 +2294,8 @@ def _post_process_topk_ids(
             and use_per_rank_shared_slots
             and not _eplb_remap_enabled()
         )
-        if not _fold_pad_into_append:
+        # the aiter runner masks the padded rows itself
+        if not _fold_pad_into_append and not defer_hip_pad_fill:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
@@ -2348,7 +2400,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not defer_hip_pad_fill:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2365,6 +2417,7 @@ def select_experts(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    router_logits_partials: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2396,6 +2449,22 @@ def select_experts(
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
         )
     routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+
+    if router_logits_partials is not None and not (
+        _use_aiter
+        and scoring_func == "sqrtsoftplus"
+        and custom_routing_function is None
+        and not use_grouped_topk
+        and not torch_native
+        and expert_location_dispatch_info is None
+        and (
+            num_fused_shared_experts == 0
+            or has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        )
+    ):
+        # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
+        _reduce_router_logits_partials(router_logits, router_logits_partials)
+        router_logits_partials = None
 
     (
         router_logits,
@@ -2491,6 +2560,11 @@ def select_experts(
                     device=hidden_states.device,
                 )
                 _packed_kwargs = dict(packed_out=packed_topk)
+            _partials_kwargs = (
+                {"router_logits_partials": router_logits_partials}
+                if router_logits_partials is not None
+                else {}
+            )
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -2504,6 +2578,7 @@ def select_experts(
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_packed_kwargs,
+                **_partials_kwargs,
             )
             padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
         elif (
@@ -2606,6 +2681,17 @@ def select_experts(
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
+    defer_hip_pad_fill = False
+    if _use_aiter and num_token_non_padded is not None:
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            fused_sorting_masks_padded_rows,
+        )
+
+        defer_hip_pad_fill = fused_sorting_masks_padded_rows(
+            num_fused_shared_experts,
+            expert_location_dispatch_info,
+            eplb_remap=_eplb_remap_enabled(),
+        )
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -2615,6 +2701,7 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        defer_hip_pad_fill=defer_hip_pad_fill,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(
@@ -2624,6 +2711,10 @@ def select_experts(
     if packed_topk is not None:
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
+        )
+    if defer_hip_pad_fill:
+        return StandardTopKOutputDeferredPad(
+            topk_weights, topk_ids, router_logits, num_token_non_padded
         )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
