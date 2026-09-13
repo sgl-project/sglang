@@ -3,7 +3,6 @@
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::buckets::BucketRequest;
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
@@ -281,13 +280,6 @@ pub async fn chat_completions(
         .and_then(|config| headers.get(config.session_id_header.as_str()))
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
-    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
-    let prefill_bucket_request = BucketRequest {
-        input_tokens: request_input_tokens,
-        expected_peak_sequence_tokens: None,
-        ttft_slo_ms,
-        tps_slo,
-    };
     // `select_prefill_worker` reduces this to `Bucket` when Bucket
     // partitioning is off.
     let session_affinity_mode = ctx
@@ -297,29 +289,26 @@ pub async fn chat_completions(
         .as_ref()
         .map(|config| config.session_affinity_mode)
         .unwrap_or(SessionAffinityMode::Bucket);
-    let worker = {
-        let selection = select_prefill_worker(&PrefillSelectionInputs {
-            policy: &policy,
-            policy_kind: ctx.config.model.policy,
-            bucket_selector: ctx.bucket_selector.as_ref(),
-            metrics: ctx.metrics.as_ref(),
-            model_id: &model_id,
-            model_str: &model_str,
-            body: Some(&body),
-            routing_key,
-            session_id,
-            request_input_tokens,
-            request_tokens: request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-            external_prefix: external_prefix.as_ref(),
-            load_snapshot: load_snapshot.as_ref(),
-            workers: &workers,
-            bucket_request: prefill_bucket_request,
-            session_affinity_mode,
-        });
-        selection
-            .selected
-            .ok_or_else(|| policy_selection_failed(&ctx, &model_str, selection.failure_reason))?
-    };
+    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
+    let worker = select_prefill_worker(&PrefillSelectionInputs {
+        policy: policy.as_ref(),
+        policy_kind: ctx.config.model.policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        metrics: ctx.metrics.as_ref(),
+        model_id: &model_id,
+        body: Some(&body),
+        routing_key,
+        session_id,
+        request_input_tokens,
+        request_tokens: request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        external_prefix: external_prefix.as_ref(),
+        load_snapshot: load_snapshot.as_ref(),
+        workers: &workers,
+        ttft_slo_ms,
+        tps_slo,
+        session_affinity_mode,
+    })
+    .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
     // Decode selection starts after Final P.
     //
@@ -343,7 +332,7 @@ pub async fn chat_completions(
             select_decode_peer(&DecodeSelectionInputs {
                 decode_policy_kind: ctx.config.model.decode_policy,
                 bucket_selector: ctx.bucket_selector.as_ref(),
-                model_str: &model_str,
+                model_id: &model_id,
                 prefill_url: &worker.url,
                 decode_workers: &decode_workers,
                 request_input_tokens,
