@@ -88,7 +88,7 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
+    scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32

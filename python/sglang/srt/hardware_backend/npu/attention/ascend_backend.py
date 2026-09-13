@@ -476,12 +476,23 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
-            spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
-            # Overlap scheduling can publish the CPU sequence length one step
-            # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
-            # derive the block-table width from the same source. Otherwise a
-            # page-aligned request can expose KV_S=N while asking FIA for N+1.
-            seq_lens_max = forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+            if (
+                forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_dflash()
+            ):
+                # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
+                # one verify block, which already covers the draft block.
+                seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+            else:
+                # Overlap scheduling can publish the CPU sequence length one
+                # step ahead of the device tensor. FIA consumes seq_lens_cpu
+                # below, so derive the block-table width from the same source.
+                # Otherwise a page-aligned request can expose KV_S=N while
+                # asking FIA for N+1.
+                spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
+                seq_lens_max = (
+                    forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+                )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -522,6 +533,10 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
+        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
+        # only rebind the Host-side IntArray when captured as a Python list.
+
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -531,8 +546,10 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
-            if spec_algorithm is None or not spec_algorithm.is_dspark():
-                self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
+            if spec_algorithm is None or not spec_algorithm.is_dflash_family():
+                self.forward_metadata.seq_lens_cpu_int += int(
+                    forward_batch.spec_info.draft_token_num
+                )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -680,6 +697,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
+        # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -775,8 +794,17 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens[:bs].int()
+            # Update SWA mask: True = masked out (don't attend), False = attend.
+            # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
+            # (= prefix + block_size) to keep draft KV inside the mask window.
+            if (
+                forward_mode.is_target_verify()
+                and _is_dflash_verify(spec_info)
+                and seq_lens_cpu is not None
+            ):
+                seq_lens_int = seq_lens_cpu[:bs].int()
+            else:
+                seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
             start_exp = starts.unsqueeze(1)
@@ -796,6 +824,13 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
+            # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
+            # length; other spec algorithms already added the draft tokens above.
+            if _is_dflash_verify(spec_info) and seq_lens_cpu is not None:
+                kv_lens = seq_lens_cpu[:bs]
+            else:
+                kv_lens = seq_lens[:bs]
+            metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
@@ -2111,13 +2146,26 @@ class AscendAttnBackend(AttentionBackend):
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.global_num_token_non_padded_cpu]
+                # Trim DP padding rows so actualSeqLengthsKv matches the
+                # operator's batchSize (TND layout); only target_verify has a
+                # uniform per-request width.
+                if forward_batch.forward_mode.is_target_verify():
+                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
+                # Graph mode: bind the Python list, which graph.update can
+                # rebind (a captured CPU tensor would be baked as constant).
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
+            if (
+                not self.graph_mode
+                and forward_batch.forward_mode.is_target_verify()
+                and len(actual_seq_lengths_kv) > real_bs
+            ):
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -2127,6 +2175,7 @@ class AscendAttnBackend(AttentionBackend):
                     ]
                 actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
             else:
+                # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],
@@ -2146,6 +2195,13 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables_swa
             else:
                 block_table = self.forward_metadata.block_tables
+            if (
+                not self.graph_mode
+                and forward_batch.forward_mode.is_target_verify()
+                and block_table.shape[0] > real_bs
+            ):
+                # Drop DP padding rows (see real_bs comment above).
+                block_table = block_table[:real_bs]
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
@@ -2182,7 +2238,7 @@ class AscendAttnBackend(AttentionBackend):
                     query,
                     k_cache,
                     v_cache,
-                    block_table=self.forward_metadata.block_tables,
+                    block_table=block_table,
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,

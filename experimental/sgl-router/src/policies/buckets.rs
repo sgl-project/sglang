@@ -118,36 +118,6 @@ impl BucketSelector {
         .collect()
     }
 
-    /// Maps global Indexer candidates to prefill buckets using `E` as the workload.
-    pub fn bind_prefill_cache_candidate(
-        &self,
-        mut candidate: CacheCandidate,
-        request: BucketRequest,
-    ) -> Option<CacheCandidate> {
-        let Some(config) = &self.config else {
-            candidate.candidate_range_id = "global".to_string();
-            candidate.max_pending_prefill_tokens = None;
-            return Some(candidate);
-        };
-        let spec = config.buckets.iter().find(|spec| {
-            spec.stage == BucketStage::Prefill
-                && self.contains(spec, &candidate.worker.id.0)
-                && within(
-                    candidate.uncached_tokens,
-                    spec.min_extend_tokens,
-                    spec.max_extend_tokens,
-                )
-                && spec
-                    .max_context_tokens
-                    .is_none_or(|max_context| request.input_tokens <= max_context)
-                && (config.ttft_slo_policy != SloBucketPolicy::SloFirst
-                    || ttft_eligible(spec, request.ttft_slo_ms))
-        })?;
-        candidate.candidate_range_id = spec.id.clone();
-        candidate.max_pending_prefill_tokens = spec.max_pending_prefill_tokens;
-        Some(candidate)
-    }
-
     /// Finds the prefill bucket containing a global session primary.
     pub fn prefill_affinity_domain(
         &self,
@@ -176,6 +146,35 @@ impl BucketSelector {
                     spec.max_pending_prefill_tokens,
                 )
             })
+    }
+
+    /// Applies a cache candidate's Bucket metadata and hard limits.
+    /// Unbucketed candidates remain globally eligible, and extend ranges do not
+    /// constrain global cache affinity.
+    pub fn prepare_prefill_cache_candidate(
+        &self,
+        mut candidate: CacheCandidate,
+        request: BucketRequest,
+    ) -> Option<CacheCandidate> {
+        let Some(config) = &self.config else {
+            return Some(candidate);
+        };
+        let Some(spec) = config.buckets.iter().find(|spec| {
+            spec.stage == BucketStage::Prefill && self.contains(spec, &candidate.worker.id.0)
+        }) else {
+            return Some(candidate);
+        };
+        if !spec
+            .max_context_tokens
+            .is_none_or(|max_context| request.input_tokens <= max_context)
+            || (config.ttft_slo_policy == SloBucketPolicy::SloFirst
+                && !ttft_eligible(spec, request.ttft_slo_ms))
+        {
+            return None;
+        }
+        candidate.candidate_range_id = spec.id.clone();
+        candidate.max_pending_prefill_tokens = spec.max_pending_prefill_tokens;
+        Some(candidate)
     }
 
     fn contains(&self, spec: &BucketSpec, worker_id: &str) -> bool {

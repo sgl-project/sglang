@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
 
@@ -101,6 +101,7 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
         prefix_len=step.result.prefix_len,
         last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
+        swa_branch_inserted=step.result.swa_branch_inserted,
         cache_actions=actions,
     )
 
@@ -1058,21 +1059,25 @@ def test_storage_backup_spec_round_trips_the_backuped_node():
     core = _tree_core(page_size=2)
     core.set_hicache_enabled()
     core.enable_storage = True
-    _insert(core, [1, 2], [10, 11])
-    _insert(core, [1, 2, 7, 8], [10, 11, 12, 13])
-    parent = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
-    child = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 7, 8]))).best_match_node
+    key = RadixKey(
+        array("q", [1, 2, 7, 8]), extra_key="adapter-a", cache_salt="tenant-a"
+    )
+    for length in (2, 4):
+        _pump_insert(
+            core,
+            InsertParams(key=key[:length], value=torch.arange(10, 10 + length)),
+        )
+    parent = core.match_prefix(MatchPrefixParams(key=key[:2])).best_match_node
+    child = core.match_prefix(MatchPrefixParams(key=key)).best_match_node
     core.commit_backup(parent, torch.tensor([100, 101], dtype=torch.int64), {})
     core.commit_backup(child, torch.tensor([102, 103], dtype=torch.int64), {})
 
     spec = core.build_storage_backup_spec(child, pass_prefix_keys=True)
     assert spec.host_value.tolist() == [102, 103]
     assert spec.token_ids == array("q", [7, 8])
-    parent_hashes = mem_cache.get_hash_str(array("q", [1, 2]), None, 2)
-    assert spec.prefix_keys == parent_hashes
-    assert spec.hash_value == mem_cache.get_hash_str(
-        array("q", [7, 8]), parent_hashes[-1], 2
-    )
+    hashes = get_storage_hash_str(key, page_size=2)
+    assert spec.prefix_keys == hashes[:1]
+    assert spec.hash_value == hashes[1:]
     assert spec.comp_xfers == {}
 
 
@@ -2282,6 +2287,30 @@ def test_stale_inspection_handles_raise_key_error_or_report_absence():
     assert not core.is_host_evictable_leaf(stale_root)
     assert not core.is_node_in_device_lru(stale_root, ComponentType.SWA)
     assert not core.is_node_in_host_lru(stale_root, ComponentType.SWA)
+
+
+# ---- SWA branching-point caching ----
+
+
+def _swa_hicache_core(window: int = 8) -> RustUnifiedTreeCore:
+    core = _swa_tree_core(window=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
+    for branching_seqlen, expected in [(2, True), (3, False), (None, False)]:
+        core = _swa_hicache_core()
+        result = _pump_insert(
+            core,
+            InsertParams(
+                key=_key([1, 2]),
+                value=torch.tensor([10, 11], dtype=torch.int64),
+                swa_branching_seqlen=branching_seqlen,
+            ),
+        )
+        assert result.swa_branch_inserted is expected, branching_seqlen
 
 
 if __name__ == "__main__":

@@ -431,12 +431,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
-            QSA_VARIANT_COMPRESSED,
             parse_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
-            QwenDSATokenToKVPool,
         )
 
         if num_layers == 0:
@@ -444,16 +442,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        if qsa_profile.variant == QSA_VARIANT_COMPRESSED:
-            return QSATokenToKVPool.qsa_bytes_per_token(
-                kv_heads=qsa_profile.kv_heads,
-                head_dim=qsa_profile.head_dim,
-                compress_ratio=qsa_profile.compress_ratio,
-                num_layers=num_layers,
-            )
-        return QwenDSATokenToKVPool.qsa_bytes_per_token(
+        return QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=qsa_profile.kv_heads,
             head_dim=qsa_profile.head_dim,
+            compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
         )
 

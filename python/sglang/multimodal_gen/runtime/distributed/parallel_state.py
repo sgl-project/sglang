@@ -171,7 +171,9 @@ def _sync_srt_tp_group() -> None:
     published `srt` config cannot answer: `gpu_worker.py` publishes a dummy
     carrying *this* package's `tp_size`, which a sequence-parallel launch sets
     to 1 while the group lent here is as wide as the world. So the widths are
-    stamped alongside the group, as `srt.initialize_model_parallel` does.
+    permanently overridden alongside the group -- this runs with no `srt`
+    config published at all, which is exactly why it cannot go through
+    `RuntimeContext.override` (it requires one).
 
     Only tensor parallelism folds this way, so every other dimension is one.
     """
@@ -183,7 +185,7 @@ def _sync_srt_tp_group() -> None:
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
     if srt_parallel_state._ATTN_TP is _TP:
-        get_parallel().stamp_derived_widths(
+        get_parallel().override_permanently(
             **derive_parallel_widths(
                 tp_size=_TP.world_size,
                 attn_cp_size=1,
@@ -192,7 +194,7 @@ def _sync_srt_tp_group() -> None:
                 moe_dp_size=1,
                 dcp_size=1,
                 dcp_enabled=False,
-            )
+            ),
         )
 
 

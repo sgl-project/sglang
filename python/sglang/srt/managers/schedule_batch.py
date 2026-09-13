@@ -126,7 +126,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -494,6 +496,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
+            if extra_key == RETAINED_CUDA_IPC_FEATURE_PROXY_KEY:
+                continue
             if isinstance(
                 self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
             ):
@@ -533,7 +537,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
-        values = [self.feature, self.precomputed_embeddings]
+        retained_proxy = self.model_specific_data.pop(
+            RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+        )
+        self.model_specific_data.pop(CUDA_IPC_FEATURE_COPY_EVENT_KEY, None)
+        values = [self.feature, self.precomputed_embeddings, retained_proxy]
         values.extend(self.model_specific_data.values())
         for value in values:
             if not isinstance(value, CudaIpcTensorTransportProxy):
@@ -682,10 +690,9 @@ class MultimodalInputs:
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             try:
-                # A request can be rejected before a deferred GPU feature is
-                # reconstructed. Acknowledge that transport lease before the
-                # proxy is dropped so the tokenizer pool can reuse its slice.
-                item.acknowledge_deferred_cuda_ipc_feature()
+                # Release both deferred features that were never used and
+                # borrowed features retained for possible re-prefill.
+                item.release_transport_proxies()
             except Exception:
                 logger.warning(
                     "Failed to release an unused multimodal feature transport",
@@ -1131,6 +1138,15 @@ class Req(ReqDllmMixin):
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Logical-page KV sharding: rotation base of the chain this request
+        # extends (owner of position-page P is (base + P) % shard_size).
+        # Refreshed at every sharded alloc — read through last_node, or drawn
+        # least-full for a new chain — and consumed by the radix insert to
+        # stamp new tree nodes. Allocation itself must NOT read it back when
+        # a tree node is available (the cache_unfinished_req dedup rebind
+        # would make it stale); the only allocation-time reader is the
+        # ChunkCache fallback, which has no tree nodes and no rebind.
+        self.kv_rotation_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1821,6 +1837,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
