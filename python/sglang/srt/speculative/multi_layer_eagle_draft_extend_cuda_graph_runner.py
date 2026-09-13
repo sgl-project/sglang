@@ -116,6 +116,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     req_pool_indices: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -335,6 +336,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                None
+                if buffers.mamba_track_indices is None
+                else buffers.mamba_track_indices[:bs]
+            ),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -486,13 +492,19 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             forward_mode=self.forward_mode,
             input_ids=buffers.input_ids[:num_tokens],
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=(
+                None
+                if buffers.mamba_track_indices is None
+                else buffers.mamba_track_indices[:bs]
+            ),
             spec_info=spec_info,
         )
         if (
@@ -700,6 +712,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+                if get_exec().mamba.enable_mamba_extra_buffer
+                else None
+            ),
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
             extend_seq_lens=extend_seq_lens,
@@ -770,6 +787,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             bs = self.get_runner(0)._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
+
+        if buffers.mamba_track_indices is not None:
+            buffers.mamba_track_indices[:bs].zero_()
+            if forward_batch.mamba_track_indices is not None:
+                buffers.mamba_track_indices[:raw_bs].copy_(
+                    forward_batch.mamba_track_indices
+                )
 
         fill_draft_extend_prepare_buffers(
             buffers.input_ids,

@@ -72,6 +72,7 @@ def resolve_draft_extend_seq_len_fill_value(
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     req_pool_indices: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
@@ -267,6 +268,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+                if get_exec().mamba.enable_mamba_extra_buffer
+                else None
+            ),
             out_cache_loc=out_cache_loc,
             positions=positions,
             mrope_positions=mrope_positions,
@@ -419,6 +425,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                None
+                if buffers.mamba_track_indices is None
+                else buffers.mamba_track_indices[:bs]
+            ),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -531,6 +542,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
+        if buffers.mamba_track_indices is not None:
+            buffers.mamba_track_indices[:bs].zero_()
+            if forward_batch.mamba_track_indices is not None:
+                buffers.mamba_track_indices[:raw_bs].copy_(
+                    forward_batch.mamba_track_indices
+                )
+
         # Batch the small per-field device copies into a grouped foreach copy
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states
         # is handled separately below (see note), and seq_lens_cpu is handled
@@ -617,8 +635,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             forward_mode=self.forward_mode,
             input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
             seq_lens_sum=seq_lens_sum,
             # Mirror absence must survive replay (stale buffer defeats None-guards).
             seq_lens_cpu=(
@@ -627,6 +645,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=(
+                None
+                if buffers.mamba_track_indices is None
+                else buffers.mamba_track_indices[:bs]
+            ),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
