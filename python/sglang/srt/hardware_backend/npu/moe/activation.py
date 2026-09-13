@@ -201,6 +201,31 @@ class NPUSwigluStepAndMul(BaseActivation):
         return gate * up
 
 
+class NPUSwigluMxfp8Quant(BaseActivation):
+    """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
+
+    def __init__(self, limit: float):
+        from sgl_kernel_npu.activation.swiglu_mxfp8_quant import swiglu_quant
+
+        self._limit = float(limit)
+        self._kernel = swiglu_quant
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self._kernel(
+            hidden_states,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            need_quant=True,
+            do_limit=True,
+            limit=self._limit,
+        )
+
+
 # =============================================================================
 # Generic TP all‑gather wrapper – used by the runner when needed
 # =============================================================================
