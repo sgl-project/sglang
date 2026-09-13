@@ -465,11 +465,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Compact per-row block ranges into ``capacity`` write entries,
         a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
         device = token_slot_table.device
-        # The table width is a host-side bound;
-        # assert on device so a short table fails loudly without a sync.
-        torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
-        )
+        # The table width is a host-side bound. On NPU, _assert_async falls
+        # back to a CPU check and synchronizes; keep this diagnostic guard
+        # on other platforms without adding a host sync to the NPU path.
+        if not _is_npu:
+            torch._assert_async(
+                (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
         starts = ends - counts
@@ -526,7 +528,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # As in _qsa_write_plan, skip the CPU-fallback assertion on NPU.
+        if not _is_npu:
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())

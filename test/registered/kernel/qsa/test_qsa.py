@@ -805,6 +805,64 @@ def test_qsa_idle_metadata_builds_empty_rows():
         assert attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
 
 
+@pytest.mark.parametrize("is_npu", [False, True])
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_qsa_write_plan_platform_assertions(monkeypatch, is_npu, is_decode):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", is_npu)
+    original_assert = torch._assert_async
+    checks = []
+
+    def check_invariant(condition):
+        if is_npu:
+            pytest.fail("NPU write planning must not call the CPU-fallback assertion")
+        checks.append(condition)
+        original_assert(condition)
+
+    monkeypatch.setattr(torch, "_assert_async", check_invariant)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE if is_decode else ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([4, 4]),
+        input_ids=torch.zeros(8, dtype=torch.int32),
+    )
+    # Both requests complete one group; extend also reserves two padding entries.
+    write_locs, end_positions, rows, member_rows = backend._qsa_build_write_plan(
+        forward_batch=batch,
+        speculative_paged=False,
+        token_slot_table=torch.arange(4, 28).reshape(2, 12),
+        sequence_lengths=torch.tensor([8, 12]),
+    )
+    assert len(checks) == (0 if is_npu else (1 if is_decode else 2))
+    assert write_locs.tolist() == ([2, 6] if is_decode else [2, 6, 0, 0])
+    assert end_positions.tolist() == ([7, 11] if is_decode else [7, 11, 3, 3])
+    assert rows.tolist() == ([0, 1] if is_decode else [0, 1, 0, 0])
+    if is_decode:
+        assert member_rows is None
+    else:
+        assert member_rows.tolist() == [0, 4, 0, 0]
+
+
+@pytest.mark.parametrize("invalid_case", ["short_table", "unaligned_prefix"])
+def test_qsa_write_plan_retains_non_npu_validation(monkeypatch, invalid_case):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", False)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([3 if invalid_case == "unaligned_prefix" else 4]),
+        input_ids=torch.zeros(4, dtype=torch.int32),
+    )
+    width = 4 if invalid_case == "short_table" else 8
+    with pytest.raises(RuntimeError, match="Expected Tensor with single nonzero value"):
+        backend._qsa_build_write_plan(
+            forward_batch=batch,
+            speculative_paged=False,
+            token_slot_table=torch.arange(width).reshape(1, width),
+            sequence_lengths=torch.tensor([8]),
+        )
+
+
 def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
