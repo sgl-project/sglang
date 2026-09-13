@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import inspect
 import logging
 import os
+from functools import cache
 
 import aiter
 import torch
@@ -24,6 +26,9 @@ from sglang.multimodal_gen.runtime.platforms.aiter import (
 logger = logging.getLogger(__name__)
 
 _use_fp8_attn = os.environ.get("SGLANG_DIFFUSION_AITER_FP8_ATTN", "0") == "1"
+_use_int32_varlen_strides = (
+    os.environ.get("SGLANG_DIFFUSION_AITER_INT32_VARLEN_STRIDES", "0") == "1"
+)
 _fp8_dtype = torch.float8_e4m3fn
 
 # fmha_fwd_hd128_fp8_gfx950 ASM kernel. Support full MHA with q/k/v head_dim == 128 -- e.g., Wan 2.2 self- and cross-attention.
@@ -87,6 +92,21 @@ def _fmha_fp8_prefill_attention(
         softmax_scale=softmax_scale,
         window_size=(-1, -1, 0),
     )
+
+
+@cache
+def _supports_int32_varlen_strides(attention_func):
+    try:
+        supported = (
+            "prefer_int32_strides" in inspect.signature(attention_func).parameters
+        )
+    except (TypeError, ValueError):
+        supported = False
+    if not supported:
+        logger.warning(
+            "Installed AITER lacks per-call stride selection; keeping its default."
+        )
+    return supported
 
 
 class AITerBackend(AttentionBackend):
@@ -236,6 +256,15 @@ class AITerImpl(AttentionImpl):
         else:
             attention_func = aiter.flash_attn_varlen_func
 
+        stride_options = {}
+        if (
+            USE_AITER_GFX942
+            and _use_int32_varlen_strides
+            and _supports_int32_varlen_strides(attention_func)
+        ):
+            # AITER checks all tensors, outputs and masked tile offsets. Never
+            # toggle its global stride flag: other calls may run concurrently.
+            stride_options["prefer_int32_strides"] = True
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
         output = attention_func(
             q=query.contiguous(),
@@ -247,5 +276,6 @@ class AITerImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            **stride_options,
         )
         return output[0] if isinstance(output, tuple) else output
