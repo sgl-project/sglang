@@ -439,6 +439,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
+        # These Parameters are also referenced by Triton wrappers, which are
+        # outside the temporary parameter mapping used by CPU offload.
+        triton_runtime_attrs = (
+            {"_sglang_keep_on_device": True} if self.use_triton_kernels else None
+        )
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -547,6 +552,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        set_weight_attrs(w13_weight, triton_runtime_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
             torch.full(
@@ -562,6 +568,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, triton_runtime_attrs)
         w13_weight_scale.quant_method = "group"
 
         create_bias = with_bias or not _is_hip
@@ -589,6 +596,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        set_weight_attrs(w2_weight, triton_runtime_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
             torch.full(
@@ -604,6 +612,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, triton_runtime_attrs)
         w2_weight_scale.quant_method = "group"
 
         if create_bias:
@@ -1030,6 +1039,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            # Rebind the existing Parameters so state exports contain the
+            # tensors consumed by Triton while preserving weight-loader attrs.
+            # Keep the wrappers' original Tensor objects while sharing their
+            # backing storage with the registered Parameters.
+            for name, tensor in (
+                ("w13_weight", w13_weight),
+                ("w13_weight_scale", w13_scale),
+                ("w2_weight", w2_weight),
+                ("w2_weight_scale", w2_scale),
+            ):
+                param = getattr(layer, name)
+                param.data = tensor.storage.data
+
             self.w13_precision_config = PrecisionConfig(
                 b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
@@ -1039,8 +1061,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
-            del layer.w13_weight
-            del layer.w2_weight
         elif _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if use_intel_amx_backend(layer):
