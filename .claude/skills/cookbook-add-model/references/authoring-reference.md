@@ -80,8 +80,10 @@ launch line cannot express on its own.
 
 `_playground.jsx` sees the overlay dims in its `base`, so a playground axis can gate
 on them with its own `showWhen(base)` — an axis whose feature the Deploy panel never
-switched on is not rendered at all. Changing the Deploy selection resets every
-playground axis back to inherit-from-base.
+switched on is not rendered at all, and applies nothing: a hidden axis never strips or
+inserts flags, so a base cell that carries its own recipe for that feature (e.g. a
+PD-role cell's `--disaggregation-*` flags) comes through unchanged. Changing the
+Deploy selection resets every playground axis back to inherit-from-base.
 
 > The overlay resolution rule is written in BOTH engines (snippets can't import each
 > other); each copy is marked `MIRROR`. Change both or neither, or the Deploy command

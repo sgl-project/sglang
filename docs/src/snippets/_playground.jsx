@@ -14,7 +14,8 @@
 //                 is the one in effect)
 //
 // Axis-level `showWhen(base)` (any axis): the card is not rendered when the Deploy
-// panel has not switched that feature on. `base` carries the cell match dims plus
+// panel has not switched that feature on, and a card that is not rendered applies
+// nothing — the base cell's own flags stand. `base` carries the cell match dims plus
 // the Deploy panel's overlay dims, so an axis can gate on either.
 // flagSelects extras: `control: "slider"` renders the option list as a range input
 // (option order is the scale), and a per-select `showWhen(base)` gates one row.
@@ -421,6 +422,9 @@ export const Playground = ({ config }) => {
   //   - apply must not mutate its inputs.
   //   - strip policy: most axes strip ONLY when overridden; pdDisagg and
   //     hicache strip unconditionally.
+  //   - an axis whose axis-level showWhen(base) hides its card is skipped
+  //     entirely — apply does not run, so even the always-strip axes leave a
+  //     base cell's own flags alone.
   const AXIS_HANDLERS = {
 
     // ---- Axis: Attention Parallelism ----------------------------------------
@@ -1466,6 +1470,16 @@ export const Playground = ({ config }) => {
     for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
       const fc = pgFeatures[axisId];
       if (!fc) continue;
+      // A card the Deploy selection hides owns nothing here: its controls are
+      // off screen, so anything its apply strips or inserts is an edit the
+      // reader can neither see nor undo. The pdDisagg axis makes that concrete
+      // — it clears the --disaggregation-* family before re-adding the picked
+      // role, which would erase those flags from a base cell that carries its
+      // own PD recipe. The renderer runs the same predicate on constraintBase,
+      // whose extra live facts (effTp, dpAttnOn, a card-owned pdMode, ...) are
+      // computed from this very pass; only the Deploy selection exists here,
+      // so an axis-level showWhen has to decide on `base` fields alone.
+      if (typeof fc.showWhen === "function" && !fc.showWhen(sel)) continue;
       const value = allDeltas[axisId];
       if (value === undefined) continue;
       const derived = derivedMap ? derivedMap[axisId] : null;
