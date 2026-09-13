@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from sglang.multimodal_gen.configs.sensenova_u1 import get_neo_attention_backends
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models import (  # noqa: F401
     sensenova_u1 as _sensenova_u1,
@@ -19,6 +20,9 @@ def load_model_and_tokenizer(
     model_path: str,
     server_args: ServerArgs,
 ) -> dict[str, Any]:
+    attention_backends = get_neo_attention_backends(
+        server_args.attention_backend_config
+    )
     dtype = PRECISION_TO_TYPE.get(
         server_args.pipeline_config.model_precision, torch.bfloat16
     )
@@ -36,6 +40,9 @@ def load_model_and_tokenizer(
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
+    for option, backend in attention_backends.items():
+        setattr(model.config.llm_config, option, backend)
+        setattr(model.language_model.config, option, backend)
     device = get_local_torch_device()
     current_platform.set_device(device)
     model = model.to(device)

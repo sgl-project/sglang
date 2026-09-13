@@ -73,9 +73,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             )
         seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 
-        out = self.model.t2i_generate(
-            self.tokenizer,
-            batch.prompt,
+        generate_kwargs = dict(
             image_size=(int(batch.width), int(batch.height)),
             cfg_scale=float(batch.guidance_scale),
             cfg_norm=options.cfg_norm,
@@ -88,6 +86,24 @@ class SenseNovaU1GenerationStage(PipelineStage):
             think_mode=options.think_mode,
             seed=seed,
         )
+        if batch.image_path is None:
+            out = self.model.t2i_generate(
+                self.tokenizer,
+                batch.prompt,
+                **generate_kwargs,
+            )
+        else:
+            image_paths = (
+                batch.image_path
+                if isinstance(batch.image_path, list)
+                else [batch.image_path]
+            )
+            out = self.model.it2i_generate(
+                self.tokenizer,
+                batch.prompt,
+                image_paths,
+                **generate_kwargs,
+            )
         think_text = None
         if options.think_mode:
             images, think_text = out
