@@ -52,6 +52,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -1532,18 +1533,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
-            shape_key,
-            run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=(
-                forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
-                else None
-            ),
-            post_warmup_hook=post_warmup_hook,
-        )
+        trace_ctx = nullcontext()
+        if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+            from sglang.srt.layers.moe.alphamoe_trace import observe_alphamoe_capture
+
+            trace_ctx = observe_alphamoe_capture(self.backend, shape_key)
+        with trace_ctx:
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                # DP padding can install capture-only tensors on this dummy batch;
+                # BCG retains it so their recorded addresses remain valid.
+                capture_inputs=(
+                    forward_batch
+                    if forward_batch.global_num_tokens_gpu is not None
+                    else None
+                ),
+                post_warmup_hook=post_warmup_hook,
+            )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1957,5 +1964,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     static_num_tokens,
                     raw_num_tokens,
                     **kwargs,
+                )
+            if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                from sglang.srt.layers.moe.alphamoe_trace import (
+                    record_alphamoe_execution,
+                )
+
+                record_alphamoe_execution(
+                    forward_batch,
+                    execution="prefill_graph_replay",
+                    padded_tokens=static_num_tokens,
+                    backend=self.backend,
+                    graph_key=shape_key,
                 )
             return self._finalize_execute_output(output)

@@ -36,6 +36,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -1217,12 +1218,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                trace_ctx = contextlib.nullcontext()
+                if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                    from sglang.srt.layers.moe.alphamoe_trace import (
+                        observe_alphamoe_capture,
+                    )
+
+                    trace_ctx = observe_alphamoe_capture(self.backend, shape_key)
+                with trace_ctx:
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1435,6 +1444,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+
+            if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                from sglang.srt.layers.moe.alphamoe_trace import (
+                    record_alphamoe_execution,
+                )
+
+                record_alphamoe_execution(
+                    forward_batch,
+                    execution="decode_graph_replay",
+                    padded_tokens=self.bs * self.captured_req_width,
+                    backend=self.backend,
+                    graph_key=self._replay_graph_key,
+                )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
