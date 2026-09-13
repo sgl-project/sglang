@@ -11,12 +11,16 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner.base_runner import _allocate_decode_buffers
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
     _resolve_transformer_layer_model,
 )
-from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
+from sglang.srt.model_executor.runner_utils.buffers import (
+    DecodeInputBuffers,
+    PrefillInputBuffers,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -187,6 +191,91 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         finalized = runner._finalize_execute_output(output)
         self.assertEqual(finalized["hidden_states"].shape, (3, 8))
+
+    def test_aux_capture_buffers_are_available_for_graphs_and_warmup(self):
+        aux_keys = ("dspark_aux_hidden_states_0", "dspark_aux_hidden_states_3")
+        common = dict(
+            device=torch.device("cpu"),
+            max_bs=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            enable_mamba_track=False,
+            pp_size=3,
+            hc_hidden_size=12,
+            pp_proxy_aux_hidden_state_keys=aux_keys,
+            cache_loc_dtype=torch.int64,
+        )
+        prefill = PrefillInputBuffers.create(
+            **common, max_num_tokens=8, is_multimodal=False, is_first_pp_rank=False
+        )
+        decode_args = dict(
+            **common,
+            max_num_token=8,
+            dp_size=1,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=False,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=0,
+            num_tokens_per_req=2,
+        )
+        decode = DecodeInputBuffers.create(
+            **decode_args, next_token_logits_buffer=torch.zeros(8, 10)
+        )
+        warmup = _allocate_decode_buffers(**decode_args, vocab_size=10)
+        for buffers in (prefill, decode, warmup):
+            self.assertEqual(
+                {
+                    key: tuple(value.shape)
+                    for key, value in buffers.pp_proxy_tensors.items()
+                },
+                {"hidden_states": (8, 12), **{key: (8, 3) for key in aux_keys}},
+            )
+            for value in buffers.pp_proxy_tensors.values():
+                self.assertEqual(value.dtype, torch.bfloat16)
+
+        registry = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+            source=prefill,
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.buffers = prefill
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=False)
+        )
+        for num_tokens in (5, 2):
+            proxy = PPProxyTensors(
+                {
+                    key: torch.full_like(value[:num_tokens], num_tokens)
+                    for key, value in prefill.pp_proxy_tensors.items()
+                }
+            )
+            values = torch.arange(num_tokens)
+            registry.fill_from(
+                SimpleNamespace(
+                    input_ids=values, positions=values, out_cache_loc=values
+                ),
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=num_tokens,
+                padded_num_tokens=8,
+                pp_proxy_tensors=proxy,
+            )
+            capture_proxy = runner._capture_pp_proxy_tensors(8)
+            runner.raw_num_tokens = num_tokens
+            output = runner._finalize_execute_output(capture_proxy)
+            torch.testing.assert_close(output.tensors, proxy.tensors)
+            for key in aux_keys:
+                self.assertEqual(
+                    capture_proxy[key].data_ptr(),
+                    prefill.pp_proxy_tensors[key].data_ptr(),
+                )
+                self.assertEqual(
+                    torch.count_nonzero(capture_proxy[key][num_tokens:]), 0
+                )
 
     def test_bcg_eager_tail_uses_live_multimodal_embeddings(self):
         live_embeds = object()
