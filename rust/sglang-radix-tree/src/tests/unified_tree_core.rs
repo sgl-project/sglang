@@ -1158,7 +1158,7 @@ fn unevict_restores_the_value_and_the_leaf_sets() {
         .set_device_value(p, FULL, Tensor::from_slice(&[0i64]));
     tc.evictable_device_leaves.add(p);
     let mut fresh = Tensor::from_slice(&[20i64]);
-    tc.unevict_node_on_insert_(c, &fresh);
+    tc.unevict_node_on_insert_(c, &fresh, /* session_id = */ None);
     assert_eq!(tc.evictable_size_(FULL), 1);
     assert!(tc.evictable_device_leaves.contains(c));
     assert!(!tc.evictable_device_leaves.contains(p));
@@ -1187,7 +1187,11 @@ fn unevict_panics_on_a_node_that_still_has_its_value() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    tc.unevict_node_on_insert_(a, &Tensor::from_slice(&[1i64]));
+    tc.unevict_node_on_insert_(
+        a,
+        &Tensor::from_slice(&[1i64]),
+        /* session_id = */ None,
+    );
 }
 
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
@@ -1866,6 +1870,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }
@@ -2743,6 +2748,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -2756,6 +2762,32 @@ fn insert_coalesces_parent_linked_block_stores() {
         Some(hashes)
     );
     assert!(tc.namespaced_event_hashes.is_empty());
+}
+
+#[test]
+fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    let mut params = insert_params(&key, &[10, 11, 12, 13]);
+    params.session_id = Some("session-a");
+    tc.insert(&params);
+
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key,
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+            session_id: Some(Arc::from("session-a")),
+        }]
+    );
 }
 
 #[test]
@@ -2828,6 +2860,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 
@@ -2920,6 +2953,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -2930,6 +2964,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -2940,6 +2975,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -2950,6 +2986,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -2992,6 +3029,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
+        session_id: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -3000,6 +3038,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
 }
@@ -3055,6 +3094,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
     let hashes = crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, None, 1);
@@ -3070,6 +3110,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3093,6 +3134,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3148,6 +3190,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3167,6 +3210,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3255,6 +3299,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -3336,6 +3381,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             block_size: 2,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -8403,6 +8449,7 @@ fn sequence_insert_params<'k>(
         swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }

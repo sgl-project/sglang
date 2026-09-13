@@ -711,8 +711,9 @@ mod tests {
             mp::write_f64(&mut buf, ts).unwrap();
             // events array length 1
             mp::write_array_len(&mut buf, 1).unwrap();
-            // event = ["AllBlocksCleared"]
-            mp::write_array_len(&mut buf, 1).unwrap();
+            // Events use msgspec's tagged-map encoding: {"type": "AllBlocksCleared"}.
+            mp::write_map_len(&mut buf, 1).unwrap();
+            mp::write_str(&mut buf, "type").unwrap();
             mp::write_str(&mut buf, "AllBlocksCleared").unwrap();
             match attn_dp_rank {
                 Some(v) => {

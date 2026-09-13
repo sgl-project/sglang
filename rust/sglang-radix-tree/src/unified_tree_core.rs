@@ -119,6 +119,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
+    /// Request session attributed to newly stored blocks. This is event metadata only;
+    /// it does not participate in tree matching or block hashing.
+    pub session_id: Option<&'k str>,
     /// Device KV indices covering the key, one row per atom.
     pub value: Tensor,
     /// Tokens of this request already cached before the insert (the duplicate
@@ -211,6 +214,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     aligned_key_len: usize,
     value: Tensor,
     namespace: KeyNamespace,
+    session_id: Option<Arc<str>>,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
@@ -1422,6 +1426,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             aligned_key_len,
             value: params.value.narrow(0, 0, aligned_key_len as i64),
             namespace: params.namespace.to_owned(),
+            session_id: params.session_id.map(Arc::from),
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1547,6 +1552,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let params = InsertParams {
             key: &state.key,
             namespace: state.namespace.as_ref(),
+            session_id: state.session_id.as_deref(),
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
@@ -1560,6 +1566,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.unevict_node_on_insert_(
                 node_id,
                 &state.value.narrow(0, cursor as i64, prefix_len as i64),
+                state.session_id.as_deref(),
             );
             state
                 .result
@@ -1679,6 +1686,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &leaf_value,
                 state.priority,
                 state.namespace.as_ref(),
+                state.session_id.as_deref(),
             )
         } else {
             state.node_id
@@ -1698,6 +1706,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let params = InsertParams {
             key: &state.key,
             namespace: state.namespace.as_ref(),
+            session_id: state.session_id.as_deref(),
             value: state.value.shallow_clone(),
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
@@ -1888,6 +1897,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value,
             priority,
             KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            /* session_id = */ None,
         )
     }
 
@@ -1898,6 +1908,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         value: &Tensor,
         priority: i64,
         namespace: KeyNamespaceRef<'_>,
+        session_id: Option<&str>,
     ) -> NodeIdx_ {
         let page_size = self.page_size;
         let child_map_key = key.child_key(page_size);
@@ -1921,13 +1932,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(parent_id);
-        self.record_store_event_(new_node_id, StorageMedium::Gpu);
+        self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
         new_node_id
     }
 
     /// Restore an evicted node's Full device value from fresh KV indices
     /// during insert.
-    pub fn unevict_node_on_insert_(&mut self, node_id: NodeIdx_, fresh_value: &Tensor) {
+    pub fn unevict_node_on_insert_(
+        &mut self,
+        node_id: NodeIdx_,
+        fresh_value: &Tensor,
+        session_id: Option<&str>,
+    ) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
         let tokens = fresh_value.size()[0] as usize;
@@ -1943,7 +1959,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
             self.update_evictable_leaf_sets_(parent_id);
         }
-        self.record_store_event_(node_id, StorageMedium::Gpu);
+        self.record_store_event_(node_id, StorageMedium::Gpu, session_id);
     }
 
     /// Update both device and host leaf sets for a node.
@@ -2768,6 +2784,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size: tail_block_size,
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
+                    session_id: tail_session_id,
                     ..
                 }),
                 KvCacheEvent::BlockStored {
@@ -2777,10 +2794,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
+                && *tail_session_id == session_id
                 && !tail_hashes.is_empty()
                 && parent_block_hash == tail_hashes.last().copied() =>
             {
@@ -2847,7 +2866,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Build one BlockStored per page and coalesce compatible queue neighbors.
-    fn record_store_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
+    fn record_store_event_(
+        &mut self,
+        node_id: NodeIdx_,
+        medium: StorageMedium,
+        session_id: Option<&str>,
+    ) {
         if !self.enable_kv_cache_events {
             return;
         }
@@ -2856,6 +2880,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
+        let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
             self.ensure_namespaced_event_hashes_(node_id);
@@ -2885,6 +2910,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size: page.len(),
                     medium,
                     cache_salt: cache_salt.clone(),
+                    session_id: session_id.clone(),
                 });
                 parent_block_hash = Some(block_hash);
             };
@@ -3652,7 +3678,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* pool_storage_result = */ None,
             );
         for loaded_idx in loaded_node_indices {
-            self.record_store_event_(loaded_idx, StorageMedium::Gpu);
+            self.record_store_event_(loaded_idx, StorageMedium::Gpu, /* session_id = */ None);
         }
         for (component_type, transfers) in comp_xfers {
             self.component_by_type_(component_type)
@@ -3852,7 +3878,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 node.write_through_pending_id = None;
                 self.update_full_coexisting_host_tracking_(node_idx);
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu);
+            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
         }
         Ok(())
     }
@@ -5044,6 +5070,7 @@ pub enum KvCacheEvent<A> {
         block_size: usize,
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
+        session_id: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,

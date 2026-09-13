@@ -22,7 +22,6 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -1008,11 +1007,18 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         *,
         extra_key=None,
         cache_salt=None,
+        session_id=None,
     ):
         key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
         value = allocator.alloc(len(tokens))
         self.assertIsNotNone(value)
-        return cache.insert(InsertParams(key=key, value=value[: len(key)]))
+        return cache.insert(
+            InsertParams(
+                key=key,
+                value=value[: len(key)],
+                session_id=session_id,
+            )
+        )
 
     def _stored_events(self, cache, medium=None):
         events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
@@ -1092,8 +1098,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, seq, cache_salt="tenant-a")
         stored = self._stored_events(cache, StorageMedium.GPU)
         self.assertEqual(len(stored), 1)
-        self.assertIsInstance(stored[0], BlockStoredWithMetadata)
-        self.assertEqual(stored[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(stored[0].cache_salt, "tenant-a")
         salted_hashes = self._event_hashes(stored)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
@@ -1111,6 +1116,73 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             salted_hashes,
         )
 
+    def test_session_id_is_attributed_without_changing_block_hash(self):
+        cache_a, allocator_a, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache_a.take_events()
+        self._insert(cache_a, allocator_a, [1, 2, 3, 4], session_id="session-a")
+        stored_a = self._stored_events(cache_a, StorageMedium.GPU)
+        self.assertEqual(len(stored_a), 1)
+        self.assertEqual(stored_a[0].session_id, "session-a")
+
+        cache_b, allocator_b, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache_b.take_events()
+        self._insert(cache_b, allocator_b, [1, 2, 3, 4], session_id="session-b")
+        stored_b = self._stored_events(cache_b, StorageMedium.GPU)
+        self.assertEqual(stored_b[0].session_id, "session-b")
+        self.assertEqual(self._event_hashes(stored_a), self._event_hashes(stored_b))
+
+    def test_shared_prefix_hit_is_quiet_and_divergent_tails_are_attributed(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        shared_prefix = [1, 2, 3, 4]
+        self._insert(cache, allocator, shared_prefix, session_id="session-a")
+        initial = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(initial), 1)
+        shared_parent = initial[0].block_hashes[-1]
+
+        self._insert(cache, allocator, shared_prefix, session_id="session-b")
+        self.assertEqual(self._stored_events(cache, StorageMedium.GPU), [])
+
+        self._insert(
+            cache,
+            allocator,
+            shared_prefix + [5, 6],
+            session_id="session-a",
+        )
+        session_a_tail = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(session_a_tail), 1)
+        self.assertEqual(session_a_tail[0].parent_block_hash, shared_parent)
+        self.assertEqual(list(session_a_tail[0].token_ids), [5, 6])
+        self.assertEqual(session_a_tail[0].session_id, "session-a")
+
+        self._insert(
+            cache,
+            allocator,
+            shared_prefix + [7, 8],
+            session_id="session-b",
+        )
+        session_b_tail = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(session_b_tail), 1)
+        self.assertEqual(session_b_tail[0].parent_block_hash, shared_parent)
+        self.assertEqual(list(session_b_tail[0].token_ids), [7, 8])
+        self.assertEqual(session_b_tail[0].session_id, "session-b")
+
+    def test_session_id_and_cache_salt_are_both_attributed(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+        self._insert(
+            cache,
+            allocator,
+            [1, 2, 3, 4],
+            cache_salt="tenant-a",
+            session_id="session-a",
+        )
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].cache_salt, "tenant-a")
+        self.assertEqual(stored[0].session_id, "session-a")
+
     def test_cache_salt_event_parentage_survives_node_split(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache.take_events()
@@ -1123,8 +1195,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, [1, 2, 5, 6], cache_salt="tenant-a")
         branch = self._stored_events(cache, StorageMedium.GPU)
         self.assertEqual(len(branch), 1)
-        self.assertIsInstance(branch[0], BlockStoredWithMetadata)
-        self.assertEqual(branch[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(branch[0].cache_salt, "tenant-a")
         self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
         self.assertEqual(list(branch[0].token_ids), [5, 6])
 
@@ -1262,10 +1333,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_backuped(node))
 
-        self._insert(cache, allocator, seq)
+        self._insert(cache, allocator, seq, session_id="session-a")
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
         self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
+        self.assertEqual(restored_gpu[0].session_id, "session-a")
 
 
 class UnifiedRadixCacheSuite:
