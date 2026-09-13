@@ -942,6 +942,7 @@
             "estimated_full_test_time_s": 39.3
         },
         "qwen_image_edit_ti2i": {
+            "expected_load_ms": 36793.38,
             "stages_ms": {
                 "InputValidationStage": 24.78,
                 "ImageEncodingStage": 714.55,
@@ -3058,6 +3059,7 @@
             "estimated_full_test_time_s": 600.0
         },
         "lingbot_world_realtime_plastic_beach": {
+            "expected_load_ms": 31600.49,
             "stages_ms": {
                 "RealtimeInputValidationStage": 0.09,
                 "RealtimeTextEncodingStage": 0.04,

@@ -141,3 +141,9 @@ Four additional single-H100 references follow the same minimum-of-three rule.
 Their maximum/minimum ratios range from 1.090 to 1.224. These are initial
 loading references only; earlier variable runs remain diagnostic evidence,
 and no existing performance reference or tolerance is increased.
+
+`qwen_image_edit_ti2i` and `lingbot_world_realtime_plastic_beach` use runs
+34764411082, 34766506722, and 34771349145. Their minimum loading times are
+36793.38 ms and 31600.49 ms, respectively, with maximum/minimum ratios of
+1.1745 and 1.1256. The realtime case uses the same process-start-to-ready
+loading boundary, excluding warmup; its request E2E reference is unchanged.
