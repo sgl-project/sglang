@@ -20,7 +20,7 @@ export const Qwen35Deployment = () => {
   //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
-  // FP4 (397B only): NVFP4 on Blackwell B200/B300 tp=4; AMD MXFP4 on MI355X tp=2
+  // FP4 (397B only): NVFP4 on Blackwell B200 tp=4 (tp=2 ep=2 w/ MTP) / B300 tp=4; AMD MXFP4 on MI355X tp=2
 
   const MOE_MODELS = new Set(['397b', '122b', '35b']);
   const FP8_MODELS = new Set(['397b', '122b', '35b', '27b']);
@@ -108,6 +108,17 @@ export const Qwen35Deployment = () => {
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
+      ]
+    },
+    kvOffload: {
+      name: 'kvOffload',
+      title: 'KV Cache Offloading',
+      // HiCache adds a host-DRAM tier below the device KV cache. Only wired up
+      // for the MI355X MXFP4 recipe, which is the arm it is tuned on.
+      condition: (values) => values.hardware === 'mi355x' && values.quantization === 'fp4',
+      items: [
+        { id: 'disabled', label: 'Disabled',            default: true  },
+        { id: 'hicache',  label: 'Host DRAM (HiCache)', default: false }
       ]
     },
     mambaCache: {
@@ -296,7 +307,7 @@ export const Qwen35Deployment = () => {
   // Generate command — must produce byte-identical output to sgl-cookbook's
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
-    const { model, hardware, quantization, speculative, mambaCache } = values;
+    const { model, hardware, quantization, speculative, mambaCache, kvOffload } = values;
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -314,6 +325,11 @@ export const Qwen35Deployment = () => {
     // 122B H100 FP8 with MTP: bump TP to 4 and skip --mem-fraction-static.
     if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculative === 'enabled') {
       hwConfig = { ...hwConfig, tp: 4, mem: undefined };
+    }
+    // 397B B200 NVFP4 with MTP: tp=2 with expert parallelism 2 (TEP2) beats
+    // tp=4 across the concurrency sweep.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      hwConfig = { ...hwConfig, tp: 2, ep: 2, mem: 0.8 };
     }
 
     let modelName;
@@ -394,8 +410,9 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Enable NCCL symmetric memory for H100 FP8 deployments.
-    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+    // Enable NCCL symmetric memory for H100 and Blackwell FP8 deployments.
+    const symmMemFp8Hw = ['h100', 'b200', 'b300'];
+    if (symmMemFp8Hw.includes(hardware) && quantization === 'fp8' && hwConfig.tp > 1) {
       cmd += ` \\\n  --enable-symm-mem`;
     }
 
@@ -422,6 +439,15 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // B200 NVFP4 with MTP runs TP2/EP2 (set above). Keep Triton as the base
+    // linear-attention backend while routing GDN decode and prefill through
+    // FlashInfer.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      cmd += ` \\\n  --linear-attn-backend triton`;
+      cmd += ` \\\n  --linear-attn-decode-backend flashinfer`;
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // Append backend configurations
     if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
@@ -430,12 +456,22 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --attention-backend flashinfer`;
     }
 
+    // Enable FlashInfer GDN (linear attention) prefill for Blackwell FP8 deployments.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
+    // Enable FlashInfer trtllm MoE for FP8 Blackwell deployments for MoE models.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+      cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
+    }
+
     // Append AMD GPU-specific backend configurations.
     // All AMD MI GPUs use the AITER unified-attention backend (pair with
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Multi-GPU runs enable AITER allreduce fusion,
-    // except the MXFP4 MI355X recipe, which uses ROCm INT8 quantized quick
-    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT8) instead.
+    // except the MXFP4 MI355X recipe, which uses ROCm INT4 quantized quick
+    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT4) instead.
     if (amdGpu) {
       const amdFp4 = quantization === 'fp4' && hardware === 'mi355x';
       let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
@@ -443,7 +479,7 @@ export const Qwen35Deployment = () => {
         amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
       }
       if (amdFp4) {
-        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \\\n";
+        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\n";
       }
       cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
@@ -470,11 +506,23 @@ export const Qwen35Deployment = () => {
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       if (hardware === 'mi355x') {
-        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT8 quantized
+        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT4 quantized
         // ROCm quick all-reduce env are emitted by the AMD backend block above
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
-        cmd += ' \\\n  --disable-radix-cache';
+        if (kvOffload === 'hicache') {
+          // HiCache keeps a host-DRAM tier below the device KV cache, so the
+          // radix cache has to stay on: --enable-hierarchical-cache and
+          // --disable-radix-cache are rejected together at startup.
+          cmd += ' \\\n  --enable-hierarchical-cache';
+          cmd += ' \\\n  --hicache-ratio 1.5';
+          cmd += ' \\\n  --hicache-write-policy write_through';
+          cmd += ' \\\n  --hicache-io-backend kernel';
+          cmd += ' \\\n  --hicache-mem-layout page_first';
+        } else {
+          cmd += ' \\\n  --disable-radix-cache';
+        }
+        cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
         // Cap concurrency under MTP to avoid OOM at tp=2.
         if (speculative === 'enabled') {
           cmd += ' \\\n  --max-running-requests 128';

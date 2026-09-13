@@ -33,6 +33,9 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,
 )
+from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
+    mxfp8_group_quantize,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
@@ -79,6 +82,24 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     deq_t = dequant_mxfp8_to_bf16(xq_t, s_t)
     deq_k = dequant_mxfp8_to_bf16(xq_k, s_k)
     assert _relerr(deq_k, deq_t) < 1e-2
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_mxfp8_group_quantize_uses_gfx950_quantizer(dtype):
+    torch.manual_seed(0)
+    x = torch.randn(64, 128, device=DEVICE, dtype=dtype)
+
+    q, scale = mxfp8_group_quantize(x)
+    expected_q, expected_scale = _mxfp8_e4m3_quantize_triton(x)
+
+    assert q.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.uint8
+    assert q.shape == x.shape
+    assert scale.shape == (64, 4)
+    torch.testing.assert_close(q.float(), expected_q.float(), rtol=0, atol=0)
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("m,inter", [(8, 512), (65, 2048)])

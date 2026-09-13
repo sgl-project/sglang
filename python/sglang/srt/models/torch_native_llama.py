@@ -126,8 +126,7 @@ class LlamaMLP(nn.Module):
         self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 

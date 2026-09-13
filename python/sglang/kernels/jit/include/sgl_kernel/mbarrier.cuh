@@ -1,15 +1,8 @@
-#pragma once
+// `sglang::device::ptx` is the one namespace for inline PTX; both files reopen
+// it to add the SM-local primitives only they need, and
+// distributed/ptx.cuh adds the collective ones.
 
-// mbarrier PTX wrappers shared by the Kimi K3 kernels that drive TMA by hand:
-// kimi_k3/comm/gemm_ar.cuh and kimi_k3/attn_res/fused_tma.cuh both defined these
-// with identical bodies.
-//
-// The enclosing namespace is the same `sglang::ptx` both files already open, so
-// existing `ptx::mbar_*` call sites need no change.
-//
-// gemm_ar.cuh keeps mbar_arrive_cluster_release: only it uses that one.
-// attention/kda_prefill.cu duplicates a different set (MMA / ldmatrix) but is
-// built without a sglang include path and cannot consume this header.
+#pragma once
 
 #include <sgl_kernel/utils.cuh>
 
@@ -17,12 +10,12 @@
 
 namespace sglang {
 
-namespace ptx {
+namespace device::ptx {
 
 // Inline-PTX `.shared` instructions take a 32-bit byte offset in the shared
 // window, not a generic 64-bit pointer.
 template <typename T>
-static SGL_DEVICE uint32_t to_shared(T* ptr) {
+SGL_DEVICE uint32_t to_shared(T* ptr) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
@@ -40,18 +33,18 @@ static SGL_DEVICE uint32_t to_shared(T* ptr) {
 //     has touched yet) -> 1, so the first wait is a no-op skip.
 // A consumer-first wait initialized to 1 skips the producer's first signal and
 // blocks forever on the second.
-static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
+SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
   asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
 }
 
-static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
+SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
   uint64_t state;
   asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
   return state;
 }
 
 // Combined arrive + set tx-count, for TMA-load completion.
-static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
 }
 
@@ -59,7 +52,7 @@ static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
 // early wakeups. Default `.acquire` semantics mean prior `cp.async.bulk` writes
 // tracked by this mbarrier are visible to later generic-proxy reads on this
 // thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
-static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
   asm volatile(
       "{\n\t.reg .pred p;\n\t"
       "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
@@ -67,6 +60,6 @@ static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
       "r"(parity));
 }
 
-}  // namespace ptx
+}  // namespace device::ptx
 
 }  // namespace sglang

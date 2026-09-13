@@ -421,6 +421,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
 
+        total_iterations = len(block_sizes) * len(timesteps)
+        batch.record_stage_iterations(total_iterations, total_iterations)
+
         start_index = 0
         self._validate_block_prompt_count(batch, block_sizes)
 
@@ -534,7 +537,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         target_dtype: torch.dtype,
         autocast_enabled: bool,
     ) -> torch.Tensor:
-        self._manage_dit_use_site(self.transformer, "transformer", batch)
         rope_start_frame = start_frame
         if self._rope_temporal_offset != 0.0:
             rope_start_frame = start_frame + self._rope_temporal_offset

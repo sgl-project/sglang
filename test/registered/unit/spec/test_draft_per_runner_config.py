@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _StopConstruction(Exception):
@@ -134,14 +134,13 @@ class TestDraftPerRunnerConfig(CustomTestCase):
 
     def test_an_unresolved_draft_falls_back_to_the_config_field(self):
         """The v2 workers pass no backend: --speculative-draft-attention-backend."""
-        server_args = self._seed(
+        self._seed(
             attention_backend="fa3", speculative_draft_attention_backend="triton"
         )
 
         def effective(*, is_draft_worker, passed=None):
             return resolve_draft_attention_backend(
                 draft_attention_backend=passed,
-                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
 

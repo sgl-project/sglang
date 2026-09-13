@@ -115,9 +115,9 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
         # update with group router
         self.router_n_groups = getattr(config, "router_n_groups", -1)
         if self.router_n_groups > 0:
-            assert (
-                config.num_experts_per_tok % self.router_n_groups == 0
-            ), f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
+            assert config.num_experts_per_tok % self.router_n_groups == 0, (
+                f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
+            )
             self.mlp.topk = TopK(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
@@ -131,9 +131,7 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
     def get_group_offsets(router_n_groups: int, group_size: int, device: str):
         group_offsets = (
             torch.arange(router_n_groups, device=device) * group_size
-        ).view(
-            1, -1, 1
-        )  # [1, n_groups, 1]
+        ).view(1, -1, 1)  # [1, n_groups, 1]
         return group_offsets
 
     def _custom_routing_function(
@@ -146,9 +144,9 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
         """Group router"""
         routing_weights = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         if self.router_n_groups > 0:
-            assert (
-                routing_weights.shape[-1] % self.router_n_groups == 0
-            ), f"{routing_weights.shape[-1]} cannot be divided by {self.router_n_groups}"
+            assert routing_weights.shape[-1] % self.router_n_groups == 0, (
+                f"{routing_weights.shape[-1]} cannot be divided by {self.router_n_groups}"
+            )
             per_group_top_k = topk // self.router_n_groups
             group_size = routing_weights.shape[-1] // self.router_n_groups
             group_offsets = self.get_group_offsets(
@@ -189,7 +187,6 @@ class InternS1ProTextModel(Qwen3MoeLLMModel):
 
 
 class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
-
     def __init__(
         self,
         config: PretrainedConfig,

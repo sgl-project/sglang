@@ -1,6 +1,6 @@
 ---
 title: Intern-S2-Mobius
-description: "Deploy Intern-S2-Mobius with SGLang — InternLM's Mobius-v0 multimodal model with a globally shared Knowledge Memory, hybrid GDN + full attention, MTP (NEXTN) speculative decoding, and 256K context, on NVIDIA H200 and B200."
+description: "Deploy the BF16 and FP8 Intern-S2-Mobius checkpoints with SGLang on NVIDIA H200 and B200."
 tag: NEW
 ---
 
@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -52,7 +52,7 @@ import { benchmarks } from "/src/snippets/configs/internlm/intern-s2-mobius-benc
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on 2×H200 TP=2 against `main @ e0828ee3` + PR [#33691](https://github.com/sgl-project/sglang/pull/33691) head (since merged 2026-08-08 — `lmsysorg/sglang:dev` is the live equivalent). GSM8K is the full 1319-example test split; GPQA is Diamond 198 problems × 8 repeats (pass@1 avg-of-8). Both ran with no server-side sampling override, so the checkpoint's `generation_config.json` defaults applied (temperature 1.0, top_p 0.95, top_k 20). The B200 recipes are inferred from the H200 ones and unverified — same flags, just a TP=2 or TP=1 Blackwell equivalent.
+  Speed and accuracy numbers apply to the BF16 checkpoint. They were measured with `--random-range-ratio 1.0`, `--flush-cache`, on 2×H200 TP=2 against `main @ e0828ee3` + PR [#33691](https://github.com/sgl-project/sglang/pull/33691) head (since merged 2026-08-08 — `lmsysorg/sglang:dev` is the live equivalent). GSM8K is the full 1319-example test split; GPQA is Diamond 198 problems × 8 repeats (pass@1 avg-of-8). Both ran with no server-side sampling override, so the checkpoint's `generation_config.json` defaults applied (temperature 1.0, top_p 0.95, top_k 20). The FP8 H200 recipes have launch, text, vision, and stop-reason verification but no benchmark numbers yet. All B200 recipes are inferred and unverified.
 </Note>
 
 ## Playground
@@ -94,20 +94,27 @@ On the serving side the model is a hybrid: 30 of 40 transformer layers use **GDN
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>262,144</td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/internlm/Intern-S2-Mobius/blob/main/LICENSE">Apache-2.0</a></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><strong><a href="https://huggingface.co/internlm/Intern-S2-Mobius-FP8">Intern-S2-Mobius-FP8</a></strong></td>
+      <td style={{padding: "9px 12px"}}>Mobius-v0 · GDN ×30 + full ×10 · MoE-2560 / top-8 · MTP · FP8 E4M3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>262,144</td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/internlm/Intern-S2-Mobius-FP8/blob/main/LICENSE">Apache-2.0</a></td>
+    </tr>
   </tbody>
 </table>
 
-**Recommended generation:** `temperature=0.8`, `top_p=1.0`, `top_k=50`, `min_p=0.0` — the values the [model card](https://huggingface.co/internlm/Intern-S2-Mobius) recommends. Note these are *not* what the checkpoint ships in `generation_config.json` (`temperature=1.0`, `top_p=0.95`, `top_k=20`), and SGLang applies that file by default (`--sampling-defaults model`) — so send the recommended values explicitly per request if you want them.
+**Recommended generation:** `temperature=0.8`, `top_p=1.0`, `top_k=50`, `min_p=0.0` — the values the [model card](https://huggingface.co/internlm/Intern-S2-Mobius) recommends. Both checkpoints ship `generation_config.json` with different values (`temperature=1.0`, `top_p=0.95`, `top_k=20`), and SGLang applies that file by default (`--sampling-defaults model`) — so send the recommended values explicitly per request if you want them.
 
-**Resources:** [HuggingFace](https://huggingface.co/internlm/Intern-S2-Mobius) · [GitHub (InternLM/Intern-S2-Mobius)](https://github.com/InternLM/Intern-S2-Mobius).
+**Resources:** [HuggingFace (BF16)](https://huggingface.co/internlm/Intern-S2-Mobius) · [HuggingFace (FP8)](https://huggingface.co/internlm/Intern-S2-Mobius-FP8) · [GitHub (InternLM/Intern-S2-Mobius)](https://github.com/InternLM/Intern-S2-Mobius).
 
 ## 2. Configuration Tips
 
 - **Trust remote code is required.** Intern-S2-Mobius ships a custom `configuration_interns2_mobius.py` / `modeling_interns2_mobius.py` on its HF repo; every recipe adds `--trust-remote-code`.
+- **FP8 uses one H200.** The FP8 checkpoint stores E4M3 weights with 128×128 block scales and dynamic activation quantization. The verified H200 recipes use TP=1, `deep_gemm`, `--mem-fraction-static 0.6`, disabled prefill CUDA graphs, and decode graphs up to batch size 16. Higher memory fractions or the default graph range exhausted H200 memory during DeepGEMM warmup; the running MTP server used about 99 GB.
 - **Speculative decoding schedule.** The checkpoint ships one MTP layer. Enable MTP for the lowest latency (`--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`). We measured accept-length ~3.9/4 draft tokens at 8K-in / 1K-out, roughly tripling single-stream decode speed (median TPOT 9.79 ms → 3.13 ms at conc=1, 14.26 ms → 6.84 ms at conc=16) and roughly doubling mid-concurrency total throughput (9358 → 18029 tokens/s at conc=16, 21395 → 26033 tokens/s at conc=64). The high-throughput recipe stays spec-off because once you can batch wide, its saturation point is higher (34786 tokens/s at conc=256 vs the spec recipe's peak at conc=64).
 - **Mamba pool sizing.** GDN layers live in a separate Mamba state pool; the `--mamba-full-memory-ratio` (defaults to 0.9) controls the split between the 10 full-attention layers' KV pool and the 30 GDN layers' conv+SSM state pool. Default split comfortably handles conc=64 on a 2×H200 node; if you need higher concurrency than `--max-running-requests` allows for your workload, raise `--mamba-full-memory-ratio` slightly (each +1% mamba ratio costs full-attn KV).
 - **Vision input.** Images are accepted via the standard `image_url` chat message type. Vision tokens are counted into the prompt (`prompt_tokens_details.image_tokens` shows the count), and the model honors `<|vision_start|>` / `<|vision_end|>` boundaries exactly.
-- **B200 sizing.** B200 (192 GB HBM) fits the BF16 weights + KV + Mamba pool on a **single GPU** with `--tp 1`. The B200 cells in the panel inherit the H200 recipe with only `--tp` changed — unverified; treat them as a starting point until the Intern-S2-Mobius team publishes a Blackwell measurement.
+- **B200 sizing.** B200 (192 GB HBM) fits the BF16 weights + KV + Mamba pool on a **single GPU** with `--tp 1`. The FP8 B200 cells inherit the verified H200 TP=1 recipe but remain unverified; treat them as a starting point until a Blackwell measurement is available.
 
 ## 3. Advanced Usage
 

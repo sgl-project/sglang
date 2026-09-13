@@ -9,11 +9,12 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
-
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -26,6 +27,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         super().__init__(cpu_group, device, device_group, unique_name)
         self.dist_module = torch.distributed
+        self._all_gather_single = all_gather_single
 
         if (
             (current_platform.get_cpu_architecture() == CpuArchEnum.X86)
@@ -33,6 +35,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             and unique_name.startswith("tp")
         ):
             self.dist_module = _CPUSHMDistributed(self)
+            self._all_gather_single = self.dist_module.all_gather_single
 
     def all_reduce(
         self,
@@ -51,9 +54,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         NOTE: `dst` is the local rank of the destination rank.
         """
         world_size = self.world_size
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -89,9 +92,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        self.dist_module.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        self._all_gather_single(output_tensor, input_, group=self.device_group)
 
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
@@ -105,7 +106,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
 
 class _CPUSHMDistributed:
-
     def __init__(self, communicator: CpuCommunicator):
         instance_identifier = os.environ["VLLM_DIST_IDENT"]
         unique_name = communicator.unique_name
@@ -153,7 +153,7 @@ class _CPUSHMDistributed:
             torch.distributed.get_group_rank(group, dst),
         )
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self,
         output: torch.Tensor,
         input: torch.Tensor,

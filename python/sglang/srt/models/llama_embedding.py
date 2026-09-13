@@ -33,9 +33,9 @@ class LlamaEmbeddingModel(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        assert get_embedding, (
+            "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 

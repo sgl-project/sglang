@@ -107,9 +107,9 @@ def chunk_kda_fwd(
     Returns the fla-shaped 12-tuple: (o [B,T,H,128] bf16, final_state
     [N,H,128,128] fp32 or None, then Nones, ..., h, initial_state).
     """
-    assert (
-        chunk_size == CHUNK
-    ), f"kda_prefill supports chunk_size={CHUNK} only, got {chunk_size}"
+    assert chunk_size == CHUNK, (
+        f"kda_prefill supports chunk_size={CHUNK} only, got {chunk_size}"
+    )
     if cp_context is not None or disable_recompute:
         raise NotImplementedError(
             "kda_prefill is the inference forward path: cp_context, "
@@ -124,9 +124,9 @@ def chunk_kda_fwd(
     if state_v_first and initial_state is not None:
         # [V,K]-layout state: pure transpose (K==V==128), exact, ~us/call
         initial_state = initial_state.transpose(-1, -2).contiguous()
-    assert (
-        q.dim() == 4 and q.shape[-1] == K and v.shape[-1] == K
-    ), f"expected [B,T,H,{K}] q/k/v, got q={tuple(q.shape)} v={tuple(v.shape)}"
+    assert q.dim() == 4 and q.shape[-1] == K and v.shape[-1] == K, (
+        f"expected [B,T,H,{K}] q/k/v, got q={tuple(q.shape)} v={tuple(v.shape)}"
+    )
     B, T, H, _ = q.shape
 
     cu_cpu = None
@@ -145,9 +145,9 @@ def chunk_kda_fwd(
     betaf = beta.reshape(Tt, H).contiguous()
 
     if use_gate_in_kernel:
-        assert (
-            A_log is not None and dt_bias is not None
-        ), "use_gate_in_kernel=True requires A_log and dt_bias"
+        assert A_log is not None and dt_bias is not None, (
+            "use_gate_in_kernel=True requires A_log and dt_bias"
+        )
         assert g.dtype == torch.bfloat16, f"raw gate input must be bf16, got {g.dtype}"
         gf = g.reshape(Tt, H, K).contiguous()
         sg = lower_bound is not None  # fla: lb presence selects safe-gate

@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualRMSNormScaleShift,
 )
 
-_CUTEDSL_MODULE = "sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift"
+_CUTEDSL_MODULE = "sglang.kernels.ops.diffusion.norm.scale_residual_norm_cutedsl"
 
 
 @pytest.mark.parametrize("hidden_size", [257, 8448])

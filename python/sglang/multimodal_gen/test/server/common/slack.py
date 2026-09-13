@@ -145,15 +145,13 @@ def upload_file_to_slack(
                 title = (
                     "Original Image"
                     if len(final_origin_paths) == 1
-                    else f"Original Image {i+1}"
+                    else f"Original Image {i + 1}"
                 )
                 uploads.append({"file": path, "title": title})
 
         uploads.append({"file": file_path, "title": "Generated Image"})
 
-        message = (
-            f"*Case ID:* `{case_id}`\n" f"*Model:* `{model}`\n" f"*Prompt:* {prompt}"
-        )
+        message = f"*Case ID:* `{case_id}`\n*Model:* `{model}`\n*Prompt:* {prompt}"
 
         client = WebClient(token=token, timeout=60)
         channel_id = "C0A02NDF7UY"

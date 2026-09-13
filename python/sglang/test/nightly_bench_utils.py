@@ -73,6 +73,46 @@ def generate_markdown_report(
     return summary
 
 
+def generate_simple_markdown_report(
+    results: List[BenchmarkResult], default_gpu_config: str = ""
+) -> str:
+    """Generate a markdown report without the H100-priced cost columns.
+
+    Drops the leading result when it is a warmup run, which the caller requests
+    by repeating the first batch size.
+    """
+    model_header = results[0].model_path
+    if results[0].run_name and results[0].run_name != "default":
+        model_header += f" ({results[0].run_name})"
+
+    gpu_config = os.getenv("GPU_CONFIG", default_gpu_config)
+    if gpu_config:
+        model_header += f" [{gpu_config}]"
+
+    summary = f"### {model_header}\n"
+    summary += "| batch size | input len | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |\n"
+    summary += "| ---------- | --------- | ----------- | ------------------------ | ------------------------- | -------- |\n"
+
+    report_results = (
+        results[1:]
+        if len(results) > 1 and results[0].batch_size == results[1].batch_size
+        else results
+    )
+
+    for result in report_results:
+        itl = (
+            1 / (result.output_throughput / result.batch_size) * 1000
+            if result.output_throughput > 0
+            else 0
+        )
+        summary += (
+            f"| {result.batch_size} | {result.input_len} | {result.latency:.2f} | "
+            f"{result.input_throughput:.2f} | {result.output_throughput:.2f} | {itl:.2f} |\n"
+        )
+
+    return summary
+
+
 def save_results_as_pydantic_models(
     results: List,
     pydantic_result_filename: str,

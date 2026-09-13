@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import math
+import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,6 @@ from io import BytesIO
 from typing import List, Literal, Optional, Union
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
@@ -39,7 +39,9 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     MiMoAudioPipeline,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.common import download_remote_media
 from sglang.utils import logger
 
 
@@ -328,14 +330,14 @@ class MiMoProcessor:
 
         self.use_video_timestamps = use_video_timestamps
         assert self.use_video_timestamps
-        assert (
-            not self.use_video_timestamps or self.rope_type == "rope"
-        ), "use_video_timestamps only supports 1d rope"
+        assert not self.use_video_timestamps or self.rope_type == "rope", (
+            "use_video_timestamps only supports 1d rope"
+        )
         self.video_audio_interleave_length = video_audio_interleave_length
         self.use_per_grid_t_timestamps = False
-        assert (
-            self.video_audio_interleave_length == -1 or self.rope_type == "rope"
-        ), "video_audio_interleave_length != -1 only supports 1d rope"
+        assert self.video_audio_interleave_length == -1 or self.rope_type == "rope", (
+            "video_audio_interleave_length != -1 only supports 1d rope"
+        )
         assert (
             self.video_audio_interleave_length == -1
             or self.video_audio_interleave_length >= 0
@@ -485,12 +487,14 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
-        # In-process probe via torchcodec for bytes/path; ffprobe range
-        # request for HTTP URLs so we do not pre-download the blob here.
+        # Never hand a client-supplied URL to ffprobe: its internal HTTP client
+        # would bypass the shared domain and redirect policy. Resolve it through
+        # the guarded downloader first, then probe the resulting bytes in-process.
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            return _ffprobe_has_audio(path_or_data, stdin=None, label=path_or_data)
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):
             source = BytesIO(path_or_data)
@@ -719,9 +723,9 @@ class MiMoProcessor:
             else:
                 selected_frame_indices = candidate_indices
 
-            assert (
-                len(selected_frame_indices) > 0
-            ), f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
+            assert len(selected_frame_indices) > 0, (
+                f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
+            )
             return selected_frame_indices
 
         kwargs = self.prepare_video_kwargs(video_input)
@@ -787,9 +791,9 @@ class MiMoProcessor:
 
         min_pixels, max_pixels = smart_resize_video(num_frames_sampled, **kwargs)
 
-        assert (
-            num_frames_seg > 0
-        ), f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
+        assert num_frames_seg > 0, (
+            f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
+        )
 
         temporal_padding_factor = (
             self.temporal_patch_size * self.temporal_compression_ratio
@@ -907,9 +911,9 @@ class MiMoProcessor:
             // self.temporal_compression_ratio
         )
 
-        assert (
-            len(timestamps) == grid_t * self.temporal_patch_size
-        ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+        assert len(timestamps) == grid_t * self.temporal_patch_size, (
+            f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+        )
 
         if not self.use_video_timestamps:
             raise NotImplementedError
@@ -941,7 +945,7 @@ class MiMoProcessor:
         if verbose:
             verbose_str = f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
             for i, ts in enumerate(text_timestamps):
-                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i*self.temporal_patch_size*self.temporal_compression_ratio : (i+1)*self.temporal_patch_size*self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
+                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i * self.temporal_patch_size * self.temporal_compression_ratio : (i + 1) * self.temporal_patch_size * self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
             verbose_str += "<video_end>]\n"
 
         return {
@@ -979,9 +983,9 @@ class MiMoProcessor:
         # Compute per-grid_t audio-segment boundaries. Tokenizer-free so it
         # runs identically on the single-node path and the EPD encoder side.
         grid_t, grid_h, grid_w = thw_grid
-        assert (
-            len(timestamps) == grid_t * self.temporal_patch_size
-        ), f"Expected {grid_t} * {self.temporal_patch_size} timestamps, got {len(timestamps)}"
+        assert len(timestamps) == grid_t * self.temporal_patch_size, (
+            f"Expected {grid_t} * {self.temporal_patch_size} timestamps, got {len(timestamps)}"
+        )
         if not self.use_video_timestamps:
             raise NotImplementedError
 
@@ -1017,7 +1021,7 @@ class MiMoProcessor:
                     "num_video_tokens": num_media_tokens_per_grid,
                     "segment_audio_token_len": segment_audio_token_len,
                     "segment_audio": segment_audio,
-                    # Used by encode_server to trim audio_encoder output.
+                    # Used by encoder.server to trim audio_encoder output.
                     "audio_start_token_idx": audio_start_token_idx,
                 }
             )
@@ -1235,9 +1239,9 @@ class MiMoProcessor:
         labels = torch.tensor(labels)
 
         if len(is_audio_tokenized) > 0:
-            assert all(is_audio_tokenized) or not any(
-                is_audio_tokenized
-            ), "All audio inputs must be tokenized or not tokenized"
+            assert all(is_audio_tokenized) or not any(is_audio_tokenized), (
+                "All audio inputs must be tokenized or not tokenized"
+            )
             extra["is_audio_tokenized"] = is_audio_tokenized[0]
 
         if self.rope_type == "rope":
@@ -1446,10 +1450,8 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with requests.get(image, stream=True) as response:
-                    response.raise_for_status()
-                    with BytesIO(response.content) as bio:
-                        image_obj = copy.deepcopy(Image.open(bio))
+                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
                 image_obj = Image.open(image[7:])
             elif image.startswith("data:image"):
@@ -1587,7 +1589,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             processor_config, "video_end_token_id"
         )
         self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
-        device = server_args.device if self.use_image_processor_gpu else None
+        device = get_device().device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoProcessor(
             tokenizer=self._processor.tokenizer,

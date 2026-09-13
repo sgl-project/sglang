@@ -48,9 +48,7 @@ def get_tokenizer(
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""
     )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
+    if pretrained_model_name_or_path.endswith((".json", ".model", ".gguf")):
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
