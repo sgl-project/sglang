@@ -110,3 +110,14 @@ Seven partition-0 cases also meet this criterion: `flux2_modelopt_fp8_tp2_t2i`,
 `wan2_2_t2v_a14b_teacache_2gpu`. All eleven cases meet the same three-run
 stability criterion. Existing loading references are not raised when a later
 run exceeds their limits.
+
+Five more two-H100 references use runs
+[34755864886](https://github.com/sgl-project/sglang/actions/runs/34755864886),
+[34764411082](https://github.com/sgl-project/sglang/actions/runs/34764411082), and
+[34766506722](https://github.com/sgl-project/sglang/actions/runs/34766506722):
+`flux_2_image_t2i_2_gpus`, `fsdp-inference`, `mova_360p_tp2`,
+`wan2_1_i2v_14b_720P_2gpu`, and `zimage_image_t2i_2_gpus_non_square`.
+Their maximum/minimum loading ratios range from 1.093 to 1.205. Each reference
+is the minimum observed loading time rounded to two decimal places; the same
+existing tolerances apply. These are initial references, not claims that the
+full testcases or all later checks passed.
