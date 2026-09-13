@@ -53,10 +53,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    DefaultWorkload,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
-    resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     get_global_component_residency_manager,
@@ -244,23 +242,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
-        # default workload resolved once for the per-request residency hint
-        self._cached_default_workload: DefaultWorkload | None = None
-        self._cached_default_workload_failed = False
-
-    def _default_workload_for_hint(self) -> DefaultWorkload | None:
-        if (
-            self._cached_default_workload is None
-            and not self._cached_default_workload_failed
-        ):
-            try:
-                self._cached_default_workload = resolve_default_workload(
-                    self.server_args
-                )
-            except Exception:
-                logger.debug("Default workload unresolvable", exc_info=True)
-                self._cached_default_workload_failed = True
-        return self._cached_default_workload
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -1553,23 +1534,10 @@ def _oom_exceptions():
 def run_scheduler_process(
     local_rank: int,
     rank: int,
-    master_port: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
 ) -> None:
-    """
-    The entry point for the worker process.
-    Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
-    Ranks > 0 act as slaves, waiting for tasks from the master.
-    """
+    """Run a rank's scheduler and report readiness to the launching process."""
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
@@ -1583,8 +1551,6 @@ def run_scheduler_process(
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     try:
@@ -1592,8 +1558,6 @@ def run_scheduler_process(
             server_args,
             gpu_id=rank,
             port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")

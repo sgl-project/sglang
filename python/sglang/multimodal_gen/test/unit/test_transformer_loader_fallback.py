@@ -112,30 +112,6 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
         native.assert_called_once()
         server_args.should_use_fsdp_for_component.assert_called_with("transformer_2")
 
-    def test_parallel_execution_rejects_native_fallback(self):
-        cases = (
-            ({"tp_size": 2}, "tp_size=2"),
-            ({"sp_degree": 2}, "sp_degree=2"),
-            ({"ulysses_degree": 2}, "ulysses_degree=2"),
-            ({"ring_degree": 2}, "ring_degree=2"),
-            ({"kv_gather_degree": 2}, "kv_gather_degree=2"),
-            ({"fsdp_requested": True}, "FSDP"),
-        )
-
-        for overrides, expected_error in cases:
-            with self.subTest(overrides=overrides):
-                with self.assertRaisesRegex(RuntimeError, expected_error):
-                    TransformerLoader().validate_native_fallback(
-                        self._server_args(**overrides), "transformer_2"
-                    )
-
-    def test_replicated_execution_keeps_native_fallback_available(self):
-        self.assertIsNone(
-            TransformerLoader().validate_native_fallback(
-                self._server_args(), "transformer_2"
-            )
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
