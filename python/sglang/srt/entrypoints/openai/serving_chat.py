@@ -1024,6 +1024,28 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # Only requests that actually reach the dsv4 encoder can be mis-rendered:
+        # client-supplied input_ids skip tokenization, and a named conversation
+        # template is rendered by its own code, which is allowed to handle inline
+        # system messages.
+        if (
+            self.chat_encoding_spec == "dsv4"
+            and request.input_ids is None
+            and self.template_manager.chat_template_name is None
+        ):
+            # The dsv4 encoder renders a `system` turn as plain content, so a
+            # non-leading system message can produce a malformed prompt without
+            # an assistant generation boundary
+            # (https://github.com/sgl-project/sglang/issues/35433).
+            for index, message in enumerate(request.messages):
+                if index > 0 and getattr(message, "role", None) == "system":
+                    return (
+                        "DeepSeek-V4 only supports a system message at the "
+                        f"beginning of the conversation, but messages[{index}] "
+                        "has role='system'. Move system instructions to the "
+                        "first message."
+                    )
+
         return None
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> Optional[str]:
