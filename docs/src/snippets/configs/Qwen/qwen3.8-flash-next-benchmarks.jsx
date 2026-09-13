@@ -246,8 +246,47 @@ export const benchmarks = [
         ttft_ms: 2958.76, tpot_ms: 54.4, tokens_per_sec_per_gpu: 4530 },
     ],
   },
-  { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  // AMD ROCm validation uses the September 11 ROCm 10 nightlies with the exact
+  // #36601 Python tree (0b4f96ff7), embedded for validation and exposed to
+  // cookbook users as an equivalent read-only source overlay.
+  // MI300X and MI355X are direct measurements. MI325X and MI350X inherit the
+  // corresponding gfx942/gfx950 recipes, so their rows intentionally carry no
+  // copied accuracy result.
+  {
+    match: { hw: "mi300x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 0b4f96ff7",
+    accuracy: { gsm8k_pct: 97.1842 },
+    notes: "8x MI300X, TP8+EP8, AITER attention/MoE, full target/draft decode graphs, and EAGLE MTP 3/1/4. The exact-image run requested all 1,319 GSM8K examples and scored 1,277/1,314 after reserving five demonstrations, with zero request errors or fatal server patterns, 379/379 graph-backed decode summaries, and mean MTP acceptance 3.5666.",
+  },
+  {
+    match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 0b4f96ff7",
+    accuracy: { gsm8k_pct: 96.4231 },
+    notes: "8x MI300X, TP8+EP8, AITER attention/MoE, full target/draft decode graphs, and EAGLE MTP 3/1/4. The exact-image run requested all 1,319 GSM8K examples and scored 1,267/1,314 after reserving five demonstrations, with zero request errors or fatal server patterns, 379/379 graph-backed decode summaries, and mean MTP acceptance 3.5693.",
+  },
+  { match: { hw: "mi325x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" } },
+  {
+    match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 0b4f96ff7",
+    accuracy: { gsm8k_pct: 96.8798 },
+    notes: "8x MI355X, TP8+EP8, AITER attention/MoE, full target/draft decode graphs, and EAGLE MTP 3/1/4. The exact-image run requested all 1,319 GSM8K examples and scored 1,273/1,314 after reserving five demonstrations, with zero request errors or fatal server patterns, 379/379 graph-backed decode summaries, and mean MTP acceptance 3.5669.",
+  },
+  {
+    match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 0b4f96ff7",
+    accuracy: { gsm8k_pct: 96.8037 },
+    notes: "8x MI355X, TP8+EP8, AITER attention/MoE, full target/draft decode graphs, and EAGLE MTP 3/1/4. The exact-image run requested all 1,319 GSM8K examples and scored 1,272/1,314 after reserving five demonstrations, with zero request errors or fatal server patterns, 374/374 graph-backed decode summaries, and mean MTP acceptance 3.5690.",
+  },
+  { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" } },
+  {
+    match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 0b4f96ff7",
+    accuracy: { gsm8k_pct: 96.6514 },
+    notes: "8x MI355X, TP8+EP8, AITER attention/MoE, full target/draft decode graphs, and EAGLE MTP 3/1/4. The exact-head run requested all 1,319 GSM8K examples and scored 1,270/1,314 after reserving five demonstrations, with zero request errors or fatal server patterns, 374/374 graph-backed decode summaries, and mean MTP acceptance 3.5524.",
+  },
 ];

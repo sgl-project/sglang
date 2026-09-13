@@ -9,8 +9,8 @@
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
 // four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
-// runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
-// params keeps compute small and the N-gram table is the only large weight block.
+// runs on a single GPU, and the AMD BF16/FP8/MXFP4 cells run TP8+EP8. Plain TP8
+// is not a valid substitute for the expert-parallel AMD topology.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box with the N-gram table
 // resident, so it runs TP=2 across two of them over the 200GbE ConnectX-7 link;
@@ -26,7 +26,10 @@
 export const config = {
   modelName: "Qwen3.8-Flash-Next",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "rtx6000", "dgx-spark", "mi350x", "mi355x"],
+  supportedHardware: [
+    "h200", "b200", "b300", "gb300", "rtx6000", "dgx-spark",
+    "mi300x", "mi325x", "mi350x", "mi355x",
+  ],
 
   // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared
   // HARDWARE_CATALOG, so it carries a local vendor override here (same id and
@@ -39,8 +42,8 @@ export const config = {
     { id: "default", label: "Default" },
   ],
   // Checkpoint precisions. NVFP4 is SGLang's own Blackwell-only quantization of
-  // the BF16 weights (RadixArk), so it has no H200 or AMD cell — SM90 and CDNA4
-  // have no NVFP4 path. AMD serves the upstream BF16 and FP8 repos.
+  // the BF16 weights (RadixArk), so it has no H200 or AMD cell. AMD serves the
+  // upstream BF16 and FP8 repos, plus the Quark MXFP4 checkpoint on CDNA4.
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
@@ -48,15 +51,15 @@ export const config = {
   quantizations: [
     { id: "bf16",       label: "BF16"         },
     { id: "fp8",        label: "FP8"          },
+    { id: "mxfp4",      label: "MXFP4 (Quark)" },
     { id: "nvfp4",      label: "NVFP4 (RDXA)" },
     { id: "nvfp4-nvda", label: "NVFP4 (NVDA)" },
   ],
   // BF16, FP8 and NVFP4 each ship two operating points, low latency adding the
-  // in-checkpoint MTP head (NEXTN 3/1/4) on top of the high-throughput shape.
-  // The two AMD platforms ship one recipe each, which parks under `balanced`.
+  // in-checkpoint MTP head on top of the high-throughput shape. AMD BF16/FP8
+  // use the validated MTP operating point; MXFP4 also keeps a no-MTP control.
   strategies: [
     { id: "low-latency",     label: "Low Latency"     },
-    { id: "balanced",        label: "Balanced"        },
     { id: "high-throughput", label: "High Throughput" },
   ],
   // `multi-N` id carries the node count for `--nnodes N`; only the DGX Spark
@@ -94,7 +97,7 @@ export const config = {
       // of weights plus the pools to fit, so Auto and Off are greyed out and On
       // is the only pick — the forced chip appends --ple-offload-embedding, so
       // the cells do not list it themselves.
-      showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
+      showWhen: (sel) => !["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw),
       default: "auto",
       options: [
         { id: "auto", label: "Auto",
@@ -137,6 +140,7 @@ export const config = {
     "default|bf16":  "Qwen/Qwen3.8-Flash-Next",
     // Separate repos, not revisions of the BF16 one.
     "default|fp8":   "Qwen/Qwen3.8-Flash-Next-FP8",
+    "default|mxfp4": "amd/Qwen3.8-Flash-Next-Quark-MXFP4",
     "default|nvfp4": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
     "default|nvfp4-nvda": "nvidia/Qwen3.8-Flash-Next-NVFP4",
   },
@@ -177,9 +181,9 @@ export const config = {
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
-  // Launch images — this is a day-0 model with no release cut, so both tags are
-  // purpose-built rather than a version. The ROCm build targets CDNA4 (gfx950)
-  // and is not interchangeable with the CUDA one.
+  // Launch images — this is a day-0 model with no release cut, so the NVIDIA
+  // tags are purpose-built rather than a version. AMD uses immutable official
+  // September 11 ROCm nightlies and bind-mounts exact PR #36601 Python source.
   // Prepended as `# ...` comments above multi-node commands.
   multiNodeHints: {
     "dgx-spark": [
@@ -202,9 +206,22 @@ export const config = {
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
-    mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
-    mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
+    mi300x: "rocm/sgl-dev@sha256:151005265cf3f4e98c41abc41f5cd317ab2e83085ec24d82f0bd36465f886457",
+    mi325x: "rocm/sgl-dev@sha256:151005265cf3f4e98c41abc41f5cd317ab2e83085ec24d82f0bd36465f886457",
+    mi350x: "rocm/sgl-dev@sha256:9252e847c0ebcef375543d3bf61d935cbd80ef5ac86ed3ba16e31bb7e1f1be47",
+    mi355x: "rocm/sgl-dev@sha256:9252e847c0ebcef375543d3bf61d935cbd80ef5ac86ed3ba16e31bb7e1f1be47",
   },
+
+  dockerMounts: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
+    ? ["\"$PWD/python/sglang:/sgl-workspace/sglang/python/sglang:ro\""]
+    : [],
+  dockerGpuVendor: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
+    ? "amd" : "nvidia",
+  dockerRunCommand: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
+    ? "python3 -m sglang.launch_server"
+    : "sglang serve",
+  runModes: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
+    ? ["docker"] : ["python", "docker"],
 
   github: {
     cookbookModel: "Qwen/Qwen3.8-Flash-Next",
@@ -258,8 +275,12 @@ export const config = {
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp",     label: "NEXTN / MTP",
-          flags: ["--speculative-algorithm NEXTN", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+          flags: (sel) => [
+            `--speculative-algorithm ${["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw) ? "EAGLE" : "NEXTN"}`,
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+          ] },
       ],
     },
   },
@@ -1191,84 +1212,352 @@ export const config = {
       ],
     },
 
-    // ==== AMD CDNA4 (MI350X / MI355X) ====
-    // One recipe, identical for BF16 and FP8 and for both cards (same gfx950,
-    // same 288GB, same ROCm image) — hence `balanced` on all four cells. This is
-    // its own shape rather than a port of the NVIDIA one: TP8, the aiter
-    // attention backend with `--page-size 32`, and a 16384-token prefill chunk.
-    // `--kv-cache-dtype auto` is stated rather than left off so the checkpoint's
-    // own declaration is visibly what decides KV precision.
+    // ==== AMD CDNA3 / CDNA4 ====
+    // BF16 and FP8 use the same TP8+EP8, AITER, full-decode-graph, and EAGLE
+    // 3/1/4 recipe on gfx942 and gfx950. MXFP4 is exposed only on gfx950.
+    // MI300X and MI355X are the measured systems; MI325X and MI350X inherit
+    // support from the architecture-identical gfx942 and gfx950 paths.
     {
-      match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi300x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision de4b8e4d43b917e7706784d8bb445c9af86a3540",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 236dfdf285828023ca3bcd3f37366c58a3469b13",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi325x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      warn: "Validated on MI300X; MI325X uses the same gfx942 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision de4b8e4d43b917e7706784d8bb445c9af86a3540",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      warn: "Validated on MI300X; MI325X uses the same gfx942 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 236dfdf285828023ca3bcd3f37366c58a3469b13",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Validated on MI355X; MI350X uses the same gfx950 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Validated on MI355X; MI350X uses the same gfx950 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 236dfdf285828023ca3bcd3f37366c58a3469b13",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      warn: "Validated on MI355X; MI350X uses the same gfx950 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Validated on MI355X; MI350X uses the same gfx950 execution path.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 236dfdf285828023ca3bcd3f37366c58a3469b13",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
