@@ -949,7 +949,7 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
-    if sampling_batch_info._custom_logit_processor_indices is not None:
+    if sampling_batch_info.custom_logit_processor_row_indices is not None:
         _apply_custom_logit_processor_with_indices(
             logits, sampling_batch_info, num_tokens_in_batch
         )
@@ -990,7 +990,7 @@ def _apply_custom_logit_processor_with_indices(
     num_tokens_in_batch: int,
 ) -> None:
     for key, (processor, _) in sampling_batch_info.custom_logit_processor.items():
-        rows, indices = sampling_batch_info._custom_logit_processor_indices[key]
+        rows, indices = sampling_batch_info.custom_logit_processor_row_indices[key]
         if num_tokens_in_batch != 1:
             indices = (
                 indices[:, None] * num_tokens_in_batch
