@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
+from sglang.srt.mem_cache.unified_radix_cache import _OngoingPrefetch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -243,13 +244,13 @@ class TestBufferModeSidecar(unittest.TestCase):
         cache.page_size = 2
         cache.cache_controller.prefetch_tokens_occupied = len(host_indices)
         cache.ongoing_prefetch = {
-            req_id: (
-                0,
-                RadixKey(array("q", [1, 2, 3, 4])),
-                host_indices,
-                operation,
-                None,
-                {ComponentType.SWA: [swa]},
+            req_id: _OngoingPrefetch(
+                anchor_node_id=0,
+                prefetch_key=RadixKey(array("q", [1, 2, 3, 4])),
+                host_indices=host_indices,
+                operation=operation,
+                anchor_lock_params=None,
+                comp_xfers={ComponentType.SWA: [swa]},
             )
         }
         cache.prefetch_loaded_tokens_by_reqid = {}

@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
@@ -56,6 +58,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        tree_cache.buffer_pipeline = None
         return tree_cache
 
     def create_token_allocator(
@@ -100,6 +103,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
+        req.swa_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
@@ -139,7 +143,7 @@ class TestPrefillAdder(CustomTestCase):
         adder._account_prefill_cache_admission(req, prefix_len=12)
 
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
-            "storage-hit",
+            req.rid,
             fulfilled_tokens=8,
             reason=None,
         )
@@ -153,8 +157,26 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         adder._account_prefill_cache_admission(req, prefix_len=0)
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
-            "storage-hit", fulfilled_tokens=0, reason="device_capacity"
+            req.rid, fulfilled_tokens=0, reason="device_capacity"
         )
+
+        self.mock_tree_cache.finish_storage_prefetch_admission.reset_mock()
+        req.host_hit_length = 4
+        req.host_loaded_length = 4
+        req.storage_hit_length = 8
+        req.storage_hit_start = 4
+        req.materialized_host_hit_len.return_value = 4
+        req.fulfilled_storage_hit_len.return_value = 4
+        req.needs_host_load_back.return_value = True
+        adder._account_prefill_cache_admission(req, prefix_len=8)
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            req.rid,
+            fulfilled_tokens=4,
+            reason="shrunk",
+        )
+        self.assertEqual(adder.log_device_hit_tokens, 8)
+        self.assertEqual(adder.log_host_hit_tokens, 0)
+        self.assertEqual(adder.log_storage_hit_tokens, 12)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())
@@ -166,7 +188,7 @@ class TestPrefillAdder(CustomTestCase):
         adder._account_prefill_cache_admission(req, prefix_len=8)
 
         self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
-            "retracted-storage-hit"
+            req.rid
         )
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
 
@@ -665,6 +687,169 @@ class TestPrefillAdder(CustomTestCase):
         # Fix: min(extend + decode, window) reservation admits it.
         adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
         self.assertIn(req, adder.can_run_list)
+
+    def test_load_back_delivery_mismatch_reselects_the_prefill_shape(self):
+        # Two incidents: a load that delivers nothing left the SWA gate sized
+        # for the tail and the allocator OOMed; a cache-mode load that also
+        # surfaces FULL device tokens behind a host-only SWA window tripped a
+        # strict promised==loaded check and crashed the scheduler.
+        WINDOW, PAGE = 128, 8
+        SPAN, HOST_HIT = 1024, 1016
+        self.mock_token_allocator.swa_available_size.return_value = 400
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = WINDOW
+        self.mock_tree_cache.is_tree_cache.return_value = False
+
+        def run(delivered: int, remaining_after_load: int = 100_000):
+            self.mock_token_allocator.full_available_size.return_value = 100_000
+            self.mock_token_allocator.swa_available_size.return_value = 400
+            adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+            adder.is_hybrid_swa = True
+            req = self.create_mock_req("dropped-fetch", priority=0, max_new_tokens=8)
+            req.prefix_indices = torch.empty(0, dtype=torch.int64)
+            req.full_untruncated_fill_ids = list(range(SPAN))
+            req.host_hit_length = HOST_HIT
+            req.swa_host_hit_length = WINDOW
+            req.needs_host_load_back.return_value = True
+            req.last_node = MagicMock()
+            req.best_match_node = MagicMock()
+            req.kv = SimpleNamespace(cache_protected_len=0)
+
+            def set_extend_range(start, end):
+                req.extend_range = Range(start, end)
+
+            req.set_extend_range = MagicMock(side_effect=set_extend_range)
+            req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
+
+            def load_back(params):
+                self.mock_token_allocator.full_available_size.return_value = (
+                    remaining_after_load
+                )
+                if remaining_after_load == 0:
+                    self.mock_token_allocator.swa_available_size.return_value = 0
+                return torch.arange(delivered, dtype=torch.int64), req.last_node
+
+            self.mock_tree_cache.init_load_back.side_effect = load_back
+            verdict = adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+            return verdict, list(adder.can_run_list), req
+
+        # Promise kept: only the 8-token tail is prefilled, which fits.
+        _, admitted, _ = run(HOST_HIT)
+        self.assertEqual(len(admitted), 1)
+        # Nothing delivered: the whole span is prefilled and no longer fits, so
+        # admission must decline rather than OOM the pool.
+        verdict, admitted, _ = run(0)
+        self.assertIs(verdict, AddReqResult.NO_TOKEN)
+        self.assertEqual(admitted, [])
+        # Over-delivery: admitted with the loaded prefix, not the promise.
+        # The loaded prefix is now pinned and no longer part of the evictable
+        # budget. A successful load must not run admission gates again.
+        _, admitted, req = run(HOST_HIT + 4, remaining_after_load=0)
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(req.prefix_indices), HOST_HIT + 4)
+        self.assertEqual(req.kv.cache_protected_len, HOST_HIT + 4)
+        req.set_extend_range.assert_called_once_with(HOST_HIT + 4, SPAN)
+        # A partial FULL load stays fatal.
+        with self.assertRaisesRegex(RuntimeError, "promised"):
+            run(HOST_HIT // 2)
+
+    def _create_host_hit_req(self, *, prefix_len=0, host_hit=8192, tail=1024):
+        req = self._create_delayer_req(prefix_len + host_hit + tail)
+        req.prefix_indices = torch.arange(prefix_len)
+        req.host_hit_length = host_hit
+        req.needs_host_load_back.return_value = True
+        req.best_match_node = req.last_node
+        req.kv = SimpleNamespace(cache_protected_len=prefix_len)
+        return req
+
+    def test_successful_load_back_commits_the_selected_shape_once(self):
+        cases = (
+            ("full", 0, 24, None, None, 8, 8),
+            ("full_unaligned", 0, 24, None, None, 7, 8),
+            ("retracted_unaligned", 0, 24, None, None, 7, 8),
+            ("chunk", 0, 24, 4, None, 4, 0),
+            ("aux_only", 24, 0, None, None, 8, 8),
+            ("overdelivery_full", 0, 24, None, None, 8, 8),
+            ("overdelivery_chunk", 0, 24, 4, None, 4, 0),
+            ("overdelivery_chunk_end", 0, 24, 8, None, 8, 8),
+            (
+                "dllm",
+                0,
+                24,
+                None,
+                SimpleNamespace(block_size=4, max_running_requests=2),
+                4,
+                0,
+            ),
+            (
+                "overdelivery_dllm",
+                0,
+                24,
+                None,
+                SimpleNamespace(block_size=4, max_running_requests=2),
+                4,
+                0,
+            ),
+        )
+        for name, prefix_len, host_hit, chunk, dllm, extend, decode in cases:
+            with self.subTest(mode=name):
+                self.mock_tree_cache.reset_mock()
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000,
+                    delayer=None,
+                    page_size=2,
+                    rem_chunk_tokens=chunk,
+                    dllm_config=dllm,
+                )
+                req = self._create_host_hit_req(
+                    prefix_len=prefix_len,
+                    host_hit=host_hit,
+                    tail=extend if chunk is None and dllm is None else 8,
+                )
+                req.retracted_stain = name == "retracted_unaligned"
+                if name.startswith("overdelivery"):
+                    req.host_hit_length -= 4
+                old_node, restored_node = req.last_node, object()
+                if name == "aux_only":
+                    req.swa_host_hit_length = 8
+
+                def load_back(params):
+                    self.assertIs(params.req, req)
+                    tile_gate.assert_called_once()
+                    tile_gate.return_value = AddReqResult.OTHER
+                    return torch.arange(host_hit), restored_node
+
+                self.mock_tree_cache.init_load_back.side_effect = load_back
+                with patch.object(
+                    adder, "_check_prefill_tile_budget", return_value=None
+                ) as tile_gate:
+                    adder.add_one_req(req, False, None)
+                    tile_gate.assert_called_once()
+                self.mock_tree_cache.init_load_back.assert_called_once()
+                self.assertEqual(adder.can_run_list, [req])
+                req.set_extend_range.assert_called_once_with(24, 24 + extend)
+                self.mock_tree_cache.inc_lock_ref.assert_any_call(restored_node)
+                self.assertIs(
+                    self.mock_tree_cache.dec_lock_ref.call_args.args[0], old_node
+                )
+                self.assertEqual(adder.log_hit_tokens, 24)
+                self.assertEqual(adder.log_input_tokens, extend)
+                self.assertEqual(
+                    adder.reprocessed_log_input_tokens,
+                    extend if req.retracted_stain else 0,
+                )
+                self.assertEqual(
+                    adder.rem_total_token_offset,
+                    adder.ceil_paged_tokens(extend) + decode + 2,
+                )
+                self.assertEqual(
+                    adder.new_chunked_req is req,
+                    name in ("chunk", "overdelivery_chunk"),
+                )
+                self.mock_tree_cache.init_load_back.side_effect = None
 
     def test_swa_new_tokens_clamps_remaining_not_total(self):
         # Remaining decode headroom must be min(max_new - generated, CLIP)

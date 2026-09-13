@@ -411,6 +411,26 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        raise NotImplementedError(
+            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list:
+        raise NotImplementedError(
+            "attach_swa_window: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
     def inc_lock_ref(
         self,
         node_id: NodeId,
@@ -561,6 +581,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         )
         return _match_result_from_binding(result)
+
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        return self._binding.match_full_device_prefix(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            )
+        )
+
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        self._binding.inc_full_pin(node_id)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        self._binding.dec_full_pin(node_id)
 
     @property
     def empty_match_result(self) -> MatchResult:
@@ -752,6 +787,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         transfers = self._binding.build_hicache_transfers(
@@ -762,6 +798,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # TODO: Forward token ids when Rust Mamba prefetch consumes them.
             None,
             prefetch_tokens,
+            staging_tokens,
             last_hash,
         )
         if transfers is None:

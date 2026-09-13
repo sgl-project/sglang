@@ -81,6 +81,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dllm_manager = None
     s.enable_hisparse = False
     s.enable_fpm = False
+    # Exercise the unconditional scheduler-loop HiCache event-drain point.
+    s.enable_hierarchical_cache = True
+    s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
@@ -104,6 +108,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
         side_effect=lambda batch, **_: batch
     )
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
+    tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None

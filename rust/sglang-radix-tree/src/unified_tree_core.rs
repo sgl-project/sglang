@@ -846,6 +846,34 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(result)
     }
 
+    /// Pin only the FULL device values on a node's root path.
+    pub fn inc_full_pin(&mut self, node_id: NodeId) -> Result<(), NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let full = self.component_by_type_(FULL);
+        full.acquire_component_lock(
+            self,
+            node_idx,
+            IncLockRefResult::default(),
+            /* lock_host = */ false,
+        );
+        self.update_evictable_leaf_sets_(node_idx);
+        Ok(())
+    }
+
+    /// Release a FULL-only root-path pin.
+    pub fn dec_full_pin(&mut self, node_id: NodeId) -> Result<(), NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let full = self.component_by_type_(FULL);
+        full.release_component_lock(
+            self,
+            node_idx,
+            &DecLockRefParams::default(),
+            /* lock_host = */ false,
+        );
+        self.update_evictable_leaf_sets_(node_idx);
+        Ok(())
+    }
+
     /// A receipt releases only the node its acquire returned; a mispaired
     /// node would silently release (or steal) another holder's segment.
     fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
@@ -1029,6 +1057,44 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             full_kv_hit_length,
             action,
         )
+    }
+
+    /// Read-only FULL-device match, independent of auxiliary components.
+    /// Returns the request match and the complete root-path length pinned by
+    /// the deepest node; they differ when the key ends inside that node.
+    pub fn match_full_device_prefix(
+        &self,
+        key: &K,
+        namespace: KeyNamespaceRef<'_>,
+    ) -> (usize, NodeId, usize) {
+        let aligned_key_len = key.atom_len() / self.page_size * self.page_size;
+        let mut node_id = self.arena.root();
+        let mut offset = 0;
+        let mut pinned_len = 0;
+        while offset < aligned_key_len {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id,
+                namespace,
+                key.page_at(offset, self.page_size),
+            ) else {
+                break;
+            };
+            let child = self.arena.node(child_id);
+            if !child.has_device_value(FULL) {
+                break;
+            }
+            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            if prefix_len == 0 {
+                break;
+            }
+            offset += prefix_len;
+            pinned_len += child.device_value_len(FULL);
+            node_id = child_id;
+            if prefix_len < child.key.atom_len() {
+                break;
+            }
+        }
+        (offset, self.arena.node(node_id).id, pinned_len)
     }
 
     /// Walk the tree for `key`; returns matched value chunks, the best match,
@@ -3147,6 +3213,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     /* host_indices = */ None,
                     /* token_ids = */ None,
                     /* prefetch_tokens = */ 0,
+                    /* staging_tokens = */ 0,
                     /* last_hash = */ None,
                 )
                 .unwrap();
@@ -3186,6 +3253,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     /* host_indices = */ None,
                     /* token_ids = */ None,
                     /* prefetch_tokens = */ 0,
+                    /* staging_tokens = */ 0,
                     /* last_hash = */ None,
                 )
                 .unwrap();
@@ -3213,6 +3281,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         host_indices: Option<Tensor>,
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
@@ -3225,6 +3294,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 host_indices,
                 token_ids,
                 prefetch_tokens,
+                staging_tokens,
                 last_hash,
             )
     }
@@ -3250,6 +3320,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* host_indices = */ None,
                 /* token_ids = */ None,
                 /* prefetch_tokens = */ 0,
+                /* staging_tokens = */ 0,
                 /* last_hash = */ None,
             )?
             .unwrap();
@@ -3268,6 +3339,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* host_indices = */ None,
                 /* token_ids = */ None,
                 /* prefetch_tokens = */ 0,
+                /* staging_tokens = */ 0,
                 /* last_hash = */ None,
             )?;
             if let Some(transfers) = transfers

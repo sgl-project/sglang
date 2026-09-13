@@ -1292,6 +1292,25 @@ fn match_prefix_splits_on_a_partial_match() {
 }
 
 #[test]
+fn match_full_device_prefix_is_read_only_and_accounts_the_pinned_node() {
+    let mut tc = core();
+    let (a, _b) = matched_chain(&mut tc);
+
+    let (matched_len, node_id, pinned_len) =
+        tc.match_full_device_prefix(&vec![1, 9], KeyNamespaceRef::new(None, None));
+
+    assert_eq!(matched_len, 1);
+    assert_eq!(node_id, tc.arena.node(a).id);
+    assert_eq!(pinned_len, 2);
+    assert_eq!(tc.arena.node(a).key, vec![1, 2]);
+
+    tc.inc_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 1);
+    tc.dec_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 0);
+}
+
+#[test]
 fn match_prefix_stops_at_a_dead_node() {
     // An evicted, unbackuped child ends the traversal before it.
     let mut tc = core();
@@ -4265,6 +4284,7 @@ fn fallible_node_boundaries_reject_stale_handles() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))

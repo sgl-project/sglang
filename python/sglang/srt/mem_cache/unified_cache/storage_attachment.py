@@ -114,6 +114,7 @@ class StorageAttachment:
             )
 
         try:
+            prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -253,6 +254,16 @@ class StorageAttachment:
         else:
             cache.storage_metrics_collector = None
 
+    def resolve_prefetch_threshold(self, configured: int) -> int:
+        """Use the same complete-window minimum for every buffer-mode anchor."""
+        cache = self._cache
+        window = cache.sliding_window_size
+        if not window or cache.host_memory_mode != "buffer_only":
+            return configured
+        page_size = cache.page_size
+        window_tokens = ((window + page_size - 1) // page_size) * page_size
+        return max(configured, window_tokens)
+
     def _resolve_metrics_collector(
         self,
         storage_backend: Optional[str],
@@ -374,7 +385,13 @@ class StorageAttachment:
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
                 del cache.ongoing_prefetch[req_id]
-                cache.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
+                if cache.buffer_pipeline is not None:
+                    cache.buffer_pipeline.pop_prefix_ctx(req_id)
+                    cache.buffer_pipeline.release_anchor_lock(req_id)
+                elif info.anchor_lock_params is not None:
+                    cache.dec_host_lock_ref(
+                        info.anchor_node_id, info.anchor_lock_params
+                    )
                 controller.append_host_mem_release(
                     host_indices=info.host_indices[:completed_tokens],
                     extra_pools=[
@@ -382,7 +399,11 @@ class StorageAttachment:
                     ],
                 )
                 controller.prefetch_tokens_occupied = max(
-                    0, controller.prefetch_tokens_occupied - len(info.prefetch_key)
+                    0,
+                    controller.prefetch_tokens_occupied
+                    - cache._prefetch_occupied_span(
+                        info.prefetch_key, info.host_indices
+                    ),
                 )
             except Exception:
                 logger.exception("Failed to release pending prefetch %s", req_id)
@@ -399,3 +420,4 @@ class StorageAttachment:
             cache.discard_storage_prefetch_accounting(req_id)
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
+        cache.storage_prefetch_retries.clear()
