@@ -283,6 +283,8 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+    if _is_xpu:
+        return True
     return False
 
 
@@ -592,6 +594,58 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
+def torch_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run block-FP8 linear with Torch's scaled_mm implementation."""
+    if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+        raise ValueError(
+            f"XPU block-FP8 scaled_mm expects a two-dimensional weight_block_size, "
+            f"but got {block_size}"
+        )
+    block_n, block_k = block_size
+    if block_k != 128 or block_n not in (1, 128):
+        raise ValueError(
+            "XPU block-FP8 scaled_mm supports weight_block_size [1, 128] or "
+            f"[128, 128], but got {block_size}"
+        )
+
+    scale_b_recipe = (
+        torch.nn.functional.ScalingType.BlockWise1x128
+        if block_n == 1
+        else torch.nn.functional.ScalingType.BlockWise128x128
+    )
+    input_2d = input.reshape(-1, input.shape[-1])
+    if input_scale is None:
+        q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
+    else:
+        q_input = input_2d
+        activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
+
+    if q_input.stride(-1) != 1:
+        q_input = q_input.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    weight_t = weight.t()
+    scale_b = weight_scale if block_n == 1 else weight_scale.t()
+    output = torch.nn.functional.scaled_mm(
+        q_input,
+        weight_t,
+        activation_scale,
+        torch.nn.functional.ScalingType.BlockWise1x128,
+        scale_b,
+        scale_b_recipe,
+        bias=bias,
+        output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
@@ -804,7 +858,8 @@ def _dispatch_auto_backend() -> Callable:
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. NPU (Ascend)
-    # 6. Triton (fallback)
+    # 6. XPU (Intel GPU, PyTorch torch._scaled_mm)
+    # 7. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -820,6 +875,8 @@ def _dispatch_auto_backend() -> Callable:
         )
 
         return npu_w8a8_mxfp8_linear
+    elif _is_xpu:
+        return torch_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -2059,13 +2116,25 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
-    if (
+    dynamic_rowwise_scaling = (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
-    ):
+    )
+    rowwise_torch_scaled_mm = USE_ROWWISE_TORCH_SCALED_MM
+    if _is_xpu:
+        # XPU's rowwise fused kernel requires these scale layouts and is
+        # beneficial from M=8 for representative projection shapes.
+        rowwise_torch_scaled_mm = rowwise_torch_scaled_mm and (
+            x_scale.ndim == 2
+            and x_scale.shape[1] == 1
+            and x_scale.is_contiguous()
+            and weight_scale.ndim == 2
+            and weight_scale.shape[1] == 1
+            and weight_scale.t().is_contiguous()
+            and qinput.shape[0] >= 8
+        )
+    if dynamic_rowwise_scaling and (rowwise_torch_scaled_mm or _use_aiter):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
