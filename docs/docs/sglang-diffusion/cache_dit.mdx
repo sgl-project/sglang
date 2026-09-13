@@ -11,7 +11,11 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
 - **DBCache (Dual Block Cache)**: Dynamically decides when to cache transformer blocks based on residual differences
 - **TaylorSeer**: Uses Taylor expansion for calibration to optimize caching decisions
+- **DMD Calibrator**: An **exponential-basis** forecasting calibrator (Dynamic Mode Decomposition, not Distribution Matching Distillation) that serves as a drop-in alternative to TaylorSeer's polynomial basis; strongest on flow-matching models
 - **SCM (Step Computation Masking)**: Step-level caching control for additional speedup
+
+Cache-DiT also ships **SVDQuant** W4A4 (int4 / NVFP4) dynamic quantization, which can be combined
+with DBCache caching (see [Quantization](#quantization)).
 
 ## Basic Usage
 
@@ -47,8 +51,11 @@ client.images.generate(
 `SGLANG_CACHE_DIT_ENABLED` server default). `cache_dit_params` accepts the
 DBCache knobs (`Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`,
 `residual_diff_threshold`, `max_continuous_cached_steps`, `enable_taylorseer`,
-`taylorseer_order`), the SCM knobs (`scm_preset`, `scm_compute_bins`,
-`scm_cache_bins`, `scm_policy`), and a nested `secondary` dict with the DBCache
+`taylorseer_order`), the DMD knobs (`enable_dmd`, `dmd_history`, `dmd_rank`,
+`dmd_ridge`, `dmd_svd_precision`; DMD and TaylorSeer are mutually exclusive
+calibrators and cannot be enabled together), the SCM knobs (`scm_preset`,
+`scm_compute_bins`, `scm_cache_bins`, `scm_policy`), and a nested `secondary`
+dict with the DBCache
 knobs for the second transformer of dual-DiT models (unset secondary keys
 inherit the request's primary values, then the
 `SGLANG_CACHE_DIT_SECONDARY_*` defaults).
@@ -132,6 +139,49 @@ cache_config:
   num_inference_steps: 28
   steps_computation_mask: fast
   enable_sperate_cfg: true # e.g, Qwen-Image, Wan, Chroma, Ovis-Image, etc.
+```
+
+- DBCache + DMD Calibrator
+
+Instead of TaylorSeer, you can use the DMD calibrator: an **exponential-basis** forecasting
+calibrator that serves as a drop-in alternative to TaylorSeer's polynomial basis. DMD models
+the cached feature stream as a linear dynamical system (`Y_{t+1} ~= A @ Y_t`), forecasts
+cached features from the fitted eigen-modes, and stays accurate over longer cache skips where
+polynomial extrapolation diverges. DMD here refers to Dynamic Mode Decomposition (Schmid
+2010), **not** Distribution Matching Distillation. DMD works best on flow-matching models
+(e.g., FLUX), while TaylorSeer is often better on DDPM-style models — try both. DMD and
+TaylorSeer are mutually exclusive — enable only one of `enable_dmd` / `enable_taylorseer`:
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0 # Bn=0 since the DMD calibrator replaces the Bn calibrator
+  residual_diff_threshold: 0.12
+  enable_dmd: true
+  dmd_history: 6 # snapshot window length, 5-6 typical
+  dmd_svd_precision: "medium" # "low", "medium" or "high"
+```
+
+A `dmd_history` window of 5–6 snapshots is typically the sweet spot — longer histories do not
+always help, because the feature dynamics drift across timesteps. With fewer than 4 uniformly
+spaced snapshots available, DMD transparently falls back to the Taylor expansion it maintains
+internally. See the
+[Cache-DiT DMD documentation](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#dmd-calibrator-dynamic-mode-decomposition)
+for the mathematical principle and quantitative comparisons. A ready-made config is available
+at
+[examples/configs/cache_dmd.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/cache_dmd.yaml)
+in the Cache-DiT repository. Apply it with the same `--cache-dit-config` flag:
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config cache_dmd.yaml \
+  --prompt "A beautiful sunset over the mountains"
 ```
 
 ### Distributed inference
@@ -300,6 +350,81 @@ sglang generate \
   --prompt "A beautiful sunset over the mountains"
 ```
 
+#### SVDQuant (W4A4 int4 / NVFP4)
+
+SVDQuant is Cache-DiT's built-in W4A4 PTQ quantization (weights and activations in int4 or
+NVFP4, with smoothed low-rank branches). It can be freely combined with DBCache caching and
+the DMD calibrator for the largest speedups.
+
+::::note
+SVDQuant requires a cache-dit build **with CUDA extension support** — a plain
+`pip install cache-dit` does NOT include it. Install one of:
+
+```bash Command
+# Option 1: prebuilt CUDA 13 wheel
+pip install cache-dit-cu13==<version> --no-deps
+
+# Option 2: build from source with SVDQuant enabled
+git clone https://github.com/vipshop/cache-dit
+cd cache-dit
+export CUDA_HOME=/usr/local/cuda
+CACHE_DIT_BUILD_SVDQUANT=1 pip install ".[quantization]" --no-build-isolation
+```
+::::
+
+Valid `quant_type` values are `svdq_int4_r{32,64,128,256}_dq` (int4 W4A4) and
+`svdq_nvfp4_r{32,64,128,256}_dq` (NVFP4 W4A4; requires a Blackwell GPU). Example config
+combining SVDQuant NVFP4 with DBCache + DMD (see
+[examples/configs/blackwell/cache_dmd_svdq.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/blackwell/cache_dmd_svdq.yaml)):
+
+```yaml Config
+cache_config:
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_dmd: true
+  dmd_history: 6
+  dmd_svd_precision: "medium"
+quantize_config:
+  quant_type: "svdq_nvfp4_r128_dq" # nvfp4 for Blackwell; use svdq_int4_r128_dq for int4
+  svdq_kwargs:
+    quantize_device: "cuda"
+    fused_mlp: true
+  exclude_layers:
+    - "embedder"
+    - "embed"
+  verbose: false
+```
+
+For int4 W4A4 (pre-Blackwell GPUs), the same config with
+`quant_type: "svdq_int4_r128_dq"` is available at
+[examples/configs/cache_dmd_svdq.yaml](https://github.com/vipshop/cache-dit/blob/main/examples/configs/cache_dmd_svdq.yaml)
+(add `runtime_kernel: "v2"` to `svdq_kwargs`).
+
+Enable `torch.compile` for the best SVDQuant performance, and make sure `--warmup-steps`
+covers the compile warmup (use the same value as `--num-inference-steps`):
+
+```bash Command
+sglang generate \
+  --backend diffusers \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --num-inference-steps=28 \
+  --warmup-mode request \
+  --warmup-steps 28 \
+  --cache-dit-config cache_dmd_svdq.yaml \
+  --enable-torch-compile \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false \
+  --prompt "A beautiful sunset over the mountains"
+```
+
+You can verify from the log that the quantization is active:
+`[Cache-DiT] SVDQuant Type: svdq_nvfp4_r128_dq, Rank: 128`.
+
 ### Combined Configs: Cache + Parallelism + Quantization
 
 You can also combine all the above configs together in a single yaml file `combined.yaml` that contains:
@@ -418,12 +543,89 @@ TaylorSeer improves caching accuracy using Taylor expansion:
   </tbody>
 </table>
 
+### DMD Calibrator Configuration
+
+DMD (Dynamic Mode Decomposition, Schmid 2010 — **not** Distribution Matching Distillation) is
+an **exponential-basis** forecasting calibrator and a drop-in alternative to TaylorSeer's
+polynomial basis. At each full-compute step it records a snapshot of the computed features; at
+a cached step it identifies a linear propagator from the recent snapshot window (one economy
+SVD with rank truncation, then eigendecomposition) and forecasts the current features via
+eigenvalue powers — cheap to advance, and stable over longer cache skips where polynomial
+extrapolation diverges. It typically improves both speed and quality over pure DBCache.
+**DMD and TaylorSeer are mutually exclusive** (enabling both raises a `ValueError`); DMD is
+best for flow-matching models, TaylorSeer for DDPM-style ones. See the
+[Cache-DiT DMD documentation](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#dmd-calibrator-dynamic-mode-decomposition)
+for details:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "14%"}} />
+    <col style={{width: "38%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "34%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DMD calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>History</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_HISTORY`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Snapshot window length; 5-6 typical. Needs >= 4 uniformly spaced snapshots, otherwise DMD falls back to TaylorSeer</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Rank</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_RANK`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SVD truncation rank; 0 = automatic (drop modes below 1e-4 of the leading singular value)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Ridge</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_RIDGE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1e-8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tikhonov regularization added to the inverted singular values</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SVD Precision</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_DMD_SVD_PRECISION`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>medium</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SVD precision: "low", "medium" or "high"</td>
+    </tr>
+  </tbody>
+</table>
+
+Usage (SGLD backend, env-driven):
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_DMD=true \
+sglang generate --model-path black-forest-labs/FLUX.1-dev \
+    --prompt "A curious raccoon in a forest"
+```
+
+On the diffusers backend, enable DMD from the yaml config instead
+(`enable_dmd: true` in `cache_config`, see
+[Diffusers Backend](#diffusers-backend)); DMD can also be set per request via
+`cache_dit_params: {"enable_dmd": true}`.
+
 ### Combined Configuration Example
 
 DBCache and TaylorSeer are complementary strategies that work together, you can configure both sets of parameters
 simultaneously:
 
-```bash
+```bash Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_FN=2 \
 SGLANG_CACHE_DIT_BN=1 \
@@ -496,7 +698,7 @@ SCM is configured with presets:
 
 **Usage**
 
-```bash
+```bash Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_SCM_PRESET=medium \
 sglang generate --model-path Qwen/Qwen-Image \
@@ -507,7 +709,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 For fine-grained control over which steps to compute vs cache:
 
-```bash
+```bash Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_SCM_COMPUTE_BINS="8,3,3,2,2" \
 SGLANG_CACHE_DIT_SCM_CACHE_BINS="1,2,2,2,3" \
@@ -616,6 +818,18 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
 acceleration still works.
+
+### SVDQuant unavailable or load failure
+
+SVDQuant cases raise `svdq_is_available() = False` or
+`undefined symbol: ... materialize_cow_storage ...` when the installed cache-dit has no CUDA
+extension, or the prebuilt wheel was compiled against an incompatible torch. Fix: reinstall
+from the `cache-dit-cu13` wheel matching your torch version, or build cache-dit from source
+with `CACHE_DIT_BUILD_SVDQUANT=1` (see [Quantization](#quantization)). Quick self-check:
+
+```bash Command
+python -c "from cache_dit.quantization.svdquant import svdq_is_available, svdq_get_load_error as e; print(svdq_is_available(), e())"
+```
 
 ## References
 
