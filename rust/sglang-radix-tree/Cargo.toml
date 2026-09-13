@@ -10,7 +10,7 @@ repository = "https://github.com/sgl-project/sglang"
 python-module = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
 debug = false
 features = ["python-extension"]
-torch-compat-header = "torch_2_13_compat.h"
+torch-compat-header = "torch_compat.h"
 
 [lib]
 name = "mem_cache"

@@ -20,7 +20,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+# Torch 2.14 headers reject anything below C++20 with a hard #error.
+set(SGL_KERNEL_CXX_STANDARD "20" CACHE STRING "C++ standard used for host and CUDA compilation")
 set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 

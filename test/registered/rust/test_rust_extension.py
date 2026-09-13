@@ -201,7 +201,7 @@ crate-type = ["cdylib"]
                     crate,
                     features=(*crate.features, "inspection"),
                     extension_module="demo._inspection",
-                    build_fingerprint={"torch": "2.13"},
+                    build_fingerprint={"torch": "2.14"},
                 )
                 self.assertNotEqual(changed_source.fingerprint, inspection.fingerprint)
                 self.assertNotEqual(
@@ -458,7 +458,7 @@ crate-type = ["cdylib"]
             compat_header = root / "compat.h"
             compat_header.write_text("// compatibility\n", encoding="utf-8")
             fake_torch = SimpleNamespace(
-                __version__="2.13.0+cu130",
+                __version__="2.14.0+cu130",
                 __file__=str(torch_init),
                 compiled_with_cxx11_abi=lambda: True,
                 version=SimpleNamespace(cuda="13.0", hip=None),
@@ -483,11 +483,15 @@ crate-type = ["cdylib"]
             self.assertEqual(build.environment["LIBTORCH_CXX11_ABI"], "1")
             self.assertEqual(build.environment["LIBTORCH_BYPASS_VERSION_CHECK"], "1")
             self.assertIn(str(compat_header), build.environment["CXXFLAGS"])
+            # Trailing the inherited CXXFLAGS is what lets this beat a `-std=`
+            # the caller already set; cc-rs puts all of CXXFLAGS after the
+            # `-std=c++17` torch-sys sets, so that one loses either way.
+            self.assertRegex(build.environment["CXXFLAGS"], r"^-O2\b.*\s-std=c\+\+20\b")
             self.assertIn(
                 "$ORIGIN/../../../../torch/lib", build.environment["RUSTFLAGS"]
             )
             self.assertIn(str(torch_root / "lib"), build.environment["RUSTFLAGS"])
-            self.assertEqual(build.fingerprint["torch_version"], "2.13.0+cu130")
+            self.assertEqual(build.fingerprint["torch_version"], "2.14.0+cu130")
             self.assertTrue(build.fingerprint["torch_cxx11_abi"])
 
             wheel_build = torch_build_configuration(
@@ -502,8 +506,39 @@ crate-type = ["cdylib"]
             )
             self.assertFalse(wheel_build.fingerprint["include_absolute_rpath"])
 
-            fake_torch.__version__ = "2.14.0"
-            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.13"):
+            # libtorch declares CXX_STANDARD 20 from 2.12 on, so the flag
+            # starts there; 2.11 is the one supported release still on C++17.
+            for version, expected in (("2.12.0+cu128", True), ("2.11.0+cu128", False)):
+                fake_torch.__version__ = version
+                older_build = torch_build_configuration(
+                    compat_header=compat_header,
+                    python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                    torch_module=fake_torch,
+                    base_environment={},
+                )
+                self.assertEqual(
+                    "-std=c++20" in older_build.environment["CXXFLAGS"],
+                    expected,
+                    msg=version,
+                )
+
+            # cc-rs only honours the shell quoting on a spaced header path
+            # when it parses *FLAGS as shell words.
+            fake_torch.__version__ = "2.14.0+cu130"
+            spaced_header = root / "compat dir" / "compat.h"
+            spaced_header.parent.mkdir()
+            spaced_header.write_text("// compatibility\n", encoding="utf-8")
+            spaced_build = torch_build_configuration(
+                compat_header=spaced_header,
+                python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                torch_module=fake_torch,
+                base_environment={},
+            )
+            self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
+            self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
+
+            fake_torch.__version__ = "2.15.0"
+            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
                 torch_build_configuration(
                     compat_header=compat_header,
                     python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",

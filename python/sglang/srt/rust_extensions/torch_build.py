@@ -13,7 +13,7 @@ from types import ModuleType
 from typing import Mapping
 
 _MIN_SUPPORTED_TORCH = (2, 11)
-_MAX_SUPPORTED_TORCH = (2, 13)
+_MAX_SUPPORTED_TORCH = (2, 14)
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ def torch_build_configuration(
     environment["LIBTORCH_LIB"] = os.fspath(torch_root)
     environment["LIBTORCH_CXX11_ABI"] = "1" if cxx11_abi else "0"
     # tch 0.24 targets Torch 2.11. The compatibility header below covers the
-    # API removals in the supported 2.12/2.13 builds, after this explicit gate.
+    # API removals in the supported 2.12-2.14 builds, after this explicit gate.
     environment["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     environment["PYO3_PYTHON"] = sys.executable
     environment["PATH"] = os.pathsep.join(
@@ -90,10 +90,19 @@ def torch_build_configuration(
         filter(None, (os.fspath(torch_lib), environment.get("LD_LIBRARY_PATH")))
     )
 
-    cxxflags = environment.get("CXXFLAGS", "")
-    environment["CXXFLAGS"] = (
-        f"{cxxflags} -include {shlex.quote(os.fspath(compat_header.resolve()))}"
-    ).strip()
+    # torch-sys 0.24 hardcodes `-std=c++17`, but libtorch declares
+    # CXX_STANDARD 20 from Torch 2.12 on, and 2.14 headers reject C++17
+    # outright. cc-rs pushes all of CXXFLAGS after a build script's own flags,
+    # so this overrides it. Only 2.11 still ships a C++17 libtorch.
+    # cc-rs splits *FLAGS on plain whitespace unless told to parse them as
+    # shell words, which is what makes the quoting below hold a header path
+    # containing a space together.
+    environment["CC_SHELL_ESCAPED_FLAGS"] = "1"
+    cxxflags = [environment.get("CXXFLAGS", "")]
+    if major_minor >= (2, 12):
+        cxxflags.append("-std=c++20")
+    cxxflags.append(f"-include {shlex.quote(os.fspath(compat_header.resolve()))}")
+    environment["CXXFLAGS"] = " ".join(filter(None, cxxflags)).strip()
 
     package_depth = len(python_module.split(".")) - 1
     bundled_torch_lib = "$ORIGIN/" + "../" * package_depth + "torch/lib"
