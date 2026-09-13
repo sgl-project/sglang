@@ -241,7 +241,7 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
@@ -284,8 +284,7 @@ class BlockStored(KVCacheEvent):
 class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
     """BlockStored wire extension used only when typed metadata is present.
 
-    A separate struct keeps unsalted events at their legacy array length; an
-    optional field on BlockStored would still serialize a trailing null.
+    A separate struct keeps metadata required when this extension is used.
     """
 
     metadata: BlockStoredMetadata
@@ -303,7 +302,7 @@ class AllBlocksCleared(KVCacheEvent):
 class KVEventBatch(EventBatch):
     # BlockStoredWithMetadata deliberately stays out of this tagged union.
     # Existing typed consumers decode its shared "BlockStored" tag as the base
-    # type and ignore the trailing metadata; adding both types would give
+    # type and ignore the extra metadata key; adding both types would give
     # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
