@@ -3484,6 +3484,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._mhc_prewarmed_at_load = True
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
+        if _is_hip:
+            # TileLang JIT compilation of MHC prewarm kernels hangs indefinitely
+            # on specific TP ranks on ROCm (manifests as a TP barrier deadlock
+            # after weight loading on DSpark checkpoints). MHC compiles on first
+            # request instead, which has no serving correctness impact.
+            return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
             None,
@@ -3642,6 +3648,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
+                        and not name.startswith("mtp")
                     ):
                         name = name.replace(
                             "mlp.shared_experts",
