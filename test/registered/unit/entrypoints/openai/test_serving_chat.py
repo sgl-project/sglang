@@ -2894,6 +2894,30 @@ class ServingChatTestCase(unittest.TestCase):
             chunks.append(chunk)
         return chunks
 
+    def test_streaming_logprobs_use_per_token_top_logprobs(self):
+        """Each token in a multi-token streaming segment carries its own top_logprobs.
+
+        Streaming can commit more than one token per chunk (speculative decode,
+        stream_interval, coalesced deltas). The segment is token-aligned, so the
+        second token must not report the first token's alternatives.
+        """
+        content = {
+            "meta_info": {
+                "output_token_logprobs": [(-0.1, 1, "a"), (-0.2, 2, "b")],
+                "output_top_logprobs": [
+                    [(-0.1, 1, "a"), (-1.1, 3, "x")],
+                    [(-0.2, 2, "b"), (-2.2, 4, "y")],
+                ],
+            }
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(content, 0, 2)
+
+        self.assertEqual([t.token for t in choice_logprobs.content], ["a", "b"])
+        first_top = {t.token for t in choice_logprobs.content[0].top_logprobs}
+        second_top = {t.token for t in choice_logprobs.content[1].top_logprobs}
+        self.assertEqual(first_top, {"a", "x"})
+        self.assertEqual(second_top, {"b", "y"})
+
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
         self.chat.reasoning_parser = "qwen3"
