@@ -172,6 +172,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     uses_state_checkpoints = True
 
+    def prepare_state_checkpoint_plan(
+        self,
+        forward_batch: ForwardBatch,
+        forward_metadata: ForwardMetadata,
+        device: str,
+    ) -> None:
+        maybe_build_flashinfer_checkpoint_plan(forward_batch, forward_metadata, device)
+
     def __init__(self):
         (
             available,
