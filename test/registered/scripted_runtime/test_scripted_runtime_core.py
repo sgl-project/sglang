@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
@@ -11,6 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     advance_to_nth_chunk,
     base_engine_kwargs,
     exhaust_row_pool,
+    run_until,
     run_until_finished,
     warmup_radix,
 )
@@ -30,6 +31,22 @@ _ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
 def _script_noop(t: ScriptedContext):
     yield
+
+
+def _assert_resources_restored(t: ScriptedContext, baseline: dict):
+    for _ in range(40):
+        if t.is_fully_idle:
+            break
+        yield
+    assert t.is_fully_idle, "requests did not drain"
+    assert all(ref == 0 for ref in t.get_all_node_lock_refs().values())
+    t.flush_cache()
+    yield
+    final = t.engine_stats()
+    for resource in ("kv_pool_free", "req_pool_free"):
+        assert final[resource] == baseline[resource], (
+            f"{resource} changed: {baseline[resource]} -> {final[resource]}"
+        )
 
 
 class TestScriptedRuntimeCore(ScriptedTestCase):
@@ -58,6 +75,156 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         assert t.find_req_by_rid("explicit-rid-test") is not None, (
             "explicit rid not visible to the scheduler after one step"
         )
+
+    def test_rid_reuse_after_finish_preserves_each_request(self):
+        self.server.execute_script(self._script_rid_reuse_after_finish)
+
+    @staticmethod
+    def _script_rid_reuse_after_finish(t: ScriptedContext):
+        baseline = t.engine_stats()
+        r1 = yield from t.start_req_with_retry(
+            rid="reuse-after-finish",
+            prompt_len=_LONG_PROMPT_LEN,
+            prompt_token=210,
+            max_new_tokens=2,
+            ignore_eos=True,
+        )
+        yield from advance_to_nth_chunk(r1, 1)
+        old_req = r1.req
+        assert old_req is not None and old_req.kv.holds_kv
+        yield from run_until_finished(r1)
+        old_chunks = r1.chunks_done
+        assert old_chunks > 0
+
+        r2 = yield from t.start_req_with_retry(
+            rid=r1.rid,
+            prompt_len=_SHORT_PROMPT_LEN,
+            prompt_token=211,
+            max_new_tokens=4,
+            ignore_eos=True,
+        )
+        assert r1.finished and not r2.finished
+        assert r2.chunks_done == 0
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        yield from run_until_finished(r2)
+
+        assert isinstance(old_req.finished_reason, FINISH_LENGTH)
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(old_req.output_ids) == 2
+        assert len(new_req.output_ids) == 4
+        assert r1.chunks_done == old_chunks and r2.chunks_done == 0
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        yield from _assert_resources_restored(t, baseline)
+
+    def test_double_abort_then_reuse_rid(self):
+        self.server.execute_script(self._script_double_abort_then_reuse_rid)
+
+    @staticmethod
+    def _script_double_abort_then_reuse_rid(t: ScriptedContext):
+        baseline = t.engine_stats()
+        r1 = yield from t.start_req_with_retry(
+            rid="double-abort-reuse",
+            prompt_len=_LONG_PROMPT_LEN,
+            prompt_token=220,
+            max_new_tokens=2,
+            ignore_eos=True,
+        )
+        yield from advance_to_nth_chunk(r1, 1)
+        old_req = r1.req
+        assert old_req is not None and old_req.kv.holds_kv
+        assert old_req.kv.kv_allocated_len > 0
+        t.abort(r1)
+        t.abort(r1)
+        r2 = yield from t.start_req_with_retry(
+            rid=r1.rid,
+            prompt_len=_SHORT_PROMPT_LEN,
+            prompt_token=221,
+            max_new_tokens=4,
+            ignore_eos=True,
+        )
+        assert not r2.finished and r2.chunks_done == 0
+        old_chunks = r1.chunks_done
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
+        t.abort(r1)
+        yield from run_until_finished(r2)
+
+        assert isinstance(old_req.finished_reason, FINISH_ABORT)
+        assert old_req.kv.req_pool_idx is None
+        assert old_req.kv.kv_allocated_len == 0
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        assert r1.chunks_done == old_chunks and r2.chunks_done == 0
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(new_req.output_ids) == 4
+        yield from _assert_resources_restored(t, baseline)
+
+    def test_rid_retry_budget_preserves_original_request(self):
+        self.server.execute_script(self._script_rid_retry_budget)
+
+    @staticmethod
+    def _script_rid_retry_budget(t: ScriptedContext):
+        baseline = t.engine_stats()
+        original = t.start_req(
+            rid="retry-budget",
+            prompt_len=_SHORT_PROMPT_LEN,
+            max_new_tokens=16,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(original, 1)
+        req = original.req
+        assert req is not None
+        before = len(req.output_ids)
+        try:
+            yield from t.start_req_with_retry(
+                rid=original.rid,
+                prompt_len=_SHORT_PROMPT_LEN,
+                max_new_tokens=4,
+                max_steps=2,
+                ignore_eos=True,
+            )
+        except TimeoutError as exc:
+            assert original.rid in str(exc)
+        else:
+            raise AssertionError("reusing an active RID did not exhaust the budget")
+
+        assert not original.finished
+        assert len(req.output_ids) > before, "retry did not advance the scheduler"
+        yield from run_until_finished(original)
+        assert original.req is None or original.req is req
+        assert isinstance(req.finished_reason, FINISH_LENGTH)
+        assert len(req.output_ids) == 16, "rejected retries disturbed the original"
+        yield from _assert_resources_restored(t, baseline)
+
+    def test_rid_reuse_across_scripts(self):
+        """Reset must drain old HTTP work before another script reuses its ID."""
+        self.server.execute_script(self._script_reuse_across_scripts, args=(False,))
+        self.server.execute_script(self._script_reuse_across_scripts, args=(True,))
+
+    @staticmethod
+    def _script_reuse_across_scripts(t: ScriptedContext, finish: bool):
+        baseline = t.engine_stats()
+        handle = t.start_req(
+            rid="reuse-across-scripts",
+            prompt_len=_SHORT_PROMPT_LEN,
+            max_new_tokens=4,
+            ignore_eos=True,
+        )
+        yield
+        req = handle.req
+        assert req is not None and not handle.finished
+        if not finish:
+            return
+        yield from run_until_finished(handle)
+        assert isinstance(req.finished_reason, FINISH_LENGTH)
+        assert len(req.output_ids) == 4
+        yield from _assert_resources_restored(t, baseline)
 
     def test_find_req_by_rid_hit_and_miss(self):
         self.server.execute_script(self._script_find_req_by_rid_hit_and_miss)

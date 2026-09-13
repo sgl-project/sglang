@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
+from sglang.test.scripted_runtime.context.http_post import _http_post_and_await_recv_msg
 from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
     ScriptedTokenizerRecvProxy,
 )
@@ -84,6 +89,68 @@ class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
 
 
 class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
+    def test_http_post_failure_reaches_script_wait(self):
+        """A rejected POST must report its error instead of a socket-arrival timeout."""
+        poster = BackgroundHttpPoster()
+        self.addCleanup(poster.close)
+        poster.post = AsyncMock(side_effect=RuntimeError("request rejected"))
+        ctx = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                server_args=SimpleNamespace(host="127.0.0.1", port=30000)
+            ),
+            _http_poster=poster,
+            _tokenizer_recv_proxy=ScriptedTokenizerRecvProxy(
+                underlying=_FakeUnderlyingSocket()
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "request rejected"):
+            _http_post_and_await_recv_msg(
+                ctx,
+                path="/generate",
+                json={"rid": "reused", "stream": True},
+                predicate=_is_start_req("reused"),
+                description="reused request",
+                timeout_s=1.0,
+            )
+
+        poster.post.assert_awaited_once_with(
+            "http://127.0.0.1:30000/generate", {"rid": "reused", "stream": True}
+        )
+
+    def test_wait_until_arrived_propagates_failed_post(self):
+        """A failed request must interrupt the wait for its scheduler message."""
+        proxy = ScriptedTokenizerRecvProxy(underlying=_FakeUnderlyingSocket())
+        future = Future()
+        future.set_exception(RuntimeError("Duplicate request ID detected: reused"))
+
+        with self.assertRaisesRegex(RuntimeError, "Duplicate request ID detected"):
+            proxy.wait_until_arrived(
+                _is_start_req("reused"), timeout_s=0.02, post_future=future
+            )
+
+    def test_successful_post_still_requires_socket_arrival(self):
+        proxy = ScriptedTokenizerRecvProxy(underlying=_FakeUnderlyingSocket())
+        future = Future()
+        future.set_result(None)
+
+        with self.assertRaises(TimeoutError):
+            proxy.wait_until_arrived(_is_control, timeout_s=0.02, post_future=future)
+
+    def test_socket_arrival_does_not_wait_for_post_completion(self):
+        underlying = _FakeUnderlyingSocket()
+        proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
+        msg = _StartReq("pending")
+        underlying.feed(msg)
+        future = Future()
+
+        proxy.wait_until_arrived(
+            _is_start_req("pending"), timeout_s=0.02, post_future=future
+        )
+
+        self.assertFalse(future.done())
+        self.assertIs(proxy.recv_pyobj(), msg)
+
     def _proxy_with_stale_control(self):
         underlying = _FakeUnderlyingSocket()
         proxy = ScriptedTokenizerRecvProxy(underlying=underlying)

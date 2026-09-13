@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -28,6 +29,22 @@ def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
         ):
             return
         yield
+
+
+def _drain_flush_then_assert_no_resource_leak(t: ScriptedContext, baseline: dict):
+    for _ in range(DEFAULT_MAX_STEPS):
+        if t.is_fully_idle:
+            break
+        yield
+    assert t.is_fully_idle, "requests did not drain after abort"
+    assert all(ref == 0 for ref in t.get_all_node_lock_refs().values())
+    t.flush_cache()
+    yield
+    final = t.engine_stats()
+    for resource in ("kv_pool_free", "req_pool_free"):
+        assert final[resource] == baseline[resource], (
+            f"{resource} changed after abort: {baseline[resource]} -> {final[resource]}"
+        )
 
 
 class TestAbortBasic(ScriptedTestCase):
@@ -161,18 +178,39 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_then_start_same_step_same_rid(t: ScriptedContext):
-        r1 = t.start_req(
+        baseline = t.engine_stats()
+        r1 = yield from t.start_req_with_retry(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
             rid="abort-reuse",
             prompt_token=150,
+            ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking)
+        old_req = r1.req
+        assert old_req is not None and old_req.kv.holds_kv
+        assert old_req.kv.kv_allocated_len > 0
         t.abort(r1)
-        yield
-        r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="abort-reuse")
+        r2 = yield from t.start_req_with_retry(
+            prompt_len=16,
+            max_new_tokens=4,
+            rid="abort-reuse",
+            prompt_token=151,
+            ignore_eos=True,
+        )
+        assert not r2.finished and r2.chunks_done == 0
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
         yield from run_until_finished(r2)
-        assert r2.finished
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(new_req.output_ids) == 4
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        assert old_req.kv.req_pool_idx is None
+        assert old_req.kv.kv_allocated_len == 0
+        assert r2.chunks_done == 0
+        yield from _drain_flush_then_assert_no_resource_leak(t, baseline)
 
     def test_abort_five_chunked_in_a_row(self):
         self.server.execute_script(self._script_abort_five_chunked_in_a_row)
@@ -272,15 +310,24 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_double_abort_idempotent(t: ScriptedContext):
+        baseline = t.engine_stats()
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=190
         )
         yield from run_until(r, lambda h: h.is_chunking)
+        req = r.req
+        assert req is not None and req.kv.holds_kv
+        assert req.kv.kv_allocated_len > 0
         t.abort(r)
         t.abort(r)
-        yield from _drain_until_released(t, r)
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
+        for _ in range(DEFAULT_MAX_STEPS):
+            if req.kv.req_pool_idx is None and req.kv.kv_allocated_len == 0:
+                break
+            yield
+        assert req.kv.req_pool_idx is None
+        assert req.kv.kv_allocated_len == 0
+        t.abort(r)
+        yield from _drain_flush_then_assert_no_resource_leak(t, baseline)
 
     def test_abort_during_decode(self):
         self.server.execute_script(self._script_abort_during_decode)
@@ -389,25 +436,39 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_then_resubmit_same_rid_same_step(t: ScriptedContext):
-        r1 = t.start_req(
+        baseline = t.engine_stats()
+        r1 = yield from t.start_req_with_retry(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
             rid="abort-resubmit-same-step",
             prompt_token=230,
+            ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking)
+        old_req = r1.req
+        assert old_req is not None and old_req.kv.holds_kv
+        assert old_req.kv.kv_allocated_len > 0
         t.abort(r1)
-        r2 = t.start_req(
+        r2 = yield from t.start_req_with_retry(
             prompt_len=16,
-            max_new_tokens=2,
+            max_new_tokens=4,
             rid="abort-resubmit-same-step",
+            prompt_token=231,
+            ignore_eos=True,
         )
-        yield
+        assert not r2.finished and r2.chunks_done == 0
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
         yield from run_until_finished(r2)
-        assert r2.finished, "resubmit under same rid must complete independently"
-        assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
-        assert r1.req is None or r1.req.kv.req_pool_idx is None
-        assert r1.lock_refs == 0
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(new_req.output_ids) == 4
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        assert old_req.kv.req_pool_idx is None
+        assert old_req.kv.kv_allocated_len == 0
+        assert r2.chunks_done == 0
+        yield from _drain_flush_then_assert_no_resource_leak(t, baseline)
 
     def test_abort_during_gap_inflight_middle_chunks_positive(self):
         self.server.execute_script(
