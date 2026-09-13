@@ -27,6 +27,7 @@ from sglang.multimodal_gen.test.runner.pytest_runner import (
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     DiffusionTestCase,
+    get_case_full_test_time_estimate,
 )
 
 # TODO: remove duplicated code
@@ -77,10 +78,21 @@ class PartitionAssignment:
 
 def get_case_est_time(case_id: str) -> float:
     scenario = BASELINE_CONFIG.scenarios.get(case_id)
+    case = next(
+        (
+            case
+            for groups in PARAMETRIZED_CASE_GROUPS.values()
+            for _, cases in groups
+            for case in cases
+            if case.id == case_id
+        ),
+        None,
+    )
+    estimate = get_case_full_test_time_estimate(case, scenario)
+    if estimate is not None:
+        return estimate
     if scenario is None:
         return DEFAULT_EST_TIME_SECONDS
-    if scenario.estimated_full_test_time_s is not None:
-        return scenario.estimated_full_test_time_s
     return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
 

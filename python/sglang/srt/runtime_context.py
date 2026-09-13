@@ -626,6 +626,8 @@ class Resources(_FlagGroupBase):
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
     buffers: dict = msgspec.field(default_factory=dict)
+    # The weight data parallel manager belongs to the model using it.
+    dwdp_manager: Any = None
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
@@ -1584,6 +1586,33 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     (bags re-projected, provenance reset, role overwritten), which is what
     lets one process rebuild an engine after shutting the previous one down.
     """
+    return _configure_context(_CONTEXT, server_args, role=role)
+
+
+def create_context(server_args, *, role: str) -> RuntimeContext:
+    """Build a model-owned context without replacing the active process config."""
+    context = RuntimeContext(parallel=ParallelContext())
+    return _configure_context(context, server_args, role=role)
+
+
+@contextmanager
+def use_context(context: RuntimeContext):
+    """Activate a model context for serialized embedded SRT work.
+
+    Like process group scopes, this changes process globals and requires the
+    caller to serialize model execution. It does not isolate concurrent threads.
+    The previous context is restored by identity without re-projecting its bags.
+    """
+    global _CONTEXT, _PARALLEL
+    previous_context, previous_parallel = _CONTEXT, _PARALLEL
+    _CONTEXT, _PARALLEL = context, context.parallel
+    try:
+        yield context
+    finally:
+        _CONTEXT, _PARALLEL = previous_context, previous_parallel
+
+
+def _configure_context(context, server_args, *, role: str) -> RuntimeContext:
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
         raise ValueError(
@@ -1591,8 +1620,8 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
-    discarded = _CONTEXT.overrides_log()
-    _CONTEXT.set_server_args(server_args)
+    discarded = context.overrides_log()
+    context.set_server_args(server_args)
     if discarded:
         logger.warning(
             "publish(role=%s) re-projected the config bags and dropped %d "
@@ -1603,7 +1632,7 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
                 f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
             ),
         )
-    _CONTEXT._publish_role = role
+    context._publish_role = role
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
@@ -1615,7 +1644,7 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             file=sys.stderr,
             flush=True,
         )
-    return _CONTEXT
+    return context
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:
@@ -1669,16 +1698,12 @@ def get_buffer(name: str, factory: Any) -> Any:
     return _CONTEXT.get_buffer(name, factory)
 
 
-_GLOBAL_DWDP_MANAGER: Any = None
-
-
 def get_global_dwdp_manager() -> Any:
-    return _GLOBAL_DWDP_MANAGER
+    return _CONTEXT.resources.dwdp_manager
 
 
 def set_global_dwdp_manager(manager: Any) -> None:
-    global _GLOBAL_DWDP_MANAGER
-    _GLOBAL_DWDP_MANAGER = manager
+    _CONTEXT.resources.dwdp_manager = manager
 
 
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:

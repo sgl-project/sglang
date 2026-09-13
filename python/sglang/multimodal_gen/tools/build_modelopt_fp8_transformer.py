@@ -2,7 +2,7 @@
 
 The core conversion path is model-agnostic:
 - read the ModelOpt diffusers transformer export
-- rebuild per-layer `weight_scale` / `input_scale` tensors from `backbone.pt`
+- rebuild per-layer `weight_scale` tensors (and static `input_scale` tensors when requested) from `backbone.pt`
 - materialize SGLang-native `float8_e4m3fn` weights
 - preserve ModelOpt `ignore` layers in their original dtype
 
@@ -297,11 +297,26 @@ def _map_hunyuanvideo_runtime_module_name(module_name: str) -> list[str]:
     return mapped_names
 
 
+def _map_llada_image_runtime_module_name(module_name: str) -> list[str]:
+    replacements = (
+        (r"^(.*\.attention)\.to_[qkv]$", r"\1.to_qkv"),
+        (r"^(.*\.feed_forward)\.w[13]$", r"\1.w13"),
+    )
+    mapped_names: list[str] = []
+    for pattern, replacement in replacements:
+        mapped = re.sub(pattern, replacement, module_name)
+        if mapped != module_name:
+            mapped_names.append(mapped)
+    return mapped_names
+
+
 def _get_runtime_module_name_mapper(
     *, model_type: str, class_name: str | None
 ) -> Callable[[str], list[str]] | None:
     if model_type == "hunyuan-video" or class_name == "HunyuanVideoTransformer3DModel":
         return _map_hunyuanvideo_runtime_module_name
+    if model_type == "llada-image" or class_name == "LLaDAImageTransformer2DModel":
+        return _map_llada_image_runtime_module_name
     return None
 
 
@@ -346,23 +361,68 @@ def _preferred_module_name(
     return _module_name_variants(weight_name, runtime_name_mapper)[-1]
 
 
-def _scale_key_candidates(weight_name: str) -> list[str]:
+def _scale_key_candidates(
+    weight_name: str,
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
+) -> list[str]:
     candidates = [weight_name]
     if weight_name.startswith("model.diffusion_model."):
         candidates.append(
             "velocity_model." + weight_name[len("model.diffusion_model.") :]
         )
+    for module_name in _module_name_variants(weight_name, runtime_name_mapper):
+        candidate = f"{module_name}.weight"
+        if candidate not in candidates:
+            candidates.append(candidate)
     return candidates
 
 
 def _resolve_scale_key(
     weight_name: str,
     scale_map: Mapping[str, Mapping[str, torch.Tensor]],
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
 ) -> str | None:
-    for candidate in _scale_key_candidates(weight_name):
+    for candidate in _scale_key_candidates(weight_name, runtime_name_mapper):
         if candidate in scale_map:
             return candidate
     return None
+
+
+def _validate_llada_image_fused_weight_scales(
+    weight_names: Iterable[str],
+    scale_map: Mapping[str, Mapping[str, torch.Tensor]],
+) -> None:
+    scales_by_fused_module: dict[str, list[tuple[str, torch.Tensor]]] = defaultdict(
+        list
+    )
+    for weight_name in weight_names:
+        mapped_modules = _map_llada_image_runtime_module_name(weight_name[:-7])
+        if not mapped_modules:
+            continue
+        scale_key = _resolve_scale_key(
+            weight_name, scale_map, _map_llada_image_runtime_module_name
+        )
+        if scale_key is None:
+            continue
+        fused_module = _preferred_module_name(
+            weight_name, _map_llada_image_runtime_module_name
+        )
+        scales_by_fused_module[fused_module].append(
+            (scale_key, scale_map[scale_key]["weight_scale"])
+        )
+
+    for fused_module, scale_entries in scales_by_fused_module.items():
+        reference_scale = scale_entries[0][1]
+        if all(torch.equal(scale, reference_scale) for _, scale in scale_entries[1:]):
+            continue
+        scale_details = ", ".join(
+            f"{scale_key}={scale.item():g}" for scale_key, scale in scale_entries
+        )
+        raise ValueError(
+            "LLaDA-Image FP8 conversion currently requires identical weight scales "
+            f"for parameters fused into {fused_module!r}; got {scale_details}. "
+            "Re-export the checkpoint with a fused weight observer for this module."
+        )
 
 
 def _is_ltx2_x0_export(
@@ -473,6 +533,7 @@ def build_fp8_scale_map(
     model_state_dict: Mapping[str, torch.Tensor],
     *,
     maxbound: float = FP8_E4M3_MAXBOUND,
+    require_input_scale: bool = True,
 ) -> dict[str, dict[str, torch.Tensor]]:
     scale_map: dict[str, dict[str, torch.Tensor]] = {}
     for key, value in model_state_dict.items():
@@ -487,10 +548,13 @@ def build_fp8_scale_map(
                 value.detach().to(torch.float32).reshape(1).cpu() / maxbound
             )
 
+    required_scales = (
+        {"weight_scale", "input_scale"} if require_input_scale else {"weight_scale"}
+    )
     return {
         weight_name: scale_tensors
         for weight_name, scale_tensors in scale_map.items()
-        if {"weight_scale", "input_scale"} <= set(scale_tensors)
+        if required_scales <= set(scale_tensors)
     }
 
 
@@ -543,6 +607,44 @@ def _load_selected_tensors(
     return tensors
 
 
+def _get_modelopt_activation_scheme(
+    quant_config: Mapping, *, allow_mixed: bool = False
+) -> str | None:
+    schemes = set()
+    declared = quant_config.get("activation_scheme")
+    if declared is not None:
+        if declared not in ("static", "dynamic"):
+            raise ValueError(f"Invalid ModelOpt activation_scheme {declared!r}.")
+        schemes.add(declared)
+    groups = quant_config.get("config_groups", {})
+    if not isinstance(groups, dict):
+        raise ValueError("ModelOpt activation config_groups must be a dictionary.")
+    for group in groups.values():
+        if not isinstance(group, dict):
+            raise ValueError(
+                "Each ModelOpt activation config group must be a dictionary."
+            )
+        activations = group.get("input_activations")
+        if activations is None:
+            continue
+        if not isinstance(activations, dict):
+            raise ValueError("ModelOpt input_activations must be a dictionary.")
+        if "dynamic" not in activations:
+            continue
+        dynamic = activations["dynamic"]
+        if not isinstance(dynamic, bool):
+            raise ValueError("ModelOpt input activation dynamic must be a boolean.")
+        schemes.add("dynamic" if dynamic else "static")
+    if len(schemes) > 1:
+        if allow_mixed:
+            return None
+        raise ValueError(
+            "Conflicting ModelOpt activation schemes. "
+            "Set activation_scheme explicitly to choose the converted output."
+        )
+    return next(iter(schemes), None)
+
+
 def build_modelopt_fp8_transformer(
     *,
     modelopt_hf_dir: str,
@@ -551,6 +653,7 @@ def build_modelopt_fp8_transformer(
     base_transformer_dir: str | None = None,
     model_type: str = "auto",
     keep_bf16_patterns: Sequence[str] | None = None,
+    activation_scheme: str = "auto",
     maxbound: float = FP8_E4M3_MAXBOUND,
     overwrite: bool = False,
 ) -> dict[str, int]:
@@ -580,6 +683,28 @@ def build_modelopt_fp8_transformer(
         source_weight_map=source_weight_map_all,
     )
     class_name = config.get("_class_name")
+    is_llada_image = (
+        model_type == "llada-image" or class_name == "LLaDAImageTransformer2DModel"
+    )
+    source_activation_scheme = _get_modelopt_activation_scheme(
+        quant_config, allow_mixed=activation_scheme != "auto"
+    )
+    if activation_scheme == "auto":
+        activation_scheme = source_activation_scheme or (
+            "dynamic" if is_llada_image else "static"
+        )
+    if activation_scheme not in {"static", "dynamic"}:
+        raise ValueError(
+            "activation_scheme must be one of 'auto', 'static', or 'dynamic', "
+            f"got {activation_scheme!r}."
+        )
+    if is_llada_image and activation_scheme != "dynamic":
+        raise ValueError(
+            "LLaDA-Image FP8 conversion currently supports only dynamic activation "
+            "quantization. To convert this checkpoint, set activation_scheme='dynamic'."
+        )
+    dynamic_activation = activation_scheme == "dynamic"
+
     runtime_name_mapper = _get_runtime_module_name_mapper(
         model_type=model_type, class_name=class_name
     )
@@ -630,7 +755,11 @@ def build_modelopt_fp8_transformer(
     backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")[
         "model_state_dict"
     ]
-    fp8_scale_map = build_fp8_scale_map(backbone_state, maxbound=maxbound)
+    fp8_scale_map = build_fp8_scale_map(
+        backbone_state,
+        maxbound=maxbound,
+        require_input_scale=not dynamic_activation,
+    )
     quant_algo = str(quant_config.get("quant_algo", "")).upper()
     if quant_algo and "FP8" not in quant_algo:
         raise ValueError(
@@ -655,7 +784,8 @@ def build_modelopt_fp8_transformer(
             _preferred_module_name(weight_name, runtime_name_mapper)
             for weight_name in source_weight_map
             if weight_name.endswith(".weight")
-            and _resolve_scale_key(weight_name, fp8_scale_map) is None
+            and _resolve_scale_key(weight_name, fp8_scale_map, runtime_name_mapper)
+            is None
         }
     )
     fallback_ignore_modules = sorted(
@@ -671,7 +801,33 @@ def build_modelopt_fp8_transformer(
             *fallback_ignore_modules,
         }
     )
-    effective_quant_config["ignore"] = ignore_patterns
+    if is_llada_image:
+        _validate_llada_image_fused_weight_scales(
+            (
+                weight_name
+                for weight_name in source_weight_map
+                if weight_name.endswith(".weight")
+                and weight_name not in fallback_weight_names_set
+                and not is_ignored_by_modelopt(
+                    weight_name, ignore_patterns, runtime_name_mapper
+                )
+            ),
+            fp8_scale_map,
+        )
+    if dynamic_activation:
+        effective_quant_config = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "ignored_layers": ignore_patterns,
+        }
+    else:
+        effective_quant_config["ignore"] = ignore_patterns
+        if "activation_scheme" in effective_quant_config:
+            effective_quant_config["activation_scheme"] = "static"
+        for group in effective_quant_config.get("config_groups", {}).values():
+            activations = group.get("input_activations")
+            if activations is not None:
+                activations["dynamic"] = False
     serialized_quant_config = json.dumps(effective_quant_config, sort_keys=True)
     output_config = _build_output_config(
         source_config=config,
@@ -686,11 +842,12 @@ def build_modelopt_fp8_transformer(
         else {}
     )
     fallback_scale_names = {
-        scale_name
+        weight_name[:-7] + scale_suffix
         for weight_name in fallback_weight_names
-        for scale_name in (
-            weight_name[:-7] + ".weight_scale",
-            weight_name[:-7] + ".input_scale",
+        for scale_suffix in (
+            (".weight_scale",)
+            if dynamic_activation
+            else (".weight_scale", ".input_scale")
         )
     }
 
@@ -726,6 +883,9 @@ def build_modelopt_fp8_transformer(
             if "_quantizer." in name:
                 del shard_tensors[name]
                 continue
+            if dynamic_activation and name.endswith(".input_scale"):
+                del shard_tensors[name]
+                continue
             if name in fallback_scale_names:
                 del shard_tensors[name]
                 continue
@@ -737,7 +897,7 @@ def build_modelopt_fp8_transformer(
             ):
                 preserved_ignored_weight_count += 1
                 continue
-            scale_key = _resolve_scale_key(name, fp8_scale_map)
+            scale_key = _resolve_scale_key(name, fp8_scale_map, runtime_name_mapper)
             if (
                 name.endswith(".weight")
                 and scale_key is not None
@@ -748,11 +908,18 @@ def build_modelopt_fp8_transformer(
                 shard_tensors[name] = quantize_fp8_weight(
                     shard_tensors[name], scale_tensors["weight_scale"]
                 )
+                # One fused runtime observer can feed multiple logical source
+                # weights (for example LLaDA Q/K/V). Safetensors rejects
+                # multiple dictionary entries that alias the same storage.
                 shard_tensors[name[:-7] + ".weight_scale"] = scale_tensors[
                     "weight_scale"
-                ]
-                shard_tensors[name[:-7] + ".input_scale"] = scale_tensors["input_scale"]
-                added_scale_count += 2
+                ].clone()
+                added_scale_count += 1
+                if not dynamic_activation:
+                    shard_tensors[name[:-7] + ".input_scale"] = scale_tensors[
+                        "input_scale"
+                    ].clone()
+                    added_scale_count += 1
 
         save_file(shard_tensors, os.path.join(output_path, filename), metadata=metadata)
 
@@ -782,7 +949,7 @@ def build_modelopt_fp8_transformer(
             1
             for name in source_weight_map
             if name.endswith(".weight")
-            and _resolve_scale_key(name, fp8_scale_map) is not None
+            and _resolve_scale_key(name, fp8_scale_map, runtime_name_mapper) is not None
             and not is_ignored_by_modelopt(name, ignore_patterns, runtime_name_mapper)
         ),
         "bf16_fallback_weights": len(fallback_weight_names),
@@ -830,6 +997,7 @@ def _parse_args() -> argparse.Namespace:
             "ltx2",
             "hunyuan-video",
             "qwen-image",
+            "llada-image",
             "none",
         ],
         default="auto",
@@ -848,6 +1016,17 @@ def _parse_args() -> argparse.Namespace:
             "Regex matched against module names without the trailing .weight. "
             "Matching weights are copied from --base-transformer-dir instead of "
             "staying in FP8."
+        ),
+    )
+    parser.add_argument(
+        "--activation-scheme",
+        choices=["auto", "static", "dynamic"],
+        default="auto",
+        help=(
+            "Activation quantization scheme in the converted checkpoint. 'auto' "
+            "reads ModelOpt input activation metadata, falling back to dynamic "
+            "for LLaDA-Image and static for other families when metadata is absent. "
+            "Use 'dynamic' explicitly to convert a static LLaDA-Image export."
         ),
     )
     parser.add_argument(
@@ -873,6 +1052,7 @@ def main() -> None:
         base_transformer_dir=args.base_transformer_dir,
         model_type=args.model_type,
         keep_bf16_patterns=args.keep_bf16_pattern,
+        activation_scheme=args.activation_scheme,
         maxbound=args.maxbound,
         overwrite=args.overwrite,
     )

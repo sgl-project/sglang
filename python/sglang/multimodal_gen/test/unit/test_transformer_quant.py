@@ -100,6 +100,7 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
     _Flux2Nvfp4FallbackAdapter,
+    _ModelOptFp8OffloadAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
     _resolve_weight_override_quantization,
@@ -115,6 +116,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformer
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     Flux2Transformer2DModel,
 )
+from sglang.multimodal_gen.runtime.models.dits.llada_image import LLaDAImageFeedForward
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -164,81 +166,147 @@ def _make_quant_config(name: str, **attrs):
     return quant_config
 
 
+class _FakeOnlineFp8Config:
+    is_checkpoint_fp8_serialized = False
+
+    @classmethod
+    def get_name(cls):
+        return "fp8"
+
+
 class TestTransformerQuantHelpers(unittest.TestCase):
     def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
-        method = ModelOptFp8LinearMethod(
-            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        )
-        method.cutlass_fp8_supported = True
-        layer = torch.nn.Module()
-        layer.logical_widths = [2, 2, 2]
-        weight = (
-            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
-        )
-        layer.register_parameter(
-            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
-        )
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(
-                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
-                requires_grad=False,
-            ),
-        )
-        layer.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
-        )
+        for use_fnuz in (False, True):
+            with (
+                self.subTest(use_fnuz=use_fnuz),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                    "is_fp8_fnuz",
+                    return_value=use_fnuz,
+                ),
+            ):
+                method = ModelOptFp8LinearMethod(
+                    ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+                )
+                method.cutlass_fp8_supported = True
+                layer = torch.nn.Module()
+                layer.logical_widths = [2, 2, 2]
+                values = torch.arange(24, dtype=torch.float32).reshape(6, 4) - 12
+                values[0, 0] = -0.0
+                weight = values.to(torch.float8_e4m3fn)
+                checkpoint_scales = torch.tensor([0.1, 0.2, 0.3])
+                input_scales = torch.tensor([0.5, 1.0, 1.5])
+                layer.register_parameter(
+                    "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+                )
+                layer.register_parameter(
+                    "weight_scale",
+                    torch.nn.Parameter(checkpoint_scales.clone(), requires_grad=False),
+                )
+                layer.register_parameter(
+                    "input_scale",
+                    torch.nn.Parameter(input_scales.clone(), requires_grad=False),
+                )
 
-        method.process_weights_after_loading(layer)
+                method.process_weights_after_loading(layer)
 
-        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
-        torch.testing.assert_close(
-            layer.weight_scale,
-            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
-        )
-        torch.testing.assert_close(layer.input_scale, torch.tensor(1.0))
+                scale_factor = 2 if use_fnuz else 1
+                expected_dtype = (
+                    torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+                )
+                expected_weight = (weight.float() / scale_factor).to(expected_dtype)
+                self.assertEqual(layer.weight.dtype, expected_dtype)
+                torch.testing.assert_close(
+                    layer.weight.view(torch.int8),
+                    expected_weight.t().view(torch.int8),
+                    rtol=0,
+                    atol=0,
+                )
+                channel_scales = checkpoint_scales.repeat_interleave(2).view(-1, 1)
+                torch.testing.assert_close(
+                    layer.weight_scale, channel_scales * scale_factor, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    layer.input_scale, input_scales.max() * scale_factor, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    layer.weight.t().float() * layer.weight_scale,
+                    weight.float() * channel_scales,
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
-        method = ModelOptFp8LinearMethod(
-            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        )
-        method.cutlass_fp8_supported = True
-        layer = torch.nn.Module()
-        layer.logical_widths = [2, 2, 2]
-        weight = (
-            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
-        )
-        layer.register_parameter(
-            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
-        )
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(
-                torch.tensor(
-                    [0.1, torch.finfo(torch.float32).min, 0.3],
-                    dtype=torch.float32,
+        for use_fnuz in (False, True):
+            with (
+                self.subTest(use_fnuz=use_fnuz),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                    "is_fp8_fnuz",
+                    return_value=use_fnuz,
                 ),
-                requires_grad=False,
-            ),
-        )
-        layer.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
-        )
+            ):
+                method = ModelOptFp8LinearMethod(
+                    ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+                )
+                method.cutlass_fp8_supported = True
+                layer = torch.nn.Module()
+                layer.logical_widths = [2, 2, 2]
+                weight = (
+                    torch.arange(24, dtype=torch.float32)
+                    .reshape(6, 4)
+                    .to(torch.float8_e4m3fn)
+                )
+                checkpoint_scales = torch.tensor(
+                    [0.1, torch.finfo(torch.float32).min, 0.3], dtype=torch.float32
+                )
+                layer.register_parameter(
+                    "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+                )
+                layer.register_parameter(
+                    "weight_scale",
+                    torch.nn.Parameter(checkpoint_scales.clone(), requires_grad=False),
+                )
+                layer.register_parameter(
+                    "input_scale",
+                    torch.nn.Parameter(torch.ones(3), requires_grad=False),
+                )
+                scale_factor = 2 if use_fnuz else 1
+                expected_dtype = (
+                    torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+                )
+                expected_weight = (weight.float() / scale_factor).to(expected_dtype)
+                expected_scales = checkpoint_scales * scale_factor
 
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
-            "requantize_with_max_scale",
-            return_value=(torch.tensor(0.3), weight.clone()),
-        ) as requantize:
-            method.process_weights_after_loading(layer)
+                def requantize_native(runtime_weight, scales, logical_widths):
+                    self.assertEqual(runtime_weight.dtype, expected_dtype)
+                    self.assertEqual(logical_widths, layer.logical_widths)
+                    torch.testing.assert_close(
+                        runtime_weight, expected_weight, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+                    return scales.max(), runtime_weight.clone()
 
-        requantize.assert_called_once()
-        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
-        torch.testing.assert_close(
-            layer.weight_scale, torch.full((6, 1), 0.3), rtol=0, atol=0
-        )
+                with patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                    "requantize_with_max_scale",
+                    side_effect=requantize_native,
+                ) as requantize:
+                    method.process_weights_after_loading(layer)
+
+                requantize.assert_called_once()
+                torch.testing.assert_close(
+                    layer.weight, expected_weight.t(), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    layer.weight_scale,
+                    expected_scales.max().expand(6, 1),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    layer.input_scale, torch.tensor(float(scale_factor))
+                )
 
     def test_modelopt_packed_layer_requires_consistent_shard_precision(self):
         prefix = "blocks.0.attn.to_qkv"
@@ -619,6 +687,28 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             backend = _default_quantized_attention_backend(quant_spec, server_args)
 
         self.assertIsNone(backend)
+
+    def test_explicit_fp8_quantization_uses_online_defaults(self):
+        config = _resolve_quant_config(
+            hf_config={},
+            server_args=self._make_server_args(quantization="fp8"),
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "fp8")
+        self.assertFalse(config.is_checkpoint_fp8_serialized)
+        self.assertEqual(config.activation_scheme, "dynamic")
+
+    def test_online_fp8_disables_whole_dit_cpu_offload(self):
+        server_args = self._make_server_args(dit_cpu_offload=True)
+
+        _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
+            server_args=server_args,
+            quant_config=_FakeOnlineFp8Config(),
+        )
+
+        self.assertFalse(server_args.dit_cpu_offload)
 
     def test_resolve_transformer_checkpoint_files_uses_single_override_file(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
@@ -1884,6 +1974,33 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     _resolve_quant_method_name({"quant_method": quant_method}),
                     quant_method,
                 )
+
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.linear.get_tp_group", return_value=None
+    )
+    def test_llada_image_online_fp8_quantizes_fused_linears(
+        self,
+        _mock_tp_group,
+        _mock_group_size,
+        _mock_group_rank,
+    ):
+        fp8_module = "sglang.multimodal_gen.runtime.layers.quantization.fp8"
+        with patch(
+            f"{fp8_module}.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ):
+            feed_forward = LLaDAImageFeedForward(
+                dim=192,
+                quant_config=Fp8Config(),
+                prefix="layers.0.feed_forward",
+            )
+
+        self.assertIsInstance(feed_forward.w13.quant_method, Fp8LinearMethod)
+        self.assertIsInstance(feed_forward.w2.quant_method, Fp8LinearMethod)
+        self.assertEqual(feed_forward.w13.prefix, "layers.0.feed_forward.w13")
+        self.assertEqual(feed_forward.w2.prefix, "layers.0.feed_forward.w2")
 
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)

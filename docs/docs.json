@@ -1521,6 +1521,13 @@
                     ]
                   },
                   {
+                    "group": "InclusionAI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/InclusionAI/LLaDA-Image"
+                    ]
+                  },
+                  {
                     "group": "LongCat-Image",
                     "tag": "NEW",
                     "pages": [

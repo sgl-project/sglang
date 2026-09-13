@@ -41,6 +41,7 @@ def harness(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.setenv("SGLANG_SKIP_CONSISTENCY", "0")
     monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig(
         stages_ms={"DenoisingStage": 10},
         denoise_step_ms={0: 5, 1: 5},
@@ -122,6 +123,31 @@ def test_each_request_failure_fails_case(harness, monkeypatch, bad_request, fail
     # Even failed performance measurements must survive in the report.
     expected = [i + 1 for i in range(2) if failure != "generation" or i != bad_request]
     assert [r["request_index"] for r in runner._perf_results] == expected
+
+
+@pytest.mark.parametrize("metric", ["performance", "load_peak", "runtime_peak"])
+def test_hip_performance_outliers_warn(harness, monkeypatch, caplog, metric):
+    _, case = harness
+    monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: True)
+    baseline = test_server_common.BASELINE_CONFIG
+    scenario = baseline.scenarios[case.id]
+    validator = test_server_common.PerformanceValidator(
+        scenario, baseline.tolerances, baseline.step_fractions
+    )
+    record = _perf_record()
+    if metric == "performance":
+        record.total_duration_ms = 10000
+        validator.validate(record, case.sampling_params.num_frames)
+    else:
+        record.memory_snapshots[metric]["peak_reserved_mb"] = 10000
+        validator.validate_peak_vram(
+            validator.collect_metrics(record),
+            scenario.load_peak_vram_mb,
+            scenario.runtime_peak_vram_mb,
+        )
+
+    assert "AMD PERF WARNING" in caplog.text
 
 
 def test_both_requests_pass(harness, monkeypatch):
@@ -328,3 +354,31 @@ def test_h3_cases_check_two_short_requests_and_audio():
         assert case.sampling_params.expect_audio_output
         assert case.sampling_params.extras["num_inference_steps"] <= 8
         assert case.sampling_params.extras["target"]["duration_seconds"] == 4.0
+
+
+@pytest.mark.parametrize("estimate", [None, 600.0])
+def test_server_teardown_accepts_explicit_case_estimates(
+    harness, monkeypatch, estimate
+):
+    _, case = harness
+    case = replace(case, run_perf_check=False, estimated_full_test_time_s=estimate)
+    monkeypatch.setattr(
+        test_server_common,
+        "BASELINE_CONFIG",
+        replace(test_server_common.BASELINE_CONFIG, scenarios={}),
+    )
+    missing = set()
+    monkeypatch.setattr(test_server_common, "_MISSING_ESTIMATED_TIME_CASES", missing)
+    context = Mock()
+    manager = Mock()
+    manager.start.return_value = context
+    monkeypatch.setattr(test_server_common, "ServerManager", Mock(return_value=manager))
+    monkeypatch.setattr(test_server_common, "get_dynamic_server_port", lambda: 19000)
+
+    fixture = test_server_common.diffusion_server.__wrapped__(case)
+    assert next(fixture) is context
+    with pytest.raises(StopIteration):
+        next(fixture)
+
+    context.cleanup.assert_called_once_with()
+    assert (case.id in missing) == (estimate is None)

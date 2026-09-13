@@ -102,7 +102,13 @@ class TimestepPreparationStage(PipelineStage):
         sigmas = batch.sigmas
         n_tokens = batch.n_tokens
 
-        sigmas = server_args.pipeline_config.prepare_sigmas(sigmas, num_inference_steps)
+        use_uniform_sigmas = getattr(
+            getattr(scheduler, "config", None), "use_uniform_sigmas", False
+        )
+        if sigmas is not None or not use_uniform_sigmas:
+            sigmas = server_args.pipeline_config.prepare_sigmas(
+                sigmas, num_inference_steps
+            )
         batch.sigmas = sigmas
 
         # Prepare extra kwargs for set_timesteps

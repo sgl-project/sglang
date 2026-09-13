@@ -702,8 +702,7 @@ sglang generate \
 - On disk, the quantization config stays `quant_method=modelopt` with
   `quant_algo=FP8`; the `modelopt-fp8` label in this document is a support
   family name, not a serialized config key.
-- To build the converted checkpoint yourself from a ModelOpt diffusers export,
-  use `python -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer`.
+- To build the converted checkpoint yourself from a ModelOpt diffusers export, use `python -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer`. The default `--activation-scheme auto` reads the export's input activation metadata. For a LLaDA-Image export that declares static activations, pass `--activation-scheme dynamic` explicitly. Exports without activation metadata keep the legacy defaults of dynamic for LLaDA-Image and static for other models.
 
 ## ModelOpt NVFP4
 

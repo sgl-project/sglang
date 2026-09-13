@@ -43,6 +43,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
+    get_case_full_test_time_estimate,
     get_model_task_type_for_server_args,
     get_perf_baseline_update_path,
 )
@@ -236,9 +237,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             )
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
-        needs_estimated_time = (
-            scenario is None or scenario.estimated_full_test_time_s is None
-        )
+        needs_estimated_time = get_case_full_test_time_estimate(case, scenario) is None
 
         if needs_estimated_time and not is_baseline_generation_mode:
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
@@ -398,7 +397,7 @@ class DiffusionServerBase:
         if (
             not missing_scenario
             and not is_baseline_generation_mode
-            and scenario.estimated_full_test_time_s is None
+            and get_case_full_test_time_estimate(case, scenario) is None
         ):
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
 

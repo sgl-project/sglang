@@ -96,6 +96,7 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
     def __init__(self):
         self.cases: Dict[str, List[str]] = {}  # list_name -> [case_id, ...]
         self.factory_case_ids: Dict[str, str] = {}
+        self.case_est_times: Dict[str, float] = {}
 
     def visit_Module(self, node: ast.Module):
         for stmt in node.body:
@@ -225,7 +226,15 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             "_make_modelopt_ci_case",
         }:
             if node.args and isinstance(node.args[0], ast.Constant):
-                return node.args[0].value
+                case_id = node.args[0].value
+                for keyword in node.keywords:
+                    if (
+                        keyword.arg == "estimated_full_test_time_s"
+                        and isinstance(keyword.value, ast.Constant)
+                        and isinstance(keyword.value.value, (int, float))
+                    ):
+                        self.case_est_times[case_id] = float(keyword.value.value)
+                return case_id
         if isinstance(node.func, ast.Name) and not node.args:
             return self.factory_case_ids.get(node.func.id)
 
@@ -365,7 +374,9 @@ def _iter_baseline_paths(baseline_path: Path) -> List[Path]:
     return [path for path in ordered_paths if path.exists()]
 
 
-def load_baselines(baseline_path: Path) -> Dict[str, float]:
+def load_baselines(
+    baseline_path: Path, case_est_times: Optional[Dict[str, float]] = None
+) -> Dict[str, float]:
     """
     Load performance baselines from a JSON file or platform baseline directory.
 
@@ -381,6 +392,8 @@ def load_baselines(baseline_path: Path) -> Dict[str, float]:
         for case_id, scenario in scenarios.items():
             if scenario.get("estimated_full_test_time_s") is not None:
                 est_time = scenario["estimated_full_test_time_s"]
+            elif case_est_times and case_id in case_est_times:
+                est_time = case_est_times[case_id]
             else:
                 expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
                 est_time = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
@@ -402,14 +415,17 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
         Dictionary mapping list name to case IDs.
         e.g., {"ONE_GPU_CASES_A": ["qwen_image_t2i", ...], ...}
     """
+    return _parse_testcase_config(config_path).cases
+
+
+def _parse_testcase_config(config_path: Path) -> DiffusionTestCaseVisitor:
     with open(config_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     tree = ast.parse(content, filename=str(config_path))
     visitor = DiffusionTestCaseVisitor()
     visitor.visit(tree)
-
-    return visitor.cases
+    return visitor
 
 
 def parse_run_suite_standalone_data(
@@ -467,7 +483,8 @@ def collect_diffusion_suites(
         Dictionary mapping suite name to DiffusionSuiteInfo.
     """
     # Parse case IDs from the single source case config.
-    case_lists = parse_testcase_configs(case_config_path)
+    parsed_config = _parse_testcase_config(case_config_path)
+    case_lists = parsed_config.cases
 
     # Parse standalone files from run_suite.py
     standalone_files, standalone_est_times = parse_run_suite_standalone_data(
@@ -478,7 +495,10 @@ def collect_diffusion_suites(
     )
 
     # Load baselines for time estimation
-    baselines = load_baselines(baseline_path)
+    baselines = {
+        **parsed_config.case_est_times,
+        **load_baselines(baseline_path, parsed_config.case_est_times),
+    }
 
     # Build suite info
     suites = {}

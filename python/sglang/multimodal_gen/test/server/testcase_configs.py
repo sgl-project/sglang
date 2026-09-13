@@ -328,6 +328,8 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    # Scheduling budget for functional cases without a performance baseline
+    estimated_full_test_time_s: float | None = None
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -362,6 +364,14 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+def get_case_full_test_time_estimate(
+    case: DiffusionTestCase | None, scenario: ScenarioConfig | None
+) -> float | None:
+    if scenario is not None and scenario.estimated_full_test_time_s is not None:
+        return scenario.estimated_full_test_time_s
+    return case.estimated_full_test_time_s if case is not None else None
 
 
 _REALTIME_MODEL_COMMON_EXTRAS = {

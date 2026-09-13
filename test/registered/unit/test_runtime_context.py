@@ -311,6 +311,89 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             get_server_args()
 
 
+class TestEmbeddedRuntimeContext(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt import runtime_context as rc
+
+        self.addCleanup(rc.restore_context, rc.snapshot_context())
+        rc.reset_context()
+
+    def test_serial_contexts_keep_config_and_resources_across_scopes(self):
+        from sglang.srt import runtime_context as rc
+
+        outer_args = ServerArgs(model_path="dummy", tp_size=1)
+        outer = publish(outer_args, role="diffusion_gpu_worker")
+        outer.override("diffusion.setup", grammar_backend="none")
+        outer_bags = outer._config_bags
+        outer_log = outer.overrides_log()
+        outer_buffer = rc.get_buffer("shared_name", object)
+        outer_manager = object()
+        rc.set_global_dwdp_manager(outer_manager)
+        outer.flags.capture.enable_torch_compile = True
+        outer.parallel.stamp_derived_widths(attn_tp_size=1)
+
+        inner_args = ServerArgs(model_path="dummy", tp_size=2)
+        inner = rc.create_context(inner_args, role="scheduler")
+        self.assertIs(get_context(), outer)
+        self.assertIs(get_parallel(), outer.parallel)
+        inner_manager = object()
+        inner_buffer = object()
+        for index in range(2):
+            with self.subTest(index=index), rc.use_context(inner):
+                self.assertIs(assert_published(inner_args, role="scheduler"), inner)
+                self.assertIs(get_parallel(), inner.parallel)
+                self.assertEqual(get_parallel().tp_size, 2)
+                self.assertFalse(get_flags().capture.enable_torch_compile)
+                if index == 0:
+                    self.assertIsNone(rc.get_global_dwdp_manager())
+                    self.assertNotIn("shared_name", inner.resources.buffers)
+                    inner.override("encoder.setup", page_size=16)
+                    inner.resources.buffers["shared_name"] = inner_buffer
+                    inner.parallel.stamp_derived_widths(attn_tp_size=2)
+                    rc.set_global_dwdp_manager(inner_manager)
+                self.assertEqual(rc.get_schedule().page_size, 16)
+                self.assertEqual(len(inner.overrides_log()), 1)
+                self.assertIs(rc.get_buffer("shared_name", object), inner_buffer)
+                self.assertIs(rc.get_global_dwdp_manager(), inner_manager)
+                self.assertEqual(get_parallel().attn_tp_size, 2)
+                with self.assertRaisesRegex(RuntimeError, "nested failure"):
+                    with rc.use_context(outer):
+                        self.assertIs(rc.get_global_dwdp_manager(), outer_manager)
+                        self.assertEqual(get_parallel().attn_tp_size, 1)
+                        raise RuntimeError("nested failure")
+                self.assertIs(get_context(), inner)
+                self.assertIs(get_parallel(), inner.parallel)
+            self.assertIs(get_context(), outer)
+            self.assertIs(get_server_args(), outer_args)
+            self.assertIs(get_parallel(), outer.parallel)
+            self.assertEqual(publish_role(), "diffusion_gpu_worker")
+            self.assertIs(outer._config_bags, outer_bags)
+            self.assertEqual(outer.overrides_log(), outer_log)
+            self.assertEqual(get_exec().kernel.grammar_backend, "none")
+            self.assertTrue(get_flags().capture.enable_torch_compile)
+            self.assertIs(rc.get_buffer("shared_name", object), outer_buffer)
+            self.assertIs(rc.get_global_dwdp_manager(), outer_manager)
+
+    def test_failed_context_creation_preserves_active_context(self):
+        from sglang.srt import runtime_context as rc
+
+        outer = publish(ServerArgs(model_path="dummy"), role="diffusion_gpu_worker")
+        outer.override("diffusion.setup", grammar_backend="none")
+        bags, log = outer._config_bags, outer.overrides_log()
+        with patch.object(rc, "_ROLE_NS_MODE", "enforce"):
+            with self.assertRaisesRegex(ValueError, "has no ROLE_NAMESPACE_SETS"):
+                rc.create_context(ServerArgs(model_path="dummy"), role="invalid_role")
+        broken_args = ServerArgs(model_path="dummy")
+        with patch.object(
+            broken_args, "resolve_once", side_effect=RuntimeError("resolution failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "resolution failed"):
+                rc.create_context(broken_args, role="scheduler")
+        self.assertIs(get_context(), outer)
+        self.assertIs(outer._config_bags, bags)
+        self.assertEqual(outer.overrides_log(), log)
+
+
 class TestAssertPublished(_IsolatedServerArgs):
     """Publishing is the process entry's job; the constructors only check.
 

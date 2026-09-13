@@ -69,6 +69,42 @@ from sglang.multimodal_gen.test.test_utils import (
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
 
+def _llada_image_ci_kwargs(sp_degree: int, mode: str) -> dict:
+    return dict(
+        server_args=DiffusionServerArgs(
+            model_path="inclusionAI/LLaDA-Image-Turbo-FP8",
+            modality="image",
+            num_gpus=sp_degree,
+            tp_size=1,
+            ulysses_degree=sp_degree,
+            ring_degree=1,
+            cfg_parallel=False,
+            extras=[
+                "--trust-remote-code",
+                "--revision",
+                "2b822499be3f33a6f83c988dafab7986ebd1f733",
+            ],
+        ),
+        sampling_params=DiffusionSamplingParams(
+            prompt=(
+                "Convert 2D style to 3D style"
+                if mode == "edit"
+                else "A red fox sitting on a snowy hill"
+            ),
+            image_path=(
+                "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg"
+                if mode == "edit"
+                else None
+            ),
+            output_size="512x512",
+            extras={"num_inference_steps": 4, "guidance_scale": 1.0, "seed": 42},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    )
+
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -499,6 +535,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
 ]
+
+if not current_platform.is_hip() and not current_platform.is_xpu():
+    ONE_GPU_CASES += [
+        DiffusionTestCase(
+            "llada_image_turbo_fp8_t2i_sp1",
+            estimated_full_test_time_s=600.0,
+            **_llada_image_ci_kwargs(1, "t2i"),
+        ),
+        DiffusionTestCase(
+            "llada_image_turbo_fp8_edit_sp1",
+            estimated_full_test_time_s=600.0,
+            **_llada_image_ci_kwargs(1, "edit"),
+        ),
+    ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
@@ -1185,6 +1235,20 @@ TWO_GPU_CASES = [
         run_component_accuracy_check=False,
     ),
 ]
+
+if not current_platform.is_hip() and not current_platform.is_xpu():
+    TWO_GPU_CASES += [
+        DiffusionTestCase(
+            "llada_image_turbo_fp8_t2i_sp2",
+            estimated_full_test_time_s=600.0,
+            **_llada_image_ci_kwargs(2, "t2i"),
+        ),
+        DiffusionTestCase(
+            "llada_image_turbo_fp8_edit_sp2",
+            estimated_full_test_time_s=600.0,
+            **_llada_image_ci_kwargs(2, "edit"),
+        ),
+    ]
 
 if not current_platform.is_hip():
     # Flux2 multi-image edit with cache-dit, regression test
