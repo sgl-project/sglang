@@ -32,7 +32,23 @@ def _rms_norm(norm_input, weight, eps, dtype):
     return (x * rms * weight.float()).to(dtype)
 
 
-def _mhc_pre_oracle(residual, fn, scale, base, rms_eps, hc_eps, norm_weight, norm_eps):
+def _relative_rms(actual, expected):
+    diff = actual.float() - expected.float()
+    return diff.square().mean().sqrt() / expected.float().square().mean().sqrt()
+
+
+def _mhc_pre_oracle(
+    residual,
+    fn,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    post_mult_value,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
     """Pure-torch hc_pre + caller-applied RMSNorm.
 
     Mirrors _mhc_pre_torch: BF16-round layer_input, then the same weight/eps
@@ -44,9 +60,77 @@ def _mhc_pre_oracle(residual, fn, scale, base, rms_eps, hc_eps, norm_weight, nor
     mixes = torch.nn.functional.linear(x_flat, fn) * rsqrt
 
     pre_raw = mixes[:, :n]
+    post_raw = mixes[:, n : 2 * n]
+    comb_raw = mixes[:, 2 * n :].view(s, n, n)
     pre = torch.sigmoid(pre_raw * scale[0] + base[:n]) + hc_eps
+    post = post_mult_value * torch.sigmoid(post_raw * scale[1] + base[n : 2 * n])
+    comb = comb_raw * scale[2] + base[2 * n :].view(n, n)
+    comb = comb.softmax(-1) + hc_eps
+    comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
     layer = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(torch.bfloat16)
-    return _rms_norm(layer, norm_weight, norm_eps, torch.bfloat16)
+    return (
+        _rms_norm(layer, norm_weight, norm_eps, torch.bfloat16),
+        comb,
+        post.unsqueeze(-1),
+    )
+
+
+def test_mhc_hip_tilelang_fallback_keeps_existing_unfused_kernels(monkeypatch):
+    """AITER-off HIP keeps TileLang, but leaves RMSNorm to the caller."""
+    monkeypatch.setattr(mhc.envs.SGLANG_USE_AITER, "get", lambda: False)
+    monkeypatch.setattr(mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_PRE, "get", lambda: True)
+    monkeypatch.setattr(mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_POST, "get", lambda: True)
+    monkeypatch.setattr(mhc, "is_gfx95_supported", lambda: True)
+
+    residual = torch.empty(1, 4, 8)
+    post_mix = torch.empty(1, 4, 1)
+    comb_mix = torch.empty(1, 4, 4)
+    layer_input = torch.empty(1, 8)
+    norm_weight = torch.empty(8)
+    calls = {"pre": 0, "post": 0}
+
+    def native_pre(**kwargs):
+        calls["pre"] += 1
+        assert kwargs["norm_weight"] is None
+        assert kwargs["norm_eps"] is None
+        return post_mix, comb_mix, layer_input
+
+    def native_post(*args):
+        calls["post"] += 1
+        return residual
+
+    def unexpected_torch(*args, **kwargs):
+        pytest.fail("enabled TileLang fallback was replaced by Torch")
+
+    monkeypatch.setattr(mhc, "mhc_pre", native_pre)
+    monkeypatch.setattr(mhc, "mhc_post", native_post)
+    monkeypatch.setattr(mhc, "_mhc_pre_torch", unexpected_torch)
+    monkeypatch.setattr(mhc, "_mhc_post_torch", unexpected_torch)
+
+    pre = mhc._mhc_pre_dispatch(
+        residual=residual,
+        fn=torch.empty(24, 32),
+        hc_scale=torch.empty(3),
+        hc_base=torch.empty(24),
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=2,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    assert pre[0] is post_mix
+    assert pre[1] is comb_mix
+    assert pre[2] is layer_input
+    assert pre[3] is False
+
+    post = mhc._mhc_post_dispatch(torch.empty(1, 8), residual, post_mix, comb_mix)
+    assert post is residual
+    assert calls == {"pre": 1, "post": 1}
 
 
 @pytest.mark.parametrize(
@@ -58,8 +142,11 @@ def _mhc_pre_oracle(residual, fn, scale, base, rms_eps, hc_eps, norm_weight, nor
     ],
 )
 def test_mhc_hip_pre_and_post_match_torch_oracles(monkeypatch, shape):
+    if not mhc.is_gfx95_supported():
+        pytest.skip("AITER mHC dispatch requires gfx950.")
+
     try:
-        import aiter.ops.mhc  # noqa: F401
+        import aiter.ops.mhc as aiter_mhc
     except ImportError as exc:
         pytest.skip(f"AITER mHC unavailable: {exc}")
 
@@ -71,6 +158,21 @@ def test_mhc_hip_pre_and_post_match_torch_oracles(monkeypatch, shape):
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
+
+    calls = {"pre": 0, "post": 0}
+    original_pre = aiter_mhc.mhc_pre
+    original_post = aiter_mhc.mhc_post
+
+    def tracked_pre(*args, **kwargs):
+        calls["pre"] += 1
+        return original_pre(*args, **kwargs)
+
+    def tracked_post(*args, **kwargs):
+        calls["post"] += 1
+        return original_post(*args, **kwargs)
+
+    monkeypatch.setattr(aiter_mhc, "mhc_pre", tracked_pre)
+    monkeypatch.setattr(aiter_mhc, "mhc_post", tracked_post)
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -107,36 +209,43 @@ def test_mhc_hip_pre_and_post_match_torch_oracles(monkeypatch, shape):
     else:
         layer_normed = _rms_norm(layer_input, norm_weight, rms_eps, torch.bfloat16)
 
-    ref = _mhc_pre_oracle(
-        residual, fn, scale, base, rms_eps, hc_eps, norm_weight, rms_eps
+    ref, ref_h_res, ref_h_post = _mhc_pre_oracle(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        2.0,
+        sinkhorn_iters,
+        norm_weight,
+        rms_eps,
     )
 
     torch.cuda.synchronize()
     assert torch.isfinite(layer_normed).all(), "layer_input contains NaN/Inf"
     assert torch.isfinite(ref).all(), "oracle contains NaN/Inf"
 
-    diff = layer_normed.float() - ref.float()
-    rel_rms = diff.square().mean().sqrt() / ref.float().square().mean().sqrt()
+    rel_rms = _relative_rms(layer_normed, ref)
     assert rel_rms < 0.005, f"relative RMS {rel_rms.item():.6f} >= 0.005"
 
-    assert h_res.shape == (s, hc_mult * hc_mult)
-    assert h_post.shape == (s, hc_mult)
-    assert torch.isfinite(h_res).all()
-    assert torch.isfinite(h_post).all()
+    h_res_rel_rms = _relative_rms(h_res, ref_h_res.reshape_as(h_res))
+    h_post_rel_rms = _relative_rms(h_post, ref_h_post.reshape_as(h_post))
+    assert h_res_rel_rms < 0.005
+    assert h_post_rel_rms < 0.005
+    assert calls["pre"] == 1
 
     x = torch.randn(s, hidden_size, device=device, dtype=torch.bfloat16)
     actual_post = mhc.hc_post(x, residual.view(s, -1), h_post, h_res, hc_mult)
     expected_post = mhc._mhc_post_torch(
         x,
         residual,
-        h_post.view(s, hc_mult, 1),
-        h_res.view(s, hc_mult, hc_mult),
+        ref_h_post,
+        ref_h_res,
     ).view(s, -1)
-    post_diff = actual_post.float() - expected_post.float()
-    post_rel_rms = (
-        post_diff.square().mean().sqrt() / expected_post.float().square().mean().sqrt()
-    )
+    post_rel_rms = _relative_rms(actual_post, expected_post)
     assert post_rel_rms < 0.005, f"post relative RMS {post_rel_rms.item():.6f} >= 0.005"
+    assert calls["post"] == 1
 
 
 if __name__ == "__main__":

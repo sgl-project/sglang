@@ -1852,7 +1852,7 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
-    if is_hip() or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1866,6 +1866,12 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
+    # The gfx95 HIP TileLang output-normalization path does not match the
+    # caller's RMSNorm contract. Keep its existing mHC math, but leave that
+    # normalization to MHCState just as the AITER and Torch paths do.
+    use_caller_norm = is_hip() and is_gfx95_supported()
+    native_norm_weight = None if use_caller_norm else norm_weight
+    native_norm_eps = None if use_caller_norm else norm_eps
     post_mix, comb_mix, layer_input = mhc_pre(
         residual=residual,
         fn=fn,
@@ -1876,10 +1882,10 @@ def _mhc_pre_dispatch(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
+        norm_weight=native_norm_weight,
+        norm_eps=native_norm_eps,
     )
-    return post_mix, comb_mix, layer_input, norm_weight is not None
+    return post_mix, comb_mix, layer_input, native_norm_weight is not None
 
 
 @torch._dynamo.disable
@@ -1897,7 +1903,7 @@ def _mhc_post_dispatch(
         out = torch.empty_like(residual)
         aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
         return out
-    if is_hip() or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
