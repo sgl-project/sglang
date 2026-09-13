@@ -1089,10 +1089,8 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             assert input.numel() == output.numel() * self.world_size
-            # A reduce-scatter ring sums in a different order for each receiving
-            # rank. A token can move between ranks as the batch size changes,
-            # so use the deterministic all-reduce path before selecting its shard.
-            # Clone because callers may retain input or alias output into it.
+            # Reduction order must be independent of the receiving rank.
+            # Preserve input even when all_reduce mutates its argument.
             reduced = self.all_reduce(input.clone())
             output.copy_(
                 reduced.reshape(-1)
