@@ -14,8 +14,8 @@
 """Exact FlashInfer AGMM sequence-parallel route for Llama 3.1 70B.
 
 This module intentionally supports only exact unquantized BF16 Llama 3.1 70B
-configurations: TP4 or TP8 on SM103 and an extend batch containing exactly 4096
-token rows. Decode and other row counts continue through the native Llama model
+configurations: TP8 on SM100 or SM103, or TP4 on SM103, and an extend batch
+containing exactly 4096 token rows. Decode and other row counts continue through the native Llama model
 path.
 """
 
@@ -375,8 +375,13 @@ class LlamaFlashInferAgmmTrueSP:
         if not group_name:
             raise RuntimeError("FlashInfer AGMM true-SP group has no stable name")
         device = model.layers[0].self_attn.qkv_proj.weight.device
-        if tuple(self._torch.cuda.get_device_capability(device)) != (10, 3):
-            raise RuntimeError("--enable-flashinfer-agmm-true-sp requires an SM103 GPU")
+        capability = tuple(self._torch.cuda.get_device_capability(device))
+        if capability != (10, 3) and not (
+            capability == (10, 0) and topology.tp_size == 8
+        ):
+            raise RuntimeError(
+                "--enable-flashinfer-agmm-true-sp requires SM100/SM103 TP8 or SM103 TP4"
+            )
         if str(symm_mem.get_backend(device)).upper() != "NVSHMEM":
             raise RuntimeError(
                 "--enable-flashinfer-agmm-true-sp requires the NVSHMEM backend"

@@ -233,8 +233,8 @@ class Parallel:
     enable_flashinfer_agmm_true_sp: A[
         bool,
         "Enable the exact FlashInfer all-gather-matmul sequence-parallel route "
-        "for unquantized BF16 Llama 3.1 70B on SM103 with TP4 or TP8. The route "
-        "handles 4096-row extend batches and requires --disable-cuda-graph, "
+        "for unquantized BF16 Llama 3.1 70B with TP8 on SM100/SM103 or TP4 on SM103. "
+        "The route handles 4096-row extend batches and requires --disable-cuda-graph, "
         "--disable-radix-cache, --disable-overlap-schedule, "
         "--chunked-prefill-size 4096, and --max-running-requests 1.",
     ] = False
