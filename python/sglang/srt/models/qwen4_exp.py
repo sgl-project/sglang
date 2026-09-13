@@ -1632,6 +1632,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            if i in self.layers_to_capture:
+                # Capturing before layer i runs yields the completed output of
+                # layer i - 1, mirroring the parent's
+                # layer_communicator.prepare_attn_and_capture_last_layer_outputs
+                # hook (which qwen4-exp layers deliberately drop).
+                aux_hidden_states.append(
+                    self._prepare_aux_hidden_state(layer, hidden_states, residual)
+                )
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
                 if next_ple is not None:
@@ -1643,23 +1651,50 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        if len(aux_hidden_states) != 0:
+            # Aux capture (DFlash / EAGLE3) owns the second return slot so the
+            # outer model can route it to the logits processor. The HC stream
+            # below only feeds the MTP drafter, which is never active together
+            # with aux hidden state capture.
+            return hidden_states, aux_hidden_states
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
+        return hidden_states
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+    def _prepare_aux_hidden_state(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        aux_hidden_state = hidden_states
+        if residual is not None:
+            aux_hidden_state = aux_hidden_state + residual
+        if aux_hidden_state.shape[-1] == self.hidden_size:
+            # Only the first capture edge (the embedding output feeding layer
+            # 0) is plain hidden_size wide; set_dflash_layers_to_capture
+            # shifts capture targets by +1, so this edge is unreachable in
+            # practice. Mirror _prepare_qwen4_exp_attn: tile into the
+            # hyper-connection layout before the learned mix. Mixing also
+            # avoids appending the live embedding tensor, which the parent's
+            # capture hook would have to clone (communicator.py).
+            aux_hidden_state = torch.cat(
+                [aux_hidden_state for _ in range(self.hc_count)], dim=-1
+            )
+        # Between layers the residual stream stays in the hyper-connection
+        # layout (hc_count * hidden_size) wide. Contract it back to
+        # hidden_size with the same learned gate layer i applies to its own
+        # attention input (attn_hyper_connection.mix), not a uniform
+        # hc_contract average: reviewer hardware checks showed hc_contract
+        # matches the reference hidden states at cos 0.000, while the
+        # learned mix reaches 0.23-0.89.
+        return layer.attn_hyper_connection.mix(aux_hidden_state)[0]
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -1696,8 +1731,16 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             inputs_embeds=input_embeds,
         )
         if isinstance(model_output, tuple):
-            hidden_states, self.last_hc_hidden_states = model_output
-            return hidden_states
+            hidden_states, tail = model_output
+            if isinstance(tail, torch.Tensor):
+                # Second slot carries the hyper-connection stream for the MTP
+                # drafter's future map.
+                self.last_hc_hidden_states = tail
+                return hidden_states
+            # Second slot holds the captured aux hidden states; pass the tuple
+            # through so Qwen3VLForConditionalGeneration.forward can unpack it
+            # and route it to the logits processor.
+            return model_output
         return model_output
 
 
@@ -1733,7 +1776,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def forward(self, *args, **kwargs):
         output = super().forward(*args, **kwargs)
         hc_hidden_states = self.model.last_hc_hidden_states
-        if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
+        if (
+            hc_hidden_states is not None
+            and not self.capture_aux_hidden_states
+            and isinstance(output, LogitsProcessorOutput)
+        ):
+            # With aux capture (DFlash / EAGLE3) active, output.hidden_states
+            # already carries the packed aux hidden states for the drafter;
+            # the HC stream must not clobber them.
             output.hidden_states = hc_hidden_states
         return output
 
