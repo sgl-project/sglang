@@ -115,6 +115,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    expected_load_ms: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
     # Peak of the warmup calibration probe (the default workload's full shape
@@ -146,6 +147,7 @@ class ScenarioConfig:
             expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
             expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            expected_load_ms=optional_float("expected_load_ms"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
             warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
@@ -320,6 +322,7 @@ class DiffusionTestCase:
     run_perf_check: bool = True
     # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    perf_warmup_requests: int = 0
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -332,12 +335,19 @@ class DiffusionTestCase:
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
             raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        if self.perf_warmup_requests < 0:
+            raise ValueError(f"{self.id}: perf_warmup_requests must be non-negative")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
             )
+        if (
+            self.perf_warmup_requests
+            and self.sampling_params.realtime_num_chunks is not None
+        ):
+            raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
@@ -467,6 +477,8 @@ class PerformanceSummary:
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+    denoising_stages: set[str] = field(default_factory=set)
+    load_time_ms: float | None = None
 
     @staticmethod
     def from_req_perf_record(
@@ -488,10 +500,13 @@ class PerformanceSummary:
 
         # convert from list to dict
         stage_metrics = {}
+        denoising_stages = set()
         for item in record.stages:
             if isinstance(item, dict) and "name" in item:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
+                if item.get("is_denoising", item["name"] == "DenoisingStage"):
+                    denoising_stages.add(item["name"])
 
         load_peak_vram_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
@@ -527,6 +542,7 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            denoising_stages=denoising_stages,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
             warmup_peak_vram_mb=warmup_peak_vram_mb,

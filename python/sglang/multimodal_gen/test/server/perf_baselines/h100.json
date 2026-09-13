@@ -39,6 +39,27 @@
         ]
     },
     "scenarios": {
+        "sana_wm_ti2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 7239.81,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
+        "sana_video_2b_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 2472.55,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
+        "pi05_action_http": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 21.37,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "qwen_image_t2i": {
             "stages_ms": {
                 "TextEncodingStage": 232.03,
@@ -180,17 +201,81 @@
             "estimated_full_test_time_s": 65.6
         },
         "qwen_image_t2i_2_gpus_extra_high": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
+            "notes": "H100 CI run 34695613376, job 103558583416, head 5ae9847fc7092a7c75a275556d672f7507a1f933; request 1 after server warmup. E2E also agrees with runs 34693958419 and 34687251777. Existing tolerances are unchanged.",
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 455.77,
+                "LatentPreparationStage": 0.16,
+                "TimestepPreparationStage": 18.03,
+                "DenoisingStage": 9335.7,
+                "DecodingStage": 51.15
+            },
+            "denoise_step_ms": {
+                "0": 203.41,
+                "1": 191.47,
+                "2": 188.81,
+                "3": 186.65,
+                "4": 184.78,
+                "5": 185.17,
+                "6": 190.42,
+                "7": 191.36,
+                "8": 190.9,
+                "9": 183.73,
+                "10": 187.01,
+                "11": 184.09,
+                "12": 183.56,
+                "13": 182.9,
+                "14": 182.7,
+                "15": 197.53,
+                "16": 191.23,
+                "17": 188.21,
+                "18": 186.65,
+                "19": 184.42,
+                "20": 186.86,
+                "21": 185.31,
+                "22": 185.24,
+                "23": 184.98,
+                "24": 184.09,
+                "25": 183.76,
+                "26": 183.12,
+                "27": 182.28,
+                "28": 183.34,
+                "29": 183.79,
+                "30": 182.83,
+                "31": 182.17,
+                "32": 181.26,
+                "33": 182.59,
+                "34": 182.78,
+                "35": 182.32,
+                "36": 182.42,
+                "37": 182.26,
+                "38": 182.04,
+                "39": 183.17,
+                "40": 182.72,
+                "41": 181.68,
+                "42": 187.57,
+                "43": 190.77,
+                "44": 185.43,
+                "45": 185.76,
+                "46": 190.02,
+                "47": 182.43,
+                "48": 181.89,
+                "49": 183.58
+            },
+            "expected_e2e_ms": 9878.54,
+            "expected_avg_denoise_ms": 185.67,
+            "expected_median_denoise_ms": 184.09,
+            "load_peak_vram_mb": 42026.0,
+            "runtime_peak_vram_mb": 46696.0,
+            "warmup_peak_vram_mb": 43424.0,
+            "load_peak_allocated_mb": 41798.14,
+            "runtime_peak_allocated_mb": 44854.98,
             "estimated_full_test_time_s": 54.4
         },
         "flux2_modelopt_fp8_tp2_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2089.62,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 75.4
@@ -198,7 +283,7 @@
         "joy_echo_t2v_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2469.07,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 62.8
@@ -206,7 +291,7 @@
         "ideogram4_fp8_tp2_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 8975.57,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 60.8
@@ -2764,11 +2849,36 @@
             "estimated_full_test_time_s": 186.0
         },
         "ltx_2_5_diffusion_decoder_2gpus": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
+            "stages_ms": {
+                "InputValidationStage": 0.05,
+                "TextEncodingStage": 634.13,
+                "LTX2TextConnectorStage": 317.43,
+                "LTX2DurationStage": 0.01,
+                "LTX2SigmaPreparationStage": 0.03,
+                "TimestepPreparationStage": 246.11,
+                "LTX2AVLatentPreparationStage": 0.31,
+                "LTX2ImageEncodingStage": 0.02,
+                "LTX2AVDenoisingStage": 3750.7,
+                "LTX2AVDecodingStage": 3382.33
+            },
+            "denoise_step_ms": {
+                "0": 292.65,
+                "1": 259.94,
+                "2": 256.47,
+                "3": 256.26,
+                "4": 259.62,
+                "5": 255.44,
+                "6": 258.02,
+                "7": 255.91
+            },
+            "expected_e2e_ms": 10141.6,
+            "expected_avg_denoise_ms": 261.79,
+            "expected_median_denoise_ms": 257.25,
+            "load_peak_vram_mb": 1906,
+            "runtime_peak_vram_mb": 69546,
+            "warmup_peak_vram_mb": 28396,
+            "load_peak_allocated_mb": 1876.14,
+            "runtime_peak_allocated_mb": 48399,
             "estimated_full_test_time_s": 545.1
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
@@ -2916,7 +3026,7 @@
                 "CausalVaeDecodingStage": 217.75
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 1912.29,
+            "expected_e2e_ms": 18687.61,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "load_peak_vram_mb": 42814.0,
@@ -3062,7 +3172,7 @@
         "flux_2_t2i_customized_vae_path": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 23073.55,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 574.4
@@ -3070,7 +3180,7 @@
         "wan2_2_t2v_a14b_teacache_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 82478.23,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 186.4
@@ -3078,7 +3188,7 @@
         "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 1077.99,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 52.2
@@ -3145,7 +3255,7 @@
         "mova_360p_tp2": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 58242.09,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 141.9
@@ -3182,7 +3292,7 @@
         "flux1_modelopt_fp8_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 1138.33,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 50.3
@@ -3198,7 +3308,7 @@
         "wan22_modelopt_fp8_t2v": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 7908.23,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 89.5
@@ -3238,7 +3348,7 @@
         "qwen_image_modelopt_fp8_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 3038.04,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 65.5
@@ -3246,7 +3356,7 @@
         "qwen_image_edit_modelopt_fp8_ti2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2964.8,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 73.7

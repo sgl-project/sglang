@@ -115,6 +115,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
+        perf_warmup_requests=1,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -181,6 +182,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
+            extras=[
+                "--warmup-num-frames 1",
+                "--component-residency transformer=resident",
+            ],
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
@@ -254,6 +259,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="video",
+            # the latency baseline measures the warmed, resident transformer
+            extras=["--component-residency transformer=resident"],
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
@@ -1091,6 +1098,9 @@ TWO_GPU_CASES = [
             # decoder headroom on 80 GB GPUs.
             extras=[
                 "--load-diffusion-decoder",
+                "--warmup-resolutions 768x448",
+                "--warmup-num-frames 49",
+                """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
                 "--component-residency "
                 "transformer=component-offload,text_encoder=component-offload",
             ],
@@ -1102,7 +1112,6 @@ TWO_GPU_CASES = [
             expect_audio_output=True,
             extras={"seed": 42, "use_diffusion_decoder": True},
         ),
-        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -1140,7 +1149,6 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
-        run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
