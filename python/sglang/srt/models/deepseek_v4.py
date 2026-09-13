@@ -2754,7 +2754,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
-                and 0 < x.shape[0] <= 8
+                and 0 < x.shape[0] <= 96
                 and self.hc_mult == 4
                 and x_flat.shape[1] == 20480
                 and x.dtype == norm.weight.dtype == torch.bfloat16
