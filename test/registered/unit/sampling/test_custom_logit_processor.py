@@ -104,7 +104,7 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             custom_logit_processor={
                 0: (processor, torch.tensor([True, False, True], device="cuda"))
             },
-            _custom_logit_processor_indices={
+            custom_logit_processor_row_indices={
                 0: ([0, 2], torch.tensor([0, 2], device="cuda"))
             },
             device="cuda",

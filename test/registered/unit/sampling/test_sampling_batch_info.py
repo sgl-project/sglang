@@ -468,7 +468,7 @@ class TestFilterBatch(CustomTestCase):
                         42: (processor, torch.tensor([True, False, True]))
                     },
                     custom_params=[{"value": 10}, None, {"value": 20}],
-                    _custom_logit_processor_indices=(
+                    custom_logit_processor_row_indices=(
                         {42: ([0, 2], torch.tensor([0, 2]))} if left_cached else None
                     ),
                 )
@@ -479,17 +479,17 @@ class TestFilterBatch(CustomTestCase):
                         has_custom_logit_processor=True,
                         custom_logit_processor={42: (processor, torch.tensor([True]))},
                         custom_params=[{"value": 30}],
-                        _custom_logit_processor_indices=(
+                        custom_logit_processor_row_indices=(
                             {42: ([0], torch.tensor([0]))} if right_cached else None
                         ),
                     )
                 )
                 if left_cached and right_cached:
-                    rows, indices = info._custom_logit_processor_indices[42]
+                    rows, indices = info.custom_logit_processor_row_indices[42]
                     self.assertEqual(rows, [0, 2, 3])
                     self.assertEqual(indices.tolist(), rows)
                 else:
-                    self.assertIsNone(info._custom_logit_processor_indices)
+                    self.assertIsNone(info.custom_logit_processor_row_indices)
                 for width in (1, 3):
                     logits = torch.zeros(4 * width, VOCAB_SIZE)
                     apply_custom_logit_processor(logits, info, width)
@@ -758,7 +758,7 @@ class TestFromScheduleBatch(CustomTestCase):
         key = list(info.custom_logit_processor.keys())[0]
         proc, mask = info.custom_logit_processor[key]
         self.assertIsInstance(proc, DisallowedTokensLogitsProcessor)
-        rows, indices = info._custom_logit_processor_indices[key]
+        rows, indices = info.custom_logit_processor_row_indices[key]
         self.assertEqual(rows, [0])
         self.assertEqual(indices.tolist(), rows)
         self.assertEqual(indices.dtype, torch.long)
@@ -771,7 +771,7 @@ class TestFromScheduleBatch(CustomTestCase):
             pass
 
         extended = ExtendedSamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertIsNone(extended._custom_logit_processor_indices)
+        self.assertIsNone(extended.custom_logit_processor_row_indices)
         extended_proc, extended_mask = extended.custom_logit_processor[key]
         self.assertIsInstance(extended_proc, DisallowedTokensLogitsProcessor)
         self.assertTrue(torch.equal(extended_mask, mask))

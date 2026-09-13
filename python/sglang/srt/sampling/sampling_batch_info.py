@@ -85,8 +85,7 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
-    # None uses the legacy path; an empty dict is a valid cache with no processors.
-    _custom_logit_processor_indices: Optional[
+    custom_logit_processor_row_indices: Optional[
         Dict[int, Tuple[List[int], torch.Tensor]]
     ] = None
 
@@ -225,7 +224,7 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
-            _custom_logit_processor_indices=(
+            custom_logit_processor_row_indices=(
                 processor_indices if cls is SamplingBatchInfo else None
             ),
             device=device,
@@ -396,7 +395,7 @@ class SamplingBatchInfo:
                 mask[keep_indices_device]
             )  # ignore the custom logit processor whose mask is all False
         }
-        self._filter_custom_logit_processor_indices(keep_indices)
+        self._filter_custom_logit_processor_row_indices(keep_indices)
         self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         # If the custom logit processor is an empty dict, set the flag to False,
@@ -451,7 +450,7 @@ class SamplingBatchInfo:
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
-            self._merge_custom_logit_processor_indices(other)
+            self._merge_custom_logit_processor_row_indices(other)
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
@@ -523,12 +522,14 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def _filter_custom_logit_processor_indices(self, keep_indices: List[int]) -> None:
-        if self._custom_logit_processor_indices is None:
+    def _filter_custom_logit_processor_row_indices(
+        self, keep_indices: List[int]
+    ) -> None:
+        if self.custom_logit_processor_row_indices is None:
             return
 
         indices = {}
-        for key, (rows, _) in self._custom_logit_processor_indices.items():
+        for key, (rows, _) in self.custom_logit_processor_row_indices.items():
             selected = set(rows)
             new_rows = [i for i, old in enumerate(keep_indices) if old in selected]
             if new_rows:
@@ -536,16 +537,17 @@ class SamplingBatchInfo:
                     new_rows,
                     torch.tensor(new_rows, dtype=torch.long, device=self.device),
                 )
-        self._custom_logit_processor_indices = indices
+        self.custom_logit_processor_row_indices = indices
 
-    def _merge_custom_logit_processor_indices(self, other: SamplingBatchInfo) -> None:
-        left_indices = self._custom_logit_processor_indices
-        right_indices = other._custom_logit_processor_indices
+    def _merge_custom_logit_processor_row_indices(
+        self, other: SamplingBatchInfo
+    ) -> None:
+        left_indices = self.custom_logit_processor_row_indices
+        right_indices = other.custom_logit_processor_row_indices
         if left_indices is None or right_indices is None:
-            self._custom_logit_processor_indices = None
+            self.custom_logit_processor_row_indices = None
             return
 
-        # Right-hand rows are offset by the batch size before merging temperatures.
         offset = len(self)
         indices = {}
         for key in left_indices.keys() | right_indices.keys():
@@ -556,7 +558,7 @@ class SamplingBatchInfo:
                 rows,
                 torch.tensor(rows, dtype=torch.long, device=self.device),
             )
-        self._custom_logit_processor_indices = indices
+        self.custom_logit_processor_row_indices = indices
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
