@@ -1741,7 +1741,6 @@ def init_unified_swa_pools(
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
-    unified_total_bytes: Optional[int] = None,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
@@ -1780,11 +1779,6 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    if total_bytes is not None and unified_total_bytes is not None:
-        raise ValueError("total_bytes and unified_total_bytes are mutually exclusive")
-    if total_bytes is None:
-        total_bytes = unified_total_bytes
-
     legacy_allocator_capacities = {}
     if total_bytes is None:
         if full_max_total_num_tokens is None or swa_max_total_num_tokens is None:

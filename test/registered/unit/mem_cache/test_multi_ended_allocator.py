@@ -728,7 +728,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             max_new_tokens,
             sliding_window_size=16,
             page_size=page_size,
-            include_allocated_tail=False,
+            allocation_limit=16,
         )
         reservation_swa_with_tail = estimate_swa_kv_tokens(
             extend_tokens,
