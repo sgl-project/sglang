@@ -1,7 +1,6 @@
-"""Standalone renderer completion, chat, tool-calling, and logprob parity tests.
+"""Manual standalone renderer completion, chat, tool-calling, and logprob parity tests.
 
-Run this file directly, or use unittest discovery with this directory as the
-start directory.
+Build sglang-renderer with --features http and run this file directly.
 """
 
 import json
@@ -20,7 +19,6 @@ import requests
 from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_free_port
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,9 +27,6 @@ from sglang.test.test_utils import (
     is_rust_server_built,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
-
 
 @contextmanager
 def launch_rust_renderer(model, base_url, *, timeout, engine_args=(), renderer_args=()):

@@ -61,6 +61,14 @@ The CLI defaults to sampling parameters from the model's generation config.
 `--help` for template, parser, and limit options. A custom Cargo target directory
 or compilation target changes the executable path shown above.
 
+The GPU OpenAI parity suite is manual until the renderer has its own CI binary
+provisioning. With the Rust server extension and renderer executable built, run:
+
+```sh
+SGLANG_RENDERER_BIN=rust/target/release/sglang-renderer \
+  python rust/sglang-renderer/tests/test_rust_renderer.py
+```
+
 ## Docker image
 
 Build the CPU-only renderer image from the repository root (`linux/amd64` or
