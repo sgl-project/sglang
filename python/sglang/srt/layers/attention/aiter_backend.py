@@ -345,6 +345,9 @@ class AiterAttnBackend(AttentionBackend):
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        # The DCP extend planner translates prefix ids through the backend's
+        # translator (get_attn_backend().kv_index_translator).
+        self.kv_index_translator = getattr(model_runner, "kv_index_translator", None)
         self.g_kv_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
@@ -2417,6 +2420,83 @@ class AiterAttnBackend(AttentionBackend):
     ) -> None:
         pass
 
+    def _dcp_extend_kv_layout(self, forward_batch: ForwardBatch):
+        """Per-batch (cached) kv_indptr/kv_indices over the DCP gathered
+        buffer: [all gathered prefixes, contiguous per request in position
+        order | this rank's extend tokens in batch order]. Request i attends
+        its prefix rows followed by its own extend rows."""
+        dcp_md = forward_batch.attn_dcp_metadata
+        cached = getattr(dcp_md, "_aiter_extend_layout", None)
+        if cached is not None:
+            return cached
+        prefix = forward_batch.extend_prefix_lens_cpu
+        extend = forward_batch.extend_seq_lens_cpu
+        prefix_sum = int(dcp_md.dcp_extend_prefix_lens_sum)
+        bs = len(prefix)
+        pieces = []
+        indptr = [0]
+        p0 = 0
+        e0 = prefix_sum
+        for i in range(bs):
+            pl, el = int(prefix[i]), int(extend[i])
+            if pl:
+                pieces.append(torch.arange(p0, p0 + pl, dtype=torch.int32))
+            if el:
+                pieces.append(torch.arange(e0, e0 + el, dtype=torch.int32))
+            p0 += pl
+            e0 += el
+            indptr.append(indptr[-1] + pl + el)
+        device = forward_batch.seq_lens.device
+        kv_indices = (
+            torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.int32)
+        ).to(device, non_blocking=True)
+        kv_indptr = torch.tensor(indptr, dtype=torch.int32).to(
+            device, non_blocking=True
+        )
+        kv_last_page_len = self.kv_last_page_len[:bs]
+        cached = (kv_indptr, kv_indices, kv_last_page_len)
+        dcp_md._aiter_extend_layout = cached
+        return cached
+
+    def _forward_extend_dcp_mla(
+        self, q: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
+        """Absorbed MLA extend under DCP: attend the gathered latent buffer
+        (prefix from every rank + local extend rows, filled by the model)
+        with the aiter MLA prefill kernel; no pool read, no extra copy."""
+        dcp_md = forward_batch.attn_dcp_metadata
+        kv_indptr, kv_indices, kv_last_page_len = self._dcp_extend_kv_layout(
+            forward_batch
+        )
+        n = q.shape[0]
+        if self.head_pad_mode == "zero":
+            q_in = self._zero_pad_mla_q_heads(q, layer)
+            nh = self.num_head_padded
+        else:
+            q_in = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            nh = layer.tp_q_head_num
+        o = q.new_empty((n, nh, layer.v_head_dim))
+        # mla_prefill_asm_fwd takes bf16 KV only; the gathered buffer carries
+        # the pool dtype (fp8 raw cast, scale 1.0 for K3), so up-cast per layer.
+        kv = dcp_md.dcp_kv_buffer
+        if kv.dtype != q.dtype:
+            kv = kv.to(q.dtype)
+        mla_prefill_fwd(
+            q_in,
+            kv.view(-1, 1, 1, layer.qk_head_dim),
+            o,
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            self.forward_metadata.max_q_len,
+            layer.scaling,
+            layer.logit_cap,
+        )
+        if nh != layer.tp_q_head_num:
+            o = o[:, : layer.tp_q_head_num, :].contiguous()
+        return o.view(n, layer.tp_q_head_num * layer.v_head_dim)
+
     def _forward_extend_prefix_chunk(
         self,
         q: torch.Tensor,
@@ -2538,6 +2618,16 @@ class AiterAttnBackend(AttentionBackend):
                         k_scale=k_descale,
                         v_scale=v_descale,
                     )
+                elif self.use_mla and self.dcp_size > 1:
+                    # DCP: the pool kernel resolves the owner rule on the
+                    # widened loc; k is the latent+rope row of the MQA layer.
+                    k3 = k.view(-1, 1, k.shape[-1])
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k3[..., : layer.v_head_dim],
+                        k3[..., layer.v_head_dim :],
+                    )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 elif self._use_fused_fp8_kv_write(layer):
@@ -2591,6 +2681,13 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if forward_batch.mha_return_lse:
                     return self._forward_extend_skip_prefix(q, k, v, layer)
+                if (
+                    self.dcp_size > 1
+                    and layer.qk_head_dim == kv_lora_rank + qk_rope_head_dim
+                    and forward_batch.attn_dcp_metadata is not None
+                    and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+                ):
+                    return self._forward_extend_dcp_mla(q, layer, forward_batch)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(

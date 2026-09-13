@@ -436,8 +436,13 @@ class DeepseekMHAForwardMixin:
             f"{forward_batch.num_prefix_chunks} chunks"
         )
         backend = resolve_attn_backend(forward_batch)
+        # The chunk ids from prepare_chunked_kv_indices are already DCP-local
+        # and translated; the ROCm door filters/translates again, so bypass it
+        # under DCP.
         get_mla_kv_buffer = (
-            self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
+            self._get_mla_kv_buffer_rocm
+            if _is_hip and not get_parallel().dcp_enabled
+            else self._get_mla_kv_buffer
         )
 
         # With one chunk, these indices are request-major and are described by
@@ -478,8 +483,13 @@ class DeepseekMHAForwardMixin:
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        # The chunk ids from prepare_chunked_kv_indices are already DCP-local
+        # and translated; the ROCm door filters/translates again, so bypass it
+        # under DCP.
         get_mla_kv_buffer = (
-            self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
+            self._get_mla_kv_buffer_rocm
+            if _is_hip and not get_parallel().dcp_enabled
+            else self._get_mla_kv_buffer
         )
 
         # If the complete prefix fits the capacity, gather/project/pack once.

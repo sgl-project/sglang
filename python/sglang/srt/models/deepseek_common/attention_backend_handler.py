@@ -1,3 +1,4 @@
+import os
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -193,6 +194,20 @@ def handle_attention_aiter(attn, forward_batch):
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
+    # DCP: prefix-bearing extends take the chunked-KV MHA path, whose chunk
+    # index builder and per-chunk all-gather are DCP-aware and whose aiter
+    # kernels attend caller-provided K/V (no sharded-pool read); one-shot MHA
+    # re-reads the pool inside the backend. The absorbed path over the
+    # gathered latent buffer (16 padded heads x 1088 dims) is ~4x the
+    # attention FLOPs; keep it opt-in for experiments.
+    if (
+        get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and _get_sum_extend_prefix_lens(forward_batch) > 0
+    ):
+        if os.environ.get("SGLANG_K3_DCP_PREFILL_ABSORBED", "0") == "1":
+            return _dispatch_mla_subtype(attn, forward_batch)
+        return AttnForwardMethod.MHA_CHUNKED_KV
     if forward_batch.forward_mode.is_extend_without_speculative():
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
