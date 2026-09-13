@@ -92,9 +92,7 @@ def _get_flashinfer_trtllm_moe_allreduce_api(comm):
 
 
 def _cake_moe_allreduce_topology_supported(device_sm: int, world_size: int) -> bool:
-    return (device_sm in (100, 103) and world_size == 4) or (
-        device_sm == 100 and world_size == 8
-    )
+    return device_sm in (100, 103) and world_size in (4, 8)
 
 
 def _cake_moe_allreduce_lamport_workspace_supported(
