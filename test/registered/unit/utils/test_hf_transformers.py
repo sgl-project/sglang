@@ -4,16 +4,26 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import copy
 import inspect
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from transformers import PretrainedConfig
 from transformers.image_processing_utils import BaseImageProcessor
 
+import sglang.srt.utils.hf_transformers.config as config_utils
 import sglang.srt.utils.hf_transformers.processor as processor_utils
+from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.speculators import normalize_speculators_dspark_config
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    parse_dspark_draft_config,
+    resolve_runtime_config,
+)
 from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
@@ -27,11 +37,320 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
+from sglang.srt.utils.hf_transformers.config import get_config
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+
+
+class TestSpeculatorsDsparkConfig(CustomTestCase):
+    @staticmethod
+    def _raw_config():
+        # Small synthetic decoder, with the published GLM DSpark window/layer
+        # convention. Target feature count and draft depth are independent;
+        # Qwen3 also permits an explicit head_dim != hidden_size / head count.
+        return {
+            "architectures": ["DSparkDraftModel"],
+            "auto_map": {"": "config.DSparkSpeculatorConfig"},
+            "speculators_model_type": "dspark",
+            "dtype": "bfloat16",
+            "block_size": 8,
+            "aux_hidden_state_layer_ids": [8, 23, 39, 55, 70],
+            "draft_vocab_size": 128,
+            "mask_token_id": 127,
+            "markov_rank": 4,
+            "markov_head_type": "vanilla",
+            "enable_confidence_head": True,
+            "confidence_head_with_markov": True,
+            "target_hidden_size": None,
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "vocab_size": 128,
+                "max_position_embeddings": 128,
+                "rope_parameters": {
+                    "rope_theta": 8000000,
+                    "rope_type": "default",
+                },
+                "layer_types": ["full_attention"] * 3,
+                "tie_word_embeddings": False,
+            },
+        }
+
+    def _load_local_config(self, raw):
+        with tempfile.TemporaryDirectory() as model_dir:
+            config_path = Path(model_dir) / "config.json"
+            original = json.dumps(raw)
+            config_path.write_text(original)
+            config = get_config(
+                model_dir,
+                trust_remote_code=False,
+                model_config_parser="hf",
+                local_files_only=True,
+            )
+            self.assertEqual(config_path.read_text(), original)
+            return config
+
+    def test_raw_checkpoint_reaches_dspark_runtime_with_capture_convention(self):
+        """A nested decoder previously had no HF model_type and failed to load;
+        merely flattening it must not leave target capture shifted by one.
+        """
+        raw = self._raw_config()
+        config = self._load_local_config(raw)
+        draft = parse_dspark_draft_config(draft_hf_config=config)
+        runtime = resolve_runtime_config(
+            draft_hf_config=config,
+            speculative_num_draft_tokens=None,
+            target_vocab_size=128,
+        )
+
+        self.assertEqual(config.architectures, ["DSparkDraftModel"])
+        self.assertEqual(config.model_type, "qwen3")
+        self.assertEqual(config.hidden_size, 32)
+        self.assertEqual(config.head_dim, 32)
+        self.assertEqual(get_rope_config(config)[0], 8000000)
+        self.assertIn(str(config.dtype), ("bfloat16", "torch.bfloat16"))
+        self.assertEqual(draft.num_hidden_layers, 3)
+        self.assertEqual(draft.target_layer_ids, [7, 22, 38, 54, 69])
+        self.assertEqual((draft.markov_rank, draft.markov_head_type), (4, "vanilla"))
+        self.assertEqual((runtime.gamma, runtime.verify_num_draft_tokens), (8, 9))
+        self.assertEqual(runtime.mask_token_id, 127)
+        self.assertTrue(config.enable_confidence_head)
+        self.assertTrue(config.confidence_head_with_markov)
+        self.assertEqual(
+            config.layer_types, raw["transformer_layer_config"]["layer_types"]
+        )
+        # Saving the translated HF config retains both canonical and native
+        # IDs; reloading it must not apply the offset to the native IDs again.
+        reloaded = self._load_local_config(config.to_dict())
+        self.assertEqual(reloaded.target_layer_ids, [7, 22, 38, 54, 69])
+
+    def test_conflicts_and_invalid_capture_ids_fail_before_loading(self):
+        """Competing aliases must not silently override trained tensor or layer
+        semantics; bool/float IDs must not be truncated into valid layer IDs.
+        """
+        overrides = [
+            {"hidden_size": 64},
+            {"target_layer_ids": [8, 23, 39, 55, 70]},
+            {"dflash_config": {"block_size": 9}},
+            {"dspark_target_layer_ids": [0]},
+            {"aux_hidden_state_layer_ids": []},
+            {"aux_hidden_state_layer_ids": [0, 2]},
+            {"aux_hidden_state_layer_ids": [True, 2]},
+            {"aux_hidden_state_layer_ids": [1.5, 2]},
+            {"aux_hidden_state_layer_ids": [2, 2]},
+            {"aux_hidden_state_layer_ids": [5, 2]},
+            {"mask_token_id": -1},
+            {"draft_vocab_size": 64},
+            {"target_hidden_size": 64},
+        ]
+        for override in overrides:
+            with self.subTest(override=override):
+                raw = self._raw_config()
+                raw.update(override)
+                with self.assertRaises(ValueError):
+                    normalize_speculators_dspark_config(raw)
+
+    def test_normalization_preserves_source_and_does_not_shift_ids_twice(self):
+        """Retained canonical IDs must not trigger another -1 on reload, and
+        editing an in-memory normalized config must not rewrite its source.
+        """
+        raw = self._raw_config()
+        raw.pop("speculators_model_type")
+        raw["aux_hidden_state_layer_ids"] = [2, 5]
+        raw["target_hidden_size"] = 32
+        original = copy.deepcopy(raw)
+
+        normalized = normalize_speculators_dspark_config(raw)
+        self.assertEqual(normalized["target_layer_ids"], [1, 4])
+        self.assertIsNone(normalize_speculators_dspark_config(normalized))
+        self.assertEqual(raw, original)
+
+        normalized["layer_types"][0] = "changed"
+        normalized["aux_hidden_state_layer_ids"][0] = 99
+        self.assertEqual(raw, original)
+
+    def test_null_nested_aliases_preserve_canonical_runtime_values(self):
+        """Optional null aliases must not hide capture IDs or runtime settings
+        in readers that use dict.get(key, canonical_value).
+        """
+        for section, name in (
+            ("dflash_config", "target_layer_ids"),
+            ("dflash_config", "block_size"),
+            ("dspark_config", "mask_token_id"),
+            ("dspark_config", "markov_rank"),
+            ("dspark_config", "markov_head_type"),
+        ):
+            with self.subTest(section=section, name=name):
+                raw = self._raw_config()
+                raw[section] = {name: None}
+                original = copy.deepcopy(raw)
+
+                normalized = normalize_speculators_dspark_config(raw)
+                self.assertNotIn(name, normalized[section])
+                self.assertEqual(raw, original)
+
+                config = self._load_local_config(raw)
+                reloaded = self._load_local_config(config.to_dict())
+                for loaded in (config, reloaded):
+                    draft = parse_dspark_draft_config(draft_hf_config=loaded)
+                    runtime = resolve_runtime_config(
+                        draft_hf_config=loaded,
+                        speculative_num_draft_tokens=None,
+                        target_vocab_size=128,
+                    )
+                    self.assertEqual(draft.target_layer_ids, [7, 22, 38, 54, 69])
+                    self.assertEqual(draft.markov_rank, 4)
+                    self.assertEqual(draft.markov_head_type, "vanilla")
+                    self.assertEqual(runtime.gamma, 8)
+                    self.assertEqual(runtime.verify_num_draft_tokens, 9)
+                    self.assertEqual(runtime.mask_token_id, 127)
+
+    def test_native_hf_and_flat_dspark_keep_their_existing_contract(self):
+        """The new nested-schema reader must not hijack ordinary HF configs or
+        subtract one from already-native DSpark target_layer_ids.
+        """
+        native = self._raw_config()["transformer_layer_config"]
+        native["architectures"] = ["Qwen3ForCausalLM"]
+        flat = self._raw_config()
+        flat.update(flat.pop("transformer_layer_config"))
+        flat.pop("aux_hidden_state_layer_ids")
+        flat["target_layer_ids"] = [4, 1]
+
+        for raw in (native, flat):
+            with self.subTest(architecture=raw["architectures"]):
+                original = copy.deepcopy(raw)
+                self.assertIsNone(normalize_speculators_dspark_config(raw))
+                self.assertEqual(raw, original)
+                config = self._load_local_config(raw)
+                self.assertEqual(config.architectures, raw["architectures"])
+                self.assertEqual(config.num_hidden_layers, 3)
+                self.assertEqual(config.head_dim, 32)
+                if raw is flat:
+                    draft = parse_dspark_draft_config(draft_hf_config=config)
+                    self.assertEqual(draft.target_layer_ids, [4, 1])
+                    self.assertEqual(draft.gamma, 8)
+
+    def test_other_architectures_keep_native_config_loading_with_nested_metadata(self):
+        """The nested field name alone must not activate DSpark conversion.
+
+        Calls still use the real HF loader; the spy records forwarded options
+        without supplying a replacement configuration.
+        """
+        for model_type, architecture in (
+            ("llama", "LlamaForCausalLM"),
+            ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+            ("qwen3", "Qwen3ForCausalLM"),
+        ):
+            for nested in (None, {"model_type": "other", "hidden_size": 999}):
+                with self.subTest(architecture=architecture, nested=nested):
+                    raw = self._raw_config()["transformer_layer_config"]
+                    raw.update(
+                        model_type=model_type,
+                        architectures=[architecture],
+                        transformer_layer_config=nested,
+                        speculators_model_type="other",
+                    )
+                    original = copy.deepcopy(raw)
+                    self.assertIsNone(normalize_speculators_dspark_config(raw))
+                    self.assertEqual(raw, original)
+
+                    with tempfile.TemporaryDirectory() as model_dir:
+                        config_path = Path(model_dir) / "config.json"
+                        contents = json.dumps(raw)
+                        config_path.write_text(contents)
+                        with patch.object(
+                            config_utils.AutoConfig,
+                            "from_pretrained",
+                            wraps=config_utils.AutoConfig.from_pretrained,
+                        ) as load:
+                            config = get_config(
+                                model_dir,
+                                trust_remote_code=False,
+                                revision="local-revision",
+                                model_config_parser="hf",
+                                local_files_only=True,
+                                max_position_embeddings=256,
+                            )
+                        load.assert_called_once_with(
+                            model_dir,
+                            trust_remote_code=False,
+                            revision="local-revision",
+                            local_files_only=True,
+                            max_position_embeddings=256,
+                        )
+                        self.assertEqual(config_path.read_text(), contents)
+                    self.assertEqual(config.model_type, model_type)
+                    self.assertEqual(config.architectures, [architecture])
+                    self.assertEqual(config.transformer_layer_config, nested)
+                    self.assertEqual(config.speculators_model_type, "other")
+                    self.assertEqual(config.hidden_size, 32)
+                    self.assertEqual(config.max_position_embeddings, 256)
+
+    def test_longcat_keeps_its_existing_config_dispatch_with_nested_metadata(self):
+        """Adding a DSpark reader must retain Longcat's custom HF dispatch."""
+        for architecture in (
+            "LongcatCausalLM",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashNgramForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
+                raw = {
+                    "architectures": [architecture],
+                    "model_type": "longcat_flash",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 3,
+                    "transformer_layer_config": {"format": "unrelated"},
+                }
+                with tempfile.TemporaryDirectory() as model_dir:
+                    config_path = Path(model_dir) / "config.json"
+                    contents = json.dumps(raw)
+                    config_path.write_text(contents)
+                    with (
+                        patch.object(
+                            LongcatFlashConfig,
+                            "from_pretrained",
+                            wraps=LongcatFlashConfig.from_pretrained,
+                        ) as load,
+                        patch.object(
+                            config_utils.AutoConfig,
+                            "from_pretrained",
+                            wraps=config_utils.AutoConfig.from_pretrained,
+                        ) as auto_load,
+                    ):
+                        config = get_config(
+                            model_dir,
+                            trust_remote_code=False,
+                            revision="local-revision",
+                            model_config_parser="hf",
+                            local_files_only=True,
+                        )
+                    # The parser also reloads registered configs later. Check
+                    # the first dispatch, without changing that existing flow.
+                    self.assertEqual(load.call_args_list[0].args, (model_dir,))
+                    self.assertEqual(
+                        load.call_args_list[0].kwargs,
+                        {"revision": "local-revision", "local_files_only": True},
+                    )
+                    auto_load.assert_not_called()
+                    self.assertEqual(config_path.read_text(), contents)
+                self.assertIsInstance(config, LongcatFlashConfig)
+                # The existing parser canonicalizes all three Longcat names.
+                self.assertEqual(config.architectures, ["LongcatFlashForCausalLM"])
+                self.assertEqual(config.model_type, "longcat_flash")
+                self.assertEqual(config.hidden_size, 32)
+                self.assertEqual(config.num_hidden_layers, 3)
+                self.assertEqual(
+                    config.transformer_layer_config, raw["transformer_layer_config"]
+                )
 
 
 # ---------------------------------------------------------------------------
