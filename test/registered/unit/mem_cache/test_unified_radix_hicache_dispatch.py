@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
@@ -33,6 +37,55 @@ MAMBA = ComponentType.MAMBA
 
 
 class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
+    def test_storage_query_probes_all_registered_sidecar_pools(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = object.__new__(UnifiedRadixCache)
+        cache.sidecar_pool_specs = [
+            SidecarPoolSpec(PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+            SidecarPoolSpec(PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+            SidecarPoolSpec(PoolName.DEEPSEEK_V4_C128, PoolName.KV),
+            SidecarPoolSpec(
+                PoolName.DEEPSEEK_V4_C4_STATE,
+                PoolName.SWA,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+
+        # The existence probe moves no data: no indices, no component
+        # sources, no node state -- every registered pool participates and
+        # batch_exists_v2 derives its keys from the page hashes.
+        transfers = cache._build_storage_query_transfers()
+
+        self.assertEqual(
+            [transfer.name for transfer in transfers],
+            [
+                PoolName.DEEPSEEK_V4_C4,
+                PoolName.DEEPSEEK_V4_C4_INDEXER,
+                PoolName.DEEPSEEK_V4_C128,
+                PoolName.DEEPSEEK_V4_C4_STATE,
+            ],
+        )
+        self.assertIsNone(transfers[0].host_indices)
+        self.assertIsNone(transfers[0].keys)
+        # State sidecars must join the query: their trailing-window objects
+        # are required for the prefix to be restorable.
+        self.assertEqual(
+            transfers[-1].hit_policy,
+            PoolHitPolicy.TRAILING_PAGES,
+        )
+        self.assertIsNone(transfers[-1].keys)
+
+    def test_storage_query_empty_spec_list(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # A plain single-pool model has no sidecars: the query falls back to
+        # the legacy KV-only existence check (pool_transfers=None).
+        cache = object.__new__(UnifiedRadixCache)
+        cache.sidecar_pool_specs = []
+
+        self.assertEqual(cache._build_storage_query_transfers(), [])
+
     def test_strategy_registry_ordering(self):
         order = [type(s) for s in _STRATEGIES]
         # DeepSeekV4 inherits from SWAKVPool, so it must resolve before _SwaStrategy.
