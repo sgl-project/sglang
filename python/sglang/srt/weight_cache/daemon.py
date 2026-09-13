@@ -42,7 +42,7 @@ import os
 import signal
 import socket
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -67,6 +67,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    is_pid_alive,
     recv_msg,
     send_msg,
 )
@@ -188,6 +189,18 @@ class WeightCacheDaemon:
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
+        # Runtime counters surfaced by the `status` request (monitoring only).
+        self._started_at = time.time()
+        self._loaded_at: Optional[float] = None
+        self._load_seconds: Optional[float] = None
+        self._serve_count = 0  # successful fetch_state responses ("hit")
+        self._mismatch_count = 0  # fetch_state rejected on CacheConfig mismatch
+        self._last_served_at: Optional[float] = None
+        # Client-reported engine PIDs, pruned of dead ones at each snapshot.
+        # Best-effort: PID reuse or a client in another PID namespace can make
+        # os.kill(pid, 0) vouch for an unrelated process.
+        self._served_client_pids: Set[int] = set()
+
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
 
@@ -255,6 +268,7 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        load_tic = time.perf_counter()
         # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
         # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
         # instead of dying deep inside the export with an opaque error.
@@ -390,10 +404,13 @@ class WeightCacheDaemon:
         # Export all parameters and buffers as IPC handles
         self._export_state()
 
+        self._load_seconds = time.perf_counter() - load_tic
+        self._loaded_at = time.time()
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors as IPC handles in "
+            f"{self._load_seconds:.2f}s total. Ready to serve."
         )
 
     @staticmethod
@@ -573,6 +590,7 @@ class WeightCacheDaemon:
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
                     f"Config mismatch: {mismatches}"
                 )
+                self._mismatch_count += 1
                 send_msg(
                     conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
                 )
@@ -593,9 +611,18 @@ class WeightCacheDaemon:
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
+            self._serve_count += 1
+            self._last_served_at = time.time()
+            client_pid = req.get("client_pid")
+            if isinstance(client_pid, int) and client_pid > 0:
+                self._served_client_pids.add(client_pid)
 
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
+
+        elif req.get("type") == "status":
+            # Read-only monitoring snapshot; safe to poll frequently.
+            send_msg(conn, self._status_snapshot())
 
         else:
             send_msg(
@@ -605,6 +632,35 @@ class WeightCacheDaemon:
                     "message": f"Unknown request type: {req.get('type')}",
                 },
             )
+
+    def _status_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        self._served_client_pids = {
+            pid for pid in self._served_client_pids if is_pid_alive(pid)
+        }
+        live_client_pids = sorted(self._served_client_pids)
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "gpu_id": self.gpu_id,
+            "socket_path": self.socket_path,
+            "ready_path": self.ready_path,
+            "config": self.config.to_dict() if self.config else None,
+            "transport_backend": (
+                self.transport_backend.name if self.transport_backend else None
+            ),
+            "num_tensors": len(self.state_entries),
+            "preloaded_weights_bytes": self.preloaded_weights_bytes,
+            "started_at": self._started_at,
+            "loaded_at": self._loaded_at,
+            "load_seconds": self._load_seconds,
+            "uptime_seconds": now - self._started_at,
+            "serve_count": self._serve_count,
+            "mismatch_count": self._mismatch_count,
+            "last_served_at": self._last_served_at,
+            "live_client_count": len(live_client_pids),
+            "live_client_pids": live_client_pids,
+        }
 
     def shutdown(self):
         """Release GPU memory and clean up."""
