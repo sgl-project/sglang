@@ -10,9 +10,11 @@ Two capture-trace modes plus their precedence:
   * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
     profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
     knobs (record_shapes / with_stack / with_flops / profile_memory) and an
-    ``on_trace_ready`` hook that writes one trace per batch size to
+    ``on_trace_ready`` hook that writes one trace per captured graph to
     ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` named
-    ``{runner_name}_bs_{bs}_rank{rank}.json.gz``.
+    ``{runner_name}_bs_{bs}_rank{rank}.json.gz``, with the stream group and the
+    LoRA / attention variant appended when a bs bucket captures more than one
+    graph.
   * **Precedence**: when both env vars are set, the original single-trace path
     wins (no per-bs schedule / dir / bookkeeping).
 
@@ -85,12 +87,11 @@ class TestInitProfileBatchMode(CustomTestCase):
             self._invoke(capture_bs=[1, 2, 4], profiler_dir=tmp)
             self.assertTrue(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
 
-    def test_primes_reversed_bs_list_and_zero_index(self):
+    def test_primes_empty_trace_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
-            # Capture iterates large -> small, so the bs list is reversed.
-            self.assertEqual(fake_self._profile_bs_list, [8, 4, 2, 1])
-            self.assertEqual(fake_self._profile_bs_idx, 0)
+            # The capture loop names each graph as it reaches it.
+            self.assertIsNone(fake_self._profile_trace_label)
 
     def test_profiler_built_with_trace_export_knobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,7 +165,7 @@ class TestInitProfileOriginalMode(CustomTestCase):
             self.assertIsNone(kwargs.get("on_trace_ready"))
             mock_schedule.assert_not_called()
             self.assertFalse(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
-            self.assertFalse(hasattr(fake_self, "_profile_bs_list"))
+            self.assertFalse(hasattr(fake_self, "_profile_trace_label"))
 
     def test_no_flags(self):
         self._invoke_original(env={})
@@ -195,9 +196,15 @@ class TestOnTraceReadyNaming(CustomTestCase):
             os.environ.pop(_CAPTURE_TRACE, None)
             DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
+        # The capture loop owns the label, and _set_profile_trace_label keys off
+        # _profiler to tell the scheduled per-bs profiler from the original pass.
+        fake_self._profiler = mock_profile.return_value
+        fake_self._set_profile_trace_label = (
+            DecodeCudaGraphRunner._set_profile_trace_label.__get__(fake_self)
+        )
         return fake_self, on_trace_ready
 
-    def test_exports_one_named_trace_per_bs_and_advances_index(self):
+    def test_exports_one_named_trace_per_bs(self):
         with tempfile.TemporaryDirectory() as tmp:
             capture_bs = [1, 2, 4]  # reversed -> [4, 2, 1]
             fake_self, on_trace_ready = self._build_on_trace_ready(
@@ -208,6 +215,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
 
             exported = []
             for expected_bs in [4, 2, 1]:
+                fake_self._set_profile_trace_label(bs=expected_bs)
                 prof = mock.Mock()
                 prof.export_chrome_trace.side_effect = lambda p: exported.append(p)
                 on_trace_ready(prof)
@@ -223,8 +231,79 @@ class TestOnTraceReadyNaming(CustomTestCase):
                     os.path.join(trace_dir, f"{runner}_bs_1_rank0.json.gz"),
                 ],
             )
-            # Index advanced once per flush.
-            self.assertEqual(fake_self._profile_bs_idx, 3)
+
+    def test_variant_graphs_get_one_trace_each(self):
+        # A bs bucket that captures LoRA / no-LoRA and two attention variants
+        # flushes the profiler four times, so the name cannot come from the bs
+        # sequence: it used to mislabel the extra flushes and then run off the
+        # end of the bs list.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_self, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[2, 4], rank=0, tmp=tmp
+            )
+            trace_dir = os.path.join(tmp, "graph_capture_profile")
+            runner = type(fake_self).__name__
+
+            exported = []
+            for bs in [4, 2]:
+                for variant_label in ["lora", "nolora"]:
+                    for attention_variant in ["dense", "sparse"]:
+                        fake_self._set_profile_trace_label(
+                            bs=bs,
+                            variant_label=variant_label,
+                            attention_variant=attention_variant,
+                        )
+                        prof = mock.Mock()
+                        prof.export_chrome_trace.side_effect = lambda p: (
+                            exported.append(p)
+                        )
+                        on_trace_ready(prof)
+
+            expected = [
+                os.path.join(trace_dir, f"{runner}_bs_{bs}_{lora}_{dsa}_rank0.json.gz")
+                for bs in [4, 2]
+                for lora in ["lora", "nolora"]
+                for dsa in ["dense", "sparse"]
+            ]
+            self.assertEqual(exported, expected)
+            self.assertEqual(len(set(exported)), len(expected))
+
+    def test_stream_group_in_trace_filename(self):
+        # PDMUX repeats the whole bs sweep per stream group, which would
+        # otherwise have every group overwrite the first group's traces.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_self, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[8], rank=0, tmp=tmp
+            )
+            runner = type(fake_self).__name__
+
+            exported = []
+            for stream_idx in [0, 1]:
+                fake_self._set_profile_trace_label(bs=8, stream_idx=stream_idx)
+                prof = mock.Mock()
+                prof.export_chrome_trace.side_effect = lambda p: exported.append(p)
+                on_trace_ready(prof)
+
+            self.assertEqual(
+                exported,
+                [
+                    os.path.join(
+                        tmp,
+                        "graph_capture_profile",
+                        f"{runner}_bs_8_stream_{i}_rank0.json.gz",
+                    )
+                    for i in [0, 1]
+                ],
+            )
+
+    def test_flush_without_a_captured_graph_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[8], rank=0, tmp=tmp
+            )
+            prof = mock.Mock()
+            on_trace_ready(prof)
+            prof.export_chrome_trace.assert_not_called()
 
     def test_rank_in_trace_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +311,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 capture_bs=[8], rank=3, tmp=tmp
             )
             runner = type(fake_self).__name__
+            fake_self._set_profile_trace_label(bs=8)
             prof = mock.Mock()
             on_trace_ready(prof)
             prof.export_chrome_trace.assert_called_once_with(

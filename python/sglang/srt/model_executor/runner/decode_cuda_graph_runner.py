@@ -767,18 +767,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
-            # Track which BS is currently being captured for trace file naming
-            self._profile_bs_list = list(reversed(self.capture_bs))
-            self._profile_bs_idx = 0
+            # Names the trace of the graph currently being captured. The capture
+            # loop sets it per graph rather than the callback walking the bs
+            # sequence, because a bs bucket can capture more than one graph.
+            self._profile_trace_label = None
 
             def on_trace_ready(prof):
-                bs = self._profile_bs_list[self._profile_bs_idx]
+                label = self._profile_trace_label
+                if label is None:
+                    # Flushed outside a capture, so there is no graph to name.
+                    return
                 trace_file = os.path.join(
-                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                    trace_dir, f"{runner_name}_{label}_rank{rank}.json.gz"
                 )
                 prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for bs={bs} to {trace_file}")
-                self._profile_bs_idx += 1
+                logger.info(f"Saved trace for {label} to {trace_file}")
 
             profile_context = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -803,6 +806,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         torch.cuda.memory._record_memory_history()
         return profile_context
+
+    def _set_profile_trace_label(
+        self,
+        bs: int,
+        stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
+    ) -> None:
+        """Name the per-bs capture trace after the graph about to be captured.
+
+        A bs bucket can capture several graphs -- LoRA / no-LoRA, and one per
+        attention graph variant -- and PDMUX repeats the whole sweep per stream
+        group, so the profiler flushes more often than there are bs values.
+        Keep ``bs_{bs}`` as the leading component so the file name is unchanged
+        when a bucket captures a single graph.
+        """
+        if getattr(self, "_profiler", None) is None:
+            return
+        parts = [f"bs_{bs}"]
+        if stream_idx is not None:
+            parts.append(f"stream_{stream_idx}")
+        if variant_label is not None:
+            parts.append(variant_label)
+        if attention_variant is not None:
+            parts.append(attention_variant)
+        self._profile_trace_label = "_".join(parts)
 
     def _post_process_after_profile(self, prof_context):
         torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
@@ -1093,6 +1122,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
+                    self._set_profile_trace_label(
+                        bs=bs,
+                        stream_idx=stream_idx,
+                        variant_label=variant_label,
+                        attention_variant=attention_variant,
+                    )
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
