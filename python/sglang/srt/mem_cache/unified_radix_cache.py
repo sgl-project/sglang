@@ -1483,7 +1483,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller._l2_load_transfers(
                 load_host, load_device, load_pools
             ),
-            layer_num=self.cache_controller.layer_num,
+            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         completion.finish_event.synchronize()
         self.retraction_discard(backup)
