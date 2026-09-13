@@ -298,9 +298,7 @@ class SchedulerPoolStatsObserver:
         if supports_swa_byte_budget(allocator):
             full_capacity = allocator.current_full_capacity
             swa_capacity = allocator.current_swa_capacity
-            full_available_size = allocator.full_available_size()
-            swa_available_size = allocator.swa_available_size()
-        elif isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # The tri-pool reports static capacities paired with conserve views.
             full_available_size = allocator.conserve_full_available_size()
             swa_available_size = allocator.conserve_swa_available_size()

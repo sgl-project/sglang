@@ -169,7 +169,8 @@ def evict_from_tree_cache(
             supports_swa_byte_budget,
         )
 
-        if supports_swa_byte_budget(allocator):
+        is_unified_swa = supports_swa_byte_budget(allocator)
+        if is_unified_swa:
             reclaim_plan = allocator.reclaim_plan(
                 num_tokens,
                 required_swa,
@@ -179,23 +180,17 @@ def evict_from_tree_cache(
             if reclaim_plan is None:
                 return
             full_num_tokens, swa_num_tokens = reclaim_plan
-            if full_num_tokens or swa_num_tokens:
-                tree_cache.evict_for_alloc(
-                    EvictParams(
-                        num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens
-                    )
-                )
-            # Realize any compaction assumed by the reclaim plan before callers
-            # inspect availability.
-            allocator.ensure_capacity(num_tokens, required_swa)
-            return
-
-        full_num_tokens = max(0, num_tokens - allocator.full_available_size())
-        swa_num_tokens = max(0, required_swa - allocator.swa_available_size())
+        else:
+            full_num_tokens = max(0, num_tokens - allocator.full_available_size())
+            swa_num_tokens = max(0, required_swa - allocator.swa_available_size())
         if full_num_tokens or swa_num_tokens:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
+        if is_unified_swa:
+            # Even a zero-reclaim plan can depend on compaction before callers
+            # inspect availability.
+            allocator.ensure_capacity(num_tokens, required_swa)
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
