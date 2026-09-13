@@ -49,11 +49,6 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.kernels.ops.attention.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
-
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
@@ -1254,7 +1249,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-    ):
+        # Returns (output, lse) with lse in [total_q, num_heads].
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        lse_out = None
+        # Bound in __init__ so a subclass can substitute a different FA4 build.
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+        flash_attn_varlen_func = self.flash_attn_varlen_func
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         cp_active = is_cp_active(forward_batch)
@@ -1534,7 +1535,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
@@ -1594,6 +1595,8 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+            elif return_lse:
+                o, lse_out, *_ = result
             else:
                 o = result
         else:
@@ -1794,7 +1797,12 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            assert lse_out is not None
+            # The varlen kernel emits LSE head-major [num_heads, total_q].
+            return o, lse_out.transpose(0, 1).contiguous()
+        return o
 
     def forward_decode(
         self,
@@ -1815,7 +1823,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-    ) -> torch.Tensor:
+        # Returns (output, lse) with lse in [total_q, num_heads].
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        lse_out = None
+        # Bound in __init__ so a subclass can substitute a different FA4 build.
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+        flash_attn_varlen_func = self.flash_attn_varlen_func
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if k is not None:
@@ -2016,7 +2030,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=(
                         self.decode_num_splits
                         if not is_swa_layer
@@ -2061,6 +2075,8 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
+                elif return_lse:
+                    o, lse_out, *_ = result
                 else:
                     o = result
         else:
@@ -2139,7 +2155,12 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            assert lse_out is not None
+            # The varlen kernel emits LSE head-major [num_heads, total_q].
+            return o, lse_out.transpose(0, 1).contiguous()
+        return o
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
