@@ -802,17 +802,20 @@ latency.
 
 ## 7. VDN-H3: hybrid attention, 8-step distill
 
+[Video DeltaNet](https://openvdn.github.io/) (VDN) is a hybrid attention
+architecture that approaches the speed of linear attention while maintaining
+near-lossless quality. It splits the video-video attention into two
+complementary branches: a sliding-window softmax branch for local frame pairs
+(five consecutive latent frames form a chunk, and each chunk attends to
+itself, the previous chunk, and the following chunk; the first and last
+frames, text and audio stay dense) and a bidirectional linear branch, Video
+Delta Attention, for long-range context.
 [OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
-([openvdn.github.io](https://openvdn.github.io/)) is MiniMax-H3 with every
-DiT block's dense self-attention replaced by a hybrid: an exact, gated softmax
-over a local frame window (chunk 5, radius 1; the first and last frames, text
-and audio stay dense) plus a frame-wise linear-attention branch (the Video
-Delta rule, scanned forward and backward) for everything outside the window.
-The released `stage-dmd-step-250` checkpoint is an 8-step DMD2 distill: a
-4.3 GB linear branch and two small LoRA adapters on the unchanged H3 backbone.
-It is the FL2VA partition, so it serves `t2va` and `fl2va` (first, last, or
-both keyframes); `ref2va` is rejected. The weights inherit the MiniMax-H3
-Community License.
+applies it to MiniMax-H3: the released `stage-dmd-step-250` checkpoint adds a
+4.3 GB linear branch and OpenVDN's own 8-step DMD2 LoRA on the unchanged H3
+backbone. It is the FL2VA partition, so it serves `t2va` and `fl2va` (first,
+last, or both keyframes); `ref2va` is rejected. The weights inherit the
+MiniMax-H3 Community License.
 
 Pass the repository directly to `--model-path`. On first launch a registered
 overlay prefuses both adapters into the transformer weights (a 62 GB write)
@@ -1518,11 +1521,11 @@ peak memory.
 An 8× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
 on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
 102 latent frames, about 104k packed rows), `task: "t2va"`,
-`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`
-with the decomposed window kernel, eager, and the warmup run at the served
-clip shape (`--warmup-num-frames 345 --warmup-resolutions 1344x768`), so
-every forward of the served request is steady state; without those flags the
-first forward pays about 3 s of allocator growth and kernel setup. "Steady
+`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`,
+eager, and the warmup run at the served clip shape
+(`--warmup-num-frames 345 --warmup-resolutions 1344x768`), so every forward
+of the served request is steady state; without those flags the first forward
+pays 2 to 3 s of allocator growth and kernel setup. "Steady
 s/NFE" is the mean of forwards 2 to 8. The OpenVDN reference rows ran the released
 inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
 and the same clip length, with its Ulysses layout (`parallel.softmax_ranks`)
