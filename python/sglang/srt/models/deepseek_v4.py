@@ -2322,6 +2322,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._post_attention_layernorm_weight_bf16 = (
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
+        # Rebuilt after weight loading, like the norm cache above. Keep the
+        # original FP32 parameters intact for small rows and invariant mode.
+        self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
+        if (
+            self.hc_pre_from_prev_sublayer
+            and get_platform().is_sm100
+            and self.hc_attn_fn.shape == (24, 20480)
+            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and envs.SGLANG_DSV41_COMPENSATED_MHC.get()
+        ):
+            from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+                split_tf32_hc_weight,
+            )
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                ENABLE_JIT_DEEPGEMM,
+            )
+
+            if ENABLE_JIT_DEEPGEMM:
+                self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
+                self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
 
     def hc_pre(
         self,
@@ -2826,16 +2846,47 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if stats_stream is not None
                 else nullcontext()
             ):
-                pre, post, comb = hc_mix_stats_sinkhorn(
-                    x_flat,
-                    hc_fn,
-                    hc_scale,
-                    hc_base,
-                    self.hc_mult,
-                    self.hc_sinkhorn_iters,
-                    self.rms_norm_eps,
-                    self.hc_eps,
+                from sglang.srt.batch_invariant_ops import (
+                    is_batch_invariant_mode_enabled,
                 )
+
+                parts = None
+                if (
+                    x_flat.shape[0] >= 128
+                    and x_flat.is_contiguous()
+                    and get_platform().is_sm100
+                    and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+                    and not is_batch_invariant_mode_enabled()
+                ):
+                    if hc_fn is self.hc_attn_fn:
+                        parts = getattr(self, "_hc_attn_tf32_parts", None)
+                    elif hc_fn is self.hc_ffn_fn:
+                        parts = getattr(self, "_hc_ffn_tf32_parts", None)
+                if parts is not None:
+                    from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+                        hc_mix_stats_sinkhorn_deepgemm,
+                    )
+
+                    pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
+                        x_flat,
+                        parts,
+                        hc_scale,
+                        hc_base,
+                        self.hc_sinkhorn_iters,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                    )
+                else:
+                    pre, post, comb = hc_mix_stats_sinkhorn(
+                        x_flat,
+                        hc_fn,
+                        hc_scale,
+                        hc_base,
+                        self.hc_mult,
+                        self.hc_sinkhorn_iters,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                    )
             if stats_stream is not None:
                 # These allocations originate on the side stream and are read
                 # after the caller joins it, on the main stream.

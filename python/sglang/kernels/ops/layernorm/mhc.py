@@ -2246,6 +2246,7 @@ def _hc_mix_reduce_sinkhorn_kernel(
     NUM_SLICES: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
+    part_mix_residual_ptr=None,
 ):
     """One CTA per row keeps the sinkhorn reductions two-dimensional.
     Per-row arithmetic follows the slice reduction, then the Triton sinkhorn.
@@ -2263,9 +2264,16 @@ def _hc_mix_reduce_sinkhorn_kernel(
     sq = tl.zeros([], dtype=tl.float32)
     for s in tl.static_range(NUM_SLICES):
         off = (s * m + row) * MIX
-        a_pre += tl.load(part_mix_ptr + off + j)
-        a_post += tl.load(part_mix_ptr + off + HC + j)
-        a_comb += tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
+        v_pre = tl.load(part_mix_ptr + off + j)
+        v_post = tl.load(part_mix_ptr + off + HC + j)
+        v_comb = tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
+        if part_mix_residual_ptr is not None:
+            v_pre += tl.load(part_mix_residual_ptr + off + j)
+            v_post += tl.load(part_mix_residual_ptr + off + HC + j)
+            v_comb += tl.load(part_mix_residual_ptr + off + 2 * HC + jj * HC + kk)
+        a_pre += v_pre
+        a_post += v_post
+        a_comb += v_comb
         sq += tl.load(part_sq_ptr + s * m + row)
     rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
 
