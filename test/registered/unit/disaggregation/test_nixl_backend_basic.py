@@ -152,6 +152,7 @@ class TestNixlBackendInitialization(CustomTestCase):
             ) as get_device_module,
             patch.object(NixlKVManager, "register_buffer_to_engine"),
             patch.object(NixlKVManager, "_start_bootstrap_thread"),
+            patch.object(NixlKVManager, "_start_decode_listener_thread"),
             patch.object(NixlKVManager, "_start_heartbeat_checker_thread"),
         ):
             NixlKVManager.__init__(mgr, args, mode, SimpleNamespace(device="cuda"))
