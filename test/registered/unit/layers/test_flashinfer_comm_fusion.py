@@ -176,9 +176,7 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
 
     def test_layout_adapter_produces_expert_major_inputs(self):
         gemm2_out = torch.arange(24, dtype=torch.bfloat16).reshape(8, 3)
-        expert_weights = torch.tensor(
-            [[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16
-        )
+        expert_weights = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16)
         # The native finalizer addresses expanded_idx[token * top_k + k].
         expanded_idx = torch.tensor([4, 0, 6, 1, 3, 5], dtype=torch.int32)
         expected_active = torch.stack(
@@ -187,9 +185,7 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
                 torch.stack((gemm2_out[0], gemm2_out[1], gemm2_out[5])),
             )
         )
-        expected_scales = torch.tensor(
-            [[1, 3, 5], [2, 4, 6]], dtype=torch.float32
-        )
+        expected_scales = torch.tensor([[1, 3, 5], [2, 4, 6]], dtype=torch.float32)
 
         for index_map in (expanded_idx, expanded_idx.view(3, 2)):
             with self.subTest(index_shape=tuple(index_map.shape)):
@@ -217,9 +213,7 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
         )
         for expanded_idx in malformed_indices:
             with self.subTest(index_shape=tuple(expanded_idx.shape)):
-                with self.assertRaisesRegex(
-                    ValueError, "expanded_idx_to_permuted_idx"
-                ):
+                with self.assertRaisesRegex(ValueError, "expanded_idx_to_permuted_idx"):
                     fusion.materialize_flashinfer_trtllm_moe_allreduce_layout(
                         gemm2_out, expert_weights, expanded_idx
                     )
@@ -508,9 +502,7 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
                 zero_allocator=MagicMock(),
             )
 
-            self.assertIsInstance(
-                payload, fusion.FlashInferTrtllmMoeAllReducePayload
-            )
+            self.assertIsInstance(payload, fusion.FlashInferTrtllmMoeAllReducePayload)
             self.assertIs(unchanged_residual, residual)
             self.assertFalse(hasattr(payload, "_sglang_needs_allreduce_fusion"))
             experts.forward_deferred_finalize.assert_called_once()

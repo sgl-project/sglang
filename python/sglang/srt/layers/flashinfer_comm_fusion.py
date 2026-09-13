@@ -175,8 +175,8 @@ if is_flashinfer_available():
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
             )
-            _flashinfer_trtllm_moe_allreduce = (
-                _get_flashinfer_trtllm_moe_allreduce_api(comm)
+            _flashinfer_trtllm_moe_allreduce = _get_flashinfer_trtllm_moe_allreduce_api(
+                comm
             )
         else:
             _flashinfer_allreduce_unavailable = True
@@ -867,7 +867,8 @@ def materialize_flashinfer_trtllm_moe_allreduce_layout(
     tokens, top_k = expert_weights.shape
     hidden_dim = gemm2_out.shape[1]
     expert_major_indices = (
-        expanded_idx_to_permuted_idx.reshape(tokens, top_k).transpose(0, 1)
+        expanded_idx_to_permuted_idx.reshape(tokens, top_k)
+        .transpose(0, 1)
         .contiguous()
         .reshape(-1)
         .to(torch.int64)
@@ -1033,13 +1034,9 @@ def run_flashinfer_trtllm_moe_allreduce(
         rms_gamma=norm_weight,
         rms_eps=eps,
         scale_factor=1.0,
-        moe_reduction_device_num_experts=(
-            payload.active_experts_token_input.shape[0]
-        ),
+        moe_reduction_device_num_experts=(payload.active_experts_token_input.shape[0]),
         moe_reduction_scale_input=payload.scale_input,
-        moe_reduction_active_experts_token_input=(
-            payload.active_experts_token_input
-        ),
+        moe_reduction_active_experts_token_input=(payload.active_experts_token_input),
         moe_reduction_token_input=payload.token_input,
         layout_code=None,
         moe_allreduce_out=None,
