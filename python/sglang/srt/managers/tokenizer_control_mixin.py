@@ -52,11 +52,9 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
-    ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqOutput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
@@ -64,18 +62,26 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TokenizerControlAckReq,
+    TokenizerControlBackendResultReq,
+    TokenizerControlBroadcastReq,
+    TokenizerControlResultReq,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
-    UpdateWeightVersionReqOutput,
+    async_sock_send,
+    msgpack_decode,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.tokenizer_control import (
+    CONTROL_TIMEOUT_SECONDS,
+    ControlCoordinator,
+    ControlRpc,
+    make_control_request,
+)
 from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
@@ -101,18 +107,12 @@ logger = logging.getLogger(__name__)
 _COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
-    ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
-    ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
-    ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
-    ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
-    ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
-    ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
@@ -171,7 +171,163 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+        self._control_futures = {}
+        self._control_tasks = set()
+        self._control_apply_lock = asyncio.Lock()
+        self._control_error = None
+        self._control_revision = 0
+        self._control_rpc = ControlRpc(self._send_control_to_scheduler)
+        self._control = ControlCoordinator(
+            self._control_rpc.call, self._apply_control_broadcast, self._fail_control
+        )
+        dispatch_pairs.extend(
+            [
+                (TokenizerControlBackendResultReq, self._control_rpc.handle_recv),
+                (TokenizerControlBroadcastReq, self._handle_control_broadcast),
+                (TokenizerControlResultReq, self._handle_control_result),
+            ]
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    async def _send_control_to_scheduler(self, obj):
+        # Preserve the coordinator return route instead of stamping an HTTP worker.
+        await async_sock_send(self.send_to_scheduler, obj)
+
+    def _own_control_task(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._control_tasks.add(task)
+
+        def completed(task):
+            self._control_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()  # A disconnected HTTP caller no longer observes it.
+
+        task.add_done_callback(completed)
+        return task
+
+    async def _call_control(self, obj, kind):
+        self.auto_create_handle_loop()
+        if self._control_error is not None:
+            raise RuntimeError(
+                f"Previous control operation failed; restart the server: {self._control_error}"
+            )
+        fan_out = self.elastic_worker_count
+        if kind in ("pause", "continue"):
+            fan_out = self.get_internal_state_communicator._fan_out
+        request = make_control_request(
+            obj, kind, fan_out, self.get_internal_state_communicator._fan_out
+        )
+        return await asyncio.shield(self._own_control_task(self._wait_control(request)))
+
+    async def _wait_control(self, request):
+        if get_serving().tokenizer_worker_num == 1:
+            return await self._control.run(request)
+        future = asyncio.get_running_loop().create_future()
+        self._control_futures[request.operation_id] = future
+        try:
+            await self._async_dispatch_to_scheduler(request)
+            return await asyncio.wait_for(future, CONTROL_TIMEOUT_SECONDS + 5)
+        except asyncio.TimeoutError:
+            self._fail_control(request.operation_id, "Control coordinator timed out")
+            raise
+        finally:
+            self._control_futures.pop(request.operation_id, None)
+
+    def _handle_control_result(self, obj):
+        future = self._control_futures.get(obj.operation_id)
+        if future is None or future.done():
+            return
+        if obj.error is not None:
+            future.set_exception(RuntimeError(obj.error))
+        else:
+            future.set_result([msgpack_decode(r) for r in obj.results])
+
+    def _fail_control(self, operation_id, error):
+        self._control_error = error
+        self.is_pause = True
+
+    def _handle_control_broadcast(self, obj):
+        if obj.action == "abort":
+            # Cancellation must bypass an action waiting for readers to drain.
+            self._mark_abort_requests(obj.rid, obj.abort_all)
+            self._own_control_task(self._notify_control_waiters())
+            self._ack_control_action(obj)
+        else:
+            self._own_control_task(self._apply_and_ack_control(obj))
+
+    def _ack_control_action(self, obj, error=None):
+        self._dispatch_to_scheduler(
+            TokenizerControlAckReq(
+                broadcast_id=obj.broadcast_id,
+                worker_ipc_name=self.tokenizer_ipc_name,
+                error=error,
+            )
+        )
+
+    async def _notify_control_waiters(self):
+        async with self.is_pause_cond:
+            self.is_pause_cond.notify_all()
+
+    async def _apply_and_ack_control(self, obj):
+        error = None
+        try:
+            if obj.action == "fail":
+                await self._apply_control_broadcast(obj)
+            else:
+                # A duplicate action must not ACK while the first copy is draining.
+                async with self._control_apply_lock:
+                    await self._apply_control_broadcast(obj)
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+        if obj.action != "fail":
+            self._ack_control_action(obj, error)
+
+    async def _apply_control_broadcast(self, obj):
+        if obj.action == "fail":
+            self._fail_control(obj.broadcast_id, obj.error)
+            return
+        if self._control_error is not None:
+            raise RuntimeError(self._control_error)
+        if obj.revision <= self._control_revision:
+            return
+        self._control_revision = obj.revision
+        async with self.is_pause_cond:
+            if obj.action == "pause":
+                self.is_pause = True
+            elif obj.is_pause is not None:
+                self.is_pause = obj.is_pause
+            if obj.abort_all:
+                self._mark_abort_requests("", True)
+            if obj.updates:
+                if "model_path" in obj.updates:
+                    self._update_model_path_info(
+                        obj.updates["model_path"], obj.updates["load_format"]
+                    )
+                self.record_config_updates("tokenizer.control", **obj.updates)
+            if obj.clear_mm_cache and self.mm_processor is not None:
+                self.mm_processor.clear_preprocess_cache()
+            if obj.weights_ready:
+                self.initial_weights_loaded = True
+            if not self.is_pause or obj.abort_all:
+                self.is_pause_cond.notify_all()
+        if obj.wait_for_requests or obj.action == "drain":
+            while await self.model_update_lock.is_locked() or any(
+                state.abort_requested and not state.finished
+                for state in self.rid_to_state.values()
+            ):
+                if self._control_error is not None:
+                    raise RuntimeError(self._control_error)
+                await asyncio.sleep(0.01)
+
+    async def _update_weights(self, obj):
+        try:
+            results = await self._call_control(obj, "weights")
+        except (RuntimeError, TimeoutError) as exc:
+            return False, str(exc) or type(exc).__name__, []
+        success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.weight_version is not None:
+            message += f" Weight version updated to {obj.weight_version}."
+        return success, message, results
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -454,26 +610,7 @@ class TokenizerControlMixin:
             "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
         )
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
+        success, message, _ = await self._update_weights(obj)
         return success, message
 
     async def init_weights_send_group_for_remote_instance(
@@ -514,29 +651,10 @@ class TokenizerControlMixin:
             "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
         )
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
-
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
+        success, message, _ = await self._update_weights(obj)
         return success, message
 
     async def update_weights_from_ipc(
@@ -544,36 +662,8 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromIPCReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Update weights via IPC for checkpoint-engine integration."""
-        self.auto_create_handle_loop()
-        try:
-            # For now, we only support single data parallel instance
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
-            )
-            logger.info("Starting IPC weight update")
-
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-                if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-
-            if not is_paused:
-                async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-        except Exception as e:
-            error_msg = f"IPC weight update failed: {str(e)}"
-            logger.error(error_msg)
-            success, message = False, error_msg
-
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
+        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+        success, message, _ = await self._update_weights(obj)
         return success, message
 
     async def _unload_lora_adapter_locked(
@@ -801,7 +891,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        await self._call_control(obj, "release")
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -809,7 +899,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        await self._call_control(obj, "resume")
 
     async def check_weights(
         self: TokenizerManager,
@@ -929,18 +1019,5 @@ class TokenizerControlMixin:
     ):
         await self._async_dispatch_to_scheduler(obj)
 
-    async def update_weight_version(
-        self: TokenizerManager, obj: UpdateWeightVersionReqInput
-    ) -> None:
-        self.auto_create_handle_loop()
-        await self.update_weight_version_communicator(obj)
-        self._update_weight_version_if_provided(obj.new_version)
-
-    def _update_weight_version_if_provided(
-        self: TokenizerManager, weight_version: Optional[str]
-    ) -> None:
-        """Update weight version if provided."""
-        if weight_version is not None:
-            self.record_config_updates(
-                "tokenizer.weight_version", weight_version=weight_version
-            )
+    async def update_weight_version(self, obj: UpdateWeightVersionReqInput):
+        await self._call_control(obj, "version")

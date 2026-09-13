@@ -173,6 +173,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizerControlBackendAckReq,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -272,6 +273,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.tokenizer_control import CONTROL_RETURN_PREFIX
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -2103,6 +2105,15 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            if (
+                output is None
+                and isinstance(
+                    recv_req,
+                    (PauseGenerationReqInput, ContinueGenerationReqInput, AbortReq),
+                )
+                and (recv_req.http_worker_ipc or "").startswith(CONTROL_RETURN_PREFIX)
+            ):
+                output = TokenizerControlBackendAckReq()
             if output is not None:
                 if self.rust_server is not None:
                     # Embedded Rust server: every control-request response goes
@@ -4984,6 +4995,7 @@ class Scheduler(
             tp_size=get_parallel().tp_size,
             pp_size=get_parallel().pp_size,
         )
+        ret["is_fully_idle"] = self.is_fully_idle()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage

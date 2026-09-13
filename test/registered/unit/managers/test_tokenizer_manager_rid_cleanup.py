@@ -15,6 +15,7 @@ Covers:
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
@@ -28,6 +29,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -37,6 +39,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.aio_rwlock import RWLock
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -129,6 +132,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm.is_pause = False
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -458,16 +462,6 @@ class TestResubmitAfterCompletion(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
-class _DummyAsyncCM:
-    """Reusable no-op async context manager (stands in for an RW lock)."""
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
 def _make_tm_for_generate(case) -> TokenizerManager:
     """Augment the mocked TokenizerManager with what generate_request needs."""
     tm = _make_tokenizer_manager(case)
@@ -480,8 +474,7 @@ def _make_tm_for_generate(case) -> TokenizerManager:
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
-    tm.model_update_lock = Mock()
-    tm.model_update_lock.reader_lock = _DummyAsyncCM()
+    tm.model_update_lock = RWLock()
     tm._validate_and_resolve_lora = AsyncMock(return_value=None)
     return tm
 
@@ -801,6 +794,160 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestAbortBeforeScheduler(CustomTestCase, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tm = _make_tm_for_generate(self)
+        self.tm._control_tasks = set()
+        self.tm._dispatch_to_scheduler = Mock()
+        self.tm.cuda_vmm_feature_transport = Mock()
+        self.tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+
+    async def asyncTearDown(self):
+        await asyncio.gather(*self.tm._control_tasks)
+
+    async def test_abort_during_tokenization_returns_abort_without_dispatch(self):
+        tm = self.tm
+        started, finish_tokenizing = asyncio.Event(), asyncio.Event()
+        obj = GenerateReqInput(rid="preprocessing", input_ids=[1], sampling_params={})
+
+        async def tokenize(req):
+            started.set()
+            await finish_tokenizing.wait()
+            return Mock(rid=req.rid, input_ids=[1])
+
+        tm._tokenize_one_request = tokenize
+        stream = tm.generate_request(obj)
+        result = asyncio.create_task(stream.__anext__())
+        await asyncio.wait_for(started.wait(), 1)
+        tm.abort_request(obj.rid)
+        finish_tokenizing.set()
+        out = await asyncio.wait_for(result, 1)
+        await stream.aclose()
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertEqual(len(tm._dispatch_to_scheduler.call_args_list), 1)
+        self.assertIsInstance(tm._dispatch_to_scheduler.call_args.args[0], AbortReq)
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+        self.assertFalse(await tm.model_update_lock.is_locked())
+
+    async def test_abort_wakes_a_request_waiting_for_continue(self):
+        tm = self.tm
+        tm.is_pause = True
+        tm._tokenize_one_request = AsyncMock()
+        obj = GenerateReqInput(rid="paused", input_ids=[1], sampling_params={})
+        stream = tm.generate_request(obj)
+        result = asyncio.create_task(stream.__anext__())
+        await asyncio.sleep(0)
+        self.assertIn(obj.rid, tm.rid_to_state)
+        tm.abort_request(obj.rid)
+        out = await asyncio.wait_for(result, 1)
+        await stream.aclose()
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        tm._tokenize_one_request.assert_not_awaited()
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+        self.assertTrue(tm.is_pause)
+
+    async def test_abort_during_feature_publication_cancels_prepared_items(self):
+        tm = self.tm
+        started, published = asyncio.Event(), asyncio.Event()
+        items = [object()]
+        obj = GenerateReqInput(rid="publishing", input_ids=[1], sampling_params={})
+        tm._tokenize_one_request = AsyncMock(
+            return_value=Mock(rid=obj.rid, input_ids=[1], mm_inputs=None)
+        )
+
+        async def publish_features(_):
+            started.set()
+            await published.wait()
+            return items
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish_features
+        stream = tm.generate_request(obj)
+        result = asyncio.create_task(stream.__anext__())
+        await asyncio.wait_for(started.wait(), 1)
+        tm.abort_request(obj.rid)
+        published.set()
+        out = await asyncio.wait_for(result, 1)
+        await stream.aclose()
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertTrue(
+            all(
+                isinstance(call.args[0], AbortReq)
+                for call in tm._dispatch_to_scheduler.call_args_list
+            )
+        )
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(items)
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+
+    async def test_batch_abort_during_publication_preserves_live_features(self):
+        tm = self.tm
+        first, second = _make_req_state("first"), _make_req_state("second")
+        tm.rid_to_state = {"first": first, "second": second}
+        items = [object(), object()]
+        inputs = [
+            Mock(
+                spec=TokenizedGenerateReqInput,
+                rid=rid,
+                mm_inputs=SimpleNamespace(mm_items=[item]),
+            )
+            for rid, item in zip(("first", "second"), items)
+        ]
+        started, published = asyncio.Event(), asyncio.Event()
+
+        async def publish_features(_):
+            started.set()
+            await published.wait()
+            return items
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish_features
+        dispatch = asyncio.create_task(tm._send_batch_request(inputs))
+        await asyncio.wait_for(started.wait(), 1)
+        tm._mark_abort_requests(rid="first", abort_all=False)
+        published.set()
+        await asyncio.wait_for(dispatch, 1)
+        sent = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual([req.rid for req in sent.batch], ["second"])
+        self.assertTrue(first.finished)
+        self.assertFalse(first.dispatched)
+        self.assertTrue(second.dispatched)
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+            [items[0]]
+        )
+
+    async def test_batch_cancellation_drops_only_matching_inputs(self):
+        tm = self.tm
+        first, second = _make_req_state("first"), _make_req_state("second")
+        tm.rid_to_state = {"first": first, "second": second}
+        tm._mark_abort_requests("first", False)
+        inputs = [
+            Mock(spec=TokenizedGenerateReqInput, rid="first"),
+            Mock(spec=TokenizedGenerateReqInput, rid="second"),
+        ]
+        await tm._send_batch_request(inputs)
+        self.assertTrue(first.finished)
+        self.assertFalse(second.finished)
+        self.assertEqual(len(inputs), 2)
+        sent = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual([req.rid for req in sent.batch], ["second"])
+
+    async def test_old_response_waiter_does_not_remove_a_reused_rid(self):
+        tm = self.tm
+        state = _make_req_state("reused")
+        tm.rid_to_state[state.obj.rid] = state
+        waiter = tm._wait_one_response(state.obj)
+        result = asyncio.create_task(waiter.__anext__())
+        await asyncio.sleep(0)
+        tm._handle_abort_req(_make_abort_req("reused"))
+        replacement = _make_req_state("reused")
+        tm.rid_to_state["reused"] = replacement
+        await asyncio.wait_for(result, 1)
+        await waiter.aclose()
+        self.assertIs(tm.rid_to_state["reused"], replacement)
 
 
 if __name__ == "__main__":
