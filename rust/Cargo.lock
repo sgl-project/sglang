@@ -3677,6 +3677,7 @@ dependencies = [
  "protoc-bin-vendored",
  "pyo3",
  "serde_json",
+ "sglang-environ",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -3700,6 +3701,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sglang-environ",
  "ureq",
 ]
 

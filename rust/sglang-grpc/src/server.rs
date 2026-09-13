@@ -5,6 +5,7 @@ use std::sync::Arc;
 use pyo3::PyErr;
 use pyo3::Python;
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use sglang_environ::envs;
 use tokio::sync::{Notify, mpsc::Receiver};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
@@ -28,33 +29,16 @@ pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 300;
 
 /// 64 MiB — leaves headroom for multimodal inputs and OpenAI JSON pass-through bodies,
 /// well above tonic's 4 MiB decode default.
-pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = envs::SGLANG_TONIC_PAYLOAD.default_value();
 
 /// Resolve the per-message size cap (bytes) applied to the Tonic encoder/decoder.
 //
 // TODO(grpc-args): promote SGLANG_TONIC_PAYLOAD to a proper `--grpc-max-message-size`
 // server argument once the launcher PR (3/4) wires server args through.
 fn resolve_max_message_size() -> usize {
-    match std::env::var("SGLANG_TONIC_PAYLOAD") {
-        Ok(raw) => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => {
-                tracing::info!(
-                    bytes = n,
-                    "Using SGLANG_TONIC_PAYLOAD override for gRPC max message size"
-                );
-                n
-            }
-            _ => {
-                tracing::warn!(
-                    value = %raw,
-                    default = DEFAULT_GRPC_MAX_MESSAGE_SIZE,
-                    "Ignoring invalid SGLANG_TONIC_PAYLOAD; using default"
-                );
-                DEFAULT_GRPC_MAX_MESSAGE_SIZE
-            }
-        },
-        Err(_) => DEFAULT_GRPC_MAX_MESSAGE_SIZE,
-    }
+    let size = envs::SGLANG_TONIC_PAYLOAD.get_with(|raw| raw.parse().ok().filter(|&n| n > 0));
+    tracing::info!(bytes = size, "gRPC max message size");
+    size
 }
 
 /// Classify a bridge `PyErr` into the right gRPC `Status`.

@@ -22,7 +22,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use sglang_environ::{env_bool, env_i64};
+use sglang_environ::envs;
 use tokio::sync::mpsc;
 
 use super::app::AppState;
@@ -98,9 +98,9 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// plain 200 (routing the request proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout =
-        std::time::Duration::from_secs(env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64);
+        std::time::Duration::from_secs(envs::SGLANG_HEALTH_CHECK_TIMEOUT.get().max(0) as u64);
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
-    let health = if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+    let health = if envs::SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get() {
         probe.clone()
     } else {
         get(health_without_generation)

@@ -1,98 +1,138 @@
-//! Env-var parsing with the semantics of Python `sglang.srt.environ.EnvField`:
-//! unset → default, invalid → warn + default (never an error). One shared
-//! parser per type — call sites pass their variable name + default instead of
-//! each hand-rolling a reader.
+//! Environment variables with the semantics of Python `sglang.srt.environ`:
+//! unset -> default, invalid -> warn + default (never an error). Variables are
+//! declared once in [`envs`]; call sites read them with `.get()`, which hits
+//! the process environment on every call.
+
+pub mod envs;
+
+use std::fmt::Debug;
+use std::str::FromStr;
+
+/// A declared variable: its name and the default used when unset or invalid.
+pub struct EnvField<T> {
+    name: &'static str,
+    default: T,
+}
+
+pub type EnvBool = EnvField<bool>;
+pub type EnvInt = EnvField<i64>;
+pub type EnvU64 = EnvField<u64>;
+pub type EnvUsize = EnvField<usize>;
+
+impl<T: Copy> EnvField<T> {
+    pub const fn new(name: &'static str, default: T) -> Self {
+        Self { name, default }
+    }
+
+    /// The declared default, for call sites that also expose it as a constant.
+    pub const fn default_value(&self) -> T {
+        self.default
+    }
+}
+
+impl EnvBool {
+    pub fn get(&self) -> bool {
+        self.read(parse_bool)
+    }
+}
+
+impl EnvInt {
+    pub fn get(&self) -> i64 {
+        self.read(parse)
+    }
+}
+
+impl EnvU64 {
+    pub fn get(&self) -> u64 {
+        self.read(parse)
+    }
+}
+
+impl EnvUsize {
+    pub fn get(&self) -> usize {
+        self.read(parse)
+    }
+}
+
+impl<T: Copy + Debug> EnvField<T> {
+    /// Read with an extra call-site rule (such as "must be positive"); a value
+    /// the rule rejects warns and falls back exactly like a parse failure.
+    pub fn get_with(&self, parse: impl Fn(&str) -> Option<T>) -> T {
+        self.read(parse)
+    }
+
+    fn read(&self, parse: impl Fn(&str) -> Option<T>) -> T {
+        let Ok(raw) = std::env::var(self.name) else {
+            return self.default;
+        };
+        parse(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                name = self.name,
+                value = %raw,
+                default = ?self.default,
+                "invalid env value; using default"
+            );
+            self.default
+        })
+    }
+}
 
 /// Python `EnvBool.parse`: true = `true/1/yes/y`, false = `false/0/no/n`
 /// (case-insensitive); anything else is invalid.
-pub fn env_bool(name: &str, default: bool) -> bool {
-    read(name, default, |raw| match raw.to_lowercase().as_str() {
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.to_lowercase().as_str() {
         "true" | "1" | "yes" | "y" => Some(true),
         "false" | "0" | "no" | "n" => Some(false),
         _ => None,
-    })
-}
-
-/// Signed integer parser. Accepts the `i64::from_str` grammar, including
-/// negative values, while invalid or out-of-range values warn and use the
-/// default.
-pub fn env_i64(name: &str, default: i64) -> i64 {
-    read(name, default, |raw| raw.parse().ok())
-}
-
-/// Shared read-or-default: unset → default; a set-but-unparsable value warns
-/// and falls back to the default (mirrors `EnvField.get`'s `warnings.warn`).
-fn read<T: Copy + std::fmt::Debug>(name: &str, default: T, parse: impl Fn(&str) -> Option<T>) -> T {
-    let Ok(raw) = std::env::var(name) else {
-        return default;
-    };
-    match parse(&raw) {
-        Some(v) => v,
-        None => {
-            tracing::warn!(name, value = %raw, ?default, "invalid env value; using default");
-            default
-        }
     }
+}
+
+fn parse<T: FromStr>(raw: &str) -> Option<T> {
+    raw.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The accepted literal sets are copied from Python `EnvBool.parse`
-    /// (`true/1/yes/y` / `false/0/no/n`, case-insensitive; invalid → default) —
-    /// parity pins, not this crate's invention.
+    /// Parity pins copied from Python `EnvBool.parse`, not this crate's invention.
     #[test]
-    fn env_bool_matches_python_envbool_parse() {
-        // Unique var name per case: tests in this binary run concurrently and
-        // share the process environment.
-        for (raw, want) in [
-            ("true", true),
-            ("1", true),
-            ("YES", true),
-            ("y", true),
-            ("false", false),
-            ("0", false),
-            ("No", false),
-            ("n", false),
-            // Invalid → default (here: true), matching the warn-and-default path.
-            ("off", true),
-            ("2", true),
-        ] {
-            let name = format!("SGLANG_TEST_ENV_BOOL_{raw}");
-            unsafe { std::env::set_var(&name, raw) };
-            assert_eq!(env_bool(&name, true), want, "value {raw:?}");
+    fn parse_bool_matches_python_envbool_parse() {
+        for raw in ["true", "1", "YES", "y"] {
+            assert_eq!(parse_bool(raw), Some(true), "{raw:?}");
         }
-        assert!(env_bool("SGLANG_TEST_ENV_BOOL_UNSET", true));
-        assert!(!env_bool("SGLANG_TEST_ENV_BOOL_UNSET", false));
+        for raw in ["false", "0", "No", "n"] {
+            assert_eq!(parse_bool(raw), Some(false), "{raw:?}");
+        }
+        for raw in ["off", "2", ""] {
+            assert_eq!(parse_bool(raw), None, "{raw:?}");
+        }
     }
 
-    /// `env_i64`: strict `i64::from_str` grammar, including negative values;
-    /// everything else falls back to the default.
+    const VAR: &str = "SGLANG_TEST_ENV";
+    static AS_INT: EnvInt = EnvInt::new(VAR, 20);
+    static AS_BOOL: EnvBool = EnvBool::new(VAR, true);
+    static AS_SIZE: EnvUsize = EnvUsize::new(VAR, 7);
+
+    /// The only test that touches the process environment - keep it that way,
+    /// or `set_var` races the other tests in this binary.
     #[test]
-    fn env_i64_parses_or_defaults() {
-        for (i, (raw, want)) in [
-            ("45", 45),
-            ("+45", 45),
-            ("-1", -1),
-            ("-9223372036854775808", i64::MIN),
-            ("9223372036854775807", i64::MAX),
-            // Invalid → default.
-            ("20s", 20),
-            ("", 20),
-            (" 45 ", 20),
-            ("4_5", 20),
-            ("9223372036854775808", 20),
-            ("-9223372036854775809", 20),
-            ("١٢", 20), // non-ASCII digits
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let name = format!("SGLANG_TEST_ENV_I64_{i}");
-            unsafe { std::env::set_var(&name, raw) };
-            assert_eq!(env_i64(&name, 20), want, "value {raw:?}");
-        }
-        assert_eq!(env_i64("SGLANG_TEST_ENV_I64_UNSET", 20), 20);
+    fn get_reads_the_environment_on_every_call() {
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(AS_INT.get(), 20);
+
+        unsafe { std::env::set_var(VAR, "-45") };
+        assert_eq!(AS_INT.get(), -45);
+        assert_eq!(AS_SIZE.get(), 7);
+        assert!(AS_BOOL.get());
+        let positive = |raw: &str| raw.parse().ok().filter(|&n| n > 0);
+        assert_eq!(AS_SIZE.get_with(positive), 7);
+
+        // Re-read, not a value cached in the declaration.
+        unsafe { std::env::set_var(VAR, "1") };
+        assert_eq!(AS_INT.get(), 1);
+        assert_eq!(AS_SIZE.get_with(positive), 1);
+
+        unsafe { std::env::remove_var(VAR) };
     }
 }
