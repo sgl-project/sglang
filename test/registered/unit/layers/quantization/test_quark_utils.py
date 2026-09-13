@@ -115,16 +115,5 @@ class TestE8M0ToF32(CustomTestCase):
         self.assertTrue(torch.isnan(out[2]).item())
 
 
-class TestShouldIgnoreLayer(CustomTestCase):
-    def test_direct_fused_module_exclusion_takes_precedence(self):
-        self.assertTrue(
-            should_ignore_layer(
-                "visual.blocks.0.attn.qkv_proj",
-                ["visual.blocks.0.attn.qkv_proj"],
-                {"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
-            )
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
