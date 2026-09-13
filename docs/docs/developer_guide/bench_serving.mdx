@@ -56,6 +56,62 @@ python3 -m sglang.bench_serving \
   --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
+### TraceLab session replay
+
+`python -m sglang.benchmark.tracelab` replays the request lengths and session
+ordering in [TraceLab](https://github.com/uw-syfi/TraceLab) JSONL or canonical
+session-runner CSV traces (also gzip) against SGLang's native `/generate` endpoint:
+
+```bash Command
+curl -L --fail -o syfi_coding_trace.jsonl.gz \
+  https://github.com/uw-syfi/TraceLab/releases/latest/download/syfi_coding_trace.jsonl.gz
+curl -L --fail -o enwik9.zip http://mattmahoney.net/dc/enwik9.zip
+unzip enwik9.zip
+
+python -m sglang.benchmark.tracelab \
+  --dataset-path syfi_coding_trace.jsonl.gz \
+  --tokenizer /path/to/model \
+  --text-file enwik9 \
+  --base-url http://127.0.0.1:30000 \
+  --output-file tracelab-results.jsonl \
+  --num-requests 128 --max-rounds-per-session 16 --concurrency 8 --request-rate 0.5 \
+  --min-input-len 32768 --max-input-len 131072 \
+  --min-output-len 128 --max-output-len 4096
+```
+
+Like TraceLab's official replay runner, `--text-file` supplies a tokenized corpus
+for new input while prior prompt and actual generated token IDs carry forward
+into the next round's retained prefix. Missing history at the start of a selected
+segment is filled from the corpus and reported as cold rather than a cache hit.
+Without `--text-file`, content uses random vocabulary IDs for length-only probes.
+The corpus can be a source tree exported to one UTF-8 file, a code dataset shard,
+or a large public text corpus such as enwik9. It must tokenize to at least the
+largest selected input length; the driver fails before sending requests when it
+is too short. The public trace does not disclose original prompts. This is a
+serving-load replay, not an agent-quality
+evaluation or a representative measurement of speculative acceptance or expert
+routing. For content-sensitive profiling, use separately attributed real prompts.
+
+Input/output length bounds filter complete requests; they do not truncate them.
+Input length includes the recorded prefix plus newly appended tokens. Requests
+within each selected session run serially, with up to `--concurrency` active
+sessions. `--request-rate` controls global request starts. Canonical CSV
+`arrival_time` and `tool_wait_after_ms` are replayed in milliseconds; absent
+timing fields default to zero. CSV `input_len` means newly appended tokens,
+so total prompt length is `prefix_len + input_len`.
+`--max-rounds-per-session` optionally limits selected rounds
+from each session, so an early long session does not fill the whole request
+budget. The output records the actual number of selected sessions.
+Output JSONL records configuration, per-request results and a
+summary, and refuses to overwrite an existing file.
+
+TTFT starts when the HTTP request is submitted. TBT is the observed inter-chunk
+gap divided by the number of newly reported completion tokens in that chunk;
+the first chunk is excluded because its internal token timings are unknown.
+This is client-observed chunk-normalized TBT, not exact individual token latency.
+Failures and incomplete output lengths are recorded separately from successful
+request latency statistics.
+
 ### Fair embedding comparison
 
 Use the two embedding backends with the same model, tokenizer, input length, prompt count, and concurrency. The benchmark reports input-token throughput and end-to-end latency; embeddings have no decode-side TTFT or TPOT.
