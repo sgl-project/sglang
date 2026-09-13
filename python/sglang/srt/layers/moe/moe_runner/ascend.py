@@ -20,8 +20,18 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
+
+
+def _uses_fused_gmm1(kernel) -> bool:
+    """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
+    if isinstance(kernel, NPUMXFP8MoEMethod):
+        return True
+    return isinstance(kernel, NPUW4A8MXFP4MoEMethod) and kernel.use_fused_gmm1
+
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -89,13 +99,15 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
-            # separate activation step — run() skips it. Left None on purpose so
-            # that reaching for it fails loudly instead of silently applying an
-            # unfused swiglu to already-requantised activations. This holds for
-            # both dispatchers: ascend_tp gets its activation quant fused into
-            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
+        if _uses_fused_gmm1(kernel):
+            # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
+            # gate/up + swiglu + requant into gmm1, so there is no separate
+            # activation step — run() skips it. Left None on purpose so that
+            # reaching for it fails loudly instead of silently applying an
+            # unfused swiglu to already-requantised activations. This holds
+            # for both dispatchers: ascend_tp gets its activation quant fused
+            # into routing, DeepEP dispatches bf16 and gmm1 quantises it
+            # itself.
             self.activation = None
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
@@ -159,10 +171,10 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+        if _uses_fused_gmm1(w13_kernel):
             # --- w13 projection + activation, fused into one kernel ---
-            # MXFP8 gmm1 returns activations already requantised for gmm2, so
-            # there is no separate activation step to run.
+            # The fused gmm1 returns activations already requantised for gmm2,
+            # so there is no separate activation step to run.
             hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
                 quant_info,
                 x,
