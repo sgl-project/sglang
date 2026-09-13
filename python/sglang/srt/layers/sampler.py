@@ -949,49 +949,61 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
-    for key, (
+    if sampling_batch_info._custom_logit_processor_indices is not None:
+        _apply_custom_logit_processor_with_indices(
+            logits, sampling_batch_info, num_tokens_in_batch
+        )
+        return
+
+    for _, (
         processor,
         batch_mask,
     ) in sampling_batch_info.custom_logit_processor.items():
-        if sampling_batch_info._custom_logit_processor_indices is not None:
-            rows, indices = sampling_batch_info._custom_logit_processor_indices[key]
-            if num_tokens_in_batch != 1:
-                indices = (
-                    indices[:, None] * num_tokens_in_batch
-                    + torch.arange(num_tokens_in_batch, device=logits.device)
-                ).flatten()
-            logits.index_copy_(
-                0,
-                indices,
-                processor(
-                    logits.index_select(0, indices),
-                    [
-                        sampling_batch_info.custom_params[i]
-                        for i in rows
-                        for _ in range(num_tokens_in_batch)
-                    ],
-                ),
-            )
-        else:
-            # Get the batch indices that need to be processed
-            batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+        # Get the batch indices that need to be processed
+        batch_indices = batch_mask.nonzero(as_tuple=True)[0]
 
-            assert batch_mask.shape[0] == len(sampling_batch_info), (
-                f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
-                f"sampling_batch_info ({len(sampling_batch_info)})"
-            )
-            batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
-            custom_params = [
-                sampling_batch_info.custom_params[i]
-                for i in batch_indices
-                for _ in range(num_tokens_in_batch)
-            ]
+        assert batch_mask.shape[0] == len(sampling_batch_info), (
+            f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
+            f"sampling_batch_info ({len(sampling_batch_info)})"
+        )
+        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+        custom_params = [
+            sampling_batch_info.custom_params[i]
+            for i in batch_indices
+            for _ in range(num_tokens_in_batch)
+        ]
 
-            # Apply the processor to the logits
-            logits[batch_mask] = processor(
-                logits[batch_mask],
-                custom_params,
-            )
+        # Apply the processor to the logits
+        logits[batch_mask] = processor(
+            logits[batch_mask],
+            custom_params,
+        )
+
+        logger.debug(
+            f"Custom logit processor {processor.__class__.__name__} is applied."
+        )
+
+
+def _apply_custom_logit_processor_with_indices(
+    logits: torch.Tensor,
+    sampling_batch_info: SamplingBatchInfo,
+    num_tokens_in_batch: int,
+) -> None:
+    for key, (processor, _) in sampling_batch_info.custom_logit_processor.items():
+        rows, indices = sampling_batch_info._custom_logit_processor_indices[key]
+        if num_tokens_in_batch != 1:
+            indices = (
+                indices[:, None] * num_tokens_in_batch
+                + torch.arange(num_tokens_in_batch, device=logits.device)
+            ).flatten()
+        selected = logits.index_select(0, indices)
+        custom_params = [
+            sampling_batch_info.custom_params[i]
+            for i in rows
+            for _ in range(num_tokens_in_batch)
+        ]
+        result = processor(selected, custom_params)
+        logits.index_copy_(0, indices, result)
 
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
