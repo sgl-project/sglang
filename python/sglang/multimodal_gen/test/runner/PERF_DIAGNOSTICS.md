@@ -91,3 +91,22 @@ stability is a conservative selection criterion, not proof of an optimal load
 time. Cases with insufficient samples or greater variation remain uncalibrated
 and continue to fail the missing-loading-baseline check; B200 and 5090 references
 are not inferred from H100 or development H200 measurements.
+
+The six RTX 5090 loading references use the same selection rule, from runs
+[34753876622](https://github.com/sgl-project/sglang/actions/runs/34753876622),
+[34755864886](https://github.com/sgl-project/sglang/actions/runs/34755864886), and
+[34764411082](https://github.com/sgl-project/sglang/actions/runs/34764411082).
+Their per-case maximum/minimum ratios range from 1.048 to 1.203. The last run's
+six recorded requests passed E2E validation and failed the then-missing loading
+baseline check; subsequent checks and MiniMax's second request did not run.
+The existing MiniMax wall-clock tolerance override is unchanged.
+
+The same three runs also provide initial two-H100 loading references for
+`ltx_2.3_one_stage_ti2v`, `ltx_2.3_two_stage_t2v_2gpus`,
+`wan2_1_t2v_1.3b_cfg_parallel`, and `zimage_image_t2i_2_gpus`.
+Seven partition-0 cases also meet this criterion: `flux2_modelopt_fp8_tp2_t2i`,
+`flux_image_t2i_2_gpus`, `ideogram4_fp8_tp2_t2i`, `qwen_image_t2i_2_gpus`,
+`wan2_2_i2v_a14b_2gpu`, `wan2_2_t2v_a14b_lora_2gpu`, and
+`wan2_2_t2v_a14b_teacache_2gpu`. All eleven cases meet the same three-run
+stability criterion. Existing loading references are not raised when a later
+run exceeds their limits.
