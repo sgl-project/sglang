@@ -12,7 +12,7 @@ namespace canary {
 // Device-side handle for one real-KV source.
 struct RealKvSourceHandle {
   const uint8_t* tensor;     // raw uint8 byte pointer to the source tensor
-  int32_t row_stride_bytes;  // tensor.shape[1] in bytes (may exceed page_size * num_bytes_per_token)
+  int32_t row_stride_bytes;  // tensor.stride(0) in bytes (may exceed page_size * num_bytes_per_token)
   int32_t page_size;
   int32_t num_bytes_per_token;
   int32_t read_bytes;
@@ -37,8 +37,8 @@ SGL_DEVICE uint64_t splitmix64_mix3(uint64_t a, uint64_t b, uint64_t c) {
 //     tensor[slot_idx // page_size,
 //            (slot_idx % page_size) * num_bytes_per_token + byte_offset]
 //
-// row_stride_bytes is the dim-1 size of the underlying tensor in bytes (which may exceed
-// page_size * num_bytes_per_token; trailing bytes are skipped).
+// row_stride_bytes is the dim-0 stride of the underlying tensor in bytes (which may exceed
+// page_size * num_bytes_per_token; the remaining bytes are skipped).
 SGL_DEVICE void real_kv_load_uint4(
     const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset, uint64_t& word_lo, uint64_t& word_hi) {
   const int64_t row = slot_idx / src.page_size;

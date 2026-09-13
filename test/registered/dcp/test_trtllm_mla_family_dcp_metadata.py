@@ -229,7 +229,6 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
     PAGE_SIZE = 64
     DCP_SIZE = 4
     DCP_RANK = 2
-    MULTIPLIER = 3
     # Virtual page per request, deliberately not the identity so a missing
     # gather cannot coincide with the right answer.
     VIRTUAL_PAGES = [[5, 2, 9], [7, 0, 4], [1, 8, 6]]
@@ -277,7 +276,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             )
         return block_kv_indices.cpu(), local_seq_lens.cpu(), req_to_token.cpu()
 
-    def _reference(self, req_to_token, local_seq_lens, v2p, multiplier):
+    def _reference(self, req_to_token, local_seq_lens, v2p):
         """What each live entry must be, derived from the id-space definition."""
         rows = []
         for req in range(local_seq_lens.numel()):
@@ -290,7 +289,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                 if v2p is None:
                     row.append(collapsed_page)
                 else:
-                    row.append(max(int(v2p[collapsed_page]) * multiplier, 0))
+                    row.append(max(int(v2p[collapsed_page]), 0))
             rows.append(row)
         return rows
 
@@ -302,9 +301,9 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             self.assertTrue((table[req, len(row) :] == -1).all())
 
     def test_static_pool_entries_are_the_collapsed_page(self):
-        translator = SimpleNamespace(full_v2p_table=None, full_page_multiplier=1)
+        translator = SimpleNamespace(full_v2p_table=None)
         table, local_lens, req_to_token = self._fill(translator)
-        self._assert_matches(table, self._reference(req_to_token, local_lens, None, 1))
+        self._assert_matches(table, self._reference(req_to_token, local_lens, None))
 
     def test_unified_pool_entries_go_through_the_page_table(self):
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
@@ -314,25 +313,21 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             dtype=torch.int64,
             device="cuda",
         )
-        translator = SimpleNamespace(
-            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
-        )
+        translator = SimpleNamespace(full_v2p_table=v2p)
         table, local_lens, req_to_token = self._fill(translator)
-        expected = self._reference(req_to_token, local_lens, v2p.cpu(), self.MULTIPLIER)
+        expected = self._reference(req_to_token, local_lens, v2p.cpu())
         self._assert_matches(table, expected)
         # And it is genuinely a translation, not an accident of the fixture.
-        static = self._reference(req_to_token, local_lens, None, 1)
+        static = self._reference(req_to_token, local_lens, None)
         self.assertNotEqual(expected, static)
 
     def test_freed_page_lands_on_the_padding_sink(self):
         # A tombstoned (-1) v2p row must clamp to entry 0, the reserved
-        # padding page, rather than scale -1 into a wild block id.
+        # padding page, rather than emit -1 as a block id.
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
         v2p = torch.arange(num_pages, dtype=torch.int64, device="cuda")
         v2p[self.VIRTUAL_PAGES[0][0]] = -1
-        translator = SimpleNamespace(
-            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
-        )
+        translator = SimpleNamespace(full_v2p_table=v2p)
         table, _, _ = self._fill(translator)
         self.assertEqual(int(table[0, 0]), 0)
 
