@@ -38,6 +38,16 @@ This section explains how to configure the request tracing and export the trace 
 
     Replace `0.0.0.0:4317` with the actual endpoint of the OpenTelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
 
+    To distinguish multiple SGLang deployments in your tracing backend, set a service name with `--otlp-service-name`:
+    ```bash Command
+    python -m sglang.launch_server \
+      --enable-trace \
+      --otlp-traces-endpoint 0.0.0.0:4317 \
+      --otlp-service-name sglang-production \
+      <other options>
+    ```
+    If you omit `--otlp-service-name`, SGLang uses the standard `OTEL_SERVICE_NAME` environment variable when it is set and defaults to `sglang` otherwise. The CLI option takes precedence over the environment variable.
+
     To use the HTTP/protobuf span exporter, set the following environment variable and point to an HTTP endpoint, for example, `http://0.0.0.0:4318/v1/traces`.
     ```bash Command
     export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf

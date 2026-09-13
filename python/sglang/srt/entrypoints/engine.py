@@ -329,7 +329,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
