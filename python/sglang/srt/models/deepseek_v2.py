@@ -518,7 +518,8 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            # fp32 logits, one kernel for every M: bf16 rounding flips noaux_tc top-k.
+            return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
 
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
             logits = tiny_gemm_bf16(
