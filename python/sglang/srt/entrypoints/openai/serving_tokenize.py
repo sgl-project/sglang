@@ -56,7 +56,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 tokens = token_ids
                 count = len(token_ids)
             elif isinstance(request.prompt, str):
-                token_ids = tokenizer.encode(
+                token_ids = self._tokenize_text(
                     request.prompt,
                     add_special_tokens=request.add_special_tokens,
                 )
@@ -64,7 +64,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 count = len(token_ids)
             elif isinstance(request.prompt, list):
                 token_ids_list = [
-                    tokenizer.encode(
+                    self._tokenize_text(
                         text, add_special_tokens=request.add_special_tokens
                     )
                     for text in request.prompt
@@ -89,6 +89,13 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
+    def _tokenize_text(self, text: str, *, add_special_tokens: bool) -> List[int]:
+        token_ids = self.tokenizer_manager.tokenizer.encode(
+            text,
+            add_special_tokens=add_special_tokens,
+        )
+        return self.tokenizer_manager.normalize_dllm_prompt_token_ids(token_ids)
+
     def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
         if self.chat_serving is None:
             raise ValueError("Chat template tokenization requires a template manager.")
@@ -109,12 +116,14 @@ class OpenAIServingTokenize(OpenAIServingBase):
         ):
             return prompt_ids
         if isinstance(prompt_ids, str):
-            return self.tokenizer_manager.tokenizer.encode(
-                prompt_ids, add_special_tokens=False
+            return self._tokenize_text(
+                prompt_ids,
+                add_special_tokens=False,
             )
         if processed_messages.prompt:
-            return self.tokenizer_manager.tokenizer.encode(
-                processed_messages.prompt, add_special_tokens=False
+            return self._tokenize_text(
+                processed_messages.prompt,
+                add_special_tokens=False,
             )
 
         raise ValueError("Failed to render chat messages into token ids.")

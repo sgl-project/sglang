@@ -4,6 +4,19 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
+_DLLM_MODEL_PARAMS = {
+    "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+    "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
+    "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+}
+
+
+def get_dllm_model_params(model_config: ModelConfig) -> dict[str, int]:
+    arch = model_config.hf_config.architectures[0]
+    if arch not in _DLLM_MODEL_PARAMS:
+        raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+    return _DLLM_MODEL_PARAMS[arch]
+
 
 class DllmConfig:
     def __init__(
@@ -36,19 +49,9 @@ class DllmConfig:
             model_path=cfg.model_path,
             model_revision=cfg.revision,
         )
-        DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
-            "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-        }
-
-        arch = model_config.hf_config.architectures[0]
-        if arch in DLLM_PARAMS:
-            params = DLLM_PARAMS[arch]
-            block_size = params["block_size"]
-            mask_id = params["mask_id"]
-        else:
-            raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+        params = get_dllm_model_params(model_config)
+        block_size = params["block_size"]
+        mask_id = params["mask_id"]
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
