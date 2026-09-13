@@ -297,6 +297,39 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
 
+    def save_kv_cache_only(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        backend = get_attn_backend()
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not self.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        swa_loc = None
+        if (
+            hasattr(backend, "forward_metadata")
+            and backend.forward_metadata is not None
+        ):
+            swa_loc = getattr(backend.forward_metadata, "swa_out_cache_loc", None)
+        scales = (
+            backend._kv_write_scales(self)
+            if hasattr(backend, "_kv_write_scales")
+            else ()
+        )
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        backend.token_to_kv_pool.set_kv_buffer(
+            self,
+            KVWriteLoc(cache_loc, swa_loc),
+            k,
+            v,
+            *scales,
+        )
+
 
 def _unified_attention_with_output_impl(
     query: torch.Tensor,
