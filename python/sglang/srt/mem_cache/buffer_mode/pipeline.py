@@ -360,20 +360,22 @@ class BufferModePipeline:
     def _shared_host_requests(
         self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
     ) -> Optional[list[tuple[str, int]]]:
-        cc = self._cache.cache_controller
-        anchor = cc.mem_pool_host.anchor_entry.host_pool
         if self._shared_host_domain() is None:
             return None
-        requests = [(anchor.pool_label, kv_tokens)]
+        return [
+            (pool.pool_label, tokens)
+            for pool, tokens in self._host_staging_sizes(kv_tokens, aux_xfers)
+        ]
+
+    def _host_staging_sizes(self, kv_tokens, aux_xfers):
+        cc = self._cache.cache_controller
+        yield cc.mem_pool_host.anchor_entry.host_pool, kv_tokens
         for transfer in aux_xfers or ():
             if transfer.indices_from_pool is not None:
                 continue
             entry = cc.mem_pool_host.entry_map.get(transfer.name)
             if entry is not None:
-                requests.append(
-                    (entry.host_pool.pool_label, self._transfer_tokens(transfer))
-                )
-        return requests
+                yield entry.host_pool, self._transfer_tokens(transfer)
 
     def _host_request_units(
         self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
@@ -383,16 +385,21 @@ class BufferModePipeline:
         anchor = cc.mem_pool_host.anchor_entry.host_pool
         if self._shared_host_domain() is None:
             return kv_tokens
-        num_bytes = kv_tokens * anchor.size_per_token
-        for transfer in aux_xfers or ():
-            if transfer.indices_from_pool is not None:
-                continue
-            entry = cc.mem_pool_host.entry_map.get(transfer.name)
-            if entry is not None:
-                num_bytes += (
-                    self._transfer_tokens(transfer) * entry.host_pool.size_per_token
-                )
+        num_bytes = sum(
+            tokens * pool.size_per_token
+            for pool, tokens in self._host_staging_sizes(kv_tokens, aux_xfers)
+        )
         return (num_bytes + anchor.size_per_token - 1) // anchor.size_per_token
+
+    def _shared_backup_fits(self, requests, *, empty: bool = False) -> bool:
+        can_fit = self._shared_host_domain().can_fit_many_then(
+            requests, self._shared_load_reserve_requests(), empty=empty
+        )
+        if not empty:
+            can_fit = self._cache.cache_controller._sync_shared_host_value(
+                int(can_fit), torch.distributed.ReduceOp.MIN
+            )
+        return bool(can_fit)
 
     def _shared_load_reserve_requests(self) -> list[tuple[str, int]]:
         cc = self._cache.cache_controller
@@ -566,11 +573,7 @@ class BufferModePipeline:
             )
             if self._host_request_units(intent_tokens, aux_xfers) > max_write_units:
                 return True
-            return not self._shared_host_domain().can_fit_many_then(
-                shared_requests,
-                self._shared_load_reserve_requests(),
-                empty=True,
-            )
+            return not self._shared_backup_fits(shared_requests, empty=True)
         if intent_tokens > cc.mem_pool_host.size:
             return True
         for t in aux_xfers or ():
@@ -767,14 +770,7 @@ class BufferModePipeline:
             len(snapshot.hash_values) * self._cache.page_size, aux
         )
         if shared_requests is not None:
-            can_fit = self._shared_host_domain().can_fit_many_then(
-                shared_requests,
-                self._shared_load_reserve_requests(),
-            )
-            can_fit = cc._sync_shared_host_value(
-                int(can_fit), torch.distributed.ReduceOp.MIN
-            )
-            return not bool(can_fit)
+            return not self._shared_backup_fits(shared_requests)
         if not aux:
             return False
         for t in aux:

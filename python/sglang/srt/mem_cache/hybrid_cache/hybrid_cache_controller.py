@@ -650,6 +650,40 @@ class HybridCacheController(BaseHiCacheController):
             transfer.host_indices = indices
         return allocated[0]
 
+    def allocate_storage_hit(
+        self,
+        operation: StorageOperation,
+        hit_tokens: int,
+        *,
+        allow_partial: bool,
+        evict_host: Callable[[int], int],
+    ) -> tuple[Optional[torch.Tensor], int]:
+        host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
+        if host_indices is None and not shared:
+            evict_host(hit_tokens)
+            host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        if host_indices is not None or not allow_partial:
+            return host_indices, hit_tokens
+
+        if shared:
+            low, high = 0, hit_tokens // self.page_size
+            while low < high:
+                mid = (low + high + 1) // 2
+                if self.can_fit_prefetch_host_buffers(
+                    operation, mid * self.page_size, empty=False
+                ):
+                    low = mid
+                else:
+                    high = mid - 1
+            alloc_len = low * self.page_size
+        else:
+            available = self.mem_pool_host.available_size()
+            alloc_len = min(hit_tokens, available - available % self.page_size)
+        if alloc_len >= self.prefetch_threshold:
+            host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
+        return host_indices, alloc_len
+
     def free_prefetch_host_buffers(
         self, operation: StorageOperation, host_indices: torch.Tensor
     ) -> None:
