@@ -378,9 +378,30 @@ class TestIpcQuantAllowlist(CustomTestCase):
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
 
+    def test_mxfp4_exact_format_is_ipc_supported(self):
+        config = {
+            "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 4,
+                        "group_size": 32,
+                        "scale_dtype": "torch.uint8",
+                        "type": "float",
+                        "strategy": "group",
+                    }
+                }
+            },
+        }
+        self.assertTrue(is_ipc_quant_supported("compressed-tensors", config))
+        bad = dict(config)
+        bad["format"] = "mxfp4"
+        self.assertFalse(is_ipc_quant_supported("compressed-tensors", bad))
+
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
+        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "compressed-tensors"})
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
@@ -520,6 +541,61 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
             )
         get_uuid.assert_called_once_with(5)
         self.assertIsNone(result)  # no real daemon at that socket -> absent
+
+    def test_rebuilds_k3_qkv_conv_weight_view(self):
+        """K3's KDA kernel consumes a plain squeeze view, not a state tensor."""
+        from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        class K3Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv_conv1d = torch.nn.Module()
+                self.qkv_conv1d.weight = torch.nn.Parameter(torch.zeros(6, 1, 4))
+                self.attn = RadixLinearAttention(
+                    layer_id=0,
+                    num_q_heads=1,
+                    num_k_heads=1,
+                    num_v_heads=1,
+                    head_q_dim=4,
+                    head_k_dim=4,
+                    head_v_dim=4,
+                    conv_weights=self.qkv_conv1d.weight.squeeze(1),
+                )
+
+        model = K3Layer()
+        model.qkv_conv1d.weight = torch.nn.Parameter(torch.ones(6, 1, 4))
+        IpcModelLoader._rebuild_stale_views(model)
+        self.assertEqual(
+            model.attn.conv_weights.data_ptr(), model.qkv_conv1d.weight.data_ptr()
+        )
+        self.assertTrue(torch.equal(model.attn.conv_weights, torch.ones(6, 4)))
+
+    def test_rebuilds_k3_topk_correction_bias_reference(self):
+        """TopK stores the gate bias as a plain, non-state tensor reference."""
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        class K3MoE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate = torch.nn.Module()
+                self.gate.e_score_correction_bias = torch.nn.Parameter(torch.zeros(8))
+                self.topk = SimpleNamespace(
+                    topk_config=SimpleNamespace(
+                        correction_bias=self.gate.e_score_correction_bias
+                    )
+                )
+
+        model = K3MoE()
+        old_bias = model.topk.topk_config.correction_bias
+        model.gate.e_score_correction_bias = torch.nn.Parameter(torch.ones(8))
+        IpcModelLoader._rebuild_stale_views(model)
+
+        self.assertIsNot(model.topk.topk_config.correction_bias, old_bias)
+        self.assertIs(
+            model.topk.topk_config.correction_bias,
+            model.gate.e_score_correction_bias,
+        )
 
 
 if __name__ == "__main__":

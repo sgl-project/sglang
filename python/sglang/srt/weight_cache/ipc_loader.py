@@ -21,6 +21,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
+    _post_load_weights,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -32,6 +33,7 @@ from .protocol import (
     get_quant_method_name,
     get_socket_path,
     hash_quant_config,
+    is_ipc_mxfp4_config,
     recv_msg,
     send_msg,
 )
@@ -168,6 +170,10 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+        # Build K3's derived decode state only after repairing construction-time
+        # references. Otherwise _prepare_fused_decode caches meta-device views
+        # in _k3_fused_decode_args even though the owning parameters were mapped.
+        _post_load_weights(model)
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
@@ -245,10 +251,11 @@ class IpcModelLoader(BaseModelLoader):
     def _rebuild_stale_views(model):
         """Rebuild tensor views that went stale after IPC weight replacement.
 
-        RadixLinearAttention.conv_weights is a view of conv1d.weight created
-        during __init__. After IPC mapping replaces conv1d.weight with a new
-        tensor, the old view still points to meta-device storage. Recreate
-        it from the now-valid parameter.
+        RadixLinearAttention.conv_weights is a plain view created during model
+        construction. Generic linear-attention modules expose ``conv1d``;
+        Kimi-K3 exposes the same storage as ``qkv_conv1d``. After IPC mapping
+        replaces the owning parameter, the original view still points to meta
+        storage. Recreate it from the now-valid parameter.
         """
         try:
             from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -258,6 +265,8 @@ class IpcModelLoader(BaseModelLoader):
         count = 0
         for _, module in model.named_modules():
             conv1d = getattr(module, "conv1d", None)
+            if conv1d is None:
+                conv1d = getattr(module, "qkv_conv1d", None)
             attn = getattr(module, "attn", None)
             if conv1d is not None and isinstance(attn, RadixLinearAttention):
                 if hasattr(conv1d, "weight") and conv1d.weight is not None:
@@ -266,7 +275,29 @@ class IpcModelLoader(BaseModelLoader):
                     )
                     if hasattr(conv1d, "bias") and conv1d.bias is not None:
                         attn.bias = conv1d.bias
+                    # K3 passes these owners as plain tensor references into
+                    # RadixLinearAttention during construction. They are not
+                    # included in model.state_dict(), so replace them after
+                    # IPC replaces the owner parameters.
+                    if hasattr(module, "A_log"):
+                        attn.A_log = module.A_log
+                    if hasattr(module, "dt_bias"):
+                        attn.dt_bias = module.dt_bias
                     count += 1
+
+            # K3's TopK configuration retains a direct tensor reference to
+            # the gate correction bias. It is not a module parameter, so IPC
+            # replacement of gate.e_score_correction_bias leaves this field on
+            # the construction-time meta tensor unless it is rebound here.
+            gate = getattr(module, "gate", None)
+            topk = getattr(module, "topk", None)
+            topk_config = getattr(topk, "topk_config", None)
+            if (
+                gate is not None
+                and topk_config is not None
+                and hasattr(gate, "e_score_correction_bias")
+            ):
+                topk_config.correction_bias = gate.e_score_correction_bias
 
         if count > 0:
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
@@ -354,6 +385,9 @@ class IpcModelLoader(BaseModelLoader):
         new_params_count = 0
         map_tic = time.perf_counter()
 
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+        allow_ipc_dtype_adaptation = is_ipc_mxfp4_config(quant_config)
+
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
@@ -371,12 +405,16 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
-                    mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
-                        f"vs model={ref_param.shape}/{ref_param.dtype}"
-                    )
-                    del imported_tensor
-                    continue
+                    if not (
+                        allow_ipc_dtype_adaptation
+                        and imported_tensor.shape == ref_param.shape
+                    ):
+                        mismatched.append(
+                            f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                            f"vs model={ref_param.shape}/{ref_param.dtype}"
+                        )
+                        del imported_tensor
+                        continue
 
             # Replace or register the tensor in the model
             self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
@@ -443,7 +481,8 @@ class IpcModelLoader(BaseModelLoader):
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
+            f"({new_params_count} new post-quant), "
+            f"time={map_elapsed:.3f}s"
         )
 
         return model
