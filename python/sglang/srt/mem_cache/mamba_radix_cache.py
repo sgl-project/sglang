@@ -564,13 +564,6 @@ class MambaRadixCache(BasePrefixCache):
         # (a stop inside a committed spec chunk, or strip_thinking_cache).
         if is_insert and self.enable_mamba_extra_buffer:
             if (req.kv.mamba_last_track_seqlen or 0) > len(token_ids):
-                logger.debug(
-                    "mamba checkpoint dropped: tracked state past the key "
-                    "(cache_len=%s, token_ids_len=%s, rid=%s)",
-                    req.kv.mamba_last_track_seqlen,
-                    len(token_ids),
-                    req.rid,
-                )
                 is_insert = False
 
         if is_insert:

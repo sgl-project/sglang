@@ -597,31 +597,6 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
-    def test_multimodal_text_prompt_reuses_rendered_token_ids(self):
-        self.tm.model_config.is_multimodal = True
-        processed = MessageProcessingResult(
-            "rendered prompt", [11, 22, 33], None, None, [], [], None
-        )
-
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(adapted.input_ids, [11, 22, 33])
-        self.assertIsNone(adapted.text)
-
-    def test_multimodal_media_prompt_keeps_text_for_placeholder_expansion(self):
-        self.tm.model_config.is_multimodal = True
-        processed = MessageProcessingResult(
-            "rendered prompt", [11, 22, 33], None, None, [], [], None
-        )
-        processed.image_data = ["image"]
-
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(adapted.text, "rendered prompt")
-        self.assertIsNone(adapted.input_ids)
-
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",

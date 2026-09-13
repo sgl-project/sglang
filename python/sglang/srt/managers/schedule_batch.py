@@ -1396,18 +1396,10 @@ class Req(ReqDllmMixin):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
 
-    @property
-    def kv_key_capped_at_prompt(self) -> bool:
-        """Why a key can stop short: capped at the prompt, not at a stop.
-
-        The shortfall is then not a speculative overshoot.
-        """
-        return get_serving().strip_thinking_cache and self.reasoning_tokens > 0
-
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if self.kv_key_capped_at_prompt:
+        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
         if self.finished_len is None:
             return self.kv.kv_committed_len

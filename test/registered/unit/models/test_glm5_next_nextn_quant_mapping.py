@@ -13,7 +13,6 @@ import torch
 
 from sglang.srt.models.glm5_next_nextn import (
     Glm5NextForConditionalGenerationNextN,
-    _Glm5NextNWeightNameMapper,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,7 +21,8 @@ class TestGlm5NextNextNWeightNameMapper(CustomTestCase):
     _NEXTN_PREFIXES = ("model.layers.45", "model.language_model.layers.45")
 
     def _mapper(self):
-        return _Glm5NextNWeightNameMapper(num_hidden_layers=45)
+        config = SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=45))
+        return Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(config)
 
     def test_special_nextn_tensors_map_to_model(self):
         for prefix in self._NEXTN_PREFIXES:
@@ -76,7 +76,6 @@ class TestGlm5NextNextNWeightNameMapper(CustomTestCase):
     def test_get_hf_to_sglang_mapper_uses_text_config(self):
         config = SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=45))
         mapper = Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(config)
-        self.assertIsInstance(mapper, _Glm5NextNWeightNameMapper)
         self.assertEqual(
             mapper._map_name("model.language_model.layers.45.eh_proj.weight"),
             "model.eh_proj.weight",

@@ -375,7 +375,10 @@ def sparse_attention_fwd_kernel_v1(
                 if has_tail:
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         K_tail_shared[bi_i, d_i] = KV[
-                            b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                            b_i,
+                            Indices[b_i, s_i, g_i, i_i * BI + bi_i],
+                            g_i,
+                            D + d_i,
                         ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):

@@ -530,8 +530,6 @@ class MambaComponent(TreeComponent):
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
         cache_len = req.kv.mamba_last_track_seqlen or 0
 
-        if req.kv_key_capped_at_prompt:
-            return cache_len, keep_idx
         if cache_len <= token_ids_len:
             return cache_len, keep_idx
 

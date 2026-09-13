@@ -1,51 +1,20 @@
-"""Exercise the metadata-only gate without initializing a distributed server."""
-
-import __future__
-
-import ast
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sglang.srt.layers.attention.linear.kda_backend as kda_backend
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def _load_gate(*, hip=True, gfx950=True):
-    source = (
-        Path(__file__).resolve().parents[5]
-        / "python/sglang/srt/layers/attention/linear/kda_backend.py"
-    )
-    tree = ast.parse(source.read_text())
-    backend = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "KDAAttnBackend"
-    )
-    gate = next(
-        n
-        for n in backend.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_can_run_fused_chain_verify"
-    )
-    namespace = {
-        "torch": torch,
-        "is_hip": lambda: hip,
-        "is_gfx95_supported": lambda: gfx950,
-    }
-    exec(
-        compile(
-            ast.Module(body=[gate], type_ignores=[]),
-            str(source),
-            "exec",
-            flags=__future__.annotations.compiler_flag,
-        ),
-        namespace,
-    )
-    return namespace[gate.name]
+def _load_gate(monkeypatch, *, hip=True, gfx950=True):
+    monkeypatch.setattr(kda_backend, "is_hip", lambda: hip)
+    monkeypatch.setattr(kda_backend, "is_gfx95_supported", lambda: gfx950)
+    return KDAAttnBackend._can_run_fused_chain_verify
 
 
 class _CudaMetadata:
@@ -106,8 +75,8 @@ def _inputs(batch, *, tokens=6, heads=16, head_dim=128, weight_dtype=torch.float
         (16, 8),  # supported max batch, T=8
     ],
 )
-def test_hip_only_routes_supported_batch_range(batch, tokens):
-    gate = _load_gate()
+def test_hip_only_routes_supported_batch_range(monkeypatch, batch, tokens):
+    gate = _load_gate(monkeypatch)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
     assert gate(backend, **_inputs(batch, tokens=tokens)) is (batch <= 16)
 
@@ -119,26 +88,26 @@ def test_hip_only_routes_supported_batch_range(batch, tokens):
         dict(heads=8),
     ],
 )
-def test_hip_unmeasured_shapes_fall_back(changes):
-    gate = _load_gate()
+def test_hip_unmeasured_shapes_fall_back(monkeypatch, changes):
+    gate = _load_gate(monkeypatch)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
     assert not gate(backend, **_inputs(4, **changes))
 
 
-def test_hip_unmeasured_architecture_falls_back():
-    gate = _load_gate(gfx950=False)
+def test_hip_unmeasured_architecture_falls_back(monkeypatch):
+    gate = _load_gate(monkeypatch, gfx950=False)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
     assert not gate(backend, **_inputs(4))
 
 
-def test_cuda_keeps_existing_shape_coverage():
-    gate = _load_gate(hip=False)
+def test_cuda_keeps_existing_shape_coverage(monkeypatch):
+    gate = _load_gate(monkeypatch, hip=False)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
     assert gate(backend, **_inputs(32, tokens=4, weight_dtype=torch.bfloat16))
 
 
-def test_tree_and_disabled_paths_stay_unfused():
-    gate = _load_gate()
+def test_tree_and_disabled_paths_stay_unfused(monkeypatch):
+    gate = _load_gate(monkeypatch)
     backend = SimpleNamespace(_fused_chain_verify_fn=None)
     kwargs = _inputs(4)
     assert not gate(backend, **kwargs)
