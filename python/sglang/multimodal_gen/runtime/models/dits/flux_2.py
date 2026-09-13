@@ -960,6 +960,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             freqs_complex=complex_freqs,
             is_neox=False,
             allow_inplace=True,
+            allow_strided_qk=True,
         )
         hidden_states = self.attn(
             query,
