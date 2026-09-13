@@ -1,0 +1,17 @@
+{
+  "_comment": "Consistency thresholds for Intel Arc Pro B60 (XPU). The GT images are CUDA-generated, and XPU seeds its initial latent noise from a different RNG stream, so pixels cannot match: the image is semantically identical (CLIP stays high) while ssim/psnr/mean_abs_diff degrade. Per-case entries below are only tuned where an XPU run has actually been measured; the rest are inherited from h100.json and will need the same treatment as they are triaged.",
+  "cases": {
+    "qwen_image_t2i_2_gpus": {
+      "clip_threshold": 0.98,
+      "ssim_threshold": 0.79,
+      "psnr_threshold": 15.7,
+      "mean_abs_diff_threshold": 17.2
+    },
+    "fsdp-inference": {
+      "clip_threshold": 0.97,
+      "ssim_threshold": 0.6,
+      "psnr_threshold": 11.0,
+      "mean_abs_diff_threshold": 37.0
+    }
+  }
+}
