@@ -41,6 +41,7 @@ from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -48,6 +49,56 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("inplace_allreduce", [False, True])
+@pytest.mark.parametrize("alias_output", [False, True])
+def test_deterministic_reduce_scatter_preserves_input_and_selects_rank_shard(
+    monkeypatch, rank, inplace_allreduce, alias_output
+):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.rank_in_group = rank
+    coordinator.world_size = 4
+    # Flattened input is a valid reduce-scatter layout too.
+    input_ = torch.arange(24, dtype=torch.float32)
+    original = input_.clone()
+    output = input_.view(4, 2, 3)[rank] if alias_output else torch.empty((2, 3))
+    reduced = original + 100
+
+    def all_reduce(tensor):
+        assert tensor.data_ptr() != input_.data_ptr()
+        torch.testing.assert_close(tensor, original)
+        if inplace_allreduce:
+            tensor.copy_(reduced)
+            return tensor
+        return reduced
+
+    coordinator.all_reduce = Mock(side_effect=all_reduce)
+    coordinator._reduce_scatter_tensor = Mock(side_effect=AssertionError)
+    coordinator.reduce_scatter_tensor(output, input_)
+    torch.testing.assert_close(output, reduced.view(4, 2, 3)[rank])
+    if alias_output:
+        original.view(4, 2, 3)[rank].copy_(output)
+    torch.testing.assert_close(input_, original)
+    coordinator.all_reduce.assert_called_once()
+
+
+def test_nondeterministic_reduce_scatter_keeps_native_path(monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "0")
+    monkeypatch.setattr(parallel_state, "_is_cpu", True)
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator._reduce_scatter_tensor = Mock()
+    coordinator.all_reduce = Mock(side_effect=AssertionError)
+    input_ = torch.arange(8, dtype=torch.float32)
+    output = torch.empty(2)
+    coordinator.reduce_scatter_tensor(output, input_)
+    coordinator._reduce_scatter_tensor.assert_called_once_with(output, input_)
 
 
 def test_custom_allreduce_precedes_symmetric_memory_pynccl():

@@ -1086,7 +1086,17 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            assert input.numel() == output.numel() * self.world_size
+            # Reduction order must be independent of the receiving rank.
+            # Preserve input even when all_reduce mutates its argument.
+            reduced = self.all_reduce(input.clone())
+            output.copy_(
+                reduced.reshape(-1)
+                .narrow(0, self.rank_in_group * output.numel(), output.numel())
+                .view_as(output)
+            )
+        elif _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):

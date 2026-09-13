@@ -1296,6 +1296,10 @@ def ep_scatter_from_psum(
         BLOCK_E=BLOCK_E,
     )
 
+    # The BF16 specialization never dereferences these scale pointers.
+    recv_x_scale_arg = recv_x_scale if is_fp8 else recv_x
+    output_tensor_scale_arg = output_tensor_scale if is_fp8 else output_tensor
+
     grid = min(recv_topk.shape[0], 1024 * 8)
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
@@ -1303,7 +1307,7 @@ def ep_scatter_from_psum(
         recv_x,
         recv_x.stride(0),
         recv_x.stride(1),
-        recv_x_scale,
+        recv_x_scale_arg,
         recv_x_scale.stride(0) if is_fp8 else 0,
         recv_x_scale.stride(1) if is_fp8 else 0,
         recv_topk,
@@ -1312,12 +1316,15 @@ def ep_scatter_from_psum(
         output_tensor,
         output_tensor.stride(0),
         output_tensor.stride(1),
-        output_tensor_scale,
+        output_tensor_scale_arg,
         output_tensor_scale.stride(0) if is_fp8 else 0,
         output_tensor_scale.stride(1) if is_fp8 else 0,
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        # DeepEP v2 already rebases recv_topk to local expert IDs.
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
