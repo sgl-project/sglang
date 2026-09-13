@@ -106,6 +106,9 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     def supports_fp8(self) -> bool:
         return True
 
+    def supports_dflash(self) -> bool:
+        return True
+
     def support_cuda_graph(self) -> bool:
         return True
 

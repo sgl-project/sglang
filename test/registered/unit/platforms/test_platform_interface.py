@@ -209,6 +209,13 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_dflash_capability_defaults_to_existing_platform_support(self):
+        class NpuPlatform(SRTPlatform):
+            _enum = PlatformEnum.NPU
+
+        self.assertFalse(SRTPlatform().supports_dflash())
+        self.assertTrue(NpuPlatform().supports_dflash())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -252,6 +259,7 @@ class TestCudaDeviceMixin(CustomTestCase):
     def test_cuda_srt_platform_capabilities(self):
         base = CudaSRTPlatform()
         self.assertTrue(base.supports_fp8())
+        self.assertTrue(base.supports_dflash())
         self.assertTrue(base.support_cuda_graph())
         self.assertTrue(base.support_piecewise_cuda_graph())
 

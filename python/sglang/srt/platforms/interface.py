@@ -103,6 +103,14 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
+    def supports_dflash(self) -> bool:
+        """Whether this platform supports DFlash speculative decoding.
+
+        NPU support predates the platform capability interface, so retain it
+        here while allowing other out-of-tree platforms to opt in explicitly.
+        """
+        return self.is_npu()
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
