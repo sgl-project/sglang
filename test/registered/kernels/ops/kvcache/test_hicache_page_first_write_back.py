@@ -78,6 +78,18 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
         ALLOC_MEMORY_FUNCS[DEVICE] = original_alloc
 
 
+def _registered_host_pool(host_pool_cls, **kwargs):
+    return host_pool_cls(
+        host_to_device_ratio=2.0,
+        host_size=0,
+        page_size=PAGE_SIZE,
+        pin_memory=True,
+        device="cpu",
+        allocator_type="default",
+        **kwargs,
+    )
+
+
 def _fill_with_offset(tensor: torch.Tensor, offset: int) -> None:
     data = torch.arange(
         tensor.numel(), device=tensor.device, dtype=tensor.dtype
@@ -253,6 +265,96 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+@pytest.mark.parametrize("pool_kind", ["mha", "mla"])
+def test_registered_mmap_page_first_kernel_operands_and_graph(
+    pool_kind: str,
+) -> None:
+    if pool_kind == "mha":
+        device_pool = MHATokenToKVPool(
+            size=PAGE_SIZE * 4,
+            page_size=PAGE_SIZE,
+            head_num=1,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            layer_num=1,
+            device=DEVICE,
+            enable_memory_saver=False,
+        )
+        host_pool = _registered_host_pool(
+            MHATokenToKVPoolHost,
+            device_pool=device_pool,
+            layout="page_first",
+        )
+        host_refs = [host_pool.k_data_refs[0], host_pool.v_data_refs[0]]
+        device_refs = [device_pool.k_buffer[0], device_pool.v_buffer[0]]
+    else:
+        device_pool = MLATokenToKVPool(
+            size=PAGE_SIZE * 4,
+            page_size=PAGE_SIZE,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            dtype=torch.bfloat16,
+            layer_num=1,
+            device=DEVICE,
+            enable_memory_saver=False,
+        )
+        host_pool = _registered_host_pool(
+            MLATokenToKVPoolHost,
+            device_pool=device_pool,
+            layout="page_first",
+        )
+        host_refs = [host_pool.data_refs[0]]
+        device_refs = [device_pool.kv_buffer[0]]
+
+    graph = None
+    try:
+        assert host_pool.can_use_jit
+        for index, host_ref in enumerate(host_refs):
+            _fill_with_offset(host_ref, index + 3)
+
+        host_indices = _token_indices_for_pages(torch.tensor([0]))
+        aot_device_indices = _token_indices_for_pages(torch.tensor([1]))
+        host_pool.can_use_jit = False
+        host_pool.load_to_device_per_layer(
+            device_pool, host_indices, aot_device_indices, 0, "kernel"
+        )
+        torch.cuda.synchronize()
+        for host_ref, device_ref in zip(host_refs, device_refs):
+            _assert_pages_equal(
+                host_ref,
+                device_ref,
+                torch.tensor([0]),
+                torch.tensor([1]),
+            )
+
+        graph_device_indices = _token_indices_for_pages(torch.tensor([2]))
+        host_pool.can_use_jit = True
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                host_pool.load_to_device_per_layer(
+                    device_pool, host_indices, graph_device_indices, 0, "kernel"
+                )
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        for device_ref in device_refs:
+            device_ref.index_fill_(0, graph_device_indices, 0)
+        graph.replay()
+        torch.cuda.synchronize()
+        for host_ref, device_ref in zip(host_refs, device_refs):
+            _assert_pages_equal(
+                host_ref,
+                device_ref,
+                torch.tensor([0]),
+                torch.tensor([2]),
+            )
+    finally:
+        torch.cuda.synchronize()
+        del graph
+        host_pool.destroy()
 
 
 if __name__ == "__main__":
