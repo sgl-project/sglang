@@ -27,10 +27,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    PoolName,
-    PoolTransfer,
     count_pool_hits,
 )
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator

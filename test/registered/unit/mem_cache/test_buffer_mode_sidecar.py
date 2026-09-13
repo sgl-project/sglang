@@ -12,11 +12,11 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     _UnifiedBackupIntent,
     validate_buffer_only_stack,
 )
-from sglang.srt.mem_cache.hicache_storage import (
+from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
+from sglang.srt.mem_cache.pool_transfer import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (

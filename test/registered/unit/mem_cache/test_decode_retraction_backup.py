@@ -7,9 +7,9 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import retraction_backup
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.pool_transfer import PoolName
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler

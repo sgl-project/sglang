@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import (
+from sglang.srt.mem_cache.pool_transfer import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,

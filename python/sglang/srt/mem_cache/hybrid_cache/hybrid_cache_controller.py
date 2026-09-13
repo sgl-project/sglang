@@ -26,15 +26,17 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
-    PoolHitPolicy,
-    PoolName,
-    PoolTransfer,
-    PoolTransferResult,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_transfer import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator

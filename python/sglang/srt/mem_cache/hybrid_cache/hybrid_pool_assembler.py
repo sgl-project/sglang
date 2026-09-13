@@ -4,11 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -26,6 +22,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_transfer import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import (
     get_memory,

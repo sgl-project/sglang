@@ -23,7 +23,7 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
+from sglang.srt.mem_cache.pool_transfer import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,

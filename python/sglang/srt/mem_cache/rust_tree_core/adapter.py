@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.pool_transfer import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -61,7 +61,7 @@ from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hicache_storage import PoolTransferResult
+    from sglang.srt.mem_cache.pool_transfer import PoolTransferResult
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,

@@ -10,11 +10,6 @@ import torch
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    PoolTransfer,
-)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -29,6 +24,11 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_transfer import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

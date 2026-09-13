@@ -14,7 +14,7 @@ from fastapi.responses import ORJSONResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.pool_transfer import PoolName
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import Hf3fsMetadataInterface
 
 # --- Configuration ---
