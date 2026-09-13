@@ -9,13 +9,14 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import (
     Any,
     Dict,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -24,8 +25,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
 
 
-@dataclasses.dataclass
-class Memory:
+class Memory(msgspec.Struct):
     """Namespace ``memory``."""
 
     _NS_PATH = "memory"
@@ -41,8 +41,12 @@ class Memory:
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            resolvable=True,
         ),
     ] = "lru"
+    # The value alone cannot distinguish the default from an explicit LRU
+    # choice, which model-specific defaults must preserve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -139,11 +143,12 @@ class Memory:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
                 "mooncake",
+                "npu_memcache",
                 "hf3fs",
                 "nixl",
                 "aibrix",
