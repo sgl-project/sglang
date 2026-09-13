@@ -605,9 +605,7 @@ def accept_greedy(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
-        bs, verify_num_draft_tokens
-    )
+    target_predict = _row_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -649,6 +647,24 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
+def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """``logits.argmax(-1)``; the speculative shape is few rows over a wide vocab,
+    where ``torch.argmax``'s single-block-per-row reduction is ~7x off the memory
+    the reduction touches. Falls back for anything the split kernel does not cover."""
+    if (
+        logits.is_cuda
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.shape[0] <= 64
+        and logits.shape[1] >= 4096
+    ):
+        from sglang.kernels.ops.speculative.dspark.fast_argmax import fast_row_argmax
+
+        return fast_row_argmax(logits)
+    return torch.argmax(logits, dim=-1)
+
+
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
@@ -657,9 +673,7 @@ def accept_greedy_triton(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
-        bs, verify_num_draft_tokens
-    )
+    target_predict = _row_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
