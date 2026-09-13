@@ -35,6 +35,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "quality",
 }
 
+MIN_INPUT_MAX_PIXELS = 512 * 512
+
 
 @dataclass
 class SenseNovaU1SamplingParams(SamplingParams):
@@ -45,12 +47,15 @@ class SenseNovaU1SamplingParams(SamplingParams):
     fps: int = 1
     num_inference_steps: int = 50
     guidance_scale: float = 4.0
+    img_cfg_scale: float = 1.0
     cfg_norm: str = DEFAULT_CFG_NORM
     timestep_shift: float = DEFAULT_TIMESTEP_SHIFT
     enable_timestep_shift: bool = DEFAULT_ENABLE_TIMESTEP_SHIFT
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    input_max_pixels: int | None = None
+    do_resize: bool = True
     negative_prompt: None = field(default=None, init=False)
 
     @classmethod
@@ -91,6 +96,17 @@ class SenseNovaU1SamplingParams(SamplingParams):
                 f"cfg_norm must be one of {SENSENOVA_U1_CFG_NORM_CHOICES}, "
                 f"got {self.cfg_norm!r}"
             )
+        if self.img_cfg_scale < 0:
+            raise ValueError(
+                f"img_cfg_scale must be non-negative, got {self.img_cfg_scale!r}"
+            )
+        if self.input_max_pixels is not None and (
+            self.input_max_pixels < MIN_INPUT_MAX_PIXELS
+        ):
+            raise ValueError(
+                "input_max_pixels must be at least "
+                f"{MIN_INPUT_MAX_PIXELS}, got {self.input_max_pixels!r}"
+            )
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
         start, end = self.cfg_interval
@@ -108,5 +124,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_interval": tuple(self.cfg_interval),
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
+            "img_cfg_scale": self.img_cfg_scale,
+            "input_max_pixels": self.input_max_pixels,
+            "do_resize": self.do_resize,
         }
         return extra
