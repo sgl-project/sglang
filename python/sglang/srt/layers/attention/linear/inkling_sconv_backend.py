@@ -276,7 +276,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._refresh_cache_indices()
 
     def _prepare_track_indices(self, forward_batch: ForwardBatch):
-        indices = forward_batch.mamba_track_indices
+        # Replay metadata views may omit optional checkpoint tracking.
+        indices = getattr(forward_batch, "mamba_track_indices", None)
         if indices is None:
             return
         n = indices.shape[0]
@@ -453,6 +454,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         ``batch_size`` rows while the track lengths cover only live requests, and
         every row it may read must index inside *this* replay's token buffer.
         """
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # Draft extend snapshots the accepted window in its own cache update.
+            # Inert prefill tracking would overwrite its checkpoint destinations.
+            self.sconv_metadata.track_conv_indices = None
+            return
         if forward_batch.mamba_track_mask is None:
             if not on_graph_path:
                 self.sconv_metadata.track_conv_indices = None

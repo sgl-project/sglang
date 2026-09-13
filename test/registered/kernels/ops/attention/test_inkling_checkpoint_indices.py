@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -24,14 +24,16 @@ from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestInklingCheckpointIndices(CustomTestCase):
-    def make_backend(self, *, lazy=False, static=False, slot_count=6):
+    def make_backend(
+        self, *, lazy=False, static=False, slot_count=6, draft_token_num=None
+    ):
         mamba = MambaSubPoolSpec(
             name="mamba",
             layer_num=2,
@@ -99,7 +101,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
             ),
             patch(
                 _BACKEND + ".get_spec",
-                return_value=SimpleNamespace(speculative_num_draft_tokens=None),
+                return_value=SimpleNamespace(
+                    speculative_num_draft_tokens=draft_token_num
+                ),
             ),
         ):
             backend._alloc_graph_buffers()
@@ -388,6 +392,243 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     scatter.call_args.args[1],
                     backend._translate_mamba_indices(slots[1:2].to(torch.int32)),
                 )
+
+    def test_missing_tracking_field_still_refreshes_active_slots(self):
+        backend, allocator, _, slots = self.make_backend()
+        allocator.free(slots[:1].clone())
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            req_pool_indices=torch.tensor([0], device="cuda"),
+        )
+        backend.init_forward_metadata_out_graph(batch)
+        torch.testing.assert_close(
+            backend._cache_indices,
+            backend._translate_mamba_indices(slots[1:2]).to(torch.int32),
+        )
+
+    def test_draft_runners_capture_and_replay_checkpoint_destinations(self):
+        for multilayer in (False, True):
+            for static in (False, True):
+                for tracking in (False, True):
+                    with self.subTest(
+                        multilayer=multilayer, static=static, tracking=tracking
+                    ):
+                        self._check_draft_checkpoint_replay(
+                            multilayer, static, tracking
+                        )
+
+    def _make_draft_checkpoint_runner(self, multilayer, static, tracking):
+        from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
+        from sglang.srt.speculative import (
+            multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
+        )
+
+        backend, allocator, pool, slots = self.make_backend(
+            lazy=True, static=static, slot_count=12, draft_token_num=4
+        )
+        backend.mamba_cache_chunk_size = 4
+        req_pool = backend.req_to_token_pool
+        req_pool.req_index_to_mamba_index_mapping = torch.cat(
+            [slots.new_zeros(1), slots[1:5]]
+        ).to(torch.int32)
+        buffers = SimpleNamespace(
+            input_ids=torch.zeros(16, dtype=torch.int64, device="cuda"),
+            req_pool_indices=torch.arange(1, 5, device="cuda"),
+            mamba_track_indices=slots[-4:].clone() if tracking else None,
+            out_cache_loc=torch.zeros(16, dtype=torch.int64, device="cuda"),
+            positions=torch.zeros(16, dtype=torch.int64, device="cuda"),
+            mrope_positions=torch.zeros(3, 16, dtype=torch.int64, device="cuda"),
+            hidden_states=torch.zeros(16, 64, dtype=torch.bfloat16, device="cuda"),
+            seq_lens=torch.full((4,), 6, dtype=torch.int64, device="cuda"),
+            seq_lens_cpu=torch.full((4,), 6, dtype=torch.int64),
+            extend_seq_lens=torch.full((4,), 4, dtype=torch.int32, device="cuda"),
+            extend_start_loc=torch.arange(0, 16, 4, device="cuda"),
+            num_correct_drafts=torch.ones(4, dtype=torch.int32, device="cuda"),
+            num_accept_tokens=torch.full((4,), 3, dtype=torch.int32, device="cuda"),
+            select_index=torch.arange(0, 16, 4, device="cuda"),
+            next_token_logits_buffer=torch.zeros(16, 8, device="cuda"),
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dsa_seed_topk_capture=None,
+            temperatures=None,
+            draft_probs=None,
+        )
+        cls = (
+            multi.MultiLayerEagleDraftExtendCudaGraphRunner
+            if multilayer
+            else eagle.EAGLEDraftExtendCudaGraphRunner
+        )
+        runner = cls.__new__(cls)
+        runner.buffers = buffers
+        runner.captured_req_width = 4
+        runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        runner.extend_seq_lens_cpu = [4] * 4
+        runner.require_mlp_tp_gather = False
+        runner.require_attn_tp_gather = False
+        runner.require_gathered_buffer = False
+        runner.capture_bs = [4]
+        runner.seq_len_fill_value = 4
+        runner.num_front_tokens = 0
+        runner.prune_draft_extend_logits = False
+        runner.metadata_captured_in_graph = False
+        runner.step = 0
+        runner.deepep_adapter = Mock()
+        runner.device_module = torch.cuda
+        runner.attn_backend = SimpleNamespace(
+            supports_draft_extend_metadata_staging=False
+        )
+        runner.draft_extend_attn_backend = backend
+        runner.eagle_worker = SimpleNamespace(draft_extend_attn_backend_list=[backend])
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+            device_timer=None,
+            canary_manager=None,
+        )
+        return runner, backend, allocator, pool, slots, buffers
+
+    def _check_draft_checkpoint_replay(self, multilayer, static, tracking):
+        from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
+        from sglang.srt.speculative import (
+            multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        runner, backend, allocator, pool, slots, buffers = (
+            self._make_draft_checkpoint_runner(multilayer, static, tracking)
+        )
+        cache = pool.mamba_cache.conv[0][0]
+        captured = []
+        graph = torch.cuda.CUDAGraph()
+        output = SimpleNamespace(
+            next_token_logits=buffers.next_token_logits_buffer,
+            hidden_states=buffers.hidden_states,
+        )
+
+        def model_forward(input_ids, positions, batch):
+            if not captured:
+                captured.append(batch)
+            ShortConvolution._update_sconv_cache_for_draft_extend(
+                None, batch, cache, backend._cache_indices, buffers.hidden_states
+            )
+            return output
+
+        def capture_graph(key, run_once, **kwargs):
+            run_once()
+            with torch.cuda.graph(graph):
+                run_once()
+
+        runner.model_runner.model = SimpleNamespace(forward=model_forward)
+        runner.backend = SimpleNamespace(capture_one=capture_graph)
+        runner._replay_graph = lambda *args: (graph.replay(), output)[1]
+        sconv_module = "sglang.srt.models.inkling_common.sconv"
+        with (
+            patch(
+                sconv_module + ".get_exec",
+                return_value=SimpleNamespace(
+                    mamba=SimpleNamespace(
+                        mamba_track_interval=4, enable_mamba_extra_buffer=True
+                    )
+                ),
+            ),
+            patch.object(eagle, "maybe_flashinfer_autotune_speculative_draft"),
+            patch.object(eagle, "set_dp_buffer_len"),
+            patch.object(eagle, "set_is_extend_in_batch"),
+        ):
+            if multilayer:
+                batch = runner.get_forward_batch(4)
+                backend.init_forward_metadata_out_graph(batch, in_capture=True)
+
+                def run_once():
+                    backend.init_forward_metadata_in_graph(batch)
+                    return model_forward(batch.input_ids, batch.positions, batch)
+
+                capture_graph(None, run_once)
+            else:
+                runner.capture_one_shape(4, None)
+            pointer = captured[0].mamba_track_indices.data_ptr() if tracking else None
+            self.assertIsNone(backend.sconv_metadata.track_conv_indices)
+            for live in (4, 2, 1, 3, 4):
+                if live == 2 and not static:
+                    allocator.free(slots[:1].clone())
+                    allocator._flush(urgent=True)
+                ids = slots[-live:].flip(0).clone()
+                spec = EagleDraftExtendInput(
+                    hidden_states=buffers.hidden_states[: live * 4],
+                    num_correct_drafts=torch.ones(
+                        live, dtype=torch.int32, device="cuda"
+                    ),
+                    num_accept_tokens=torch.full(
+                        (live,), 3, dtype=torch.int32, device="cuda"
+                    ),
+                )
+                fresh = SimpleNamespace(
+                    batch_size=live,
+                    input_ids=buffers.input_ids[: live * 4],
+                    positions=buffers.positions[: live * 4],
+                    out_cache_loc=buffers.out_cache_loc[: live * 4],
+                    req_pool_indices=torch.arange(1, live + 1, device="cuda"),
+                    seq_lens=torch.full((live,), 6, dtype=torch.int64, device="cuda"),
+                    seq_lens_sum=6 * live,
+                    seq_lens_cpu=None,
+                    extend_seq_lens=torch.full(
+                        (live,), 4, dtype=torch.int32, device="cuda"
+                    ),
+                    extend_seq_lens_cpu=None,
+                    mamba_track_indices=ids if tracking and live != 3 else None,
+                    spec_info=spec,
+                )
+                cache.fill_(-7)
+                cache[0].zero_()
+                buffers.hidden_states.copy_(
+                    torch.arange(16, device="cuda")[:, None] + 1
+                )
+                original = ids.clone()
+                active = backend._translate_mamba_indices(slots[1 : live + 1]).long()
+                physical = backend._translate_mamba_indices(ids).long()
+                expected = cache.clone()
+                for row in range(live):
+                    joined = torch.cat(
+                        [
+                            cache[active[row]],
+                            buffers.hidden_states[row * 4 : (row + 1) * 4],
+                        ]
+                    )
+                    if tracking and live != 3:
+                        expected[physical[row]] = joined[1:4]
+                    expected[active[row]] = joined[3:6]
+                if multilayer:
+                    composite = multi.MultiLayerEagleMultiStepDraftExtendCudaGraphRunner.__new__(
+                        multi.MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
+                    )
+                    composite.buffers = buffers
+                    composite.captured_req_width = 4
+                    composite.require_mlp_tp_gather = False
+                    composite.require_gathered_buffer = False
+                    composite.capture_bs = [4]
+                    composite.num_front_tokens = 0
+                    composite.seq_len_fill_value = 4
+                    composite.runners = [runner]
+                    composite._stage_metadata = Mock()
+                    composite.prepare(fresh)
+                    runner.replay(
+                        4, composite.seq_lens_sum, composite._replay_spec_info, None
+                    )
+                else:
+                    runner.execute(fresh, torch.arange(live, device="cuda") * 4 + 1)
+                torch.testing.assert_close(cache[1:], expected[1:], rtol=0, atol=0)
+                torch.testing.assert_close(ids, original, rtol=0, atol=0)
+                if tracking:
+                    expected_ids = torch.zeros_like(buffers.mamba_track_indices)
+                    if live != 3:
+                        expected_ids[:live] = original
+                    torch.testing.assert_close(
+                        buffers.mamba_track_indices, expected_ids, rtol=0, atol=0
+                    )
+                    self.assertEqual(
+                        captured[0].mamba_track_indices.data_ptr(), pointer
+                    )
+                else:
+                    self.assertIsNone(captured[0].mamba_track_indices)
 
 
 if __name__ == "__main__":
