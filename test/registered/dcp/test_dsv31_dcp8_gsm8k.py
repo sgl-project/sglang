@@ -77,7 +77,7 @@ _COMMON_SERVER_ARGS = [
     "256",
     "--attention-backend",
     "flashinfer",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
     "--log-level",
     "info",
     "--log-requests",

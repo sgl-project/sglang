@@ -48,7 +48,7 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     74,
     "--mem-fraction-static",
     0.7,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     8,
     16,

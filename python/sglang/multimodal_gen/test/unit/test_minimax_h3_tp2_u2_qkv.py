@@ -76,6 +76,7 @@ def test_unvalidated_partitions_keep_full_qkv_ownership(partition):
         ("attention_head_dim", 64),
         ("checkpoint_uses_diffusers_layout", True),
         ("has_gate_compress", True),
+        ("hybrid_attention", object()),
     ],
 )
 def test_unvalidated_architectures_keep_full_qkv_ownership(field, value):

@@ -94,7 +94,6 @@ sources = [
     "csrc/speculative/packbit.cu",
     "csrc/speculative/speculative_sampling.cu",
     "csrc/kvcacheio/transfer.cu",
-    "csrc/gemm/awq_kernel.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/gemm/per_token_group_quant_8bit.cu",
     "csrc/gemm/per_token_group_quant_8bit_v2.cu",
