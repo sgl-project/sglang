@@ -2153,11 +2153,22 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
-                with patch(
-                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
-                    return_value=False,
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                        return_value=False,
+                    ),
+                    patch(
+                        # `handle_gpu_memory_settings` computes `gpu_mem` itself
+                        # now (`get_device_memory_capacity(cfg.device)`),
+                        # imported at module scope into `memory_hook` -- patch
+                        # the name where it is looked up, not its origin
+                        # module.
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=None,
+                    ),
                 ):
-                    handle_gpu_memory_settings(args, gpu_mem=None)
+                    handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 

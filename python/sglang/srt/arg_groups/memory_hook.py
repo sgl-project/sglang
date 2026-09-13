@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def handle_offload_compatibility(server_args: Any) -> None:
         )
 
 
-def handle_gpu_memory_settings(server_args: Any, gpu_mem):
+def handle_gpu_memory_settings(server_args: Any):
     """
     Configure GPU memory-dependent settings including
     chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
@@ -68,6 +69,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     )
 
     cfg = resolving_view(server_args)
+    gpu_mem = get_device_memory_capacity(cfg.device)
     # A copy, so an earlier declaration keeps the value it recorded.
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
