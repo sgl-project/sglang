@@ -11,9 +11,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
@@ -48,6 +45,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -327,7 +325,7 @@ class MossVLVisionModel(nn.Module):
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        # The vision rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
         rotary_pos_emb_full = self.rotary_pos_emb(
             torch.arange(max_grid_size, device=self.device)
         )

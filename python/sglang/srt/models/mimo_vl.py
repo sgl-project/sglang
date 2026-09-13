@@ -10,9 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -21,7 +18,11 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
+from sglang.srt.models.qwen2_5_vl import (
+    Qwen2_5_VisionPatchMerger,
+    Qwen2_5_VisionRotaryEmbedding,
+    Qwen2_5_VLMLP,
+)
 from sglang.srt.runtime_context import get_mm, get_server_args
 from sglang.srt.utils import add_prefix
 
@@ -389,7 +390,7 @@ class MiMoVisionTransformer(nn.Module):
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        # The vision rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
         rotary_pos_emb_full = self.rotary_pos_emb(
             torch.arange(max_grid_size, device=self.device)
         )
