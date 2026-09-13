@@ -1055,7 +1055,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if req.last_node is not None:
             self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
-        if is_insert and result is not None and result.last_device_node is not None:
+        if (
+            is_insert
+            and result is not None
+            and result.last_device_node is not None
+            and result.last_device_node != self.root_node.id
+        ):
             req.last_node = result.last_device_node
 
         # cleanup
