@@ -336,6 +336,7 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",
+    "elastic_ep_retiree_lifecycle",
     "elastic_ep_rejoin",
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",

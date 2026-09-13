@@ -142,10 +142,13 @@ def init_torch_distributed(
 
     # Draft workers reuse the target pool config and may exist on only one PP stage;
     # including them in this WORLD reduction would deadlock on absent peers.
+    solo_join = get_exec().moe.is_ep_offset_joiner  # Solo boot: no WORLD peers yet.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1 and not is_draft_worker,
+        distributed=(
+            not solo_join and get_world_group().world_size > 1 and not is_draft_worker
+        ),
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()
@@ -266,10 +269,14 @@ def _init_parallel_groups(
 ) -> None:
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
-    rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
+    is_offset_joiner = get_exec().moe.is_ep_offset_joiner
+    rank_offset = get_parallel().ep_join_rank_offset if is_offset_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
+    # Recover-into-retired-slot: WORLD is the launch cohort, not tp*pp.
+    if is_offset_joiner and not is_scale_joiner:
+        world_size = (server_args.elastic_ep_initial_size or tp_size) * pp_size
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
     init_distributed_environment(
@@ -293,9 +300,11 @@ def _init_parallel_groups(
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
+        # Only WORLD is extended during scale-up. The joiner's model-parallel
+        # groups are fixed groups local to its launch cohort.
+        recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
-        max_world_size=get_parallel().max_ep_size,
+        max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
