@@ -22,6 +22,18 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.sp import (
+    sp_cp_all_gather,
+    sp_cp_reduce_scatter,
+    sp_cp_reduce_scatter_rows,
+    sp_cp_static_enabled,
+)
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    cp_shard_position_ids,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -1218,6 +1230,10 @@ class Qwen4ExpLayerExtensionMixin:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.ple = None
+        # Sequence-parallel residual stream over collocated prefill CP
+        # (attn_cp_size == tp_size). Static per process; the per-forward
+        # decision (`sp`) additionally requires an active CP prefill.
+        self._sp_static = sp_cp_static_enabled()
 
         for attr_name in (
             "input_layernorm",
@@ -1269,6 +1285,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        sp: bool = False,
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1288,9 +1305,19 @@ class Qwen4ExpLayerExtensionMixin:
                 ple_query = (
                     hidden_states if residual is None else hidden_states + residual
                 )
-                hidden_states = hidden_states + self.ple(
-                    ple_query, forward_batch, ple_batch
-                )
+                if sp:
+                    # PLE needs the n-gram window and the short-conv history in
+                    # global token order: run it on the gathered bank exactly as
+                    # without CP, then keep this rank's zigzag rows of its output.
+                    ple_query_full = cp_gather_after_forward(ple_query, forward_batch)
+                    ple_out_full = self.ple(ple_query_full, forward_batch, ple_batch)
+                    hidden_states = hidden_states + cp_shard_hidden_states(
+                        ple_out_full, forward_batch
+                    )
+                else:
+                    hidden_states = hidden_states + self.ple(
+                        ple_query, forward_batch, ple_batch
+                    )
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
         return hidden_states, residual
@@ -1300,8 +1327,11 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        skip_reduce: bool = False,
     ):
-        if not forward_batch.forward_mode.is_idle():
+        # skip_reduce: the block output is already summed (SP reduce-scatter, or
+        # attention TP width 1 under collocated CP), so no attn-TP all-reduce.
+        if not forward_batch.forward_mode.is_idle() and not skip_reduce:
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
@@ -1317,9 +1347,20 @@ class Qwen4ExpLayerExtensionMixin:
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        sp: bool = False,
     ) -> torch.Tensor:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
+        if sp:
+            # Sequence-parallel MoE: the TP-sharded experts (and the shared
+            # expert) see every token. All-gather this rank's rows rank-major
+            # (row order is irrelevant for a token-wise MoE), run the block
+            # without its all-reduce, then reduce-scatter the TP partials so
+            # each rank gets the sum for its own rows. Same bytes as the
+            # all-reduce it replaces; router/top-k run on all rows (cheap).
+            gathered = sp_cp_all_gather(hidden_states)
+            partial = self.mlp(gathered, forward_batch, reduce_output=False)
+            return sp_cp_reduce_scatter(partial)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
@@ -1396,21 +1437,37 @@ class Qwen4ExpLinearDecoderLayer(
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
+        sp = bool(kwargs.get("sp", False))
 
         hidden_states, residual = self._prepare_qwen4_exp_attn(
             hidden_states,
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            sp=sp,
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(hidden_states, forward_batch)
+            if sp:
+                # The gated delta rule is a causal scan: gather the full
+                # sequence in global token order, run GDN with its heads folded
+                # over all TP(=CP) ranks, then sum the out_proj partials and
+                # keep this rank's zigzag rows in one reduce-scatter.
+                full_rows = cp_gather_after_forward(hidden_states, forward_batch)
+                partial = self.linear_attn(full_rows, forward_batch)
+                hidden_states = sp_cp_reduce_scatter_rows(partial, forward_batch)
+            else:
+                hidden_states = self.linear_attn(hidden_states, forward_batch)
+                if self._sp_static:
+                    # Heads are folded over the whole TP group (attention TP
+                    # width 1), so non-CP forwards (decode, short prefill) must
+                    # sum the out_proj partials over the TP group here.
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, skip_reduce=self._sp_static
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch, sp=sp)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 
 
@@ -1447,6 +1504,7 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        **indexer_kwargs,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1470,6 +1528,7 @@ class Qwen4ExpAttentionDecoderLayer(
             positions,
             forward_batch,
             indexer_metadata,
+            **indexer_kwargs,
         )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
@@ -1485,14 +1544,29 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        sp: bool = False,
+        global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         overlap_indexer = (
             self.is_qsa
+            and not sp
             and self.alt_stream is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
         attention_kwargs = {}
+        if sp and self.is_qsa:
+            # Prefill CP: the indexer projects and scores only this rank's
+            # zigzag rows (local positions); it all-gathers the raw index keys
+            # so the compressed-K cache is complete on every rank. Attention
+            # then runs on the local query rows against the all-gathered K/V
+            # (backend CP path).
+            attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
+                hidden_states,
+                positions,
+                forward_batch,
+                cp_global_rope_positions=global_positions,
+            )
         if overlap_indexer:
             # Safe to overlap: the indexer reads only hidden_states/positions,
             # and writes QSA-private pool buffers.
@@ -1515,7 +1589,7 @@ class Qwen4ExpAttentionDecoderLayer(
             # stream; tell the caching allocator before alt_stream is reused.
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
-        elif self.is_qsa:
+        elif self.is_qsa and not sp:
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
                 hidden_states, positions, forward_batch
             )
@@ -1540,11 +1614,13 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
+        sp = bool(kwargs.get("sp", False))
         hidden_states, residual = self._prepare_qwen4_exp_attn(
             hidden_states,
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            sp=sp,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1552,12 +1628,16 @@ class Qwen4ExpAttentionDecoderLayer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                sp=sp,
+                global_positions=kwargs.get("global_positions"),
             )
 
+        # Under collocated CP the attention TP width is 1: o_proj is complete
+        # and there is nothing to reduce (in either CP or non-CP forwards).
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, skip_reduce=self._sp_static
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch, sp=sp)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 
 
@@ -1605,6 +1685,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        self._sp_static = sp_cp_static_enabled()
 
     def forward(
         self,
@@ -1628,6 +1709,22 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
+        # Sequence-parallel prefill CP: keep this rank's zigzag token shard of
+        # the residual bank for the whole layer stack; GDN / PLE / the indexer
+        # gather the full ordered sequence where they need it, the logits get
+        # the gathered rows at the end (global metadata stays on forward_batch).
+        cp_active = is_cp_active(forward_batch)
+        if cp_active and not self._sp_static:
+            raise RuntimeError(
+                "Qwen4-Exp prefill CP is active but the sequence-parallel residual "
+                "stream is not enabled for this topology (needs attn_cp_size == "
+                "tp_size, no attention DP, no MoE a2a backend, PP=1)."
+            )
+        sp = self._sp_static and cp_active
+        global_positions = positions
+        if sp:
+            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+            positions = cp_shard_position_ids(positions, forward_batch)
         residual = None
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
@@ -1643,6 +1740,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    sp=sp,
+                    global_positions=global_positions,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1654,6 +1753,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        if sp:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
+            if capture_mode is not None and capture_mode.need_capture():
+                hc_hidden_states = cp_gather_after_forward(
+                    hc_hidden_states, forward_batch
+                )
+            else:
+                # The hc bank is only consumed by hidden-state capture; skip a
+                # [N, hc*hidden] all-gather that nothing would read.
+                hc_hidden_states = None
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
@@ -1704,6 +1814,9 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    # Prefill CP is handled inside Qwen4ExpModel.forward (sequence-parallel
+    # residual stream); the runner must not shard/gather at the model boundary.
+    supports_full_sequence_cp = True
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):

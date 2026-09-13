@@ -107,6 +107,8 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
     get_stream,
+    linear_attn_tp_rank,
+    linear_attn_tp_size,
 )
 
 # Utils
@@ -330,8 +332,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        # Linear attention uses CP ranks as additional head shards
+        # (linear_attn_tp_* fold attn_cp into the attention-TP partition).
+        self.attn_tp_rank = linear_attn_tp_rank()
+        self.attn_tp_size = linear_attn_tp_size()
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -438,8 +442,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        for param in (self.A_log, self.dt_bias):
+            set_weight_attrs(
+                param,
+                {
+                    "weight_loader": sharded_weight_loader(
+                        0, tp_rank_getter=lambda: self.attn_tp_rank
+                    )
+                },
+            )
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
