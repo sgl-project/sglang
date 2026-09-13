@@ -35,7 +35,8 @@ class EmbeddingPoolerOutput:
         pooled_hidden_states: Raw transformer hidden states *before* the
             task-specific head, present only when
             ``forward_batch.return_pooled_hidden_states`` is True.  Tensor
-            (standard path) or list of tensors (MIS path, one per delimiter).
+            (standard path) or list of tensors (one per position — MIS: one per
+            delimiter; setwise / multi-position readout: one per pooled position).
     """
 
     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
@@ -114,6 +115,47 @@ def pool_at_delimiter_positions(
     return list(data[index_tensor].split(delim_counts))
 
 
+def pool_at_positions(
+    data: torch.Tensor,
+    per_request_indices: List[torch.Tensor],
+    forward_batch: ForwardBatch,
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Pool a tensor exactly AT the given token positions for every request.
+
+    Setwise scoring reads the score head at each candidate's trailing anchor
+    token, so — unlike ``pool_at_delimiter_positions`` (which pools at
+    delimiter - 1) — this pools at the position itself with no offset shift and
+    no discarded first entry.
+
+    Args:
+        data: 2-D tensor [total_tokens, dim] — hidden states or logits.
+        per_request_indices: Per-request anchor positions (CPU tensors), each
+            relative to the start of that request's sequence.
+        forward_batch: Forward batch with extend_seq_lens_cpu populated.
+        device: Device for the index tensor.
+
+    Returns:
+        One tensor per request, shaped [num_anchors, dim].
+    """
+    all_index_tensors: List[torch.Tensor] = []
+    counts: List[int] = []
+    offset = 0
+    for req_idx, req_seq_len in enumerate(forward_batch.extend_seq_lens_cpu):
+        indices_tensor = per_request_indices[req_idx]
+        n = len(indices_tensor)
+        if n > 0:
+            all_index_tensors.append(indices_tensor + offset)
+        counts.append(n)
+        offset += req_seq_len
+
+    if all_index_tensors:
+        index_tensor = torch.cat(all_index_tensors).to(device, non_blocking=True)
+    else:
+        index_tensor = torch.empty(0, dtype=torch.long, device=device)
+    return list(data[index_tensor].split(counts))
+
+
 def score_and_pool(
     score_head: nn.Module,
     pooler: Pooler,
@@ -122,6 +164,10 @@ def score_and_pool(
     input_ids: torch.Tensor,
 ) -> EmbeddingPoolerOutput:
     """Apply a classification/score head with MIS and pooled-hidden-states support.
+
+    Multi-position readout path (``token_indices_to_pool`` on forward_batch, e.g.
+    setwise scoring): pool the head AT each caller-specified position (no offset,
+    no discarded row), then split per-request.
 
     MIS path (pre-computed delimiter indices on forward_batch): extract hidden
     states at positions just before each delimiter, apply the score head, then
@@ -132,6 +178,31 @@ def score_and_pool(
     When ``forward_batch.return_pooled_hidden_states`` is True, the raw pooled
     hidden states (before the score head) are included in the output.
     """
+    if (
+        forward_batch.token_indices_to_pool is not None
+        and forward_batch.is_prefill_only
+    ):
+        # Multi-position pooling readout: pool the head AT each requested position
+        # (no -1 shift, no discarded boundary row). Setwise scoring uses this to
+        # read the score head at each candidate's trailing anchor token. Concat to
+        # call the head once, then split back per request.
+        per_request_phs = pool_at_positions(
+            hidden_states,
+            forward_batch.token_indices_to_pool,
+            forward_batch,
+            input_ids.device,
+        )
+        phs_flat = torch.cat(per_request_phs, dim=0)
+        scores_flat = score_head(phs_flat)
+        pos_counts = [t.shape[0] for t in per_request_phs]
+        per_request_scores = list(scores_flat.split(pos_counts))
+        return EmbeddingPoolerOutput(
+            embeddings=per_request_scores,
+            pooled_hidden_states=(
+                per_request_phs if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
+
     if (
         forward_batch.multi_item_delimiter_indices is not None
         and forward_batch.is_prefill_only

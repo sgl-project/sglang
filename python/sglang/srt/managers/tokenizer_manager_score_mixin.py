@@ -1,29 +1,53 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TypeAlias, Union
 
 import torch
 
-from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
+from sglang.srt.configs.model_config import (
+    is_cross_encoding_pooler_model,
+    is_score_and_pool_model,
+)
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
 
 logger = logging.getLogger(__name__)
 
 
+ScoreRow: TypeAlias = List[float]
+ScoreMatrix: TypeAlias = List[ScoreRow]
+# Last-token pooling: one score row per item ([num_items, num_labels]).
+# Multi-position pooling (the head is read at each score-extraction token): one
+# [N_i, num_labels] matrix per item.
+ScoreOutput: TypeAlias = Union[ScoreMatrix, List[ScoreMatrix]]
+
+PooledHiddenStateRows: TypeAlias = List[Optional[torch.Tensor]]
+# Last-token / MIS pooling: one optional vector per item. Multi-position pooling:
+# one optional matrix (a vector per score-extraction token) per item.
+PooledHiddenStateOutput: TypeAlias = Union[
+    PooledHiddenStateRows, List[Optional[List[torch.Tensor]]]
+]
+
+
 @dataclass(frozen=True, slots=True)
 class ScoreResult:
-    scores: List[List[float]]
+    # Last-token pooling returns a score matrix with one row per item.
+    # Multi-position pooling (the head is read at each score-extraction token
+    # instead of the last token) is always nested: one score matrix per item,
+    # regardless of item count or --enable-mis. This is what powers setwise
+    # scoring, where a set's candidates are concatenated into one item with one
+    # score-extraction token per candidate.
+    scores: ScoreOutput
     prompt_tokens: int = 0
-    # Per-item pooled hidden states (pre-head transformer output).
-    # CPU tensors when return_pooled_hidden_states=True; kept as tensors so
-    # in-process consumers (gRPC, engine API) avoid a .tolist() round-trip.
-    # The HTTP path converts to lists in serving_score.py before JSON serialization.
-    # Same layout as scores: one tensor per item (not a single packed 2D tensor).
-    pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+    # Pre-head CPU tensors, parallel to scores: one optional vector per item for
+    # last-token / MIS pooling, or one optional list of per-extraction-token
+    # vectors per item for multi-position pooling. Kept as tensors so in-process
+    # consumers avoid a .tolist() round-trip; the HTTP path converts tensors
+    # recursively before JSON serialization.
+    pooled_hidden_states: Optional[PooledHiddenStateOutput] = None
 
 
 class TokenizerManagerScoreMixin:
@@ -182,12 +206,125 @@ class TokenizerManagerScoreMixin:
         if return_pooled_hidden_states:
             raw_phs = single_result.get("pooled_hidden_state")
             if raw_phs is not None and len(raw_phs) == expected_count:
-                phs_list = raw_phs[1:]
+                phs_list = list(raw_phs[1:])
 
         return ScoreResult(
             scores=scores,
             prompt_tokens=prompt_tokens,
             pooled_hidden_states=phs_list,
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-position pooling result helpers — the head is read at every
+    # score-extraction token instead of the last token. Shared by the batched
+    # and fused (--enable-mis) result processors. These power setwise scoring: a
+    # set's candidates are concatenated into one item with one score-extraction
+    # token per candidate.
+    # ------------------------------------------------------------------
+
+    def _multi_position_score_rows(
+        self, embedding: Any, apply_softmax: bool
+    ) -> List[List[float]]:
+        """Validate a multi-position result embedding and return its per-token rows.
+
+        The head pooled at every score-extraction token yields a 2-D
+        ``[num_positions, num_labels]`` embedding. This validates that shape and
+        returns it as a list of rows (softmaxed over labels when requested). The
+        original list values are preserved when no softmax is applied (avoiding a
+        float round-trip).
+        """
+        embedding_tensor = torch.as_tensor(embedding)
+        if embedding_tensor.ndim != 2:
+            # A 1-D result means the model pooled a single vector (e.g. a
+            # reward/embedding head that reads the last token) instead of
+            # per-position scores. Raise ValueError so the /v1/score handler
+            # returns a clean 400, not a 500.
+            raise ValueError(
+                "Multi-position scoring expected a 2-D "
+                "[num_positions, num_labels] result, but got shape "
+                f"{tuple(embedding_tensor.shape)}. This model may not support "
+                "score_extraction_token_id (only SequenceClassification heads that "
+                "pool per position do)."
+            )
+        if apply_softmax:
+            return torch.softmax(embedding_tensor, dim=-1).tolist()
+        return embedding if isinstance(embedding, list) else embedding_tensor.tolist()
+
+    def _multi_position_phs_matrix(self, phs: Any, expected_rows: int) -> torch.Tensor:
+        """Validate multi-position pooled hidden states are a 2-D tensor with one
+        row per score-extraction token and return it as a tensor."""
+        phs_tensor = torch.as_tensor(phs)
+        if phs_tensor.ndim != 2 or phs_tensor.shape[0] != expected_rows:
+            raise ValueError(
+                "Multi-position pooled hidden states must be a 2-D tensor with "
+                "one row per score position."
+            )
+        return phs_tensor
+
+    def _process_multi_item_extraction_results(
+        self,
+        results: Any,
+        per_item_anchor_counts: List[int],
+        apply_softmax: bool,
+        return_pooled_hidden_states: bool = False,
+    ) -> ScoreResult:
+        """Process a fused multi-item score-extraction request (``--enable-mis``).
+
+        The items are fused into one multi-item sequence, so the scheduler returns
+        a single result whose ``embedding`` is the ``[ΣNᵢ, num_labels]`` matrix of
+        every anchor's pooled logits, in item order. This splits that flat matrix
+        back into one ``[Nᵢ, num_labels]`` matrix per item using the per-item
+        anchor counts, yielding a nested ``scores`` list (one matrix per item).
+
+        Args:
+            results: Result(s) from generate_request (single fused request).
+            per_item_anchor_counts: Number of extraction tokens per item, in order.
+            apply_softmax: Whether to softmax over labels for each row.
+            return_pooled_hidden_states: Whether to group pooled hidden states per
+                item (parallel to ``scores``).
+
+        Returns:
+            ScoreResult with ``scores`` nested per item.
+        """
+        single_result = results[0] if isinstance(results, list) else results
+        meta_info = single_result.get("meta_info", {})
+        request_id = meta_info.get("id", "<unknown>")
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+
+        embedding = single_result.get("embedding")
+        if embedding is None:
+            raise ValueError("Embedding not found in the result.")
+
+        # One flat [ΣNᵢ, num_labels] matrix of every anchor's logits, in item order.
+        rows = self._multi_position_score_rows(embedding, apply_softmax)
+        total_anchors = sum(per_item_anchor_counts)
+        if len(rows) != total_anchors:
+            raise RuntimeError(
+                f"Expected {total_anchors} anchor rows across "
+                f"{len(per_item_anchor_counts)} items, but got {len(rows)}. "
+                f"Request ID: {request_id}"
+            )
+
+        # Split the flat matrix into one [Nᵢ, num_labels] matrix per item.
+        scores = []
+        offset = 0
+        for count in per_item_anchor_counts:
+            scores.append(rows[offset : offset + count])
+            offset += count
+
+        phs_grouped = None
+        if return_pooled_hidden_states:
+            raw_phs = single_result.get("pooled_hidden_state")
+            if raw_phs is not None:
+                phs_matrix = self._multi_position_phs_matrix(raw_phs, total_anchors)
+                phs_grouped = [
+                    list(group) for group in phs_matrix.split(per_item_anchor_counts)
+                ]
+
+        return ScoreResult(
+            scores=scores,
+            prompt_tokens=prompt_tokens,
+            pooled_hidden_states=phs_grouped,
         )
 
     def _process_single_item_scoring_results(
@@ -196,6 +333,7 @@ class TokenizerManagerScoreMixin:
         label_token_ids: Optional[List[int]],
         apply_softmax: bool,
         return_pooled_hidden_states: bool = False,
+        per_item_matrix: bool = False,
     ) -> ScoreResult:
         """
         Process results from single-item scoring request.
@@ -203,6 +341,12 @@ class TokenizerManagerScoreMixin:
         For generation (CausalLM) models: reads output_token_ids_logprobs.
         For non-generation (SequenceClassification) models: reads the embedding field
         which contains pooled class logits from the classification head.
+
+        per_item_matrix (setwise / multi-position mode): each result carries a 2-D
+        ``[num_positions, num_labels]`` embedding (the head pooled at every
+        extraction token). Each such matrix is kept as one item's entry, so
+        ``scores`` is nested one score matrix per item. When False (pointwise),
+        each result is one score row and ``scores`` is ``[num_items x num_labels]``.
         """
         scores = []
         phs_list = []
@@ -240,23 +384,36 @@ class TokenizerManagerScoreMixin:
 
                 prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
 
-                if apply_softmax:
-                    embedding = torch.softmax(
-                        torch.as_tensor(embedding), dim=-1
-                    ).tolist()
-
-                # The classification head produces per-token logits, which the pooler reduces
-                # into a single vector per input. That vector is returned in the `.embeddings`
-                # field — not as semantic embeddings, but as pooled classification logits.
-                # The field name is reused for compatibility with the existing
-                # EmbeddingPoolerOutput API.
-                scores.append(embedding)
+                # The classification head produces per-token logits, which the pooler
+                # reduces into a single vector per input (pointwise) or one row per
+                # extraction token (setwise). The field name is reused for
+                # compatibility with the existing EmbeddingPoolerOutput API.
+                if per_item_matrix:
+                    # Multi-position: one 2-D [num_positions, num_labels] matrix per
+                    # item — keep the item's rows grouped instead of flattening
+                    # across items.
+                    rows = self._multi_position_score_rows(embedding, apply_softmax)
+                    scores.append(rows)
+                else:
+                    # Pointwise: one score vector per item.
+                    if apply_softmax:
+                        embedding = torch.softmax(
+                            torch.as_tensor(embedding), dim=-1
+                        ).tolist()
+                    scores.append(embedding)
 
                 if return_pooled_hidden_states:
                     phs = result.get("pooled_hidden_state")
-                    phs_list.append(phs)
-                    if phs is not None:
+                    if per_item_matrix and phs is not None:
+                        # One pooled-hidden-states matrix per item, parallel to scores.
+                        phs_list.append(
+                            list(self._multi_position_phs_matrix(phs, len(rows)))
+                        )
                         has_phs = True
+                    else:
+                        phs_list.append(phs)
+                        if phs is not None:
+                            has_phs = True
 
         return ScoreResult(
             scores=scores,
@@ -438,6 +595,227 @@ class TokenizerManagerScoreMixin:
             )
 
     # ------------------------------------------------------------------
+    # Multi-position pooling readout (setwise scoring)
+    # ------------------------------------------------------------------
+
+    def _resolve_score_extraction_token_id(self, token: str) -> int:
+        """Resolve the score-extraction token string to a dedicated token id.
+
+        Runs in the tokenizer-manager process (which owns the tokenizer). Used by
+        the HTTP score handler to turn a client-supplied token string into the id
+        that ``score_request`` scans for.
+
+        Raises:
+            ValueError: if no tokenizer is available or the token does not resolve
+                to a dedicated (non-unk) id.
+        """
+        if self.tokenizer is None:
+            raise ValueError(
+                "A tokenizer is required to resolve score_extraction_token."
+            )
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        unk_id = self.tokenizer.unk_token_id
+        if token_id is None or (unk_id is not None and token_id == unk_id):
+            raise ValueError(
+                f"score_extraction_token {token!r} did not resolve to a dedicated "
+                f"token id."
+            )
+        return token_id
+
+    def _validate_score_extraction(
+        self,
+        is_generation: bool,
+        item_first: bool,
+    ) -> None:
+        """Validate that multi-position pooling readout is applicable.
+
+        Multi-position pooling (read the head at each score-extraction token) is
+        supported only by models whose forward routes the head through
+        ``score_and_pool`` (per-position pooling) -- the SequenceClassification
+        heads in ``is_score_and_pool_model``. Generation (CausalLM), cross-encoder
+        (``CrossEncodingPooler``), reward, and embedding models are rejected here,
+        before inference, because they pool a single vector and would ignore the
+        readout positions.
+
+        Multiple items (candidate sets) are supported in both execution modes and
+        return one score matrix per item: ``--enable-mis`` fuses them into one
+        multi-item sequence (block-diagonal mask, shared query-prefix KV), while
+        without MIS each item is scored as an independent ``query + item`` sequence
+        in one batch. As with all MIS scoring, the fused path injects delimiter
+        tokens into each item's attention context, so its scores differ slightly
+        from the independent batch path (the standard MIS trade-off); pick the mode
+        the deployment already uses.
+        """
+        if is_generation:
+            raise ValueError(
+                "score_extraction_token_id is only supported for "
+                "SequenceClassification models, not generation (CausalLM) models."
+            )
+        architectures = self.model_config.hf_config.architectures or []
+        if not is_score_and_pool_model(architectures):
+            raise ValueError(
+                "score_extraction_token_id is only supported for "
+                "SequenceClassification models that pool the head per position "
+                "(score_and_pool); model architecture(s) "
+                f"{architectures} do not (cross-encoder, reward, and embedding "
+                "models pool a single vector and ignore the readout positions)."
+            )
+        if item_first:
+            raise ValueError(
+                "item_first is not supported with score_extraction_token_id."
+            )
+        if not get_memory().disable_radix_cache:
+            raise ValueError(
+                "score_extraction_token_id requires --disable-radix-cache because "
+                "pooling positions are relative to the full prompt."
+            )
+        if get_schedule().chunked_prefill_size != -1:
+            raise ValueError(
+                "score_extraction_token_id requires --chunked-prefill-size -1 "
+                "because all pooling positions must be processed in one prefill."
+            )
+        if get_serving().allow_auto_truncate:
+            raise ValueError(
+                "score_extraction_token_id is not supported with "
+                "--allow-auto-truncate: pooling positions are computed from the "
+                "full prompt, and truncating the sequence would leave them "
+                "pointing past the truncated length."
+            )
+
+    def _reject_query_prefix_anchor(
+        self,
+        query_token_ids: List[int],
+        score_extraction_token_id: int,
+    ) -> None:
+        """Reject a shared query prefix that itself contains the extraction token.
+
+        The non-MIS path scans the whole ``query + item`` sequence for anchors, so
+        a query-side hit would emit an extra, misaligned score row instead of one
+        row per candidate. Mirrors the MIS guard in ``_anchor_counts_per_item``
+        that confines anchors to the item blocks.
+        """
+        if score_extraction_token_id in query_token_ids:
+            raise ValueError(
+                "score-extraction token found in the shared query prefix; it must "
+                "appear only within items, one per candidate."
+            )
+
+    def _build_score_extraction_text_inputs(
+        self,
+        query: str,
+        items: Union[str, List[str]],
+        score_extraction_token_id: int,
+    ) -> List[List[int]]:
+        """Tokenize each complete query-item prompt once for extraction scanning."""
+        items_list = [items] if isinstance(items, str) else items
+        if not all(isinstance(item, str) for item in items_list):
+            raise ValueError(
+                "query and items must both be text or both be token IDs when "
+                "score_extraction_token_id is set."
+            )
+        if query:
+            self._reject_query_prefix_anchor(
+                self.tokenizer.encode(query), score_extraction_token_id
+            )
+        return [self.tokenizer.encode(f"{query}{item}") for item in items_list]
+
+    def _resolve_score_extraction_indices(
+        self,
+        input_ids: List[List[int]],
+        score_extraction_token_id: int,
+    ) -> List[List[int]]:
+        """Scan each built sequence for the score-extraction token.
+
+        The classification head is later pooled AT these positions (via
+        ``token_indices_to_pool``) instead of the last token. Returns one list of
+        positions per sequence (parallel to ``input_ids``).
+
+        Raises:
+            ValueError: if any sequence contains no extraction token (the client
+                must render one per candidate; a missing token would silently
+                drop that sequence's scores and lose request-to-score alignment).
+        """
+        token_indices_to_pool = [
+            [i for i, t in enumerate(seq) if t == score_extraction_token_id]
+            for seq in input_ids
+        ]
+        if any(not seq_indices for seq_indices in token_indices_to_pool):
+            raise ValueError(
+                f"No score-extraction token (id={score_extraction_token_id}) "
+                "found in one or more input(s); the client must render one per "
+                "candidate."
+            )
+        return token_indices_to_pool
+
+    def _anchor_counts_per_item(
+        self,
+        delimiter_indices: List[int],
+        anchor_positions: List[int],
+    ) -> List[int]:
+        """Count extraction-token anchors falling inside each fused item's block.
+
+        ``--enable-mis`` fuses the items into one sequence as
+        ``query <delim> item0 <delim> item1 … <delim>`` (``delimiter_indices`` has
+        one entry per delimiter, so item ``i`` spans ``(delimiter_indices[i],
+        delimiter_indices[i + 1])``). This buckets the fused sequence's anchor
+        positions back to their items so the flat score matrix can be split per
+        item.
+
+        Raises:
+            ValueError: if any item contains no anchor, or if an anchor falls
+                outside every item block (e.g. in the shared query prefix). Both
+                are validated here (before inference) so the client gets a clean
+                400 instead of a post-forward RuntimeError.
+        """
+        counts = [
+            sum(1 for p in anchor_positions if lo < p < hi)
+            for lo, hi in zip(delimiter_indices, delimiter_indices[1:])
+        ]
+        # Every anchor must fall inside an item block. The extraction scan covers
+        # the whole fused sequence, including the shared query prefix before the
+        # first delimiter; an anchor there is not attributable to any item and
+        # would leave the pooled forward with more rows than sum(counts). Reject it
+        # up front rather than crashing in _process_multi_item_extraction_results.
+        if sum(counts) != len(anchor_positions):
+            raise ValueError(
+                "score-extraction token found outside the candidate items (e.g. in "
+                "the shared query prefix) under --enable-mis multi-item scoring; it "
+                "must appear only within items, one per candidate."
+            )
+        if any(c == 0 for c in counts):
+            raise ValueError(
+                "Each item (candidate set) must contain at least one "
+                "score-extraction token under --enable-mis multi-item scoring."
+            )
+        return counts
+
+    def _resolve_multi_position_pooling(
+        self,
+        input_ids: List[List[int]],
+        score_extraction_token_id: int,
+        use_multi_item_scoring: bool,
+        delimiter_indices: Optional[List[int]],
+    ) -> Tuple[List[List[int]], Optional[List[int]]]:
+        """Resolve where the head is pooled for a score-extraction request.
+
+        Scans each built sequence for the score-extraction token to get the head
+        pooling positions (``token_indices_to_pool``). Under ``--enable-mis`` the
+        items are fused into one sequence, so it also buckets the anchor positions
+        back to their items (``per_item_anchor_counts``) so the fused score matrix
+        can be split per item. Returns ``(token_indices_to_pool,
+        per_item_anchor_counts)`` — the latter is None outside MIS.
+        """
+        token_indices_to_pool = self._resolve_score_extraction_indices(
+            input_ids, score_extraction_token_id
+        )
+        per_item_anchor_counts = None
+        if use_multi_item_scoring:
+            per_item_anchor_counts = self._anchor_counts_per_item(
+                delimiter_indices, token_indices_to_pool[0]
+            )
+        return token_indices_to_pool, per_item_anchor_counts
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -453,6 +831,7 @@ class TokenizerManagerScoreMixin:
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         request: Optional[Any] = None,
         return_pooled_hidden_states: bool = False,
+        score_extraction_token_id: Optional[int] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -472,6 +851,16 @@ class TokenizerManagerScoreMixin:
         - Generation (CausalLM): Requires label_token_ids; returns logprob-based scores.
         - SequenceClassification: label_token_ids is optional; returns pooled class logits.
 
+        Setwise scoring (SequenceClassification-only) is expressed via
+        score_extraction_token_id: when set, the classification head is pooled AT
+        every occurrence of this token in each ``query + item`` sequence (instead of
+        the default last token). Each item is one candidate set, and ``scores`` is
+        returned nested — one ``[Nᵢ x num_labels]`` matrix per item. Multiple items
+        are supported in both execution modes: with ``--enable-mis`` the items are
+        fused into one multi-item sequence (block-diagonal mask, shared query-prefix
+        KV); without MIS each item is scored as an independent ``query + item``
+        sequence in one batch. Incompatible with generation models.
+
         return_pooled_hidden_states is only supported for non-generation models
         (SequenceClassification, RewardModel); raises ValueError for CausalLM.
         """
@@ -485,6 +874,15 @@ class TokenizerManagerScoreMixin:
             raise ValueError("items must be provided")
         if not items:
             return ScoreResult(scores=[], prompt_tokens=0)
+
+        # Normalize an omitted query by item type so the input-path selection below
+        # sees a concrete prefix: [] for pre-tokenized (token-ID) items so they take
+        # the token-ID path, "" for text items so they take the text path. Without
+        # this, token-ID items with the query omitted fall through to the text
+        # builder (and None reaches the tokenizer helpers as list(None)).
+        if query is None:
+            items_are_token_ids = isinstance(items, list) and isinstance(items[0], list)
+            query = [] if items_are_token_ids else ""
 
         has_embeds = (
             query_embed_overrides is not None or item_embed_overrides is not None
@@ -512,12 +910,20 @@ class TokenizerManagerScoreMixin:
         # Check if multi-item scoring is enabled
         use_multi_item_scoring = get_exec().features.enable_mis
 
+        # Multi-position pooling readout (setwise): pool the head at every
+        # occurrence of score_extraction_token_id instead of the last token.
+        use_score_extraction = score_extraction_token_id is not None
+        if use_score_extraction:
+            self._validate_score_extraction(is_generation, item_first)
+
         input_ids = None
         text_prompts = None
         positional_embed_overrides = None
         delimiter_indices = None
 
-        use_text_prompts = isinstance(query, str) and not has_embeds
+        use_text_prompts = (
+            isinstance(query, str) and not has_embeds and not use_score_extraction
+        )
 
         if use_text_prompts:
             # Both query and items are text
@@ -551,6 +957,12 @@ class TokenizerManagerScoreMixin:
         ):
             # Both query and items are token IDs — tokenize text inputs if needed for embed overrides
             query_ids, items_ids = query, items
+            if use_score_extraction and not use_multi_item_scoring:
+                # MIS confines anchors to item blocks in _anchor_counts_per_item;
+                # the non-MIS path concatenates query + item, so reject a
+                # query-prefix anchor here (the text path does so in
+                # _build_score_extraction_text_inputs).
+                self._reject_query_prefix_anchor(query_ids, score_extraction_token_id)
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
                     query_ids,
@@ -562,9 +974,32 @@ class TokenizerManagerScoreMixin:
                     item_embed_overrides,
                 )
             )
-        elif has_embeds:
-            # Text inputs with embed overrides — need to tokenize first to resolve positions
-            query_ids, items_ids = self._batch_tokenize_query_and_items(query, items)
+        elif (
+            use_score_extraction
+            and not use_multi_item_scoring
+            and not has_embeds
+            and (query is None or isinstance(query, str))
+        ):
+            # Single-set setwise: text (or omitted) query + text items, one
+            # sequence per item (whole candidate block in one item, no shared
+            # prefix when query=None). Multi-item scoring (--enable-mis) instead
+            # fuses the items below via _build_token_id_inputs.
+            input_ids = self._build_score_extraction_text_inputs(
+                query or "", items, score_extraction_token_id
+            )
+        elif has_embeds or use_score_extraction:
+            # Tokenize text inputs to token IDs, then build via the token-id path.
+            # has_embeds needs positions to resolve embed overrides; score
+            # extraction needs token IDs to scan for the extraction token. Under
+            # --enable-mis this fuses the items (candidate sets) into one
+            # multi-item sequence with delimiter tokens and a block-diagonal mask.
+            query_ids, items_ids = self._batch_tokenize_query_and_items(
+                query or "" if use_multi_item_scoring else query, items
+            )
+            if use_score_extraction and not use_multi_item_scoring:
+                # Same query-prefix anchor guard as the pre-tokenized branch, for
+                # the tokenized non-MIS path (e.g. text query + embed overrides).
+                self._reject_query_prefix_anchor(query_ids, score_extraction_token_id)
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
                     query_ids,
@@ -579,6 +1014,22 @@ class TokenizerManagerScoreMixin:
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
+            )
+
+        # Multi-position pooling readout: scan each built sequence for the
+        # extraction token; the pooler reads the head AT those positions. Under
+        # --enable-mis this also returns the per-item anchor counts used to split
+        # the fused score matrix back into one matrix per item.
+        token_indices_to_pool = None
+        per_item_anchor_counts = None
+        if use_score_extraction:
+            token_indices_to_pool, per_item_anchor_counts = (
+                self._resolve_multi_position_pooling(
+                    input_ids,
+                    score_extraction_token_id,
+                    use_multi_item_scoring,
+                    delimiter_indices,
+                )
             )
 
         if return_pooled_hidden_states:
@@ -620,11 +1071,22 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
+                token_indices_to_pool=token_indices_to_pool,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
 
-        if use_multi_item_scoring:
+        if use_multi_item_scoring and use_score_extraction:
+            # Multi-item setwise: the items were fused into one sequence and the
+            # head pooled at every anchor. Split the flat [ΣNᵢ, num_labels] result
+            # back into one matrix per item (nested scores).
+            return self._process_multi_item_extraction_results(
+                results,
+                per_item_anchor_counts,
+                apply_softmax,
+                return_pooled_hidden_states,
+            )
+        elif use_multi_item_scoring:
             # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
             return self._process_multi_item_scoring_results(
                 results,
@@ -635,9 +1097,16 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states,
             )
         else:
-            # Single-item scoring: process each result separately
+            # Single-item scoring: process each result separately. With
+            # score_extraction_token_id, each item is scored as an independent
+            # query+item sequence and its 2-D embedding ([positions x num_labels])
+            # is kept as one score matrix per item (nested scores).
             return self._process_single_item_scoring_results(
-                results, label_token_ids, apply_softmax, return_pooled_hidden_states
+                results,
+                label_token_ids,
+                apply_softmax,
+                return_pooled_hidden_states,
+                per_item_matrix=use_score_extraction,
             )
 
     def _convert_logprobs_to_scores(
