@@ -695,6 +695,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        self.shared_experts: Optional[DeepseekV2MLP] = None
         self._shared_expert_tp1 = False
         # Shared experts: skip when fused into MoE kernel
         # (self.num_fused_shared_experts > 0) or when DeepEP/MegaMOE fusion is enabled.
@@ -863,7 +864,7 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
             and self.num_fused_shared_experts == 0
             and hidden_states.shape[0] > 0
-            and hasattr(self, "shared_experts")
+            and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
@@ -1045,7 +1046,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
     ) -> torch.Tensor:
-        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+        if self.shared_experts is not None and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
@@ -1103,7 +1104,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
@@ -1342,7 +1342,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1360,7 +1359,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
 
                 if (
@@ -1398,7 +1396,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1527,7 +1524,7 @@ class DeepseekV2MoE(nn.Module):
         # Shared-expert side: fp8 block-128 weights served by a w8a8 linear
         # backend taught to accept a pre-quantized (q, scale) tuple: cutlass
         # or deepgemm (fp32 scales only, i.e. not UE8M0/Blackwell).
-        if self.num_fused_shared_experts != 0 or not hasattr(self, "shared_experts"):
+        if self.num_fused_shared_experts != 0 or self.shared_experts is None:
             return False, "no separate shared experts"
         if not self.shared_experts_is_fp8:
             return False, "shared experts not fp8"
