@@ -15,9 +15,10 @@ use crate::{
             UsageInfo,
         },
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-            ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
-            ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
+            ReasoningEffort, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
+            ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
+            TextFormat,
         },
         UNKNOWN_MODEL_ID,
     },
@@ -193,6 +194,19 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         tools,
         tool_choice: req.tool_choice.clone(),
         response_format: map_text_to_response_format(&req.text),
+        // Forward reasoning.effort so the chat pipeline sees the tier (previously
+        // dropped, so even supported tiers were lost on the Responses→Chat path).
+        // TODO: switch to `as_str()` once openai-protocol with smg#2410 is released
+        // (adds None/Xhigh/Max + as_str/parse). Local enum currently has 4 variants.
+        reasoning_effort: req.reasoning.as_ref().and_then(|r| r.effort).map(|effort| {
+            match effort {
+                ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+            }
+            .to_string()
+        }),
         ..Default::default()
     })
 }
@@ -367,6 +381,7 @@ pub(crate) fn chat_to_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::responses::ResponseReasoningParam;
 
     #[test]
     fn test_text_input_conversion() {
@@ -412,6 +427,21 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.messages.len(), 2); // user + assistant
+    }
+
+    #[test]
+    fn test_reasoning_effort_forwarding() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("Hello".to_string()),
+            reasoning: Some(ResponseReasoningParam {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+            }),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert_eq!(chat_req.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
