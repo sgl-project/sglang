@@ -58,7 +58,9 @@ class EPLBManager:
         assert (
             get_exec().moe.eplb_rebalance_num_iterations
             >= get_exec().moe.expert_distribution_recorder_buffer_size
-        ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        ), (
+            "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        )
 
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()

@@ -139,9 +139,9 @@ The helper defaults to eager. Add `--torch-compile` only for a labeled compile
 control. `--no-torch-compile` remains accepted for compatibility but is no
 longer required.
 
-Run one explicit quality or BCG comparator with `--quality lossless|high` and
+Run one explicit quality or BCG comparator with `--quality {lossless,extra-high,high}` and
 `--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
-exclusive in this helper. A high+BCG command is only a compatibility probe:
+exclusive in this helper. An extra-high/high+BCG command is only a compatibility probe:
 it is invalid if request-scoped DiT fusions mount after the lossless warmup
 graphs were captured. When a preset has explicit width and height, the helper
 declares that same `--warmup-resolutions` value automatically. Video presets
@@ -150,21 +150,22 @@ with an explicit frame count also declare the matching `--warmup-num-frames`:
 ```bash
 PYTHONPATH=python python3 "$BENCH_PY" \
   --model longcat-image \
-  --quality high \
+  --quality extra-high \
   --breakable-cuda-graph \
-  --label bcg-high \
+  --label bcg-extra-high \
   --output-dir "${BENCH_DIR}"
 ```
 
 For optimization discovery, use the full repeated matrix. It runs
-Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
-holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
+Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `extra-high` and
+`high`, while holding one GPU set and one isolated checkpoint cache. The
+extra-high/high+BCG cells test
 whether the combination is actually supported; do not average them when the
 runtime rejects the combination or the helper detects a late quality-fusion
 mount. The helper hashes every generated image, video, audio, or 3D mesh
 artifact. It first requires the two Eager rows at each quality to agree, then
 rejects any BCG row whose hash differs from that Eager reference. Cleanup occurs
-only after all eight runs, including on failure or interruption:
+only after all twelve runs, including on failure or interruption:
 
 ```bash
 MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
@@ -181,7 +182,7 @@ Before starting, confirm the chosen GPU set has no foreign process and remains
 unchanged through every run boundary. The helper rejects a BCG row unless its
 log contains `[Diffusion BCG] captured` and contains none of: support-gate
 disable, capture failure, `serving signature MISSED`, a message that no graph
-will be captured, or a request-scoped high-quality DiT fusion mounted after
+will be captured, or a request-scoped quality-gated DiT fusion mounted after
 capture. Do not average rejected rows with valid results.
 
 BCG signatures include more than width and height. The helper maps an explicit
@@ -313,19 +314,20 @@ Use the preset categories this way:
 | `cosmos3-super-t2v-cfg2tp2` | `nvidia/Cosmos3-Super` | No | Explicit four-GPU TP2 x CFG2 throughput comparator. On H200 it was 48.00% faster end to end than TP2, but the topology changed the deterministic output (SSIM 0.914244, PSNR 29.469771 dB), so do not treat it as lossless-equivalent or select it automatically. |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
 | `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
+| `fasth3-t2va-vsa` | `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | No | FastH3 4-step distilled T2VA on the trained VSA-H3 backend: 1344x768, 10 seconds / 243 frames, five sigma points = four DiT forwards, 4 GPUs, Ulysses 4, eager, 2-step warmup request. Compare against `--attention-backend fa` on the same weights for the dense-fallback gap. |
 | `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
 | `longcat-image-edit` | `meituan-longcat/LongCat-Image-Edit` | No | Native edit baseline using the public SGLang edit fixture. Its 1536x1024 source resolves to 1264x848 under the checkpoint's roughly-one-megapixel aspect-ratio rule, and the BCG comparator captures that exact serving canvas; prompt rewrite is disabled to isolate the DiT. |
 | `longcat-image-edit-turbo` | `meituan-longcat/LongCat-Image-Edit-Turbo` | No | Matching distilled edit baseline using the same public fixture, prompt, and 1264x848 BCG canvas. Its registered sampling class owns the eight-step, guidance-1 schedule. |
 | `qwen-edit-base` | `Qwen/Qwen-Image-Edit` | No | Covers the original native `QwenImageEditPipelineConfig`, which is distinct from the 2509/2511 edit-plus paths; public SGLang edit fixture, 1024x1024. |
 | `qwen-image-layered` | `Qwen/Qwen-Image-Layered` | No | Native layered-image path using the same public reference image and four-frame request as the GPU server case, at the registered 640x640 canvas. |
 | `stable-diffusion-3.5-medium` | `stabilityai/stable-diffusion-3.5-medium-diffusers` | No | Representative native `StableDiffusion3PipelineConfig` path at 1024x1024. The repository is gated, so export `HF_TOKEN`; an unauthenticated run is a recorded access blocker, not model evidence. |
-| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. The BCG comparator declares the same 17-frame warmup shape. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. The BCG comparator declares the same 17-frame warmup shape. Compare all three tiers; `extra-high` and `high` enable the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
 | `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
 | `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
 | `lingbot-world` | `robbyant/lingbot-world-fast-diffusers` | No | One-H200 offline single-chunk profile for the registered causal DMD path: 832x480x9, four steps, guidance 1.0, the shared image fixture, and forward-camera actions for all nine frames. Keep stateful websocket latency as a separate metric. |
 | `lingbot-world-v2` | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | No | Matching controlled single-chunk profile for the separately registered v2 checkpoint. The fixed shape, action program, and schedule make v1/v2 hotspot comparisons reproducible without presenting one-chunk e2e as stateful realtime latency. |
-| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/high comparisons do not measure an offload-policy change. |
+| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/extra-high/high comparisons do not measure an offload-policy change. |
 | `wan21-t2v-1.3b` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU 832x480, 81-frame Wan2.1 baseline at 50 steps and guidance 3.0. Keep it separate from FastWan and TurboWan because the longer schedule changes the end-to-end weight of VAE optimizations. |
 | `wan21-t2v-14b` | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | No | Cookbook-aligned four-GPU CFG/Ulysses baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Text encoding stays CPU-offloaded as in the documented deployment command. |
 | `wan21-i2v-14b-480p` | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Uses the shared cat fixture and its motion prompt. |
@@ -668,7 +670,8 @@ some generation failures are reported through the response payload without a
 nonzero process exit.
 
 For `quality=lossless`, compare saved artifact hashes and require byte equality
-for a claimed lossless fast path or BCG change. For `quality=high`, keep the
+for a claimed lossless fast path or BCG change. For `quality=extra-high` and
+`quality=high`, keep the
 lossless artifact as ground truth and report both aggregate and worst-frame
 SSIM/PSNR. Repository defaults are SSIM 0.95 / PSNR 28 dB for images and SSIM
 0.92 / PSNR 24 dB for videos; checked-in model/hardware consistency metadata
@@ -788,7 +791,7 @@ the known mainline families.
 | `to_q -> to_k -> to_v` on NVFP4 or Nunchaku FLUX-family checkpoints | Treat as a packed-QKV fast-path miss or checkpoint-format mismatch |
 | `rmsnorm_scale` or `rmsnorm_tanh_residual` missing on Z-Image | Check the bf16-native Triton eligibility guards before proposing a new fusion |
 | FLUX.1, GLM-Image, or SANA shows separate LayerNorm plus adaLN elementwise kernels | Check the bit-exact `modulate_scale_shift` and `fused_layernorm_modulate` guards/self-test before proposing another norm fusion |
-| `quality=high` shows the same FLUX/GLM DiT or FLUX-family/Wan VAE chain as `lossless` | Check whether the request-scoped quality gate mounted and whether every site passed its all-or-nothing compatibility checks |
+| `quality=extra-high` or `quality=high` shows the same FLUX/GLM DiT or FLUX-family/Wan VAE chain as `lossless` | Check whether the request-scoped quality gate mounted and whether every site passed its all-or-nothing compatibility checks |
 | LTX-2 split RoPE appears as a long PyTorch elementwise chain | Check the `apply_ltx2_split_rotary_emb` Triton path and its shape guards |
 | Wan decode is dominated by causal `cat + pad + contiguous`, feature-cache copies, or `repeat_interleave + permute + add` | Check the bit-exact Wan causal-cache and DupUp3D data-movement kernels before writing a new decoder kernel |
 | masked attention spends time packing/unpacking Q/K/V | Check whether fused varlen USP pack/scatter should have engaged |
@@ -826,7 +829,7 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
-- [ ] lossless artifact hash is exact; high-quality aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
+- [ ] lossless artifact hash is exact; extra-high/high aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
 - [ ] reference image or start/middle/end video contact sheet checked visually
 - [ ] any PR claim has repeated saved-request e2e improvement >= 1.5%
 - [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files

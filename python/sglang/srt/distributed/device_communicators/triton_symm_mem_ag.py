@@ -374,9 +374,9 @@ def all_gather_inner(
         f"hidden_states.data_ptr()={hex(hidden_states.data_ptr())} must be "
         f"16-byte aligned for 128-bit multimem.st"
     )
-    assert (
-        tp_hidden_dim % world_size == 0
-    ), f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    assert tp_hidden_dim % world_size == 0, (
+        f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    )
     local_hidden = tp_hidden_dim // world_size
     assert local_hidden % _NUMEL_PER_THREAD == 0, (
         f"per-rank hidden shard ({local_hidden}) must be a multiple of "
@@ -387,12 +387,12 @@ def all_gather_inner(
         f"state.hidden_dim={state.hidden_dim}"
     )
     total_tokens, in_hidden = hidden_states.shape
-    assert (
-        in_hidden == local_hidden
-    ), f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
-    assert (
-        total_tokens <= state.max_token_num
-    ), f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    assert in_hidden == local_hidden, (
+        f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
+    )
+    assert total_tokens <= state.max_token_num, (
+        f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    )
 
     hidden_offset = local_hidden * state.rank_in_group
     symm_mem_hdl = state.symm_mem_hdl

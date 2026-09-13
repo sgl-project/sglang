@@ -197,7 +197,7 @@ def test_strict_schema_rejects_invalid_parameters(arguments):
 
 def test_required_allows_response_prefix_but_requires_tools():
     grammar = _grammar([_tool()], tool_choice="required")
-    response = "<|open|>response<|sep|>Checking." "<|close|>response<|sep|>"
+    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)

@@ -103,9 +103,9 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
     assert len(x.shape) == 2
-    assert (
-        x.shape == residual.shape and x.dtype == residual.dtype
-    ), f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    assert x.shape == residual.shape and x.dtype == residual.dtype, (
+        f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    )
     output, mid = torch.empty_like(x), torch.empty_like(x)
     bs, hidden_dim = x.shape
     if autotune:
@@ -434,9 +434,9 @@ def fused_sigmoid_mul(
         gate_stride_head = gate.stride(1)
     else:
         # Flat path: both tensors have the same shape
-        assert (
-            attn_output.shape == gate.shape
-        ), "attn_output and gate must have the same shape"
+        assert attn_output.shape == gate.shape, (
+            "attn_output and gate must have the same shape"
+        )
         hidden_dim = attn_output.shape[-1]
         num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim

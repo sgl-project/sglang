@@ -147,7 +147,6 @@ class CustomOpWrapper:
     def real_impl(self) -> Callable:
         if self._impl is None:
             if not hasattr(torch.ops.sglang, self.op_name):
-
                 # NOTE(dark): if torch compile fail here, mark the decorator as eager
                 # lazy registration does not work with torch compile
                 direct_register_custom_op(
@@ -240,15 +239,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None

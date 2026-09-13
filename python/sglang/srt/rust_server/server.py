@@ -23,7 +23,7 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
@@ -35,6 +35,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
@@ -54,10 +55,12 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
@@ -76,24 +79,20 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # `TokenizerManager` merges these under each request's own sampling params
-        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
-        # manager wholesale — so honouring the flag is not implemented here yet.
-        # Refuse rather than run: silently dropping it means generating with
-        # sampling the operator did not configure, and `/get_model_info` would go on
-        # advertising values no request ever receives.
-        if get_serving().preferred_sampling_params:
-            raise ValueError(
-                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
-                "(the Python TokenizerManager merges it into every request; the rust "
-                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
-                "drop --preferred-sampling-params and send those values per request."
-            )
-        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
-        # so the rank is not conflated with rank 0 of a one-rank group.
+        # Preserve the DP startup log; ports use node-local offsets.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        listen_port = get_serving().port + (dp_rank or 0)
-        listen_addr = f"{get_serving().host}:{listen_port}"
+        if get_exec().moe.is_ep_scale_joiner:
+            # The joining TP group is entirely local to this node.
+            tp_size_per_node = scheduler.ps.tp_size
+        else:
+            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
+            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
+        dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
+        # Count DP leaders within this node's TP range. The first leader must
+        # use the base port even when a DP group spans multiple nodes.
+        local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
+        listen_port = get_serving().port + local_dp_rank
+        listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
@@ -107,7 +106,7 @@ class RustServer:
             _build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
-            port_offset=dp_rank,
+            port_offset=local_dp_rank,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
@@ -163,7 +162,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, http_port=listen_port, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -217,14 +216,13 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the Rust
-                # path. `None` for a text-only request on a multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = RustMmProcessor.build_output(
-                        self.mm_spec, mm_result
-                    )
+                # The buffers were parked in the Rust result store before the
+                # ring push; wrapping them into tensors is the only Python step
+                # of the Rust path. `None` for a text-only request on a
+                # multimodal model.
+                encoded = self.server.take_mm_result(obj.rid)
+                if encoded is not None:
+                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
 
@@ -242,9 +240,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -371,7 +369,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)

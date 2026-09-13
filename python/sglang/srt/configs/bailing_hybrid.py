@@ -37,7 +37,6 @@ class HybridLayerType(enum.Enum):
 
 
 class BailingHybridConfig(PretrainedConfig):
-
     model_type = "bailing_hybrid"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -175,9 +174,9 @@ class BailingHybridConfig(PretrainedConfig):
                     layer_type_list.append(HybridLayerType.linear_attention.value)
         else:
             # Per-layer schedule: 1 marks a linear-attention layer.
-            assert (
-                len(self.layer_group_size) == self.num_hidden_layers
-            ), "When layer_group_size is a list, its length must be equal to num_hidden_layers"
+            assert len(self.layer_group_size) == self.num_hidden_layers, (
+                "When layer_group_size is a list, its length must be equal to num_hidden_layers"
+            )
             for l in range(self.num_hidden_layers):
                 if self.layer_group_size[l] == 1:
                     layer_type_list.append(HybridLayerType.linear_attention.value)

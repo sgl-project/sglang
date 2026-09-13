@@ -261,8 +261,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     ep_active = local_experts < global_experts
     if ep_active:
         assert E == local_experts, (
-            f"Marlin has {E} local experts but runner_config declares "
-            f"{local_experts}"
+            f"Marlin has {E} local experts but runner_config declares {local_experts}"
         )
         assert (
             lora_info.gate_up_lora_b_weights.shape[1]

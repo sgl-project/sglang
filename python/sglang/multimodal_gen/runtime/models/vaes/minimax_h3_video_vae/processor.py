@@ -54,7 +54,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class VAEProcessor:
-
     def __init__(
         self,
         *,

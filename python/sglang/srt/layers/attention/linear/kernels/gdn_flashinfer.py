@@ -109,7 +109,12 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global \
+        _flashinfer_gdn_available, \
+        _flashinfer_chunk_gated_delta_rule, \
+        _flashinfer_gated_delta_rule_mtp, \
+        _flashinfer_gated_delta_rule_decode, \
+        _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -473,15 +478,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import (
+            gdn_prefill_qkv_prepare_fwd,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
-        v_fi = v[0].contiguous()
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
 
         output = kwargs.get("output")
         output_fi = None

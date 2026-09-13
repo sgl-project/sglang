@@ -501,6 +501,74 @@ impl TreeState {
         }
     }
 
+    /// Contiguous prefix depth for every worker on the chain, in one descent.
+    /// `insert` marks a worker at every node it descends, so "holds the first
+    /// `d` blocks" means present at each of levels `1..=d`. A worker is frozen
+    /// at the first level that omits it, so a `remove`d interior node stops the
+    /// count at the hole instead of counting past it.
+    fn prefix_depths(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+    ) -> HashMap<KvWorkerId, usize> {
+        if block_hashes.is_empty() {
+            return HashMap::new();
+        }
+        // Same start resolution as `match_prefix`: an ambiguous `parent_hash`
+        // has no worker context to disambiguate, so fall back to root.
+        let start = match parent_hash {
+            None => ROOT_ID,
+            Some(p) => match self.by_hash.get(&p) {
+                Some(set) if set.len() == 1 => *set.iter().next().unwrap(),
+                _ => ROOT_ID,
+            },
+        };
+        // Keys borrow the arena for the walk; ids are cloned once on the way out.
+        let mut depths: HashMap<&KvWorkerId, usize> = HashMap::new();
+        let mut alive: Vec<&KvWorkerId> = Vec::new();
+        let mut current = start;
+        let mut reached = 0usize;
+        let now = now_millis();
+        for &h in block_hashes {
+            let Some(child_id) = self
+                .nodes
+                .get(&current)
+                .and_then(|n| n.children.get(&h).copied())
+            else {
+                break;
+            };
+            let Some(child) = self.nodes.get(&child_id) else {
+                break;
+            };
+            child.last_used.store(now, Ordering::Relaxed);
+            current = child_id;
+            reached += 1;
+            if reached == 1 {
+                // Absent here means never in `alive`: a tail held without
+                // block 0 is reported as holding nothing.
+                alive = child.workers.iter().collect();
+            } else {
+                let mut still = Vec::with_capacity(alive.len());
+                for w in alive {
+                    if child.workers.contains(w) {
+                        still.push(w);
+                    } else {
+                        depths.insert(w, reached - 1);
+                    }
+                }
+                alive = still;
+            }
+            if alive.is_empty() {
+                break;
+            }
+        }
+        // Whoever is still tracked held every level the walk reached.
+        for w in alive {
+            depths.insert(w, reached);
+        }
+        depths.into_iter().map(|(w, d)| (w.clone(), d)).collect()
+    }
+
     /// Approximate count of *non-root* nodes in the tree.
     fn node_count(&self) -> usize {
         // Subtract one for the root sentinel.
@@ -652,6 +720,18 @@ impl HashTree {
         state.match_prefix(parent_hash, block_hashes)
     }
 
+    /// How many leading blocks of `block_hashes` each worker holds contiguously,
+    /// in one descent under one read lock. [`Self::match_prefix`] names only the
+    /// deepest matched node's holders, so it cannot answer this. Absent = none.
+    pub fn prefix_depths(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+    ) -> HashMap<KvWorkerId, usize> {
+        let state = self.state.read();
+        state.prefix_depths(parent_hash, block_hashes)
+    }
+
     /// Approximate number of non-root nodes in the tree (the root sentinel
     /// is not counted). Useful for metrics and to decide when to call
     /// [`HashTree::evict_lru`].
@@ -700,6 +780,36 @@ mod tests {
 
     fn workers(ids: &[&KvWorkerId]) -> HashSet<KvWorkerId> {
         ids.iter().map(|w| (*w).clone()).collect()
+    }
+
+    /// One descent answers for every worker at its *own* depth, where
+    /// `match_prefix` names only whoever sits at the deepest matched node.
+    /// Also pins that a `remove`d interior block stops the count at the hole.
+    #[test]
+    fn prefix_depths_answers_every_worker_at_its_own_depth() {
+        let chain = [1i64, 2, 3, 4];
+        let (deep, shallow, holed) = (
+            worker("http://a", 0),
+            worker("http://b", 0),
+            worker("http://c", 0),
+        );
+        let tree = HashTree::new();
+        tree.insert(&deep, None, &chain);
+        tree.insert(&shallow, None, &chain[..2]);
+        tree.insert(&holed, None, &chain);
+        tree.remove(&holed, &chain[1..2]);
+
+        let depths = tree.prefix_depths(None, &chain);
+        assert_eq!(depths.get(&deep), Some(&4), "holds the whole chain");
+        assert_eq!(depths.get(&shallow), Some(&2), "holds two of four");
+        assert_eq!(depths.get(&holed), Some(&1), "stops at the cleared block");
+        assert_eq!(depths.get(&worker("http://d", 0)), None, "holds nothing");
+
+        // Contiguity matters: `remove` left `holed` listed at the deepest node,
+        // so `match_prefix` credits it with the full chain scored here at 1.
+        let m = tree.match_prefix(None, &chain);
+        assert_eq!(m.matched_blocks, 4);
+        assert_eq!(m.workers, workers(&[&deep, &holed]));
     }
 
     #[test]

@@ -84,7 +84,7 @@ def update_others_index(
         return False
 
     index_dir.mkdir(parents=True, exist_ok=True)
-    updated = f"{OTHERS_HEADER}{entry}{content[len(OTHERS_HEADER):]}"
+    updated = f"{OTHERS_HEADER}{entry}{content[len(OTHERS_HEADER) :]}"
     index_path.write_text(updated, encoding="utf-8")
     return True
 

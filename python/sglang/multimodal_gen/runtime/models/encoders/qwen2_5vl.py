@@ -1329,7 +1329,9 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         eos_token_ids = (
             []
             if eos_token_id is None
-            else [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+            else [eos_token_id]
+            if isinstance(eos_token_id, int)
+            else list(eos_token_id)
         )
         if pad_token_id is None:
             raise ValueError("pad_token_id must be set for generation")

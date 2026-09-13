@@ -70,8 +70,7 @@ class MiniMaxH3VideoModelAdapter:
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:
             raise ValueError(
-                "task is required for MiniMax H3; supported tasks: "
-                "fl2va, ref2va, t2va"
+                "task is required for MiniMax H3; supported tasks: fl2va, ref2va, t2va"
             )
         if not isinstance(task, str):
             raise ValueError("task must be a non-empty string for MiniMax H3")

@@ -69,9 +69,9 @@ class TestSageMakerServer(CustomTestCase):
             ret_num_top_logprobs = len(
                 response["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
             )
-            assert (
-                ret_num_top_logprobs == logprobs
-            ), f"{ret_num_top_logprobs} vs {logprobs}"
+            assert ret_num_top_logprobs == logprobs, (
+                f"{ret_num_top_logprobs} vs {logprobs}"
+            )
 
         assert len(response["choices"]) == parallel_sample_num
         assert response["choices"][0]["message"]["role"] == "assistant"
@@ -155,18 +155,18 @@ class TestSageMakerServer(CustomTestCase):
                     .get("content")[0]
                     .get("top_logprobs")
                 )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                assert ret_num_top_logprobs == logprobs, (
+                    f"{ret_num_top_logprobs} vs {logprobs}"
+                )
 
             assert isinstance(data["content"], str)
             assert line["id"]
             assert line["created"]
 
         for index in [i for i in range(parallel_sample_num)]:
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), (
+                f"index {index} is not found in the response"
+            )
 
     def test_chat_completion(self):
         for logprobs in [None, 5]:

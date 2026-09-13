@@ -81,9 +81,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
-  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
-  m.impl("awq_dequantize", torch::kMUSA, &awq_dequantize);
-
   m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");

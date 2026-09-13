@@ -63,6 +63,7 @@ _TRITON_KERNELS = [
     ("cache_ops", "launch_reshape_and_cache_flash"),
     ("pd_dcp_gather", "copy_mla_rows_into_pack"),
     ("kv_read_table", "build_kv_read_table"),
+    ("kv_read_table", "build_kv_read_table_packed"),
     ("kv_indices", "create_flashinfer_kv_indices_triton"),
     ("kv_indices", "create_flashmla_kv_indices_triton"),
     ("kv_indices", "create_chunked_prefix_cache_kv_indices"),

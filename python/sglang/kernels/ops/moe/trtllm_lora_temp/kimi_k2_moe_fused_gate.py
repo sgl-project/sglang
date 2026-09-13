@@ -39,12 +39,12 @@ def kimi_k2_moe_fused_gate(
     (output_weights, expert_indices).
     """
     _supported = (torch.float32, torch.bfloat16, torch.float16)
-    assert (
-        input.dtype in _supported
-    ), f"input must be float32/bfloat16/float16, got {input.dtype}"
-    assert (
-        bias.dtype in _supported
-    ), f"bias must be float32/bfloat16/float16, got {bias.dtype}"
+    assert input.dtype in _supported, (
+        f"input must be float32/bfloat16/float16, got {input.dtype}"
+    )
+    assert bias.dtype in _supported, (
+        f"bias must be float32/bfloat16/float16, got {bias.dtype}"
+    )
     assert input.ndim == 2, "input must be 2D"
     assert bias.ndim == 1, "bias must be 1D"
     assert input.size(1) == bias.size(0), "input and bias must have same num_experts"

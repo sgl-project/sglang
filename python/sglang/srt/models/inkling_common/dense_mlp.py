@@ -329,9 +329,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         """
         assert x.ndim in (2, 3), f"{x.shape=}"
         assert gammas.ndim in (2, 3), f"{gammas.shape=}"
-        assert (
-            gammas.size(-1) == self.n_shared_experts
-        ), f"{gammas.shape=} {self.n_shared_experts=}"
+        assert gammas.size(-1) == self.n_shared_experts, (
+            f"{gammas.shape=} {self.n_shared_experts=}"
+        )
         if self._fp4_strategy.serves_fp4:
             return self._forward_fp4(x, gammas, use_reduce_scatter)
 
@@ -387,9 +387,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             silu_and_mul_triton,
         )
 
-        assert (
-            self.inference_moe_w13_interleaved
-        ), "silu_and_mul_triton requires interleaved w13"
+        assert self.inference_moe_w13_interleaved, (
+            "silu_and_mul_triton requires interleaved w13"
+        )
         y_st_2f = y_st2f.view(-1, y_st2f.size(-1))
         y_st_f = silu_and_mul_triton(y_st_2f, gammas_st.reshape(-1))
         return y_st_f.view(*y_st2f.shape[:-1], y_st2f.size(-1) // 2)

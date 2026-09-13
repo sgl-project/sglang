@@ -292,9 +292,9 @@ def _load_cache_to_device_buffer_mla(
     miss_count: torch.Tensor | None,
     skip_io: bool,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(

@@ -21,6 +21,9 @@ class ArchConfig:
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=list
     )  # mapping from huggingface weight names to custom names
+    param_names_mapping: dict[str, str | tuple[str, int, int]] = field(
+        default_factory=dict
+    )
     extra_attrs: Dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str):
@@ -53,6 +56,9 @@ class ModelConfig:
     # sglang-diffusion-specific parameters here
     # i.e. STA, quantization, teacache
 
+    def post_diffusers_config_update(self) -> None:
+        """Normalize external configuration before constructing the runtime model."""
+
     def __getattr__(self, name):
         # Only called if 'name' is not found in ModelConfig directly
         if hasattr(self.arch_config, name):
@@ -83,9 +89,9 @@ class ModelConfig:
             arch_config.__post_init__()
 
     def update_model_config(self, source_model_dict: dict[str, Any]) -> None:
-        assert (
-            "arch_config" not in source_model_dict
-        ), "Source model config shouldn't contain arch_config."
+        assert "arch_config" not in source_model_dict, (
+            "Source model config shouldn't contain arch_config."
+        )
 
         valid_fields = {f.name for f in fields(self)}
 

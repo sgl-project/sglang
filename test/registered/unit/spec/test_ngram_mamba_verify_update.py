@@ -7,7 +7,7 @@ import sglang.srt
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class TestNgramLastCorrectStepIndices(CustomTestCase):
@@ -194,12 +194,15 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             dtype=torch.int32,
         )
 
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=256,
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,

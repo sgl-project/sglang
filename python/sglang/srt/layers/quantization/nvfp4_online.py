@@ -1,5 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Implementation details for online NVFP4 model serving from:
+# - https://humansand.ai/blog/nvfp4-rl#a-pleasant-side-effect-online-nvfp4-serving
+# - https://www.lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl#online-nvfp4-model-serving
 
 from __future__ import annotations
 

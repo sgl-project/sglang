@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
 
+from sglang.srt.utils import broadcast_pyobj
+
 from .parallel_state import (
+    get_attn_cp_group,
     get_attn_tp_group,
     get_moe_ep_group,
     get_moe_tp_group,
@@ -94,6 +97,23 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
+    """Broadcast from the (attn-TP 0, attn-CP 0) rank to every rank of its DP shard."""
+    # attn-TP and attn-CP are orthogonal factors of the shard and no single group
+    # covers both, so broadcast along TP first and then along CP.
+    tp_group = get_attn_tp_group()
+    if tp_group.world_size > 1:
+        data = broadcast_pyobj(
+            data, tp_group.rank, tp_group.cpu_group, src=tp_group.ranks[0]
+        )
+    cp_group = get_attn_cp_group()
+    if cp_group.world_size > 1:
+        data = broadcast_pyobj(
+            data, cp_group.rank, cp_group.cpu_group, src=cp_group.ranks[0]
+        )
+    return data
 
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

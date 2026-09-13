@@ -17,11 +17,11 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeTransferQueue:
@@ -136,7 +136,7 @@ class TestPrefillMoveGate(CustomTestCase):
 class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While the move gate is closed that flush relocates nothing, so
-    crediting them lets the scheduler admit work `_flush_peer_for_alloc` cannot
+    crediting them lets the scheduler admit work `_relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """

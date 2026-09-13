@@ -12,8 +12,8 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
-from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
@@ -21,13 +21,13 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    is_port_available,
+from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.multimodal_gen.runtime.utils.process import (
+    kill_itself_when_parent_died,
     kill_process_tree,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 
 _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10
@@ -662,7 +662,7 @@ def launch_disagg_role(server_args: ServerArgs):
     role_type = server_args.disagg_role
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints

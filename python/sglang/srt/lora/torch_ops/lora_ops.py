@@ -29,7 +29,6 @@ def sgemm_lora_a_embedding_fwd(
 
         rank = lora_ranks[lora_idx]
         if rank > 0:
-
             x_seq = inputs[token_offset : token_offset + seq_len]
             w_seq = weights[lora_idx, :rank]
 
@@ -70,7 +69,6 @@ def sgemm_lora_a_fwd(
 
         rank = lora_ranks[lora_idx]
         if rank > 0:
-
             x_seq = inputs[token_offset : token_offset + seq_len]
             w_seq = weights[lora_idx, : num_slices * rank]
 
@@ -120,7 +118,6 @@ def sgemm_lora_b_fwd(
 
         rank = lora_ranks[lora_idx]
         if rank > 0:
-
             for slice_idx in range(num_slices):
                 slice_start_input = slice_idx * rank
                 slice_end_input = (slice_idx + 1) * rank

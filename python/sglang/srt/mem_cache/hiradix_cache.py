@@ -80,7 +80,6 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
-
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
@@ -105,7 +104,6 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -342,7 +340,6 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-
                 storage_cls = resolve_collector_class(
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
@@ -1184,9 +1181,9 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), f"This request holds the node from another tree"
+                assert node is self.root_node, (
+                    f"This request holds the node from another tree"
+                )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1397,9 +1394,9 @@ class HiRadixCache(RadixCache):
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
-            assert (
-                node.backuped
-            ), "No backup available on evicted nodes, should not happen"
+            assert node.backuped, (
+                "No backup available on evicted nodes, should not happen"
+            )
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -1491,15 +1488,17 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
             return 0
 
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1776,16 +1775,14 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
-        # Cache mode write-through keeps the anchor on the request's own path,
-        # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)

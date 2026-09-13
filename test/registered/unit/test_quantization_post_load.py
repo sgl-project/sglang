@@ -9,7 +9,7 @@ from sglang.srt.model_loader.loader import device_loading_context
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 def _process_device() -> torch.device | None:

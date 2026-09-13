@@ -171,9 +171,9 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        assert (
-            "feature_attention_mask" in ret
-        ), "feature_attention_mask not found in processor output"
+        assert "feature_attention_mask" in ret, (
+            "feature_attention_mask not found in processor output"
+        )
         input_lengths = ret["feature_attention_mask"].sum(dim=-1)
         input_lengths = (input_lengths - 1) // 2 + 1
         output_lengths = (input_lengths - 2) // 2 + 1

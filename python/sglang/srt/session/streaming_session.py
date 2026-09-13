@@ -48,29 +48,31 @@ class SessionSlot:
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
-    swa_uuid_for_lock: Optional[str] = None
-    # components the first req skipped locking on last_node, so release dec
-    # releases only what it took (may share the node with another req).
-    skip_lock_node_ids: dict = field(default_factory=dict)
+    # Receipt of the first request's tree lock on last_node.
+    lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
+    # Whether the first request already released its SWA lock.
+    swa_prefix_lock_released: bool = False
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         kv = req.detach_kv()
         if is_first:
             self.last_node = req.last_node
-            self.swa_uuid_for_lock = req.swa_uuid_for_lock
-            self.skip_lock_node_ids = req.skip_lock_node_ids
+            self.lock_receipt = req.lock_receipt
+            self.swa_prefix_lock_released = req.swa_prefix_lock_released
             # The slot takes over the request's KV record.
             self.kv = kv
         else:
             # Later turns run on the slot's record (see restore_to_req).
             assert kv is self.kv
 
+        req.swa_branching_seqlen = None
+
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.kv = self.kv
-        req.swa_uuid_for_lock = self.swa_uuid_for_lock
-        req.skip_lock_node_ids = self.skip_lock_node_ids
+        req.lock_receipt = self.lock_receipt
+        req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
         # NOTE: the slot keeps sharing the record it just handed out. During
         # chunked prefill, a request may be rejected by
@@ -288,8 +290,8 @@ class StreamingSession(BasePrefixCache):
                 slot = SessionSlot(
                     kv=kv,
                     last_node=req.last_node,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    skip_lock_node_ids=req.skip_lock_node_ids,
+                    lock_receipt=req.lock_receipt,
+                    swa_prefix_lock_released=req.swa_prefix_lock_released,
                 )
                 self.slots[session_id] = slot
             else:
@@ -394,13 +396,10 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            self.inner.dec_lock_ref(
-                lock_node,
-                DecLockRefParams(
-                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
-                    skip_lock_node_ids=slot.skip_lock_node_ids,
-                ),
-            )
+            # skip_swa is an SWA-cache extension kwarg; a slot can only have
+            # early-released when the inner cache supports SWA locks.
+            skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+            self.inner.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
 
         if slot.kv.holds_kv:
             self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
@@ -564,6 +563,17 @@ class StreamingSession(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(req_id)
+
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        self.inner.discard_storage_prefetch_accounting(req_id)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()

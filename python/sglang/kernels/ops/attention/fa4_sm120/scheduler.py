@@ -75,9 +75,9 @@ class Sm120UniformBatchScheduler:
         loc=None,
         ip=None,
     ) -> Params:
-        assert (
-            scheduling_mode == SchedulingMode.STATIC
-        ), f"SM120 uniform-batch scheduler only supports STATIC, got {scheduling_mode!r}"
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            f"SM120 uniform-batch scheduler only supports STATIC, got {scheduling_mode!r}"
+        )
         return Sm120UniformBatchScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod

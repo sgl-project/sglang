@@ -431,9 +431,9 @@ class AccuracyEngine:
         ).item()
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         logger.info("[%s] Rank %s CosSim=%.6f", name, rank, cos_sim)
-        assert (
-            cos_sim > threshold
-        ), f"Accuracy failure in {name}: CosSim {cos_sim:.4f} < {threshold}"
+        assert cos_sim > threshold, (
+            f"Accuracy failure in {name}: CosSim {cos_sim:.4f} < {threshold}"
+        )
 
     @staticmethod
     def transfer_weights(

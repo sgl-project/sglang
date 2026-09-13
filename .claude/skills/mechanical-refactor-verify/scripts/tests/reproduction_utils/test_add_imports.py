@@ -110,13 +110,7 @@ def test_add_typechecking_import_inserts_in_block(tmp_path: Path) -> None:
 def test_add_typechecking_import_creates_missing_block(tmp_path: Path) -> None:
     """With no TYPE_CHECKING block, one is created after the trailing module import."""
     (tmp_path / "m.py").write_text(
-        "from typing import TYPE_CHECKING\n"
-        "\n"
-        "from a import X\n"
-        "\n"
-        "\n"
-        "def f():\n"
-        "    pass\n"
+        "from typing import TYPE_CHECKING\n\nfrom a import X\n\n\ndef f():\n    pass\n"
     )
     r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
     _apply(r, tmp_path)
@@ -215,12 +209,7 @@ def test_add_typechecking_import_raises_without_imports(tmp_path: Path) -> None:
 def test_add_typechecking_import_drops_a_lone_pass_placeholder(tmp_path: Path) -> None:
     """Populating a `pass`-only TYPE_CHECKING block replaces the placeholder."""
     (tmp_path / "m.py").write_text(
-        "from typing import TYPE_CHECKING\n"
-        "\n"
-        "if TYPE_CHECKING:\n"
-        "    pass\n"
-        "\n"
-        "x = 1\n"
+        "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    pass\n\nx = 1\n"
     )
     r = Repro("b", "t").add_typechecking_import("m.py", "from b import Y")
     _apply(r, tmp_path)

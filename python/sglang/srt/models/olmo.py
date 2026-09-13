@@ -233,7 +233,6 @@ class OlmoDecoderLayer(nn.Module):
 
 
 class OlmoModel(nn.Module):
-
     def __init__(
         self,
         config: OlmoConfig,

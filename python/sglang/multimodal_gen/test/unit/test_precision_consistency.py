@@ -1,69 +1,11 @@
-import importlib.util
-import sys
-import types
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils import precision
 
-def _load_precision_module():
-    package_names = (
-        "sglang",
-        "sglang.multimodal_gen",
-        "sglang.multimodal_gen.runtime",
-        "sglang.multimodal_gen.runtime.utils",
-    )
-    stub_names = (
-        *package_names,
-        "sglang.multimodal_gen.runtime.platforms",
-        "sglang.multimodal_gen.utils",
-    )
-    missing = object()
-    previous_modules = {name: sys.modules.get(name, missing) for name in stub_names}
-
-    try:
-        utils_module = types.ModuleType("sglang.multimodal_gen.utils")
-        utils_module.PRECISION_TO_TYPE = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "fp32": torch.float32,
-        }
-        platforms_module = types.ModuleType("sglang.multimodal_gen.runtime.platforms")
-        platforms_module.current_platform = SimpleNamespace(
-            device_type="cpu",
-            is_mps=lambda: False,
-            is_amp_supported=lambda: True,
-        )
-        for package_name in package_names:
-            package = types.ModuleType(package_name)
-            package.__path__ = []
-            sys.modules[package_name] = package
-        sys.modules["sglang.multimodal_gen.runtime.platforms"] = platforms_module
-        sys.modules["sglang.multimodal_gen.utils"] = utils_module
-
-        precision_path = (
-            Path(__file__).resolve().parents[2] / "runtime/utils/precision.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "_diffusion_precision_under_test", precision_path
-        )
-        precision = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = precision
-        spec.loader.exec_module(precision)
-    finally:
-        for module_name, previous_module in previous_modules.items():
-            if previous_module is missing:
-                sys.modules.pop(module_name, None)
-            else:
-                sys.modules[module_name] = previous_module
-
-    return precision
-
-
-precision = _load_precision_module()
 align_tensor_to_module_dtype = precision.align_tensor_to_module_dtype
 autocast_context = precision.autocast_context
 autocast_enabled = precision.autocast_enabled
@@ -148,6 +90,13 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 quality="high",
             ),
             torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="extra-high",
+            ),
+            torch.float16,
         )
         self.assertEqual(
             resolve_decode_precision(

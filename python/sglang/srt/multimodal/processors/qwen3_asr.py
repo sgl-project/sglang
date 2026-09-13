@@ -13,10 +13,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 DEFAULT_ASR_PROMPT = (
-    f"<|im_start|>user\n"
-    f"{AUDIO_PLACEHOLDER}"
-    f"<|im_end|>\n"
-    f"<|im_start|>assistant\n"
+    f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 

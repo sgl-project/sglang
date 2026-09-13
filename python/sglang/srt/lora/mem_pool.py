@@ -865,9 +865,9 @@ class LoRAMemoryPool:
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                assert buffer_view.shape == weight.shape, (
+                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                )
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
@@ -1457,9 +1457,9 @@ class LoRAMemoryPool:
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
-                    assert (
-                        not get_pp_group().is_last_rank
-                    ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    assert not get_pp_group().is_last_rank, (
+                        f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    )
                     continue
         else:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA

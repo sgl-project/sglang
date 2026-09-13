@@ -51,7 +51,6 @@ def gegelu(input, limit: Optional[float] = None):
 
 
 class Phi3SmallMLP(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -60,9 +59,9 @@ class Phi3SmallMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        assert (
-            self.config.hidden_act == "gegelu"
-        ), "Only `gegelu` is supported for the 4.7 series of models .."
+        assert self.config.hidden_act == "gegelu", (
+            "Only `gegelu` is supported for the 4.7 series of models .."
+        )
         self.hidden_size = config.hidden_size
         self.gegelu_limit = config.gegelu_limit
         self.intermediate_size = config.intermediate_size
@@ -90,7 +89,6 @@ class Phi3SmallMLP(nn.Module):
 
 
 class Phi3SmallSelfAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -233,7 +231,6 @@ class Phi3SmallSelfAttention(nn.Module):
 
 
 class Phi3SmallDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -286,7 +283,6 @@ class Phi3SmallDecoderLayer(nn.Module):
 
 
 class Phi3SmallModel(nn.Module):
-
     def __init__(
         self,
         config: Phi3Config,

@@ -277,11 +277,15 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with _autotune_process_group(sync_group), autotune(
-            True,
-            cache=str(autotune_cache),
-            skip_ops=skip_ops,
-        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
+        with (
+            _autotune_process_group(sync_group),
+            autotune(
+                True,
+                cache=str(autotune_cache),
+                skip_ops=skip_ops,
+            ),
+            autotune_dummy_run_mode(run_lm_head=run_lm_head),
+        ):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")

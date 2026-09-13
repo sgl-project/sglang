@@ -3,8 +3,8 @@
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import argparse
 import unittest
@@ -47,6 +47,10 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+        # The real eviction helper reports unbacked FULL evictions to the
+        # write-through drop counter; this fake never tracks a walk.
+        self._is_tracking_unbacked_tokens = False
+        self._tracked_unbacked_tokens = 0
 
     def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
         self.evicted.append(node)
@@ -105,9 +109,12 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError,
-                "must be -1 \\(unlimited\\) or a positive integer",
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "must be -1 \\(unlimited\\) or a positive integer",
+                ),
             ):
                 handle_mamba_backend(args)
 

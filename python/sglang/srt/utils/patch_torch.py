@@ -29,9 +29,9 @@ if _is_npu:
         return npu_reductions._rebuild_npu_tensor_original(*args)
 
     def npu_verl_to_sglang(device: int):
-        assert (
-            SGLANG_TP_RANK is not None
-        ), "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        assert SGLANG_TP_RANK is not None, (
+            "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        )
         return SGLANG_TP_RANK
 
 

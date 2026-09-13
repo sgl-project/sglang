@@ -19,7 +19,6 @@ logger = init_logger(__name__)
 
 
 class PromptEnhancementStage(PipelineStage):
-
     def __init__(self, pe_model, pe_tokenizer):
         super().__init__()
         self.pe_model = pe_model

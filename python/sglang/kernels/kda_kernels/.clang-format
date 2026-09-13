@@ -1,0 +1,25 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: Empty
+DerivePointerAlignment: false
+PointerAlignment: Left
+NamespaceIndentation: None
+SortIncludes: true
+AllowShortLoopsOnASingleLine: false
+BinPackParameters: false
+BinPackArguments: false
+AlignAfterOpenBracket: AlwaysBreak
+AlignOperands: Align
+PenaltyBreakBeforeFirstCallParameter: 1
+PenaltyReturnTypeOnItsOwnLine: 100
+
+IncludeCategories:
+  - Regex: '^<sgl_kernel/.*\.h>$'
+    Priority: 0
+  - Regex: '^<sgl_kernel/.*/.*>$'
+    Priority: 2
+  - Regex: '^<sgl_kernel/.*\.cuh>$'
+    Priority: 1
+  - Regex: '^<.*/.*>$'
+    Priority: 3

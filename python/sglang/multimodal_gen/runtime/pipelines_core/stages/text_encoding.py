@@ -480,9 +480,11 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.string_not_none(x)
-            or isinstance(x, str),
+            lambda x: (
+                not batch.do_classifier_free_guidance
+                or V.string_not_none(x)
+                or isinstance(x, str)
+            ),
         )
         result.add_check(
             "do_classifier_free_guidance",
@@ -868,8 +870,10 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.list_of_tensors_with_min_dims(x, 2),
+            lambda x: (
+                not batch.do_classifier_free_guidance
+                or V.list_of_tensors_with_min_dims(x, 2)
+            ),
         )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")

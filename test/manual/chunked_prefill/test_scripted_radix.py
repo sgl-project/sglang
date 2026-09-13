@@ -76,9 +76,9 @@ class TestRadixBasic(ScriptedTestCase):
             f"after eviction r2 must re-chunk from scratch; "
             f"chunks_done={r2.chunks_done} cached_tokens={r2.req.cached_tokens}"
         )
-        assert (
-            r2.req.cached_tokens == 0
-        ), f"eviction must clear r1's prefix; cached_tokens={r2.req.cached_tokens}"
+        assert r2.req.cached_tokens == 0, (
+            f"eviction must clear r1's prefix; cached_tokens={r2.req.cached_tokens}"
+        )
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -219,9 +219,9 @@ class TestRadixBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=400)
         assert r.finished
-        assert (
-            r.chunks_done == 0
-        ), f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
+        assert r.chunks_done == 0, (
+            f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
+        )
 
     def test_radix_evict_race_concurrent_chunked_admit(self):
         self.server.execute_script(
@@ -319,9 +319,9 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             "test must observe r as the in-flight chunked_req at least once; the "
             "no-tail else branch was never exercised"
         )
-        assert (
-            r.kv_pages == 0
-        ), f"finished chunked req must release KV; got {r.kv_pages}"
+        assert r.kv_pages == 0, (
+            f"finished chunked req must release KV; got {r.kv_pages}"
+        )
 
 
 class TestRadixHitCountInvariant(ScriptedTestCase):

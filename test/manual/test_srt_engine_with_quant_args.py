@@ -5,7 +5,6 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTest
 
 
 class TestSRTEngineWithQuantArgs(CustomTestCase):
-
     def test_1_quantization_args(self):
 
         # we only test fp8 because other methods are currently dependent on vllm. We can add other methods back to test after vllm dependency is resolved.

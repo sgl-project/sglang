@@ -3299,9 +3299,9 @@ def _create_thd_cp_zigzag_dumps(
     # Dump each rank
     for cp_rank in range(cp_size):
         rank_tensor: torch.Tensor = torch.cat(rank_segments[cp_rank], dim=0)
-        assert (
-            rank_tensor.shape[0] == total_per_rank
-        ), f"rank {cp_rank}: expected {total_per_rank} tokens, got {rank_tensor.shape[0]}"
+        assert rank_tensor.shape[0] == total_per_rank, (
+            f"rank {cp_rank}: expected {total_per_rank} tokens, got {rank_tensor.shape[0]}"
+        )
 
         _create_rank_dump(
             directory,
@@ -4008,11 +4008,13 @@ class TestEntrypointMetaOverride:
         baseline_path, target_path = self._create_single_rank_pair(tmp_path)
 
         yaml_path: Path = tmp_path / "override.yaml"
-        yaml_path.write_text(textwrap.dedent("""\
+        yaml_path.write_text(
+            textwrap.dedent("""\
             overrides:
               - match: "hidden"
                 dims: "t h"
-        """))
+        """)
+        )
 
         argv = _make_argv(
             baseline_path,
@@ -4148,13 +4150,15 @@ class TestEntrypointMetaOverride:
         baseline_path, target_path = self._create_single_rank_pair(tmp_path)
 
         yaml_path: Path = tmp_path / "override.yaml"
-        yaml_path.write_text(textwrap.dedent("""\
+        yaml_path.write_text(
+            textwrap.dedent("""\
             overrides:
               - match: "hidden"
                 dims: "t h"
               - match: "hidden"
                 dims: "a b"
-        """))
+        """)
+        )
 
         argv = _make_argv(
             baseline_path,
@@ -4169,11 +4173,13 @@ class TestEntrypointMetaOverride:
         baseline_path, target_path = self._create_single_rank_pair(tmp_path)
 
         yaml_path: Path = tmp_path / "override.yaml"
-        yaml_path.write_text(textwrap.dedent("""\
+        yaml_path.write_text(
+            textwrap.dedent("""\
             overrides:
               - match: "hidden"
                 dims: "a b"
-        """))
+        """)
+        )
 
         argv = _make_argv(
             baseline_path,

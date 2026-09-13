@@ -47,9 +47,7 @@ assistant_msg_template: str = "{reasoning}{content}{tool_calls}" + eos_token
 assistant_msg_wo_eos_template: str = "{reasoning}{content}{tool_calls}"
 thinking_template: str = "{reasoning_content}"
 
-response_format_template: str = (
-    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
-)
+response_format_template: str = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
 tool_call_template: str = (
     '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
 )
@@ -447,9 +445,9 @@ def render_message(
     task = messages[index].get("task")
     if task is not None:
         # Task special token for internal classification tasks
-        assert (
-            task in VALID_TASKS
-        ), f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}"
+        assert task in VALID_TASKS, (
+            f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}"
+        )
         task_sp_token = DS_TASK_SP_TOKENS[task]
 
         if task != "action":
@@ -843,9 +841,9 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
             index, text, [thinking_end_token, tool_calls_start_token]
         )
         reasoning_content = content_delta
-        assert (
-            stop_token == thinking_end_token
-        ), "Invalid thinking format: missing </think>"
+        assert stop_token == thinking_end_token, (
+            "Invalid thinking format: missing </think>"
+        )
 
     index, content_delta, stop_token = _read_until_stop(
         index, text, [eos_token, tool_calls_start_token]
@@ -874,9 +872,9 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
         thinking_end_token,
         dsml_token,
     ]:
-        assert (
-            sp_token not in summary_content and sp_token not in reasoning_content
-        ), f"Unexpected special token '{sp_token}' in content"
+        assert sp_token not in summary_content and sp_token not in reasoning_content, (
+            f"Unexpected special token '{sp_token}' in content"
+        )
 
     return {
         "role": "assistant",
