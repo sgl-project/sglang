@@ -121,21 +121,11 @@ class EagleVerifyInput(SpecInput):
             + (self.draft_token_num**2) * batch_size
         )
         if self.custom_mask.numel() < mask_numel:
-            # FIXME(attn): temporary fix for custom mask padding with cuda graph
-            self.custom_mask = torch.cat(
-                [
-                    self.custom_mask,
-                    torch.full(
-                        (mask_numel - self.custom_mask.numel(),),
-                        True,
-                        dtype=torch.bool,
-                        device=device,
-                    ),
-                ],
-                dim=0,
+            self.custom_mask = torch.full(
+                (mask_numel,), True, dtype=torch.bool, device=device
             )
 
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask[:mask_numel]
 
 
 @dataclass
