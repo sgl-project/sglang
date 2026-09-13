@@ -415,6 +415,8 @@ class _MoriEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         instance_id: int = 0,
+        *,
+        num_trailing_shared_slots: int,
     ):
         try:
             import mori  # noqa: F401
@@ -429,6 +431,7 @@ class _MoriEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
+        self.num_trailing_shared_slots = num_trailing_shared_slots
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
@@ -799,7 +802,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         # low_latency hook only when the recorder is actually active.
         if record:
             get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
+                self.mori_op.local_expert_count,
+                num_trailing_shared_slots=self.num_trailing_shared_slots,
             )
 
         return (
@@ -1008,7 +1012,8 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
 
         if record:
             get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
+                self.mori_op.local_expert_count,
+                num_trailing_shared_slots=self.num_trailing_shared_slots,
             )
 
         return MoriEPLLDispatchOutput(
@@ -1107,6 +1112,8 @@ class MoriEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         instance_id: int = 0,
+        *,
+        num_trailing_shared_slots: int,
     ):
         super().__init__()
 
@@ -1134,6 +1141,7 @@ class MoriEPDispatcher(BaseDispatcher):
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
             instance_id=instance_id,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
         if self.deepep_mode.enable_low_latency():

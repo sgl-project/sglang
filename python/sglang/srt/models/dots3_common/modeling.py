@@ -401,6 +401,7 @@ class Dots3MoE(nn.Module):
                 deepep_mode=get_deepep_mode(),
                 async_finish=True,
                 return_recv_hook=True,
+                num_trailing_shared_slots=0,
             )
 
         self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
