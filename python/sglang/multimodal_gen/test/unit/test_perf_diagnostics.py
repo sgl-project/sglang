@@ -53,6 +53,41 @@ def test_real_process_counters():
     assert sample["major_faults"] >= 0
     assert sample["io"]["read_bytes"] >= 0
     assert set(sample["kernel"]) == {"syscall", "wchan"}
+    assert sample["scheduler"]["cpu"] >= 0
+    assert sample["scheduler"]["schedstat"]["runtime_ns"] > 0
+    assert sample["scheduler"]["schedstat"]["runqueue_wait_ns"] >= 0
+
+
+def test_scheduler_sample(monkeypatch):
+    values = {
+        "/proc/123/schedstat": "1200 3400 56\n",
+        "/sys/devices/system/cpu/cpu7/cpufreq/scaling_cur_freq": "3200000\n",
+    }
+    monkeypatch.setattr(
+        perf_diagnostics.Path, "read_text", lambda path: values[str(path)]
+    )
+    assert perf_diagnostics._scheduler_sample(123, 7) == {
+        "cpu": 7,
+        "schedstat": {"runtime_ns": 1200, "runqueue_wait_ns": 3400, "timeslices": 56},
+        "frequency_khz": 3200000,
+    }
+
+
+def test_optional_scheduler_files_preserve_process_counters(monkeypatch):
+    original = perf_diagnostics.Path.read_text
+
+    def read(path):
+        if path.name == "schedstat":
+            raise PermissionError()
+        if path.name == "scaling_cur_freq":
+            raise FileNotFoundError()
+        return original(path)
+
+    monkeypatch.setattr(perf_diagnostics.Path, "read_text", read)
+    sample = perf_diagnostics._process_sample(psutil.Process())
+    assert sample["rss_bytes"] > 0
+    assert sample["scheduler"]["schedstat"] == {"error": "PermissionError"}
+    assert sample["scheduler"]["frequency_khz"] == {"error": "FileNotFoundError"}
 
 
 def test_kernel_sample_does_not_retain_arguments(monkeypatch):

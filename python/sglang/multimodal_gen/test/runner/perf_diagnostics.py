@@ -69,6 +69,7 @@ def _process_sample(process):
             "major_faults": int(stat[9]),
             "context_switches": process.num_ctx_switches()._asdict(),
             "kernel": _kernel_sample(process.pid),
+            "scheduler": _scheduler_sample(process.pid, int(stat[36])),
         }
 
 
@@ -82,6 +83,31 @@ def _kernel_sample(pid):
         except OSError as exc:
             # restricted procfs must not discard the other process counters
             result[name] = {"error": type(exc).__name__}
+    return result
+
+
+def _scheduler_sample(pid, cpu):
+    # main-thread counters; frequency is an instantaneous sample, not a guarantee
+    result = {"cpu": cpu}
+    try:
+        values = Path(f"/proc/{pid}/schedstat").read_text().split()
+        result["schedstat"] = dict(
+            zip(
+                ("runtime_ns", "runqueue_wait_ns", "timeslices"),
+                map(int, values),
+                strict=True,
+            )
+        )
+    except (OSError, ValueError) as exc:
+        result["schedstat"] = {"error": type(exc).__name__}
+    try:
+        result["frequency_khz"] = int(
+            Path(
+                f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+            ).read_text()
+        )
+    except (OSError, ValueError) as exc:
+        result["frequency_khz"] = {"error": type(exc).__name__}
     return result
 
 
