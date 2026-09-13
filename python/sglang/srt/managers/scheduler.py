@@ -340,6 +340,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1610,6 +1611,14 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # Depth 3: at most two copy_done records are in flight (result_queue
+        # holds the previous result plus the one just appended; the processor
+        # synchronizes before a slot comes around again). Built alongside
+        # device_module, above the MLX return below, because the non-overlap
+        # speculative path records into it on every device.
+        self._copy_done_event_ring = ReusableEventRing(
+            self.device_module.Event, depth=3
+        )
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -4306,7 +4315,7 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = self._copy_done_event_ring.next()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -4366,7 +4375,7 @@ class Scheduler(
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Only the last PP rank owns real results requiring D2H; other ranks
                 # consume device tensors rebuilt from the output ring.
-                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_done = self._copy_done_event_ring.next()
                 if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
                     batch_result.copy_to_cpu(
                         return_logprob=batch.return_logprob,

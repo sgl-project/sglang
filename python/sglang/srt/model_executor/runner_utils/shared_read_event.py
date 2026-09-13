@@ -23,9 +23,7 @@ def make_external_event(device_module) -> Optional[torch.cuda.Event]:
         return None
 
 
-def maybe_publish_prefill_shared_read_done(
-    model_runner, forward_batch, device_module
-) -> None:
+def maybe_publish_prefill_shared_read_done(model_runner, forward_batch) -> None:
     """Publish prefill read-done after compliant metadata initialization."""
     if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
         return
@@ -47,6 +45,6 @@ def maybe_publish_prefill_shared_read_done(
         "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,
     )
-    read_done = device_module.Event()
+    read_done = model_runner.shared_read_done_events.next()
     read_done.record()
     model_runner.shared_read_done_event = read_done
