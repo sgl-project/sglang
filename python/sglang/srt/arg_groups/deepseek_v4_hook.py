@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    if cfg.dp_size != 1 or cfg.dcp_size != 1:
+        return False
+    if cfg.disaggregation_mode == "decode":
+        return (
+            not cfg.enable_dp_attention
+            and cfg.attn_cp_size == 1
+            and not cfg.enable_prefill_context_parallel
+        )
+
+    prefill_cp = cfg.enable_prefill_cp and cfg.attn_cp_size > 1
+    return (
+        (not cfg.enable_dp_attention or prefill_cp)
+        and (cfg.attn_cp_size == 1 or prefill_cp)
+        and (not cfg.enable_prefill_context_parallel or prefill_cp)
+    )
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -297,16 +315,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
-            or cfg.dcp_size != 1
-            or cfg.enable_prefill_context_parallel
+            or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DP=1, DCP=1, and Decode CP=1. Prefill may use canonical "
+                "interleave CP. Both servers must enable DSpark with the same "
+                "block size and total attention parallel width."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -339,7 +354,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
             # input_ids_global is a DP-wide gather, not a per-local-token tensor,
             # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
+            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:

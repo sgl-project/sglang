@@ -793,6 +793,15 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     local_lens_cpu: Optional[List[int]] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        return (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1513,6 +1522,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
@@ -2707,15 +2717,31 @@ class DeepseekV4AttnBackend(
             )[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk_dense(
-                layer,
-                x[:num_local],
-                q_lora[:num_local],
-                positions[:num_local].to(torch.int64),
-                forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
-                q_lens_cpu,
-            )
+            local_x = x[:num_local]
+            local_q_lora = q_lora[:num_local]
+            local_pos = positions[:num_local].to(torch.int64)
+            if (
+                self._use_dense_fp4_prefill_indexer(forward_batch)
+                and _is_sm100_or_newer()
+            ):
+                self._low_ratio_index_topk_dense(
+                    layer,
+                    local_x,
+                    local_q_lora,
+                    local_pos,
+                    forward_batch,
+                    torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
+                    q_lens_cpu,
+                )
+            else:
+                local_req = torch.repeat_interleave(
+                    forward_batch.req_pool_indices.to(torch.int64),
+                    torch.tensor(q_lens_cpu, dtype=torch.int64, device=x.device),
+                    output_size=num_local,
+                )
+                self._low_ratio_index_topk_torch(
+                    layer, local_x, local_q_lora, local_req, local_pos
+                )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
