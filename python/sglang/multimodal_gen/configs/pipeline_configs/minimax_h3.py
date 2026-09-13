@@ -88,11 +88,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             speed_mode_enable_torch_compile_by_default=False,
-            # 61.73 GB of DiT weights. Every card that is not part of a
-            # 4xH200 set has to stream them, so the DiT has to be eligible for
-            # automatic layerwise offload -- the default here is an empty tuple,
-            # which makes the gate in _should_auto_enable_dit_layerwise_offload
-            # always false and leaves the DiT resident until it fails to load.
+            # Keep the 61.73 GB DiT eligible for automatic layerwise offload
+            # when the deployment does not meet the resident-memory threshold.
             dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
@@ -130,9 +127,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
         )
 
-    def validate_quality_deployment(self, server_args) -> None:
-        """Fail closed unless the resident server matches the deployment
-        audited for quality="high"."""
+    def validate_quality_deployment(
+        self, server_args, *, task: str | None = None
+    ) -> None:
+        """Fail closed unless the resident server matches the released
+        quality="high" deployment contract."""
 
         attention_backend = self._server_arg_value(server_args.attention_backend)
         attention_backend = (
@@ -164,7 +163,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 server_args.is_dit_layerwise_offload_selected
             ),
             "model_variant": model_variant,
-            "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
             "quantization": server_args.quantization,
             "transformer_weights_path": server_args.transformer_weights_path,
@@ -179,6 +177,9 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         actual["component_attention_backends"] = dict(
             server_args.component_attention_backends or {}
         )
+        is_sm90 = capability_int == 90
+        is_sm100 = capability_int == 100
+        allowed_model_variants = {"fl2va", "ref2va"}
         expected = {
             "attention_backend": {None, "fa"},
             "backend": {"auto", "sglang"},
@@ -186,17 +187,16 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
-            "model_variant": "fl2va",
-            "num_gpus": 4,
+            "model_variant": allowed_model_variants,
             "performance_mode": "speed",
             "quantization": None,
             "transformer_weights_path": None,
             "text_encoder_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
-            "sp_degree": 4,
+            "sp_degree": server_args.num_gpus,
             "tp_size": 1,
-            "ulysses_degree": 4,
+            "ulysses_degree": server_args.num_gpus,
             "use_fsdp_inference": False,
         }
         mismatches = {
@@ -208,19 +208,21 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
-        ):
+        if not current_platform.is_cuda() or not (is_sm90 or is_sm100):
             mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
+                "expected": "SM90 or SM100 (compute capability 9.0 or 10.0)",
                 "actual": f"{device_name} (compute capability {capability_int})",
+            }
+        if task == "fl2va" and not is_sm100:
+            mismatches["task"] = {
+                "expected": "fl2va on SM100",
+                "actual": f"fl2va on compute capability {capability_int}",
             }
         if mismatches:
             raise ValueError(
                 'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                "SM90/SM100 fl2va/ref2va deployments; "
+                f"mismatches: {mismatches}"
             )
 
     def validate_server_args(self, server_args) -> None:
