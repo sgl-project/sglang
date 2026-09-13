@@ -189,6 +189,7 @@ class TestKernelEnv(CustomTestCase):
         "SGLANG_K3_AITER_TUNED_MOE_FRONT",
         "SGLANG_K3_MOE_LATENT_MXFP4",
         "SGLANG_K3_PTPC_FP8",
+        "AITER_FLYDSL_DISABLE_MXMOE_V2",
         "AITER_FLYDSL_STAGE1_SCRATCH_REUSE",
     ]
 

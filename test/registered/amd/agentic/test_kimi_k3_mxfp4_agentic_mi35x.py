@@ -55,13 +55,14 @@ What intentionally differs
   ``SGLANG_K3_AITER_{KDA_GROUP64,B2_FUSIONS,MOE_PREROUTE_FP8,LATENT_TAIL_FP8}``,
   ``SGLANG_K3_AITER_MLA_Q_CACHE_FUSION``, ``SGLANG_K3_AITER_TUNED_MOE_FRONT*``,
   ``SGLANG_K3_PREROUTE_PREACTIVATED_SHARED``, ``SGLANG_K3_MOE_LATENT_MXFP4``,
-  ``SGLANG_K3_PTPC_FP8*`` and ``AITER_FLYDSL_STAGE1_SCRATCH_REUSE`` -- are read
-  only by the pinned ``yuychang/sglang`` + ``yuychang/aiter``
-  ``kimi_k3_mxmoe_16k`` branches the recipe runs against, so exporting them here
-  would be dead configuration that reads as if it were doing something. This is
-  the recipe's own ``ENABLE_YUYUN_KERNEL_ENV=0`` ("AITER-only") arm plus the
-  in-tree subset, and it is the main reason the throughput here is expected to
-  sit below a published AgentX number on the same hardware.
+  ``SGLANG_K3_PTPC_FP8*``, ``AITER_FLYDSL_DISABLE_MXMOE_V2`` and
+  ``AITER_FLYDSL_STAGE1_SCRATCH_REUSE`` -- are read only by the pinned
+  ``yuychang/sglang`` + ``yuychang/aiter`` ``kimi_k3_mxmoe_16k`` branches the
+  recipe runs against, so exporting them here would be dead configuration that
+  reads as if it were doing something. This is the recipe's own
+  ``ENABLE_YUYUN_KERNEL_ENV=0`` ("AITER-only") arm plus the in-tree subset, and
+  it is the main reason the throughput here is expected to sit below a published
+  AgentX number on the same hardware.
 * ``HSA_NO_SCRATCH_RECLAIM`` is not set: the recipe gates it on MEC firmware
   older than 177, and ``docker/rocm.Dockerfile`` already exports it for every
   ROCm CI container.
@@ -234,7 +235,6 @@ COMMON_ENV = {
     "AITER_FLYDSL_FORCE": "1",
     "AITER_SITUV2_A4W4": "1",
     "AITER_SITUV2_A8W4": "0",
-    "AITER_FLYDSL_DISABLE_MXMOE_V2": "0",
     "SGLANG_AITER_MLA_PERSIST": "0",
     "SGLANG_AITER_FP8_PREFILL_ATTN": "0",
     "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION": "1",
