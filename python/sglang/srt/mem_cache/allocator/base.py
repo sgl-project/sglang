@@ -24,6 +24,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+class TokenAllocationRecovery(Protocol):
+    """Complete feasibility of the next token allocation, including shared pools."""
+
+    def token_allocation_ready(self, num_tokens: int) -> bool: ...
+
+    def prepare_token_allocation(self, num_tokens: int) -> bool:
+        """Apply safe deferred reclaim and report whether allocation can proceed."""
+        ...
+
+
 class MambaFullCacheDonor(Protocol):
     """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
 
@@ -87,6 +97,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Idle-time diagnostic: recompute byte/slot accounting and return
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def token_allocation_recovery(self) -> TokenAllocationRecovery | None:
+        return None
 
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
         """Return the shared-pool donor capability, if this allocator has one."""

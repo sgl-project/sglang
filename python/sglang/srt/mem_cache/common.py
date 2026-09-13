@@ -160,6 +160,20 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     allocator = tree_cache.token_to_kv_pool_allocator
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
+        recovery = allocator.token_allocation_recovery()
+        if recovery is not None:
+            if recovery.token_allocation_ready(num_tokens):
+                return
+            if recovery.prepare_token_allocation(num_tokens):
+                return
+            tree_cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=max(0, num_tokens - allocator.full_available_size()),
+                    swa_num_tokens=max(0, num_tokens - allocator.swa_available_size()),
+                ),
+                allocation_ready=lambda: recovery.prepare_token_allocation(num_tokens),
+            )
+            return
         # Hybrid allocator
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()

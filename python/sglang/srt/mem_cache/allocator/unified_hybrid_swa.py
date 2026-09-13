@@ -23,7 +23,10 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
+from sglang.srt.mem_cache.allocator.base import (
+    MambaFullCacheDonor,
+    TokenAllocationRecovery,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
@@ -217,6 +220,60 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = K1 + K2 + K3
         K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
         return K_total * self.page_size
+
+    def token_allocation_recovery(self) -> TokenAllocationRecovery:
+        return self
+
+    def token_allocation_ready(self, num_tokens: int) -> bool:
+        return (
+            self.full_available_size() >= num_tokens
+            and self.swa_available_size() >= num_tokens
+            and self.available_size() >= num_tokens
+        )
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.token_allocation_ready(num_tokens)
+
+    def prepare_token_allocation(self, num_tokens: int) -> bool:
+        _flush_deferred_free_group(
+            self,
+            (self.free_group, self.free_page_reps_group, self.full_free_group),
+        )
+        if self.token_allocation_ready(num_tokens):
+            return True
+        # Movement can open a short band, but cannot free occupied logical slots.
+        if (
+            self._conserve_full_available_size() < num_tokens
+            or self._conserve_swa_available_size() < num_tokens
+        ):
+            return False
+        if self._token_allocation_byte_shortfall(num_tokens) > 0:
+            return False
+        return _relieve_for_alloc(self, num_tokens) and self.token_allocation_ready(
+            num_tokens
+        )
+
+    def _token_allocation_byte_shortfall(self, num_tokens: int) -> int:
+        """Minimum bytes that must be freed before layout recovery can succeed.
+
+        Credit every non-live byte, including holes and pending reuse. Only the
+        sink prefix excluded by ALL members is subtracted; alignment and layout
+        restrictions can make less space usable. This optimistic bound may allow
+        an unsuccessful recovery, but cannot skip one that could satisfy demand.
+        """
+        members = self._flush_targets()
+        sink_bytes = min(m.min_page_index * m.entry_bytes_per_page for m in members)
+        live_bytes = sum(m.allocated_count() * m.entry_bytes for m in members)
+        pages = -(-num_tokens // self.page_size)
+        required_bytes = pages * (
+            self.full_attn_allocator.entry_bytes_per_page
+            + self.swa_attn_allocator.entry_bytes_per_page
+        )
+        return max(
+            0,
+            required_bytes + live_bytes + sink_bytes - self.unified_buffer.total_bytes,
+        )
 
     # Slot-conservation views for the leak invariant only; the byte-coordinated
     # value would flag spurious leaks. `allocated_count()` is in TOKENS.
@@ -907,20 +964,6 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         # `out_cache_loc`, so its in-flight write-set is None.
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
-
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        """Joint-aware eviction: one tri-lifetime node frees bytes on several sides
-        at once, so re-check the JOINT gate instead of the per-side shortfall."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
-        # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
-        for _ in range(4):
-            before = self.available_size()
-            if before >= num_tokens:
-                return
-            evict_from_tree_cache(tree_cache, num_tokens)
-            if self.available_size() <= before:
-                return  # no progress
 
     def verify_byte_accounting(self) -> List[str]:
         return (
