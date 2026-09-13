@@ -722,7 +722,7 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host: run them outside
     # the prefill CUDA graph on the live batch, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -2174,16 +2174,20 @@ class MQALayer(MqaAttentionBase):
 @contextmanager
 def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
     """Route every all-gathered row: under CP the real rows are not a prefix."""
-    saved = forward_batch.num_token_non_padded, forward_batch.num_token_non_padded_cpu
+    saved = (
+        forward_batch.num_token_non_padded,
+        forward_batch.global_num_token_non_padded_cpu,
+    )
     if saved[0] is not None:
         forward_batch.num_token_non_padded = torch.full_like(saved[0], num_rows)
-    forward_batch.num_token_non_padded_cpu = num_rows
+    forward_batch.global_num_token_non_padded_cpu = num_rows
     try:
         yield
     finally:
-        forward_batch.num_token_non_padded, forward_batch.num_token_non_padded_cpu = (
-            saved
-        )
+        (
+            forward_batch.num_token_non_padded,
+            forward_batch.global_num_token_non_padded_cpu,
+        ) = saved
 
 
 class DeepseekV4DecoderLayer(nn.Module):
