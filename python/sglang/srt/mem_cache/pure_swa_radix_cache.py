@@ -138,10 +138,10 @@ class PureSWARadixCache(RadixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, chunked=False, is_insert: bool = True):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
         has happened yet, so standard RadixCache logic is correct."""
-        super().cache_unfinished_req(req, chunked=chunked)
+        super().cache_unfinished_req(req, chunked=chunked, is_insert=is_insert)
 
     def available_and_evictable_str(self) -> str:
         allocator = self.token_to_kv_pool_allocator
