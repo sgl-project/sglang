@@ -403,7 +403,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # schedulers read them O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        self._sched_avail_memo_epoch: Optional[int] = None
+        self._sched_avail_memo_key: Optional[Tuple[int, ...]] = None
         self._sched_avail_memo_tokens: int = 0
 
         self.clear()
@@ -576,7 +576,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        if self._sched_avail_memo_epoch == epoch:
+        if self._sched_avail_memo_key == self._schedulable_capacity_key():
             actual = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
@@ -697,16 +697,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
+    def _schedulable_capacity_key(self) -> Tuple[int, ...]:
+        # PD gates can change without any allocator mutation. Include the
+        # realizable peer credit so both blocking and unblocking invalidate.
+        return self._chain_capacity_epoch(), self._peer_drainable_hole_bytes()
+
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a neighbor urgent-flush; alloc gates use
-        `available_size()` instead. Memoized on the chain capacity epoch.
+        `available_size()` instead. Memoized on capacity state and PD move gates.
         """
-        epoch = self._chain_capacity_epoch()
-        if self._sched_avail_memo_epoch != epoch:
+        key = self._schedulable_capacity_key()
+        if self._sched_avail_memo_key != key:
             self._sched_avail_memo_tokens = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
-            self._sched_avail_memo_epoch = epoch
+            self._sched_avail_memo_key = key
         return self._sched_avail_memo_tokens
 
     def _flush_targets(self):
@@ -2147,6 +2152,15 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         if p.disagg_move_gate is not None and not p.disagg_move_gate():
             return 0
         return len(p._free_phys_pages) * p.entry_bytes_per_page
+
+    def _schedulable_capacity_key(self) -> Tuple[int, ...]:
+        # Equal maximum credit can hide a change of side; each side extends
+        # a different gap and must participate independently in the memo key.
+        return (
+            self._chain_capacity_epoch(),
+            self._side_drainable_hole_bytes("low"),
+            self._side_drainable_hole_bytes("high"),
+        )
 
     def _peer_drainable_hole_bytes(self) -> int:
         """The better of the two sides. `_growth_side_neighbor()` is undefined
