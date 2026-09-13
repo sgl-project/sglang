@@ -1,9 +1,11 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -22,8 +24,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
       5. min_new_tokens <= max_new_tokens afterwards
 
     Each case asserts all rules hold and the result is tight: one more token
-    would violate a rule or exceed the request. Over-long inputs degenerate to
-    max_new_tokens = 0 and are rejected by later admission checks.
+    would violate a rule or exceed the request. Request intake rejects raw
+    inputs that can never pass PrefillAdder's total-token gate.
     """
 
     @classmethod
@@ -144,6 +146,79 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
 
+    def test_max_req_input_len_matches_prefill_admission_boundary(self):
+        # With a 190,784-token pool and 64-token pages, the old advertised
+        # input limit was 190,778. Inputs in [190,720, 190,777] pass that
+        # check but can never pass PrefillAdder's first total-token gate. The
+        # threshold itself is rejected by validate_input_length, so 190,719 is
+        # the largest admitted input.
+        capacity, page_size = 190_784, 64
+        threshold = Scheduler.get_max_admissible_input_len(
+            capacity - 6, capacity, page_size, attn_dcp_size=1
+        )
+        self.assertEqual(threshold, 190_720)
+
+        scheduler = self._new_scheduler(
+            max_req_len=capacity - 1,
+            max_total_num_tokens=capacity,
+            page_size=page_size,
+        )
+        req = self._new_req(max_new_tokens=1 << 20, input_len=threshold - 1)
+        self.assertEqual(self._init_and_check(scheduler, req), 0)
+
+        oversized_req = self._new_req(max_new_tokens=1 << 20, input_len=190_720)
+        self.assertIsNotNone(
+            validate_input_length(oversized_req, threshold, allow_auto_truncate=False)
+        )
+
+        # Auto truncation must produce an admissible input and must run before
+        # init_req_max_new_tokens, so both use the same final prompt length.
+        self.assertIsNone(
+            validate_input_length(oversized_req, threshold, allow_auto_truncate=True)
+        )
+        self.assertEqual(len(oversized_req.origin_input_ids), threshold - 1)
+        self.assertEqual(self._init_and_check(scheduler, oversized_req), 0)
+
+    def test_max_req_input_len_accounts_for_dcp_capacity(self):
+        self.assertEqual(
+            Scheduler.get_max_admissible_input_len(
+                max_req_input_len=2_000,
+                max_total_num_tokens=512,
+                page_size=64,
+                attn_dcp_size=2,
+            ),
+            960,
+        )
+
+    def test_auto_truncate_rejects_when_no_nonempty_prompt_can_fit(self):
+        for threshold in (0, 1):
+            with self.subTest(threshold=threshold):
+                req = self._new_req(max_new_tokens=1, input_len=8)
+
+                error_msg = validate_input_length(
+                    req, threshold, allow_auto_truncate=True
+                )
+
+                self.assertIsNotNone(error_msg)
+                self.assertIn("no room for a non-empty prompt", error_msg)
+                self.assertEqual(len(req.origin_input_ids), 8)
+
+    def test_auto_truncate_keeps_token_aligned_fields_consistent(self):
+        req = self._new_req(max_new_tokens=1, input_len=10)
+        req.origin_input_ids = list(range(10))
+        req.origin_input_ids_unpadded = list(range(10))
+        req.input_embeds = [[value] for value in range(10)]
+        req.token_type_ids = [value % 2 for value in range(10)]
+        req.multi_item_delimiter_indices = [0, 3, 7, 9]
+
+        self.assertIsNone(validate_input_length(req, 8, allow_auto_truncate=True))
+
+        self.assertEqual(req.origin_input_ids, list(range(7)))
+        self.assertEqual(req.origin_input_ids_unpadded, list(range(7)))
+        self.assertEqual(req.input_embeds, [[value] for value in range(7)])
+        self.assertEqual(req.token_type_ids, [value % 2 for value in range(7)])
+        self.assertEqual(req.multi_item_delimiter_indices, [0, 3])
+
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler()
@@ -179,6 +254,72 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                         max_new_tokens=requested, input_len=input_len
                                     )
                                     self._init_and_check(scheduler, req)
+
+    @patch(
+        "sglang.srt.managers.scheduler.get_memory",
+        return_value=SimpleNamespace(enable_flexkv=False),
+    )
+    def test_empty_running_batch_clears_stale_batch_is_full(self, _get_memory):
+        scheduler = object.__new__(Scheduler)
+        scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.enable_priority_preemption = False
+        scheduler.is_hybrid_swa = False
+        scheduler.waiting_queue = []
+        scheduler.chunked_req = None
+
+        running_batch = SimpleNamespace(
+            batch_is_full=True,
+            is_empty=lambda: True,
+        )
+        batch_to_run, returned_batch = Scheduler._get_new_batch_prefill_raw(
+            scheduler, None, running_batch
+        )
+
+        self.assertIsNone(batch_to_run)
+        self.assertIs(returned_batch, running_batch)
+        self.assertFalse(running_batch.batch_is_full)
+
+    @patch(
+        "sglang.srt.managers.scheduler.get_serving",
+        return_value=SimpleNamespace(allow_auto_truncate=False),
+    )
+    @patch("sglang.srt.managers.scheduler.Req")
+    def test_oversized_embedding_request_is_finished_before_queueing(
+        self, req_cls, _get_serving
+    ):
+        scheduler = object.__new__(Scheduler)
+        scheduler.tokenizer = object()
+        scheduler.max_req_input_len = 448
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+
+        req = req_cls.return_value
+        req.origin_input_ids = [1] * 448
+        recv_req = SimpleNamespace(
+            rid="oversized-embedding",
+            input_text=None,
+            input_ids=req.origin_input_ids,
+            sampling_params=SimpleNamespace(max_new_tokens=0),
+            positional_embed_overrides=None,
+            token_type_ids=None,
+            routed_dp_rank=None,
+            priority=None,
+            dimensions=None,
+            lora_id=None,
+            http_worker_ipc=None,
+            time_stats=None,
+            return_pooled_hidden_states=False,
+            multi_item_delimiter_indices=None,
+            mm_inputs=None,
+        )
+
+        scheduler.handle_embedding_request(recv_req)
+
+        error_msg = req.set_finish_with_abort.call_args.args[0]
+        self.assertIn("Input length (448 tokens)", error_msg)
+        scheduler._add_request_to_queue.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

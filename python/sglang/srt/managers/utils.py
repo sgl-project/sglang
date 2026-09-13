@@ -236,12 +236,39 @@ def validate_input_length(
     """
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
+            truncate_len = max_req_input_len - 1
+            if truncate_len <= 0:
+                return (
+                    f"Input length ({len(req.origin_input_ids)} tokens) cannot fit "
+                    "in the available KV cache because there is no room for a "
+                    "non-empty prompt. Increase the KV cache capacity."
+                )
+
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            # The validation condition is ``len >= max_req_input_len``, so
+            # truncating to the threshold would still leave an inadmissible
+            # request. Keep one token below it.
+            req.origin_input_ids = req.origin_input_ids[:truncate_len]
+            # Keep token-aligned request fields consistent with the effective
+            # prompt. In particular, stale token_type_ids would otherwise have
+            # a different length from the flattened embedding input.
+            for attr in (
+                "origin_input_ids_unpadded",
+                "input_embeds",
+                "token_type_ids",
+            ):
+                value = getattr(req, attr, None)
+                if value is not None:
+                    setattr(req, attr, value[:truncate_len])
+            delimiter_indices = getattr(req, "multi_item_delimiter_indices", None)
+            if delimiter_indices is not None:
+                req.multi_item_delimiter_indices = [
+                    index for index in delimiter_indices if 0 <= index < truncate_len
+                ]
             return None
         else:
             error_msg = (

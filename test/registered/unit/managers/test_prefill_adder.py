@@ -125,6 +125,36 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_near_capacity_raw_input_boundary(self):
+        capacity, page_size = 512, 64
+
+        for input_len, admitted in ((447, True), (448, False)):
+            with self.subTest(input_len=input_len):
+                self.mock_token_allocator.available_size.return_value = capacity
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=page_size
+                )
+                req = self.create_mock_req(
+                    f"near-capacity-{input_len}",
+                    priority=0,
+                    max_new_tokens=0,
+                )
+                req.full_untruncated_fill_ids = list(range(input_len))
+                req.last_node = MagicMock()
+                req.sampling_params.ignore_eos = False
+                req.set_extend_range = MagicMock(
+                    side_effect=lambda start, end, req=req: setattr(
+                        req, "extend_range", Range(start, end)
+                    )
+                )
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertEqual(result, AddReqResult.NO_TOKEN)
+                self.assertEqual(req in adder.can_run_list, admitted)
+
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())
         req = self.create_mock_req("storage-hit", priority=0, max_new_tokens=1)
