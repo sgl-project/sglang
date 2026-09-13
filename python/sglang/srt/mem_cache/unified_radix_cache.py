@@ -2607,6 +2607,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 operation,
                 hit_tokens,
                 allow_partial=not buffer_mode,
+                min_tokens=self.prefetch_threshold,
                 evict_host=self.evict_host,
             )
             if host_indices is None:

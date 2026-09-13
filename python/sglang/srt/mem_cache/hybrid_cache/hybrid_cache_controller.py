@@ -656,6 +656,7 @@ class HybridCacheController(BaseHiCacheController):
         hit_tokens: int,
         *,
         allow_partial: bool,
+        min_tokens: int,
         evict_host: Callable[[int], int],
     ) -> tuple[Optional[torch.Tensor], int]:
         host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
@@ -680,7 +681,7 @@ class HybridCacheController(BaseHiCacheController):
         else:
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
-        if alloc_len >= self.prefetch_threshold:
+        if alloc_len >= min_tokens:
             host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
         return host_indices, alloc_len
 
