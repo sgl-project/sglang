@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare V4.1 byte tables in a Mooncake Store owner or immutable local files."""
+"""Prepare V4.1 byte tables in Mooncake Store or owned local shared memory."""
 
 import argparse
 import gc
@@ -61,7 +61,8 @@ def main():
         if not args.local_dir:
             parser.error("--mode local requires --local-dir")
         local_dir = Path(args.local_dir).resolve()
-        local_dir.mkdir(parents=True, exist_ok=False)
+        if local_dir.exists():
+            parser.error("--local-dir must be a new directory")
     else:
         store = MooncakeDistributedStore()
         server_connection = dict(
@@ -72,9 +73,11 @@ def main():
             raise RuntimeError(f"Mooncake setup failed: {rc}")
     replicate = ReplicateConfig()
     replicate.with_hard_pin = True
-    manifest = dict(mode=args.mode, connection=connection, layers={})
+    manifest = dict(mode=args.mode, layers={})
+    if store is not None:
+        manifest["connection"] = connection
     if local_dir is not None:
-        manifest["local_tables"] = {}
+        manifest["local_dir"] = str(local_dir)
     ready_key = "engram:ready"
     if store is not None and store.is_exist(ready_key):
         raise RuntimeError("Engram tables already published in this Store")
@@ -86,7 +89,11 @@ def main():
         ]
         cfg.row_bytes = layout.head_dim + layout.head_dim // 32
         layers[layer] = cfg
-    table = EngramStore(layers, store)
+    table = EngramStore(
+        layers,
+        store_client=store,
+        local_dir=str(local_dir) if local_dir is not None else "",
+    )
     try:
         for layer_index, layer in enumerate(layout.layer_ids):
             cfg = layers[layer]
@@ -103,16 +110,8 @@ def main():
                 weight = wf.get_slice(weight_name)
                 scale = sf.get_slice(scale_name)
                 buffers, offset = [], 0
-                local_paths = []
                 for head, rows in enumerate(cfg.table_vocab_sizes):
-                    if local_dir is None:
-                        packed = np.empty((rows, cfg.row_bytes), dtype=np.uint8)
-                    else:
-                        path = local_dir / f"layer-{layer}-head-{head}.bin"
-                        packed = np.memmap(
-                            path, mode="w+", dtype=np.uint8, shape=(rows, cfg.row_bytes)
-                        )
-                        local_paths.append(str(path))
+                    packed = np.empty((rows, cfg.row_bytes), dtype=np.uint8)
                     # Bound temporary copies while retaining one layer's upload buffers.
                     for start in range(0, rows, 65536):
                         end = min(start + 65536, rows)
@@ -126,11 +125,6 @@ def main():
                             .view(torch.uint8)
                             .numpy()
                         )
-                    if local_dir is not None:
-                        packed.flush()
-                        packed = np.memmap(
-                            path, mode="r", dtype=np.uint8, shape=(rows, cfg.row_bytes)
-                        )
                     buffers.append(packed)
                     offset += rows
                     print(
@@ -139,11 +133,7 @@ def main():
                     )
                 if offset != layout.num_embeddings[layer_index]:
                     raise ValueError("Head sizes do not match checkpoint table")
-                if local_dir is None:
-                    table.populate(layer, buffers, replicate)
-                else:
-                    table.bind_local(layer, buffers)
-                    manifest["local_tables"][str(layer)] = local_paths
+                table.populate(layer, buffers, replicate)
                 # Validate rows at both ends, including byte offsets above 2 GiB.
                 ids = np.array(
                     [
@@ -193,7 +183,7 @@ def main():
         temporary.replace(output)
         if local_dir is not None:
             print(
-                f"READY: {output}; keep local table files immutable while serving",
+                f"READY: {output}; local tables are owned by Mooncake; keep the directory until serving stops",
                 flush=True,
             )
             return

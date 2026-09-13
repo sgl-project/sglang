@@ -39,21 +39,26 @@ def setup(tmp_path, monkeypatch, request):
         rdma_devices=os.getenv("MOONCAKE_RDMA_DEVICES", ""),
         master_server_addr=os.getenv("MOONCAKE_MASTER", "127.0.0.1:50051"),
     )
-    owner = MooncakeDistributedStore()
-    assert owner.setup(**dict(connection, global_segment_size=128 * 1024**2)) == 0
-    if owner.is_exist("engram:ready"):
-        owner.close()
-        pytest.fail("Use a dedicated test Store without published Engram tables")
-    manifest = dict(mode=request.param, connection=connection, layers={})
-    if request.param == "local":
-        manifest["local_tables"] = {}
+    owner = None
+    manifest = dict(mode=request.param, layers={})
+    if request.param == "store":
+        owner = MooncakeDistributedStore()
+        assert owner.setup(**dict(connection, global_segment_size=128 * 1024**2)) == 0
+        if owner.is_exist("engram:ready"):
+            owner.close()
+            pytest.fail("Use a dedicated test Store without published Engram tables")
+        manifest["connection"] = connection
+    else:
+        manifest["local_dir"] = str(tmp_path / "tables")
     configs = {}
     for i, layer in enumerate(layout.layer_ids):
         cfg = EngramStoreConfig()
         cfg.table_vocab_sizes = [p for group in layout.primes[i] for p in group]
         cfg.row_bytes = 264
         configs[layer] = cfg
-    table = EngramStore(configs, owner)
+    table = EngramStore(
+        configs, store_client=owner, local_dir=manifest.get("local_dir", "")
+    )
     reference = []
     for layer, cfg in configs.items():
         arrays = []
@@ -64,20 +69,13 @@ def setup(tmp_path, monkeypatch, request):
             raw[:, :32] = 56  # FP8 1.0
             raw[:, 256] = 0  # E8M0 exponent zero is 2**-127, not zero.
             arrays.append(raw)
-        if request.param == "store":
-            table.populate(layer, arrays)
-        else:
-            paths = []
-            for h, raw in enumerate(arrays):
-                path = tmp_path / f"{layer}-{h}.bin"
-                raw.tofile(path)
-                paths.append(str(path))
-            manifest["local_tables"][str(layer)] = paths
+        table.populate(layer, arrays)
         reference.append(torch.from_numpy(np.concatenate(arrays)).cuda())
         manifest["layers"][str(layer)] = dict(
             table_vocab_sizes=cfg.table_vocab_sizes, head_dim=256, row_bytes=264
         )
-    assert owner.put("engram:ready", json.dumps(manifest["layers"]).encode()) == 0
+    if owner is not None:
+        assert owner.put("engram:ready", json.dumps(manifest["layers"]).encode()) == 0
     path = tmp_path / "mooncake.json"
     path.write_text(json.dumps(manifest))
     monkeypatch.setenv("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "1")
@@ -128,10 +126,11 @@ def setup(tmp_path, monkeypatch, request):
     if embeds[0].store is not None:
         embeds[0].store.close()
     connect_store.cache_clear()
-    for layer in layout.layer_ids:
-        table.remove_from_store(layer, force=True)
-    owner.remove("engram:ready", True)
-    owner.close()
+    if owner is not None:
+        for layer in layout.layer_ids:
+            table.remove_from_store(layer, force=True)
+        owner.remove("engram:ready", True)
+        owner.close()
 
 
 def test_changing_tokens_padding_and_bucket_replay(setup):

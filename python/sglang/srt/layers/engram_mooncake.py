@@ -7,7 +7,6 @@ capture. Sequential scheduling is required for host-buffer ownership.
 
 import functools
 import json
-import mmap
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -42,29 +41,11 @@ def connect_store(config_path):
         cfg.table_vocab_sizes = layout["table_vocab_sizes"]
         cfg.row_bytes = layout["row_bytes"]
         layers[int(layer_id)] = cfg
-    table = EngramStore(layers, store)
-    if mode == "local":
-        for layer_id, cfg in layers.items():
-            paths = config["local_tables"][str(layer_id)]
-            if len(paths) != len(cfg.table_vocab_sizes):
-                raise ValueError("Local Engram table count mismatch")
-            arrays = []
-            for path, rows in zip(paths, cfg.table_vocab_sizes):
-                if Path(path).stat().st_size != rows * cfg.row_bytes:
-                    raise ValueError(f"Local Engram table size mismatch: {path}")
-                # Establish page tables before serving; sparse first-touch faults
-                # otherwise dominate the row copies even when tmpfs is resident.
-                with open(path, "rb") as source:
-                    mapping = mmap.mmap(
-                        source.fileno(),
-                        0,
-                        flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
-                        prot=mmap.PROT_READ,
-                    )
-                arrays.append(
-                    np.ndarray((rows, cfg.row_bytes), dtype=np.uint8, buffer=mapping)
-                )
-            table.bind_local(layer_id, arrays)
+    table = EngramStore(
+        layers,
+        store_client=store,
+        local_dir=config["local_dir"] if mode == "local" else "",
+    )
     return store, table, config
 
 
