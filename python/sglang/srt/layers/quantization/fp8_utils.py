@@ -2021,8 +2021,21 @@ def apply_fp8_linear(
             )
         else:
             # default use per-token quantization if dynamic
+            pre_quant = (
+                getattr(input, "_fp8_qinput", None)
+                if _is_hip and weight_scale.numel() > 1
+                else None
+            )
             if _is_cuda:
                 qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+            elif (
+                pre_quant is not None
+                and pre_quant[0].shape[0] == input_2d.shape[0]
+                and pre_quant[0].shape[-1] == input_2d.shape[-1]
+            ):
+                # Per-token fp8 activation already produced by the fused
+                # add-RMSNorm kernel (``out._fp8_qinput``); skip the re-quant.
+                qinput, x_scale = pre_quant[0], pre_quant[1]
             else:
                 # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
                 # final solution should be: 1. add support to per-tensor activation scaling.

@@ -154,6 +154,9 @@ if _is_hip:
 def _fuse_norm_fp8_max_m() -> int:
     if not is_gfx95_supported():
         return 0
+    override = envs.SGLANG_FUSED_NORM_FP8_QUANT_MAX_M.get()
+    if override is not None:
+        return override
     from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
 
     return MXFP8_DENSE_PTPC_DECODE_MAX_M
