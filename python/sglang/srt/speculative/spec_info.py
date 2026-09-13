@@ -382,6 +382,10 @@ class SpecInputType(IntEnum):
     UNO_STATE = auto()
     UNO_DRAFT = auto()
     UNO_VERIFY = auto()
+    # Carried between rounds under PP: the tree the last stage drafted, which
+    # every stage rebuilds its verify input from. Neither a draft nor a verify
+    # input -- no forward ever runs on it.
+    PP_SPEC_RELAY = auto()
 
 
 class SpecInput(ABC):
