@@ -77,5 +77,43 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         self.assertEqual(backend.forward_metadata.max_seq_len_k, 16)
 
 
+class TestSpecReadSeqLenDelta(CustomTestCase):
+    """The mode -> seq_len_delta map IS the widening the whole-sequence spec
+    reads apply to cache_seqlens; a drift silently truncates the verify or
+    draft tail of the translated read table (the metadata builders widen
+    cache_seqlens while the source fill stays prefix-only)."""
+
+    def _backend(self, *, topk=1, num_steps=3, step_id=1, num_draft=4):
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.topk = topk
+        b.speculative_num_steps = num_steps
+        b.speculative_step_id = step_id
+        b.speculative_num_draft_tokens = num_draft
+        return b
+
+    def test_mode_to_delta_map(self):
+        b = self._backend()
+        spec = object()
+        # Verify reads [prefix + drafts]; draft decode step i reads
+        # [prefix + i + 1] (both write the drafts into the pool first).
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.TARGET_VERIFY, spec), 4)
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.DECODE, spec), 2)
+        # Prefix-only shapes stay un-widened.
+        self.assertEqual(
+            b._spec_read_seq_len_delta(ForwardMode.DRAFT_EXTEND_V2, spec), 0
+        )
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.DECODE, None), 0)
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.EXTEND, spec), 0)
+        # Draft-extend's idle batch carries no live draft chain.
+        idle = self._backend(num_steps=0)
+        self.assertEqual(idle._spec_read_seq_len_delta(ForwardMode.IDLE, spec), 0)
+        # topk>1 reads the drafts via the expand metadata - prefix only.
+        tree = self._backend(topk=2)
+        self.assertEqual(
+            tree._spec_read_seq_len_delta(ForwardMode.TARGET_VERIFY, spec), 0
+        )
+        self.assertEqual(tree._spec_read_seq_len_delta(ForwardMode.DECODE, spec), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

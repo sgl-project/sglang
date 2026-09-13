@@ -15,10 +15,11 @@
 memory pool (Kimi-Linear).
 
 `req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are
-contiguous (`build_mla_views`). The paged MLA backends therefore need their
-page-level block table filled with kernel-facing page ids:
+token-major (`build_dense_views`), indexed by the physical token id. The paged
+MLA backends therefore need their page-level block table filled with physical
+page ids:
 
-    kernel_page(virtual_page) = v2p[virtual_page] * layer_num
+    kernel_page(virtual_page) = v2p[virtual_page]
 
 Since the read-path translator, ONE builder computes that formula for every
 family — `build_index_table` (the canonical) — and the backends only
@@ -57,12 +58,9 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
-_LAYERS = 24  # K3 MLA full-attention layer count
 
 
-def _fill_block_table(
-    req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
-):
+def _fill_block_table(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p):
     """The unified route: canonical builder into a -1-filled block table
     (exactly what KVIndexTranslator.build_into does for trtllm_mla/flashmla)."""
     from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
@@ -75,7 +73,6 @@ def _fill_block_table(
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens.to(torch.int64),
         v2p=v2p,
-        multiplier=mult,
         page_size=page_size,
         max_pages=max_blocks,
         out=out,
@@ -107,7 +104,7 @@ def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size
     return out
 
 
-def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult):
+def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p):
     """Python reference: virtual token -> virtual page -> physical page -> kernel id."""
     bs = req_pool_indices.shape[0]
     max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
@@ -117,7 +114,7 @@ def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
         row = req_to_token[int(req_pool_indices[r].item())]
         virt_pages = row[: n_pages * page_size : page_size] // page_size
         pages = v2p[virt_pages.long()] if v2p is not None else virt_pages.long()
-        ref[r, :n_pages] = pages * mult
+        ref[r, :n_pages] = pages
     return ref
 
 
@@ -148,13 +145,46 @@ class TestBlockTable(unittest.TestCase):
         v2p[0] = 0  # page 0 is the reserved sink
         return req_to_token, req_pool_indices, seq_lens, v2p
 
+    def test_seq_len_delta_matches_widened_lens(self):
+        """The kernel's ``seq_len_delta`` equals building with ``seq_lens + k``
+        (the two spellings of verify widening), and genuinely widens: the
+        widened columns overwrite the -1 sentinel the plain build leaves."""
+        from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            delta = page_size + 1
+            max_pages = int((sl.max().item() + delta + page_size - 1) // page_size)
+
+            def fill(seq_lens, seq_len_delta):
+                out = torch.full(
+                    (rpi.shape[0], max_pages), -1, dtype=torch.int32, device=_DEV
+                )
+                build_kv_read_table(
+                    req_to_token=rt,
+                    req_pool_indices=rpi,
+                    seq_lens=seq_lens.to(torch.int64),
+                    v2p=v2p,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=out,
+                    seq_len_delta=seq_len_delta,
+                )
+                return out
+
+            widened = fill(sl, delta)
+            by_lens = fill(sl + delta, 0)
+            plain = fill(sl, 0)
+            self.assertTrue(torch.equal(widened, by_lens), f"ps={page_size}")
+            self.assertFalse(torch.equal(widened, plain), f"ps={page_size}")
+
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the
         plain token//ps reference -- guards the v2p-arg removal itself."""
         for page_size in (1, 32, 64):
             rt, rpi, sl, _ = self._make_batch(page_size)
             got = _fill_block_table_static(rt, rpi, sl, page_size)
-            want = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
+            want = _reference(rt, rpi, sl, page_size, v2p=None)
             self.assertTrue(
                 torch.equal(got.long(), want), f"page_size={page_size}: {got} != {want}"
             )
@@ -162,31 +192,28 @@ class TestBlockTable(unittest.TestCase):
     def test_block_table_matches_reference(self):
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
+            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p)
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p)
             self.assertTrue(
                 torch.equal(got.long(), want),
                 f"page_size={page_size}:\ngot ={got}\nwant={want}",
             )
 
     def test_single_full_attention_layer_still_maps_v2p(self):
-        """A config with exactly ONE full-attention layer (e.g. a PP rank owning a
-        single MLA layer) has `kernel_page_multiplier == 1`, but its req_to_token
-        still holds VIRTUAL ids. The kernel-facing id collapses onto the physical id, so
-        the v2p gather alone IS the whole translation -- it must not be skipped.
-
-        Regression guard for detecting the unified pool via `multiplier > 1`:
-        that predicate treats this config as a static pool and leaves the block
-        table in virtual id space.
+        """The kernel-facing id IS the physical id, so the v2p gather alone is
+        the whole translation -- it must not be skipped. Regression guard for
+        detecting the unified pool via `multiplier > 1`: that predicate would
+        treat every unified pool as static and leave the block table in
+        virtual id space.
         """
         for page_size in (1, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=1).long()
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=1)
+            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p).long()
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p)
             self.assertTrue(torch.equal(got, want), f"page_size={page_size}")
             # ... and the v2p permutation is non-trivial here, so a skipped
             # translation would be visibly different rather than accidentally equal.
-            virtual = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
+            virtual = _reference(rt, rpi, sl, page_size, v2p=None)
             self.assertFalse(
                 torch.equal(want, virtual),
                 "test batch degenerated: v2p is the identity on the pages used",
@@ -198,7 +225,7 @@ class TestBlockTable(unittest.TestCase):
         trtllm/flashmla block-table contract)."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
-        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
+        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p)
         for r in range(got.shape[0]):
             n_pages = (int(sl[r].item()) + page_size - 1) // page_size
             self.assertTrue(
@@ -207,21 +234,18 @@ class TestBlockTable(unittest.TestCase):
             )
 
     def test_agrees_with_token_level_translate(self):
-        """The flashinfer updaters translate TOKEN ids with
-        `translate_kv_loc_for_kernel`; the trtllm path builds PAGE ids in-kernel. Both
-        must address the same kernel-facing page block."""
+        """The flashinfer updaters translate TOKEN ids with `translate_kv_loc`;
+        the trtllm path builds PAGE ids in-kernel. Both must address the same
+        physical page."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
-        block_table = _fill_block_table(
-            rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS
-        ).long()
+        block_table = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p).long()
         for r in range(rt.shape[0]):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
-            # translate_kv_loc_for_kernel's formula, applied to token ids.
+            # translate_kv_loc's formula, applied to token ids.
             kernel_tokens = (
-                v2p[virt_tokens // page_size] * (page_size * _LAYERS)
-                + virt_tokens % page_size
+                v2p[virt_tokens // page_size] * page_size + virt_tokens % page_size
             )
             # The block-table entry scaled by page_size must be the kernel-facing id of
             # each page's first token.
@@ -245,7 +269,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     (no source flag) stays byte-identical to the pre-translator kernel.
     """
 
-    def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
+    def _run(self, page_size, *, v2p, bs=5, max_ctx=2048):
         from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
         from sglang.kernels.ops.kvcache.kv_read_table import (
             build_kv_read_table,
@@ -283,7 +307,6 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
                 req_pool_indices=rpi,
                 seq_lens=cache_seqlens,
                 v2p=v2p_full,
-                multiplier=mult,
                 page_size=page_size,
                 max_pages=max_pages,
                 out=page_table,
@@ -303,9 +326,7 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
                 None,
             )
         torch.cuda.synchronize()
-        want = _reference(
-            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None), mult=mult
-        )
+        want = _reference(rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None))
         return page_table, want, sl
 
     def _assert_live_prefix(self, got, want, sl, page_size):
@@ -322,27 +343,26 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     def test_identity_when_hooks_absent(self):
         """Static pool: no v2p, multiplier 1 -> byte-identical to pre-change."""
         for page_size in (1, 64):
-            got, want, sl = self._run(page_size, v2p=False, mult=1)
+            got, want, sl = self._run(page_size, v2p=False)
             self._assert_live_prefix(got, want, sl, page_size)
 
     def test_translated_mapping_ps1_fast_path(self):
-        got, want, sl = self._run(1, v2p=True, mult=_LAYERS)
+        got, want, sl = self._run(1, v2p=True)
         self._assert_live_prefix(got, want, sl, 1)
 
     def test_translated_mapping_general_path(self):
-        got, want, sl = self._run(64, v2p=True, mult=_LAYERS)
+        got, want, sl = self._run(64, v2p=True)
         self._assert_live_prefix(got, want, sl, 64)
 
     def test_single_full_attention_layer(self):
         """multiplier 1 with a real v2p: the gather alone is the translation."""
         for page_size in (1, 64):
-            got, want, sl = self._run(page_size, v2p=True, mult=1)
+            got, want, sl = self._run(page_size, v2p=True)
             self._assert_live_prefix(got, want, sl, page_size)
             virtual = _reference(
                 *TestBlockTable._make_batch(self, page_size)[:3],
                 page_size,
                 v2p=None,
-                mult=1,
             )
             self.assertFalse(
                 torch.equal(want, virtual),
