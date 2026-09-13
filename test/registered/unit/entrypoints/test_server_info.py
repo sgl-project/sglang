@@ -40,6 +40,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
+class _CustomModelLoader:
+    pass
+
+
 def _stub_tokenizer_manager(
     server_args: ServerArgs, get_internal_state=None
 ) -> TokenizerManager:
@@ -55,6 +59,40 @@ def _stub_tokenizer_manager(
     tokenizer_manager.startup_time = None
     tokenizer_manager.get_internal_state = get_internal_state
     return tokenizer_manager
+
+
+def test_model_info_serializes_custom_loader_class():
+    server_args = ServerArgs(model_path="dummy")
+    values = {
+        "weight_version": None,
+        "load_format": _CustomModelLoader,
+        "reasoning_parser": None,
+        "tool_call_parser": None,
+    }
+    tokenizer_manager = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_image_understandable_model=False,
+            is_audio_understandable_model=False,
+            hf_config=SimpleNamespace(model_type="test", architectures=["TestModel"]),
+            embedding_model_spec=None,
+        ),
+        model_path="dummy",
+        served_model_name="dummy",
+        server_args=server_args,
+        is_generation=True,
+        config_value=values.__getitem__,
+    )
+    prior_state = http_server.get_global_state()
+    http_server.set_global_state(SimpleNamespace(tokenizer_manager=tokenizer_manager))
+    publish(server_args, role="tokenizer")
+    try:
+        payload = asyncio.run(http_server.model_info())
+    finally:
+        http_server._global_state = prior_state
+        reset_context()
+
+    assert payload["load_format"] == f"{__name__}._CustomModelLoader"
+    json.dumps(payload)
 
 
 def _call_server_info_with(
