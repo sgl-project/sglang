@@ -263,7 +263,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        # EagleDraftExtendInput carries no draft_token_num; its seq_lens_cpu is
+        # already the post-write length (prepare_for_draft_extend adds
+        # num_draft_tokens).
+        draft_window = getattr(spec_info, "draft_token_num", None)
+        draft_window = 0 if draft_window is None else int(draft_window)
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
