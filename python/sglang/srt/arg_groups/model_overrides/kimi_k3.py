@@ -5,6 +5,8 @@ Architectures: KimiK3ForConditionalGeneration.
 
 import inspect
 import logging
+
+from sglang.srt.utils import is_hip
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -100,6 +102,14 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 prefill_attention_backend="tokenspeed_mla",
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
+            )
+        elif decode_backend == "triton" and is_hip():
+            # ROCm experiment: the triton MLA backend carries the DCP extend and
+            # decode paths; keep it for both phases.
+            logger.info("Kimi-K3 DCP on ROCm keeps the 'triton' attention backend for prefill and decode.")
+            overrides.update(
+                prefill_attention_backend="triton",
+                decode_attention_backend="triton",
             )
         else:
             raise AssertionError(

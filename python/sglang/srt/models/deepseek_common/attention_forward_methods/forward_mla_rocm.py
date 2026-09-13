@@ -783,14 +783,26 @@ class DeepseekMLARocmForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if is_dcp_mla_decode_phase(forward_batch):
+                # Rank-local partial output + LSE; the cross-rank combine
+                # happens below.
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
 
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):

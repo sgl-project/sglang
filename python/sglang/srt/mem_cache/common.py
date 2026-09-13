@@ -107,6 +107,26 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def _coalesce_contiguous_segments(
+    segments: list[tuple[torch.Tensor, int]],
+) -> list[tuple[torch.Tensor, int]]:
+    """Merge ascending segments that abut on the row. Callers split a freed
+    tail at boundaries that are not page-aligned (a state-checkpoint
+    truncation point, the unaligned key tail); with a DCP-widened allocator
+    page those pieces share a page, which the page-once free contract rejects,
+    while their union is one page-aligned segment."""
+    merged: list[tuple[torch.Tensor, int]] = []
+    for kv_indices, start_pos in segments:
+        if kv_indices.numel() == 0:
+            continue
+        if merged and merged[-1][1] + merged[-1][0].numel() == start_pos:
+            prev_indices, prev_start = merged[-1]
+            merged[-1] = (torch.cat([prev_indices, kv_indices]), prev_start)
+        else:
+            merged.append((kv_indices, start_pos))
+    return merged
+
+
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],
@@ -117,7 +137,7 @@ def free_kv_row_segments(
     request's kv row, split at the SWA eviction floor."""
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
-    for kv_indices, start_pos in segments:
+    for kv_indices, start_pos in _coalesce_contiguous_segments(segments):
         num_indices = kv_indices.numel()
         if num_indices == 0:
             continue

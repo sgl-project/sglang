@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
+
 import torch
 import triton
 
@@ -1483,6 +1484,21 @@ class TritonAttnBackend(AttentionBackend):
             return output, lse
         return output
 
+    def _set_mla_kv_buffer_dcp(
+        self, layer: RadixAttention, forward_batch: ForwardBatch, k: torch.Tensor
+    ) -> None:
+        # k is the combined [nope | rope] latent row; the pool's DCP kernel
+        # takes the widened out_cache_loc and applies the owner rule itself.
+        # Absorbed MLA: v_head_dim is the latent rank, the tail is the rope part.
+        kv_lora_rank = layer.v_head_dim
+        k = k.view(-1, 1, k.shape[-1])
+        self.token_to_kv_pool.set_mla_kv_buffer(
+            layer,
+            forward_batch.out_cache_loc,
+            k[..., :kv_lora_rank],
+            k[..., kv_lora_rank:],
+        )
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1569,7 +1585,10 @@ class TritonAttnBackend(AttentionBackend):
                     self.forward_metadata.swa_out_cache_loc,
                     full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
-                if layer.k_scale is None:
+                if self.use_mla and self.dcp_size > 1:
+                    k_dcp = k if layer.k_scale is None else k.clone().div_(layer.k_scale)
+                    self._set_mla_kv_buffer_dcp(layer, forward_batch, k_dcp)
+                elif layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -1875,9 +1894,14 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Select the replicated K/V heads matching this rank's Q shard.
+        # Select the replicated K/V heads matching this rank's Q shard. Only
+        # when k carries every DCP rank's heads; a TP-sharded MHA layer (K3:
+        # 12 q heads over 12 k heads per rank) already lines up with q.
+        mha_tp_matched = layer.tp_k_head_num > 1 and (
+            layer.tp_k_head_num == layer.tp_q_head_num
+        )
         if k.numel() > 0:
-            if layer.tp_k_head_num > 1:
+            if layer.tp_k_head_num > 1 and not mha_tp_matched:
                 kv_head_start = (
                     group.rank_in_group * layer.tp_k_head_num // group.world_size
                 )
@@ -1915,6 +1939,13 @@ class TritonAttnBackend(AttentionBackend):
         if kv_indices.numel() == 0:
             return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
                 q.dtype
+            )
+        if mha_tp_matched:
+            # The latent pool cannot serve MHA-dim queries; a prefix here must
+            # arrive up-projected through the one-shot path (dense kernel above).
+            raise NotImplementedError(
+                "DCP Triton extend: MHA layer with a cached prefix must use the "
+                "one-shot path (mha_one_shot) so K/V span prefix + chunk."
             )
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
@@ -2146,20 +2177,26 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    # `full_loc` carries the pre-translated loc under the unified
-                    # pool, refreshed into a capture-stable buffer before replay —
-                    # translating inside set_kv_buffer would be captured and replay
-                    # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
-                    ),
-                    k,
-                    v,
-                )
+                if self.dcp_size > 1:
+                    # MLA pools resolve the DCP owner rule inside
+                    # set_mla_kv_buffer from the widened loc; the combined-row
+                    # set_kv_buffer door has no DCP path.
+                    self._set_mla_kv_buffer_dcp(layer, forward_batch, k)
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        # `full_loc` carries the pre-translated loc under the unified
+                        # pool, refreshed into a capture-stable buffer before replay —
+                        # translating inside set_kv_buffer would be captured and replay
+                        # a stale v2p. None (-> raw loc) for static pools.
+                        KVWriteLoc(
+                            forward_batch.out_cache_loc,
+                            self.forward_metadata.swa_out_cache_loc,
+                            full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                        ),
+                        k,
+                        v,
+                    )
             else:
                 self._set_kv_buffer(
                     forward_batch,
@@ -2212,7 +2249,9 @@ class TritonAttnBackend(AttentionBackend):
             get_is_capture_mode,
         )
 
-        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get() or self.dcp_size > 1:
+            # Lean partitions its persistent grid on the full sequence
+            # lengths; under DCP each rank holds a 1/dcp_size KV shard.
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
@@ -2241,11 +2280,19 @@ class TritonAttnBackend(AttentionBackend):
                     "DCP Triton decode does not support score_mod"
                 )
             group = get_parallel().dcp_group
-            with use_symmetric_memory(group):
-                q_for_decode = q.view(
-                    -1, layer.tp_q_head_num, layer.qk_head_dim
-                ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+            # Replicated Q projection hands every DCP rank all heads already
+            # (layer = attn_mqa_for_dcp_decode); the model then combines the
+            # rank-local partials with the returned LSE. Otherwise gather the
+            # head shards and combine here.
+            model_side_combine = layer.tp_q_head_num == self.num_head
+            if model_side_combine:
+                q_for_decode = q.view(-1, self.num_head, layer.qk_head_dim).contiguous()
+            else:
+                with use_symmetric_memory(group):
+                    q_for_decode = q.view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    ).contiguous()
+                q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -2281,6 +2328,14 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if model_side_combine:
+                # Natural-log LSE (kernel stores e_max + log(e_sum) per split).
+                # A rank whose KV shard is empty for a short request yields
+                # NaN output and -inf LSE; zero the output so the combine's
+                # exp(-inf - max) = 0 weight is the only contribution.
+                o_local = o_for_decode.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                local_lse = torch.nan_to_num(local_lse, nan=-float("inf"))
+                return o_local.to(q.dtype), local_lse
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
