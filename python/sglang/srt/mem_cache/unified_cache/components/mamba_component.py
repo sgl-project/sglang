@@ -529,6 +529,14 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        # Finish may donate the active slot without going through pool.copy_from
+        # or free_mamba_cache. Flush before the radix tree owns that checkpoint.
+        pool = self.cache.req_to_token_pool.mamba_pool
+        if (
+            is_finished
+            and (accepted := getattr(pool, "kda_accepted_state", None)) is not None
+        ):
+            accepted.materialize(req.kv.mamba_pool_idx.reshape(-1))
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:

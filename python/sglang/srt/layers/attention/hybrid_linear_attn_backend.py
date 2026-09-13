@@ -1351,7 +1351,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1390,6 +1389,32 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 null_block_id=-1,
+            )
+            return
+
+        accepted_state = getattr(mamba_pool, "kda_accepted_state", None)
+        if accepted_state is not None:
+            if req_pool_indices is None:
+                raise ValueError(
+                    "KDA accepted-state commit requires request identities"
+                )
+            request_rows = req_pool_indices[:request_number]
+            for conv, intermediate in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv, intermediate, state_indices_tensor, last_correct_step_indices
+                )
+                if mamba_track_indices is not None and mamba_steps_to_track is not None:
+                    fused_conv_window_scatter_with_mask(
+                        conv, intermediate, mamba_track_indices, mamba_steps_to_track
+                    )
+            if mamba_track_indices is not None and mamba_steps_to_track is not None:
+                accepted_state.track(
+                    mamba_track_indices, request_rows, mamba_steps_to_track
+                )
+            accepted_state.record(
+                state_indices_tensor, request_rows, last_correct_step_indices
             )
             return
 
