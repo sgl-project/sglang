@@ -21,6 +21,30 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 pytest_plugins = ["pytester"]
 
 
+@pytest.mark.parametrize("load_time_ms", [None, 0, float("nan"), 1000])
+def test_load_guard_is_terminal_without_stage_checks(harness, load_time_ms):
+    runner, case = harness
+    case = replace(case, run_perf_check=False)
+    with pytest.raises(test_server_common.PerformanceValidationError, match="Load"):
+        runner.test_diffusion_generation(
+            case, SimpleNamespace(load_time_ms=load_time_ms)
+        )
+    assert runner.run_and_collect.call_count == 1
+
+
+@pytest.mark.parametrize("load_time_ms", [None, 0, float("nan")])
+def test_baseline_generation_requires_loading_measurement(
+    harness, monkeypatch, load_time_ms
+):
+    runner, case = harness
+    monkeypatch.setenv("SGLANG_GEN_BASELINE", "1")
+    with pytest.raises(test_server_common.PerformanceValidationError, match="Load"):
+        runner.test_diffusion_generation(
+            case, SimpleNamespace(load_time_ms=load_time_ms)
+        )
+    assert test_server_common._PENDING_BASELINE_DUMPS == {}
+
+
 def test_request_warmup_is_separate_from_guarded_requests(harness, monkeypatch, capsys):
     runner, case = harness
     case = replace(case, perf_warmup_requests=1)
@@ -347,7 +371,7 @@ def test_perf_fixture_retains_failed_case_results(pytester, monkeypatch):
                     DiffusionServerArgs("test", modality="image"),
                     DiffusionSamplingParams(prompt="test"),
                 )
-                summary = PerformanceSummary(100, 5, 5, {}, [], {}, {})
+                summary = PerformanceSummary(100, 5, 5, {}, [], {}, {}, load_time_ms=100)
                 for index in (1, 2):
                     self._record_performance_result(case, summary, index)
                 if case_id == "failed":

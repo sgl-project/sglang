@@ -364,9 +364,11 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
     monkeypatch.setitem(
         test_server_common.BASELINE_CONFIG.scenarios,
         case.id,
-        ScenarioConfig({}, {}, 1000, 0, 0),
+        ScenarioConfig({}, {}, 1000, 0, 0, expected_load_ms=100),
     )
-    runner._validate_realtime_performance(None, case, result.chunk_stats)
+    runner._validate_realtime_performance(
+        SimpleNamespace(load_time_ms=100), case, result.chunk_stats
+    )
     assert runner._perf_results[0]["e2e_ms"] == result.e2e_ms
     assert websocket.sent == [
         {"type": "init", "prompt": "test"},
@@ -393,7 +395,9 @@ def test_realtime_requires_e2e_without_threshold_checks(e2e_ms):
     with pytest.raises(
         PerformanceValidationError, match="E2E duration missing or invalid"
     ):
-        runner._validate_realtime_performance(None, case, [])
+        runner._validate_realtime_performance(
+            SimpleNamespace(load_time_ms=100), case, []
+        )
 
 
 @pytest.mark.parametrize("baseline", [None, 0, float("nan"), 1000])
@@ -425,7 +429,9 @@ def test_realtime_e2e_guard_without_chunk_thresholds(monkeypatch, baseline):
     runner._perf_results = []
     record_realtime_perf_stats(case.id, [], 2000)
     with pytest.raises(error, match=message):
-        runner._validate_realtime_performance(None, case, [])
+        runner._validate_realtime_performance(
+            SimpleNamespace(load_time_ms=100), case, []
+        )
     assert runner._perf_results[0]["e2e_ms"] == 2000
 
 
@@ -438,7 +444,14 @@ def test_realtime_memory_guard_retains_session_e2e(monkeypatch, peak_mb):
         run_perf_check=True,
     )
     scenario = ScenarioConfig(
-        {}, {}, 2000, 0, 0, load_peak_vram_mb=1000, runtime_peak_vram_mb=1000
+        {},
+        {},
+        2000,
+        0,
+        0,
+        load_peak_vram_mb=1000,
+        runtime_peak_vram_mb=1000,
+        expected_load_ms=100,
     )
     monkeypatch.setitem(test_server_common.BASELINE_CONFIG.scenarios, case.id, scenario)
     monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
@@ -467,7 +480,7 @@ def test_realtime_memory_guard_retains_session_e2e(monkeypatch, peak_mb):
     record_realtime_perf_stats(case.id, stats, 2000)
     runner = DiffusionServerBase()
     runner._perf_results = []
-    ctx = SimpleNamespace(perf_log_path="unused")
+    ctx = SimpleNamespace(perf_log_path="unused", load_time_ms=100)
     if peak_mb > 1000:
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             runner._validate_realtime_performance(ctx, case, stats)

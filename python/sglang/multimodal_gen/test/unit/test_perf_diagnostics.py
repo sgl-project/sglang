@@ -265,7 +265,7 @@ runner._perf_results = []
 case = DiffusionTestCase("probe", DiffusionServerArgs("test", modality="image"), DiffusionSamplingParams(prompt="test"))
 print("BEGIN diffusion testcase: probe", flush=True)
 for index in (1, 2):
-    runner._record_performance_result(case, PerformanceSummary(float(sys.argv[1]), 5, 5, {}, [], {}, {}), index)
+    runner._record_performance_result(case, PerformanceSummary(float(sys.argv[1]), 5, 5, {}, [], {}, {}, load_time_ms=100), index)
 time.sleep(1.2)
 sys.exit(int(sys.argv[2]))
 """
