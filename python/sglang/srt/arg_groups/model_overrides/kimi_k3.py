@@ -103,6 +103,14 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "aiter" and is_hip():
+            # ROCm: aiter asm MLA decode carries the round-robin CP causal map
+            # and returns the LSE; prefill stays on the triton DCP path.
+            logger.info("Kimi-K3 DCP on ROCm: prefill 'triton', decode 'aiter'.")
+            overrides.update(
+                prefill_attention_backend="triton",
+                decode_attention_backend="aiter",
+            )
         elif decode_backend == "triton" and is_hip():
             # ROCm experiment: the triton MLA backend carries the DCP extend and
             # decode paths; keep it for both phases.
