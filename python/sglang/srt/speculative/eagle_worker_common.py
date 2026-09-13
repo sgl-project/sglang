@@ -15,7 +15,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    apply_eagle_swa_mask,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -345,7 +350,8 @@ def build_eagle_verify_input(
     # Write straight into the backend's buffer when it owns one and this batch
     # fits; an eager batch past the captured max_bs falls back to allocating.
     bs = batch.seq_lens.shape[0]
-    target_attn_backend = target_worker.model_runner.attn_backend
+    model_runner = target_worker.model_runner
+    target_attn_backend = model_runner.attn_backend
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
@@ -369,7 +375,7 @@ def build_eagle_verify_input(
         retrieve_index,
         retrieve_next_token,
         retrieve_next_sibling,
-        draft_tokens,
+        verify_tokens,
     ) = build_tree_kernel_efficient(
         draft_input.bonus_tokens,
         parent_list,
@@ -385,9 +391,64 @@ def build_eagle_verify_input(
         fill_prefix_mask=fill_mask,
     )
 
+    swa_custom_mask = None
+    verify_backend = (
+        model_runner.decode_attention_backend_str
+        if get_spec().speculative_attention_mode == "decode"
+        else model_runner.prefill_attention_backend_str
+    )
+    window = model_runner.sliding_window_size
+    if (
+        verify_backend in ("flashinfer", "triton")
+        and window is not None
+        and window >= 0
+    ):
+        # Rebuild only the mask in the SWA wrapper's compact KV coordinates.
+        # Positions and retrieval indices must retain the original prefix lengths.
+        if batch.seq_lens_cpu is not None:
+            swa_seq_lens_sum = int(torch.clamp(batch.seq_lens_cpu, max=window).sum())
+        else:
+            # Allocation upper bound, as above; avoid a device-to-host sync.
+            swa_seq_lens_sum = bs * window
+        window_covers_tree = (
+            batch.seq_lens_cpu is not None
+            and int(batch.seq_lens_cpu.max()) + min(num_steps, num_draft_tokens - 1)
+            <= window
+        )
+        if window_covers_tree:
+            swa_custom_mask = tree_mask[
+                : (swa_seq_lens_sum + bs * num_draft_tokens) * num_draft_tokens
+            ]
+        elif batch.seq_lens_cpu is not None and swa_seq_lens_sum == seq_lens_sum:
+            swa_custom_mask = tree_mask[
+                : (swa_seq_lens_sum + bs * num_draft_tokens) * num_draft_tokens
+            ].clone()
+        else:
+            swa_custom_mask = build_tree_kernel_efficient(
+                draft_input.bonus_tokens,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                torch.clamp(batch.seq_lens, max=window),
+                swa_seq_lens_sum,
+                topk,
+                num_steps,
+                num_draft_tokens,
+                TreeMaskMode.FULL_MASK,
+            )[0]
+        if not window_covers_tree:
+            apply_eagle_swa_mask(
+                swa_custom_mask,
+                batch.seq_lens,
+                position.view(bs, num_draft_tokens),
+                window,
+            )
+
     return EagleVerifyInput(
-        draft_token=draft_tokens,
+        draft_token=verify_tokens,
         custom_mask=tree_mask,
+        swa_custom_mask=swa_custom_mask,
+        swa_mask_window=window if swa_custom_mask is not None else None,
         positions=position,
         retrieve_index=retrieve_index,
         retrieve_next_token=retrieve_next_token,

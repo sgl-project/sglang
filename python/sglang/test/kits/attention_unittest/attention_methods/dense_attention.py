@@ -1231,13 +1231,28 @@ def prepare_dense_runner_inputs(
     *,
     max_context_len: int,
 ) -> None:
-    del batch
+    # Verify capture/replay rebuilds the mapping; fill its current locations.
+    # Other runner modes retain their original fixture layout.
+    req_to_token = (
+        (
+            fixture.runner.req_to_token_pool.req_to_token[batch.req_pool_indices]
+            .cpu()
+            .tolist()
+        )
+        if batch.forward_mode.is_target_verify()
+        else None
+    )
     _populate_prefix_kv(
         fixture.actual_module,
         case,
         fixture.runner,
         inputs["prefix_hidden"],
         max_context_len=max_context_len,
+        loc_fn=(
+            (lambda req_idx, pos: req_to_token[req_idx][pos])
+            if req_to_token is not None
+            else None
+        ),
     )
 
 
