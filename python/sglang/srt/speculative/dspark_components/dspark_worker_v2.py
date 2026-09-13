@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -65,17 +66,18 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     draft_tp_context,
-    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -676,9 +678,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # batch.seq_lens needs no record_stream: the overlap scheduler pins the
+        # post-resolve SB snapshot for two iterations (record_batch_in_overlap)
+        # and synchronizes copy_done(N) before that slot is recycled, so the
+        # tensor cannot be freed while this forward still reads it.
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -766,7 +769,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
         )
-        prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -818,12 +820,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
+            self._compute_decode_logprobs(batch, logits_output, accept)
 
         if on_publish is not None:
             if confidence is not None:
@@ -875,6 +872,38 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
 
+        return self._build_decode_result(
+            accept=accept,
+            layout=layout,
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _compute_decode_logprobs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        accept: AcceptOuts,
+    ) -> None:
+        """Per-token logprobs of the emitted chain onto ``logits_output``;
+        a subclass whose verify tail already produced them overrides this."""
+        compute_spec_logprobs(
+            batch,
+            logits_output,
+            accept.out_tokens.reshape(-1),
+            chain_stride=self.verify_num_draft_tokens,
+        )
+
+    def _build_decode_result(
+        self,
+        *,
+        accept: AcceptOuts,
+        layout: Optional[RaggedVerifyLayout],
+        logits_output: LogitsProcessorOutput,
+        can_run_cuda_graph: bool,
+    ) -> GenerationBatchResult:
+        """The one translation from the accept outcome to the scheduler's result;
+        subclasses whose accept lands in their own buffers override it."""
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
