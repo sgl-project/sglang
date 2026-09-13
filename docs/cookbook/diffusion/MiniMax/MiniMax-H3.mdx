@@ -803,30 +803,24 @@ latency.
 ## 7. VDN-H3: hybrid attention, 8-step distill
 
 [OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
-(Video DeltaNet MiniMax-H3, [openvdn.github.io](https://openvdn.github.io/))
-replaces every DiT block's dense self-attention with a hybrid of two branches:
-an exact, gated softmax over a chunk-aligned frame window (chunk 5, radius 1,
-the first and last frames dense as anchors, text and audio dense both ways)
-and a frame-wise linear-attention branch (the Video Delta rule, scanned
-forward and backward over frames) that covers exactly the rest. The released
-`stage-dmd-step-250` checkpoint is an 8-NFE DMD2 distill and adds a 4.3 GB
-linear branch plus two small LoRA adapters on top of the untouched MiniMax-H3
-backbone. The weights are the FL2VA partition, so the deployment serves `t2va`
-and `fl2va` (first, last, or both keyframes, as OpenVDN's own stack does); the
-keyframe rows are attended densely, like text and audio. `ref2va` was not
-trained and is rejected. The weights inherit the MiniMax-H3 Community License,
-including its territorial exclusions.
+([openvdn.github.io](https://openvdn.github.io/)) is MiniMax-H3 with every
+DiT block's dense self-attention replaced by a hybrid: an exact, gated softmax
+over a local frame window (chunk 5, radius 1; the first and last frames, text
+and audio stay dense) plus a frame-wise linear-attention branch (the Video
+Delta rule, scanned forward and backward) for everything outside the window.
+The released `stage-dmd-step-250` checkpoint is an 8-step DMD2 distill: a
+4.3 GB linear branch and two small LoRA adapters on the unchanged H3 backbone.
+It is the FL2VA partition, so it serves `t2va` and `fl2va` (first, last, or
+both keyframes); `ref2va` is rejected. The weights inherit the MiniMax-H3
+Community License.
 
-Pass the repository directly to `--model-path`. A registered model overlay
-materializes the base-H3 layout once: both LoRA adapters are prefused into the
-transformer weights (a real 62 GB write), the linear branch is attached as an
-extra shard, the Qwen3-VL conditioner is linked from `MiniMaxAI/MiniMax-H3`,
-and the video VAE is re-serialized as for FastH3. Point
-`SGLANG_DIFFUSION_CACHE_ROOT` at a volume with at least 90 GB free on the same
-filesystem as the Hugging Face cache before the first launch (the conditioner
-and VAEs are hard-linked, not copied).
+Pass the repository directly to `--model-path`. On first launch a registered
+overlay prefuses both adapters into the transformer weights (a 62 GB write)
+and attaches the linear branch; the Qwen3-VL conditioner and the VAEs are
+hard-linked from `MiniMaxAI/MiniMax-H3`. Keep `SGLANG_DIFFUSION_CACHE_ROOT` on
+the same filesystem as the Hugging Face cache with at least 90 GB free.
 
-```bash 8×B200 hybrid window attention
+```bash 8×B200
 sglang serve \
   --model-path OpenVDN/vdn-minimax-h3 \
   --num-gpus 8 \
@@ -838,44 +832,30 @@ sglang serve \
 ```
 
 `--num-gpus 4`, `2` or `1` gives the smaller Ulysses recipes in the benchmark
-table; `sglang generate` takes the same flags.
+table; `sglang generate` takes the same flags. `--warmup-num-frames` /
+`--warmup-resolutions` warm up at the clip length and canvas you will serve;
+without them the first long request pays 2 to 3 s of allocator growth and
+kernel setup.
 
-`--warmup-num-frames` / `--warmup-resolutions` make the startup warmup run
-at the clip length and canvas you will serve (here the 14.375 s paper
-workload). Without them H3 warms up on a 5-second clip, and the first
-forward of the first longer request pays allocator growth and kernel setup
-in every DiT block (2 to 3 s on this workload, for base H3 as well).
+Requests use the same video endpoint as the base model with `task: "t2va"`
+and `conditions: []`, or `task: "fl2va"` with the
+[keyframe conditions](#4-generate-video-and-audio), and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}` (the
+345-frame paper workload). The default `num_inference_steps: 9` is the only
+accepted value: nine sigma grid points, eight DiT forwards. Each keyframe adds
+about 2,000 dense rows, so an `fl2va` forward costs a little more than `t2va`.
 
-Requests use the same asynchronous video endpoint as the base model, with
-`task: "t2va"`, `conditions: []` (or `task: "fl2va"` with the keyframe
-conditions of the [FL2VA request](#4-generate-video-and-audio)), and a target such as
-`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}`. Each
-keyframe adds about 2,000 global rows (the conditioner's image tokens plus the
-latent keyframe), dense both ways in the window softmax, so an `fl2va` forward
-costs more than a `t2va` one. The
-request default is `num_inference_steps: 9`: nine points on the standard
-shift-12/shift-3 sigma grid, i.e. the eight distilled DiT evaluations (VDN
-counts NFEs, SGLang counts grid points). Any other step count is rejected. The
-paper workload is 1344×768 at 24 fps for 14.375 s: 345 frames, already 17n+5
-aligned, 102 latent frames and about 104k packed rows.
-
-`hybrid_window_attn_h3` is required for the transformer: a dense backend on
-these weights would silently skip the linear branch and the softmax gates and
-produce the wrong model, so it is rejected. The window softmax is computed
-exactly with FlashAttention (no sparse approximation); the linear branch runs
-on fused Triton kernels. On Blackwell (SM100 / SM103,
-and SM120 such as the RTX PRO 6000) the transformer defaults to online MXFP8
-(`--quantization fp8` selects it too, `--quantization bf16` opts out); the
-gates, beta, alpha and the conv stay bf16. Before SM100 `--quantization fp8`
-is the per-channel fp8 path of base H3 (SM89 and SM90); SM80 has no fp8
-tensor cores, so it runs the bf16 DiT (62 GB, budget for
-`--layerwise-offload-components` or `--dit-layerwise-offload`). Ampere and
-Ada run the window on FA3's Sm80 mainloop, which is FA2-class throughput; they
-are enabled but not benchmarked. Ulysses sequence parallelism is supported;
-`--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
-`torch.compile`, and breakable CUDA graph execution are rejected. See
-[Attention Backends](/docs/sglang-diffusion/attention_backends) for the
-backend options.
+`hybrid_window_attn_h3` is required: a dense backend would silently skip the
+linear branch and the gates and produce the wrong model. On Blackwell
+(SM100 / SM103 / SM120) the transformer defaults to online MXFP8;
+`--quantization bf16` opts out. Before SM100, `--quantization fp8` is base
+H3's per-channel fp8 path, and SM80 runs the bf16 DiT (62 GB; budget for
+`--layerwise-offload-components`). Ampere and Ada are enabled but not
+benchmarked. Ulysses sequence parallelism is supported; `--model-variant`,
+`quality: "high"`, `--ring-degree` greater than 1, `torch.compile`, and
+breakable CUDA graph execution are rejected. The backend's
+`--attention-backend-config` keys are listed in
+[Attention Backends](/docs/sglang-diffusion/attention_backends).
 
 Measured latencies for 1, 2, 4 and 8 B200s are in
 [VDN-H3 on B200](#vdn-h3-on-b200); single-card and PCIe multi-card numbers
