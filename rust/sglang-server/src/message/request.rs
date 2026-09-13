@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
+use sglang_environ::envs;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
@@ -14,8 +15,8 @@ use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
+use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
-use crate::utils::{environ::env_i64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -24,12 +25,12 @@ use crate::utils::{environ::env_i64, error::Error};
 /// NOT a concurrency limit: it is a pure function of the body being parsed, so
 /// separate HTTP calls never interact with it.
 ///
-/// Read once from `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ` (registered in
-/// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
-/// value is process-static — Python sets it before launching this server — and a
+/// Read once from `sglang_environ::envs`, which mirrors the default registered
+/// in `python/sglang/srt/environ.py`. Memoized because the value is
+/// process-static — Python sets it before launching this server — and a
 /// per-request `env::var` would take a lock on the hot path for a constant.
 static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
-    LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
+    LazyLock::new(|| envs::SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.get());
 
 fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
     limit >= 0 && batch_size as u128 > limit as u128

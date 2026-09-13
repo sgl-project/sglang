@@ -17,11 +17,10 @@ use std::sync::OnceLock;
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let n = std::env::var("SGL_MM_RS_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |c| c.get().min(8)));
+        let n = match sglang_environ::envs::SGL_MM_RS_THREADS.get() {
+            0 => std::thread::available_parallelism().map_or(8, |c| c.get().min(8)),
+            n => n,
+        };
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .thread_name(|i| format!("sgl-mm-{i}"))

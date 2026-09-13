@@ -1,6 +1,5 @@
 //! Shared helpers with no home in a pipeline stage.
 
-pub mod environ;
 pub mod error;
 pub mod fsm;
 pub mod logging;

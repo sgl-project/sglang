@@ -282,10 +282,7 @@ fn in_ipv4_network(ip: std::net::Ipv4Addr, net: std::net::Ipv4Addr, bits: u32) -
 
 fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     // Python: `int(os.getenv("REQUEST_TIMEOUT", "3"))` seconds per image GET.
-    let timeout = std::env::var("REQUEST_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3);
+    let timeout = sglang_environ::envs::REQUEST_TIMEOUT.get();
     let agent = match host_port_of(url) {
         Some((host, port)) if bypasses_proxy(&host, port) => direct_agent(),
         _ => http_agent(),
