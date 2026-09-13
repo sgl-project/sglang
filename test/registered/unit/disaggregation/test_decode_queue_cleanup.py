@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -40,6 +42,73 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    @staticmethod
+    def _make_prealloc_queue(num_requests):
+        requests = []
+        for i in range(num_requests):
+            req = SimpleNamespace(
+                rid=f"prealloc-{i}",
+                origin_input_ids=[1, 2, 3],
+                output_ids=[],
+                finished_reason=None,
+                return_logprob=False,
+                sampling_params=SimpleNamespace(max_new_tokens=1),
+                req_pool_idx=i,
+                time_stats=MagicMock(),
+            )
+            requests.append(
+                SimpleNamespace(
+                    req=req,
+                    kv_receiver=MagicMock(),
+                    waiting_for_input=True,
+                    is_rebootstrap=False,
+                )
+            )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = requests
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1024)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._pre_alloc_fill_len = MagicMock(return_value=3)
+        queue._pre_alloc = MagicMock()
+        queue._uses_dsv4_decode_radix_cache = MagicMock(return_value=False)
+        queue.req_to_token_pool = SimpleNamespace(
+            available_size=lambda: 1024,
+            req_to_token=torch.arange(num_requests * 3, dtype=torch.int64).reshape(
+                num_requests, 3
+            ),
+        )
+        metadata_allocator = SimpleNamespace(
+            available_size=lambda: 1024,
+            alloc=MagicMock(side_effect=range(num_requests)),
+        )
+        queue.req_to_metadata_buffer_idx_allocator = metadata_allocator
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            translate_kv_indices_for_transfer=lambda indices: indices,
+        )
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue._num_published_destinations = 0
+
+        scheduler = SimpleNamespace(
+            running_batch=SimpleNamespace(reqs=[]),
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
+            enable_decode_hicache=False,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+            last_batch=None,
+        )
+        queue.scheduler = scheduler
+        return queue
 
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
