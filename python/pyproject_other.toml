@@ -46,7 +46,7 @@ runtime_base = [
   "packaging",
   "partial_json_parser",
   "pillow",
-  "prometheus-client>=0.20.0",
+  "prometheus-client>=0.25.0",
   "psutil",
   "py-spy",
   "pybase64",
