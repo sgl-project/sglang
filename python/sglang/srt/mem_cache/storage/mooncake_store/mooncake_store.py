@@ -25,7 +25,12 @@ from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
-DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_LOCAL_BUFFER_SIZE = int(
+    __import__("os").environ.get(
+        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
+        16 * 1024 * 1024
+    )
+)
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
@@ -88,6 +93,28 @@ def _normalize_tenant_id(value) -> str:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
+    """Return a metrics port unique to this physical scheduler process."""
+    base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        global_rank = torch.distributed.get_rank()
+        if dp_rank is not None:
+            global_rank += dp_rank * torch.distributed.get_world_size()
+        return base_port + global_rank
+    return base_port
+
+
+def _get_mooncake_client_http_setup_kwargs(
+    enable_client_http_server: bool, dp_rank: Optional[int] = None
+) -> dict[str, Any]:
+    if not enable_client_http_server:
+        return {}
+    return {
+        "enable_client_http_server": True,
+        "client_http_port": _get_mooncake_client_http_port(dp_rank),
+    }
 
 
 @dataclass
@@ -377,7 +404,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        enable_client_http_server: Optional[bool] = None,
     ):
         MooncakeBaseStore.__init__(self)
         MooncakeDistributedStore = self._import_mooncake_store()
@@ -393,6 +423,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if enable_client_http_server is None:
+                enable_client_http_server = bool(
+                    getattr(storage_config, "enable_storage_metrics", False)
+                )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -500,7 +534,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                setup_kwargs = {}
+                setup_kwargs = _get_mooncake_client_http_setup_kwargs(
+                    bool(enable_client_http_server),
+                    getattr(storage_config, "dp_rank", None),
+                )
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -958,7 +995,107 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_set_v2_aggregated(transfers)
+
+    def _batch_set_v2_aggregated(self, transfers: List[PoolTransfer]) -> dict:
+        """Write all v2 pool transfers with one Mooncake batch-put call.
+
+        A logical page may expand to several Mooncake objects, and different
+        pools may expose either one buffer or multiple buffers per object.  The
+        object ranges recorded here allow the single, flattened put result to
+        be converted back to the existing per-pool, per-page result format.
+        """
+        all_key_strs: List[str] = []
+        all_buffer_ptrs: List[Any] = []
+        all_buffer_sizes: List[Any] = []
+        all_group_ids: Optional[List[str]] = (
+            [] if self._can_use_group_semantics() else None
+        )
+        transfer_ranges = []
+
+        for transfer in transfers:
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            keys = transfer.keys
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            host_indices = transfer.host_indices
+            assert len(keys) > 0
+            assert len(keys) == len(host_indices) // page_size
+
+            tagged_keys = self._tag_keys(keys)
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            key_strs = self._tag_keys(key_strs)
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
+                host_indices
+            )
+            if len(ptr_list) != len(key_strs):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    key_strs, ptr_list, element_size_list
+                )
+
+            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
+                raise ValueError(
+                    "Mooncake v2 write metadata must align with component keys: "
+                    f"pool={transfer.name}, keys={len(key_strs)}, "
+                    f"ptrs={len(ptr_list)}, sizes={len(element_size_list)}"
+                )
+
+            start = len(all_key_strs)
+            all_key_strs.extend(key_strs)
+            all_buffer_ptrs.extend(ptr_list)
+            all_buffer_sizes.extend(element_size_list)
+            if all_group_ids is not None:
+                all_group_ids.extend(
+                    self._expand_group_ids(tagged_keys, key_multiplier)
+                )
+            transfer_ranges.append(
+                (transfer.name, start, len(all_key_strs), key_multiplier)
+            )
+
+        if not all_key_strs:
+            return {}
+
+        # batch_put_from_multi_buffers requires every object to use the same
+        # vector-of-vectors representation. Normalize scalar entries only when
+        # at least one pool already supplies multiple buffers per object.
+        if any(isinstance(ptr, Sequence) for ptr in all_buffer_ptrs):
+            all_buffer_ptrs = [
+                list(ptr) if isinstance(ptr, Sequence) else [ptr]
+                for ptr in all_buffer_ptrs
+            ]
+            all_buffer_sizes = [
+                list(size) if isinstance(size, Sequence) else [size]
+                for size in all_buffer_sizes
+            ]
+
+        exist_result = self._batch_exist(all_key_strs)
+        if len(exist_result) != len(all_key_strs):
+            raise RuntimeError(
+                "Mooncake batch_is_exist returned an unexpected result count: "
+                f"expected={len(all_key_strs)}, actual={len(exist_result)}"
+            )
+
+        io_results = [0 if state == 1 else -1 for state in exist_result]
+        missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+        if missing_idx:
+            put_results = self._put_batch_zero_copy_impl(
+                [all_key_strs[i] for i in missing_idx],
+                [all_buffer_ptrs[i] for i in missing_idx],
+                [all_buffer_sizes[i] for i in missing_idx],
+                self._filter_group_ids(all_group_ids, missing_idx),
+            )
+            for i, result in zip(missing_idx, put_results):
+                io_results[i] = result
+
+        results = {}
+        for pool_name, start, end, key_multiplier in transfer_ranges:
+            results[pool_name] = self._batch_postprocess(
+                io_results[start:end],
+                is_set_operate=True,
+                key_multiplier=key_multiplier,
+            )
+        return results
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (

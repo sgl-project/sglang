@@ -320,6 +320,9 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,
         attn_cp_size=ps.attn_cp_size,
+        # Regular DP launches independent default worlds; DP attention embeds
+        # its DP dimension in the global world rank already.
+        dp_rank=ps.dp_rank if not server_args.enable_dp_attention else None,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
