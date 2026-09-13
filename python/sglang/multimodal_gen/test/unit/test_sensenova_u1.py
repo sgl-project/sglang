@@ -442,7 +442,6 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
     ("override", "expected"),
     [
         ({"enable_torch_compile": True}, "torch.compile"),
-        ({"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"}, "LoRA adapters"),
         (
             {"component_residency": {"transformer": "component-offload"}},
             "component residency offload",
@@ -849,3 +848,86 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+# ===== 8-step distilled LoRA =====
+
+
+def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
+    """LoRAPipeline resolves the denoiser as modules["transformer"].
+
+    This pipeline loads one monolithic model under "model", so it must alias it
+    for both the load path and the pre-loaded-modules path.
+    """
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+        LoRAPipeline,
+    )
+
+    assert issubclass(SenseNovaU1Pipeline, LoRAPipeline)
+
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    model, tokenizer = object(), object()
+    loaded = {"model": model, "tokenizer": tokenizer}
+    modules = pipeline.load_modules(server_args=None, loaded_modules=loaded)
+
+    assert modules["transformer"] is model
+    assert modules["model"] is model
+    assert "transformer" not in loaded
+
+
+def _validate_server_args_with_lora(**overrides):
+    """Run validate_server_args on a minimal args set, returning the mutated object."""
+    config = SenseNovaU1PipelineConfig()
+    args = {
+        "num_gpus": 1,
+        "enable_torch_compile": False,
+        "lora_path": None,
+        "lora_target_modules": None,
+        "component_residency": None,
+        "cpu_offload_components": None,
+        "dit_cpu_offload": None,
+        "text_encoder_cpu_offload": None,
+        "image_encoder_cpu_offload": None,
+        "vae_cpu_offload": False,
+        "dit_layerwise_offload": None,
+        "layerwise_offload_components": None,
+        "quantization": None,
+        "quantization_ignored_layers": None,
+        "transformer_weights_path": None,
+        "component_paths": {},
+        "component_weights_paths": {},
+        "component_quantizations": {},
+        "component_quantization_ignored_layers": {},
+        "component_precisions": {},
+        "attention_backend": None,
+        "component_attention_backends": {},
+        "attention_backend_config": {},
+    }
+    args.update(overrides)
+    server_args = SimpleNamespace(**args)
+    config.validate_server_args(server_args)
+    return server_args
+
+
+def test_sensenova_u1_defaults_lora_targets_to_the_generation_branch():
+    """A target list is needed: without one LoRA wraps every nn.Linear of the
+    monolithic model and clones each base weight into host memory.
+
+    The official distilled adapter only carries the generation branch.
+    """
+    adapter = "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"
+
+    server_args = _validate_server_args_with_lora(lora_path=adapter)
+    assert server_args.lora_target_modules == ["_mot_gen"]
+
+    explicit = _validate_server_args_with_lora(
+        lora_path=adapter, lora_target_modules=["q_proj"]
+    )
+    assert explicit.lora_target_modules == ["q_proj"]
+
+    # No adapter, no default: the attribute is left as the caller set it.
+    unused = _validate_server_args_with_lora()
+    assert unused.lora_target_modules is None
