@@ -131,6 +131,13 @@ def _print_warning_once(logger: Logger, msg: str, *args: Any) -> None:
     _log_once(logger, logging.WARNING, msg, *args)
 
 
+# These were lru_cache objects, so `.cache_clear()` was part of their surface and
+# a test resets the dedup through it. Moving the cache one level down took that
+# away; keep it, pointing at the cache that now holds the state.
+_print_info_once.cache_clear = _emit_once.cache_clear
+_print_warning_once.cache_clear = _emit_once.cache_clear
+
+
 def get_is_main_process():
     try:
         rank = int(os.environ["RANK"])

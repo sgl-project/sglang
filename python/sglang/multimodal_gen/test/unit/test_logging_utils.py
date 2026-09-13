@@ -68,6 +68,26 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
             logger.warning_once("from the caller %d", 1)
         self.assertEqual(captured.records[0].filename, "test_logging_utils.py")
 
+    def test_cache_clear_is_still_on_the_helpers(self):
+        """`.cache_clear()` is part of these helpers' surface, and is used.
+
+        They were lru_cache objects; moving the cache one level down silently
+        removed the attribute, and test_diffusion_bcg_padding -- which resets the
+        dedup that way so its warning fires -- died with AttributeError.
+        """
+        from sglang.multimodal_gen.runtime.utils.logging_utils import (
+            _print_info_once,
+            _print_warning_once,
+        )
+
+        logger = init_logger("sglang.test.logonce.clear")
+        logger.warning_once("clear me %d", 1)
+        _print_warning_once.cache_clear()
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("clear me %d", 1)
+        self.assertIn("clear me 1", captured.output[0])
+        self.assertTrue(callable(_print_info_once.cache_clear))
+
     def test_arguments_are_not_retained(self):
         """The once-cache must key on text, not on the arguments.
 
