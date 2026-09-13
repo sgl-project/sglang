@@ -172,7 +172,11 @@ class DecodeKVCacheOffloadManager:
         if not isinstance(self.kv_cache, UnifiedSWAKVPool):
             return full_indices, []
 
-        swa_indices = self.kv_cache.translate_loc_from_full_to_swa(virtual_indices)
+        swa_indices = (
+            self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                virtual_indices
+            )
+        )
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
         if live_swa_indices.numel() == 0:
             return full_indices, []

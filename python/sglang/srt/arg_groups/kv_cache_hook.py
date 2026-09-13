@@ -164,7 +164,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
     if (
-        cfg.disaggregation_decode_retraction_backup == "host_pool"
+        cfg.enable_unified_memory
+        and cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.disaggregation_decode_enable_radix_cache
         and cfg.hicache_write_policy in ("write_through", "write_through_selective")
     ):
