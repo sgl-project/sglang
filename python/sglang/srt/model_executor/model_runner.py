@@ -146,6 +146,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    maybe_prebuild_deepep_v2_buffers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -1102,6 +1103,11 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+
+        maybe_prebuild_deepep_v2_buffers(
+            model=self.model,
+            decode_cuda_graph_runner=self.decode_cuda_graph_runner,
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_resources,
 )
 
@@ -116,8 +117,15 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-
-    return get_exec().moe.deepep_v2_mode == "hybrid"
+    # direct is NVLink-only and hangs across nodes; require explicit hybrid there.
+    mode = get_exec().moe.deepep_v2_mode
+    nnodes = get_parallel().nnodes
+    if mode == "direct" and nnodes > 1:
+        raise ValueError(
+            "--deepep-v2-mode direct is NVLink-only and cannot run across "
+            f"nodes (nnodes={nnodes}); pass --deepep-v2-mode hybrid."
+        )
+    return mode == "hybrid"
 
 
 def _quantize_for_deepep_v2_dispatch(
@@ -192,7 +200,6 @@ class DeepEPv2Buffer:
             sl_idx=0,
             prefer_overlap_with_compute=False,
         )
-        # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
         logger.info(
@@ -237,6 +244,7 @@ class _DeepEPv2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
+        self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -249,6 +257,15 @@ class _DeepEPv2Impl:
             self.num_max_dispatch_tokens_per_rank,
             True,
         )
+
+    def prebuild_buffer(self) -> None:
+        """Build the ElasticBuffer now instead of lazily on the first dispatch.
+
+        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
+        on pure-prefill nodes (no decode CUDA-graph warmup to build it). Needs only
+        host-known config already on this impl; key-cached so dispatch reuses it.
+        """
+        self._get_buffer()
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -288,22 +305,21 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
-        use_masked = use_expand_layout
+        is_decode = not get_is_extend_in_batch()
+        use_masked = is_decode
+        use_expand_layout = is_decode or self._prefill_expand_enabled
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
-            # Dummy routes need distinct expert ids; zero weights null the result.
             topk_ids = torch.arange(
                 topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
             ).unsqueeze(0)
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
         _ensure_fp8_quant_available()
-        if use_masked:
+        if use_expand_layout:
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -319,7 +335,6 @@ class _DeepEPv2Impl:
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
-        # This collective argument must not depend on a rank-local batch.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
         # Masked dispatch stays asynchronous for CUDA graph capture.
         do_cpu_sync_val = True
@@ -459,3 +474,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
         return self._impl.combine(combine_input)
+
+    def prebuild(self) -> None:
+        """Build the ElasticBuffer eagerly at deployment time (no forward needed)."""
+        self._impl.prebuild_buffer()
