@@ -45,21 +45,7 @@ _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
-try:
-    if _use_zbal:
-        from zbal.zbal.deepep_adaptor import Config
-        from zbal.zbal_buffer import Buffer
-    else:
-        from deep_ep import Buffer, Config
-
-    if not _is_npu:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
-    use_deepep = True
-except ImportError:
-    use_deepep = False
+use_deepep = False
 
 from enum import Enum, IntEnum, auto
 
@@ -73,6 +59,33 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
+
+
+def _ensure_deepep_available() -> None:
+    global use_deepep, Buffer, Config, sglang_per_token_group_quant_fp8
+
+    if use_deepep:
+        return
+
+    # DeepEP initializes its JIT runtime on import, so load it only when used.
+    try:
+        if _use_zbal:
+            from zbal.zbal.deepep_adaptor import Config
+            from zbal.zbal_buffer import Buffer
+        else:
+            from deep_ep import Buffer, Config
+
+        if not _is_npu:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+    except ImportError as exc:
+        raise ImportError(
+            "DeepEP is not available. Please install a compatible DeepEP package from "
+            "https://github.com/deepseek-ai/deepep."
+        ) from exc
+
+    use_deepep = True
 
 
 def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
@@ -210,6 +223,7 @@ class DeepEPBuffer:
         if state.buffer is not None:
             return state.buffer
 
+        _ensure_deepep_available()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
@@ -336,6 +350,7 @@ class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
     def __init__(self):
+        _ensure_deepep_available()
         config_str = get_deepep_config()
         if config_str:
             config_parsed = load_json_config(config_str)
@@ -373,11 +388,7 @@ class _DeepEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
     ):
-        if not use_deepep:
-            raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from "
-                "https://github.com/deepseek-ai/deepep."
-            )
+        _ensure_deepep_available()
 
         self.group = group
         self.router_topk = router_topk
