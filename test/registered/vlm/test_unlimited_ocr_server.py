@@ -1,6 +1,7 @@
 import base64
 import io
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import openai
 from PIL import Image, ImageDraw, ImageFont
@@ -37,12 +38,28 @@ class TestUnlimitedOCRServer(TestOpenAIMLLMServerBase):
         return ImageFont.load_default()
 
     @classmethod
-    def _make_ocr_image_url(cls) -> str:
-        img = Image.new("RGB", (640, 360), "white")
+    def _make_ocr_image_url(cls, size=(640, 360)) -> str:
+        width, height = size
+        scale = min(width / 640, height / 360)
+        img = Image.new("RGB", size, "white")
         draw = ImageDraw.Draw(img)
-        draw.rectangle((24, 24, 616, 336), outline="black", width=4)
-        draw.text((72, 92), "SGLang OCR", fill="black", font=cls._font(56))
-        draw.text((72, 180), "12345", fill="black", font=cls._font(72))
+        draw.rectangle(
+            (24 * scale, 24 * scale, width - 24 * scale, height - 24 * scale),
+            outline="black",
+            width=max(1, round(4 * scale)),
+        )
+        draw.text(
+            (72 * scale, 92 * scale),
+            "SGLang OCR",
+            fill="black",
+            font=cls._font(round(56 * scale)),
+        )
+        draw.text(
+            (72 * scale, 180 * scale),
+            "12345",
+            fill="black",
+            font=cls._font(round(72 * scale)),
+        )
 
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
@@ -79,6 +96,39 @@ class TestUnlimitedOCRServer(TestOpenAIMLLMServerBase):
         self.assertGreater(response.usage.prompt_tokens, 0)
         self.assertGreater(response.usage.completion_tokens, 0)
         self.assertGreater(response.usage.total_tokens, 0)
+
+    def test_concurrent_heterogeneous_gundam_crops(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        def request(size):
+            return client.chat.completions.create(
+                model="default",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "document parsing."},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": self._make_ocr_image_url(size)},
+                            },
+                        ],
+                    }
+                ],
+                temperature=0,
+                max_tokens=64,
+                extra_body={"images_config": {"image_mode": "gundam"}},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(request, [(1280, 640), (1920, 640)]))
+
+        for response in responses:
+            self.assertEqual(response.choices[0].message.role, "assistant")
+            self.assertIsInstance(response.choices[0].message.content, str)
+
+        # A failed multimodal batch must not take down the scheduler.
+        self.test_single_image_chat_completion()
 
 
 del TestOpenAIMLLMServerBase
