@@ -497,18 +497,20 @@ class SGLangFailuresAnalyzer:
                         ):
                             test_failures[test_file]["has_timeout"] = True
 
-                    # For tests we've seen before that didn't fail this time,
-                    # they get a "pass" (the job failed but this specific test passed)
                     for test_file in test_failures.keys():
                         if test_file not in failed_test_files:
-                            # Test passed in this run (job failed for other reasons)
-                            test_failures[test_file]["current_streak"] = 0
+                            if (
+                                not is_incomplete
+                            ):  # Reset the streak only when the summary is complete.
+                                test_failures[test_file]["current_streak"] = 0
                             test_failures[test_file]["recent_runs"].append(
                                 {
                                     "run_number": run_info.get("run_number"),
                                     "job_url": run_info.get("job_url"),
-                                    "status": "✅",
-                                    "failed": False,
+                                    "status": "\u26aa" if is_incomplete else "\u2705",
+                                    "failed": None
+                                    if is_incomplete
+                                    else False,  # Record unknown when the summary is incomplete.
                                 }
                             )
                 else:
@@ -564,14 +566,23 @@ class SGLangFailuresAnalyzer:
 
             # If there's a current streak, check if it contains actual failures
             if current_streak > 0:
-                # Look at the last N runs where N = current_streak
+                known_runs = []
+
+                for run in recent_runs:
+                    # Keep failed (True) and passed (False) outcomes.
+                    # Skip unknown outcomes (None).
+                    if run.get("failed") is not None:
+                        known_runs.append(run)
+
+                # Select the last N known outcomes, where N = current_streak.
                 # Check if any of them are actual failures (not just cancelled/skipped)
-                streak_runs = recent_runs[-current_streak:]
+                streak_runs = known_runs[-current_streak:]
+
                 has_actual_failure = any(
-                    run.get("failed") == True for run in streak_runs
+                    run.get("failed") is True for run in streak_runs
                 )
 
-                # Skip this test if the streak contains no actual failures
+                # Exclude the test if no actual failure is found.
                 if not has_actual_failure:
                     continue
 
