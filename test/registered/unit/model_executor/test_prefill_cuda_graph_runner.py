@@ -279,7 +279,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             global_forward_mode=ForwardMode.EXTEND,
         )
 
-        static_batch = runner.load_batch(forward_batch)
+        static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
