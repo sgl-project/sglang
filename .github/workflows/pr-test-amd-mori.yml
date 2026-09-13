@@ -53,7 +53,7 @@ jobs:
           fi
 
       - name: Start disaggregation container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm724
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm10
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -84,7 +84,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm724
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm10
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"

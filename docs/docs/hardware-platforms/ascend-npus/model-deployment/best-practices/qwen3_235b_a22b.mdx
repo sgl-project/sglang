@@ -101,7 +101,7 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --tp 16 \
     --mem-fraction-static 0.78 \
-    --cuda-graph-bs 1 \
+    --cuda-graph-bs-decode 1 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen25
 ```
@@ -210,7 +210,7 @@ python3 -m sglang.launch_server \
     --enable-dp-attention \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 1 2 4 8 16 20 24 26 27 \
+    --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen25
 ```

@@ -63,12 +63,12 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       aime25_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\
@@ -97,7 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
-    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260728",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -178,8 +178,12 @@ sgl-eval run aime25 \\
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+          disable: [
+            { when: { hw: ["mi300x", "mi325x"] },
+              reason: "MTP/EAGLE speculative decoding is not yet validated for GLM-5.2 on MI300X or MI325X." },
+            { when: { hw: ["mi355x"], quant: ["fp8", "bf16", "nvfp4"] },
+              reason: "The five-step MI355X recipe is validated only with amd/GLM-5.2-MXFP4." },
+          ] },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
@@ -772,7 +776,7 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -837,7 +841,7 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -927,7 +931,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -944,7 +948,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -978,7 +982,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -995,7 +999,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1007,10 +1011,10 @@ sgl-eval run aime25 \\
     // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
     // architecture family) — --trust-remote-code (Quark custom quant config)
     // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
-    // newer image (v0.5.16, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
-    // mi355x cells. MTP (mtp-314, steps=3) is validated on MI355X gfx950 with
-    // this precision — see the mtp-314 cell below. Not yet benchmarked for
-    // GLM-5.2 on the base strategies → verified:false.
+    // newer image (v0.5.19, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
+    // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
+    // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
+    // DSA backend: triton (SGLang's ROCm default).
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
@@ -1019,10 +1023,15 @@ sgl-eval run aime25 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 8",
+        "--ep-size 1",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 131072",
         "--mem-fraction-static 0.80",
         "--watchdog-timeout 1200",
@@ -1039,11 +1048,11 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1058,11 +1067,16 @@ sgl-eval run aime25 \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--ep-size 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1086,15 +1100,15 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 131072",
         "--mem-fraction-static 0.80",
-        "--cuda-graph-max-bs 160",
+        "--cuda-graph-max-bs-decode 160",
         "--max-running-requests 160",
         "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
@@ -1128,7 +1142,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1145,7 +1159,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1179,7 +1193,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1196,7 +1210,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1230,7 +1244,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1247,7 +1261,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",

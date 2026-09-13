@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=800, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
 
 
 class FlashinferNvFp4OnlineMoeBackendBase:
@@ -121,6 +121,48 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+    }
+
+
+class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    backend = "flashinfer_cutedsl"
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+    extra_args = [
+        "--reasoning-parser",
+        "nemotron_3",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "flashinfer",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+    ]
+    eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
+    spec_accept_length_threshold = 2.5
+    extra_env = {
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
+        "SGLANG_MOE_NVFP4_DISPATCH": "0",
+        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
     }
 
 

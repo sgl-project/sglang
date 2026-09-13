@@ -42,12 +42,13 @@ def get_dcp_lens(
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
+    """Keep this rank's share of a read-index tensor, still WIDENED.
+
+    Selection only; the caller collapses via translate_dcp_read_ids.
+    """
     parallel = get_parallel()
     if parallel.dcp_enabled:
-        kv_indices = (
-            kv_indices[kv_indices % parallel.dcp_size == parallel.dcp_rank]
-            // parallel.dcp_size
-        )
+        kv_indices = kv_indices[kv_indices % parallel.dcp_size == parallel.dcp_rank]
     return kv_indices
 
 
@@ -67,7 +68,7 @@ def filter_dcp_local_chunk_kv_indices(
         first = (parallel.dcp_rank - start) % dcp_size
         parts.append(kv_indices[offset + first : offset + length : dcp_size])
         offset += length
-    return torch.cat(parts) // dcp_size
+    return torch.cat(parts)
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):

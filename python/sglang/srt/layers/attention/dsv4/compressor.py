@@ -22,17 +22,13 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_finish,
-    cp_all_gather_rerange_launch,
-)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -264,6 +260,7 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
     # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
@@ -271,7 +268,7 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        if compress_ratio == 128:
+        if compress_ratio == 128 or use_req_ring:
             state_loc = req_pool_indices * ring_size + positions % ring_size
         else:
             loc = req_to_token[req_pool_indices, positions]
@@ -294,6 +291,7 @@ def create_paged_compressor_data(
             extend_seq_lens=extend_lens,
             req_to_token=req_to_token,
             full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+            use_req_ring=use_req_ring,
         )
 
         plan_kwargs: dict
@@ -374,10 +372,43 @@ class Compressor(BaseFusedOp):
         self.norm = RMSNorm(
             self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
         )
+        if (
+            is_in_indexer
+            and _is_hip
+            and get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        ):
+            self._init_fp4_norm_weight()
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
+
+    def _init_fp4_norm_weight(self) -> None:
+        """Mirror the FP32 norm weight in BF16 for the AITER FP4 K writer.
+
+        The FP8 path feeds the FP32 weight straight to its kernel; AITER wants
+        BF16, and converting at the call site costs one copy per C4 layer per
+        forward. A buffer keeps the conversion out of the forward and survives
+        module ``_apply``, and the loader below re-derives it so online weight
+        updates propagate -- they land as ``param.data.copy_``, which leaves the
+        parameter's identity and ``_version`` untouched and would silently
+        defeat any cache keyed on those. Same reach as ``load_ape_weight``:
+        ``update_weights_from_tensor(load_format="direct")`` calls
+        ``default_weight_loader`` itself and so skips both hooks.
+        """
+        self.norm.register_buffer(
+            "fp4_weight_bf16",
+            self.norm.weight.detach().to(torch.bfloat16).contiguous(),
+            persistent=False,
+        )
+        set_weight_attrs(self.norm.weight, {"weight_loader": self.load_norm_weight})
+
+    def load_norm_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        assert param is self.norm.weight
+        param.data.copy_(loaded_weight)
+        self.norm.fp4_weight_bf16.copy_(param.data)
 
     def _apply_ape_hotfix(self):
         self.ape_converted = True
@@ -410,37 +441,7 @@ class Compressor(BaseFusedOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
-    def _pending_key(self):
-        return ("kv_score", self.layer_id, self.is_in_indexer)
-
-    def prelaunch_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        """Compute kv_score and start its CP all-gather, without waiting.
-
-        kv_score only needs `x`, which the attention already has at entry, so the
-        gather can be issued before the q/kv projections and collected later in
-        compute_kv_score -- that projection work is what hides it. Caller must
-        guarantee a matching compute_kv_score in the same op (see
-        DeepseekV4Attention._forward_prepare).
-        """
-        if not _is_hip:
-            return
-        comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
-        if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
-            return
-        kv_score = self._compute_wkv_gate(x)
-        # Keyed by forward_batch: each TBO ubatch carries its own, so the two
-        # ubatches cannot collect each other's gather.
-        pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
-        pending[self._pending_key()] = cp_all_gather_rerange_launch(
-            kv_score, get_parallel().attn_cp_size, comm_stream, self._pending_key()
-        )
-
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _is_hip:
-            pending = getattr(forward_batch, "_cp_pending_gathers", None)
-            handle = pending.pop(self._pending_key(), None) if pending else None
-            if handle is not None:
-                return cp_all_gather_rerange_finish(handle)
 
         kv_score = self._compute_wkv_gate(x)
 

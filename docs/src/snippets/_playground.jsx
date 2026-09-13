@@ -1520,13 +1520,17 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
-      // `hw`; `:dev` if unmapped (matches _deployment.jsx). The strategy key covers
-      // a tier that needs its own build (e.g. a spec-decoding preview image), so the
-      // playground base must resolve it too or it hands back an image that cannot
-      // run the command.
+      // Image keyed by `hw|variant|quant` (most specific), then `variant|quant`,
+      // then `hw|quant|strategy`, `hw|quant`, `hw`; `:dev` if unmapped (matches
+      // _deployment.jsx). The variant keys cover a checkpoint that needs its own
+      // build (e.g. a new-variant preview image) and the strategy key a tier that
+      // needs one (e.g. a spec-decoding preview image), so the playground base
+      // must resolve them too or it hands back an image that cannot run the
+      // command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+        || di[`${sel.variant}|${sel.quant}`]
+        || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
         ? config.dockerRunCommand(sel)
