@@ -110,6 +110,13 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
+    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "NPU decode context parallelism is currently implemented only for "
+            "DeepSeek DSA models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+        )
+
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
         if cfg.pp_size != 1:
