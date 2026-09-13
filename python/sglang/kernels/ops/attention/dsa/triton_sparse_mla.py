@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
@@ -26,6 +27,7 @@ _G = tl.constexpr(128)
 _PREFERRED_BLOCK_K = 64
 _MIN_BLOCK_K = 16
 _INDEX_ELEMENT_SIZE = 4
+_I32_MAX = (1 << 31) - 1
 
 _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
@@ -118,11 +120,21 @@ def _no_async_copy():
 # ---------------------------------------------------------------------------
 
 
-@functools.lru_cache(maxsize=1)
-def _cu_count() -> int:
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+def _device_index(device: torch.device | int | None = None) -> int:
+    if isinstance(device, torch.device):
+        device = device.index
+    if device is None:
+        return torch.cuda.current_device()
+    return device
+
+
+@functools.lru_cache(maxsize=None)
+def _cu_count_for_device(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _cu_count(device: torch.device | int | None = None) -> int:
+    return _cu_count_for_device(_device_index(device))
 
 
 @functools.lru_cache(maxsize=None)
@@ -185,6 +197,67 @@ def _kv_splits_heuristic(
         return 1
     splits_to_fill = max(1, target_wg // base_ctas)
     return _prev_pow2(min(splits_to_fill, max_kv_splits))
+
+
+@functools.lru_cache(maxsize=None)
+def _is_gfx950_device(device: int) -> bool:
+    properties = torch.cuda.get_device_properties(device)
+    arch = getattr(properties, "gcnArchName", "") or ""
+    return arch.split(":", 1)[0] == "gfx950"
+
+
+def _is_gfx950_sparse_mla_fp8(
+    kv_dtype: torch.dtype,
+    H: int,
+    d_v: int,
+    d_tail: int,
+    kv_dim: int,
+    device: torch.device | int | None = None,
+) -> bool:
+    """Gate for the tuning below: gfx950 with an FP8 KV cache in the DSA shape."""
+    return (
+        kv_dtype != torch.bfloat16
+        and H == 16
+        and d_v == 512
+        and d_tail == 64
+        and kv_dim == 576
+        and _is_gfx950_device(_device_index(device))
+    )
+
+
+# Tuning constants below were measured on MI355X (TP4/EP4, GLM-5.2, FP8 KV).
+def _gfx950_sparse_mla_kv_splits(
+    base_ctas: int,
+    topk: int,
+    block_k: int,
+    num_cu: int,
+    kv_splits: int,
+    max_kv_splits: int,
+) -> int:
+    tiles_per_split = (topk + kv_splits * block_k - 1) // (kv_splits * block_k)
+    if 4 < base_ctas <= 8 and kv_splits == 32 and tiles_per_split == 1:
+        return kv_splits // 2
+
+    tokens_per_split = (topk + kv_splits - 1) // kv_splits
+    if (
+        topk >= 2048
+        and base_ctas <= num_cu
+        and tokens_per_split >= 1024
+        and kv_splits < max_kv_splits
+    ):
+        return min(kv_splits * 2, max_kv_splits)
+
+    return kv_splits
+
+
+def _gfx950_sparse_mla_num_warps(
+    base_ctas: int, active_splits: int, num_cu: int
+) -> int:
+    return 2 if base_ctas * active_splits > num_cu else 4
+
+
+def _page_offsets_fit_i32(num_pages: int, kv_dim: int) -> bool:
+    return num_pages * kv_dim <= _I32_MAX
 
 
 def _row_strides(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -504,6 +577,12 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _reduce_d_chunk(active_splits: int, output_rows: int = 0) -> int:
+    if active_splits <= 4:
+        return 512 if output_rows >= 1536 else 128
+    return 64
+
+
 # ---------------------------------------------------------------------------
 # Split-K kernels (for short sequences: MTP verify/draft, decode)
 # grid=(seq, head_blocks, kv_splits) + reduce
@@ -516,6 +595,7 @@ def _sparse_mla_fused_kernel(
     q_rope_ptr,
     kv_ptr,
     idx_ptr,
+    topk_length_ptr,
     out_ptr,
     qk_scale,
     fp8_max,
@@ -530,8 +610,11 @@ def _sparse_mla_fused_kernel(
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
     USE_FP8_DOT: tl.constexpr,
+    USE_TOPK_LENGTH: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_I64_PAGE: tl.constexpr = True,
+    PIPE_STAGES: tl.constexpr = 3,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0)
@@ -585,17 +668,23 @@ def _sparse_mla_fused_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
-    k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(topk, BLOCK_K)
+    valid_topk = topk
+    if USE_TOPK_LENGTH:
+        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
 
-    for j in tl.range(0, num_tiles, num_stages=3):
+    k_offs = tl.arange(0, BLOCK_K)
+    num_tiles = tl.cdiv(valid_topk, BLOCK_K)
+
+    for j in tl.range(0, num_tiles, num_stages=PIPE_STAGES):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        valid = k_pos < topk
+        valid = k_pos < valid_topk
 
         slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
         valid = valid & (slot >= 0)
-        page = tl.where(valid, slot, 0).to(tl.int64)
+        page = tl.where(valid, slot, 0)
+        if USE_I64_PAGE:
+            page = page.to(tl.int64)
 
         kv_base = kv_ptr + page[:, None] * KV_DIM
         kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(
@@ -607,11 +696,15 @@ def _sparse_mla_fused_kernel(
             ).to(input_type)
         if NUM_GROUPS >= 3:
             kv2 = tl.load(
-                kv_base + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0
+                kv_base + (2 * _G + g)[None, :],
+                mask=valid[:, None],
+                other=0.0,
             ).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = tl.load(
-                kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
+                kv_base + (3 * _G + g)[None, :],
+                mask=valid[:, None],
+                other=0.0,
             ).to(input_type)
         kv_tail = tl.load(
             kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
@@ -952,6 +1045,8 @@ def _triton_sparse_mla_fwd_splitk(
     sm_scale: float,
     d_v: int,
     kv_splits: int,
+    topk_length: torch.Tensor | None = None,
+    use_topk_length: bool = False,
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -962,6 +1057,15 @@ def _triton_sparse_mla_fwd_splitk(
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
     idx_flat = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices
+    if use_topk_length:
+        assert topk_length is not None
+        assert topk_length.dtype == torch.int32
+        assert topk_length.device == q_nope.device
+        assert topk_length.numel() >= seq
+        assert topk_length.is_contiguous()
+        topk_length_ptr = topk_length.reshape(-1)
+    else:
+        topk_length_ptr = idx_flat
     q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
@@ -969,6 +1073,11 @@ def _triton_sparse_mla_fwd_splitk(
     BLOCK_K = _sparse_mla_block_k(kv)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
+    num_cu = _cu_count(q_nope.device)
+    base_ctas = seq * n_head_blocks
+    optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
+        kv.dtype, H, d_v, d_tail, kv_dim, q_nope.device
+    )
 
     num_groups = d_v // 128
     assert num_groups <= 4, (
@@ -981,15 +1090,25 @@ def _triton_sparse_mla_fwd_splitk(
     # double its partial-buffer traffic merely because each tile is smaller.
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     kv_splits = min(kv_splits, max_kv_splits)
+    if use_topk_length:
+        kv_splits = 1
 
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
 
     if kv_splits == 1:
+        fused_num_warps = 4
+        if optimize_gfx950_fp8:
+            fused_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, 1, num_cu)
+        # i32 page offsets are correct whenever they fit; the rest is a tuning
+        # gate, since narrowing only paid off in this configuration.
+        i32_page_safe = _page_offsets_fit_i32(kv.shape[0], kv_dim)
+        i32_page_tuned = optimize_gfx950_fp8 and fused_num_warps == 2 and topk >= 2048
         _sparse_mla_fused_kernel[(seq, n_head_blocks)](
             q_nope,
             q_rope,
             kv,
             idx_flat,
+            topk_length_ptr,
             out,
             qk_scale,
             _FP8_MAX,
@@ -1004,9 +1123,12 @@ def _triton_sparse_mla_fwd_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
+            USE_TOPK_LENGTH=use_topk_length,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
-            num_warps=4,
+            USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
+            PIPE_STAGES=1 if use_topk_length else 3,
+            num_warps=fused_num_warps,
             num_stages=2,
         )
         return out.unsqueeze(0)
@@ -1016,6 +1138,9 @@ def _triton_sparse_mla_fwd_splitk(
         tiles_per_split * BLOCK_K
     )
     active_splits = min(active_splits, kv_splits)
+    split_num_warps = 4
+    if optimize_gfx950_fp8:
+        split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
 
     lse_partial = torch.empty(
         seq, kv_splits, h_padded, dtype=torch.float32, device=q_nope.device
@@ -1047,11 +1172,11 @@ def _triton_sparse_mla_fwd_splitk(
         KV_SPLITS=kv_splits,
         BLOCK_H=BLOCK_H,
         BLOCK_K=BLOCK_K,
-        num_warps=4,
+        num_warps=split_num_warps,
         num_stages=2,
     )
 
-    D_CHUNK = 64
+    D_CHUNK = _reduce_d_chunk(active_splits, seq * H) if optimize_gfx950_fp8 else 64
     _sparse_mla_reduce_kernel[(seq, H, (d_v + D_CHUNK - 1) // D_CHUNK)](
         lse_partial,
         acc_partial,
@@ -1080,24 +1205,61 @@ def triton_sparse_mla_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    topk_length: torch.Tensor | None = None,
+    max_topk_length: int | None = None,
 ) -> torch.Tensor:
     """Unified sparse MLA forward. Auto-selects single-pass vs split-K.
 
     q_nope: [seq, H, d_v] fp8/bf16, q_rope: [seq, H, dim-d_v] fp8/bf16,
     kv: [num_pages, 1, dim] fp8/bf16, indices: [seq, 1, topk].
+    topk_length optionally gives a per-row upper bound on the last valid index;
+    max_topk_length is its host-known batch maximum.
 
     Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
-    num_cu = _cu_count()
+    num_cu = _cu_count(q_nope.device)
     BLOCK_H = 16
     BLOCK_K = _sparse_mla_block_k(kv)
     topk = indices.shape[-1]
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
+    optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
+        kv.dtype, H, d_v, q_rope.shape[-1], kv.shape[-1], q_nope.device
+    )
+    use_topk_length = (
+        optimize_gfx950_fp8
+        and topk >= 2048
+        and topk % 128 == 0
+        and max_topk_length is not None
+        and max_topk_length <= 512
+    )
+    if use_topk_length:
+        if topk_length is None:
+            indices_2d = indices.squeeze(1) if indices.dim() == 3 else indices
+            if indices_2d.stride(1) != 1:
+                indices_2d = indices_2d.contiguous()
+            topk_length = q8kv8_topk_length_from_indices(indices_2d)
+        with _no_async_copy():
+            return _triton_sparse_mla_fwd_splitk(
+                q_nope,
+                q_rope,
+                kv,
+                indices,
+                sm_scale,
+                d_v,
+                kv_splits=1,
+                topk_length=topk_length,
+                use_topk_length=True,
+            )
     if base_ctas > num_cu:
+        if optimize_gfx950_fp8:
+            with _no_async_copy():
+                return _triton_sparse_mla_fwd_splitk(
+                    q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits=1
+                )
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(
         _kv_splits_heuristic(
@@ -1105,6 +1267,15 @@ def triton_sparse_mla_fwd(
         ),
         max_kv_splits,
     )
+    if optimize_gfx950_fp8:
+        kv_splits = _gfx950_sparse_mla_kv_splits(
+            base_ctas,
+            topk,
+            BLOCK_K,
+            num_cu,
+            kv_splits,
+            max_kv_splits,
+        )
     return _triton_sparse_mla_fwd_splitk(
         q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
     )
