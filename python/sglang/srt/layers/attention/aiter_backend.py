@@ -60,6 +60,7 @@ try:
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
+        reset_verify_attn_plan_cache,
         unified_attention_3d_mtp_decode_func,
         unified_attention_3d_mtp_func,
         unified_attention_3d_mtp_ragged_func,
@@ -1387,6 +1388,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        reset_verify_attn_plan_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1425,6 +1427,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        reset_verify_attn_plan_cache()
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
