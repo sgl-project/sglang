@@ -46,15 +46,27 @@ class _FakeBuffer:
 
 
 class _FakeCudart:
-    def __init__(self, fail_on_registration: int | None = None):
+    def __init__(
+        self,
+        fail_on_registration: int | None = None,
+        already_registered_from_call: int | None = None,
+    ):
         self.registrations = []
         self.unregistrations = []
         self.fail_on_registration = fail_on_registration
+        # When set, cudaHostRegister calls from this 1-based index onward
+        # return cudaErrorHostMemoryAlreadyRegistered (712).
+        self.already_registered_from_call = already_registered_from_call
 
     def cudaHostRegister(self, ptr: int, size: int, flags: int) -> int:
         self.registrations.append((ptr, size, flags))
         if len(self.registrations) == self.fail_on_registration:
             return 1
+        if (
+            self.already_registered_from_call is not None
+            and len(self.registrations) >= self.already_registered_from_call
+        ):
+            return 712
         return 0
 
     def cudaHostUnregister(self, ptr: int) -> int:
@@ -352,6 +364,92 @@ class TestHiCacheHostRegister(unittest.TestCase):
             cudart.registrations,
             [(base, gib, 0), (base + gib, gib, 0)],
         )
+        self.assertEqual(cudart.unregistrations, [base])
+
+    def test_reregistering_same_buffer_is_idempotent(self):
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 2 * gib + 17)
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+            calls_after_first = list(cudart.registrations)
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+
+        self.assertEqual(cudart.registrations, calls_after_first)
+
+    def test_reregister_after_unregister_registers_again(self):
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 2 * gib)
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+            _cuda_host_unregister(buffer)
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+
+        self.assertEqual(
+            cudart.registrations,
+            [(base, gib, 0), (base + gib, gib, 0)] * 2,
+        )
+
+    def test_already_registered_chunks_are_tolerated_and_not_unregistered(self):
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 2 * gib)
+        cudart = _FakeCudart(already_registered_from_call=1)
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+            _cuda_host_unregister(buffer)
+
+        self.assertEqual(
+            cudart.registrations,
+            [(base, gib, 0), (base + gib, gib, 0)],
+        )
+        self.assertEqual(cudart.unregistrations, [])
+
+    def test_partially_preexisting_ranges_unregister_only_new_chunks(self):
+        gib = 1024**3
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 3 * gib)
+        # Chunks from the second onward are already registered by another owner.
+        cudart = _FakeCudart(already_registered_from_call=2)
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(buffer, registration_granularity_bytes=gib)
+            _cuda_host_unregister(buffer)
+
         self.assertEqual(cudart.unregistrations, [base])
 
     def test_missing_copy_granularity_preserves_single_registration(self):
