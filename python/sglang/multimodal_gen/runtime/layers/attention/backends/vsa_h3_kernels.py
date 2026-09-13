@@ -17,6 +17,7 @@ padded tile layout the attention kernel reads and pools each tile in the same
 pass; ``vsa_h3_untile`` scatters the attention output back to packed rows and
 folds in the gated compression branch. Both replace chains of index copies
 and transposes that otherwise cost more than the attention kernel itself.
+``vsa_h3_gate_add`` folds the same branch after the caller's collectives.
 """
 
 import math
@@ -25,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
 
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must
@@ -106,10 +109,12 @@ def vsa_h3_block_sparse_attn_forward(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     out: torch.Tensor | None = None,
+    native: bool = False,
 ) -> torch.Tensor:
     """q/k/v: contiguous [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad
     rows zero. q2k_index/q2k_num: contiguous [B, H, n_tiles, max_kv] /
-    [B, H, n_tiles] int32."""
+    [B, H, n_tiles] int32. ``native`` runs FastVideo's tcgen05 kernel (sm_100a /
+    sm_103a, even n_tiles) instead of the Triton kernel."""
     batch, heads, seq_q, head_dim = q.shape
     seq_kv = k.shape[2]
     if seq_q % VSA_H3_KERNEL_BLOCK or seq_kv % VSA_H3_KERNEL_BLOCK:
@@ -124,6 +129,18 @@ def vsa_h3_block_sparse_attn_forward(
         )
     if out is None:
         out = torch.empty_like(q)
+    if native:
+        vsa_block_sparse_sm100(
+            q,
+            k,
+            v,
+            q2k_index.view(-1, q2k_index.shape[-1]),
+            q2k_num.view(-1),
+            variable_block_sizes,
+            out,
+            1.0 / math.sqrt(head_dim),
+        )
+        return out
     block = [1, 1, VSA_H3_KERNEL_BLOCK, head_dim]
     desc_q, desc_k, desc_v, desc_o = (
         TensorDescriptor.from_tensor(t, block_shape=block) for t in (q, k, v, out)
@@ -243,9 +260,10 @@ def vsa_h3_pack_tiles(
     """Gather packed [T, H, D] rows into ``tiled`` [3|4, H, S_pad, D] and write
     fp32 per-tile means of q/k/v into ``pooled`` [3, H, n_tiles, D].
     ``src_index`` maps each padded position to its packed row, or -1 (pad -> 0).
+    S_pad may hold one extra empty tile past ``n_tiles``; it is left untouched.
     """
     _, heads, seq_pad, head_dim = tiled.shape
-    n_tiles = seq_pad // VSA_H3_KERNEL_BLOCK
+    n_tiles = pooled.shape[2]
     has_gate = gate is not None
     g = gate if has_gate else q
     assert all(t.stride(-1) == 1 for t in (q, k, v, g))
@@ -327,6 +345,8 @@ def vsa_h3_untile(
     heads, seq_pad, head_dim = out_tiled.shape
     total = result.shape[0]
     has_gate = gate_tiled is not None
+    # S_pad may carry one padded tile; the compression output does not
+    n_tiles = out_compress.shape[1] if has_gate else seq_pad // VSA_H3_KERNEL_BLOCK
     _untile_kernel[(triton.cdiv(total, VSA_H3_KERNEL_BLOCK), heads)](
         out_tiled,
         gate_tiled if has_gate else out_tiled,
@@ -336,8 +356,74 @@ def vsa_h3_untile(
         used,
         total,
         seq_pad,
-        seq_pad // VSA_H3_KERNEL_BLOCK,
+        n_tiles,
         HAS_GATE=has_gate,
+        HEAD_DIM=head_dim,
+        BLOCK=VSA_H3_KERNEL_BLOCK,
+    )
+
+
+@triton.jit
+def _gate_add_kernel(
+    Out,
+    Gate,
+    Compress,
+    tile_index,
+    num_rows,
+    stride_o_row,
+    stride_o_head,
+    stride_g_row,
+    stride_g_head,
+    N_TILES,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_block = tl.program_id(0)
+    h = tl.program_id(1)
+    rows = row_block * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, HEAD_DIM)
+    in_rows = rows < num_rows
+    tile = tl.load(tile_index + rows, mask=in_rows, other=-1)
+    valid = (tile >= 0)[:, None]
+    o_off = (
+        rows.to(tl.int64)[:, None] * stride_o_row + h * stride_o_head + cols[None, :]
+    )
+    g_off = (
+        rows.to(tl.int64)[:, None] * stride_g_row + h * stride_g_head + cols[None, :]
+    )
+    o = tl.load(Out + o_off, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(Gate + g_off, mask=valid, other=0.0).to(tl.float32)
+    c = tl.load(
+        Compress + (h * N_TILES + tile)[:, None] * HEAD_DIM + cols[None, :],
+        mask=valid,
+        other=0.0,
+    )
+    o = o + c * g
+    tl.store(Out + o_off, o.to(Out.type.element_ty), mask=valid)
+
+
+def vsa_h3_gate_add(
+    out: torch.Tensor,
+    gate: torch.Tensor,
+    out_compress: torch.Tensor,
+    tile_index: torch.Tensor,
+) -> None:
+    """In place: ``out[t, h] += out_compress[h, tile_index[t]] * gate[t, h]``
+    where ``tile_index[t] >= 0``; same fp32 arithmetic as ``vsa_h3_untile``."""
+    num_rows, heads, head_dim = out.shape
+    assert out.stride(-1) == 1 and gate.stride(-1) == 1
+    assert out_compress.is_contiguous() and out_compress.shape[0] == heads
+    _gate_add_kernel[(triton.cdiv(num_rows, VSA_H3_KERNEL_BLOCK), heads)](
+        out,
+        gate,
+        out_compress,
+        tile_index,
+        num_rows,
+        out.stride(0),
+        out.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        out_compress.shape[1],
         HEAD_DIM=head_dim,
         BLOCK=VSA_H3_KERNEL_BLOCK,
     )

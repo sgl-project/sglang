@@ -335,6 +335,7 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
     """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
 
     num_inference_steps: int = 5
+    quality: str = "extra-high"
 
     def _validate(self) -> None:
         super()._validate()

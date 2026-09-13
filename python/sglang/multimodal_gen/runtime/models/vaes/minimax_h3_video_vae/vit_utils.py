@@ -209,13 +209,14 @@ def apply_rotary_pos_emb(
         raise
 
 
-def apply_rotary_pos_emb_qk(
+def native_rope_cache(
     query: torch.Tensor,
     key: torch.Tensor,
     rotary_pos_emb: Sequence[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
-    if (
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(cache, positions)`` from ``prepare_rotary_pos_emb`` when the native
+    kernels can consume it for this Q/K, else None."""
+    if not (
         len(rotary_pos_emb) == 4
         and query.is_cuda
         and query.shape == key.shape
@@ -225,29 +226,43 @@ def apply_rotary_pos_emb_qk(
         and query.shape[0] == 1
         and not torch.compiler.is_compiling()
     ):
-        _, _, cache, positions = rotary_pos_emb
-        if (
-            cache.is_cuda
-            and cache.dtype == query.dtype
-            and cache.dim() == 2
-            and cache.shape[0] == query.shape[1]
-            and cache.shape[1] <= query.shape[-1]
-            and positions.is_cuda
-            and positions.shape == (query.shape[1],)
-        ):
-            from sgl_kernel import rotary_embedding
+        return None
+    _, _, cache, positions = rotary_pos_emb
+    if not (
+        cache.is_cuda
+        and cache.dtype == query.dtype
+        and cache.dim() == 2
+        and cache.shape[0] == query.shape[1]
+        and cache.shape[1] <= query.shape[-1]
+        and positions.is_cuda
+        and positions.shape == (query.shape[1],)
+    ):
+        return None
+    return cache, positions
 
-            query = query.contiguous()
-            key = key.contiguous()
-            rotary_embedding(
-                positions,
-                query.view(query.shape[1], -1),
-                key.view(key.shape[1], -1),
-                query.shape[-1],
-                cache,
-                True,
-            )
-            return query, key
+
+def apply_rotary_pos_emb_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_pos_emb: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
+    native = native_rope_cache(query, key, rotary_pos_emb)
+    if native is not None:
+        from sgl_kernel import rotary_embedding
+
+        cache, positions = native
+        query = query.contiguous()
+        key = key.contiguous()
+        rotary_embedding(
+            positions,
+            query.view(query.shape[1], -1),
+            key.view(key.shape[1], -1),
+            query.shape[-1],
+            cache,
+            True,
+        )
+        return query, key
 
     return (
         apply_rotary_pos_emb(query, rotary_pos_emb),
