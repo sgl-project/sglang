@@ -45,6 +45,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
+    get_flags,
     publish,
     reset_context,
 )
@@ -87,6 +88,8 @@ def _make_options(**overrides):
         device="cuda",
         is_cuda_platform=True,
         cuda_graph_enabled=True,
+        has_speculative_token_map=False,
+        dcp_replicate_q_proj=False,
         moe_a2a_backend="none",
         moe_runner_backend="triton",
         fp8_gemm_runner_backend="triton",
@@ -722,16 +725,58 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     )
                     self._create(options=options, model_config=make_config())
 
-    def test_refreshed_speculative_and_dcp_copies_do_not_restrict_admission(self):
-        cases = (
-            {"dcp_size": 2, "dcp_replicate_q_proj": True},
-            {"speculative_algorithm": "EAGLE", "speculative_token_map": "/dummy/map"},
+    def test_speculative_and_dcp_without_weight_copies_remain_admitted(self):
+        for changes in (
+            {"dcp_size": 2, "dcp_replicate_q_proj": False},
+            {"dcp_size": 1, "dcp_replicate_q_proj": True},
+            {"speculative_algorithm": "EAGLE"},
             {"speculative_algorithm": "EAGLE3", "speculative_token_map": "/dummy/map"},
-        )
-        for changes in cases:
+        ):
             with self.subTest(changes=changes):
                 options = self._published_options(**changes)
                 self._create(options=options)
+
+    def test_unrefreshed_weight_copies_fall_back_before_model_resolution(self):
+        for changes, rejection in (
+            (
+                {"dcp_size": 2, "dcp_replicate_q_proj": True},
+                "dcp_replicated_q_proj",
+            ),
+            (
+                {
+                    "speculative_algorithm": "EAGLE",
+                    "speculative_token_map": "/dummy/map",
+                },
+                "speculative_token_map",
+            ),
+        ):
+            with (
+                self.subTest(changes=changes),
+                get_context().override_server_args(
+                    device="cuda", startup_weight_load_mode="auto", **changes
+                ),
+                patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=True),
+                patch(f"{_STARTUP_MODULE}._get_native_model_class") as native_class,
+                patch(f"{_STARTUP_MODULE}.get_model_architecture") as resolve,
+                patch.object(self.loader, "initialize_model_for_startup") as initialize,
+                patch(f"{_STARTUP_MODULE}.logger.info") as log_info,
+            ):
+                get_exec().graph.cuda_graph_config.decode.backend = Backend.FULL
+                options = StartupWeightLoadOptions.from_published_config()
+                manager = StartupWeightLoadManager.create_from_published_config(
+                    loader=self.loader,
+                    model_config=_make_model_config(),
+                    load_config=self.load_config,
+                    device_config=self.device_config,
+                    is_draft_worker=False,
+                )
+                self.assertIsNone(manager)
+                self.assertIn(rejection, log_info.call_args.args[1])
+                native_class.assert_not_called()
+                resolve.assert_not_called()
+                initialize.assert_not_called()
+                with self.assertRaisesRegex(ValueError, rejection):
+                    self._create(options=options)
 
     def test_lora_detection_includes_uno_before_lora_initialization(self):
         for changes in (
@@ -759,15 +804,21 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "triton",
                 "deep_gemm",
                 "flashinfer_cutlass",
+                "hpc_ops",
                 "flashinfer_trtllm_routed",
-                "flashinfer_trtllm",
-                "experimental_sgl_trtllm",
             ):
                 with self.subTest(model=make_config, runner=runner):
                     options = _make_options(
                         moe_runner_backend=runner, moe_a2a_backend="deepep"
                     )
                     self._create(model_config=make_config(), options=options)
+            for runner in ("flashinfer_trtllm", "experimental_sgl_trtllm"):
+                with self.subTest(model=make_config, runner=runner):
+                    with self.assertRaisesRegex(ValueError, "moe_runner_backend"):
+                        self._create(
+                            model_config=make_config(),
+                            options=_make_options(moe_runner_backend=runner),
+                        )
 
     def test_glm_fp8_checks_layout_not_benchmark_configuration(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
@@ -827,7 +878,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     else:
                         self._create(model_config=config)
 
-    def test_mla_and_dense_share_block_fp8_admission(self):
+    def test_non_128_block_scales_are_rejected_only_for_mla(self):
         for make_config in (
             _make_model_config,
             _make_qwen3_moe_model_config,
@@ -841,7 +892,11 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     "quant_method": "fp8",
                     "weight_block_size": [64, 128],
                 }
-                self._create(model_config=config)
+                if make_config is _make_glm_moe_dsa_fp8_model_config:
+                    with self.assertRaisesRegex(ValueError, "fp8_weight_block_size"):
+                        self._create(model_config=config)
+                else:
+                    self._create(model_config=config)
 
     def test_fp8_linear_scale_conversion_guard_is_shared(self):
         for make_config in (
@@ -887,7 +942,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             (False, "deep_gemm", "triton", "none", None),
             (True, "deep_gemm", "triton", "none", "fp8_gemm_backend"),
             (True, "triton", "deep_gemm", "none", "moe_runner_backend"),
-            (False, "triton", "hpc_ops", "none", None),
+            (False, "triton", "hpc_ops", "none", "moe_runner_backend"),
             (False, "triton", "triton", "megamoe", "moe_a2a_backend"),
             (False, "triton", "flashinfer_trtllm", "none", None),
         )
@@ -1085,6 +1140,61 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIsNone(manager.finalize())
         self.assertIsNone(manager.finalize())
         self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+
+    def test_mixed_fp8_unquantized_trt_experts_are_checked_before_capture(self):
+        from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        for runner, packed, auto, wrapped in (
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, True, False, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, True, True, False),
+            (MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM, True, True, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, True, True, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, False, True, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, True, True, True),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, True, True, True),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, False, True, True),
+        ):
+            with (
+                self.subTest(runner=runner, packed=packed, auto=auto, wrapped=wrapped),
+                get_flags().moe.override(runner_backend=runner),
+            ):
+                trace = []
+                model = _TiedWeightModel()
+                model.experts = nn.Module()
+                method = UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=packed)
+                if wrapped:
+                    wrapper = KTEPWrapperMethod.__new__(KTEPWrapperMethod)
+                    wrapper.gpu_method = method
+                    method = wrapper
+                model.experts.quant_method = method
+                loader = _RecordingLoader(model, trace)
+                manager = self._manager(loader, fallback_to_serial=auto)
+                manager._model_config = _make_glm_moe_dsa_fp8_model_config()
+                rejected = packed and not runner.is_flashinfer_trtllm_routed()
+                if rejected and not auto:
+                    before = model.weight.detach().clone()
+                    with self.assertRaisesRegex(
+                        ValueError, "requires the routed runner"
+                    ):
+                        manager.prepare()
+                    self.assertEqual(trace, ["initialize", "resolve"])
+                    torch.testing.assert_close(model.weight, before)
+                else:
+                    self.assertIs(manager.prepare(), model)
+                    self.assertEqual(
+                        trace,
+                        [
+                            "initialize",
+                            "resolve",
+                            "serial_load" if rejected else "prepare_capture",
+                        ],
+                    )
+                    self.assertEqual(manager.is_deferred, not rejected)
+                    if rejected:
+                        self.assertEqual(manager.state, StartupWeightLoadState.READY)
+                        self.assertIsNone(manager.finalize())
 
     def test_multiple_safetensors_sources_share_the_overlap_lifecycle(self):
         trace = []
@@ -2204,7 +2314,6 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         draft_worker = (
             SimpleNamespace(
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
-                refresh_startup_weight_load=lambda: trace.append("draft_refresh"),
             )
             if use_draft_worker
             else None
@@ -2302,12 +2411,6 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             ],
         )
 
-    def test_mapped_draft_weights_refresh_only_after_real_target_commit(self):
-        self.assertEqual(
-            self._run_startup("overlap", use_draft_worker=True)[-3:],
-            ["finalize", "draft_refresh", "synchronize"],
-        )
-
     def test_elastic_recovery_rejoins_after_real_weight_commit(self):
         self.assertEqual(
             self._run_startup("overlap", recovering=True)[-2:],
@@ -2315,13 +2418,12 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         self.assertEqual(self._run_startup("serial", recovering=True)[-1], "recover")
 
-    def test_failed_commit_never_refreshes_draft_or_rejoins(self):
+    def test_failed_commit_never_rejoins(self):
         trace = self._run_startup(
             "overlap", use_draft_worker=True, recovering=True, commit_fails=True
         )
         self.assertEqual(trace[-1], "finalize")
         self.assertNotIn("recover", trace)
-        self.assertNotIn("draft_refresh", trace)
 
     def test_auto_routes_from_the_actual_admission_result(self):
         self.assertEqual(

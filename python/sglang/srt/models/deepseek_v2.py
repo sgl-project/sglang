@@ -1991,16 +1991,8 @@ class DeepseekV2AttentionMLA(
 
     def named_startup_weight_load_derived_tensors(self):
         """Yield derived MLA tensors whose storage CUDA graphs capture."""
-        for name in (
-            "w_kc",
-            "w_vc",
-            "w_scale",
-            "w_scale_k",
-            "w_scale_v",
-            "w_kc_qrep",
-            "q_b_proj_qrep_weight",
-        ):
-            tensor = getattr(self, name, None)
+        for name in ("w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"):
+            tensor = getattr(self, name)
             if isinstance(tensor, torch.Tensor):
                 yield name, tensor
 

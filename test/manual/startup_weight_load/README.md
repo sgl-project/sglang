@@ -10,9 +10,7 @@ small tensors or a locally generated checkpoint; no model download is needed.
 | --- | --- | --- |
 | Admission, fallback, storage validation, or startup ordering | [CPU unit tests](../../registered/unit/model_executor/model_runner_components/test_startup_weight_load.py) | Decisions, failure paths, and storage/constant checks |
 | GDN converted/aligned parameter caches | `test_gdn_weight_refresh.py` | Real FlashInfer decode replay observes refreshed values without changing cache addresses |
-| DCP, mapped EAGLE heads, or HPC-Ops weight copies | `test_weight_copies.py` | Actual preparation/refresh helpers update captured tensor consumers |
-| MLA weight-derived tensors or scales | `test_mla_reload.py`, `test_reload_layouts.py` | Repeated model postprocess, stable storage, and replay parity; includes non-128 block scales |
-| TRT-LLM unquantized MoE layout processing | `test_reload_layouts.py` | Checkpoint shape restoration and repeated packing match fresh postprocess |
+| MLA weight-derived tensors | `test_mla_reload.py` | Repeated postprocess, stable storage, and replay parity for unquantized and 128x128 block-FP8 weights |
 | CPU offload, device staging, or mixed-device validation | `test_cpu_offload.py` | V1 partial offload, real H2D copies, BF16/block-FP8 replay parity, and postprocess staging |
 | Loader/runner lifecycle integration | `test_cpu_offload_engine.py` | Two engine boots, serial/forced-overlap parity with V1 offload, repeated batches 1 and 3 |
 | MegaMoE packing or MoE LoRA wrapper ownership | Explicit repros below | Known unsupported paths, **not** passing support tests |
@@ -39,15 +37,12 @@ process. Run engine tests separately from layer tests.
 ```bash
 # Existing CPU mechanism regressions (no GPU).
 CUDA_VISIBLE_DEVICES="" python -m pytest -q \
-  test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py \
-  test/registered/unit/model_executor/model_runner_components/test_replicated_q_proj.py
+  test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py
 
 # Small GPU layer checks; no server or model download.
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
   test/manual/startup_weight_load/test_gdn_weight_refresh.py \
-  test/manual/startup_weight_load/test_weight_copies.py \
   test/manual/startup_weight_load/test_mla_reload.py \
-  test/manual/startup_weight_load/test_reload_layouts.py \
   test/manual/startup_weight_load/test_cpu_offload.py
 
 # Generated BF16 Qwen MoE checkpoint, serial vs overlap, with CPU offload.
@@ -71,6 +66,15 @@ model and is separate from these download-free manual checks.
 
 The reference path must itself work without overlap. Existing serial limitations
 are not a reason to add an overlap-only configuration gate.
+
+## Deferred support
+
+The following paths still need overlap-specific handling: HPC-Ops block-FP8
+scale caches, non-routed TRT-LLM unquantized MoE packing (including unquantized
+experts in FP8 checkpoints), MLA non-128x128 block-FP8 scales, DCP replicated-Q
+buffers, and EAGLE token-mapped target heads. Auto mode selects serial loading;
+forced overlap rejects them before capture-safe preparation. Ordinary dtype and
+parallelism validation remains in the normal startup pipeline.
 
 ## Known-limit reproductions
 
@@ -104,20 +108,24 @@ positive serial/replay regression; do not preserve the old failure expectation.
 
 ## Coverage limits and development record
 
-On 2026-09-13, the repository-path commands above passed on H100 80 GB with
+On 2026-09-13, the pre-reduction revision `415412660` passed on H100 80 GB with
 PyTorch 2.13.0+cu130, FlashInfer 0.6.18, Transformers 5.12.1, and `sgl-kernel`
-0.4.6.post1: 10 layer checks and one generated BF16 Qwen MoE engine comparison
-with CPU offload. Serial and forced overlap produced identical token IDs and
-logprobs within `1e-5` for repeated batches of 1, 3, and 3, with captured decode
-confirmed in both runs. None of these checks were skipped.
+0.4.6.post1: 10 layer checks, including the five retained above, and one generated
+BF16 Qwen MoE engine comparison with CPU offload. Serial and forced overlap
+produced identical token IDs and logprobs within `1e-5` for repeated batches of
+1, 3, and 3, with captured decode confirmed in both runs. None of these checks
+were skipped.
+
+The deferred-support probes were removed with their implementations. Their source
+and results remain associated with that revision; these historical results do not
+validate subsequent admission or lifecycle changes. Rerun the retained checks
+when changing those paths.
 
 The explicit repros also reproduced all three known MegaMoE/MoE LoRA limitations.
 These are correctness observations, not performance measurements or a requirement
 to pin those package versions. In particular, the two engine boots share compiled
 kernel caches, so their startup times are not an overlap speedup measurement.
 
-DCP uses a concatenating two-shard surrogate, not a two-rank collective. HPC-Ops
-and TRT-LLM checks cover storage/layout processing, not their fused MoE kernels.
 The MLA checks use the non-DeepGEMM BMM path. GDN exercises a real FlashInfer decode
 kernel but not every attention backend. The generated engine fixture is a wiring
 check, not full-model accuracy coverage. Keep these limits when reusing results.

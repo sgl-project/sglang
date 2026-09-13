@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_model,
+    get_parallel,
     get_spec,
 )
 
@@ -110,6 +111,8 @@ class StartupWeightLoadOptions:
     device: str
     is_cuda_platform: bool
     cuda_graph_enabled: bool
+    has_speculative_token_map: bool
+    dcp_replicate_q_proj: bool
     moe_a2a_backend: str
     moe_runner_backend: str
     fp8_gemm_runner_backend: str
@@ -130,6 +133,14 @@ class StartupWeightLoadOptions:
             device=get_device().device,
             is_cuda_platform=is_cuda_platform,
             cuda_graph_enabled=cuda_graph_enabled,
+            has_speculative_token_map=(
+                get_spec().speculative_algorithm == "EAGLE"
+                and get_spec().speculative_token_map is not None
+            ),
+            dcp_replicate_q_proj=(
+                get_parallel().dcp_size > 1
+                and bool(get_parallel().dcp_replicate_q_proj)
+            ),
             moe_a2a_backend=get_exec().moe.moe_a2a_backend,
             moe_runner_backend=get_exec().moe.moe_runner_backend,
             fp8_gemm_runner_backend=get_exec().kernel.fp8_gemm_runner_backend,
@@ -265,6 +276,11 @@ def _moe_weight_rules(
             options.has_lora,
             "LoRA replaces MoE checkpoint parameter paths before startup commit",
         ),
+        (
+            "moe_runner_backend",
+            model_config.quantization is None and runner.is_flashinfer_trtllm(),
+            "TRT-LLM MoE checkpoint-shape restoration requires the routed runner",
+        ),
     )
     block_size = _checkpoint_block_fp8_size(model_config)
     if not block_size:
@@ -283,6 +299,11 @@ def _moe_weight_rules(
             "moe_runner_backend",
             converts_scales,
             "MoE UE8M0 scale conversion is not reload-safe during startup overlap",
+        ),
+        (
+            "moe_runner_backend",
+            runner.is_hpc_ops(),
+            "HPC-Ops block-FP8 post-processing replaces captured scale buffers",
         ),
         (
             "moe_a2a_backend",
@@ -306,6 +327,22 @@ def _validate_moe(
     return _rejections_from_rules(
         _weight_format_rules(model_config, options)
         + _moe_weight_rules(model_config, options)
+    )
+
+
+def _validate_glm_moe_dsa(
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    block_size = _checkpoint_block_fp8_size(model_config)
+    return _validate_moe(model_config, options) + _rejections_from_rules(
+        (
+            (
+                "fp8_weight_block_size",
+                bool(block_size) and block_size != (128, 128),
+                "MLA non-128x128 block-FP8 post-processing replaces captured scales",
+            ),
+        )
     )
 
 
@@ -340,7 +377,7 @@ _STARTUP_WEIGHT_LOAD_PROFILE_SPECS = (
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.GLM_MOE_DSA,
         model_classes={"GlmMoeDsaForCausalLM": _resolve_glm_moe_dsa_model_class},
-        validate=_validate_moe,
+        validate=_validate_glm_moe_dsa,
     ),
 )
 
@@ -622,6 +659,16 @@ def evaluate_startup_weight_load_admission(
             "load format must be auto or safetensors",
         ),
         (
+            "speculative_token_map",
+            options.has_speculative_token_map,
+            "EAGLE token mapping copies the target LM head before weight commit",
+        ),
+        (
+            "dcp_replicated_q_proj",
+            options.dcp_replicate_q_proj,
+            "DCP Q projection replication copies weights before weight commit",
+        ),
+        (
             "layer_group_offload",
             options.offload_group_size > 0,
             "layer-group offloading moves weight storage before weight commit",
@@ -817,7 +864,7 @@ class StartupWeightLoadManager:
     def prepare(self) -> nn.Module:
         """Resolve sources, then build capture-safe storage.
 
-        Source-based auto fallback happens before sentinel mutation.
+        Source and layer checks happen before sentinel mutation.
         """
 
         if self._state != StartupWeightLoadState.CREATED:
@@ -833,13 +880,15 @@ class StartupWeightLoadManager:
             self._model_config,
             model,
         )
-        source_rejection = self._get_source_rejection(resolved_sources)
-        if source_rejection is not None:
+        rejection = self._get_source_rejection(
+            resolved_sources
+        ) or self._get_model_rejection(model)
+        if rejection is not None:
             if not self._fallback_to_serial:
-                raise ValueError(source_rejection)
+                raise ValueError(rejection)
             logger.info(
                 "Startup weight-load auto mode selected serial loading: %s",
-                source_rejection,
+                rejection,
             )
             model = self._loader.load_initialized_model_from_resolved_sources(
                 model=model,
@@ -875,6 +924,25 @@ class StartupWeightLoadManager:
             source.use_safetensors for source in resolved_sources
         ):
             return "startup overlap requires safetensors checkpoints"
+        return None
+
+    @staticmethod
+    def _get_model_rejection(model: nn.Module) -> Optional[str]:
+        from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        # FP8 checkpoints can leave individual expert layers unquantized.
+        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            for module in model.modules():
+                method = getattr(module, "quant_method", None)
+                if isinstance(method, KTEPWrapperMethod):
+                    method = method.gpu_method
+                if (
+                    isinstance(method, UnquantizedFusedMoEMethod)
+                    and method.use_flashinfer_trtllm_moe
+                ):
+                    return "TRT-LLM MoE checkpoint-shape restoration requires the routed runner"
         return None
 
     def start_prefetch(self) -> None:
