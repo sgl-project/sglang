@@ -366,6 +366,7 @@
             "estimated_full_test_time_s": 120.0
         },
         "flux_image_t2i": {
+            "expected_load_ms": 29629.92,
             "stages_ms": {
                 "TimestepPreparationStage": 32.58,
                 "DenoisingStage": 6447.42,
@@ -606,6 +607,7 @@
             "estimated_full_test_time_s": 124.4
         },
         "flux_2_ti2i": {
+            "expected_load_ms": 54947.9,
             "stages_ms": {
                 "TextEncodingStage": 364.98,
                 "DenoisingStage": 44465.25,
@@ -1009,6 +1011,7 @@
             "estimated_full_test_time_s": 153.6
         },
         "joyai_image_edit_ti2i": {
+            "expected_load_ms": 34589.89,
             "stages_ms": {
                 "InputValidationStage": 16.43,
                 "ImageEncodingStage": 602.8,
@@ -1522,6 +1525,7 @@
             "estimated_full_test_time_s": 141.7
         },
         "qwen_image_edit_2509_ti2i": {
+            "expected_load_ms": 37508.7,
             "stages_ms": {
                 "ImageEncodingStage": 587.89,
                 "DenoisingStage": 37539.33,
@@ -1583,6 +1587,7 @@
             "estimated_full_test_time_s": 160.2
         },
         "qwen_image_layered_i2i": {
+            "expected_load_ms": 37439.25,
             "stages_ms": {
                 "QwenImageLayeredBeforeDenoisingStage": 144.26,
                 "TimestepPreparationStage": 0.0,
@@ -3261,6 +3266,7 @@
             "estimated_full_test_time_s": 340.0
         },
         "minimax_h3_t2va_2gpu_h100": {
+            "expected_load_ms": 79373.57,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "MiniMaxH3PartitionAdmissionStage": 0.03,
@@ -3406,6 +3412,7 @@
             "estimated_full_test_time_s": 65.5
         },
         "qwen_image_edit_modelopt_fp8_ti2i": {
+            "expected_load_ms": 49282.42,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 2964.8,

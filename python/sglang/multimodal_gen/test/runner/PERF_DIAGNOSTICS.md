@@ -121,3 +121,13 @@ Their maximum/minimum loading ratios range from 1.093 to 1.205. Each reference
 is the minimum observed loading time rounded to two decimal places; the same
 existing tolerances apply. These are initial references, not claims that the
 full testcases or all later checks passed.
+
+Seven further H100 references use that same recent three-run window:
+`flux_image_t2i`, `flux_2_ti2i`, `joyai_image_edit_ti2i`,
+`qwen_image_edit_2509_ti2i`, `qwen_image_layered_i2i`,
+`minimax_h3_t2va_2gpu_h100`, and `qwen_image_edit_modelopt_fp8_ti2i`.
+Their maximum/minimum ratios in this window range from 1.006 to 1.250
+(the largest unrounded ratio is 1.249565). Earlier historical runs vary more;
+these references do not claim stability across the entire history. Each value
+is the minimum in the stated window, rounded to two decimals. Existing loading
+references, E2E references, and tolerances are unchanged.
