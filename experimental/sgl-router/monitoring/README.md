@@ -16,8 +16,7 @@ on `/metrics` (text/plain, version 0.0.4) on the router's serving port
 
 ## Metrics covered
 
-Families the router emits. The dashboard graphs all of them except the
-`sgl_router_kv_*` series, whose panels ship separately:
+Families the router emits, all of them graphed:
 
 | Metric | Type | What it shows |
 |---|---|---|
@@ -41,6 +40,13 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_event_batches_lost_total` | Counter | KV-event batches dropped in transit, from gaps in each publisher's sequence |
 | `sgl_router_kv_tree_accounting_errors_total` | Counter | Occupancy-bookkeeping contradictions, by `reason`. Always 0 on a correct tree |
 | `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
+| `sgl_router_cache_aware_decisions_total` | Counter | Terminal outcome of each cache-aware selection, by `model_id` and `decision` |
+| `sgl_router_cache_aware_query_blocks_total` | Counter | Blocks the request was looked up on — the locality denominator, by `model_id` and `decision` |
+| `sgl_router_matched_overlap_blocks_total` | Counter | Blocks the fleet's BEST holder has — the ceiling, by `model_id` and `decision` |
+| `sgl_router_selected_overlap_blocks_total` | Counter | Blocks the CHOSEN worker has — the router's prediction of the engine's hit rate |
+| `sgl_router_overlap_blocks` | Histogram | Distribution behind the matched counter, by `model_id` |
+| `sgl_router_selected_owner_tier_total` | Counter | Storage `tier` the chosen worker holds the matched prefix on, by `model_id` |
+| `sgl_router_zero_match_block0_total` | Counter | Zero-overlap selections by whether block 0 is in the tree (`presence`), by `model_id` |
 
 `sgl_router_overlap_blocks` is back after its removal with the
 `cache_aware_zmq` policy, and its meaning is narrower than the one old queries
@@ -49,6 +55,41 @@ constraints could reach, not what the chosen worker holds. Queries that read
 its `_sum` as a hit rate were already reading the ceiling; point them at
 `sgl_router_selected_overlap_blocks_total` over
 `sgl_router_cache_aware_query_blocks_total` instead.
+
+## Reading cache locality against the engine
+
+The three block counters decompose prefix reuse into terms that subtract. The
+ratio comparable to the engine's
+`sglang:cached_tokens_total / sglang:prompt_tokens_total` is
+**`selected / query`**, not `matched / query`: the latter is the fleet-wide
+best and reads structurally high, because it meters the deepest prefix anyone
+holds even on selections that then routed elsewhere. `matched - selected` is
+locality the routing decision gave up, attributable to a decision bucket
+because all three share the `(model_id, decision)` key.
+
+The residual against the engine's own number is not one-directional, and the
+direction is the diagnosis:
+
+| observation | conclusion |
+|---|---|
+| `selected/query` fell, `matched/query` flat | routing is diverting off the prefix owner |
+| both fell | the tree or the indexer is losing state |
+| router ratios flat, engine hit rate fell | engine-side eviction, not routing |
+| `selected/query` **below** the engine's rate | a worker serves traffic while publishing no KV events — a failed `/server_info` probe or a page-size disagreement |
+| `zero_match_block0_total{presence="absent"}` rising | engine-side publish gap, not a router linkage fault |
+| `zero_match_block0_total{presence="in_tree"}` rising | router-side linkage: the hash is carried but unreachable from the root |
+
+Block counts convert to the engine's token units by multiplying by
+`sgl_router_kv_block_size`. The query-block denominator rounds a partial
+trailing block up to a whole one, so per request it can overstate the engine's
+token count by up to one block less a token — averaging half a block on
+uniformly distributed lengths, which is where the two denominators agree in
+aggregate.
+
+Ratios are **not** additive across models: keep `model_id` on any locality or
+coverage panel and collapse it only for rates. The per-decision counters are
+evaluations, not requests, which is why their panels use `evals/s` rather than
+`ops` and are deliberately not stacked.
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting
@@ -103,6 +144,6 @@ default to *All*) to scope the panels.
 
 ## Regenerating
 
-The JSON is generated programmatically to keep the ~20 panels consistent. If
+The JSON is generated programmatically to keep the ~35 panels consistent. If
 the metric surface changes, update the generator and overwrite the JSON
 rather than hand-editing — hand-edits drift from the panel conventions.

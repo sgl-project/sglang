@@ -1606,12 +1606,507 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Router cache locality",
+      "description": "The router's own view of prefix reuse, as two ratios that must be read apart. selected/query is what the chosen worker holds \u2014 the router's prediction of the engine's hit rate, and the only one comparable to the engine's sglang:cached_tokens_total / sglang:prompt_tokens_total. matched/query is the deepest prefix ANY worker in the fleet holds, so it reads structurally high: it counts selections that then routed elsewhere. The gap between the two lines is locality the routing decision gave up; the gap between selected/query and the engine's number is cache state that changed between selection and prefill. selected/query sitting BELOW the engine's rate is the third case and means a worker serves traffic while publishing no KV events \u2014 a failed /server_info probe or a page-size disagreement \u2014 not eviction. Kept per model_id: ratios are not additive across models.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "id": 32,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / clamp_min(sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])), 1e-9)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}} selected/query (vs engine)",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_matched_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / clamp_min(sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])), 1e-9)",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "{{model_id}} matched/query (fleet ceiling)",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache-aware decisions",
+      "description": "Terminal outcome of every cache-aware selection. Evaluations, not requests \u2014 which is why the unit is not ops and the series are not stacked. cache_hit = a prefix owner won. no_candidates = the lookup ran and produced no usable owner (a cache problem). candidates_exhausted = owners existed and admission or the pressure guard rejected every one (a sizing problem). lookup_unavailable = no lookup happened at all \u2014 no routing tokens, no fleet block size established yet, or no provider configured; a router that has just started sits here until the first worker reports its page size. Selections that ended in a 503 are absent, in sgl_router_policy_selection_failures_total instead. Rates are additive across models, so model_id is collapsed here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "id": 33,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:evals/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{decision}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Locality by decision",
+      "description": "selected/query split by the decision that produced it \u2014 which bucket is losing the locality. A low ratio under candidates_exhausted is capacity pushing requests off their prefix and is fixed by sizing, not by the cache. A low ratio under cache_hit means the winner held little to begin with: read it with Router cache locality, where a matched/query that is also low says the fleet simply does not hold this traffic's prefixes. no_candidates reads at or near 0 by construction. Kept per model_id: ratios are not additive across models.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "id": 34,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id, decision) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / clamp_min(sum by (model_id, decision) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])), 1e-9)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}} {{decision}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Zero-match attribution",
+      "description": "Selections that matched nothing, split by whether the request's FIRST queried block hash exists anywhere in the tree. absent = no node carries it: the engines never published the block or already removed it, so the work is engine-side. in_tree = the hash IS carried but the root-anchored walk could not reach it, so the work is router-side linkage. A zero match is the most common outcome on an unhealthy fleet and these two faults live in different repositories; matched = 0 alone cannot tell them apart. Emitted only where the in-process tree is the provider \u2014 an external Indexer cannot answer this, and the panel is empty there rather than wrong.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "id": 35,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:evals/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (presence) (rate(sgl_router_zero_match_block0_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{presence}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Lookup availability \u2014 fleet vs worst replica",
+      "description": "Share of cache-aware selections that got a prefix lookup at all (1 - lookup_unavailable). Every router replica maintains its own tree and its own block-size oracle, so one replica can lose the lookup while the fleet aggregate stays healthy \u2014 the worst-replica line is the only place that shows. A single replica at 0 while the fleet sits near 1 means that pod never learned the fleet's page size or lost its KV subscription, and everything it routes is going out blind. Both lines dropping together is a fleet-wide event: a rollout that changed the page size, or every subscription failing at once. Both expressions supply an explicit zero for an empty numerator: no lookup_unavailable samples at all is the healthy case, and 1 - <empty> is empty rather than 1, which would blank the panel precisely when nothing is wrong.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 24,
+        "h": 8
+      },
+      "id": 36,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "1 - ((sum(rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=\"lookup_unavailable\"}[$__rate_interval])) or sum(rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) * 0) / clamp_min(sum(rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])), 1e-9))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "fleet",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "min(1 - ((sum without (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=\"lookup_unavailable\"}[$__rate_interval])) or sum without (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) * 0) / clamp_min(sum without (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])), 1e-9)))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "worst replica",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Routing Policy",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 65,
         "w": 24,
         "h": 1
       },
@@ -1628,7 +2123,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 50,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1721,7 +2216,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 50,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1814,7 +2309,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 50,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1903,7 +2398,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 58,
+        "y": 74,
         "w": 24,
         "h": 1
       },
@@ -1920,7 +2415,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 59,
+        "y": 75,
         "w": 12,
         "h": 8
       },
@@ -2025,7 +2520,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 59,
+        "y": 75,
         "w": 12,
         "h": 8
       },
@@ -2118,7 +2613,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 67,
+        "y": 83,
         "w": 24,
         "h": 8
       },
@@ -2198,6 +2693,195 @@
           "range": true,
           "refId": "A",
           "legendFormat": "{{namespace}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hits by tier served from",
+      "description": "Which storage tier the CHOSEN worker holds the matched prefix on, in the same vocabulary as KV tree blocks by tier: device = served in place, host = served by a load-back from host memory, disk / external = fetched from a storage backend. Two labels are not tiers. none = the chosen worker holds no part of this prefix, which is every no_candidates selection plus any hit whose winner was not the owner. unknown = the deployment routes through the out-of-process Indexer, whose wire contract carries no medium \u2014 the tier is not observable there, and this reports so rather than defaulting to device.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 91,
+        "w": 12,
+        "h": 8
+      },
+      "id": 37,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:evals/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tier) (rate(sgl_router_selected_owner_tier_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{tier}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Affinity routes served by load-back",
+      "description": "host / (device + host): the fraction of in-place-or-load-back hits that ride the host tier rather than device HBM. This is what the storage-tier work buys, stated as a number \u2014 before the tree honoured tiers, every one of these was a cold prefill on a random worker instead. Rising is normal as device turns over (the device tier holds minutes, host holds hours); rising toward 1 while the engines report a healthy device pool means device ownership is being revoked faster than it should be. Kept per model_id: ratios are not additive across models.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 91,
+        "w": 12,
+        "h": 8
+      },
+      "id": 38,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_selected_owner_tier_total{model_id=~\"$model_id\",tier=\"host\"}[$__rate_interval])) / clamp_min(sum by (model_id) (rate(sgl_router_selected_owner_tier_total{model_id=~\"$model_id\",tier=~\"device|host\"}[$__rate_interval])), 1e-9)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}}",
           "format": "time_series"
         }
       ]
