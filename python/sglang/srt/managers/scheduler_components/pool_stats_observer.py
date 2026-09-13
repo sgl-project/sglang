@@ -14,7 +14,7 @@ from typing import (
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
-    UnifiedSWATokenToKVPoolAllocator,
+    supports_swa_byte_budget,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +39,8 @@ class PoolStats:
     is_hisparse: bool = False
 
     # For hybrid-swa pools
+    full_capacity: Optional[int] = None
+    swa_capacity: Optional[int] = None
     swa_num_used: Optional[int] = None
     swa_token_usage: Optional[float] = None
     swa_available_size: Optional[int] = None
@@ -293,13 +295,12 @@ class SchedulerPoolStatsObserver:
         allocator = self.token_to_kv_pool_allocator
         full_capacity = self.full_tokens_per_layer
         swa_capacity = self.swa_tokens_per_layer
-        if (
-            isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-            and allocator.supports_asymmetric_reservation
-        ):
+        if supports_swa_byte_budget(allocator):
             full_capacity = allocator.current_full_capacity
             swa_capacity = allocator.current_swa_capacity
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
+        elif isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # The tri-pool reports static capacities paired with conserve views.
             full_available_size = allocator.conserve_full_available_size()
             swa_available_size = allocator.conserve_swa_available_size()
@@ -336,6 +337,8 @@ class SchedulerPoolStatsObserver:
 
         return PoolStats(
             is_hybrid_swa=True,
+            full_capacity=full_capacity,
+            swa_capacity=swa_capacity,
             full_num_used=full_num_used,
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
