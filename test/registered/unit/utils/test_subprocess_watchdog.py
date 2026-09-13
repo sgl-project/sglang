@@ -20,6 +20,9 @@ import threading
 import time
 import unittest.mock
 
+from uvicorn.supervisors import multiprocess
+
+from sglang.srt.entrypoints.uvicorn_utils import run_uvicorn_with_sigquit_handler
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -133,6 +136,42 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+    def test_uvicorn_preserves_sigquit_handler(self):
+        for sig in multiprocess.SIGNALS:
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+        # This regression needs real signal delivery through Uvicorn's handlers.
+        self._patcher.stop()
+        received_signals = []
+        signal.signal(
+            signal.SIGQUIT, lambda signum, frame: received_signals.append(signum)
+        )
+        proc = self._spawn(healthy_worker)
+
+        def run_supervisor(supervisor):
+            self._watch(proc)
+            proc.kill()
+            deadline = time.monotonic() + 5
+            while not received_signals and time.monotonic() < deadline:
+                supervisor.handle_signals()
+                time.sleep(0.01)
+            self.assertEqual(
+                received_signals,
+                [signal.SIGQUIT],
+                "Backend death must reach the original SIGQUIT handler",
+            )
+
+        with (
+            unittest.mock.patch.object(
+                multiprocess.Multiprocess,
+                "run",
+                autospec=True,
+                side_effect=run_supervisor,
+            ),
+            unittest.mock.patch("uvicorn.Config.bind_socket"),
+        ):
+            run_uvicorn_with_sigquit_handler("unused:app", workers=2, log_config=None)
 
 
 if __name__ == "__main__":

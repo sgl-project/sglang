@@ -111,6 +111,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.uvicorn_utils import run_uvicorn_with_sigquit_handler
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -2733,7 +2734,7 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
+                run_uvicorn_with_sigquit_handler(
                     "sglang.srt.entrypoints.http_server:app",
                     host=get_serving().host,
                     port=get_serving().port,
