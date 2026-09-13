@@ -870,8 +870,12 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
 
     if requested_transport == "cuda_ipc":
-        if not get_platform().is_cuda:
-            raise ValueError("--mm-feature-transport=cuda_ipc requires NVIDIA CUDA.")
+        # The implementation only uses torch.cuda APIs (``_share_cuda_``,
+        # streams, events), which dispatch to HIP IPC in a ROCm build.
+        if not (get_platform().is_cuda or get_platform().is_hip):
+            raise ValueError(
+                "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA or AMD ROCm/HIP."
+            )
         if cfg.nnodes != 1:
             raise ValueError(
                 "--mm-feature-transport=cuda_ipc only supports a single node."
