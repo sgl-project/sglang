@@ -640,6 +640,8 @@ class DiffusionServerBase:
             f"--- Performance Log: {case.id} ---",
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
+                f"load={summary.load_time_ms:.2f}ms, "
+                f"load_inclusive_e2e={summary.load_time_ms + summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "

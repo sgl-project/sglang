@@ -5,9 +5,14 @@ from unittest.mock import Mock
 import pytest
 
 from sglang.multimodal_gen.runtime import launch_server as launcher
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.scripts import gen_perf_baselines
 from sglang.multimodal_gen.test.server import test_server_utils as utils
 from sglang.multimodal_gen.test.server.test_server_utils import PerformanceValidator
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionSamplingParams,
+    DiffusionServerArgs,
+    DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
@@ -42,6 +47,51 @@ def test_fast_loading_cannot_hide_inference_regression(validator):
     validator.validate_load_inclusive_e2e(summary)
     with pytest.raises(AssertionError, match="E2E Latency"):
         validator.validate_e2e(summary)
+
+
+@pytest.mark.parametrize("load_time_ms", [None, 0, float("nan"), 1234.5])
+def test_baseline_script_preserves_required_load_measurement(monkeypatch, load_time_ms):
+    case = DiffusionTestCase(
+        "load-baseline",
+        DiffusionServerArgs("test", modality="image"),
+        DiffusionSamplingParams(prompt="test"),
+    )
+    context = SimpleNamespace(
+        port=1234, load_time_ms=load_time_ms, perf_log_path="unused", cleanup=Mock()
+    )
+    monkeypatch.setattr(
+        gen_perf_baselines,
+        "ServerManager",
+        Mock(return_value=Mock(start=lambda: context)),
+    )
+    monkeypatch.setattr(gen_perf_baselines, "get_dynamic_server_port", lambda: 1234)
+    monkeypatch.setattr(gen_perf_baselines, "_build_server_extra_args", lambda case: "")
+    monkeypatch.setattr(gen_perf_baselines, "_openai_client", Mock())
+    monkeypatch.setattr(
+        gen_perf_baselines,
+        "get_generate_fn",
+        lambda **kwargs: lambda *args: ("request", b"output"),
+    )
+    monkeypatch.setattr(gen_perf_baselines.current_platform, "is_cuda", lambda: False)
+    record = RequestPerfRecord(
+        request_id="request",
+        commit_hash="test",
+        tag="test",
+        stages=[],
+        steps=[],
+        total_duration_ms=1000,
+    )
+    monkeypatch.setattr(
+        gen_perf_baselines, "wait_for_req_perf_record", lambda *args, **kwargs: record
+    )
+    if load_time_ms == 1234.5:
+        scenario = ScenarioConfig.from_dict(gen_perf_baselines._run_case(case))
+        assert scenario.expected_load_ms == 1234.5
+        assert scenario.expected_e2e_ms == 1000
+    else:
+        with pytest.raises(ValueError, match="load duration missing or invalid"):
+            gen_perf_baselines._run_case(case)
+    context.cleanup.assert_called_once()
 
 
 @pytest.mark.parametrize("duration", [None, 0, -1, float("nan"), float("inf")])

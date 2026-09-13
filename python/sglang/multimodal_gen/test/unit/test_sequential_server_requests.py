@@ -22,9 +22,14 @@ pytest_plugins = ["pytester"]
 
 
 @pytest.mark.parametrize("load_time_ms", [None, 0, float("nan"), 1000])
-def test_load_guard_is_terminal_without_stage_checks(harness, load_time_ms):
+def test_load_guard_is_terminal_without_stage_checks(
+    harness, monkeypatch, load_time_ms
+):
     runner, case = harness
     case = replace(case, run_perf_check=False)
+    monkeypatch.setattr(
+        runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
+    )
     with pytest.raises(test_server_common.PerformanceValidationError, match="Load"):
         runner.test_diffusion_generation(
             case, SimpleNamespace(load_time_ms=load_time_ms)
@@ -38,6 +43,9 @@ def test_baseline_generation_requires_loading_measurement(
 ):
     runner, case = harness
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "1")
+    monkeypatch.setattr(
+        runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
+    )
     with pytest.raises(test_server_common.PerformanceValidationError, match="Load"):
         runner.test_diffusion_generation(
             case, SimpleNamespace(load_time_ms=load_time_ms)
