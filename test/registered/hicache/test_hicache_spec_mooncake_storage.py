@@ -156,6 +156,7 @@ class TestHiCacheSpecMooncakeStorage(
     @classmethod
     def _get_spec_server_env(cls):
         return {
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
             "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
             "MOONCAKE_PROTOCOL": "tcp",
             "MC_MS_AUTO_DISC": "0",
