@@ -21,3 +21,7 @@ export ENVS2="$ENVS2 SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=mat
 # Track L: chunked-prefill fairness (waiting short extends share the chunk budget with a long in-flight prefill);
 # c=24 900 s windows: TTFT p90 4.50->3.96 s, p99 12.7->10.3 s, throughput within noise; gsm8k-500 0.870 on the real-acceptance cfg.
 export ENVS2="$ENVS2 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5"
+
+# Track N: fp4 activations for the decode MoE too (aiter FlyDSL path with fused SwiGLU; default keeps bf16 activations below 256 rows).
+# Performance-only: GSM8K-500 0.834/0.834/0.820 vs 0.85-0.89 with bf16 activations. Steady decode ~195K: N=16 1604->1839, N=24 2016->2094 tok/s.
+export ENVS2="$ENVS2 GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0"
