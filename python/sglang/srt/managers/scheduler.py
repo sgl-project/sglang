@@ -1632,7 +1632,8 @@ class Scheduler(
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
         self.future_map = self.spec_algorithm.create_future_map(
-            self.device,
+            # MLX workers return sampled tokens on CPU; relay buffers must match.
+            "cpu" if use_mlx() else self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
