@@ -1487,15 +1487,19 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
+        # slicing along dim 1 keeps the original row stride, so the shard is
+        # contiguous only while the batch dim is 1; all_gather_into_tensor
+        # requires a contiguous input, so materialize the shard before the
+        # collective
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
-            sharded = tensor[:, num_replicated_prefix:]
+            sharded = tensor[:, num_replicated_prefix:].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([replicated, gathered], dim=1)
 
         if num_replicated_suffix:
             replicated = tensor[:, -num_replicated_suffix:]
-            sharded = tensor[:, :-num_replicated_suffix]
+            sharded = tensor[:, :-num_replicated_suffix].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
