@@ -124,7 +124,7 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="The IO backend for KV cache transfer between CPU and GPU",
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "kernel_xpu"],
         ),
     ] = "kernel"
     hicache_mem_layout: A[

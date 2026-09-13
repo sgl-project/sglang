@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
+    XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -150,6 +151,68 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         self.assertFalse(check_equal_or_regex_match(GATE_PROJ, ["re:.*down_proj$"]))
 
 
+class TestClippableWrapperIgnoreNames(CustomTestCase):
+    """Gemma 4's tower projections must stay ignored under both naming shapes.
+
+    A quantized-text / bf16-vision checkpoint lists every tower projection in
+    ``ignore`` under the clippable wrapper's inner module (``...q_proj.linear``).
+    Fused projections drop that suffix in our module tree (the inner module is
+    named ``qkv_proj``/``gate_up_proj``), non-fused ones keep it. Rewriting
+    ``.linear`` away for *both* leaves the non-fused entry a bare prefix of the
+    real layer name, which the ignore check refuses to match -- the bf16 vision
+    MLP then resolved a packed W4A16 scheme and tripped its group-size
+    alignment check (vision ``intermediate_size`` is not a multiple of the
+    checkpoint's ``group_size``).
+    """
+
+    VISION_LAYER = "model.vision_tower.encoder.layers.0"
+
+    def _mapped_ignore(self):
+        from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+
+        cls = Gemma4ForConditionalGeneration
+        # Names exactly as a compressed-tensors config spells them.
+        ignore = [
+            f"{self.VISION_LAYER}.self_attn.{p}_proj.linear"
+            for p in ("q", "k", "v", "o")
+        ] + [f"{self.VISION_LAYER}.mlp.{p}_proj.linear" for p in ("gate", "up", "down")]
+        return (
+            cls.hf_to_sglang_mapper.apply_list(ignore),
+            cls.packed_modules_mapping,
+        )
+
+    def test_fused_and_unfused_tower_projections_both_ignored(self):
+        ignore, packed = self._mapped_ignore()
+
+        for layer_name in (
+            # Fused: inner module is named after the fused projection.
+            f"{self.VISION_LAYER}.self_attn.qkv_proj",
+            f"{self.VISION_LAYER}.mlp.gate_up_proj",
+            # Non-fused: inner module really does live at `.linear`.
+            f"{self.VISION_LAYER}.self_attn.o_proj.linear",
+            f"{self.VISION_LAYER}.mlp.down_proj.linear",
+        ):
+            with self.subTest(layer_name=layer_name):
+                self.assertTrue(
+                    should_ignore_layer(layer_name, ignore=ignore, fused_mapping=packed)
+                )
+
+    def test_text_model_stays_quantized(self):
+        # The mapper must not widen the ignore list into the text model.
+        ignore, packed = self._mapped_ignore()
+
+        for layer_name in (
+            "model.language_model.layers.0.self_attn.qkv_proj",
+            "model.language_model.layers.0.self_attn.o_proj",
+            "model.language_model.layers.0.mlp.gate_up_proj",
+            "model.language_model.layers.0.mlp.down_proj",
+        ):
+            with self.subTest(layer_name=layer_name):
+                self.assertFalse(
+                    should_ignore_layer(layer_name, ignore=ignore, fused_mapping=packed)
+                )
+
+
 class TestMixedPrecisionFormat(CustomTestCase):
     """The per-group `format` must win over a top-level "mixed-precision"."""
 
@@ -182,7 +245,12 @@ class TestMixedPrecisionFormat(CustomTestCase):
                 torch.nn.Module(), layer_name=MLP_LAYER
             )
 
-        self.assertIsInstance(scheme, CompressedTensorsWNA16)
+        # Which WNA16 class is device-dependent (XPU dispatches to its own
+        # oneDNN-backed scheme); what matters here is that a WNA16 scheme was
+        # resolved at all, with the matched group's parameters.
+        self.assertIsInstance(
+            scheme, (CompressedTensorsWNA16, XPUCompressedTensorsWNA16)
+        )
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)

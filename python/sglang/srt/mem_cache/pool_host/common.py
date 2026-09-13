@@ -255,5 +255,8 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        # XPU pinned memory is already USM host, i.e. addressable from device
+        # kernels, so no separate registration step is needed.
+        "xpu": alloc_with_pin_memory,
     },
 )

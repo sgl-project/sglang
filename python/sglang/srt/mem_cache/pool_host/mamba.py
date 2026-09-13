@@ -18,10 +18,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -34,6 +35,17 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
+if _is_xpu:
+    # SYCL kernels, JIT-compiled on first use. sgl-kernel-xpu has no AOT
+    # kvcacheio module yet, so these are built from source in-tree.
+    from sglang.srt.mem_cache import xpu_kvcacheio
+
+    # There is no SYCL mamba kernel; the single-pool ("mla") helpers have
+    # matching signatures and move the state verbatim. Binding here is lazy:
+    # the wrappers compile on first call, not at import.
+    transfer_kv_all_layer_mla_lf_pf = xpu_kvcacheio.transfer_kv_all_layer_mla_lf_pf
+    transfer_kv_per_layer_mla = xpu_kvcacheio.transfer_kv_per_layer_mla
+    transfer_kv_per_layer_mla_pf_lf = xpu_kvcacheio.transfer_kv_per_layer_mla_pf_lf
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +314,7 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend in ("kernel", "kernel_xpu"):
             # TODO: Rename the interface for clarity.
             # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
             # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
@@ -336,7 +348,20 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel_xpu":
+            # No SYCL mamba kernel; the single-pool mla helper has the same
+            # signature and moves the state verbatim (see the note at import).
+            item_size = MambaPoolHost._item_size_per_index(dst)
+            transfer_kv_per_layer_mla_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                item_size=item_size,
+                src_layout_dim=item_size * num_layers,
+            )
+        elif io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
             # Mamba JIT kernel expects all index tensors on CUDA.
             # host_indices may be on CPU (kept there by start_writing when
@@ -378,7 +403,20 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel_xpu":
+            # No SYCL mamba kernel; the single-pool mla helper has the same
+            # signature and moves the state verbatim (see the note at import).
+            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=src_ptrs,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+                dst_layout_dim=item_size * num_layers,
+                num_layers=num_layers,
+            )
+        elif io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             # Mamba JIT kernel expects all index tensors on CUDA.
             # When can_use_write_back_jit is True on the HostPoolGroup,

@@ -65,6 +65,7 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -167,6 +168,34 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             "up_proj",
         ],
     }
+
+    # Quant configs name the vision/audio towers' projections under the
+    # clippable wrapper's inner module (`...self_attn.q_proj.linear`,
+    # `...mlp.down_proj.linear`).  Two cases, and only one needs rewriting:
+    #
+    #   * Non-fused (`o_proj`, `down_proj`, ...) — the wrapper's inner module
+    #     really does live at `.linear`, so the config name already equals the
+    #     sglang layer name.  Leave it alone.
+    #   * Fused (`{q,k,v}_proj` -> `qkv_proj`, `{gate,up}_proj` ->
+    #     `gate_up_proj`) — the inner module is named after the fused
+    #     projection, so there is no `.linear` in the sglang name.  The ignore
+    #     check expands a fused layer name back into bare shard names
+    #     (`...self_attn.q_proj`), which cannot match a `.linear`-suffixed
+    #     config entry, so drop the suffix on exactly these shards.
+    #
+    # Without this, quantized-text / bf16-vision checkpoints (e.g.
+    # gemma-4-31B-it-qat-w4a16-ct) route the towers to a packed scheme and
+    # fail looking for absent packed weights.  A blanket `.linear` -> ``
+    # rewrite fixes the fused case but breaks the non-fused one: the shortened
+    # entry is then a *prefix* of the real layer name, which the ignore check
+    # deliberately refuses to match.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            f"{shard}.linear": shard
+            for shards in packed_modules_mapping.values()
+            for shard in shards
+        },
+    )
 
     # LoRA specific attributes
     supported_lora_modules = [
