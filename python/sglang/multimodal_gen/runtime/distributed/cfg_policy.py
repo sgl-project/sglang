@@ -43,6 +43,9 @@ class CFGPolicy:
     """
 
     branches: list[CFGBranch] = field(default_factory=list)
+    # Gather predictions before combining when a model needs the same bf16
+    # rounding as serial CFG. The default retains legacy WAN all-reduce outputs.
+    parallel_uses_serial_arithmetic: bool = False
 
     def build(
         self,
@@ -83,7 +86,7 @@ class CFGPolicy:
             return predictions[0]
         pos_t = _wrap(predictions[0])
         neg_t = _wrap(predictions[1])
-        if cfg_parallel:
+        if cfg_parallel and not self.parallel_uses_serial_arithmetic:
             # Match the old CFG-parallel calculation: multiply the positive
             # prediction by cfg_scale and the negative prediction by
             # (1 - cfg_scale) before adding them. The serial CFG formula is

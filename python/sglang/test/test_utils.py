@@ -26,6 +26,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
+import msgspec
 import numpy as np
 import requests
 import torch
@@ -2118,7 +2119,7 @@ def server_args_variant(server_args, **fields):
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__
+        if name not in cls.__struct_fields__
         and not hasattr(cls, name)
         and name not in _RUNNER_WRITTEN_NAMES
     }
@@ -2130,16 +2131,14 @@ def server_args_variant(server_args, **fields):
     stash = getattr(variant, "_resolved_overrides", None)
     if stash is None:
         stash = []
-        object.__setattr__(variant, "_resolved_overrides", stash)
+        msgspec.Struct.__setattr__(variant, "_resolved_overrides", stash)
     declared = {
-        name: value
-        for name, value in fields.items()
-        if name in cls.__dataclass_fields__
+        name: value for name, value in fields.items() if name in cls.__struct_fields__
     }
     if declared:
         stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
-        object.__setattr__(variant, name, value)
+        msgspec.Struct.__setattr__(variant, name, value)
     return variant
 
 
