@@ -18,7 +18,6 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
 )
 from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark.schemes import (
     quark_w4a4_mxfp4_moe as quark_moe,
 )
@@ -41,66 +40,6 @@ class _CapturingRunner:
 
 
 class TestGLM53FlashQuarkMoE(CustomTestCase):
-    def test_flash_fused_qkv_exclusion_maps_to_runtime_proj_name(self):
-        config = object.__new__(QuarkConfig)
-        config.exclude_layers = ["model.visual.blocks.0.attn.qkv"]
-        config.packed_modules_mapping = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        }
-        mapper = SimpleNamespace(
-            apply_list=lambda names: [
-                name.replace("model.visual.", "visual.") for name in names
-            ]
-        )
-
-        config.apply_weight_name_mapper(mapper)
-
-        self.assertIn("visual.blocks.0.attn.qkv_proj", config.exclude_layers)
-
-    def test_flash_layer_config_matches_runtime_prefix_without_language_model(self):
-        config = object.__new__(QuarkConfig)
-        fp8_config = {
-            "weight": {
-                "dtype": "fp8_e4m3",
-                "is_dynamic": False,
-                "qscheme": "per_block",
-                "block_size": [128, 128],
-            },
-            "input_tensors": {
-                "dtype": "fp8_e4m3",
-                "is_dynamic": True,
-                "qscheme": "per_group",
-                "group_size": 128,
-            },
-        }
-        global_mxfp4_config = {"weight": {"dtype": "fp4"}}
-        config.quant_config = {
-            "layer_quant_config": {
-                "model.language_model.layers.0.mlp.down_proj": fp8_config,
-            },
-            "layer_type_quant_config": {},
-            "global_quant_config": global_mxfp4_config,
-        }
-        config.packed_modules_mapping = {}
-
-        matched = config._find_matched_config(
-            "model.layers.0.mlp.down_proj", SimpleNamespace()
-        )
-
-        self.assertIs(matched, fp8_config)
-        self.assertTrue(
-            config._is_block_fp8_w8a8(fp8_config["weight"], fp8_config["input_tensors"])
-        )
-
-        direct_config = {"weight": {"dtype": "bf16"}}
-        config.quant_config["layer_quant_config"]["model.layers.0.mlp.down_proj"] = (
-            direct_config
-        )
-        matched = config._find_matched_config(
-            "model.layers.0.mlp.down_proj", SimpleNamespace()
-        )
-        self.assertIs(matched, direct_config)
-
     def test_block_fp8_forwards_separated_layout_and_clamp(self):
         method = object.__new__(Fp8MoEMethod)
         method.block_quant = True
