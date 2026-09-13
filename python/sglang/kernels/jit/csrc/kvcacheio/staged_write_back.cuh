@@ -9,41 +9,16 @@
 namespace sglang {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
-#if CUDA_VERSION >= 13000
-using CudaMemcpyBatchPtr = const void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    const size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    cudaStream_t);
-#else
 using CudaMemcpyBatchPtr = void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    size_t*,
-    cudaStream_t);
-#endif
 
-inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
-  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
-    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
-    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
-  }();
+inline auto get_cuda_memcpy_batch_async() -> void* {
+  static void* cuda_memcpy_batch_async = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
   return cuda_memcpy_batch_async;
 }
 
 inline auto call_cuda_memcpy_batch_async(
-    CudaMemcpyBatchAsyncFn copy_fn,
+    void* copy_fn,
+    bool use_v13_signature,
     CudaMemcpyBatchPtr* dsts,
     CudaMemcpyBatchPtr* srcs,
     size_t* sizes,
@@ -52,12 +27,18 @@ inline auto call_cuda_memcpy_batch_async(
     size_t* attrs_idxs,
     size_t num_attrs,
     cudaStream_t stream) -> cudaError_t {
-#if CUDA_VERSION >= 13000
-  return copy_fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
-#else
+  if (use_v13_signature) {
+    using FnV13 = cudaError_t (*)(
+        void* const*, const void* const*, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
+    auto fn = reinterpret_cast<FnV13>(copy_fn);
+    return fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
+  }
+
+  using FnV12 =
+      cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+  auto fn = reinterpret_cast<FnV12>(copy_fn);
   size_t fail_idx = std::numeric_limits<size_t>::max();
-  return copy_fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, &fail_idx, stream);
-#endif
+  return fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, &fail_idx, stream);
 }
 #endif
 
@@ -119,6 +100,15 @@ inline bool try_copy_page_first_pages_batch(
     return false;
   }
 
+  // CUDA 13 removed failIdx from cudaMemcpyBatchAsync. Select the ABI from
+  // the loaded runtime rather than the toolkit that compiled this JIT kernel.
+  static int runtime_version = 0;
+  static const cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != cudaSuccess) {
+    return false;
+  }
+  static const bool use_v13_signature = runtime_version >= 13000;
+
   const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
   batch_srcs.clear();
   batch_dsts.clear();
@@ -166,6 +156,7 @@ inline bool try_copy_page_first_pages_batch(
 
   cudaError_t err = call_cuda_memcpy_batch_async(
       copy_fn,
+      use_v13_signature,
       batch_dsts.data(),
       batch_srcs.data(),
       batch_sizes.data(),
