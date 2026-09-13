@@ -1238,15 +1238,26 @@ class MossVLForConditionalGeneration(nn.Module):
         if not mm_inputs.mm_items:
             return 0
 
-        grid_thw = getattr(mm_inputs.mm_items[0], "grid_thw", None)
-        if grid_thw is None:
+        items = (
+            mm_inputs.mm_items
+            if mm_inputs.incremental_encoder_cache
+            else mm_inputs.mm_items[:1]
+        )
+        grid_chunks = []
+        for item in items:
+            grid_thw = getattr(item, "grid_thw", None)
+            if grid_thw is None:
+                continue
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int64)
+            if grid_thw.ndim == 1:
+                grid_thw = grid_thw.unsqueeze(0)
+            if grid_thw.numel() > 0:
+                grid_chunks.append(grid_thw)
+
+        if not grid_chunks:
             return 0
 
-        grid_thw = torch.as_tensor(grid_thw, dtype=torch.int64)
-        if grid_thw.ndim == 1:
-            grid_thw = grid_thw.unsqueeze(0)
-        if grid_thw.numel() == 0:
-            return 0
+        grid_thw = torch.cat(grid_chunks, dim=0)
 
         merge_square = self.spatial_merge_size**2
         tokens_per_media = torch.prod(grid_thw, dim=1) // merge_square
@@ -1265,8 +1276,30 @@ class MossVLForConditionalGeneration(nn.Module):
         if encoder_len == 0 or not mm_inputs.mm_items:
             return array("q")
 
-        pad_value = mm_inputs.mm_items[0].pad_value
-        return array("q", [pad_value]) * encoder_len
+        prefix = array("q")
+        merge_square = self.spatial_merge_size**2
+        items = (
+            mm_inputs.mm_items
+            if mm_inputs.incremental_encoder_cache
+            else mm_inputs.mm_items[:1]
+        )
+        for item in items:
+            grid_thw = getattr(item, "grid_thw", None)
+            if grid_thw is None:
+                continue
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int64)
+            if grid_thw.ndim == 1:
+                grid_thw = grid_thw.unsqueeze(0)
+            item_len = int(
+                (torch.prod(grid_thw, dim=1) // merge_square + grid_thw[:, 0])
+                .sum()
+                .item()
+            )
+            prefix.extend([item.pad_value] * item_len)
+
+        if len(prefix) < encoder_len:
+            prefix.extend([items[-1].pad_value] * (encoder_len - len(prefix)))
+        return prefix
 
     def pad_input_ids(
         self, input_ids: array[int], mm_inputs: MultimodalInputs
@@ -1295,12 +1328,25 @@ class MossVLForConditionalGeneration(nn.Module):
             if not mm_input.mm_items:
                 continue
 
-            item = mm_input.mm_items[0]
-            pixel_values_list.append(item.feature)
-            grid_thw = getattr(item, "grid_thw", None)
-            if grid_thw is not None:
-                grid_thw_list.append(torch.as_tensor(grid_thw, dtype=torch.long))
-            encoder_len = forward_batch.encoder_lens_cpu[i]
+            items = (
+                [item for item in mm_input.mm_items if item.feature is not None]
+                if mm_input.incremental_encoder_cache
+                else mm_input.mm_items[:1]
+            )
+            for item in items:
+                pixel_values_list.append(item.feature)
+                grid_thw = getattr(item, "grid_thw", None)
+                if grid_thw is not None:
+                    grid_thw = torch.as_tensor(grid_thw, dtype=torch.long)
+                    if grid_thw.ndim == 1:
+                        grid_thw = grid_thw.unsqueeze(0)
+                    grid_thw_list.append(grid_thw)
+
+            encoder_len = (
+                mm_input.encoder_append_len
+                if mm_input.incremental_encoder_cache
+                else forward_batch.encoder_lens_cpu[i]
+            )
 
             vp = mm_input.vision_position_ids
             if vp is not None:
@@ -1435,18 +1481,30 @@ class MossVLForConditionalGeneration(nn.Module):
                 )
                 continue
 
-            item = mm_input.mm_items[0] if mm_input.mm_items else None
-            grid_thw = getattr(item, "grid_thw", None) if item else None
-            if grid_thw is None:
+            items = (
+                mm_input.mm_items
+                if mm_input.incremental_encoder_cache
+                else mm_input.mm_items[:1]
+            )
+            grid_chunks = []
+            for item in items:
+                grid_thw = getattr(item, "grid_thw", None)
+                if grid_thw is None:
+                    continue
+                grid_thw = torch.as_tensor(grid_thw, dtype=torch.long)
+                if grid_thw.ndim == 1:
+                    grid_thw = grid_thw.unsqueeze(0)
+                if grid_thw.numel() > 0:
+                    grid_chunks.append(grid_thw)
+
+            if not grid_chunks:
                 mask_parts.append(
                     torch.ones(q_len * kv_len, dtype=torch.uint8, device=device)
                 )
                 continue
 
             need_mask = True
-            grid_thw_t = torch.as_tensor(grid_thw, dtype=torch.long)
-            if grid_thw_t.ndim == 1:
-                grid_thw_t = grid_thw_t.unsqueeze(0)
+            grid_thw_t = torch.cat(grid_chunks, dim=0)
 
             # Build frame_ranges: each frame's [start, end) in the encoder
             # token sequence (vision tokens + separator per frame).
@@ -1582,7 +1640,10 @@ class MossVLForConditionalGeneration(nn.Module):
                 # visible_frame_counts[-1], so shrink the tensor to that single
                 # element and drop the rest. .clone() detaches the view from
                 # the original storage so the large tensor can be freed.
-                if text_offset + extend_seq_len >= visible_frame_counts.shape[0]:
+                if (
+                    not mm_input.incremental_encoder_cache
+                    and text_offset + extend_seq_len >= visible_frame_counts.shape[0]
+                ):
                     mm_input.visible_frame_counts = visible_frame_counts[-1:].clone()
 
                 offset += extend_seq_len

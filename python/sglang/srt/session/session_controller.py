@@ -323,6 +323,8 @@ class Session:
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
+            if self.streaming:
+                new_req.session = None
         elif self.streaming:
             self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
