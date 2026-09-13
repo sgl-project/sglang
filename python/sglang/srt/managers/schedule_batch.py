@@ -1885,6 +1885,38 @@ class Req(ReqDllmMixin):
         return req_to_token_pool.mamba_pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        if self.kv.holds_mamba and isinstance(req_to_token_pool, HybridReqToTokenPool):
+            pool = req_to_token_pool.mamba_pool
+            write_pos = getattr(pool, "replayssm_spec_write_pos", None)
+            if write_pos is not None and write_pos[self.kv.req_pool_idx].item():
+                from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+                    commit_gdn_replayssm_circular,
+                )
+
+                # CPU backup carries the checkpoint, not request-keyed replay
+                # history, so fold its committed updates before freeing the row.
+                state = pool.mamba_cache
+                replay_indices = torch.tensor(
+                    [self.kv.req_pool_idx], dtype=torch.int64, device=write_pos.device
+                )
+                pool.replayssm_is_flush[replay_indices] = 1
+                commit_gdn_replayssm_circular(
+                    checkpoint_state=state.temporal,
+                    d_cache=state.replayssm_d,
+                    k_cache=state.replayssm_k,
+                    g_cache=state.replayssm_g,
+                    d_residual_cache=state.replayssm_rawv,
+                    k_residual_cache=state.replayssm_rawk,
+                    state_batch_indices=self.kv.mamba_pool_idx.reshape(1),
+                    replay_indices=replay_indices,
+                    write_pos=write_pos,
+                    cache_base=pool.replayssm_cache_base,
+                    is_flush=pool.replayssm_is_flush,
+                    # The cursor includes accepted tokens; tracking is disabled.
+                    accept_lens=torch.zeros_like(replay_indices, dtype=torch.int32),
+                    null_block_id=-1,
+                )
+
         token_indices = req_to_token_pool.req_to_token[
             self.kv.req_pool_idx, : self.seqlen - 1
         ]
