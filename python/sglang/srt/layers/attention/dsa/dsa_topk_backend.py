@@ -246,6 +246,23 @@ def _topk_unfused(
     if batch_size == 0 or topk == 0 or max_score_len == 0:
         return topk_indices
 
+    # Keep torch.topk's temporary score/index work bounded on very wide ragged
+    # batches. Without this, a 32K-row prefill can ask for several GiB of scratch
+    # even when only a few hundred MiB of final output is needed.
+    if batch_size > 4096:
+        chunk_size = 4096
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            topk_indices[start:end] = _topk_unfused(
+                score[start:end],
+                lengths[start:end],
+                topk,
+                row_starts[start:end] if row_starts is not None else None,
+                topk_op,
+                topk_op_kwargs,
+            )
+        return topk_indices
+
     if row_starts is None:
         row_starts = torch.zeros_like(lengths, dtype=torch.int32, device=score.device)
     else:

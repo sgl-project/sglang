@@ -12,6 +12,7 @@ register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -21,6 +22,7 @@ try:
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
+        scatter_mamba_states_after_mtp_verify,
     )
 
     _FUSED_IMPORT_ERROR = None
@@ -29,6 +31,7 @@ except Exception as e:  # pragma: no cover
     fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
+    scatter_mamba_states_after_mtp_verify = None
     _FUSED_IMPORT_ERROR = e
 
 from sglang.srt.mem_cache.layout.page_major import (
@@ -459,6 +462,61 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
 
     def test_multi_type_with_track_set(self):
         self._run(num_types=2, n2=4)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+class TestNegativeTrackDestinationScatter(CustomTestCase):
+    def _assert_negative_destination_is_inert(self, graph_mode):
+        if scatter_mamba_states_after_mtp_verify is None:
+            self.skipTest(
+                f"scatter_mamba_states_after_mtp_verify import failed: {_FUSED_IMPORT_ERROR}"
+            )
+        device = "cuda"
+        layers, slots = 1, 8
+        batch, steps = 2, 4
+        src_ssm = torch.arange(
+            layers * batch * steps * 4, dtype=torch.float32, device=device
+        ).reshape(layers, batch, steps, 4)
+        ssm = torch.full((layers, slots, 4), -9.0, device=device)
+        caches = SimpleNamespace(
+            temporal=ssm,
+            intermediate_ssm=src_ssm,
+            conv=[],
+            intermediate_conv_window=[],
+        )
+        state_indices = torch.tensor([3], dtype=torch.int32, device=device)
+        last_correct_step = torch.tensor([1], dtype=torch.int32, device=device)
+        track_indices = torch.tensor([-1, 3], dtype=torch.int32, device=device)
+        track_steps = torch.tensor([1, 1], dtype=torch.int32, device=device)
+
+        def run():
+            scatter_mamba_states_after_mtp_verify(
+                caches,
+                state_indices,
+                last_correct_step,
+                track_indices,
+                track_steps,
+            )
+
+        def verify():
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ssm[0, 0], torch.full((4,), -9.0, device=device))
+            torch.testing.assert_close(ssm[0, 3], src_ssm[0, 1, 1])
+
+        run()
+        verify()
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            graph.replay()
+            verify()
+
+    def test_negative_destination_is_inert(self):
+        self._assert_negative_destination_is_inert(graph_mode=False)
+
+    def test_negative_destination_is_inert_graph(self):
+        self._assert_negative_destination_is_inert(graph_mode=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

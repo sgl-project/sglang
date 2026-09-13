@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -1240,6 +1240,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        if is_hip() and not (
+            is_gfx95_supported()
+            and 1 <= batch_size <= 16
+            and draft_token_num in (6, 8)
+            and layer.num_q_heads == layer.num_v_heads == 16
+            and layer.head_k_dim == layer.head_v_dim == 128
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.conv_weights.dtype == torch.float32
+            and layer.bias is None
+            and layer.lower_bound == -5.0
+        ):
+            # Measured GLM TP4 wins only: larger gfx950 batches lose the
+            # launch saving to duplicated convolution work. Keep the
+            # reference path for them and for unmeasured ROCm shapes.
+            return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
             + layer.num_v_heads * layer.head_v_dim

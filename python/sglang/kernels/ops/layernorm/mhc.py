@@ -18,7 +18,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
@@ -1835,7 +1836,23 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    if is_hip() and is_gfx95_supported() and envs.SGLANG_USE_AITER.get():
+        from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+
+        post_mix, comb_mix, layer_input = aiter_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
+    if is_hip() or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1874,7 +1891,13 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    if is_hip() and is_gfx95_supported() and envs.SGLANG_USE_AITER.get():
+        from aiter.ops.mhc import mhc_post as aiter_mhc_post
+
+        out = torch.empty_like(residual)
+        aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
+        return out
+    if is_hip() or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 

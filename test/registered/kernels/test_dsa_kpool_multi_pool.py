@@ -1,4 +1,4 @@
-"""CUDA regressions for DSA kpool speculative writes spanning multiple pools."""
+"""GPU regressions for DSA kpool speculative writes spanning multiple pools."""
 
 import unittest
 from types import SimpleNamespace
@@ -10,15 +10,18 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     kpool_assemble_softmax_rotate_write_cache,
     kpool_max_closed_pools,
     kpool_write_tail_and_maybe_compress,
-    update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     _alloc_kpool_write_plan_buffers,
+    update_kpool_write_plan,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: the serving write-plan dispatcher must run on HIP too.
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires CUDA")
@@ -69,20 +72,20 @@ class TestDsaKpoolMultiPool(CustomTestCase):
         real_page_table[num_draft_tokens:, 0] = 5
         real_page_table[num_draft_tokens:, 4] = 6
 
-        update_kpool_write_plan_cuda_graph(
-            write_start=write_start,
-            req_pool_indices=req_pool_indices,
-            real_page_table=real_page_table,
-            req_out=plan.req,
-            write_start_out=plan.write_start,
-            tail_logical_start_out=plan.tail_logical_start,
-            write_loc_out=plan.write_loc,
-            pool_seqlens_per_q_out=plan.pool_seqlens_per_q,
-            seqlens_per_q_out=plan.seqlens_per_q,
-            pool_size=self.POOL_SIZE,
-            num_draft_tokens=num_draft_tokens,
-            slots_per_page=self.SLOTS_PER_PAGE,
-        )
+        def update_plan():
+            update_kpool_write_plan(
+                SimpleNamespace(kpool_write_plan=plan),
+                write_start=write_start,
+                req_pool_indices=req_pool_indices,
+                real_page_table=real_page_table,
+                pool_size=self.POOL_SIZE,
+                real_page_size=self.PAGE_SIZE,
+                num_draft_tokens=num_draft_tokens,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                slots_per_page=self.SLOTS_PER_PAGE,
+            )
+
+        update_plan()
 
         torch.testing.assert_close(plan.req, req_pool_indices)
         torch.testing.assert_close(plan.write_start, write_start)
@@ -104,6 +107,23 @@ class TestDsaKpoolMultiPool(CustomTestCase):
                 device="cuda",
             ),
         )
+
+        # Capture the same production dispatcher, then change inputs without
+        # recapture. A platform early-return must not leave a valid-looking zero plan.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            update_plan()
+        req_pool_indices.add_(1)
+        write_start.add_(4)
+        graph.replay()
+        torch.testing.assert_close(plan.req, req_pool_indices)
+        torch.testing.assert_close(plan.write_start, write_start)
+        expected_seq_lens = (
+            write_start[:, None]
+            + torch.arange(1, num_draft_tokens + 1, dtype=torch.int32, device="cuda")
+        ).flatten()
+        torch.testing.assert_close(plan.seqlens_per_q, expected_seq_lens)
+        torch.testing.assert_close(plan.pool_seqlens_per_q, expected_seq_lens // 4)
 
     def _run_compress_case(self, effective_n: int, expected_closed_pools: int):
         torch.manual_seed(42)

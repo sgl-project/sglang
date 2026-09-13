@@ -52,7 +52,8 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_flydsl.__path__ = []
     fake_moe_common = ModuleType("aiter.ops.flydsl.moe_common")
     fake_moe_common.GateMode = SimpleNamespace(
-        INTERLEAVE=SimpleNamespace(value="INTERLEAVE")
+        INTERLEAVE=SimpleNamespace(value="INTERLEAVE"),
+        SEPARATED=SimpleNamespace(value="SEPARATED"),
     )
 
     monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
@@ -113,6 +114,34 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+@pytest.mark.parametrize("gate_mode", [None, "INTERLEAVE", "SEPARATED"])
+@pytest.mark.parametrize("limit", [0.0, 10.0])
+def test_aiter_runner_preserves_clamp_and_explicit_gate_layout(
+    monkeypatch, gate_mode, limit
+):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setenv("SGLANG_USE_AITER_MOE_GU_ITLV", "true")
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    extra = {"gate_mode": gate_mode} if gate_mode is not None else None
+    quant = _quant_info(swiglu_limit=limit, fused_moe_kwargs=extra)
+
+    runner.run(_runner_input(), quant, running_state={})
+
+    if limit > 0:
+        assert captured["swiglu_limit"] == limit
+        assert captured["gate_mode"] == (gate_mode or "INTERLEAVE")
+    else:
+        assert "swiglu_limit" not in captured
+        assert captured.get("gate_mode") == gate_mode
+    assert quant.fused_moe_kwargs == extra
 
 
 if __name__ == "__main__":

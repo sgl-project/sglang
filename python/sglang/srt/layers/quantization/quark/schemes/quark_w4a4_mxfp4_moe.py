@@ -920,12 +920,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
+        swiglu_limit = self.moe_runner_config.swiglu_limit or 0.0
         if _is_gfx1250:
             from aiter.ops.flydsl.moe_common import GateMode
 
-            _fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
+            fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
+        elif swiglu_limit > 0:
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            # The gfx950 tile shuffle preserves separate gate/up row ranges.
+            fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
         else:
-            _fused_moe_kwargs = None
+            fused_moe_kwargs = None
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
@@ -934,6 +940,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
-            fused_moe_kwargs=_fused_moe_kwargs,
+            fused_moe_kwargs=fused_moe_kwargs,
+            swiglu_limit=swiglu_limit,
         )
         return self.runner.run(dispatch_output, quant_info)

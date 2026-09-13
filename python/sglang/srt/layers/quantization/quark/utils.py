@@ -51,14 +51,18 @@ def should_ignore_layer(
     if layer_name is None:
         return False
 
+    # Checkpoints can already fuse QKV and exclude the fused name directly.
+    # Preserve that declaration before expanding names for unfused checkpoints.
+    ignore = tuple(ignore)
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
-    # Fused layers like gate_up_proj or qkv_proj will not be fused
-    # in the safetensors checkpoint. So, we convert the name
-    # from the fused version to unfused + check to make sure that
-    # each shard of the fused layer has the same scheme.
+    # For unfused checkpoints, check that each shard of a fused layer has
+    # the same scheme.
     if proj_name in fused_mapping:
         shard_proj_names = fused_mapping[proj_name]
 

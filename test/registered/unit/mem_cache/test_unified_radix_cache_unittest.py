@@ -7772,6 +7772,66 @@ class TestMambaCheckpointGrid(CustomTestCase):
         )
 
 
+class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
+    """A donated state must have consumed exactly the prefix its key names."""
+
+    _rid = 0
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _build_req(self, allocator, pool, previous_track_seqlen):
+        tokens = list(range(12))
+        req = UnifiedRadixCacheSuite._make_req(self, pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.extra_key = None
+        req.swa_uuid_for_lock = None
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_prev_track_seqlen = previous_track_seqlen
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)
+        indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(indices)
+        pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+        return req, tokens
+
+    def test_previous_checkpoint_or_no_donation(self):
+        for previous_len, expected_len in ((8, 8), (None, 0), (12, 0)):
+            with self.subTest(previous_len=previous_len):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                req, tokens = self._build_req(allocator, pool, previous_len)
+                previous_slot = req.kv.mamba_ping_pong_track_buffer[
+                    req.kv.mamba_next_track_idx
+                ].clone()
+                req.last_node = cache.root_node_handle()
+                cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=11)
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(match.device_indices), expected_len)
+                if expected_len:
+                    node = cache.resolve_node_handle(match.last_device_node)
+                    self.assertTrue(
+                        torch.equal(
+                            node.component_data[ComponentType.MAMBA].value.reshape(-1),
+                            previous_slot.reshape(-1),
+                        )
+                    )
+                else:
+                    self.assertIsNone(req.kv.mamba_pool_idx)
+                cache.sanity_check()
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.MAMBA),
