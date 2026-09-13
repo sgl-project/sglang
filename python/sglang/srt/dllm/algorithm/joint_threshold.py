@@ -7,8 +7,9 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
@@ -120,10 +121,12 @@ class JointThreshold(DllmAlgorithm):
             "max_post_edit_steps", 16
         )
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
-        # NPU defaults to the batched (vectorized) path; other platforms keep the
-        # upstream per-row path unless explicitly overridden via algorithm_config.
+        # CUDA and NPU use the batched path for every batch size. This removes
+        # per-request host synchronizations and keeps one execution path across
+        # synchronous and FDFO decoding. Other platforms retain the per-row
+        # default until they are benchmarked.
         self.vectorized_decoding = config.algorithm_config.get(
-            "vectorized_decoding", _is_npu
+            "vectorized_decoding", _is_cuda or _is_npu
         )
         # The sync loop advances one shared batched state in place across steps;
         # FDFO must carry state per request, so it gathers/scatters each round.
