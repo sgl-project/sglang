@@ -1521,9 +1521,9 @@ def get_generate_fn(
             size=sampling_params.output_size,
             seconds=video_seconds,
             extra_body={
-                "reference_url": sampling_params.image_path,
                 "fps": sampling_params.fps,
                 "num_frames": sampling_params.num_frames,
+                **extra_body,
             },
         )
 
