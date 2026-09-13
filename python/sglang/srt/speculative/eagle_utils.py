@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_SPEC_MATCH_SAMPLE = get_bool_env_var("SGLANG_SPEC_MATCH_SAMPLE") and _is_hip
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
@@ -372,6 +374,28 @@ def verify_tree_greedy_triton(
         num_speculative_tokens=num_speculative_tokens,
         num_draft_tokens=num_draft_tokens,
     )
+
+
+def select_target_predict(
+    next_token_logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+) -> torch.Tensor:
+    if not _SPEC_MATCH_SAMPLE or sampling_info.is_all_greedy:
+        return torch.argmax(next_token_logits, dim=-1)
+
+    if sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling:
+        logger.warning_once(
+            "SGLANG_SPEC_MATCH_SAMPLE: top_p/top_k truncation has no ROCm kernel; "
+            "falling back to greedy verify."
+        )
+        return torch.argmax(next_token_logits, dim=-1)
+
+    temperatures = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    return torch.multinomial(probs, num_samples=1).flatten()
 
 
 def verify_tree_greedy_func(
@@ -782,7 +806,9 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        target_predict = select_target_predict(
+            next_token_logits, sampling_info, verify_input.draft_token_num
+        )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
