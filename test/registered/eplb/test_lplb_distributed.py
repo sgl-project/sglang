@@ -212,6 +212,13 @@ def _worker_main(local_rank: int, world_size: int):
     set_global_server_args_for_scheduler(
         ServerArgs(
             model_path="dummy",
+            # Match the tp/ep width initialize_model_parallel is about to
+            # build below -- get_parallel()'s derived widths (attn_tp_size,
+            # moe_ep_size, ...) are projected from this at publish time, and
+            # nothing here should leave that projection reflecting a width
+            # this process never actually runs at.
+            tp_size=world_size,
+            ep_size=world_size,
         )
     )
 

@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     should_report_expert_balancedness,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -29,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
-    validate_prefill_cp_platform(server_args)
+    # Through the registry, not a bare call: an out-of-tree replacement of
+    # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
+    # position must also win here, or a package permitting prefill CP on its
+    # own qualified HIP/NPU/MUSA build would still hit the original rejection
+    # at this later, nested call.
+    run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
