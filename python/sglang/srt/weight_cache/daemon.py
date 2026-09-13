@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import dataclasses
+import datetime
 import logging
 import multiprocessing
 import os
@@ -49,6 +50,7 @@ import torch.distributed as dist
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -648,7 +650,31 @@ def run_weight_cache_daemon(
     )
 
     daemon.load()
+    # Clients discover the daemon by its socket, so synchronize before serve() binds it.
+    _await_cluster_ready_to_serve(
+        timeout=resolving_view(server_args).weight_cache_timeout
+    )
     daemon.serve()
+
+
+def _await_cluster_ready_to_serve(timeout: int) -> None:
+    if timeout <= 0:
+        # timedelta(0) is torch's wait-forever sentinel.
+        raise ValueError(f"--weight-cache-timeout must be positive, got {timeout}")
+
+    # Use the CPU group and an async barrier so weight_cache_timeout bounds the wait.
+    try:
+        work = dist.barrier(group=get_world_group().cpu_group, async_op=True)
+        if work.wait(datetime.timedelta(seconds=timeout)):
+            return
+    except RuntimeError:
+        pass
+    logger.error(
+        "[weight_cache] cluster readiness barrier failed before all daemon "
+        "ranks were ready; exiting without serving."
+    )
+    # Process-group teardown can block after a failed collective.
+    os._exit(1)
 
 
 def spawn_weight_cache_daemon(

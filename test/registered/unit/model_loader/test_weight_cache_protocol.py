@@ -20,12 +20,15 @@ in any of these branches before it reaches the expensive GPU path.
 import os
 import socket
 import struct
+import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.weight_cache import daemon
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
@@ -50,7 +53,7 @@ from sglang.srt.weight_cache.transport import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -345,6 +348,187 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
             fake_context.kwargs["args"],
             (server_args, 3, 3, 0, "tcp://127.0.0.1:29500"),
         )
+
+
+class TestClusterReadyToServeGate(CustomTestCase):
+    """Serving is gated on every rank in the world group being ready to serve."""
+
+    def _gate(self, *, wait=None, timeout=30, barrier=None):
+        work = mock.Mock()
+        work.wait = wait or mock.Mock(return_value=True)
+        barrier = barrier or mock.Mock(return_value=work)
+        with (
+            mock.patch.object(daemon, "get_world_group", return_value=mock.Mock()),
+            mock.patch.object(daemon.dist, "barrier", barrier),
+            mock.patch("os._exit") as exit_,
+        ):
+            daemon._await_cluster_ready_to_serve(timeout=timeout)
+        return exit_
+
+    def test_failed_collective_stops_the_rank(self):
+        # torch reports a failed collective by raising or by returning False.
+        for wait in (
+            mock.Mock(side_effect=RuntimeError("collective failed")),
+            mock.Mock(return_value=False),
+        ):
+            with self.subTest(wait=wait):
+                self._gate(wait=wait).assert_called_once_with(1)
+
+    def test_a_collective_that_fails_on_submission_stops_the_rank(self):
+        # dist.barrier submits the collective before returning the handle, so a
+        # backend failure can surface there rather than from wait().
+        self._gate(
+            barrier=mock.Mock(side_effect=RuntimeError("submit failed"))
+        ).assert_called_once_with(1)
+
+    def test_cleared_gate_does_not_stop_the_rank(self):
+        self._gate().assert_not_called()
+
+    def test_non_positive_bound_is_rejected(self):
+        # timedelta(0) is torch's wait-forever sentinel.
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                self._gate(timeout=timeout)
+
+    def test_gate_waits_on_the_world_group_asynchronously(self):
+        from datetime import timedelta
+
+        world_group = mock.Mock()
+        with (
+            mock.patch.object(daemon, "get_world_group", return_value=world_group),
+            mock.patch.object(daemon.dist, "barrier") as barrier,
+        ):
+            daemon._await_cluster_ready_to_serve(timeout=30)
+        barrier.assert_called_once_with(group=world_group.cpu_group, async_op=True)
+        barrier.return_value.wait.assert_called_once_with(timedelta(seconds=30))
+
+    def test_rank_serves_only_after_the_gate(self):
+        calls = []
+        fake = mock.Mock()
+        fake.load.side_effect = lambda: calls.append("load")
+        fake.serve.side_effect = lambda: calls.append("serve")
+        with (
+            mock.patch.object(daemon, "WeightCacheDaemon", return_value=fake),
+            mock.patch.object(
+                daemon,
+                "resolving_view",
+                return_value=mock.Mock(weight_cache_timeout=30),
+            ),
+            mock.patch.object(
+                daemon,
+                "_await_cluster_ready_to_serve",
+                side_effect=lambda timeout: calls.append("gate"),
+            ),
+            mock.patch("sglang.srt.utils.kill_itself_when_parent_died"),
+        ):
+            daemon.run_weight_cache_daemon(
+                server_args=mock.Mock(),
+                gpu_id=0,
+                tp_rank=0,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29500",
+            )
+        self.assertEqual(calls, ["load", "gate", "serve"])
+
+
+def _gate_worker(rank, port, out):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from sglang.srt.weight_cache import daemon
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    cpu_group = dist.new_group(
+        ranks=[0, 1], backend="gloo", timeout=timedelta(seconds=60)
+    )
+
+    real_barrier = daemon.dist.barrier
+    entered = os.path.join(out, f"r{rank}_entered")
+
+    class _ObservedWork:
+        def __init__(self, work):
+            self._work = work
+
+        def wait(self, *args, **kwargs):
+            open(entered, "w").close()
+            return self._work.wait(*args, **kwargs)
+
+    def observed_barrier(*args, **kwargs):
+        return _ObservedWork(real_barrier(*args, **kwargs))
+
+    if rank == 1:
+        open(os.path.join(out, "r1_held"), "w").close()
+        deadline = time.monotonic() + 60
+        while not os.path.exists(os.path.join(out, "release")):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Peer was not released")
+            time.sleep(0.05)
+    with (
+        mock.patch.object(
+            daemon, "get_world_group", return_value=SimpleNamespace(cpu_group=cpu_group)
+        ),
+        mock.patch.object(daemon.dist, "barrier", observed_barrier),
+    ):
+        daemon._await_cluster_ready_to_serve(timeout=60)
+    assert os.path.exists(os.path.join(out, "release")), "Gate returned before release"
+    open(os.path.join(out, f"r{rank}_served"), "w").close()
+    os._exit(0)
+
+
+class TestClusterGateBlocksOverGloo(CustomTestCase):
+    """A rank cannot clear the readiness gate before its peer arrives."""
+
+    def test_a_rank_does_not_leave_the_gate_until_its_peer_arrives(self):
+        import multiprocessing
+        import tempfile
+
+        def wait_for(path, limit=60.0):
+            deadline = time.monotonic() + limit
+            while time.monotonic() < deadline:
+                if os.path.exists(path):
+                    return True
+                time.sleep(0.05)
+            return False
+
+        with tempfile.TemporaryDirectory() as out:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            ctx = multiprocessing.get_context("spawn")
+            procs = [
+                ctx.Process(target=_gate_worker, args=(rank, port, out))
+                for rank in range(2)
+            ]
+            try:
+                for proc in procs:
+                    proc.start()
+                # Observe the production wait while its required peer is held.
+                self.assertTrue(wait_for(os.path.join(out, "r1_held")))
+                self.assertTrue(wait_for(os.path.join(out, "r0_entered")))
+                self.assertFalse(os.path.exists(os.path.join(out, "r1_entered")))
+                self.assertEqual(
+                    [f for f in os.listdir(out) if f.endswith("_served")], []
+                )
+
+                open(os.path.join(out, "release"), "w").close()
+                for proc in procs:
+                    proc.join(timeout=120)
+                    self.assertEqual(proc.exitcode, 0)
+                self.assertEqual(
+                    sorted(f for f in os.listdir(out) if f.endswith("_served")),
+                    ["r0_served", "r1_served"],
+                )
+            finally:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.kill()
+                    if proc.pid is not None:
+                        proc.join(timeout=5)
+                        self.assertFalse(proc.is_alive())
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
