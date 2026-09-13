@@ -1,4 +1,4 @@
-# Modified for SGLang; see this directory's README.md for upstream source.
+# Modified for SGLang; see the SenseNova-U1 vendored model README.md for upstream source.
 
 import copy
 

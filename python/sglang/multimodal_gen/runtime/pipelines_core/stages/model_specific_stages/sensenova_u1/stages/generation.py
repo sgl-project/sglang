@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.configs.sensenova_u1 import (
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,

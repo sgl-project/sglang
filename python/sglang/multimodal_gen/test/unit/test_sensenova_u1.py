@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -11,10 +15,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SENSENOVA_U1_REQUEST_EXTRA_KEY,
     SenseNovaU1SamplingParams,
 )
-from sglang.multimodal_gen.configs.sensenova_u1 import (
-    SENSENOVA_U1_REQUEST_EXTRA_KEY,
+from sglang.multimodal_gen.configs.transformers.configuration_neo_vit import (
+    NEOVisionConfig,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -26,15 +31,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
-    NEOVisionConfig,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation import (
-    get_conv_template,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_chat import (
     _randn_with_seed,
 )
+from sglang.multimodal_gen.runtime.parser.conversation import get_conv_template
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -849,3 +849,73 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_pipeline_import_does_not_load_models():
+    # Earlier tests import model code, so check discovery in a fresh process.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                from sglang.multimodal_gen.runtime.pipelines import sensenova_u1
+                from sglang.multimodal_gen.runtime.models.sensenova_u1 import register
+                from sglang.multimodal_gen.configs.sensenova_u1 import DEFAULT_CFG_NORM
+                from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+                prefix = "sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_"
+                assert not any(name.startswith(prefix) for name in sys.modules)
+                assert "neo_chat" not in CONFIG_MAPPING
+                assert "neo_vision" not in CONFIG_MAPPING
+                from sglang.multimodal_gen.runtime.models.sensenova_u1 import NEOChatModel
+                from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_chat import (
+                    NEOChatModel as implementation,
+                )
+                assert NEOChatModel is implementation
+                """
+            ),
+        ],
+        check=True,
+        timeout=60,
+    )
+
+
+def test_sensenova_u1_load_registers_before_loading(monkeypatch):
+    from sglang.multimodal_gen.runtime.models import sensenova_u1
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        AutoTokenizer,
+        SenseNovaU1Pipeline,
+    )
+
+    register = Mock()
+    monkeypatch.setattr(sensenova_u1, "register", register)
+
+    def stop_at_checkpoint_load(*args, **kwargs):
+        register.assert_called_once_with()
+        raise RuntimeError("checkpoint loading reached")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", stop_at_checkpoint_load)
+    pipeline = SimpleNamespace(model_path="test-checkpoint")
+    args = SimpleNamespace(
+        num_gpus=1,
+        pipeline_config=SimpleNamespace(model_precision="bf16"),
+        trust_remote_code=False,
+        revision=None,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint loading reached"):
+        SenseNovaU1Pipeline.load_modules(pipeline, args)
+
+
+def test_sensenova_u1_legacy_config_and_seed_imports():
+    from sglang.multimodal_gen.configs.sensenova_u1 import (
+        DEFAULT_CFG_NORM,
+        is_sensenova_u1_model,
+    )
+    from sglang.multimodal_gen.registry import is_sensenova_u1_model as detector
+    from sglang.multimodal_gen.runtime.entrypoints.utils import normalize_output_seeds
+
+    assert DEFAULT_CFG_NORM == "none"
+    assert is_sensenova_u1_model is detector
+    assert normalize_output_seeds(10, num_outputs_per_prompt=2) == [10, 11]

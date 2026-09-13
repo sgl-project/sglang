@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.srt.observability.trace import TraceReqContext
 
 
-def normalize_output_seeds(
+def _normalize_output_seeds(
     seed: int | list[int],
     *,
     num_outputs_per_prompt: int,
@@ -79,7 +79,7 @@ def expand_request_outputs(
     context because the executor owns only the parent request trace lifecycle.
     """
     num_outputs = int(req.num_outputs_per_prompt)
-    seeds = normalize_output_seeds(
+    seeds = _normalize_output_seeds(
         req.seed,
         num_outputs_per_prompt=num_outputs,
         num_prompts=num_prompts,
