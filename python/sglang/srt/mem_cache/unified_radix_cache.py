@@ -903,6 +903,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
+            if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, page_aligned_len - 1, insert_params
+                    )
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
             insert_params.key = radix_key
