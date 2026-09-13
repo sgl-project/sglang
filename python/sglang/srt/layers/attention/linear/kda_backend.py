@@ -7,6 +7,7 @@ from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aite
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_varlen,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
@@ -35,12 +36,7 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_exec,
-    get_memory,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_spec
 
 
 class KDAKernelDispatcher:
@@ -363,29 +359,6 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
-
-
-def ragged_verify_dense_scatter_indices(
-    *,
-    query_start_loc: torch.Tensor,
-    seq_len: int,
-    draft_token_num: int,
-) -> torch.Tensor:
-    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
-
-    Rows never exceed draft_token_num under either layout variant (cap for
-    graph replay, planner construction for eager -- see
-    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
-    tokens past the layout's coverage collapse into one ghost row at index
-    bs * draft_token_num.
-    """
-    batch_size = query_start_loc.shape[0] - 1
-    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
-    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
-    return (
-        token_slots * draft_token_num
-        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
-    ).clamp_(max=batch_size * draft_token_num)
 
 
 class KDAAttnBackend(MambaAttnBackendBase):
@@ -1024,6 +997,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
+        use_varlen_conv = (
+            ragged_layout is not None
+            and is_cuda()
+            and retrieve_next_token is None
+            and retrieve_next_sibling is None
+            and retrieve_parent_token is None
+        )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
@@ -1080,6 +1060,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 )
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+        elif use_varlen_conv:
+            batch_size = query_start_loc.shape[0] - 1
+            dense_token_indices = None
+            mixed_qkv_dense = None
         else:
             # Conv update and its per-step scratch want the dense
             # [bs, draft_token_num] layout: scatter ragged tokens to their
@@ -1090,45 +1074,57 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # value-irrelevant).
             batch_size = query_start_loc.shape[0] - 1
             num_dense_tokens = batch_size * draft_token_num
-            dense_token_indices = ragged_verify_dense_scatter_indices(
-                query_start_loc=query_start_loc,
-                seq_len=seq_len,
-                draft_token_num=draft_token_num,
-            )
-            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+            dense_token_indices = fm.ragged_verify_dense_indices
+            assert dense_token_indices is not None
+            # Only real packed positions are gathered back and committed.
+            dense = mixed_qkv.new_empty(num_dense_tokens + 1, mixed_qkv.shape[-1])
             dense.index_copy_(0, dense_token_indices, mixed_qkv)
             mixed_qkv_dense = dense[:num_dense_tokens].view(
                 batch_size, draft_token_num, -1
             )
 
-        # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
-        # scratch because the deduplicated overlapping layout cannot be transposed.
-        mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
-        mixed_qkv_processed = causal_conv1d_update(
-            mixed_qkv_reshaped,
-            conv_states.transpose(-1, -2),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices[:batch_size],
-            intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
-            intermediate_state_indices=intermediate_state_indices[:batch_size],
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_parent_token=retrieve_parent_token,
-        )
-        mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
-            batch_size * draft_token_num, -1
-        )
-        if dense_token_indices is None:
-            mixed_qkv = mixed_qkv_flat
-        else:
-            # Ghost row (zeros) so uncovered tail tokens gather finite values.
-            padded_flat = mixed_qkv_flat.new_zeros(
-                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+        if use_varlen_conv:
+            mixed_qkv = causal_conv1d_update_varlen(
+                mixed_qkv,
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                query_start_loc=query_start_loc,
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache.transpose(
+                    -1, -2
+                ),
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                max_seqlen=draft_token_num,
             )
-            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
-            mixed_qkv = padded_flat[dense_token_indices]
+        else:
+            # causal_conv1d_update expects [.., dim, width].
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache.transpose(
+                    -1, -2
+                ),
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
+            )
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_flat
+            else:
+                gather_indices = fm.ragged_verify_dense_gather_indices
+                assert gather_indices is not None
+                mixed_qkv = mixed_qkv_flat[gather_indices]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
