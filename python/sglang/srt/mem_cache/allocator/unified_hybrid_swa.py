@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, TypeGuard
 
 import torch
 from torch.profiler import record_function
@@ -42,6 +42,16 @@ from sglang.srt.utils.common import get_num_new_pages
 logger = logging.getLogger(__name__)
 
 
+def supports_swa_byte_budget(
+    allocator: BaseTokenToKVPoolAllocator | None,
+) -> TypeGuard[UnifiedSWATokenToKVPoolAllocator]:
+    """Whether FULL/SWA demand can be checked against a two-pool byte budget."""
+    return (
+        isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        and allocator.supports_asymmetric_reservation
+    )
+
+
 class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools).
 
@@ -49,6 +59,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     `available_size()` (joint bytes, in TOKENS) is the only safe alloc pre-check.
     """
 
+    # Unequal FULL/SWA reservations share one byte budget. The tri-pool opts
+    # out because its Mamba state competes for those same bytes.
     supports_asymmetric_reservation = True
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
@@ -394,15 +406,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """
         if full_tokens < 0 or swa_tokens < 0:
             return False
-        if not self.supports_asymmetric_reservation:
-            if (
-                full_tokens != swa_tokens
-                or full_evictable_tokens
-                or swa_evictable_tokens
-                or empty_pool
-            ):
-                return False
-            return full_tokens <= self.available_size()
         if require_token_slack and (
             full_tokens >= self.size_full or swa_tokens >= self.size_swa
         ):
@@ -503,13 +506,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return False
         if full_tokens == 0 and swa_tokens == 0:
             return True
-        if not self.supports_asymmetric_reservation:
-            if full_tokens != swa_tokens:
-                return False
-            need_tokens = int(full_tokens)
-            if need_tokens <= self.available_size():
-                return True
-            return _relieve_for_alloc(self, need_tokens)
         page_size = self.page_size
         num_full_pages = (int(full_tokens) + page_size - 1) // page_size
         num_swa_pages = (int(swa_tokens) + page_size - 1) // page_size
@@ -1107,6 +1103,37 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         return
 
     # -- capacity --
+
+    def can_reserve(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+        require_token_slack: bool = False,
+    ) -> bool:
+        if (
+            full_tokens < 0
+            or swa_tokens < 0
+            or full_tokens != swa_tokens
+            or full_evictable_tokens
+            or swa_evictable_tokens
+            or empty_pool
+        ):
+            return False
+        return full_tokens <= self.available_size()
+
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        if full_tokens < 0 or swa_tokens < 0 or full_tokens != swa_tokens:
+            return False
+        if full_tokens == 0:
+            return True
+        need_tokens = int(full_tokens)
+        if need_tokens <= self.available_size():
+            return True
+        return _relieve_for_alloc(self, need_tokens)
 
     def _compute_available_size(self) -> int:
         """Joint TOKENS for `alloc(N)`: N costs N full pages AND N swa pages, drawn

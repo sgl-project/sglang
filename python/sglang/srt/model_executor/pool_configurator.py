@@ -781,6 +781,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )
 
+        return self._make_pool_config(full_tokens, swa_tokens)
+
+    def _make_pool_config(self, full_tokens: int, swa_tokens: int) -> MemoryPoolConfig:
         return MemoryPoolConfig(
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
@@ -907,16 +910,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 f"Reduce --max-running-requests, lower SGLANG_SWA_EVICTION_INTERVAL, "
                 f"or increase --mem-fraction-static."
             )
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=swa_tokens,
-            unified_memory_pool_bytes=(
-                self._unified_pool_bytes(full_tokens, swa_tokens)
-                if self._enable_unified_memory
-                else None
-            ),
-        )
+        return self._make_pool_config(full_tokens, swa_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
@@ -924,17 +918,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # Constrained max_total goes to the full pool; SWA stays at its cap.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         full_tokens = (max_total_num_tokens // page_size) * page_size
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=min(swa_tokens, max_total_num_tokens),
-            unified_memory_pool_bytes=(
-                self._unified_pool_bytes(
-                    full_tokens, min(swa_tokens, max_total_num_tokens)
-                )
-                if self._enable_unified_memory
-                else None
-            ),
+        return self._make_pool_config(
+            full_tokens, min(swa_tokens, max_total_num_tokens)
         )
 
 
