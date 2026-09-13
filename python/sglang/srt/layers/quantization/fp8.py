@@ -261,6 +261,7 @@ class Fp8Config(QuantizationConfig):
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        self.is_dsv4_fp4_experts = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -409,7 +410,14 @@ class Fp8Config(QuantizationConfig):
                 )
                 return fp8_method
 
-            if self.is_fp4_experts and is_npu_arch35():
+            if (
+                self.is_fp4_experts
+                and is_npu_arch35()
+                # NPUW4A4Fp4MoEMethod is DSV4-specific (deepep dispatch,
+                # swiglu_limit); other FP4-expert checkpoints fall through
+                # to Fp8MoEMethod.
+                and self.is_dsv4_fp4_experts
+            ):
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
                     NPUW4A4Fp4MoEMethod,
                 )
@@ -505,6 +513,15 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
+                # The A5 backend expects the ue8m0 weight layout installed by
+                # the arch35 load path; keep plain block-FP8 checkpoints on
+                # the generic triton backend.
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    triton_w8a8_block_fp8_linear,
+                )
+
+                self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -708,7 +725,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
-        elif _is_npu and is_npu_arch35():
+        elif _is_npu and is_npu_arch35() and self.quant_config.scale_fmt == "ue8m0":
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
@@ -1767,6 +1784,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if _is_npu:
+                    self._process_npu_fp4_expert_weights(layer)
+                    return
+
                 if get_moe_runner_backend().is_marlin():
                     layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
@@ -2454,6 +2475,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
+
+        # MXFP4 experts on NPU run through the ASCEND runner, which
+        # quantizes activations internally.
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUW4A8MXFP4MoEMethod,
+            )
+
+            layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+            layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            return
+
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -2505,6 +2540,53 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
         )
 
+    def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
+        """Convert HF MXFP4 experts to the NPU W4A8 kernel layout.
+
+        HF stores packed FP4 weights as int8 and block scales as float32; the
+        NPU kernel expects the weight in FRACTAL_NZ (transposed) and the scale
+        as e8m0 (uint8) reshaped to [E, K//64, N, 2].
+        """
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            _get_float4_e2m1fn_x2_dtype,
+        )
+        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+
+        for prefix in ("w13", "w2"):
+            weight = getattr(layer, f"{prefix}_weight")
+            weight.data = npu_format_cast(
+                weight.data.view(torch.uint8),
+                customize_dtype=torch.float8_e4m3fn,
+                input_dtype=fp4_dtype,
+            ).transpose(-1, -2)
+
+            # Two e8m0 storage conventions in the fp32 scales: (a) the value
+            # IS the e8m0 byte (int in 0..255, MiMo-V2.5-Pro); (b) the value
+            # is 2^(e-127) -> recover e from the exponent field. Never
+            # re-encode with round(log2)+127: it re-biases the exponent.
+            scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
+            scale = scale_inv.data.to(torch.float32)
+            s_flat = scale.detach().float().flatten()
+            is_int_like = bool(
+                torch.all(s_flat >= 0)
+                and torch.all(s_flat <= 255)
+                and torch.allclose(s_flat, s_flat.round())
+            )
+            if is_int_like:
+                e8m0 = scale.to(torch.uint8)
+            else:
+                e8m0 = (scale.view(torch.int32) >> 23 & 0xFF).to(torch.uint8)
+            scale_inv.data = e8m0.reshape(
+                scale.shape[0],
+                scale.shape[1],
+                scale.shape[2] // 2,
+                2,
+            ).transpose(1, 2)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2515,6 +2597,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
