@@ -228,7 +228,6 @@ class AscendQuantInfo(MoeQuantInfo):
     w2_weight_bias: Optional[torch.Tensor] = None
     w13_scale_bias: Optional[torch.Tensor] = None
     w2_scale_bias: Optional[torch.Tensor] = None
-    layer_id: int = 0
 
 
 # ---------------------------------------------------------------------------

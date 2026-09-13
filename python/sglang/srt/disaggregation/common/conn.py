@@ -1674,6 +1674,11 @@ class CommonKVSender(BaseKVSender):
         compute_event: Optional[object],
     ) -> None:
         """Build and submit one layer's RDMA write on the transfer stream."""
+        if self._layer_layout_cache is None:
+            self._layer_layout_cache = group_concurrent_contiguous(
+                self._layerwise_prefill_kv_indices,
+                self._layerwise_dst_kv_indices,
+            )
         for tinfo in list(room_infos.values()):
             if tinfo.is_dummy:
                 continue
@@ -1692,11 +1697,6 @@ class CommonKVSender(BaseKVSender):
                 src_ptr = mgr.kv_args.kv_data_ptrs[layer_id]
                 dst_ptr = decode_kv_args.dst_kv_ptrs[layer_id]
                 item_len = mgr.kv_args.kv_item_lens[layer_id]
-            if self._layer_layout_cache is None:
-                self._layer_layout_cache = group_concurrent_contiguous(
-                    self._layerwise_prefill_kv_indices,
-                    self._layerwise_dst_kv_indices,
-                )
             blocks = mgr.build_layer_transfer_blocks(
                 layer_id,
                 src_ptr,
@@ -1745,8 +1745,6 @@ class CommonKVSender(BaseKVSender):
         """Record a device event on the current compute stream so the
         transfer stream can wait for the KV write to land before issuing
         RDMA."""
-        if not hasattr(self.kv_mgr, "_layerwise_device"):
-            return None
         dev_mod = torch.get_device_module(self.kv_mgr._layerwise_device)
         event = dev_mod.Event()
         event.record()

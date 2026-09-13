@@ -5,7 +5,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import torch
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
@@ -283,12 +282,6 @@ class AscendKVManager(MooncakeKVManager):
 
 
 class AscendKVSender(MooncakeKVSender):
-    """Ascend KV sender.
-
-    Layerwise transfer methods are inherited from CommonKVSender (via
-    MooncakeKVSender → CommonKVSender).  This class is now a pass-through
-    that exists solely so the Ascend backend can be selected by name."""
-
     pass
 
 
