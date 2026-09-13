@@ -294,8 +294,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # that wide. Head split mirrors MiniMaxM3 sparse attention's.
         self._idx_group_size = 1
         if self.index_cache_enabled:
-            from sglang.srt.runtime_context import get_parallel
-
             _num_idx_heads = max(
                 sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size, 1
             )
