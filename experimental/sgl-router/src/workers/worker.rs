@@ -13,19 +13,19 @@ use std::time::Instant;
 /// Fixed for the worker's lifetime: it is derived by `manager::resolve_protocol`
 /// from the engine's `--enable-http2` launch flag and the dialed URL scheme,
 /// neither of which changes while the process runs. The asymmetry that drives
-/// the default: HTTP/1.1 is accepted by every engine, while h2c is
-/// prior-knowledge only and fails outright against an engine that does not
+/// the default: the negotiating client is accepted by every engine, while h2c
+/// is prior-knowledge only and fails outright against an engine that does not
 /// serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WireProtocol {
-    /// HTTP/1.1, in cleartext and over TLS alike. Safe for every engine, so it
-    /// is also the fallback.
+    /// The negotiating client. Safe for every engine, so it is also the
+    /// fallback.
     ///
-    /// Not ALPN-negotiated: `Cargo.toml` builds reqwest with
-    /// `default-features = false` and does not enable `http2`, so the
-    /// forwarding client advertises only `http/1.1` and a TLS engine running
-    /// `--enable-http2` still gets HTTP/1.1. Enabling that feature is what
-    /// would make this variant negotiate.
+    /// HTTP/1.1 in cleartext, ALPN-negotiated over TLS: this crate enables
+    /// reqwest's `http2` feature (see `Cargo.toml`), so the client advertises
+    /// `h2, http/1.1` and a TLS engine running `--enable-http2` reaches HTTP/2
+    /// on its own. Dropping that feature silently reduces this variant to
+    /// HTTP/1.1 everywhere.
     #[default]
     Http1,
     /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
