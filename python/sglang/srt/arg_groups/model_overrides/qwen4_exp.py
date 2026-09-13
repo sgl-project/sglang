@@ -28,8 +28,16 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     which MambaRadixCache allows only with mamba extra-buffer or --disable-radix-cache.
     """
     cfg = resolving_view(server_args)
-    if cfg.disaggregation_mode != "null":
-        raise ValueError("Qwen4-Exp does not support PD disaggregation yet")
+    if (
+        cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend == "mori"
+        and cfg.pp_size > 1
+    ):
+        raise ValueError(
+            "Qwen4-Exp PD with MORI requires --pp-size 1; MORI does not yet "
+            "exchange the global QSA layer metadata needed to pair compact "
+            "state descriptors across pipeline stages."
+        )
     if cfg.enable_unified_memory:
         raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
     overrides: Dict[str, Any] = {}
@@ -66,12 +74,11 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["page_size"] = 64 if sm100_default_attn_backend == "trtllm_mha" else 1
 
     from sglang.srt.layers.attention.qsa.config import (
-        QSA_VARIANT_COMPRESSED,
         parse_qsa_profile,
     )
 
     profile = parse_qsa_profile(hf_config)
-    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+    if profile is not None:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64

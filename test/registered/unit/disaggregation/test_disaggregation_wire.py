@@ -33,15 +33,23 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_transfer_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
     get_dsv4_c4_state_indices,
     get_dsv4_c128_state_indices,
+    get_qsa_pending_state_indices,
     setup_state_kv_args,
+    should_send_replicated_state,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.qsa_kv_pool import (
+    QSA_ROPE_STATE_LAYER_ID,
+    QSATokenToKVPool,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -186,6 +194,132 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
             self.assertEqual(
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
+            )
+
+
+class TestQwen4StateWire(unittest.TestCase):
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_qsa_registers_request_ring_and_page_state_separately(self):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = object()
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [2]
+        pool.page_size = 4
+        pool.qsa_compress_ratio = 2
+        pool.qsa_compressed_page_size = 2
+        pool.full_attention_layer_id_mapping = {24: 0}
+        pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
+        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = [
+            torch.zeros((6, 1, 8), dtype=torch.bfloat16)
+        ]
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(kv_args, pool)
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        # Pending entries are whole two-row request rings; compressed-K remains
+        # a two-row compressed page corresponding to one four-token KV page.
+        self.assertEqual(kv_args.state_item_lens[1:], [[32, 48], [32]])
+        self.assertEqual(
+            kv_args.state_layer_ids[1:],
+            [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
+        )
+
+    def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = object()
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [2]
+        pool.page_size = 4
+        pool.qsa_compress_ratio = 2
+        pool.qsa_compressed_page_size = 2
+        pool.full_attention_layer_id_mapping = {}
+        pool.qsa_key_state_buffer_pool = []
+        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = []
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(kv_args, pool)
+
+        # Keep the component slots aligned across PP stages, but expose no QSA
+        # buffers or layer ids from a stage that cannot produce their contents.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
+        self.assertEqual(kv_args.state_data_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_item_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
+
+    def test_compact_qsa_entries_map_by_global_layer_id(self):
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                [24, QSA_ROPE_STATE_LAYER_ID],
+                [0, 12, 24, QSA_ROPE_STATE_LAYER_ID],
+                2,
+                4,
+            ),
+            [(0, 2), (1, 3)],
+        )
+
+    def test_replicated_state_tp_policy(self):
+        for src_tp, dst_tp, rank, expected in (
+            (4, 1, 0, True),
+            (4, 1, 1, False),
+            (1, 4, 0, True),
+            (4, 4, 3, True),
+        ):
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, rank=rank):
+                self.assertEqual(
+                    should_send_replicated_state(
+                        src_attn_tp_size=src_tp,
+                        dst_attn_tp_size=dst_tp,
+                        local_tp_rank_in_group=rank,
+                    ),
+                    expected,
+                )
+
+        common = dict(
+            src_item_len=96,
+            dst_item_len=96,
+            src_dim=0,
+            dst_dim=0,
+            outer_count=1,
+            src_attn_tp_size=4,
+            dst_attn_tp_size=1,
+            dst_tp_rank_in_group=0,
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=0),
+            [(0, 0, 96)],
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=1),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            should_send_replicated_state(
+                src_attn_tp_size=3,
+                dst_attn_tp_size=2,
+                local_tp_rank_in_group=0,
             )
 
 

@@ -239,7 +239,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 req_weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
             )
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
         # Worst-case chunk segments for any replay batch: ceil(N / chunk_top)
         # (bounded by 16 for the small tiers) plus one per adapter group.
         chunk_top = self._determine_chunk_size_for_tokens(max_num_tokens)
@@ -247,8 +249,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             max((max_num_tokens + chunk_top - 1) // chunk_top, 16)
             + self.max_loras_per_batch
         )
-        # Each extend request has >= 1 token, so bs is bounded by the bucket.
-        max_bs = max_num_tokens
+        max_bs = max_num_tokens if max_num_requests is None else max_num_requests
         with torch.device(self.device):
             self.prefill_cuda_graph_batch_info = LoRABatchInfo(
                 bs=0,  # Set per batch
@@ -370,6 +371,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
+        if use_prefill_cuda_graph:
+            # Captured MoE kernels read every request slot; keep the tail empty.
+            batch_info.req_seg_indptr[bs + 1 :].fill_(int(req_seg_indptr_cpu[-1]))
+            batch_info.req_weight_indices[bs:].zero_()
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
 

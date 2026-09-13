@@ -135,6 +135,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -343,6 +344,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         bs = size
         buffers = self.buffers
