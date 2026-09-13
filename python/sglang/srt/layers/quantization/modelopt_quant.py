@@ -788,6 +788,12 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         return out.view(*index_shape, hidden).to(self.params_dtype)
 
 
+# FP8_PB_WO is ModelOpt's canonical 2D block-FP8 name.
+# Qwen3.8-Flash-Next-NVFP4 used FP8_BLOCK_SCALES for the same tensor layout.
+# Keep it as an alias.
+_BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -884,6 +890,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
+        # Block-FP8 layers carry their block size as group_size
+        # (default 128). One Fp8Config serves every such layer.
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 layers to "
+                f"use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+
         packed_modules_mapping = config.get("packed_modules_mapping")
         fp8_config = ModelOptFp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -894,7 +914,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         fp8_pb_wo_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
-            weight_block_size=[128, 128],
+            weight_block_size=[block_size, block_size],
             packed_modules_mapping=packed_modules_mapping,
         )
         mxfp8_config = Fp8Config(
@@ -1008,7 +1028,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "FP8_PB_WO":
+            if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1037,6 +1057,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo in _BLOCK_FP8_ALGOS:
+                return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":

@@ -22,7 +22,8 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -761,6 +762,55 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(method.quant_config.weight_block_size, [128, 128])
         self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
         self.assertEqual(method.quant_config.activation_scheme, "dynamic")
+
+    def _block_fp8_moe_method(self, algo, group_size=128):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": algo,
+                        "group_size": group_size,
+                    },
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+        # Type dispatch only needs a FusedMoE instance; skip GPU weight setup.
+        layer = FusedMoE.__new__(FusedMoE)
+        return quant_config.get_quant_method(layer, "mtp.layers.0.mlp.experts")
+
+    def test_block_fp8_moe_dispatches_under_both_algo_names(self):
+        for algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
+            with self.subTest(algo=algo):
+                method = self._block_fp8_moe_method(algo)
+                self.assertIsInstance(method, Fp8MoEMethod)
+                self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+                self.assertEqual(method.quant_config.activation_scheme, "dynamic")
+                self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+
+    def test_block_fp8_block_size_follows_checkpoint_group_size(self):
+        method = self._block_fp8_moe_method("FP8_BLOCK_SCALES", group_size=64)
+        self.assertEqual(method.quant_config.weight_block_size, [64, 64])
+
+    def test_block_fp8_conflicting_group_sizes_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "one group_size"):
+            ModelOptMixedPrecisionConfig.from_config(
+                {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "mtp.layers.0.mlp.experts": {
+                            "quant_algo": "FP8_BLOCK_SCALES",
+                            "group_size": 128,
+                        },
+                        "model.layers.0.self_attn.q_proj": {
+                            "quant_algo": "FP8_PB_WO",
+                            "group_size": 64,
+                        },
+                    },
+                    "packed_modules_mapping": {},
+                }
+            )
 
     def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
         packed_modules_mapping = {
