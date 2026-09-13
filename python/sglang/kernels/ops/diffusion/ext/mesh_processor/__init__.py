@@ -19,7 +19,7 @@ _abs_path = os.path.dirname(os.path.abspath(__file__))
 _mesh_processor_kernel = None
 
 
-def _load_mesh_processor():
+def load_mesh_processor():
     """JIT compile and load the mesh processor kernel."""
     global _mesh_processor_kernel
 
@@ -47,7 +47,7 @@ def meshVerticeInpaint(
     method: str = "smooth",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Inpaint texture using mesh vertex connectivity."""
-    kernel = _load_mesh_processor()
+    kernel = load_mesh_processor()
 
     texture = np.ascontiguousarray(texture, dtype=np.float32)
     mask = np.ascontiguousarray(mask, dtype=np.uint8)
@@ -61,4 +61,4 @@ def meshVerticeInpaint(
     )
 
 
-__all__ = ["meshVerticeInpaint"]
+__all__ = ["load_mesh_processor", "meshVerticeInpaint"]

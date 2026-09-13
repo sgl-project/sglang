@@ -715,6 +715,7 @@ _EXPORTS: dict[str, str] = {
     "interpolate": "ext.hunyuan3d_rasterizer",
     "rasterize": "ext.hunyuan3d_rasterizer",
     "meshVerticeInpaint": "ext.mesh_processor",
+    "load_mesh_processor": "ext.mesh_processor",
 }
 
 
