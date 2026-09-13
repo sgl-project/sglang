@@ -423,6 +423,48 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     return backend, forward_batch, pool
 
 
+@pytest.mark.parametrize("draft_window", [None, 0, 4])
+def test_qsa_speculative_row_bound_with_verify_window(draft_window):
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+        spec_info=SimpleNamespace(draft_token_num=draft_window),
+    )
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        batch, batch.seq_lens_cpu + (draft_window or 0)
+    ) == 16 + (draft_window or 0)
+
+
+def test_qsa_speculative_row_bound_for_draft_extend():
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    # prepare_for_draft_extend already includes the four draft slots in
+    # these CPU lengths. The bound must neither access a missing field nor
+    # add the draft window a second time.
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([12, 20], dtype=torch.int32),
+        spec_info=EagleDraftExtendInput(),
+    )
+    assert not hasattr(batch.spec_info, "draft_token_num")
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        batch, torch.tensor([9, 10, 11, 12, 17, 18, 19, 20], dtype=torch.int32)
+    ) == 20
+
+
+def test_qsa_speculative_row_bound_without_spec_info():
+    batch = SimpleNamespace(seq_lens_cpu=torch.tensor([0]), spec_info=None)
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        batch, torch.tensor([0])
+    ) == 1
+
+
+@pytest.mark.parametrize("cpu_lengths", [None, torch.empty(0, dtype=torch.int32)])
+def test_qsa_speculative_row_bound_without_cpu_lengths(cpu_lengths):
+    batch = SimpleNamespace(seq_lens_cpu=cpu_lengths, spec_info=SimpleNamespace())
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        batch, torch.tensor([12, 20], dtype=torch.int32)
+    ) == 20
+
+
 def test_qsa_cuda_graph_pads_dynamic_draft_extend_rows():
     row_lengths, row_req_pool_indices, row_prefix_lengths = (
         QwenSparseAttnBackend._graph_speculative_layout(
