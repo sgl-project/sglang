@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -584,13 +592,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_ready: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 
         ``params`` contains allocator shortfalls, not absolute eviction quotas.
         A component eviction can cascade to its peers; with a shared memory pool,
         those collateral frees can satisfy the original allocation before the
         triggering component's requested count is reached.
+
+        ``allocation_ready`` checks the entire pending allocation and may prepare
+        allocator-owned reclaim. Component targets retain the normal victim
+        policy; any remaining shared shortfall is walked to readiness/exhaustion.
         """
         if self.disable:
             return EvictResult()
@@ -617,7 +634,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa_num_tokens=params.swa_num_tokens,
                 mamba_num=mamba_id_shortfall,
             )
-        result = self._evict(initial_params, available_size_targets)
+        result = self._evict(
+            initial_params, available_size_targets, allocation_ready=allocation_ready
+        )
 
         if mamba_target is not None and mamba_full_donor is not None:
             mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
@@ -652,6 +671,24 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        if allocation_ready is not None and not allocation_ready():
+            # Initial shortfalls are not walk limits for a coupled allocation.
+            # Keep the ordinary victim policy first, then search remaining cache.
+            remaining = self._evict(
+                EvictParams(
+                    num_tokens=self.full_evictable_size(),
+                    swa_num_tokens=(
+                        self.swa_evictable_size() if self.supports_swa() else 0
+                    ),
+                    mamba_num=(
+                        self.mamba_evictable_size() if self.supports_mamba() else 0
+                    ),
+                ),
+                allocation_ready=allocation_ready,
+            )
+            result.num_tokens_evicted += remaining.num_tokens_evicted
+            result.swa_num_tokens_evicted += remaining.swa_num_tokens_evicted
+            result.mamba_num_evicted += remaining.mamba_num_evicted
         return result
 
     @staticmethod
@@ -685,6 +722,7 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        allocation_ready: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -696,6 +734,7 @@ class UnifiedRadixCache(BasePrefixCache):
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
+            allocation_ready=allocation_ready,
         )
 
         if (
@@ -788,6 +827,7 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        allocation_ready: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -797,6 +837,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def target_reached(component_type: ComponentType) -> bool:
             nonlocal last_mamba_donor_check, mamba_donor_prepared
+            if allocation_ready is not None and allocation_ready():
+                return True
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)

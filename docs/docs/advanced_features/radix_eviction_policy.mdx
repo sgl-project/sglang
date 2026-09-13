@@ -14,6 +14,16 @@ The policy scores each candidate and the **lowest score is evicted first**. Once
 
 A policy only scores. It does not decide how much to free, and it cannot pin KV in memory — a node protected by the policy is still evicted if reclaiming everything else is not enough.
 
+## Allocation-driven eviction with unified memory
+
+With `--enable-unified-memory`, hybrid models share one device byte buffer across full-attention KV, sliding-window KV, and, when present, Mamba state pools. The individual FULL and SWA capacity views can count the same free bytes. Do not add these capacities or assume that satisfying each view separately guarantees a combined allocation. For example, each pool may report room for four tokens while the shared buffer can fit only three FULL+SWA token pairs.
+
+For a pending FULL+SWA allocation, the allocator checks both component capacities and the joint capacity. It first applies deferred frees and attempts recoverable layout changes when needed, such as moving SWA storage to open a short band. If the allocation still cannot fit, allocation-driven eviction follows the selected victim policy and continues until the complete request is allocatable or eligible cache entries are exhausted. Meeting an initial component shortfall alone does not stop this recovery. The same complete-capacity check applies before decode allocation.
+
+This recovery uses the existing shared buffer; it does not increase the memory budget or release slots held by live requests. Locked entries remain protected, so eviction cannot guarantee that every request fits. You do not need a new eviction-policy setting to enable joint-capacity checks.
+
+Unified memory currently cannot be combined with `--enable-hierarchical-cache` (HiCache) or `--enable-lmcache`; server configuration rejects these combinations. See [server arguments](/docs/advanced_features/server_arguments) for the memory and cache options.
+
 ## Available policies
 
 Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.
