@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
     unshuffle_aiter_fp8_weight,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -934,7 +935,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(qweight.shape[0]):
+                            qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
@@ -990,7 +992,8 @@ class Fp8LinearMethod(LinearMethodBase):
                                 weight=weight,
                                 weight_scale=weight_scale,
                             )
-                        weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                            weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -2502,6 +2505,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        ):
+            # Neither runner has an fp8 MoE path; they get pinned globally for
+            # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
+            logger.info(
+                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
+                moe_runner_backend.name,
+            )
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()
