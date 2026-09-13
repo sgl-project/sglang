@@ -243,6 +243,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -304,6 +305,21 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_pcie_ipc_workspace(self):
+        """Build the PCIe-IPC all-reduce workspace before graph capture.
+
+        Runs for every model, not only the ones that autotune: left to the first
+        reduction, the build lands inside another autotune context and tuning
+        declines there.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        pcie_ipc_comm = get_tp_group().pcie_ipc_comm
+        if pcie_ipc_comm is None:
+            return
+
+        pcie_ipc_comm.prepare(self.model_runner.model_config.hidden_size)
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
