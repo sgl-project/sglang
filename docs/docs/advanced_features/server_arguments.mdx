@@ -1475,6 +1475,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepseek-v4-prefill-reuse`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse the DeepSeek V4 indexer top-K across a window of prefill query rows, scoring only the first row of each window. `deep10-inf-w4` also lets the ten deepest C4 indexer layers share one selection per chunk. Only affects single-request prefill on the non-paged indexer fast path; other cases keep the default path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>uniform-w4</code>, <code>deep10-inf-w4</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--fp8-gemm-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for Blockwise FP8 GEMM operations. For MXFP8 dense GEMM, <code>auto</code> selects <code>flashinfer_cutedsl</code> when FlashInfer reports support (currently SM100/SM103), and otherwise selects <code>flashinfer_cutlass</code> on supported Blackwell GPUs. Options also include 'deep_gemm' (JIT-compiled), 'flashinfer_trtllm' (FlashInfer TRTLLM backend; SM100/SM103 only), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 backend; SM100/SM103 only), 'flashinfer_deepgemm' (Hopper SM90 only, uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), and 'aiter' (ROCm only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>

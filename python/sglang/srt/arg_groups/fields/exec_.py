@@ -308,6 +308,20 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    deepseek_v4_prefill_reuse: A[
+        Optional[str],
+        Arg(
+            help="Reuse the DeepSeek V4 indexer top-K across a window of prefill "
+            "query rows, scoring only the first row of each window. 'uniform-w4' "
+            "uses a window of 4 on every C4 indexer layer; 'deep10-inf-w4' also "
+            "lets the ten deepest C4 layers of DeepSeek-V4-Flash (24-42) share one "
+            "selection per chunk. Only the non-paged indexer fast path is affected "
+            "(a single request with at least "
+            "SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS query rows); other "
+            "cases and the torch/flashinfer top-k backends keep the default path.",
+            choices=["uniform-w4", "deep10-inf-w4"],
+        ),
+    ] = None
 
 
 class ExecMamba(msgspec.Struct):
