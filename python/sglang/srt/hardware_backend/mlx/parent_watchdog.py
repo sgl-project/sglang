@@ -26,6 +26,13 @@ def start_parent_death_watcher() -> None:
     blocking native call (e.g. an MLX/Metal ``mx.eval`` / ``.tolist()``).
     """
     original_ppid = os.getppid()
+    # Already orphaned: macOS reparents to launchd the moment the parent exits,
+    # so no NOTE_EXIT is left to wait for and watching PID 1 would block forever.
+    # Comparing against 1 is safe here -- unlike the Linux PDEATHSIG path, an
+    # sglang worker is never spawned directly by launchd.
+    if original_ppid == 1:
+        os.kill(os.getpid(), signal.SIGKILL)
+        return
 
     def _watch_parent():
         kq = select.kqueue()
