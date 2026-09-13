@@ -9,7 +9,6 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import (
     Any,
@@ -18,6 +17,8 @@ from typing import (
     Optional,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
@@ -25,8 +26,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.utils.common import json_list_type
 
 
-@dataclasses.dataclass
-class Serving:
+class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"

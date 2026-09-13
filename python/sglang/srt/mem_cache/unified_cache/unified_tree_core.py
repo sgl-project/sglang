@@ -27,6 +27,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -59,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -139,6 +141,14 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Logical-page KV sharding: rotation base of the chain this node's Full
+        # KV pages belong to — the owner rank of position-page P along the chain
+        # is (rotation_base + P) % shard_size. A host-side mirror of the
+        # loc-derived owners (the Full value is a device tensor; reading it
+        # would put a D2H sync on the alloc path): set at insert from the
+        # inserting request's host base, copied on split, read through
+        # req.last_node at alloc time. None when sharding is off.
+        self.rotation_base: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -228,6 +238,12 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node(node)
+
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        assert prev_node.id in self.cache
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -399,6 +415,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -513,6 +530,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Whether the node is the tree root."""
         return self.node_by_id(node_id) is self.root_node
 
+    supports_rotation_base = True
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain)."""
+        return self.node_by_id(node_id).rotation_base
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()
@@ -621,32 +645,66 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
         node = self.node_by_id(node_id)
-        result = IncLockRefResult()
+        skipped = tuple(skip_lock_components)
+        # The receipt records the anchor and what was locked; the paired dec
+        # replays exactly that.
+        result = IncLockRefResult(node_id=node.id, skipped_lock_components=skipped)
         for component in self.components:
-            if component.component_type in skip_lock_components:
-                # Leave this component's value evictable and record every
-                # non-root node (incl tombstones) so the matching dec skips a
-                # lock we never took, which may be another req's on a shared node.
-                if node is not self.root_node:
-                    result.skip_lock_node_ids.setdefault(
-                        component.component_type, set()
-                    ).add(node.id)
+            if component.component_type in skipped:
                 continue
             result = component.acquire_component_lock(node=node, result=result)
         self._update_evictable_leaf_sets(node)
         return result
 
+    @staticmethod
+    def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
+        """A receipt releases only the node its acquire returned; a mispaired
+        node would silently release (or steal) another holder's segment."""
+        assert params.node_id is None or params.node_id == node.id, (
+            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
+        )
+
+    def _release_components(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+        *,
+        lock_host: bool = False,
+        skip_swa_and_below: bool = False,
+    ) -> None:
+        """Release each component this receipt acquired. Auxiliaries go first
+        so Full, whose walk refreshes leaf membership on every node it
+        unlocks, sees their final refs; the auxiliary walks also refresh the
+        nodes they unlock, so the order is not load-bearing for the sets."""
+        swa_priority = None
+        if skip_swa_and_below:
+            swa_component = self.components_by_type.get(ComponentType.SWA)
+            if swa_component is not None:
+                swa_priority = swa_component.eviction_priority(is_leaf=False)
+        for component in reversed(self.components):
+            ct = component.component_type
+            if ct in params.skipped_lock_components:
+                continue
+            if swa_priority is not None and (
+                ct == ComponentType.SWA
+                or component.eviction_priority(is_leaf=False) < swa_priority
+            ):
+                continue
+            component.release_component_lock(
+                node=node, params=params, lock_host=lock_host
+            )
+
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in self.components:
-            if skip_swa and component.component_type == ComponentType.SWA:
-                continue
-            component.release_component_lock(node=node, params=params)
+        self._assert_receipt_anchor(node, params)
+        # After an SWA early release (dec_swa_lock_only), SWA and the
+        # lower-priority components it dropped are already released.
+        self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
@@ -654,36 +712,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, swa_uuid_for_lock, result.device_frees, result.host_frees
+            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,
-        # honoring skip ids so we don't drop a lock a partial inc never took
-        # (matters for FULL+SWA+MAMBA models, e.g. Inkling).
+        # Drop strictly-lower-priority locks co-located on the node, skipping
+        # any the paired inc never took (matters for FULL+SWA+MAMBA models).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(
-            swa_uuid_for_lock=swa_uuid_for_lock,
-            skip_lock_node_ids=skip_lock_node_ids or {},
-        )
-        for comp in self.components:
+        for comp in reversed(self.components):
+            if comp.component_type in params.skipped_lock_components:
+                continue
             if comp.eviction_priority(is_leaf=False) < swa_priority:
-                comp.release_component_lock(node, dec_params)
+                comp.release_component_lock(node, params)
         return result
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
-        result = IncLockRefResult()
+        result = IncLockRefResult(node_id=node.id)
         for component in self.components:
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
@@ -692,11 +747,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in self.components:
-            component.release_component_lock(node=node, params=params, lock_host=True)
+        self._assert_receipt_anchor(node, params)
+        self._release_components(node, params, lock_host=True)
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 
@@ -922,7 +977,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self.enable_external_cache_linker:
             return (
-                not node.external_cache_stored
+                self._needs_external_linker_offload(node)
                 and node.hit_count >= self.write_through_threshold
             )
 
@@ -931,6 +986,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and not node.backuped
             and node.hit_count >= self.write_through_threshold
         )
+
+    @staticmethod
+    def _needs_external_linker_offload(node: UnifiedTreeNode) -> bool:
+        """Whether neither a confirmed nor an in-flight external copy exists."""
+        return not node.external_cache_stored and node.write_through_pending_id is None
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
@@ -961,6 +1021,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
             )
 
+        if params.rotation_base is not None:
+            conflict = self._rotation_conflict(key, params.rotation_base)
+            if conflict is not None:
+                total_prefix_length, node = conflict
+                return InsertStepResult(
+                    actions=[],
+                    result=InsertResult(
+                        prefix_len=total_prefix_length,
+                        last_device_node=node.id,
+                        rotation_tail_declined=True,
+                        adopted_ranges={} if params.track_adopted_ranges else None,
+                    ),
+                )
+
         self._ongoing_insert_walk_state = _InsertWalkState(
             phase=_InsertPhase.WALK,
             node=self.root_node,
@@ -974,6 +1048,52 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
         return self._advance_insert()
+
+    def _rotation_conflict(
+        self, key: RadixKey, rotation_base: int
+    ) -> Optional[tuple[int, UnifiedTreeNode]]:
+        """Logical-page KV sharding: refuse an insert that would splice two
+        rotation runs into one cached path.
+
+        Read-only mirror of ``_insert_walk_step``'s matching. Returns
+        ``(matched_len, deepest_matched_node)`` when the chain this key lands on
+        was allocated under a different rotation base than the inserting
+        request's pages, else None.
+
+        Grafting across a base discontinuity would create a cached path whose
+        page owners are not one cyclic run — the padded-allgather / ``k // N``
+        translation contract — so later readers would crash on a negative pad or
+        silently read the wrong rank's scratch rows. Such a discontinuity means
+        two requests sharing a prefix were planned in pipelined batches before
+        either's insert landed, or the match was capped below the cached prefix.
+
+        Unlike the flat radix tree, the unified insert transfers page ownership
+        at three points, not just the tail graft: the tail leaf
+        (``_add_new_node``), an evicted node restored from the request's fresh
+        pages (``_unevict_node_on_insert``), and a component re-pointing a
+        matched node's Full value at the request's pages
+        (``update_component_on_insert_overlap``). All three are downstream of
+        this same predicate, so it is evaluated once, up front, and declines the
+        whole insert — which also keeps the walk's duplicate frees from running,
+        as the declined request stays on its own pages.
+        """
+        node = self.root_node
+        total_prefix_length = 0
+        while len(key) > 0:
+            child_key = key.child_key(self.page_size)
+            if child_key not in node.children:
+                break
+            child = node.children[child_key]
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            node = child
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            if prefix_len < len(child.key):
+                # The walk would split here; the fragment inherits this base.
+                break
+        if node is self.root_node or node.rotation_base == rotation_base:
+            return None
+        return total_prefix_length, node
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
@@ -1111,7 +1231,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.total_prefix_length + len(state.key),
             )
             state.target_node = self._add_new_node(
-                state.node, state.key, state.value, priority=state.priority
+                state.node,
+                state.key,
+                state.value,
+                priority=state.priority,
+                rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
         else:
@@ -1186,8 +1310,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
-
-        self._for_each_component_lru(child, UnifiedLRUList.remove_node)
+        # The rotation base is constant along a chain (position-page P keeps
+        # owner (b + P) % N on both sides of the split).
+        new_node.rotation_base = child.rotation_base
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1214,11 +1339,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 new_child_node_id=child.id,
             )
 
+        # Splitting does not access the suffix; retain its recency and place
+        # the inherited prefix beside it, in the same session partition.
         self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
+            new_node,
+            lambda lru, node: lru.insert_after(child, node),
+            skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
 
@@ -1234,10 +1360,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        rotation_base: Optional[int] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
+        # Chain-constant under sharding: the pre-flight decline in
+        # begin_insert() guarantees this tail continues the matched prefix's
+        # rotation, so stamping the inserting request's base keeps every node
+        # on a root path carrying the same base.
+        new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1259,7 +1391,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        if cd.lock_ref > 0:
+            self.component_protected_size_[ct] += n
+        else:
+            self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
         self._update_duplicate_tracking(node)
@@ -1490,11 +1625,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if absent. Under
-        write_back, FULL pressure reclaims redundant Full host copies first."""
+        write_back, FULL pressure reclaims redundant Full host copies first
+        (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
+            if (
+                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                and self.is_write_back
+                and component_type == BASE_COMPONENT_TYPE
+            ):
                 self._reclaim_full_host_duplicates(
                     num_tokens,
                     result.tracker,
@@ -1881,7 +2021,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return True
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
-        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
+        """H-leaf: evicted, Full host value present, no children, unlocked on
+        both tiers, not root.
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -1892,6 +2033,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return False
+        # Segment locks count evicted nodes too: a device-locked candidate is
+        # a live segment's anchor, and _evict_host_leaf would delete it.
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            return False
         if len(node.children) > 0:
             return False
         return True
@@ -1900,6 +2045,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def set_host_memory_buffer_only(self) -> None:
+        self.is_host_memory_buffer_only = True
 
     def insert_host(
         self,
@@ -2095,7 +2243,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not (ancestor.backuped or ancestor.external_cache_stored)
+                and not ancestor.backuped
+                and not ancestor.external_cache_stored
+                and (
+                    not self.enable_external_cache_linker
+                    or ancestor.write_through_pending_id is None
+                )
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent
@@ -2234,6 +2387,69 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node = node.parent
         return depth
 
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build transfers for a node with no stored or pending external copy."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            return None
+
+        transfers = []
+        for component in self.components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.OFFLOAD, node, None
+            )
+            if transfer is not None:
+                transfers.append(transfer)
+        return transfers
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark an externally restored path, excluding its existing anchor."""
+        until_node = self.node_by_id(until_node_id)
+        node = self.node_by_id(from_node_id)
+        path = []
+        while node is not until_node:
+            if node.parent is None:
+                raise RuntimeError(
+                    f"node {until_node_id} is not an ancestor of node {from_node_id}"
+                )
+            path.append(node)
+            node = node.parent
+
+        for node in path:
+            node.external_cache_stored = True
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            raise AssertionError(
+                f"invalid external offload state for node {node_id}: "
+                f"stored={node.external_cache_stored}, "
+                f"pending={node.write_through_pending_id}"
+            )
+        node.write_through_pending_id = node_id
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finalize external-store state for an offload and its split fragments."""
+        nodes = [self.node_by_id(node_id) for node_id in node_ids]
+        for node_id, node in zip(node_ids, nodes):
+            if node.write_through_pending_id != ack_id:
+                raise AssertionError(
+                    f"invalid external offload state for node {node_id}: "
+                    f"expected pending={ack_id}; got "
+                    f"stored={node.external_cache_stored}, "
+                    f"pending={node.write_through_pending_id}"
+                )
+        for node in nodes:
+            node.write_through_pending_id = None
+            node.external_cache_stored |= success
+
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
@@ -2252,12 +2468,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full uses leaf sets, not LRU; its stores go through the insert paths.
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
-        node.component_data[component_type].value = value
+        cd = node.component_data[component_type]
+        cd.value = value
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        self.component_evictable_size_[component_type] += len(value)
+        # A value materialized under lock is protected; the last release
+        # moves it to evictable.
+        if cd.lock_ref > 0:
+            self.component_protected_size_[component_type] += len(value)
+        else:
+            self.component_evictable_size_[component_type] += len(value)
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -2355,8 +2577,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     E(f"node {nid} {ct} host_lock_ref={cd.host_lock_ref}")
                 if ct != FCT and fl < cd.lock_ref:
                     E(f"node {nid} full_lock={fl} < {ct}_lock={cd.lock_ref}")
-                if cd.value is None and cd.lock_ref > 0:
-                    E(f"node {nid} {ct} evicted but lock_ref={cd.lock_ref}")
+                # Locked tombstones are legal: segment locks count every
+                # node in [start, boundary], data-bearing or not.
 
             # Collect expected leaf qualification (single pass)
             if self._is_device_leaf(node):

@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -51,7 +53,10 @@ class TestPPSyncDrain(unittest.TestCase):
 class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
-        cache.tree_core = SimpleNamespace(enable_storage=False)
+        cache.tree_core = SimpleNamespace(
+            enable_storage=False,
+            write_back_duplicate_reclaim_digest=0,
+        )
         cache.pp_rank = pp_rank
         cache.pp_size = 2
         cache.enable_storage_metrics = False
@@ -62,7 +67,6 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
-        cache.drain_storage_control_queues = MagicMock()
         cache.cache_controller = SimpleNamespace(
             ack_write_queue=[
                 SimpleNamespace(
@@ -84,12 +88,16 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         leader.check_hicache_events()
 
         leader._all_reduce.assert_called_once()
-        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2])
+        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2, 0, 0])
         leader.writing_check.assert_called_once_with(finish_count=1)
         leader.loading_check.assert_called_once_with(finish_count=2)
 
         follower = self._make_cache(1, [True], [True])
-        follower._all_reduce.side_effect = lambda counts, _: counts.fill_(1)
+
+        def reduce_to_min(counts, _):
+            counts.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int64))
+
+        follower._all_reduce.side_effect = reduce_to_min
         follower.check_hicache_events()
 
         for queue in (

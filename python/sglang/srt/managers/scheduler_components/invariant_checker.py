@@ -21,6 +21,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -152,6 +153,15 @@ class SchedulerInvariantChecker:
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        if is_swa_req_ring(allocator):
+            # Per-request SWA ring: there is no token pool to conserve; ring-slot
+            # leaks are caught by the req_to_token check instead.
+            return False, (
+                "[swa] unified ring (leak-check skipped): "
+                f"available={ps.swa_available_size}, "
+                f"evictable={ps.swa_evictable_size}, "
+                f"total={self.swa_tokens_per_layer}"
+            )
         swa_available = ps.swa_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # Tri-pool: same floating-boundary phantom as the full pool -- use the

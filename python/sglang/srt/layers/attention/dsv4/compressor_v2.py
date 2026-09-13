@@ -241,6 +241,22 @@ class CompressorBackendMixin:
             is_unified_kv_triton,
         )
 
+        if token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
+            # The fused epilogue writes only the packed FlashMLA layout.
+            from sglang.srt.layers.attention.dsv4.compressor_trtllm import (
+                forward_compress_uniform_fp8,
+            )
+
+            forward_compress_uniform_fp8(
+                self,
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
+            return
+
         out_loc = self._get_out_loc(compressor.ratio)
         use_fp4_indexer = (
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
@@ -249,7 +265,7 @@ class CompressorBackendMixin:
         bf16_store = False
         kv_scale_cache = None
         if compressor.is_in_indexer:
-            page_size = token_to_kv_pool.get_index_k_page_size()
+            page_size = token_to_kv_pool.get_index_k_page_size(compressor.ratio)
             if use_hip_fp4:
                 kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
                 kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)
@@ -441,6 +457,7 @@ def create_paged_compressor_data(
 
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
@@ -467,6 +484,7 @@ def create_paged_compressor_data(
             full_to_state=full_to_swa,
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+            use_req_ring=use_req_ring,
             num_q_tokens=num_q_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
         )
@@ -479,6 +497,7 @@ def create_paged_compressor_data(
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+            use_req_ring=use_req_ring,
         )
 
 

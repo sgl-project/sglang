@@ -64,7 +64,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import resolution_result, resolving_view
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolution_result,
+    resolving_view,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -1034,8 +1038,8 @@ def main(server_args, bench_args):
         decode = dict(graph_config.get(Phase.DECODE) or {})
         decode["max_bs"] = max(bench_args.batch_size)
         graph_config[Phase.DECODE] = decode
-    server_args = server_args.replace_resolved(
-        "benchmark.one_batch", cuda_graph_config=graph_config
+    declare_resolution(
+        server_args, "benchmark.one_batch", cuda_graph_config=graph_config
     )
     server_args.resolve_once()
     cfg = resolving_view(server_args)

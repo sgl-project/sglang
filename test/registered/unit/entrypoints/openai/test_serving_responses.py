@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import StreamFixture, engine_chunk, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -63,7 +63,10 @@ class InputMessageConstructionTestCase(CustomTestCase):
                 type="message",
             ),
         ]
-        serving.msg_store["resp_prev"] = [{"role": "user", "content": "old input"}]
+        serving.msg_store["resp_prev"] = [
+            {"role": "user", "content": "old input"},
+            *[item.model_dump(exclude_none=True) for item in prev_response.output],
+        ]
 
         request = ResponsesRequest(
             model="x",
@@ -82,11 +85,197 @@ class InputMessageConstructionTestCase(CustomTestCase):
                 {"role": "user", "content": "old input"},
                 {
                     "role": "assistant",
-                    "content": "first answer part\nsecond answer part",
+                    "content": [
+                        {"type": "text", "text": "first answer part"},
+                        {"type": "text", "text": "second answer part"},
+                    ],
                 },
                 {"role": "user", "content": "new input"},
             ],
         )
+
+    def test_stored_tool_turn_matches_client_replay_without_old_instructions(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving = make_serving()
+                serving.reasoning_parser = "deepseek-r1"
+                serving.tool_call_parser = None
+                request = ResponsesRequest(
+                    model="x",
+                    input="old input",
+                    instructions="OLD INSTRUCTION",
+                    tools=[{"type": "function", "name": "lookup"}],
+                    tool_choice="required",
+                    store=True,
+                    stream=stream,
+                )
+                chunk = engine_chunk(
+                    '<think>secret plan</think>[{"name":"lookup","parameters":{}}]',
+                    finish=True,
+                )
+                if stream:
+                    StreamFixture(serving, request).run([chunk])
+                    response = serving.response_store[request.request_id]
+                else:
+                    context = SimpleContext()
+                    context.append_output(chunk)
+
+                    async def empty():
+                        if False:
+                            yield
+
+                    response = asyncio.run(
+                        serving.responses_full_generator(
+                            request,
+                            {},
+                            empty(),
+                            context,
+                            "x",
+                            Mock(),
+                            RequestResponseMetadata(request_id=request.request_id),
+                            require_reasoning=False,
+                        )
+                    )
+                call = next(
+                    item for item in response.output if item.type == "function_call"
+                )
+                result = {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": "answer 42",
+                }
+                for instructions in ("NEW INSTRUCTION", None):
+                    followup = ResponsesRequest(
+                        model="x",
+                        previous_response_id=response.id,
+                        input=[result],
+                        instructions=instructions,
+                        store=False,
+                    )
+                    explicit = ResponsesRequest(
+                        model="x",
+                        input=[{"role": "user", "content": "old input"}]
+                        + [item.model_dump() for item in response.output]
+                        + [result],
+                        instructions=instructions,
+                        store=False,
+                    )
+                    messages = serving._construct_input_messages(followup, response)
+                    self.assertEqual(
+                        messages, serving._construct_input_messages(explicit)
+                    )
+                    self.assertNotIn("OLD INSTRUCTION", str(messages))
+                    self.assertIn("secret plan", str(messages))
+                    self.assertIn(call.call_id, str(messages))
+                self.assertEqual(
+                    [item["type"] for item in serving.msg_store[response.id][1:]],
+                    ["reasoning", "function_call"],
+                )
+
+    def test_harmony_instructions_are_rebuilt_for_each_request(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        previous = Mock(id="resp_previous", output=[])
+        first = ResponsesRequest(
+            model="x", input="old input", instructions="OLD INSTRUCTION"
+        )
+        messages = serving._construct_input_messages_with_harmony(first, None)
+        serving.msg_store[previous.id] = messages[2:]
+        for instructions in ("NEW INSTRUCTION", None):
+            request = ResponsesRequest(
+                model="x",
+                input="next",
+                instructions=instructions,
+                previous_response_id=previous.id,
+            )
+            actual = serving._construct_input_messages_with_harmony(request, previous)
+            expected = serving._construct_input_messages_with_harmony(request, None)
+            self.assertEqual(actual[:2], expected[:2])
+            self.assertEqual(actual[2:], messages[2:] + expected[2:])
+
+    def test_harmony_replays_output_text_and_encoded_reasoning(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_response_input
+        from sglang.srt.entrypoints.openai.responses_adapters import (
+            encode_reasoning_state,
+        )
+
+        message = parse_response_input(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "assistant-only secret 42"},
+                ],
+                "phase": "final_answer",
+            },
+            [],
+        )
+        self.assertEqual(message.content[0].text, "assistant-only secret 42")
+        reasoning = parse_response_input(
+            {
+                "type": "reasoning",
+                "encrypted_content": encode_reasoning_state("private plan"),
+            },
+            [],
+        )
+        self.assertEqual(reasoning.content[0].text, "private plan")
+        self.assertEqual(reasoning.channel, "analysis")
+
+    def test_harmony_replays_dict_tool_calls_and_results_in_one_input(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "call_id": "call_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "output_text", "text": "result"}],
+                },
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages_with_harmony(request, None)
+        self.assertEqual(messages[-1].author.name, "functions.lookup")
+        self.assertEqual(messages[-1].content[0].text, "result")
+
+    def test_harmony_message_channels_map_to_phases(self):
+        from sglang.srt.entrypoints.harmony_utils import (
+            parse_output_message,
+            parse_response_input,
+        )
+
+        for phase in ("commentary", "final_answer"):
+            message = parse_response_input(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "phase": phase,
+                },
+                [],
+            )
+            (item,) = parse_output_message(message)
+            self.assertEqual(item.phase, phase)
+            self.assertEqual(item.content[0].text, "answer")
+
+    def test_replay_preserves_different_assistant_phases(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
+        self.assertEqual([m["content"] for m in messages], ["working", "answer"])
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
@@ -203,6 +392,23 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
+
+    def test_harmony_forced_choices_explain_missing_routing_constraints(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        for choice in ("none", "required", {"type": "function", "name": "lookup"}):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                tool_choice=choice,
+                tools=[{"type": "function", "name": "lookup"}],
+                store=False,
+            )
+            response = asyncio.run(serving.create_responses(request))
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(b"recipient", response.body)
+            self.assertIn(b"tool_choice", response.body)
+        serving.tokenizer_manager.generate_request.assert_not_called()
 
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
@@ -458,11 +664,14 @@ class InputItemNormalizationTestCase(CustomTestCase):
             },
         )
 
-    def test_developer_role_becomes_system(self):
+    def test_developer_role_becomes_labelled_system(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {"role": "developer", "content": "Be terse."}
         )
-        self.assertEqual(normalized, {"role": "system", "content": "Be terse."})
+        self.assertEqual(
+            normalized,
+            {"role": "system", "content": "Developer instructions:\nBe terse."},
+        )
 
     def test_function_call_output_becomes_tool_message(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
@@ -622,6 +831,36 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_token_first_specs_route_through_prompt_ids(self):
+        """Bug regression: token-first encoders leave prompt == "" with
+        non-empty prompt_ids; forwarding the empty text 400s in
+        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
+        for spec in ("inkling", "kimi_k3"):
+            with self.subTest(spec=spec):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = spec
+                serving._process_messages = Mock(
+                    return_value=MessageProcessingResult(
+                        prompt="",
+                        prompt_ids=[4, 5, 6],
+                        image_data=None,
+                        audio_data=None,
+                        video_data=None,
+                        modalities=[],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+
+                _, request_prompts, engine_prompts, _ = asyncio.run(
+                    serving._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+
+                self.assertEqual(engine_prompts, [[4, 5, 6]])
+                self.assertEqual(request_prompts, [[4, 5, 6]])
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
@@ -704,6 +943,7 @@ class OutputItemsTestCase(CustomTestCase):
 
         types = [type(item).__name__ for item in output_items]
         self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
+        self.assertEqual(output_items[0].phase, "commentary")
 
     def test_required_tool_choice_parses_json_array_without_native_parser(self):
         serving = self.serving
@@ -892,7 +1132,7 @@ class EnginePassthroughTestCase(CustomTestCase):
     """Both flags cross hops with no type contract, and dropping either fails
     silently."""
 
-    def _capture(self, serving, request):
+    def _capture(self, serving, request, raw_request=None):
         # Let the real _process_messages run: it is the hop that turns
         # skip_special_tokens off, so mocking it would make that assertion vacuous.
         # chat_template_name=None routes it through the tokenizer's template
@@ -924,8 +1164,34 @@ class EnginePassthroughTestCase(CustomTestCase):
             yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        asyncio.run(serving.create_responses(request))
+        asyncio.run(serving.create_responses(request, raw_request=raw_request))
         return captured
+
+    def test_pd_routing_fields_forwarded_to_engine(self):
+        serving = make_serving()
+        raw_request = Mock(headers={"x-data-parallel-rank": "2"}, state=Mock())
+
+        captured = self._capture(
+            serving,
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                bootstrap_host="10.0.0.1",
+                bootstrap_port=8998,
+                bootstrap_room=42,
+                routed_dp_rank=1,
+                disagg_prefill_dp_rank=0,
+                store=False,
+            ),
+            raw_request=raw_request,
+        )
+
+        adapted_request = captured["adapted_request"]
+        self.assertEqual(adapted_request.bootstrap_host, "10.0.0.1")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.bootstrap_room, 42)
+        self.assertEqual(adapted_request.routed_dp_rank, 2)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()

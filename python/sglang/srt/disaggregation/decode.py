@@ -27,7 +27,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_qsa_pending_state_indices,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -74,6 +75,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -138,6 +140,9 @@ class DecodeReqToTokenPool:
     In DecodeReqToTokenPool, if `--max-running-requests` is 8,
     #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
     """
+
+    # Mirrors ReqToTokenPool.register_on_alloc_rows.
+    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
 
     def __init__(
         self,
@@ -204,6 +209,8 @@ class DecodeReqToTokenPool:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if self._on_alloc_rows is not None and select_index:
+            self._on_alloc_rows(select_index)
         offset = 0
         for r in reqs:
             if not r.kv.holds_kv:
@@ -220,6 +227,10 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+
+    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+        assert self._on_alloc_rows is None
+        self._on_alloc_rows = hook
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -241,6 +252,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -288,6 +303,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def clear(self):
@@ -307,6 +326,8 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    # Receipt for the inc_lock_ref held on hicache_restored_node.
+    hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -416,12 +437,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
         if req.swa_prefix_lock_released:
-            self.tree_cache.dec_lock_ref(req.last_node, params, skip_swa=True)
+            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=True)
             req.swa_prefix_lock_released = False
         else:
-            self.tree_cache.dec_lock_ref(req.last_node, params)
+            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
@@ -556,6 +576,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -666,9 +687,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref.
-        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
-        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # boundary needed for the matching dec_lock_ref; the full receipt
+        # travels on the req so every later release mirrors this acquire.
+        req.lock_receipt = self.tree_cache.inc_lock_ref(
+            result.last_device_node
+        ).to_dec_params()
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -1229,8 +1252,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     and hasattr(self.tree_cache, "dec_swa_lock_only")
                 ):
                     self.tree_cache.dec_swa_lock_only(
-                        decode_req.req.last_node,
-                        decode_req.req.swa_uuid_for_lock,
+                        decode_req.req.last_node, decode_req.req.lock_receipt
                     )
                     decode_req.req.swa_prefix_lock_released = True
 
@@ -1415,6 +1437,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     seq_len,
                 )
 
+            def _qsa_pending_payload():
+                # Match the prefill request-pool row positionally; the two
+                # req_pool_idx values need not be equal.
+                return get_qsa_pending_state_indices(decode_req.req)
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1437,7 +1464,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            if StateType.C128_STATE in state_types:
+            if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
@@ -1445,12 +1472,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     clear_c128_state(int(decode_req.req.kv.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
+                StateType.QSA_PENDING: _qsa_pending_payload,
+                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1711,7 +1740,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
         swa_available = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable = self.tree_cache.swa_evictable_size()
+        # Per-request SWA ring: cached prefixes still report swa_evictable, but
+        # evicting them frees no ring space.
+        swa_evictable = (
+            0
+            if is_swa_req_ring(self.token_to_kv_pool_allocator)
+            else self.tree_cache.swa_evictable_size()
+        )
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
         swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
@@ -2488,8 +2523,7 @@ class SchedulerDisaggregationDecodeMixin:
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2532,8 +2566,7 @@ class SchedulerDisaggregationDecodeMixin:
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue

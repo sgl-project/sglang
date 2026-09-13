@@ -26,7 +26,7 @@ class TestCudaPlatformDetection(unittest.TestCase):
             with (
                 self.subTest(hip_version=hip_version),
                 patch(
-                    "sglang.multimodal_gen.utils.import_pynvml",
+                    "sglang.multimodal_gen.runtime.platforms.pynvml.nvmlInit",
                     side_effect=NVMLUnavailableError,
                 ),
                 patch.object(platforms.os.path, "isfile", return_value=False),

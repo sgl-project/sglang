@@ -16,10 +16,13 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    FlashinferA2ADispatchType,
+    get_flashinfer_a2a_dispatch_type,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -289,6 +292,12 @@ def slice_nvfp4_output(
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
+
+
+def _use_nvfp4_dispatch() -> bool:
+    if not get_moe_a2a_backend().is_flashinfer():
+        return MOE_NVFP4_DISPATCH
+    return get_flashinfer_a2a_dispatch_type() == FlashinferA2ADispatchType.NVFP4
 
 
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
@@ -2210,6 +2219,31 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         )
 
 
+def _input_scale_to_local_experts(
+    input_scale: torch.Tensor,
+    num_local_experts: int,
+    num_experts: int,
+    moe_ep_rank: int,
+) -> torch.Tensor:
+    """Normalize a checkpoint input scale to this rank's local experts.
+
+    Checkpoints may store the activation scale as a scalar, a per-local-expert
+    vector, or a global per-expert vector; return a (num_local_experts,) vector.
+    """
+    input_scale = input_scale.detach().to(torch.float32)
+    if input_scale.dim() == 0:
+        return input_scale.expand(num_local_experts).contiguous()
+    if input_scale.shape == (num_local_experts,):
+        return input_scale.contiguous()
+    if input_scale.shape == (num_experts,):
+        start = moe_ep_rank * num_local_experts
+        return input_scale[start : start + num_local_experts].contiguous()
+    raise ValueError(
+        f"input scale must be scalar, ({num_local_experts},), or "
+        f"({num_experts},); got {tuple(input_scale.shape)}"
+    )
+
+
 def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
     w13_input_scale: torch.Tensor,
@@ -2383,7 +2417,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2403,7 +2440,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2493,6 +2533,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2526,6 +2567,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+        elif moe_runner_backend.is_flashinfer_megamoe():
+            # MegaMOE folds a scalar w13 input scale into input_norm_const but keeps
+            # per-expert w2 scales, so g2_alphas / w2_input_scale_quant stay
+            # per-expert to feed the mega kernel's fc2_alpha / fc1_norm_const (keeps
+            # FC1-output renorm and FC2 dequant on the same per-expert scale).
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+            w2_input_scale = _input_scale_to_local_experts(
+                layer.w2_input_scale,
+                layer.num_local_experts,
+                layer.num_experts,
+                layer.moe_ep_rank,
+            )
         elif self.enable_flashinfer_cutedsl_moe:
             # CuteDSL standard path uses a single scalar input scale (all experts).
             w13_input_scale = (
@@ -2548,7 +2601,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if MOE_NVFP4_DISPATCH:
+            if use_nvfp4_dispatch:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
@@ -2633,7 +2686,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             not self.quant_config.use_per_token_activation
             and not use_cutedsl_w4a16
             and (
-                MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
         )
 
@@ -2671,6 +2724,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             assert weight_scale.dtype == torch.float8_e4m3fn, (
                 f"{name} Weight Blockscale must be represented as FP8-E4M3"
             )
+
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_nvfp4_moe_weights_for_flashinfer_megamoe,
+            )
+
+            prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+            return
 
         # Weight processing based on strategy
         if (
@@ -2899,6 +2960,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
+            )
+
+            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=mega,
+                mega_forward=layer._flashinfer_megamoe_forward,
+                fc1_alpha=layer.g1_alphas,
+                fc2_alpha=layer.g2_alphas,
+                fc1_norm_const=layer.w2_input_scale_quant,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)

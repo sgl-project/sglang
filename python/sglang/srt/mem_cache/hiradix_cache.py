@@ -1488,15 +1488,17 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
             return 0
 
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1773,16 +1775,14 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
-        # Cache mode write-through keeps the anchor on the request's own path,
-        # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)

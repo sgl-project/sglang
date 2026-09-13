@@ -169,14 +169,13 @@ do
         --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
-        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 \
+        --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 \
         --watchdog-timeout 9000 \
         --context-length 8192 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 2 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 3 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
@@ -296,7 +295,7 @@ python3 -m sglang.launch_server \
     --device npu \
     --quantization modelslim \
     --watchdog-timeout 9000 \
-    --cuda-graph-bs 4 8 12 14 \
+    --cuda-graph-bs-decode 4 8 12 14 \
     --mem-fraction-static 0.9 \
     --max-running-requests 224 \
     --context-length 8188 \
@@ -481,7 +480,7 @@ do
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 \
+        --cuda-graph-bs-decode 2 4 6 \
         --watchdog-timeout 9000 \
         --context-length 8192 \
         --speculative-algorithm NEXTN \
@@ -489,7 +488,6 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -689,7 +687,7 @@ do
         --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 \
+        --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 \
         --watchdog-timeout 9000 \
         --context-length 8192 \
         --speculative-algorithm NEXTN \
@@ -697,7 +695,6 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -893,7 +890,7 @@ do
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 \
+        --cuda-graph-bs-decode 2 4 6 \
         --watchdog-timeout 9000 \
         --context-length 8192 \
         --speculative-algorithm NEXTN \
@@ -901,7 +898,6 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -1097,7 +1093,7 @@ do
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 \
+        --cuda-graph-bs-decode 2 4 6 \
         --watchdog-timeout 9000 \
         --context-length 8192 \
         --speculative-algorithm NEXTN \
@@ -1105,7 +1101,6 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -1300,14 +1295,13 @@ do
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 \
+        --cuda-graph-bs-decode 2 4 6 \
         --watchdog-timeout 9000 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \

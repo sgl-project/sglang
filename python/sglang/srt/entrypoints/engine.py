@@ -44,6 +44,7 @@ from typing import (
     cast,
 )
 
+import msgspec
 import torch
 import uvloop
 import zmq
@@ -266,7 +267,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
             # shows here even when the caller did not pass it.
-            object.__setattr__(
+            msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
                 "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
@@ -1169,11 +1170,16 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            launch_dummy_health_check_server(
-                get_serving().host,
-                get_serving().port,
-                get_observability().enable_metrics,
+            # A node-local Rust listener owns the health endpoints when present.
+            rust_server_owns_base_port = (
+                envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             )
+            if not rust_server_owns_base_port:
+                launch_dummy_health_check_server(
+                    get_serving().host,
+                    get_serving().port,
+                    get_observability().enable_metrics,
+                )
 
             scheduler_init_result.block_until_scheduler_exits()
             return (
@@ -1868,6 +1874,31 @@ def _calculate_rank_ranges(
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def node_hosts_rust_server() -> bool:
+    """Whether this node contains a Rust listener rank, assuming Rust mode."""
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(
+        parallel.nnodes,
+        parallel.pp_size,
+        parallel.tp_size,
+        parallel.node_rank,
+    )
+    if 0 not in pp_rank_range:
+        return False
+
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch the full local TP group, including its first rank.
+        return True
+
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    ranks_per_dp_group = parallel.attn_tp_size * parallel.attn_cp_size
+    for tp_rank in tp_rank_range:
+        rank_within_dp_group = tp_rank % ranks_per_dp_group
+        if rank_within_dp_group == 0:
+            return True
+    return False
 
 
 def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
