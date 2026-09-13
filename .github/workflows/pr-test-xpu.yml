@@ -134,6 +134,12 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 60
         run: |
+          # Bridge fix: install libssl-dev in the running container so the
+          # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
+          # Can be dropped once intel/sglang-dev:latest is rebuilt from a
+          # docker/xpu.Dockerfile that already ships libssl-dev.
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
@@ -220,6 +226,12 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 60
         run: |
+          # Bridge fix: install libssl-dev in the running container so the
+          # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
+          # Can be dropped once intel/sglang-dev:latest is rebuilt from a
+          # docker/xpu.Dockerfile that already ships libssl-dev.
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang

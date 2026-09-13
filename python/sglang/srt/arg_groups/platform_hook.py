@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    record_foreign_defaults,
     resolving_view,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -82,6 +83,29 @@ def handle_nccl_pre_warm(server_args: Any):
             "Ignoring pre_warm_nccl setting on current hardware."
         )
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
+
+
+def handle_platform_defaults(server_args: Any):
+    """An out-of-tree platform's defaults, declared like every rule beside it.
+
+    `Platform.apply_server_args_defaults` is a plugin interface: the platform is
+    handed a configuration and assigns the fields it wants defaulted. In-tree
+    platforms do not implement it -- the base is a no-op and nothing overrides
+    it -- so this captures nothing here and exists for the platforms that live
+    outside this tree.
+
+    Ordering: it must precede `handle_gpu_memory_settings`, whose symm-mem
+    prealloc default keys off `enable_symm_mem`.
+    """
+    # `current_platform` is the plugin object; `get_platform()` is the facts
+    # view over it and carries neither the name nor the hook.
+    from sglang.srt.platforms import current_platform
+
+    record_foreign_defaults(
+        server_args,
+        f"platform:{current_platform.device_name}",
+        current_platform.apply_server_args_defaults,
+    )
 
 
 def handle_symm_mem_device_support(server_args: Any):

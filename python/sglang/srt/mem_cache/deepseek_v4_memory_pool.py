@@ -304,6 +304,65 @@ class DeepSeekV4SingleKVPool(KVCache):
         raise NotImplementedError("Use get_key_buffer instead.")
 
 
+class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
+    """Uniform 512-dim FP8 (e4m3) variant of the DSv4 single-KV pool.
+
+    Each token is 448 NoPE + 64 RoPE contiguous e4m3 values without in-cache
+    scales or per-page padding. The backend supplies the dequant scale.
+    """
+
+    def get_bytes_per_token(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def create_buffer(self, *, num_pages: int):
+        bytes_per_token = self.get_bytes_per_token()
+        assert bytes_per_token == 512, (
+            "DSV4 uniform-FP8 KV layout: qk_nope_head_dim (448) + "
+            "qk_rope_head_dim (64), all e4m3 = 512 bytes/token"
+        )
+        self.kv_cache_total_dim = bytes_per_token
+        self.bytes_per_page_padded = self.page_size * bytes_per_token
+
+        return torch.zeros(
+            num_pages,
+            self.page_size * bytes_per_token,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id]
+
+    def set_key_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    ):
+        raise NotImplementedError(
+            "The packed NopeFp8RopeBf16Pack store does not apply to the "
+            "uniform-FP8 pool; use set_key_buffer_fused."
+        )
+
+    def set_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Store normed/roped rows as e4m3 with the backend's fixed unit scale.
+
+        uint8 views work around index_put not supporting FP8 dtypes.
+        """
+
+        assert freqs_cis is None, "the uniform-FP8 pool takes finished (rotated) rows"
+        assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim
+        self.kv_buffer[layer_id].view(torch.uint8).view(-1, self.kv_cache_total_dim)[
+            loc.long()
+        ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
+
+
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     def __init__(
         self,
@@ -784,6 +843,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified_kv = is_unified_kv_triton()
+        # Uniform 512-dim e4m3 layout for the trtllm attention backend
+        self.uniform_fp8 = (
+            not self._unified_kv
+        ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        if self.uniform_fp8:
+            assert self.kv_layout is KVLayout.V4, (
+                "--dsv4-attn-backend trtllm keeps its own uniform 512-byte pages; "
+                f"it cannot be combined with SGLANG_DSV4_KV_LAYOUT={self.kv_layout.value}"
+            )
         c4_ring_size = self.get_ring_size(4)
         if self._unified_kv:
             # Unified C4 state is request-addressed: one ring per req slot,
@@ -910,6 +978,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
+            kv_pool_cls: type = DeepSeekV4SingleKVPool
+            if self.uniform_fp8:
+                assert dtype == torch.float8_e4m3fn, (
+                    "--dsv4-attn-backend trtllm requires "
+                    f"kv_cache_dtype=fp8_e4m3, got {dtype}"
+                )
+                kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
@@ -919,6 +994,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
                 kv_layout=self.kv_layout,
+                cls=kv_pool_cls,
             )
 
         logger.info(
@@ -1372,6 +1448,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             assert not self._unified_kv, "unified_kv has no low compress ratio layout"
 
         kv_pool_size = {4: c4_size, 128: c128_size}
+        # Uniform 512-dim e4m3 layout for the trtllm attention backend.
+        kv_pool_cls: type = DeepSeekV4SingleKVPool
+        if self.uniform_fp8:
+            assert not enable_hisparse, (
+                "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+            )
+            kv_pool_cls = DeepSeekV4UniformFP8KVPool
         if not self._unified_kv:
             for ratio, sources in self.sources_by_ratio.items():
                 self.kv_pools[ratio] = self._make_kv_pool(
@@ -1389,7 +1472,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     cls=(
                         HiSparseC4DevicePool
                         if ratio == 4 and enable_hisparse
-                        else DeepSeekV4SingleKVPool
+                        else kv_pool_cls
                     ),
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
@@ -1605,6 +1688,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the extra cache's format from."""
+        if self.uniform_fp8:
+            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
+            _, _, compress_kv_pool = self.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            return compress_kv_pool.kv_cache_total_dim
         return self.get_extra_key_layout(layer_id).bytes_per_token
 
     def get_swa_key_layout(self) -> KVLayout:
@@ -1613,6 +1701,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the SWA cache's format from (584 for V4, 528 for V4.1)."""
+        if self.uniform_fp8:
+            # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
+            return self.swa_kv_pool.kv_cache_total_dim
         return self.kv_layout.bytes_per_token
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
@@ -1766,6 +1857,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.uniform_fp8:
+            # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
+            # Triton kernel (in-place on kv; safe -- kv is not read again),
+            # then a plain e4m3 cast + scatter in the pool setter (per-tensor
+            # scale 1.0). Fusing the store is deferred to the perf phase.
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                fused_norm_rope_inplace_triton,
+            )
+
+            fused_norm_rope_inplace_triton(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions=positions,
+            )
+            self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
+            return
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
