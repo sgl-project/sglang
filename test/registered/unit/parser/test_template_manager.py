@@ -278,6 +278,38 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "nemotron_3")
 
+    def test_nemotron_with_shared_parameter_block_not_misclassified_as_granite(self):
+        # Granite 4.2 and Nemotron-3 templates share the same
+        # <function=name>/<parameter=key> tool-call instruction block; without
+        # a Granite-only signature (defer_loading) this must stay nemotron_3.
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        {{- '<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n</function>\\n</tool_call>' }}
+        """
+        _, config, parser = self._detect(template, ["<|endoftext|>"])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "nemotron_3")
+
+    def test_granite_detected_via_defer_loading_signature(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
+        {% set truncate_history_thinking = truncate_history_thinking if truncate_history_thinking is defined else True %}
+        {%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}
+        {{- '<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n</function>\\n</tool_call>' }}
+        """
+        _, config, parser = self._detect(template, [])
+
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "granite_thinking_parser")
+
     def test_minimax_uses_template_signature_without_toggle_config(self):
         template = """
         {%- set toolcall_begin_token = '<minimax:tool_call>' -%}

@@ -11,12 +11,19 @@ Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark suite
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import requests
 import torch
 
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import MAX_FUSED_ROWS
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+    DeepseekV4HipRadixBackend,
+    DSV4RawVerifyMetadata,
+    UnifiedKvMetadata,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -60,6 +67,60 @@ FP4_ENV_VARS = {
 
 
 class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
+    def test_unified_metadata_copy_updates_captured_swa_loc_in_place(self):
+        captured_swa_loc = torch.tensor([3, 5, 7], device=DEVICE, dtype=torch.int32)
+        replay_swa_loc = torch.tensor([11, 13, 17], device=DEVICE, dtype=torch.int32)
+        captured = UnifiedKvMetadata(swa_loc=captured_swa_loc)
+        replay = UnifiedKvMetadata(swa_loc=replay_swa_loc)
+
+        captured.copy_(replay)
+
+        self.assertIs(captured.swa_loc, captured_swa_loc)
+        self.assertTrue(torch.equal(captured.swa_loc, replay_swa_loc))
+
+    def test_dspark_verify_metadata_graph_routing(self):
+        num_draft_tokens = 7
+        max_fused_bs = MAX_FUSED_ROWS // num_draft_tokens
+        cases = (
+            ("eligible", True, None, max_fused_bs, True),
+            ("fp4_row_limit", True, None, max_fused_bs + 1, False),
+            ("eagle", False, None, max_fused_bs, False),
+            ("ragged", True, object(), max_fused_bs, False),
+        )
+
+        for name, is_dspark, ragged_layout, bs, expect_raw in cases:
+            with self.subTest(name=name):
+                backend = DeepseekV4HipRadixBackend.__new__(DeepseekV4HipRadixBackend)
+                backend.is_dspark = is_dspark
+                backend._fp4_graph_row_limit = MAX_FUSED_ROWS
+                backend.target_verify_num_draft_tokens = num_draft_tokens
+                eager_metadata = object()
+                backend.init_forward_metadata_target_verify_old = mock.Mock(
+                    return_value=eager_metadata
+                )
+
+                req_pool_indices = torch.arange(bs, device=DEVICE, dtype=torch.int32)
+                seq_lens = torch.ones(bs, device=DEVICE, dtype=torch.int32)
+                out_cache_loc = torch.zeros(
+                    bs * num_draft_tokens, device=DEVICE, dtype=torch.int32
+                )
+                result = backend.init_forward_metadata_target_verify(
+                    max_seq_len=128,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    out_cache_loc=out_cache_loc,
+                    use_prefill_cuda_graph=True,
+                    seq_lens_cpu=[1] * bs,
+                    ragged_layout=ragged_layout,
+                )
+
+                if expect_raw:
+                    self.assertIsInstance(result, DSV4RawVerifyMetadata)
+                    backend.init_forward_metadata_target_verify_old.assert_not_called()
+                else:
+                    self.assertIs(result, eager_metadata)
+                    backend.init_forward_metadata_target_verify_old.assert_called_once()
+
     def test_build_unified_commit_inject_layout(self):
         stride, ring_stride = 7, 128
         req_pool_indices = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=torch.int32)
