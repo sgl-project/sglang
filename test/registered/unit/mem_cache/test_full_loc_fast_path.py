@@ -30,10 +30,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
+def _loc_info(virtual_loc, swa_phys=None, full_phys=None, id_space="virtual"):
     from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-    return KVWriteLoc(virtual_loc, swa_phys, full_phys)
+    return KVWriteLoc(virtual_loc, swa_phys, full_phys, id_space=id_space)
 
 
 class _RecordingPool:
@@ -41,9 +41,17 @@ class _RecordingPool:
 
     def __init__(self):
         self.calls = []
+        self.spaces = []
 
-    def set_kv_buffer(self, layer, loc, cache_k, cache_v, *args, **kwargs):
+    def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, *args, **kwargs):
+        from sglang.srt.mem_cache.memory_pool import (
+            unwrap_write_loc,
+            write_loc_id_space,
+        )
+
+        loc, _, _ = unwrap_write_loc(loc_info)
         self.calls.append((loc, kwargs))
+        self.spaces.append(write_loc_id_space(loc_info))
 
 
 class TestUnifiedSWARouting(unittest.TestCase):
@@ -152,7 +160,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     buffer base.
     """
 
-    def _make_bare_pool(self, page_size, v2p, multiplier=1):
+    def _make_bare_pool(self, page_size, v2p):
         from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
@@ -164,23 +172,21 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         swa_allocator.page_size = page_size
         swa_allocator.pool_page_size = page_size
         swa_allocator.virtual_to_physical = v2p
-        swa_allocator.kernel_page_multiplier = multiplier
         pool = object.__new__(UnifiedSWAKVPool)
         pool._swa_allocator = swa_allocator
         return pool
 
     def test_tombstoned_id_lands_on_sink(self):
-        for ps, mult in ((1, 1), (4, 1), (4, 6)):
+        for ps in (1, 4):
             v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
-            pool = self._make_bare_pool(ps, v2p, multiplier=mult)
+            pool = self._make_bare_pool(ps, v2p)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
             kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
             out = pool.translate_loc_from_full_to_swa(kv_indices)
             self.assertEqual(out.dtype, torch.int64)
             self.assertTrue(
                 bool((out >= 0).all().item()),
-                f"tombstoned swa id stayed negative at page_size={ps}, "
-                f"multiplier={mult}: {out}",
+                f"tombstoned swa id stayed negative at page_size={ps}: {out}",
             )
             self.assertEqual(int(out[1].item()), 0)
 
@@ -229,6 +235,23 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
                         # is already physical, so write it directly.
                         self.assertIs(forwarded, loc)
                     self.assertNotIn("already_physical", kwargs)
+
+    def test_forwards_the_id_space(self):
+        # The sub-pool decides on the marker, so the composite must pass it
+        # through unchanged in both directions.
+        for space in ("kernel", "virtual"):
+            pool = self._make_bare_pool()
+            pool.set_kv_buffer(
+                types.SimpleNamespace(layer_id=0),
+                _loc_info(
+                    torch.tensor([1, 2]),
+                    full_phys=torch.tensor([5, 6]),
+                    id_space=space,
+                ),
+                torch.zeros(2, 4, 8),
+                torch.zeros(2, 4, 8),
+            )
+            self.assertEqual(pool.full_kv_pool.spaces, [space])
 
 
 class _RecordingMLAPool(_RecordingPool):
@@ -297,7 +320,6 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         pool = object.__new__(MLATokenToKVPool)
         pool.size = 64
         pool.page_size = 1
-        pool.kernel_page_blocks = 1
         pool.start_layer = 0
         pool.dtype = torch.float16
         pool.store_dtype = torch.float16

@@ -53,6 +53,8 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.page_major import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -394,7 +396,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
-            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
@@ -1320,7 +1321,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, self._decode_kernel_loc, k, k_rope
+                        layer,
+                        KVWriteLoc.for_batch(forward_batch, self._decode_kernel_loc),
+                        k,
+                        k_rope,
                     )
             else:
                 # eager (or static pool): out_cache_loc is kernel-facing.
@@ -1340,7 +1344,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, k_rope
+                        layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                     )
 
         # Prepare query tensor inline (already built when the fused save-KV
@@ -1368,7 +1372,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Prepare KV cache inline
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
         metadata = (
@@ -1512,11 +1516,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             if self._decode_kernel_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_kernel_loc, k, k_rope
+                    layer,
+                    KVWriteLoc.for_batch(forward_batch, self._decode_kernel_loc),
+                    k,
+                    k_rope,
                 )
             else:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
+                    layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                 )
 
         # TODO refactor to avoid code duplication
@@ -1558,7 +1565,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bs = forward_batch.batch_size
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
             q = q.to(self.data_type)
 

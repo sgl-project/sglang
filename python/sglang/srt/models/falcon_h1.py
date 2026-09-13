@@ -345,6 +345,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
+                use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 

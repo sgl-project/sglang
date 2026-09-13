@@ -18,7 +18,9 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
-    build_mla_views,
+    DenseEntryLayout,
+    DensePart,
+    build_dense_views,
     build_page_major_mamba_views,
     mamba_entry_bytes,
     mla_entry_bytes,
@@ -31,29 +33,34 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestMLAEnvelopeTransferAddressing(CustomTestCase):
     def test_page_envelope_matches_per_layer_views(self):
-        """Every (page, layer, slot) row written through the MLA views
-        must land at raw_ptr + page * page_envelope_bytes + layer-block offset,
-        i.e. inside the page's transfer envelope."""
+        """Every (page, layer, slot) row written through the MLA views must
+        land at raw_ptr + page * page_envelope_bytes + slot * entry_bytes +
+        layer * row_bytes, i.e. inside the page's transfer envelope."""
         layer_num, page_size, kv_dim, num_pages = 3, 4, 8, 6
         store_dtype = torch.bfloat16
         row_bytes = kv_dim * store_dtype.itemsize
-        page_bytes = page_size * layer_num * row_bytes
-        self.assertEqual(
-            page_bytes,
-            page_size
-            * mla_entry_bytes(
-                layer_num=layer_num,
-                kv_cache_dim=kv_dim,
-                itemsize=store_dtype.itemsize,
+        entry_bytes = mla_entry_bytes(
+            layer_num=layer_num, kv_cache_dim=kv_dim, itemsize=store_dtype.itemsize
+        )
+        page_bytes = page_size * entry_bytes
+        layout = DenseEntryLayout(
+            entry_bytes=entry_bytes,
+            parts=(
+                DensePart(
+                    name="kv",
+                    offset_bytes=0,
+                    layer_stride_bytes=row_bytes,
+                    layer_num=layer_num,
+                    row_shape=(1, kv_dim),
+                    dtype=store_dtype,
+                ),
             ),
         )
-        # +1 page envelope of tail pad, as UnifiedKVPool allocates for MLA.
-        raw = torch.zeros((num_pages + 1) * page_bytes, dtype=torch.uint8)
-        views = build_mla_views(
+        raw = torch.zeros(num_pages * page_bytes, dtype=torch.uint8)
+        views = build_dense_views(
             raw,
-            layer_num=layer_num,
-            kv_cache_dim=kv_dim,
-            store_dtype=store_dtype,
+            layout=layout,
+            part=layout.part("kv"),
             page_size=page_size,
             num_pages=num_pages,
             anchor_bytes=0,
@@ -62,14 +69,10 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
         for page in range(num_pages):
             for layer in range(layer_num):
                 for off in range(page_size):
-                    kernel_id = page * layer_num * page_size + off
+                    token = page * page_size + off
                     val = torch.randn(kv_dim, dtype=store_dtype)
-                    views[layer][kernel_id, 0] = val
-                    start = (
-                        page * page_bytes
-                        + layer * page_size * row_bytes
-                        + off * row_bytes
-                    )
+                    views[layer][token, 0] = val
+                    start = page * page_bytes + off * entry_bytes + layer * row_bytes
                     got = raw[start : start + row_bytes].view(store_dtype)
                     self.assertTrue(torch.equal(got, val), (page, layer, off))
 

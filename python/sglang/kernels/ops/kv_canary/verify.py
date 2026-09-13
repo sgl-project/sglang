@@ -55,22 +55,23 @@ class RealKvSource:
     num_bytes_per_token``. Trailing bytes of each row are ignored by the canary; this is exactly how the
     abstraction accommodates pools whose per-row layout interleaves canary-relevant bytes with other metadata
     (layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
-    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case.
+    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case. Dim 0 may be a per-layer
+    view into a larger buffer: the kernel steps rows by ``tensor.stride(0)`` instead of ``shape[1]``.
 
     A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — the launch wrappers
     iterate the source list and fold each into the running real_kv_hash via splitmix64 (one int64 fingerprint
     per slot, regardless of source count).
 
     Pool patchers construct sources by:
-    - viewing / reshaping the underlying KV layer into the canonical [num_rows, dim1_bytes] form (no stage-copy
-      needed when the underlying storage is already row-major contiguous on dim 0),
+    - viewing the underlying KV layer as [num_rows, dim1_bytes] (a view, never a stage-copy: a copy would
+      fingerprint a stale snapshot instead of the live pool),
     - choosing ``page_size`` and ``num_bytes_per_token`` so that the access pattern above lands on the bytes
       the canary should fingerprint,
     - leaving any per-row padding / non-canary bytes in the trailing portion of each row (they will simply be
       skipped).
 
     16-byte alignment precondition: the CUDA fold kernel issues 128-bit aligned loads, so ``read_bytes``,
-    ``num_bytes_per_token``, and the row stride (``tensor.shape[1]`` in bytes) must all be positive
+    ``num_bytes_per_token``, and the row stride (``tensor.stride(0)`` in bytes) must all be positive
     multiples of 16. There is no "skip this source" sentinel — callers omit the source from their
     ``real_kv_sources`` tuple entirely (factory helpers return an empty tuple in that case).
 
@@ -113,12 +114,12 @@ class RealKvSource:
             raise ValueError(
                 f"kv-canary: RealKvSource.tensor must be at least 2-D, got shape {tuple(self.tensor.shape)}"
             )
-        row_stride_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
+        row_stride_bytes = int(self.tensor.stride(0)) * self.tensor.element_size()
         if row_stride_bytes % 16 != 0:
             raise ValueError(
-                f"kv-canary: RealKvSource.tensor dim-1 byte width must be a multiple of 16, "
+                f"kv-canary: RealKvSource.tensor row stride must be a multiple of 16 bytes, "
                 f"got {row_stride_bytes} bytes (shape={tuple(self.tensor.shape)}, "
-                f"dtype={self.tensor.dtype})"
+                f"strides={tuple(self.tensor.stride())}, dtype={self.tensor.dtype})"
             )
 
 

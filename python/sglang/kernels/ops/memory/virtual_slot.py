@@ -203,13 +203,13 @@ def write_loc_to_kernel_id_kernel(
     out_ptr,  # out: [N] int64 — kernel-facing ids
     N,  # runtime: live element count
     W,  # runtime: lanes to write; [N, W) get 0
-    stride,  # runtime: pool_page_size * kernel_page_multiplier
+    stride,  # runtime: pool_page_size (a physical id IS the kernel id)
     PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """``kernel_id(t) = v2p[t // ps] * ps * mult + t % ps``, clamped at 0.
+    """``kernel_id(t) = v2p[t // ps] * ps + t % ps``, clamped at 0.
 
     Under DCP the incoming id is WIDENED: ``loc % dcp_size`` names its owner
     and ``loc // dcp_size`` is the row. Ids this rank does not own resolve to
