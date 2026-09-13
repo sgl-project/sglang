@@ -500,6 +500,7 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        simulate_acc_len: float = 0.0,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
@@ -532,6 +533,12 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        # SGLANG_SIMULATE_ACC_LEN runs stage the drawn length here before the
+        # replay so the in-graph accept can use it (see folds_simulated_accept).
+        self._simulate_acc_len = float(simulate_acc_len)
+        self.sim_correct_len_buf = torch.zeros(
+            (self.max_bs,), dtype=torch.int64, device=device
+        )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -569,6 +576,13 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(1 if armed else 0)
 
     def begin_static_step(self, bs: int, armed: bool) -> None:
+        if armed and self.folds_simulated_accept:
+            # Draw once per step from the same host RNG the eager override uses,
+            # so the accepted lengths of a folded run match an unfolded one.
+            simulated = sample_simulated_acc_len(
+                self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
+            )
+            self.sim_correct_len_buf[:bs].fill_(simulated - 1)
         state = (bs, armed)
         if self._static_step_state == state:
             return
@@ -576,6 +590,10 @@ class DsparkVerifyEpilogue:
         self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
+
+    @property
+    def folds_simulated_accept(self) -> bool:
+        return self._simulate_acc_len > 0
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
@@ -711,6 +729,10 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+        if self.folds_simulated_accept:
+            # Same override point as the eager path: the drafts' real bonus and
+            # cap/trim are kept, only the accepted prefix length is replaced.
+            correct_len = self.sim_correct_len_buf[:bs].to(correct_len.dtype)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
