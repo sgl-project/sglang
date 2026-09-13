@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
 use crate::policies::engine_load::EngineLoadTable;
-use crate::policies::kv_events::BlockSizeOracle;
+use crate::policies::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
@@ -36,6 +36,11 @@ pub struct AppContext {
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Read-only handles `/metrics` pulls the KV storage-tier series from on
+    /// scrape. `None` when this router maintains no local tree (external
+    /// Indexer), where those series would all be a structural zero — see
+    /// [`crate::policies::kv_events::KvEventIndex::metrics_source`].
+    pub kv_metrics: Option<KvIndexMetrics>,
     ready: AtomicBool,
 }
 
@@ -91,6 +96,7 @@ impl AppContext {
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
@@ -146,6 +152,7 @@ impl AppContext {
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }

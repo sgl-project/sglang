@@ -16,7 +16,8 @@ on `/metrics` (text/plain, version 0.0.4) on the router's serving port
 
 ## Metrics covered
 
-The dashboard graphs every family the router emits:
+Families the router emits. The dashboard graphs all of them except the
+`sgl_router_kv_*` series, whose panels ship separately:
 
 | Metric | Type | What it shows |
 |---|---|---|
@@ -33,6 +34,13 @@ The dashboard graphs every family the router emits:
 | `sgl_router_stale_requests_total` | Counter | Stale-request cancellations |
 | `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes |
 | `sgl_router_sticky_total` | Counter | Sticky-session selection outcomes |
+| `sgl_router_kv_events_total` | Counter | KV-cache events the pump consumed, by `event` and storage `medium` |
+| `sgl_router_kv_event_blocks_total` | Counter | Block hashes those events carried, by `event` and `medium` |
+| `sgl_router_kv_tree_blocks` | Gauge | Blocks the tree attributes to a `worker_url` / `dp_rank`, by storage `tier` |
+| `sgl_router_kv_block_size` | Gauge | Tokens per block hash, as established from the fleet (0 until a worker reports) |
+| `sgl_router_kv_event_batches_lost_total` | Counter | KV-event batches dropped in transit, from gaps in each publisher's sequence |
+| `sgl_router_kv_tree_accounting_errors_total` | Counter | Occupancy-bookkeeping contradictions, by `reason`. Always 0 on a correct tree |
+| `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
 
 The legacy `sgl_router_overlap_blocks` metric was removed with the
 `cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,
@@ -40,7 +48,30 @@ and dashboard panels that depend on this metric before upgrading.
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting
-series immediately rather than leaving a stale value.
+series immediately rather than leaving a stale value. The `sgl_router_kv_*`
+series are pulled from the KV-event index the same way.
+
+`sgl_router_kv_tree_blocks * sgl_router_kv_block_size` for one worker and
+tier, divided by that pod's own occupancy of the tier (device:
+`sglang_kv_used_tokens + sglang_kv_evictable_tokens`; host:
+`sglang_hicache_host_used_tokens`; `tp_rank="0"`), is the tree's coverage of
+that tier. Scope both sides to the same deployment before dividing — block
+size and fleet membership both vary between them, and an unscoped ratio
+divides one fleet's tree by another's occupancy.
+
+Read it as: about 1, the tree mirrors the engine; about 0, the engine holds a
+tier routing cannot see; **above 1, the tree holds tiers a worker has already
+released** — check `sgl_router_kv_event_batches_lost_total`, because a tagged
+removal clears only its own tier and a lost batch strands the rest.
+
+`sgl_router_kv_events_total` renders every `(event, medium)` cell including
+zeros, so a `CPU_PINNED` row pinned at 0 on a hierarchical-cache fleet is
+visible rather than absent. A nonzero `block_stored/unknown` row is the
+upgrade signal: the engine is publishing a storage tier this build cannot
+rank, so the tree drops those stores rather than filing them under a guess. Comparing `sgl_router_kv_event_blocks_total` for
+`block_stored/CPU_PINNED` against the engine's `sglang_hicache_backup_tokens_total`
+needs `sum without(pool)` on the engine side, and the two are not equal
+anyway: the engine also evicts device blocks it never backed up.
 
 ## Prometheus scrape config
 
