@@ -1281,6 +1281,14 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
+def get_kv_transfer_buf_infos(pool):
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+    if isinstance(pool, MiniMaxSparseKVPool):
+        return pool.get_sparse_kv_buf_infos()
+    return pool.get_contiguous_buf_infos()
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1343,6 +1351,11 @@ def setup_state_kv_args(
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
             append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+        append_state_component(
+            kv_args,
+            StateType.MINIMAX_DENSE_KV,
+            *token_to_kv_pool.get_dense_kv_state_buf_infos(),
+        )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 

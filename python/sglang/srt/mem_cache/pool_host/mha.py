@@ -1036,6 +1036,14 @@ class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
             layout="layer_first",
         )
 
+    def get_contiguous_buf_infos(self):
+        buffers = self.k_data_refs + self.v_data_refs
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes * self.page_size for buffer in buffers],
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,

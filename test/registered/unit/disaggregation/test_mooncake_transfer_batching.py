@@ -1,12 +1,15 @@
 import concurrent.futures
+import ctypes
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -127,6 +130,61 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestMiniMaxStateTransfer(CustomTestCase):
+    def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
+        """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
+
+        def copy_bytes(session, sources, destinations, lengths):
+            for src, dst, length in zip(sources, destinations, lengths, strict=True):
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        for state in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+            for src_pages, dst_pages in (([1], [0]), ([1, 2], [0]), ([1], [0, 2])):
+                with self.subTest(state=state, src=src_pages, dst=dst_pages):
+                    src = np.arange(3, dtype=np.int32)
+                    dst = np.full(3, -1, dtype=np.int32)
+                    manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                    manager.kv_args = SimpleNamespace(
+                        state_types=[state],
+                        state_data_ptrs=[[src.ctypes.data]],
+                        state_item_lens=[[src.itemsize]],
+                        state_dim_per_tensor=[[]],
+                        state_layer_ids=[[]],
+                    )
+                    manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
+                    manager.pp_size = manager.attn_tp_size = 1
+                    manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    peer = SimpleNamespace(
+                        dst_state_data_ptrs=[[dst.ctypes.data]],
+                        dst_state_item_lens=[[dst.itemsize]],
+                        dst_state_dim_per_tensor=[[]],
+                        dst_state_layer_ids=[[]],
+                        dst_attn_tp_size=1,
+                    )
+                    kwargs = dict(
+                        req=SimpleNamespace(
+                            mooncake_session_id="cpu", dst_state_indices=[dst_pages]
+                        ),
+                        prefill_state_indices=[src_pages],
+                        executor=None,
+                        target_rank_registration_info=peer,
+                    )
+                    if state == StateType.MINIMAX_DENSE_KV and len(src_pages) != len(
+                        dst_pages
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "state index length mismatch"
+                        ):
+                            manager.maybe_send_extra(**kwargs)
+                        np.testing.assert_array_equal(dst, [-1, -1, -1])
+                    else:
+                        self.assertEqual(manager.maybe_send_extra(**kwargs), 0)
+                        np.testing.assert_array_equal(dst, [1, -1, -1])
 
 
 if __name__ == "__main__":

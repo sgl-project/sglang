@@ -643,13 +643,9 @@ class HiSparseCoordinator:
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
-            # ROCm: the decode remap creates a temporary hisparse device slot per
-            # new token (via the page_size==1 allocator path). Free the stale
-            # slot before pointing the mapping at the reserved device-buffer slot,
-            # otherwise the temporary slots leak and corrupt later swap-in lookups.
-            # CUDA keeps the original behavior: the swap-in kernel consumes only
-            # top_k_device_locs, so stale mapping entries are harmless there.
-            if _is_hip:
+            # Page-size-one allocation creates a temporary slot before remapping
+            # the new token into the request's reserved device-buffer slot.
+            if _is_hip or self.mem_pool_device.page_size == 1:
                 previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
                     compressed_locs
                 )

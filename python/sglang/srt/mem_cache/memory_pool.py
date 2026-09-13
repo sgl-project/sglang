@@ -5752,6 +5752,25 @@ class MiniMaxSparseKVPool(KVCache):
         # Main K/V only; index buffers ride the state-buffer channel.
         return self.main_pool.get_contiguous_buf_infos()
 
+    def get_sparse_kv_buf_infos(self):
+        return self._get_layer_kv_buf_infos(
+            layer_ids=sorted(self.sparse_layer_id_mapping)
+        )
+
+    def get_dense_kv_state_buf_infos(self):
+        # Dense KV uses logical device slots, independently of sparse host slots.
+        return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
+
+    def _get_layer_kv_buf_infos(self, *, layer_ids):
+        buffers = [self.get_key_buffer(layer_id) for layer_id in layer_ids] + [
+            self.get_value_buffer(layer_id) for layer_id in layer_ids
+        ]
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes * self.page_size for buffer in buffers],
+        )
+
     def get_index_k_state_buf_infos(self):
         # Per-page item_len (MHATokenToKVPool convention); index rows share the
         # main-KV `loc`, so the transfer reuses the same page-ids.

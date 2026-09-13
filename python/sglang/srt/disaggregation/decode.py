@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -531,8 +532,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            transfer_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            transfer_kv_pool
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -1459,6 +1460,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,

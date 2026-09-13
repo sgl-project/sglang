@@ -2485,17 +2485,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notif=comp_notif,
                     state_type=st,
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+                # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
                 if self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
+                        "state yet."
                     )
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(

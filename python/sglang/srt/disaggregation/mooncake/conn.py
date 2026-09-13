@@ -1530,12 +1530,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     or rc
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+                # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
                 if (
                     target_rank_registration_info is not None
@@ -1544,11 +1543,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
+                        "state yet."
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if len(src_indices) > len(dst_indices_local):
+                if st == StateType.MINIMAX_DENSE_KV:
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            f"{st.value} state index length mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                elif len(src_indices) > len(dst_indices_local):
                     src_indices = src_indices[: len(dst_indices_local)]
                 elif len(src_indices) < len(dst_indices_local):
                     dst_indices_local = dst_indices_local[: len(src_indices)]
