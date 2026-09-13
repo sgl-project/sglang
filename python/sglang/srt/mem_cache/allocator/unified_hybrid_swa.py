@@ -523,13 +523,34 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             compacted=True,
         ):
             return False
-        self.full_attn_allocator._flush(urgent=True)
-        self.swa_attn_allocator._flush(urgent=True)
+        self.full_attn_allocator.flush_for_allocation()
+        self.swa_attn_allocator.flush_for_allocation()
         return self._fits_page_demand(
             num_full_pages,
             num_swa_pages,
             compacted=False,
         )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        reclaim_plan = self.reclaim_plan(
+            num_tokens,
+            num_tokens,
+            full_evictable_tokens=tree_cache.full_evictable_size(),
+            swa_evictable_tokens=tree_cache.swa_evictable_size(),
+        )
+        if reclaim_plan is None:
+            return
+        full_reclaim, swa_reclaim = reclaim_plan
+        if full_reclaim or swa_reclaim:
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
+            )
+        # A zero-reclaim plan can still depend on compaction before allocation.
+        self.ensure_capacity(num_tokens, num_tokens)
 
     @property
     def draft_virtual_id_space(self) -> int:

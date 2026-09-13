@@ -290,6 +290,23 @@ class KVCacheConfigurator:
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
 
+    def hybrid_swa_token_capacity(
+        self,
+        *,
+        allocator: BaseTokenToKVPoolAllocator,
+        full_capacity: Optional[int],
+        swa_capacity: Optional[int],
+    ) -> int:
+        if get_memory().enable_unified_memory:
+            capacity = allocator.size_full
+            max_total_tokens = get_schedule().max_total_tokens
+            return (
+                min(capacity, max_total_tokens)
+                if max_total_tokens is not None
+                else capacity
+            )
+        return full_capacity or swa_capacity
+
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
@@ -2379,9 +2396,8 @@ class KVCacheConfigurator:
             f"{config.max_total_num_tokens}"
         )
         if max_tokens != config.max_total_num_tokens:
-            # Token-capped re-derivation: the profiled budget no longer
-            # applies; the recalced config's unified_total_bytes stays None
-            # and the factories fall back to the token-count byte sum.
+            # Re-derive the capped budget: SWA carries unified_memory_pool_bytes;
+            # Mamba factories fall back to token-count sizing without unified_total_bytes.
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
