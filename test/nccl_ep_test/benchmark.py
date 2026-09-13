@@ -43,6 +43,9 @@ def benchmark_steps(
     warmups=20,
     rounds=4,
     fixture=make_fixture,
+    run_layer=None,
+    verify=None,
+    retain_eager_output=True,
 ):
     """Shared real driver; local tests substitute only the EP library/fixtures."""
     from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
@@ -67,6 +70,8 @@ def benchmark_steps(
             "Use two layers, positive buckets, >=2 samples/warmups, even rounds >=2"
         )
     capacity = max(buckets)
+    run_layer = run_layer or forward_layer
+    verify = verify or compare
     prepared = {}
     started = time.perf_counter()
     for bucket in buckets:
@@ -95,12 +100,12 @@ def benchmark_steps(
     def forward(bucket, *, graph):
         outputs = []
         for dispatcher, inputs in zip(dispatchers, static):
-            received, counters, combined = forward_layer(
+            received, counters, combined = run_layer(
                 dispatcher, *(x[:bucket] for x in inputs), rank
             )
             # Graph combine already makes its ownership clone. Eager must also
             # retain each layer's output before the next layer reuses scratch.
-            if not graph:
+            if not graph and retain_eager_output:
                 combined = combined.clone()
             outputs.append((received, counters, combined))
         return outputs
@@ -169,7 +174,7 @@ def benchmark_steps(
                                 actual = step(mode, bucket, live)
                                 stream.synchronize()
                                 for batch, output in zip(batches, actual):
-                                    compare(batch, rank, *output)
+                                    verify(batch, rank, *output)
                                     checked += 1
                             warmup_started = time.perf_counter()
                             for iteration in range(warmups):
@@ -197,7 +202,7 @@ def benchmark_steps(
                             for batch, output in zip(
                                 pairs[(samples - 1) % 2][0], actual
                             ):
-                                compare(batch, rank, *output)
+                                verify(batch, rank, *output)
                                 checked += 1
                             records.append(
                                 {

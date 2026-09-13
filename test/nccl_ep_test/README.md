@@ -162,6 +162,57 @@ This correctness gate includes oracle checks and EPLB migration between replays;
 its wall time is not a serving throughput benchmark. Native results for the
 EPLB/SBO/TBO extensions have not yet been recorded.
 
+For full-model serving with the extensions, first run the `env` and `single`
+phases in [the serving guide](followup_validation.md#server-gates-and-cost-order)
+on the current commit. Then run a feature-specific native gate and smoke test:
+
+```bash
+python -m nccl_ep_test.followup_server extensions \
+  --features eplb sbo tbo --reports "$NCCL_EP_REPORT_DIR"
+python -m nccl_ep_test.followup_server serve \
+  --features eplb sbo tbo --reports "$NCCL_EP_REPORT_DIR"
+```
+
+You can select `eplb`, `eplb sbo`, or `eplb tbo` separately. Each configuration
+gets its own report directory. Serving requires a successful native gate for
+the same commit and feature set. It runs the pinned full DeepSeek-V2-Lite FP8
+checkpoint, checks resolved flags and actual eager/Graph decode counters, and
+requires a completed EPLB rebalance in the server log. The recipe uses two
+redundant slots, rebalance every eight iterations, a four-iteration recording
+window and two-layer migration chunks. TBO uses even decode buckets.
+
+The eight serving requests use 32 generated tokens with EOS stopping disabled
+to exercise a complete chunked rebalance. Finite logprobs and successful requests
+are smoke-test evidence, not a model-quality or throughput benchmark.
+
+For matched MoE timing with real shared/Triton experts, run the separate driver
+after native correctness passes. Use fresh torchrun processes and separate
+directories for the serial, `--sbo`, `--tbo`, and `--sbo --tbo` configurations:
+
+```bash
+timeout 15m torchrun --standalone --nproc-per-node=2 \
+  --module nccl_ep_test.overlap_benchmark --sbo --tbo \
+  --buckets 8 32 --samples 100 --warmups 20 --rounds 4 \
+  --report-dir "$NCCL_EP_REPORT_DIR/timing-sbo-tbo"
+python -m nccl_ep_test.overlap_benchmark --summarize \
+  "$NCCL_EP_REPORT_DIR/timing-sbo-tbo/overlap-rank0.json" \
+  "$NCCL_EP_REPORT_DIR/timing-sbo-tbo/overlap-rank1.json" \
+  > "$NCCL_EP_REPORT_DIR/timing-sbo-tbo/summary.json"
+```
+
+Repeat the configuration sequence in reverse order to expose order/thermal
+effects. Each process alternates eager and Graph measurement blocks, alternates
+preloaded input/routing variants within samples, and checks outputs against
+independent expert GEMMs outside timing. The summary aligns rank samples before
+computing maximum-rank median/p95. Compare like buckets, cases and execution
+modes across configurations.
+
+This measures two independent MoE layers with fixed expert placement; it excludes
+attention computation, EPLB migration, JIT, warmup, capture, barriers and oracle
+checks. It uses no EP audit wrappers or receive snapshots. TBO includes its
+staged host execution with identity attention fixtures. It does not establish
+full-model TBO throughput. Keep profiling disabled for timing measurements.
+
 ## Matched measurement and profiling
 
 Run measurement after correctness passes. Keep JIT/debug logging and profiling

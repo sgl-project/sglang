@@ -232,11 +232,17 @@ def test_nccl_ep_gate_prefers_the_binding_library_version(model_path, monkeypatc
 
 
 @pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize(
+    "features",
+    [(), ("eplb",), ("eplb", "sbo"), ("eplb", "tbo"), ("eplb", "sbo", "tbo")],
+)
 def test_followup_serving_recipe_resolves_per_rank_capacity(
-    tmp_path, monkeypatch, graph
+    tmp_path, monkeypatch, graph, features
 ):
     import argparse
+    import dataclasses
 
+    from nccl_ep_test.followup_server import check_serving_info
     from nccl_ep_test.followup_server import server_args as serving_command
     from transformers import DeepseekV2Config, GenerationConfig
 
@@ -268,7 +274,7 @@ def test_followup_serving_recipe_resolves_per_rank_capacity(
     }
     config.save_pretrained(tmp_path)
     GenerationConfig().save_pretrained(tmp_path)
-    argv = serving_command(30000, graph=graph)[3:]
+    argv = serving_command(30000, graph=graph, features=features)[3:]
     argv[argv.index("--model-path") + 1] = str(tmp_path)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
@@ -282,6 +288,9 @@ def test_followup_serving_recipe_resolves_per_rank_capacity(
         "full" if graph else "disabled"
     )
     assert resolved.cuda_graph_config.prefill.backend == "disabled"
+    check_serving_info(dataclasses.asdict(resolved), graph=graph, features=features)
+    if "tbo" in features:
+        assert min(resolved.cuda_graph_config.decode.bs) == 2
 
 
 if __name__ == "__main__":

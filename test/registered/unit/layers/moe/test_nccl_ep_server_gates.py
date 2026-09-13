@@ -13,7 +13,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from nccl_ep_test.followup_server import check_port_available, command, prerequisite
+from nccl_ep_test.followup_server import (
+    check_port_available,
+    command,
+    completed_rebalances,
+    prerequisite,
+)
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -85,6 +90,22 @@ def test_timeout_kills_child_worker_group(tmp_path):
                 os.kill(int(worker_pid.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_same_commit_gate_must_match_requested_features(tmp_path, monkeypatch):
+    monkeypatch.setattr("nccl_ep_test.followup_server.source_head", lambda: "current")
+    report = {"passed": True, "source_head": "current", "features": ["eplb", "sbo"]}
+    (tmp_path / "extensions.json").write_text(json.dumps(report))
+    with pytest.raises(RuntimeError, match="same feature configuration"):
+        prerequisite(tmp_path, "extensions.json", features=("eplb", "tbo"))
+    assert prerequisite(tmp_path, "extensions.json", features=("eplb", "sbo")) == report
+
+
+def test_rebalance_start_or_skip_is_not_completion():
+    log = "[EPLBManager] rebalance start\n[EPLBManager] Skipped ep rebalancing"
+    with pytest.raises(RuntimeError, match="finished EPLB rebalance"):
+        completed_rebalances(log)
+    assert completed_rebalances(log + "\n[TP0] [EPLBManager] rebalance end\n") == 1
 
 
 if __name__ == "__main__":

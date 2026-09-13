@@ -34,10 +34,12 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def prerequisite(reports, name):
+def prerequisite(reports, name, *, features=None):
     record = json.loads((reports / name).read_text())
     if not record.get("passed") or record.get("source_head") != source_head():
         raise RuntimeError(f"Required successful gate for this commit: {name}")
+    if features is not None and record.get("features") != list(features):
+        raise RuntimeError(f"Required gate for the same feature configuration: {name}")
     return record
 
 
@@ -115,7 +117,7 @@ def environment():
     }
 
 
-def server_args(port, *, graph=True):
+def server_args(port, *, graph=True, features=()):
     args = [
         sys.executable,
         "-m",
@@ -154,7 +156,7 @@ def server_args(port, *, graph=True):
         "--nccl-ep-num-max-dispatch-tokens-per-rank",
         "64",
         "--cuda-graph-bs-decode",
-        "1",
+        "2" if "tbo" in features else "1",
         "8",
         "16",
         "32",
@@ -172,7 +174,51 @@ def server_args(port, *, graph=True):
     ]
     if graph:
         args.append("--enable-nccl-ep-cuda-graph")
+    if "eplb" in features:
+        args += [
+            "--enable-eplb",
+            "--ep-num-redundant-experts",
+            "2",
+            "--eplb-rebalance-num-iterations",
+            "8",
+            "--expert-distribution-recorder-buffer-size",
+            "4",
+            "--eplb-rebalance-layers-per-chunk",
+            "2",
+        ]
+    if "sbo" in features:
+        args.append("--enable-single-batch-overlap")
+    if "tbo" in features:
+        args.append("--enable-two-batch-overlap")
     return args
+
+
+def check_serving_info(info, *, graph, features=()):
+    assert info["moe_a2a_backend"] == "nccl_ep"
+    assert info["moe_runner_backend"] == "triton"
+    assert info["disable_shared_experts_fusion"]
+    assert info["enable_nccl_ep_cuda_graph"] == graph
+    assert 0 < info["chunked_prefill_size"] <= 64
+    for feature, option in (
+        ("eplb", "enable_eplb"),
+        ("sbo", "enable_single_batch_overlap"),
+        ("tbo", "enable_two_batch_overlap"),
+    ):
+        assert info[option] == (feature in features), f"Unexpected resolved {option}"
+    if "eplb" in features:
+        assert info["ep_num_redundant_experts"] == 2
+        assert info["eplb_rebalance_num_iterations"] == 8
+        assert info["expert_distribution_recorder_buffer_size"] == 4
+        assert info["eplb_rebalance_layers_per_chunk"] == 2
+
+
+def completed_rebalances(log):
+    count = log.count("[EPLBManager] rebalance end")
+    if not count:
+        raise RuntimeError(
+            "Serving completed without evidence of a finished EPLB rebalance"
+        )
+    return count
 
 
 def check_port_available(port):
@@ -184,7 +230,7 @@ def check_port_available(port):
         probe.bind(("127.0.0.1", port))
 
 
-def serving_smoke(reports, port, *, graph):
+def serving_smoke(reports, port, *, graph, features=()):
     label = "graph" if graph else "eager"
     base = f"http://127.0.0.1:{port}"
     check_port_available(port)
@@ -200,7 +246,7 @@ def serving_smoke(reports, port, *, graph):
     responses = []
     with (reports / f"serve-{label}.log").open("w") as log:
         process = subprocess.Popen(
-            server_args(port, graph=graph),
+            server_args(port, graph=graph, features=features),
             cwd=REPO,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -219,11 +265,7 @@ def serving_smoke(reports, port, *, graph):
                         raise TimeoutError("Server startup exceeded 600 seconds")
                     time.sleep(1)
             info = json.loads(request("/server_info"))
-            assert info["moe_a2a_backend"] == "nccl_ep"
-            assert info["moe_runner_backend"] == "triton"
-            assert info["disable_shared_experts_fusion"]
-            assert info["enable_nccl_ep_cuda_graph"] == graph
-            assert 0 < info["chunked_prefill_size"] <= 64
+            check_serving_info(info, graph=graph, features=features)
             save(reports / f"serve-{label}-info.json", info)
 
             def generate(index):
@@ -241,6 +283,10 @@ def serving_smoke(reports, port, *, graph):
                     },
                     "return_logprob": True,
                 }
+                if "eplb" in features:
+                    # Complete the 27-layer rebalance in two-layer chunks,
+                    # including serial requests before the concurrent phase.
+                    body["sampling_params"].update(max_new_tokens=32, ignore_eos=True)
                 result = json.loads(request("/generate", body))
                 assert isinstance(result["text"], str)
                 meta = result["meta_info"]
@@ -273,20 +319,45 @@ def serving_smoke(reports, port, *, graph):
                 )
             )
             assert passes > 0, f"No actual {mode} passes observed"
-            return {"mode": label, "requests": responses, "decode_passes": passes}
+            result = {
+                "mode": label,
+                "requests": responses,
+                "decode_passes": passes,
+                "features": list(features),
+            }
+            if "eplb" in features:
+                result["completed_rebalances"] = completed_rebalances(
+                    (reports / f"serve-{label}.log").read_text()
+                )
+            return result
         finally:
             stop_process_group(process)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("env", "single", "pair", "serve"))
+    parser.add_argument(
+        "phase", choices=("env", "single", "pair", "extensions", "serve")
+    )
     parser.add_argument("--reports", type=Path, required=True)
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument(
+        "--features", nargs="+", choices=("eplb", "sbo", "tbo"), default=[]
+    )
     args = parser.parse_args()
-    reports = args.reports.resolve()
+    features = tuple(name for name in ("eplb", "sbo", "tbo") if name in args.features)
+    if args.phase == "extensions" and "eplb" not in features:
+        parser.error("the extension gate requires --features eplb [sbo] [tbo]")
+    if features and (
+        args.phase not in ("extensions", "serve") or "eplb" not in features
+    ):
+        parser.error("use --features eplb [sbo] [tbo] with extensions or serve")
+    root_reports = args.reports.resolve()
+    reports = root_reports / "-".join(features) if features else root_reports
     reports.mkdir(parents=True, exist_ok=True)
     result = {"phase": args.phase, "source_head": source_head(), "passed": False}
+    if features:
+        result["features"] = list(features)
     target = reports / f"{args.phase}.json"
     save(target, result)
     try:
@@ -361,15 +432,53 @@ def main():
                 for rank in range(2)
             ]
             assert all(record["passed"] for record in result["ranks"])
+        elif args.phase == "extensions":
+            prerequisite(root_reports, "single.json")
+            command(
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node=2",
+                    "-m",
+                    "nccl_ep_test.eplb_pair",
+                    "--replays",
+                    "100",
+                    "--generations",
+                    "2",
+                    "--report-dir",
+                    str(reports),
+                    *(f"--{feature}" for feature in features if feature != "eplb"),
+                ],
+                reports / "extensions.log",
+                timeout=1200,
+            )
+            result["ranks"] = [
+                json.loads(
+                    (reports / f"{'-'.join(features)}-rank{rank}.json").read_text()
+                )
+                for rank in range(2)
+            ]
+            for rank, record in enumerate(result["ranks"]):
+                assert record["rank"] == rank and record["checked"] == 200
+                assert record["generations"] == 2
+                assert record["sbo"] == ("sbo" in features)
+                assert record["tbo"] == ("tbo" in features)
         else:
-            prerequisite(reports, "pair.json")
+            if features:
+                prerequisite(reports, "extensions.json", features=features)
+            else:
+                prerequisite(reports, "pair.json")
             from .environment import binding_check, prepare_jit
 
             result["bindings"] = binding_check()
             result["jit"] = prepare_jit()  # Export paths to the server subprocesses.
             result["serving"] = []
             for graph in (False, True):
-                result["serving"].append(serving_smoke(reports, args.port, graph=graph))
+                result["serving"].append(
+                    serving_smoke(reports, args.port, graph=graph, features=features)
+                )
                 save(target, result)  # Preserve eager evidence if Graph later fails.
             result["model_revision"] = REVISION
             result["full_model_accuracy_benchmark"] = False
