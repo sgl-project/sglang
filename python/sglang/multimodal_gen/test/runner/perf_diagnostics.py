@@ -2,6 +2,7 @@
 
 import json
 import os
+import platform
 import re
 import subprocess
 import tempfile
@@ -15,6 +16,17 @@ import pynvml
 
 _ROOT_ENV = "SGLANG_DIFFUSION_DIAGNOSTICS_DIR"
 _ATTEMPT_ENV = "SGLANG_DIFFUSION_DIAGNOSTICS_ATTEMPT_DIR"
+_PERFORMANCE_ENV = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "OMP_WAIT_POLICY",
+    "KMP_BLOCKTIME",
+    "CUDA_LAUNCH_BLOCKING",
+    "NCCL_NVLS_ENABLE",
+    "SGLANG_IS_IN_CI",
+    "RUNAI_STREAMER_MEMORY_LIMIT",
+)
 _BOUNDARIES = (
     ("case_begin", re.compile(r"BEGIN diffusion testcase: ([\w.-]+)")),
     ("case_end", re.compile(r"END diffusion testcase: ([\w.-]+)")),
@@ -170,6 +182,9 @@ class AttemptDiagnostics:
                 "torch",
                 "triton",
                 "flashinfer-python",
+                "flashinfer-cubin",
+                "flashinfer-jit-cache",
+                "sglang-kernel",
                 "diffusers",
                 "transformers",
                 "cuda-python",
@@ -183,6 +198,18 @@ class AttemptDiagnostics:
             commit = subprocess.run(
                 ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5
             )
+            cpu_model = None
+            try:
+                cpu_model = next(
+                    (
+                        line.partition(":")[2].strip()
+                        for line in Path("/proc/cpuinfo").read_text().splitlines()
+                        if line.startswith("model name")
+                    ),
+                    None,
+                )
+            except OSError:
+                pass
             _write_event(
                 self.events,
                 "attempt_begin",
@@ -190,6 +217,13 @@ class AttemptDiagnostics:
                 commit=commit.stdout.strip() if commit.returncode == 0 else None,
                 packages=packages,
                 machine=os.uname().machine,
+                python_version=platform.python_version(),
+                kernel_release=platform.release(),
+                cpu_model=cpu_model,
+                cpu_count=os.cpu_count(),
+                performance_env={
+                    name: os.environ.get(name) for name in _PERFORMANCE_ENV
+                },
                 run_id=os.environ.get("GITHUB_RUN_ID"),
                 run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),
                 partition=os.environ.get("DIFFUSION_PARTITION_ID"),

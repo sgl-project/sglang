@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -26,6 +27,25 @@ def test_disabled(monkeypatch, tmp_path):
     diagnostics.finish(1)
     assert diagnostics.directory is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_attempt_environment_is_allowlisted(monkeypatch, tmp_path):
+    monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path))
+    monkeypatch.setenv("OMP_NUM_THREADS", "16")
+    monkeypatch.setenv("HF_TOKEN", "do-not-retain-this-token")
+    monkeypatch.setenv("UNRELATED_SECRET", "do-not-retain-this-secret")
+    diagnostics = perf_diagnostics.AttemptDiagnostics(1)
+    diagnostics.finish(0)
+    path = diagnostics.directory / "events.jsonl"
+    event = _events(path)[0]
+    assert event["python_version"] == platform.python_version()
+    assert event["kernel_release"] == platform.release()
+    assert event["cpu_count"] == os.cpu_count()
+    assert event["performance_env"]["OMP_NUM_THREADS"] == "16"
+    assert set(event["performance_env"]) == set(perf_diagnostics._PERFORMANCE_ENV)
+    for package in ("flashinfer-cubin", "flashinfer-jit-cache", "sglang-kernel"):
+        assert package in event["packages"]
+    assert "do-not-retain" not in path.read_text()
 
 
 def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
