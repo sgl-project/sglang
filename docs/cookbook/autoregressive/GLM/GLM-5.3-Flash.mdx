@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang on NVIDIA GPUs or MI355X, including official FP8 and OneNexus MXFP4 recipes on ROCm."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, and MI355X, with MTP and multimodal serving."
 tag: NEW
 ---
 
@@ -20,40 +20,32 @@ For the listed NVIDIA hardware, the deployment panel can render a complete `dock
 
 </Accordion>
 
-<Accordion title="Prepare MI355X (official FP8 or OneNexus MXFP4)">
+<Accordion title="Prepare MI355X (FP8 or MXFP4)">
 
-Use four MI355X GPUs on one ROCm host. The MI355X commands require the
-[runtime changes in PR #39273](https://github.com/sgl-project/sglang/pull/39273),
-which also include the serving changes from #38547. The stock ROCm image alone
-does not include this PR. Follow the
-[pinned ROCm image, source-overlay, and Native Transformers setup](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4/blob/81433d9bc3cac517e4904518c3d020dd245a2fb8/reproduction/public-serving-recipe.md)
-before launching the Python-tab command. Its relative model/tokenizer paths
-refer to the directory containing these downloads: make that directory the
-working directory in the prepared ROCm environment (bind-mount it there if
-using a container). The exact benchmark container instead mounted the selected
-checkpoint at `/model` and the tokenizer at `/tokenizer`; change those two
-paths if reusing that launch verbatim. The measured run used four gfx950 VFs;
-adjust device access and NUMA placement to your host.
+Use four MI355X GPUs on one ROCm host and an SGLang build that includes
+[PR #39273](https://github.com/sgl-project/sglang/pull/39273). See the
+[MXFP4 model card](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4)
+for ROCm image and dependency setup.
+
+Download your chosen checkpoint and the shared tokenizer below. Run the
+generated **Python** command from this directory inside the ROCm environment.
 
 ```bash Command
+# FP8 checkpoint
 hf download zai-org/GLM-5.3-Flash \
   --revision 690b705278a3a58e538fcb37c2ca8b5f9511213c \
   --local-dir model-glm53-fp8
+# Or MXFP4 checkpoint
 hf download OneNexus/GLM-5.3-Flash-MXFP4 \
   --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
   --local-dir model-glm53-mxfp4
+# Shared tokenizer for either checkpoint
 hf download OneNexus/GLM-5.3-Flash-MXFP4 \
   --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
   --include config.json generation_config.json processor_config.json \
     tokenizer.json tokenizer_config.json chat_template.jinja \
   --local-dir tokenizer-glm53
 ```
-
-The FP8 and MXFP4 commands use the same pinned tokenizer and FP8 KV cache;
-only the checkpoint and its declared quantization path differ. The MI355X
-selector exposes Python commands because no published image includes the PR
-source yet. The source-qualified MXFP4 serving checks and the frozen AgentX
-frontier are [recorded separately](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4/tree/81433d9bc3cac517e4904518c3d020dd245a2fb8/reproduction).
 
 </Accordion>
 
@@ -108,7 +100,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>Official FP8 weights, or OneNexus Quark MXFP4 on MI355X; FP8 KV cache by default on Blackwell and MI355X, BF16 KV cache on H100 and H200</td>
+      <td style={{padding: "9px 12px"}}>Official FP8 weights, or MXFP4 on MI355X; FP8 KV cache by default on Blackwell and MI355X, BF16 KV cache on H100 and H200</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>

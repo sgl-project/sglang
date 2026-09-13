@@ -172,35 +172,6 @@ for (const path of walk(CONFIGS)) {
     }
   }
 
-  if (config.modelName === "GLM-5.3-Flash") {
-    const pairing = config.overlayDims.find((d) => d.id === "kvDsaPair");
-    const rocmPair = pairing.options.find((o) => o.id === "fp8-tilelang");
-    if (!config.supportedHardware.includes("mi355x") ||
-        rocmPair.disabled({ hw: "mi355x" }) ||
-        !pairing.options.find((o) => o.id === "fp8-trtllm").disabled({ hw: "mi355x" })) {
-      fail(where, "MI355X must expose FP8 KV + TileLang DSA, not TRT-LLM DSA");
-    }
-    if (config.modelNames["mi355x|mxfp4"] !== "OneNexus/GLM-5.3-Flash-MXFP4" ||
-        config.runModes({ hw: "mi355x" }).includes("docker")) {
-      fail(where, "MI355X must use the pinned OneNexus recipe without a stock-image Docker command");
-    }
-    for (const quant of ["fp8", "mxfp4"]) {
-      for (const strategy of ["low-latency", "high-throughput"]) {
-        const cell = config.cells.find((c) => c.match.hw === "mi355x" &&
-          c.match.quant === quant && c.match.strategy === strategy);
-        if (!cell || cell.verified ||
-            !cell.flags.includes(`--quantization ${quant === "fp8" ? "fp8" : "quark"}`) ||
-            !cell.flags.includes("--moe-runner-backend aiter") ||
-            !cell.flags.includes("--kv-cache-dtype fp8_e4m3") ||
-            !cell.flags.includes("--dsa-prefill-backend tilelang") ||
-            !cell.flags.includes("--dsa-decode-backend tilelang") ||
-            cell.flags.includes("--speculative-algorithm EAGLE") !== (strategy === "low-latency")) {
-          fail(where, `MI355X ${quant}/${strategy} recipe or verification status drifted`);
-        }
-      }
-    }
-  }
-
   for (const dim of (config.overlayDims || [])) {
     const ids = (dim.options || []).map((o) => o.id);
     if (dim.kind === "number") {

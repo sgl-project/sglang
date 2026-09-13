@@ -21,7 +21,7 @@ export const config = {
           id: "mxfp4",
           label: "MXFP4",
           disabled: (s) => s.hw !== "mi355x",
-          disableReason: "The OneNexus Quark MXFP4 recipe is qualified on MI355X only.",
+          disableReason: "The MXFP4 recipe is qualified on MI355X only.",
         },
         {
           id: "nvfp4",
