@@ -48,7 +48,9 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     get_exec,
+    get_forward,
     get_lora,
     get_parallel,
     get_schedule,
@@ -495,6 +497,7 @@ class LoRAManager:
 
         active_lora_ids = set(forward_batch.lora_ids)
         if self.enable_dp_attention:
+            get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
             gathered_lora_ids = get_parallel().tp_group.all_gather_object(
                 forward_batch.lora_ids
             )
