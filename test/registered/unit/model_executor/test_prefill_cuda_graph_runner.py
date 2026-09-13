@@ -202,61 +202,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(capture.runner, prefill_runner)
 
-    def test_eagle_target_tc_piecewise_still_captures_prefill_graph(self):
-        """The EAGLE target now captures FULL on tc_piecewise too, so a
-        sub-FULL server ceiling leaves no dead graph behind and the capture must
-        not fall back to eager."""
-        eager_runner = object()
-        prefill_runner = object()
-        # Bag leaves; the hidden-state ceiling is held below FULL on purpose.
-        override = get_context().override_server_args(
-            enable_lora=False,
-            enable_return_hidden_states=True,
-            return_hidden_states_mode="last",
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(bs=[1], backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        model_runner = SimpleNamespace(
-            device="cuda",
-            gpu_id=0,
-            is_draft_worker=False,
-            lora_manager=None,
-            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-            server_args=SimpleNamespace(),
-            model=SimpleNamespace(),
-            model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
-            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
-            req_to_token_pool=SimpleNamespace(size=1),
-            get_cuda_graph_layers=lambda _layer_model: ([object()], [], [], [], [None]),
-        )
-        language_model = SimpleNamespace(layers=[object()])
-
-        with (
-            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
-            patch.object(
-                graph_setup, "resolve_language_model", return_value=language_model
-            ),
-            patch.object(
-                graph_setup,
-                "get_available_gpu_memory",
-                side_effect=[10.0, 9.5],
-            ),
-            patch.object(
-                graph_setup,
-                "PrefillCudaGraphRunner",
-                return_value=prefill_runner,
-            ),
-        ):
-            capture = capture_prefill_graph(
-                model_runner=model_runner,
-                eager_runner=eager_runner,
-            )
-
-        self.assertIs(capture.runner, prefill_runner)
-
     def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.raw_num_tokens = 3
@@ -400,16 +345,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                     static.global_num_tokens_gpu, torch.full((8,), 4)
                 )
 
-    def test_eagle_target_full_reaches_graph_construction(self):
-        override = get_context().override_server_args(
-            enable_return_hidden_states=True,
-            return_hidden_states_mode="last",
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend=Backend.FULL)
-            ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
+    def test_eagle_target_reaches_graph_construction(self):
         model_runner = SimpleNamespace(
             is_draft_worker=False,
             lora_manager=None,
@@ -417,18 +353,29 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
         )
 
-        with (
-            patch.object(
-                graph_setup,
-                "resolve_language_model",
-                side_effect=RuntimeError("reached graph construction"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "reached graph construction"),
-        ):
-            capture_prefill_graph(
-                model_runner=model_runner,
-                eager_runner=object(),
-            )
+        for backend in (Backend.FULL, Backend.TC_PIECEWISE):
+            # Both backends must pass the EAGLE setup gate despite a server
+            # ceiling of LAST. Stop at model resolution before allocating GPUs.
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(
+                    enable_return_hidden_states=True,
+                    return_hidden_states_mode="last",
+                    cuda_graph_config=SimpleNamespace(
+                        prefill=SimpleNamespace(backend=backend)
+                    ),
+                ),
+                patch.object(
+                    graph_setup,
+                    "resolve_language_model",
+                    side_effect=RuntimeError("reached graph construction"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "reached graph construction"),
+            ):
+                capture_prefill_graph(
+                    model_runner=model_runner,
+                    eager_runner=object(),
+                )
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         graph_config = SimpleNamespace(
@@ -640,49 +587,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
-
-
-class _StopInit(Exception):
-    """Ends __init__ right after the capture-mode block, before buffers."""
-
-
-class TestPrefillCudaGraphRunnerCaptureHiddenMode(CustomTestCase):
-    """An EAGLE draft must capture LAST for tc_piecewise replay."""
-
-    def test_eagle_draft_tc_piecewise_captures_last(self):
-        override = get_context().override_server_args(
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(bs=[4], backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        model_runner = SimpleNamespace(
-            device="cpu",
-            gpu_id=0,
-            is_draft_worker=True,
-            is_generation=True,
-            lora_manager=None,
-            spec_algorithm=SimpleNamespace(
-                is_eagle=lambda: True,
-                is_dflash_family=lambda: False,
-            ),
-            server_args=SimpleNamespace(tp_size=1, enable_pdmux=False),
-            model=SimpleNamespace(),
-            model_config=SimpleNamespace(is_multimodal=False),
-            req_to_token_pool=SimpleNamespace(size=8),
-        )
-
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        with (
-            get_parallel().override(attn_tp_size=1, attn_tp_rank=0),
-            patch.object(
-                PrefillCudaGraphRunner, "_is_mamba_track_enabled", side_effect=_StopInit
-            ),
-            self.assertRaises(_StopInit),
-        ):
-            PrefillCudaGraphRunner.__init__(runner, model_runner)
-        self.assertEqual(runner.capture_hidden_mode, CaptureHiddenMode.LAST)
 
 
 if __name__ == "__main__":

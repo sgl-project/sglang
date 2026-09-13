@@ -27,6 +27,44 @@ _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def test_hip_prefill_padding_uses_inert_request_slot(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        # Exercise the shared expansion and HIP adapter, stopping before the
+        # downstream GPU attention/compressor work.
+        backend = SimpleNamespace(
+            req_to_token=torch.empty(0),
+            make_core_attn_metadata=lambda **metadata: SimpleNamespace(**metadata),
+            _attach_unified_kv_prefill_meta=lambda *args, **kwargs: None,
+        )
+        for capacity in (3, 6):
+            with self.subTest(capacity=capacity):
+                req_ids = torch.tensor([7, 11], dtype=torch.int32)
+                metadata = DeepseekV4HipRadixBackend.init_forward_metadata_prefill(
+                    backend,
+                    max_seq_len=16,
+                    req_pool_indices=req_ids,
+                    seq_lens=torch.tensor([9, 12], dtype=torch.int32),
+                    seq_lens_cpu=[9, 12],
+                    out_cache_loc=torch.zeros(capacity, dtype=torch.int64),
+                    num_tokens=3,
+                    extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+                    extend_seq_lens_cpu=[2, 1],
+                    need_compress=False,
+                    use_prefill_cuda_graph=True,
+                ).core_attn_metadata
+                self.assertEqual(
+                    metadata.req_pool_indices_repeated.tolist(),
+                    [7, 7, 11] + [0] * (capacity - 3),
+                )
+                self.assertEqual(
+                    metadata.seq_lens_casual.tolist(),
+                    [8, 9, 12] + [1] * (capacity - 3),
+                )
+                self.assertEqual(req_ids.tolist(), [7, 11])
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
