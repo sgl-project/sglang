@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 mod chat;
 mod completions;
 mod models;
+mod ollama;
 mod reasoning;
 mod template;
 mod template_builtins;
@@ -40,6 +41,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(ollama::routes())
 }
 
 /// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
