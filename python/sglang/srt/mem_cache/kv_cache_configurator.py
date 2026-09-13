@@ -1530,7 +1530,6 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
-
         is_arch35 = is_npu_arch35()
         use_compact_indexer_layout = (
             is_dsa_model
@@ -1552,7 +1551,7 @@ class KVCacheConfigurator:
         )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -2047,8 +2046,13 @@ class KVCacheConfigurator:
                     )
 
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        # DCP allocation is in the global virtual loc space.
+                        # The target attention path localizes these locs when
+                        # building rank-local metadata; draft/indexer paths
+                        # consume the allocator locs directly.
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,

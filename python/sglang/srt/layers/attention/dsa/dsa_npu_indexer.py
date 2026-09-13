@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -213,6 +214,23 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
+        indexer_cache_loc = forward_batch.out_cache_loc
+        parallel = get_parallel()
+        if (
+            parallel.dcp_enabled
+            and parallel.attn_dcp_size > 1
+            and not get_attn_backend().is_draft_worker
+        ):
+            indexer_cache_loc = (
+                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
+            )
+            assert indexer_cache_loc is not None, (
+                "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
+            )
+            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
+                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+            )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
@@ -222,7 +240,7 @@ class DSANPUIndexerMixin:
             pool.set_index_k_scale_buffer(
                 layer_id, forward_batch.out_cache_loc, k_scale
             )
-        pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
+        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
