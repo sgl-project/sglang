@@ -2292,13 +2292,14 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _process_logprobs_tokens(
-        self, logprobs: LogProbs, use_token_index: bool = False
+        self, logprobs: LogProbs
     ) -> List[ChatCompletionTokenLogprob]:
-        """Common helper to process logprobs tokens for both streaming and non-streaming
+        """Common helper to process logprobs tokens for both streaming and non-streaming.
 
-        Args:
-            logprobs: LogProbs data from model
-            use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
+        The caller passes token-aligned lists: non-streaming passes the full
+        sequence, streaming passes this chunk's segment (sliced here, or
+        already sliced by the incremental path). Each token therefore uses its
+        own top_logprobs entry.
         """
         token_logprobs = []
 
@@ -2308,12 +2309,7 @@ class OpenAIServingChat(OpenAIServingBase):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
-                # - Non-streaming (use_token_index=True): uses token_idx for full data
-                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
-                top_logprobs_idx = token_idx if use_token_index else 0
-                for top_token, top_logprob in logprobs.top_logprobs[
-                    top_logprobs_idx
-                ].items():
+                for top_token, top_logprob in logprobs.top_logprobs[token_idx].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(
                         TopLogprob(
@@ -2340,7 +2336,7 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
+        token_logprobs = self._process_logprobs_tokens(logprobs)
         return ChoiceLogprobs(content=token_logprobs)
 
     def _process_tool_call_id(
@@ -2510,7 +2506,7 @@ class OpenAIServingChat(OpenAIServingBase):
             output_top_logprobs=output_top_logprobs,
         )
 
-        token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
+        token_logprobs = self._process_logprobs_tokens(logprobs)
         return ChoiceLogprobs(content=token_logprobs)
 
     def _process_reasoning_stream(
