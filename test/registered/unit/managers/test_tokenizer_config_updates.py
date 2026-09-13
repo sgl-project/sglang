@@ -10,6 +10,9 @@ import re
 import unittest
 from pathlib import Path
 
+import msgspec
+import msgspec.structs
+
 import sglang
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -85,14 +88,15 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         )
 
     def test_the_dump_snapshot_identifies_the_running_checkpoint(self):
-        import dataclasses
 
         manager = _manager(self, load_format="auto")
         manager.model_path = "at-startup"
         manager.served_model_name = "at-startup"
         manager._update_model_path_info("after-reload", "dummy")
 
-        snapshot = manager.resolved_config_dict(dataclasses.asdict(manager.server_args))
+        snapshot = manager.resolved_config_dict(
+            msgspec.structs.asdict(manager.server_args)
+        )
         self.assertEqual(snapshot["model_path"], "after-reload")
         self.assertEqual(snapshot["served_model_name"], "after-reload")
         self.assertEqual(snapshot["load_format"], "dummy")
@@ -116,7 +120,6 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         self.assertIsNone(manager._dump_config_snapshot())
 
     def test_an_unpickleable_field_does_not_lose_the_dump(self):
-        import dataclasses
         import pickle
 
         # What --custom-sigquit-handler leaves on a real ServerArgs.
@@ -128,7 +131,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             "server_args": manager.server_args,
             "config_updates": get_context().overrides_log(),
             "resolved_config": manager.resolved_config_dict(
-                dataclasses.asdict(manager.server_args)
+                msgspec.structs.asdict(manager.server_args)
             ),
             "requests": [],
         }

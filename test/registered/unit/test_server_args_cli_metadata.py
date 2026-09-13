@@ -3,7 +3,7 @@
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.srt.utils.common import human_readable_int
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -23,7 +23,9 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         }
 
     def test_argparse_shape_is_preserved_for_representative_migrated_options(self):
-        self.assertEqual(self.actions_by_option["--dtype"].default, ServerArgs.dtype)
+        self.assertEqual(
+            self.actions_by_option["--dtype"].default, _declared_default("dtype")
+        )
         self.assertEqual(
             self.actions_by_option["--dtype"].choices,
             ["auto", "half", "float16", "bfloat16", "float", "float32"],
@@ -45,7 +47,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         )
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "hrrn",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,

@@ -33,6 +33,13 @@ def _try_cuda_backend() -> bool:
     return _cuda_backend_enabled
 
 
+def _is_cpu_engine() -> bool:
+    # Lazy import to avoid circular dependency issues and unnecessary imports on module load
+    from sglang.srt.utils.common import is_cpu
+
+    return is_cpu()
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
@@ -140,10 +147,13 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
+            if _is_cpu_engine():
+                return batch.data
             return batch.data if batch.data.is_cuda else batch.data.pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            output = torch.from_numpy(arr)
+            return output if _is_cpu_engine() else output.pin_memory()
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -177,6 +187,8 @@ class VideoDecoderWrapper:
                 results[idx] = future.result()
 
         output = torch.cat(results, dim=0)
+        if _is_cpu_engine():
+            return output
         return output if output.is_cuda else output.pin_memory()
 
     @property
