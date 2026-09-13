@@ -55,11 +55,11 @@ class BasicDecodeCorrectnessMixin:
         self.assertIn("yellow", out.lower())
 
     def test_ascii_ratio(self):
-        # Language-agnostic gibberish detector. Healthy English output is
-        # >90% printable ASCII; multilingual token salad / Unicode noise
-        # from broken weight load drops well below 50%.
+        # This probe expects English output. Use explicit English Q/A framing
+        # because raw completion prompts can produce coherent multilingual
+        # continuations that fall below the printable-ASCII threshold.
         out = self._decode_generate(
-            "Write a single sentence about a sunny day in the park.",
+            "Q: Write a single sentence in English about a sunny day in the park.\nA:",
             self.sanity_max_new_tokens_long,
         )
         printable = sum(1 for c in out if 32 <= ord(c) < 127 or c in "\n\t")
