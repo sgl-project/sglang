@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import logging
 import unittest
+import weakref
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
+    init_logger,
 )
 
 
@@ -25,6 +28,75 @@ class TestSuppressNoisyDependencyLogs(unittest.TestCase):
             captured.output,
             ["WARNING:torch.utils._pytree:unrelated pytree warning"],
         )
+
+
+class TestLogOnceTakesFormatArgs(unittest.TestCase):
+    """`warning_once(msg, *args)` must format, not raise.
+
+    The helpers took only the message, so every caller that formatted lazily --
+    the way logger.warning wants -- raised TypeError instead of logging. Three
+    call sites did, and each sat on a branch that rarely runs, so the bug was
+    invisible: cfg_parallel_utils only reaches its call when a CFG-parallel
+    group has more ranks than branches, which input validation used to reject
+    outright. Removing that rejection turned the latent TypeError into a crash
+    on the first single-branch request.
+    """
+
+    def test_warning_once_formats_lazy_args(self):
+        logger = init_logger("sglang.test.logonce.warning")
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("cfg_parallel_size=%d > n_branches=%d", 2, 1)
+        self.assertIn("cfg_parallel_size=2 > n_branches=1", captured.output[0])
+
+    def test_info_once_formats_lazy_args(self):
+        logger = init_logger("sglang.test.logonce.info")
+        with self.assertLogs(logger, level=logging.INFO) as captured:
+            logger.info_once("degree %d on %d GPUs", 2, 2)
+        self.assertIn("degree 2 on 2 GPUs", captured.output[0])
+
+    def test_record_points_at_the_caller(self):
+        """The record must name the caller's file, not this helper's.
+
+        The helpers exist so `warning_once` reads like `warning`, and that
+        includes where the line came from -- the original code set stacklevel
+        explicitly for it. Nesting the helper deeper moves that frame, and a
+        wrong stacklevel silently relabels every warning_once in the package as
+        coming from logging_utils.py.
+        """
+        logger = init_logger("sglang.test.logonce.stacklevel")
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("from the caller %d", 1)
+        self.assertEqual(captured.records[0].filename, "test_logging_utils.py")
+
+    def test_arguments_are_not_retained(self):
+        """The once-cache must key on text, not on the arguments.
+
+        An lru_cache keyed on the arguments holds a strong reference to each of
+        them for the life of the process, and callers in this package pass
+        tensors. Formatting first and caching the result keeps only strings.
+        """
+        logger = init_logger("sglang.test.logonce.retain")
+
+        class _Heavy:
+            def __repr__(self):
+                return "<heavy>"
+
+        obj = _Heavy()
+        ref = weakref.ref(obj)
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("holding %s", obj)
+        self.assertIn("<heavy>", captured.output[0])
+        del obj
+        gc.collect()
+        self.assertIsNone(ref(), "the once-cache kept the argument alive")
+
+    def test_same_message_and_args_logs_once(self):
+        logger = init_logger("sglang.test.logonce.dedup")
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("idle ranks: %d", 1)
+            logger.warning_once("idle ranks: %d", 1)
+            logger.warning_once("idle ranks: %d", 2)  # different args, new line
+        self.assertEqual(len(captured.output), 2, captured.output)
 
 
 if __name__ == "__main__":

@@ -101,15 +101,34 @@ class SortedHelpFormatter(argparse.HelpFormatter):
 
 
 @lru_cache
-def _print_info_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.info(msg, stacklevel=2)
+def _emit_once(logger: Logger, level: int, text: str) -> None:
+    # stacklevel 4 walks back out of _emit_once, _log_once and the
+    # _print_*_once wrapper to reach the caller. Pinned by a test: at 3 the
+    # record names logging_utils.py, which would relabel every warning_once
+    # in the package.
+    logger.log(level, text, stacklevel=4)
 
 
-@lru_cache
-def _print_warning_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.warning(msg, stacklevel=2)
+def _log_once(logger: Logger, level: int, msg: str, *args: Any) -> None:
+    """Log *msg* once, taking %-style args the way ``logger.log`` does.
+
+    The helpers used to take only the message, so a caller that formatted lazily
+    -- the way the standard contract implies -- raised TypeError instead of
+    logging, always on a branch too rare for anyone to have seen it.
+
+    Dedupe on the FORMATTED text rather than on the arguments: an lru_cache keyed
+    on the arguments keeps a strong reference to each of them, and callers here
+    pass tensors.
+    """
+    _emit_once(logger, level, msg % args if args else msg)
+
+
+def _print_info_once(logger: Logger, msg: str, *args: Any) -> None:
+    _log_once(logger, logging.INFO, msg, *args)
+
+
+def _print_warning_once(logger: Logger, msg: str, *args: Any) -> None:
+    _log_once(logger, logging.WARNING, msg, *args)
 
 
 def get_is_main_process():
@@ -167,19 +186,19 @@ class _SGLDiffusionLogger(Logger):
         `intel_extension_for_pytorch.utils._logger`.
     """
 
-    def info_once(self, msg: str) -> None:
+    def info_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`info`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_info_once(self, msg)
+        _print_info_once(self, msg, *args)
 
-    def warning_once(self, msg: str) -> None:
+    def warning_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`warning`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_warning_once(self, msg)
+        _print_warning_once(self, msg, *args)
 
     def info(  # type: ignore[override]
         self,
