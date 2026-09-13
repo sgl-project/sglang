@@ -775,6 +775,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model: nn.Module,
         model_config: ModelConfig,
+        target_device: torch.device,
     ) -> nn.Module:
         """Prepare final storage for graph capture with sentinel weights.
 
@@ -795,7 +796,8 @@ class DefaultModelLoader(BaseModelLoader):
                     and module.is_weights_quantized()
                 ):
                     continue
-                quant_method.process_weights_after_loading(module)
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
         return model.eval()
 
     def commit_model_weights(

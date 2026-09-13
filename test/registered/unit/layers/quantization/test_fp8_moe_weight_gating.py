@@ -90,5 +90,34 @@ class TestFp8MoEWeightGating(CustomTestCase):
         self.assertEqual(params["w13_weight_scale"].shape, (NUM_EXPERTS, 1))
 
 
+class TestHpcOpsWeightReload(CustomTestCase):
+    def test_block_scales_refresh_in_place(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        method = object.__new__(Fp8MoEMethod)
+        method.block_quant = True
+        for k in (3, 4):
+            with self.subTest(k=k):
+                layer = torch.nn.Module()
+                for prefix in ("w13", "w2"):
+                    layer.register_parameter(
+                        f"{prefix}_weight_scale_inv",
+                        torch.nn.Parameter(torch.ones((2, 2, k)), requires_grad=False),
+                    )
+                method._prepare_hpc_ops_weights(layer)
+                captured = dict(layer.named_buffers())
+                self.assertEqual(len(captured), 2)
+                for prefix in ("w13", "w2"):
+                    getattr(layer, f"{prefix}_weight_scale_inv").data.fill_(3)
+                method._prepare_hpc_ops_weights(layer)
+                for name, scale in captured.items():
+                    self.assertIs(getattr(layer, name), scale)
+                    torch.testing.assert_close(
+                        scale[..., :k], torch.full((2, 2, k), 3.0)
+                    )
+                    self.assertEqual(torch.count_nonzero(scale[..., k:]).item(), 0)
+                    self.assertNotIn(name, layer.state_dict())
+
+
 if __name__ == "__main__":
     unittest.main()

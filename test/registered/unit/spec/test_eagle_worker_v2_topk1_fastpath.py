@@ -385,5 +385,48 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
 
 
+class TestEagleMappedTargetHead(CustomTestCase):
+    def test_deferred_target_refresh_keeps_mapped_head_storage(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        head = torch.nn.Parameter(torch.zeros(6, 3), requires_grad=False)
+        embed = torch.nn.Parameter(torch.ones(6, 3), requires_grad=False)
+        draft_model = SimpleNamespace(set_embed_and_head=MagicMock())
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
+        worker.hot_token_id = torch.tensor([4, 1, 3])
+        worker.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(get_embed_and_head=lambda: (embed, head))
+            )
+        )
+        worker.draft_runner = SimpleNamespace(model=draft_model)
+        worker.init_lm_head()
+        shared_embed, mapped_head = draft_model.set_embed_and_head.call_args.args
+        original_pointer = mapped_head.data_ptr()
+        self.assertIs(shared_embed, embed)
+        self.assertNotEqual(original_pointer, head.data_ptr())
+
+        with torch.no_grad():
+            head.copy_(torch.arange(18).reshape(6, 3))
+        wrapper = object.__new__(EAGLEWorkerV2)
+        wrapper._draft_worker = worker
+        wrapper.refresh_startup_weight_load()
+
+        self.assertEqual(mapped_head.data_ptr(), original_pointer)
+        torch.testing.assert_close(mapped_head, head[worker.hot_token_id])
+        draft_model.set_embed_and_head.assert_called_once()
+
+    def test_refresh_skips_unmapped_heads_and_nonhosting_ranks(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.target_worker = MagicMock()
+        worker.refresh_startup_weight_load()
+        worker.target_worker.model_runner.model.get_embed_and_head.assert_not_called()
+
+        wrapper = object.__new__(EAGLEWorkerV2)
+        wrapper._draft_worker = None
+        wrapper.refresh_startup_weight_load()
+
+
 if __name__ == "__main__":
     unittest.main()

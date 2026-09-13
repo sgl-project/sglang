@@ -631,7 +631,12 @@ class DeepseekV2WeightLoaderMixin:
                         w, scale = block_quant_to_tensor_quant(
                             weight, weight_scale, weight_block_size
                         )
-                        self_attn.w_scale = scale
+                        self_attn.w_scale = bind_or_assign(
+                            self_attn.w_scale
+                            if isinstance(self_attn.w_scale, torch.Tensor)
+                            else None,
+                            scale,
+                        )
                 else:
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -648,7 +653,12 @@ class DeepseekV2WeightLoaderMixin:
                             weight_scale = weight_scale.view(-1, 1)
 
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    self_attn.w_scale = bind_or_assign(
+                        self_attn.w_scale
+                        if isinstance(self_attn.w_scale, torch.Tensor)
+                        else None,
+                        scale,
+                    )
 
             if w.dtype == torch.int8:
                 weight_block_size = (

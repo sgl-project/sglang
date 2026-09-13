@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch, sentinel
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
@@ -22,6 +23,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -79,6 +81,43 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_weight_load_refresh_reaches_hybrid_and_tbo_kernels(self):
+        kernels = [MagicMock() for _ in range(3)]
+        backends = []
+        for kernel in kernels:
+            backend = object.__new__(GDNAttnBackend)
+            backend.kernel_dispatcher = SimpleNamespace(
+                decode_kernel=kernel,
+                extend_kernel=kernel,
+                verify_kernel=kernel,
+            )
+            hybrid = object.__new__(HybridLinearAttnBackend)
+            hybrid.attn_backend_list = [MagicMock(), backend]
+            backends.append(hybrid)
+        tbo = object.__new__(TboAttnBackend)
+        tbo.primary = backends[0]
+        tbo.children = backends[1:]
+
+        tbo.on_after_weight_load()
+
+        for kernel in kernels:
+            kernel.on_after_weight_load.assert_called_once_with()
+
+    def test_weight_load_refresh_includes_separate_verify_kernel(self):
+        decode = MagicMock()
+        verify = MagicMock()
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(
+            decode_kernel=decode,
+            extend_kernel=decode,
+            verify_kernel=verify,
+        )
+
+        backend.on_after_weight_load()
+
+        decode.on_after_weight_load.assert_called_once_with()
+        verify.on_after_weight_load.assert_called_once_with()
+
     def apply_policy(
         self,
         runner,
@@ -243,6 +282,20 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_hybrid_prefill_and_decode_refresh_their_caches(self):
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+        backend = object.__new__(HybridAttnBackend)
+        backend.prefill_backend = MagicMock()
+        backend.decode_backend = MagicMock()
+        backend.on_after_weight_load()
+        backend.prefill_backend.on_after_weight_load.assert_called_once_with()
+        backend.decode_backend.on_after_weight_load.assert_called_once_with()
+        backend.prefill_backend.reset_mock()
+        backend.decode_backend = backend.prefill_backend
+        backend.on_after_weight_load()
+        backend.prefill_backend.on_after_weight_load.assert_called_once_with()
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

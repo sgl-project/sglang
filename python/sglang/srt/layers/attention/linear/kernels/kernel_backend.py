@@ -13,6 +13,9 @@ class LinearAttnKernelBase(ABC):
     uses_state_checkpoints: bool = False
     supports_fused_chain_verify: bool = False
 
+    def on_after_weight_load(self) -> None:
+        """Refresh cached parameters without replacing captured storage."""
+
     @abstractmethod
     def decode(
         self,

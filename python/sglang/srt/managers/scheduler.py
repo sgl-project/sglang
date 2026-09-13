@@ -1107,6 +1107,9 @@ class Scheduler(
 
         if startup_weight_load_active:
             self.tp_worker.finalize_startup_weight_load()
+            if self.draft_worker is not None:
+                self.draft_worker.refresh_startup_weight_load()
+                torch.get_device_module(model_runner.device).synchronize()
 
         if (
             get_exec().moe.elastic_ep_backend is not None

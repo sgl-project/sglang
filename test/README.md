@@ -94,6 +94,8 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
 
+For weight-loading or postprocess changes, see the [startup overlap coverage guide](manual/startup_weight_load/README.md) for reusable manual checks and known coverage limits.
+
 ## Multi-Hardware Backends
 
 This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends (AMD, NPU) follow the same practices and use the multi-backend registry system. A scheduled job summarizes test coverage across all backends; [here is an example run](https://github.com/sgl-project/sglang/actions/runs/23424304300).

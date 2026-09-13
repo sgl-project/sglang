@@ -11,6 +11,7 @@ from torch import nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_loader.loader import DefaultModelLoader
@@ -25,7 +26,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_model,
-    get_parallel,
     get_spec,
 )
 
@@ -33,6 +33,15 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def refresh_attention_weight_copies(attn_backend, decode_backend, decode_group) -> None:
+    """Refresh backend-owned weight copies without replacing captured storage."""
+    seen = set()
+    for backend in (attn_backend, decode_backend, *(decode_group or ())):
+        if backend is not None and id(backend) not in seen:
+            seen.add(id(backend))
+            backend.on_after_weight_load()
 
 
 def _resolve_llama_model_class():
@@ -101,14 +110,9 @@ class StartupWeightLoadOptions:
     device: str
     is_cuda_platform: bool
     cuda_graph_enabled: bool
-    has_speculative_token_map: bool
-    dcp_replicate_q_proj: bool
     moe_a2a_backend: str
     moe_runner_backend: str
     fp8_gemm_runner_backend: str
-    ep_join_mode: Optional[str]
-    uses_cached_gdn_parameters: bool
-    cpu_offload_gb: int
     offload_group_size: int
     has_lora: bool
     prefetch_num_threads: int
@@ -117,8 +121,6 @@ class StartupWeightLoadOptions:
     def from_published_config(cls) -> StartupWeightLoadOptions:
         """Read only configuration that affects deferred weight loading."""
         cuda_graph_config = get_exec().graph.cuda_graph_config
-        mamba = get_exec().mamba
-        decode_backend = mamba.linear_attn_decode_backend or mamba.linear_attn_backend
         is_cuda_platform = current_platform.is_cuda()
         cuda_graph_enabled = any(
             getattr(cuda_graph_config, phase).backend != Backend.DISABLED
@@ -128,27 +130,9 @@ class StartupWeightLoadOptions:
             device=get_device().device,
             is_cuda_platform=is_cuda_platform,
             cuda_graph_enabled=cuda_graph_enabled,
-            has_speculative_token_map=(
-                get_spec().speculative_algorithm == "EAGLE"
-                and get_spec().speculative_token_map is not None
-            ),
-            dcp_replicate_q_proj=(
-                get_parallel().dcp_size > 1
-                and bool(get_parallel().dcp_replicate_q_proj)
-            ),
             moe_a2a_backend=get_exec().moe.moe_a2a_backend,
             moe_runner_backend=get_exec().moe.moe_runner_backend,
             fp8_gemm_runner_backend=get_exec().kernel.fp8_gemm_runner_backend,
-            ep_join_mode=get_exec().moe.ep_join_mode,
-            # Unset verify follows FlashInfer decode, already covered here.
-            uses_cached_gdn_parameters=(
-                decode_backend == "flashinfer"
-                or (
-                    get_spec().speculative_algorithm is not None
-                    and mamba.linear_attn_verify_backend == "flashinfer"
-                )
-            ),
-            cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
             has_lora=(
                 get_lora().enable_lora
@@ -184,15 +168,9 @@ class StartupWeightLoadAdmission:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _StartupWeightLoadArchitectureSpec:
-    architecture: str
-    resolve_model_class: Callable[[], type]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
 class _StartupWeightLoadProfileSpec:
     profile: StartupWeightLoadProfile
-    architectures: Tuple[_StartupWeightLoadArchitectureSpec, ...]
+    model_classes: dict[str, Callable[[], type]]
     validate: Callable[
         [ModelConfig, StartupWeightLoadOptions],
         Tuple[StartupWeightLoadRejection, ...],
@@ -287,12 +265,6 @@ def _moe_weight_rules(
             options.has_lora,
             "LoRA replaces MoE checkpoint parameter paths before startup commit",
         ),
-        # Only the routed TRT-LLM path restores checkpoint shapes on reload.
-        (
-            "moe_runner_backend",
-            model_config.quantization is None and runner.is_flashinfer_trtllm(),
-            "TRT-LLM MoE checkpoint-shape restoration requires the routed runner",
-        ),
     )
     block_size = _checkpoint_block_fp8_size(model_config)
     if not block_size:
@@ -309,8 +281,8 @@ def _moe_weight_rules(
     return rules + (
         (
             "moe_runner_backend",
-            converts_scales or runner.is_hpc_ops(),
-            "MoE scale conversion or cached scale buffers are not refreshed in place",
+            converts_scales,
+            "MoE UE8M0 scale conversion is not reload-safe during startup overlap",
         ),
         (
             "moe_a2a_backend",
@@ -327,36 +299,6 @@ def _validate_native_dense(
     return _rejections_from_rules(_weight_format_rules(model_config, options))
 
 
-def _hybrid_attention_rules(
-    model_config: ModelConfig,
-    options: StartupWeightLoadOptions,
-) -> Tuple[Tuple[str, bool, str], ...]:
-    return _weight_format_rules(model_config, options) + (
-        (
-            "linear_attention_backend",
-            options.uses_cached_gdn_parameters,
-            "FlashInfer GDN decode/verify caches parameter copies before weight commit",
-        ),
-    )
-
-
-def _validate_qwen3_5_hybrid_vlm(
-    model_config: ModelConfig,
-    options: StartupWeightLoadOptions,
-) -> Tuple[StartupWeightLoadRejection, ...]:
-    return _rejections_from_rules(_hybrid_attention_rules(model_config, options))
-
-
-def _validate_qwen3_5_moe_hybrid_vlm(
-    model_config: ModelConfig,
-    options: StartupWeightLoadOptions,
-) -> Tuple[StartupWeightLoadRejection, ...]:
-    return _rejections_from_rules(
-        _hybrid_attention_rules(model_config, options)
-        + _moe_weight_rules(model_config, options)
-    )
-
-
 def _validate_moe(
     model_config: ModelConfig,
     options: StartupWeightLoadOptions,
@@ -367,145 +309,88 @@ def _validate_moe(
     )
 
 
-def _validate_glm_moe_dsa(
-    model_config: ModelConfig,
-    options: StartupWeightLoadOptions,
-) -> Tuple[StartupWeightLoadRejection, ...]:
-    block_size = _checkpoint_block_fp8_size(model_config)
-    return _rejections_from_rules(
-        _weight_format_rules(model_config, options)
-        + _moe_weight_rules(model_config, options)
-        + (
-            # Other MLA FP8 layouts replace derived scales during post-load.
-            (
-                "fp8_weight_block_size",
-                bool(block_size) and block_size != (128, 128),
-                "MLA startup overlap requires in-place 128x128 block-scale post-processing",
-            ),
-        )
-    )
-
-
 # Profiles describe weight-loading and post-processing paths, not tested configs.
 _STARTUP_WEIGHT_LOAD_PROFILE_SPECS = (
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.NATIVE_DENSE,
-        architectures=(
-            _StartupWeightLoadArchitectureSpec(
-                "LlamaForCausalLM", _resolve_llama_model_class
-            ),
-            _StartupWeightLoadArchitectureSpec(
-                "Qwen2ForCausalLM", _resolve_qwen2_model_class
-            ),
-            _StartupWeightLoadArchitectureSpec(
-                "Qwen3ForCausalLM", _resolve_qwen3_model_class
-            ),
-        ),
+        model_classes={
+            "LlamaForCausalLM": _resolve_llama_model_class,
+            "Qwen2ForCausalLM": _resolve_qwen2_model_class,
+            "Qwen3ForCausalLM": _resolve_qwen3_model_class,
+        },
         validate=_validate_native_dense,
     ),
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM,
-        architectures=(
-            # Qwen3.6 dense checkpoints retain the Qwen3.5 implementation
-            # architecture in config.json.
-            _StartupWeightLoadArchitectureSpec(
-                "Qwen3_5ForConditionalGeneration", _resolve_qwen3_5_model_class
-            ),
-        ),
-        validate=_validate_qwen3_5_hybrid_vlm,
+        model_classes={"Qwen3_5ForConditionalGeneration": _resolve_qwen3_5_model_class},
+        validate=_validate_native_dense,
     ),
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM,
-        architectures=(
-            _StartupWeightLoadArchitectureSpec(
-                "Qwen3_5MoeForConditionalGeneration",
-                _resolve_qwen3_5_moe_model_class,
-            ),
-        ),
-        validate=_validate_qwen3_5_moe_hybrid_vlm,
+        model_classes={
+            "Qwen3_5MoeForConditionalGeneration": _resolve_qwen3_5_moe_model_class,
+        },
+        validate=_validate_moe,
     ),
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.QWEN3_MOE_EP,
-        architectures=(
-            _StartupWeightLoadArchitectureSpec(
-                "Qwen3MoeForCausalLM", _resolve_qwen3_moe_model_class
-            ),
-        ),
+        model_classes={"Qwen3MoeForCausalLM": _resolve_qwen3_moe_model_class},
         validate=_validate_moe,
     ),
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.GLM_MOE_DSA,
-        architectures=(
-            _StartupWeightLoadArchitectureSpec(
-                "GlmMoeDsaForCausalLM", _resolve_glm_moe_dsa_model_class
-            ),
-        ),
-        validate=_validate_glm_moe_dsa,
+        model_classes={"GlmMoeDsaForCausalLM": _resolve_glm_moe_dsa_model_class},
+        validate=_validate_moe,
     ),
 )
 
 
-def _build_startup_weight_load_profile_indexes():
-    specs_by_profile = {}
-    specs_by_architecture = {}
-    for profile_spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS:
-        if profile_spec.profile in specs_by_profile:
-            raise RuntimeError(
-                f"Duplicate startup weight-load profile: {profile_spec.profile.value}"
-            )
-        if not profile_spec.architectures:
-            raise RuntimeError(
-                f"Startup weight-load profile has no architectures: "
-                f"{profile_spec.profile.value}"
-            )
-        if not callable(profile_spec.validate):
-            raise RuntimeError(
-                f"Startup weight-load profile has no validator: "
-                f"{profile_spec.profile.value}"
-            )
-        specs_by_profile[profile_spec.profile] = profile_spec
-        for architecture_spec in profile_spec.architectures:
-            if architecture_spec.architecture in specs_by_architecture:
-                raise RuntimeError(
-                    "Duplicate startup weight-load architecture: "
-                    f"{architecture_spec.architecture}"
-                )
-            if not callable(architecture_spec.resolve_model_class):
-                raise RuntimeError(
-                    "Startup weight-load architecture has no model resolver: "
-                    f"{architecture_spec.architecture}"
-                )
-            specs_by_architecture[architecture_spec.architecture] = (
-                profile_spec,
-                architecture_spec,
-            )
-    missing_profiles = set(StartupWeightLoadProfile) - set(specs_by_profile)
-    if missing_profiles:
-        raise RuntimeError(
-            "Missing startup weight-load profile registrations: "
-            + ", ".join(sorted(profile.value for profile in missing_profiles))
-        )
-    return specs_by_profile, specs_by_architecture
-
-
-(
-    _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_PROFILE,
-    _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE,
-) = _build_startup_weight_load_profile_indexes()
+_STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_PROFILE = {
+    spec.profile: spec for spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS
+}
 
 
 def _get_startup_weight_load_profile(
-    architecture: Optional[str],
+    model_class: type,
 ) -> Optional[StartupWeightLoadProfile]:
-    registration = _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE.get(architecture)
-    return registration[0].profile if registration is not None else None
+    # Empty native aliases (e.g. Mistral -> Llama) share the entire implementation.
+    # Any method, class setting, extra base or metaclass change requires review.
+    class_metadata = {
+        "__module__",
+        "__doc__",
+        "__qualname__",
+        "__firstlineno__",
+        "__static_attributes__",
+    }
+    implementations = [model_class]
+    while (
+        len(model_class.__bases__) == 1
+        and type(model_class) is type(model_class.__bases__[0])
+        and not model_class.__dict__.keys() - class_metadata
+        and not model_class.__dict__.get("__static_attributes__", ())
+    ):
+        model_class = model_class.__bases__[0]
+        implementations.append(model_class)
+    for candidate in implementations:
+        for spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS:
+            resolve = spec.model_classes.get(candidate.__name__)
+            if resolve is not None and candidate is resolve():
+                return spec.profile
+    return None
 
 
-def _get_canonical_model_class(architecture: str):
-    registration = _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE.get(architecture)
-    if registration is None:
-        raise ValueError(f"Unsupported startup-overlap architecture: {architecture}")
-    return registration[1].resolve_model_class()
+def _get_native_model_class(architectures) -> Optional[type]:
+    from sglang.srt.models.registry import ModelRegistry, import_model_classes
+
+    native_classes = import_model_classes("sglang.srt.models", strict=False)
+    # Match registry priority without invoking the Transformers/remote-code fallback.
+    for architecture in architectures:
+        model_class = ModelRegistry.models.get(architecture)
+        if model_class is not None:
+            return (
+                model_class if model_class is native_classes.get(architecture) else None
+            )
+    return None
 
 
 def _get_profile_rejections(
@@ -675,8 +560,7 @@ class ModelStorageManifest:
         values. Every other floating-point parameter must replace the capture
         sentinel; buffers are excluded because they are never overwritten.
         """
-        names = []
-        checks = []
+        checks_by_device = {}
         seen_tensor_ids = set()
         for name, metadata in self.tensors:
             tensor = metadata.tensor
@@ -688,15 +572,18 @@ class ModelStorageManifest:
             ):
                 continue
             seen_tensor_ids.add(id(tensor))
-            names.append(name)
-            checks.append(torch.all(tensor == value))
+            checks_by_device.setdefault(tensor.device, []).append(
+                (name, torch.all(tensor == value))
+            )
 
-        if not checks:
-            return ()
-        unchanged = torch.stack(checks).cpu().tolist()
-        return tuple(
-            name for name, is_unchanged in zip(names, unchanged) if is_unchanged
-        )
+        unchanged_names = []
+        for checks in checks_by_device.values():
+            names, values = zip(*checks)
+            unchanged = torch.stack(values).cpu().tolist()
+            unchanged_names.extend(
+                name for name, is_unchanged in zip(names, unchanged) if is_unchanged
+            )
+        return tuple(sorted(unchanged_names))
 
 
 def evaluate_startup_weight_load_admission(
@@ -735,26 +622,6 @@ def evaluate_startup_weight_load_admission(
             "load format must be auto or safetensors",
         ),
         (
-            "speculative_token_map",
-            options.has_speculative_token_map,
-            "EAGLE token mapping copies the target LM head before weight commit",
-        ),
-        (
-            "dcp_replicated_q_proj",
-            options.dcp_replicate_q_proj,
-            "DCP Q projection replication copies weights before weight commit",
-        ),
-        (
-            "elastic_ep_join",
-            options.ep_join_mode is not None,
-            "elastic EP joining changes weight sources between prepare and commit",
-        ),
-        (
-            "cpu_offload",
-            options.cpu_offload_gb > 0,
-            "capture-safe preparation requires device-resident weights",
-        ),
-        (
             "layer_group_offload",
             options.offload_group_size > 0,
             "layer-group offloading moves weight storage before weight commit",
@@ -771,49 +638,53 @@ def evaluate_startup_weight_load_admission(
         if rejected
     ]
 
-    architecture = architectures[0] if len(architectures) == 1 else None
-    profile = _get_startup_weight_load_profile(architecture)
-    if profile is not None:
-        rejections.extend(
-            _get_profile_rejections(
-                profile=profile,
-                model_config=model_config,
-                options=options,
-            )
-        )
-    else:
-        rejections.append(
-            StartupWeightLoadRejection(
-                code="architecture",
-                message=(
-                    "exactly one model architecture is required"
-                    if architecture is None
-                    else f"model architecture {architecture!r} is not in the startup overlap registry"
-                ),
-            )
-        )
+    if rejections:
+        return StartupWeightLoadAdmission(plan=None, rejections=tuple(rejections))
 
-    # Delay implementation imports until cheap preflight passes, so auto can
-    # fall back without remote-code imports or config mutation.
-    if not rejections:
-        assert architecture is not None
-        resolved_model_class, resolved_architecture = get_model_architecture(
-            model_config
-        )
-        if (
-            resolved_architecture != architecture
-            or resolved_model_class is not _get_canonical_model_class(architecture)
-        ):
-            rejections.append(
+    # Resolve only native registry entries until admission passes. Auto fallback
+    # must not import remote model code or mutate the effective configuration.
+    model_class = None
+    if architectures and model_config.model_impl in (ModelImpl.AUTO, ModelImpl.SGLANG):
+        model_class = _get_native_model_class(architectures)
+    if model_class is None:
+        return StartupWeightLoadAdmission(
+            plan=None,
+            rejections=(
                 StartupWeightLoadRejection(
                     code="model_implementation",
                     message="the native SGLang model implementation is required",
+                ),
+            ),
+        )
+    profile = _get_startup_weight_load_profile(model_class)
+    if profile is None:
+        return StartupWeightLoadAdmission(
+            plan=None,
+            rejections=(
+                StartupWeightLoadRejection(
+                    code="architecture",
+                    message=f"model implementation {model_class.__name__!r} has no startup overlap loading path",
+                ),
+            ),
+        )
+    rejections.extend(
+        _get_profile_rejections(
+            profile=profile,
+            model_config=model_config,
+            options=options,
+        )
+    )
+    if not rejections:
+        resolved_model_class, _ = get_model_architecture(model_config)
+        if resolved_model_class is not model_class:
+            rejections.append(
+                StartupWeightLoadRejection(
+                    code="model_implementation",
+                    message="model resolution selected a different implementation",
                 )
             )
-
     if rejections:
         return StartupWeightLoadAdmission(plan=None, rejections=tuple(rejections))
-    assert profile is not None
     return StartupWeightLoadAdmission(
         plan=StartupWeightLoadPlan(
             profile=profile,
@@ -984,6 +855,7 @@ class StartupWeightLoadManager:
         model = self._loader.prepare_model_for_capture(
             model=model,
             model_config=self._model_config,
+            target_device=torch.device(self._device_config.device),
         )
         self._model = model
         self._resolved_sources = resolved_sources
@@ -1023,7 +895,9 @@ class StartupWeightLoadManager:
             self._prefetch_started_at - self._capture_ready_at,
         )
 
-    def finalize(self) -> Optional[StartupWeightLoadTimings]:
+    def finalize(
+        self, *, after_weight_load: Optional[Callable[[], None]] = None
+    ) -> Optional[StartupWeightLoadTimings]:
         """Return overlap timings, or None after serial fallback."""
         if self._state == StartupWeightLoadState.READY:
             return self._timings
@@ -1047,6 +921,8 @@ class StartupWeightLoadManager:
             target_device=torch.device(self._device_config.device),
             startup_prefetch_active=startup_prefetch_active,
         )
+        if after_weight_load is not None:
+            after_weight_load()
         torch.cuda.synchronize()
         changed_names = manifest.changed_names(self._model)
         if changed_names:

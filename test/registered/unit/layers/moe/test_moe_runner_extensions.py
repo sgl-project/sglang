@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
 
@@ -375,6 +376,40 @@ def test_fused_moe_layer_runner_is_none_when_method_builds_no_runner(
     assert layer.runner is None
     layer.clear_overlap_args()
     assert layer.down_gemm_overlap_args is None
+
+
+class TestTrtllmWeightReload(CustomTestCase):
+    def test_checkpoint_shapes_restore_without_reallocation(self):
+        for backend in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+        ):
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(runner_backend=backend),
+            ):
+                method = UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True)
+                layer = SimpleNamespace(
+                    num_local_experts=2,
+                    intermediate_size_per_partition=128,
+                    hidden_size=256,
+                    moe_runner_config=MoeRunnerConfig(is_gated=True),
+                )
+                for name, shape in (
+                    ("w13_weight", (2, 256, 256)),
+                    ("w2_weight", (2, 256, 128)),
+                ):
+                    param = torch.nn.Parameter(
+                        torch.zeros(shape, dtype=torch.bfloat16), requires_grad=False
+                    )
+                    param.data = param.data.reshape(2, 128, -1)
+                    ptr = param.data_ptr()
+                    method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                        layer, param, f"model.layers.0.mlp.experts.{name}"
+                    )
+                    self.assertEqual(tuple(param.shape), shape)
+                    self.assertEqual(param.data_ptr(), ptr)
+                    param.data.copy_(torch.ones(shape, dtype=torch.bfloat16))
 
 
 if __name__ == "__main__":

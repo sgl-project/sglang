@@ -2229,12 +2229,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.hpc_ops import pad_hpc_ops_block_scale
 
         if self.block_quant:
-            layer.hpc_ops_w13_weight_scale = pad_hpc_ops_block_scale(
-                layer.w13_weight_scale_inv.data.float()
-            )
-            layer.hpc_ops_w2_weight_scale = pad_hpc_ops_block_scale(
-                layer.w2_weight_scale_inv.data.float()
-            )
+            for prefix in ("w13", "w2"):
+                name = f"hpc_ops_{prefix}_weight_scale"
+                scale = pad_hpc_ops_block_scale(
+                    getattr(layer, f"{prefix}_weight_scale_inv").data.float()
+                )
+                cached_scale = getattr(layer, name, None)
+                # Keep CUDA graph scale pointers valid across weight reloads.
+                if cached_scale is not None and (
+                    cached_scale.shape == scale.shape
+                    and cached_scale.dtype == scale.dtype
+                    and cached_scale.device == scale.device
+                ):
+                    cached_scale.copy_(scale)
+                else:
+                    layer.register_buffer(name, scale, persistent=False)
         else:
             if layer.w13_input_scale is None or layer.w2_input_scale is None:
                 raise ValueError(

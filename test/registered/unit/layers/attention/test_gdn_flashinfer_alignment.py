@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -38,7 +39,7 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     return kernel
 
 
-class TestFlashInferGDNAlignment(unittest.TestCase):
+class TestFlashInferGDNAlignment(CustomTestCase):
     def test_extend_writes_directly_to_preallocated_output(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True
@@ -206,6 +207,55 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
             kernel._prepare_gate_parameters(A_log, dt_bias)[0],
             A_log_sm90,
         )
+
+    def test_weight_load_refreshes_cached_parameters_in_place(self):
+        for pointer_mod, prepared_dtype in (
+            (0, None),
+            (2, None),
+            (0, torch.float32),
+        ):
+            with self.subTest(pointer_mod=pointer_mod, prepared_dtype=prepared_dtype):
+                kernel = _make_kernel_without_flashinfer()
+                source = _view_with_pointer_mod((8,), torch.bfloat16, pointer_mod)
+                source.fill_(1)
+                prepared = kernel._prepare_parameter(
+                    "A_log", source, dtype=prepared_dtype
+                )
+                prepared_ptr = prepared.data_ptr()
+
+                source.fill_(3)
+                if prepared_ptr != source.data_ptr():
+                    torch.testing.assert_close(prepared, torch.ones_like(prepared))
+                kernel.on_after_weight_load()
+
+                self.assertIs(
+                    kernel._prepare_parameter("A_log", source, dtype=prepared_dtype),
+                    prepared,
+                )
+                self.assertEqual(prepared.data_ptr(), prepared_ptr)
+                torch.testing.assert_close(prepared, source.to(prepared.dtype))
+
+    def test_weight_load_refreshes_all_layers_and_dtype_variants(self):
+        kernel = _make_kernel_without_flashinfer()
+        sources = [
+            _view_with_pointer_mod((8,), torch.bfloat16, 2),
+            _view_with_pointer_mod((8,), torch.bfloat16, 2),
+        ]
+        prepared = []
+        for source in sources:
+            source.fill_(1)
+            prepared.extend(
+                kernel._prepare_parameter("A_log", source, dtype=dtype)
+                for dtype in (None, torch.float32)
+            )
+
+        for index, source in enumerate(sources):
+            source.fill_(index + 2)
+        kernel.on_after_weight_load()
+
+        self.assertEqual(len(kernel._aligned_parameter_cache), 4)
+        for index, tensor in enumerate(prepared):
+            torch.testing.assert_close(tensor, torch.full_like(tensor, index // 2 + 2))
 
     def test_mutable_state_falls_back_without_losing_writeback(self):
         kernel = _make_kernel_without_flashinfer()

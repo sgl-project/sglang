@@ -289,6 +289,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
+        self._mapped_target_lm_head = None
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
@@ -326,10 +327,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
+                self._mapped_target_lm_head = head
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    @torch.no_grad()
+    def refresh_startup_weight_load(self):
+        mapped_head = getattr(self, "_mapped_target_lm_head", None)
+        if mapped_head is not None:
+            _, head = self.target_worker.model_runner.model.get_embed_and_head()
+            mapped_head.copy_(head[self.hot_token_id])
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -1166,6 +1175,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    def refresh_startup_weight_load(self):
+        if self.draft_worker is not None:
+            self.draft_worker.refresh_startup_weight_load()
 
     def forward_batch_generation(
         self,

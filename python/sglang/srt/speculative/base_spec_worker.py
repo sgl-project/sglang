@@ -116,6 +116,9 @@ class EagleDraftWorkerBase(ABC):
         self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         self._capture_cuda_graphs()
 
+    def refresh_startup_weight_load(self):
+        """Refresh copies of target weights after deferred loading."""
+
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
@@ -308,6 +311,9 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+
+    def refresh_startup_weight_load(self):
+        """Refresh copies of target weights after deferred loading."""
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         for runner in self.draft_worker.draft_runners:
