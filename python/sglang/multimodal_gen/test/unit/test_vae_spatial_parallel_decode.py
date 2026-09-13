@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
@@ -52,8 +53,7 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
     WanDistAttentionBlock,
 )
-from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 class _DispatchProbeVAE(ParallelTiledVAE):

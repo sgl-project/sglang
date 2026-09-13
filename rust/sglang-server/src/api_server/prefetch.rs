@@ -18,7 +18,7 @@ use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData};
-use crate::multi_modality::payload::{io_sources, item_count};
+use crate::multi_modality::payload::io_sources;
 
 /// Global bound on concurrent media fetches across all in-flight requests;
 /// excess acquisitions queue on the semaphore without holding a thread.
@@ -40,23 +40,22 @@ pub async fn prefetch_all(
         let Some(mm) = mm.as_deref() else {
             return Ok(Vec::new());
         };
-        let values = [
-            ("image", mm.image_data.as_ref()),
-            ("video", mm.video_data.as_ref()),
-            ("audio", mm.audio_data.as_ref()),
+        let modalities = [
+            ("image", &mm.image_data),
+            ("video", &mm.video_data),
+            ("audio", &mm.audio_data),
         ];
-        let items = values
+        let items = modalities
             .iter()
-            .filter_map(|(_, value)| *value)
-            .map(item_count)
+            .map(|(_, items)| items.len())
             .sum::<usize>();
         if items > MAX_ITEMS_PER_REQUEST {
             return Err(format!(
                 "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
             ));
         }
-        for (modality, value) in values {
-            let count = value.map(item_count).unwrap_or_default();
+        for (modality, items) in modalities {
+            let count = items.len();
             if let Some(limit) = modality_limits.get(modality)
                 && count > *limit
             {
@@ -66,10 +65,9 @@ pub async fn prefetch_all(
                 ));
             }
         }
-        Ok(values
+        Ok(modalities
             .iter()
-            .filter_map(|(_, value)| *value)
-            .flat_map(io_sources)
+            .flat_map(|(_, items)| io_sources(items))
             .collect())
     };
     let plans = requests
@@ -120,9 +118,12 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
 
 #[cfg(test)]
 mod tests {
-    use rmpv::Value;
-
     use super::*;
+    use crate::message::multimodal::MmItem;
+
+    fn src(s: impl Into<String>) -> MmItem {
+        MmItem::Source(s.into())
+    }
 
     fn serve(bodies: Vec<Vec<u8>>) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -149,10 +150,10 @@ mod tests {
         addr
     }
 
-    fn mm_request(image_data: Value) -> GenerateRequest {
+    fn mm_request(image_data: Vec<MmItem>) -> GenerateRequest {
         GenerateRequest {
             mm: Some(Box::new(MmData {
-                image_data: Some(image_data),
+                image_data,
                 ..Default::default()
             })),
             ..Default::default()
@@ -173,9 +174,9 @@ mod tests {
         }
         let mut requests = vec![GenerateRequest {
             mm: Some(Box::new(MmData {
-                image_data: Some(Value::from(paths[0].display().to_string())),
-                video_data: Some(Value::from(paths[1].display().to_string())),
-                audio_data: Some(Value::from(paths[2].display().to_string())),
+                image_data: vec![src(paths[0].display().to_string())],
+                video_data: vec![src(paths[1].display().to_string())],
+                audio_data: vec![src(paths[2].display().to_string())],
                 ..Default::default()
             })),
             ..Default::default()
@@ -197,12 +198,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sglang-prefetch-{}", std::process::id()));
         std::fs::write(&path, b"zzz").unwrap();
         let mut requests = vec![
-            mm_request(Value::Array(vec![
-                Value::from(format!("http://{addr}/a.png")),
-                Value::from("data:image/png;base64,x"),
-                Value::from(format!("http://{addr}/b.png")),
-                Value::from(path.display().to_string()),
-            ])),
+            mm_request(vec![
+                src(format!("http://{addr}/a.png")),
+                src("data:image/png;base64,x"),
+                src(format!("http://{addr}/b.png")),
+                src(path.display().to_string()),
+            ]),
             GenerateRequest::default(),
         ];
         prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
@@ -218,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_download_rejects() {
-        let mut requests = vec![mm_request(Value::from("http://127.0.0.1:1/nope.png"))];
+        let mut requests = vec![mm_request(vec![src("http://127.0.0.1:1/nope.png")])];
         let err = prefetch_all(&mut requests, &BTreeMap::new())
             .await
             .err()
@@ -230,10 +231,10 @@ mod tests {
     /// fail to fetch, so a fetch error would prove fetching started.
     #[tokio::test]
     async fn item_budget_rejects_before_fetching() {
-        let sources: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
-            .map(|i| Value::from(format!("/definitely/not/here-{i}.png")))
+        let sources: Vec<MmItem> = (0..=MAX_ITEMS_PER_REQUEST)
+            .map(|i| src(format!("/definitely/not/here-{i}.png")))
             .collect();
-        let mut requests = vec![mm_request(Value::Array(sources))];
+        let mut requests = vec![mm_request(sources)];
         let err = prefetch_all(&mut requests, &BTreeMap::new())
             .await
             .err()
@@ -249,11 +250,11 @@ mod tests {
     async fn per_modality_budget_rejects_before_fetching() {
         let mut requests = vec![GenerateRequest {
             mm: Some(Box::new(MmData {
-                image_data: Some(Value::Array(vec![
-                    Value::from("/definitely/not/here-0.png"),
-                    Value::from("/definitely/not/here-1.png"),
-                ])),
-                video_data: Some(Value::Array(vec![Value::from("/definitely/not/here.mp4")])),
+                image_data: vec![
+                    src("/definitely/not/here-0.png"),
+                    src("/definitely/not/here-1.png"),
+                ],
+                video_data: vec![src("/definitely/not/here.mp4")],
                 ..Default::default()
             })),
             ..Default::default()

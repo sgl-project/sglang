@@ -23,6 +23,7 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
@@ -30,6 +31,8 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _chain_byte_accounting_violations,
     _end_pair_chain,
     _float_open_short_side,
+    _flush_deferred_free_group,
+    _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
@@ -475,29 +478,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.swa_attn_allocator.clear_inverse_history()
 
-    def free_swa(
-        self, free_index: torch.Tensor, *, start_pos: Optional[int] = None
-    ) -> None:
+    def free_swa(self, free_index: torch.Tensor) -> None:
         """SWA tombstone path: release swa-physical, keep the virtual id and
         full-physical live; `swa.v2p_page[v_page] = -1` IS the tombstone."""
         if free_index is None or free_index.numel() == 0:
             return
         v = free_index.detach().to(torch.int64)
         ps = self.page_size
-        # `start_pos` promises a contiguous ascending range starting at that prefix
-        # position, so page reps come from stride arithmetic, not `torch.unique`.
-        if start_pos is not None and ps > 1:
-            reps = self.swa_attn_allocator._page_reps(v, start_pos)
-            # Keep only pages still bound on swa; freeing a tombstoned one would
-            # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
-            rep_pages = reps // ps
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
-            live_reps = reps[swa_v2p_pages > 0]
-            if live_reps.numel() == 0:
-                return
-            self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
-            self.swa_attn_allocator.clear_inverse_history()
-            return
         v_pages = v // ps
         # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
         swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
@@ -510,6 +497,28 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(live, _pages=live)
         else:
             self.swa_attn_allocator.free(live)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """free_swa() for a kv-row segment: `start_pos` promises a contiguous
+        ascending range, so page reps come from stride arithmetic, not `torch.unique`."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free_swa(free_index)
+            return
+        ps = self.page_size
+        reps = self.swa_attn_allocator._page_reps(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        # Keep only pages still bound on swa; freeing a tombstoned one would
+        # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
+        rep_pages = reps // ps
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
+        live_reps = reps[swa_v2p_pages > 0]
+        if live_reps.numel() == 0:
+            return
+        self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
         self.swa_attn_allocator.clear_inverse_history()
 
     def free_full(self, free_index: torch.Tensor) -> None:
@@ -838,6 +847,29 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             if isinstance(b, FloatMultiEndedAllocator):
                 flt = b
         _float_open_short_side(flt, demand)
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
+        return self
+
+    def flush_deferred_full_frees(self) -> None:
+        """Expose grouped composite frees while preserving the group scope."""
+        _flush_deferred_free_group(
+            self,
+            (self.free_group, self.free_page_reps_group, self.full_free_group),
+        )
+
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        return _full_tokens_before_mamba_recheck(
+            self.full_attn_allocator, self.mamba_allocator, target_size
+        )
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose Full reclaim, then move the SWA float away from Mamba."""
+        self.flush_deferred_full_frees()
+        if target_size <= self.mamba_allocator.available_size():
+            return
+        self.full_attn_allocator.flush_for_allocation()
+        _relieve_for_alloc(self.mamba_allocator, target_size)
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:

@@ -24,6 +24,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
@@ -134,6 +135,27 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
     if scale.dim() != 2:
         return scale
     return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
+
+
+def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Undo AITER ``shuffle_weight(..., layout=(16, 16))`` for FP8 weights."""
+    if weight.element_size() != 1:
+        raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
+
+    shape = weight.shape
+    n, k = shape[-2:]
+    if n % 16 != 0 or k % 32 != 0:
+        raise ValueError(
+            "AITER (16, 16) FP8 layout requires N % 16 == 0 and K % 32 == 0, "
+            f"got shape {tuple(shape)}"
+        )
+
+    return (
+        weight.reshape(-1, n // 16, k // 32, 2, 16, 16)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .reshape(shape)
+    )
 
 
 def materialize_bpreshuffle_fp8_scale_tuple(
@@ -781,7 +803,8 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 5. NPU (Ascend)
+    # 6. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -791,6 +814,12 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif is_npu_arch35():
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_w8a8_mxfp8_linear,
+        )
+
+        return npu_w8a8_mxfp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
