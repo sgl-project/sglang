@@ -957,6 +957,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            # The unified pool registers ONE region holding every layer's K and
+            # V inside each page envelope. The MHA branch would half-split that
+            # single region into K and V halves and compute num_kv_layers = 0,
+            # transferring nothing at all; the flat branch addresses the region
+            # as-is. MLA-unified already reaches the flat branch via
+            # is_mla_backend, so this only adds the MHA-unified peer.
+            force_flat=get_memory().enable_unified_memory,
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
@@ -1598,8 +1605,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
-                        force_flat=st
-                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                        # Two independent reasons to keep the flat layout.
+                        # QSA's per-layer list must not be half-split into K/V;
+                        # neither must a unified sub-pool's single region, which
+                        # holds every layer's K and V per slot envelope -- the
+                        # MHA branch would compute zero layers and ship nothing
+                        # (same reason as in `send_kvcache`).
+                        force_flat=(
+                            st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                            or get_memory().enable_unified_memory
+                        ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                     )
