@@ -1118,6 +1118,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
         cfg._unified = True
+        cfg._unified_fp8 = False
+        # object.__new__ skips __init__; bf16 unified row is 2B * latent
+        cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
 
     # Token pool plus the three request-scoped fixed pools, sized from the
