@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
     reason="Compensated mHC path targets datacenter Blackwell",
@@ -43,7 +43,7 @@ def reference(x, w, scale, base):
     return pre, post, comb
 
 
-@pytest.mark.parametrize("m", [0, 128, 384, 2049, 4096, 16384, 32768])
+@pytest.mark.parametrize("m", [0, 128, 384, 2049, 4096, 16384, 32768, 65536])
 @pytest.mark.parametrize("seed", [0, 42])
 def test_compensated_coefficients_match_fp64(m, seed):
     x, w, scale, base = inputs(m, seed)
