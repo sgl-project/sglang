@@ -7,7 +7,6 @@ import torch
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
-from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -28,6 +27,7 @@ from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
@@ -42,6 +42,60 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    num_requests, num_q_heads, num_kv_heads, head_dim, topk = 2, 4, 1, 128, 16
+    q = torch.randn(
+        num_requests, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        num_requests * topk,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    v = torch.randn(
+        num_requests * topk,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).repeat(
+        num_requests, 1
+    )
+    cu_q = torch.arange(num_requests + 1, dtype=torch.int32, device=device)
+    cu_k = torch.arange(
+        0,
+        (num_requests + 1) * topk,
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_lens = torch.full((num_requests,), topk, dtype=torch.int32, device=device)
+    scale = head_dim**-0.5
+
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu_q, cu_k, kv_lens, scale
+    )
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k.to(torch.bfloat16),
+        v.to(torch.bfloat16),
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(
@@ -206,22 +260,8 @@ def _compressed_config_namespace(**overrides):
     return SimpleNamespace(**fields)
 
 
-def _tokenwise_config_namespace(**overrides):
-    fields = dict(
-        model_type="qwen3_5",
-        index_topk=2048,
-        index_n_heads=64,
-        index_kv_heads=1,
-        index_head_dim=128,
-    )
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
 def test_qsa_profile_parses_compressed_qwen4_exp_schema():
     from sglang.srt.layers.attention.qsa.config import (
-        QSA_ROPE_MROPE,
-        QSA_VARIANT_COMPRESSED,
         is_qwen_qsa,
         parse_qsa_profile,
     )
@@ -242,14 +282,12 @@ def test_qsa_profile_parses_compressed_qwen4_exp_schema():
     )
     for config in (wrapped, _compressed_config_namespace()):
         profile = parse_qsa_profile(config)
-        assert profile.variant == QSA_VARIANT_COMPRESSED
         assert profile.n_heads == 8
         assert profile.kv_heads == 1
         assert profile.head_dim == 128
         assert profile.budget == TOKEN_TOPK
         assert profile.compress_ratio == COMPRESS_RATIO
         assert profile.block_topk == BLOCK_TOPK
-        assert profile.rope_mode == QSA_ROPE_MROPE
         assert is_qwen_qsa(config)
     # The legacy backend module keeps re-exporting the shared detector.
     assert qsa_backend_module.is_qwen_qsa is is_qwen_qsa
@@ -277,7 +315,7 @@ def test_qsa_profile_rejects_malformed_compressed_schema():
         raise AssertionError(f"{name} compressed config must be rejected")
 
 
-def test_qsa_glue_builds_indexer_per_variant(monkeypatch):
+def test_qsa_glue_builds_compressed_indexer(monkeypatch):
     from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
     recorded = {}
@@ -304,24 +342,6 @@ def test_qsa_glue_builds_indexer_per_variant(monkeypatch):
     assert recorded == dict(
         config=config, layer_id=7, quant_config="qc", prefix="p", rotary_emb=rotary
     )
-
-    # Tokenwise configs build the Lightning Indexer through the same glue.
-    class _FakeDSAIndexer:
-        def __init__(self, config, layer_id, quant_config=None, prefix="", **kw):
-            recorded.update(
-                dsa_config=config,
-                dsa_layer_id=layer_id,
-                dsa_quant_config=quant_config,
-                dsa_prefix=prefix,
-            )
-
-    monkeypatch.setattr(dsa_indexer_module, "QwenDSAIndexer", _FakeDSAIndexer)
-    dsa_indexer = build_qsa_indexer(
-        _tokenwise_config_namespace(), layer_id=2, prefix="q"
-    )
-    assert isinstance(dsa_indexer, _FakeDSAIndexer)
-    assert recorded["dsa_layer_id"] == 2
-    assert recorded["dsa_prefix"] == "q"
 
     try:
         build_qsa_indexer(SimpleNamespace(), layer_id=0, rotary_emb=rotary)
@@ -383,9 +403,6 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
     assert isinstance(backend, QwenSparseAttnBackend)
     assert backend.runner is compressed.draft_model_runner
     assert backend.decode_attention_backend_str == "qsa"
-    # Tokenwise profiles stay eager (no graph-stable indexer metadata); they
-    # must never silently fall back to a dense backend either.
-    assert factory(_tokenwise_config_namespace()).create_draft_extend_backend() is None
 
 
 def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):

@@ -5,8 +5,10 @@ name: Nightly Test (AMD MI355X 2N 1P1D Disagg)
 # load balancer, then an sglang.bench_serving concurrency sweep) via
 # scripts/ci/slurm/launch_mi355x.sh.
 on:
-  schedule:
-    - cron: '0 7 * * *'
+  # Temporarily paused while the DI CI nodes are unavailable. Uncomment the
+  # schedule below when the nodes return.
+  # schedule:
+  #   - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       image:
