@@ -21,6 +21,9 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    def on_after_weight_load(self) -> None:
+        """Refresh cached parameters without replacing captured storage."""
+
     @abstractmethod
     def decode(
         self,

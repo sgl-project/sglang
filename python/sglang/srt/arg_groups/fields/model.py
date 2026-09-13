@@ -45,6 +45,10 @@ class Model(msgspec.Struct):
         fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
         doc="Whether weight loading overlaps startup.",
     )
+    should_attempt_startup_weight_load_overlap = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.should_attempt_startup_weight_load_overlap_of",
+        doc="Whether to check admission for deferred startup weight loading.",
+    )
 
     # -------------------------------------------------------------------------
     # Model and tokenizer
@@ -270,12 +274,13 @@ class Model(msgspec.Struct):
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
     startup_weight_load_mode: A[
-        Literal["serial", "overlap"],
+        Literal["serial", "overlap", "auto"],
         (
             "Control startup weight loading relative to CUDA graph capture. "
             "'serial' preserves the existing startup order; 'overlap' stages "
             "checkpoint files while CUDA graphs are captured and commits the "
-            "real weights afterward."
+            "real weights afterward. 'auto' attempts overlap and falls back to "
+            "serial loading when admission or pre-capture checks reject it."
         ),
     ] = "serial"
     custom_weight_loader: A[

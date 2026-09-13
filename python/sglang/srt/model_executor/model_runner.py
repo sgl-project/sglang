@@ -1245,12 +1245,12 @@ class ModelRunner:
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
-        self.weight_load_time = time.perf_counter() - tic_total
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
         if self.startup_weight_load is None:
+            self.weight_load_time = time.perf_counter() - tic_total
             logger.info(
                 f"Load weight end. "
                 f"elapsed={self.weight_load_time:.2f} s, "
@@ -1296,24 +1296,39 @@ class ModelRunner:
         self.startup_weight_load.start_prefetch()
 
     def finalize_startup_weight_load(self) -> None:
-        """Commit the real weights, then run the post-load barrier.
+        """Commit real weights before entering the post-load barrier.
 
-        The barrier moves here because ``load_model`` returns with sentinel
-        values under overlap, so this is the first point at which "weights are
-        loaded" is true for this rank. It follows the commit and its validation
-        deliberately: a rank that fails to commit must not report readiness. A
-        commit failure is terminal for the process, so peer ranks observe it as
-        a barrier timeout rather than a clean collective abort, which matches
-        the existing startup contract for load failures.
+        Under overlap, ``load_model`` returns capture-safe sentinel weights.
+        This rank enters the barrier only after the real commit is validated.
         """
         assert self.startup_weight_load is not None
-        self.startup_weight_load.finalize()
+        timings = self.startup_weight_load.finalize(
+            after_weight_load=self._refresh_startup_weight_copies
+        )
+        if timings is None:
+            # Serial fallback already completed the normal post-load path.
+            self.startup_weight_load = None
+            return
+        # Keep the legacy phase weight-specific; scheduler_e2e reports the
+        # overlap critical path.
+        self.weight_load_time = timings.weight_load_seconds
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=get_exec().moe.is_ep_joiner,
         )
         self.startup_weight_load = None
+
+    def _refresh_startup_weight_copies(self) -> None:
+        from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+            refresh_attention_weight_copies,
+        )
+
+        refresh_attention_weight_copies(
+            self.attn_backend,
+            self.decode_attn_backend,
+            self.decode_attn_backend_group,
+        )
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)

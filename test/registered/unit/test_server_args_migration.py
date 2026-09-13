@@ -132,14 +132,26 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         """The startup loading mode keeps serial as the safe default."""
         serial = self._parse([])
         overlap = self._parse(["--startup-weight-load-mode", "overlap"])
+        auto = self._parse(["--startup-weight-load-mode", "auto"])
         self.assertEqual(serial.startup_weight_load_mode, "serial")
         self.assertEqual(overlap.startup_weight_load_mode, "overlap")
+        self.assertEqual(auto.startup_weight_load_mode, "auto")
+        future = ServerArgs(model_path="dummy", startup_weight_load_mode="future_mode")
         # The predicate over that leaf is a bag leaf now, computed at publish.
-        for record, expected in ((serial, False), (overlap, True)):
+        for record, expected_overlap, expected_attempt in (
+            (serial, False, False),
+            (overlap, True, True),
+            (auto, False, True),
+            (future, False, False),
+        ):
             reset_context()
             self.addCleanup(reset_context)
             publish(record, role="test")
-            self.assertIs(get_model().is_startup_weight_load_overlap, expected)
+            self.assertIs(get_model().is_startup_weight_load_overlap, expected_overlap)
+            self.assertIs(
+                get_model().should_attempt_startup_weight_load_overlap,
+                expected_attempt,
+            )
 
         with self.assertRaises(SystemExit):
             self.parser.parse_args(

@@ -113,6 +113,8 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
 
+For weight-loading or postprocess changes, see the [startup overlap coverage guide](manual/startup_weight_load/README.md) for reusable manual checks and known coverage limits.
+
 Before adding a registered test, identify the production change that would make
 it fail. Prefer extending an existing fixture/server launch over adding another
 file. The incremental admission check applies these ratchets to new or modified

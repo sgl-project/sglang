@@ -154,6 +154,11 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
 
+    def named_startup_weight_load_constants(self):
+        # Backends can embed these Python scales in captured kernel arguments.
+        yield "k_scale_float", self.k_scale_float
+        yield "v_scale_float", self.v_scale_float
+
     def forward(
         self,
         q,

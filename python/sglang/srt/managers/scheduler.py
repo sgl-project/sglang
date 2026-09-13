@@ -261,9 +261,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -1094,7 +1092,8 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if get_model().is_startup_weight_load_overlap:
+        startup_weight_load_active = self.tp_worker.has_startup_weight_load()
+        if startup_weight_load_active:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
@@ -1131,7 +1130,7 @@ class Scheduler(
             )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
-        if get_model().is_startup_weight_load_overlap:
+        if startup_weight_load_active:
             self.tp_worker.finalize_startup_weight_load()
 
         # Adaptive/speculative graphs and post-capture KV sizing can consume
