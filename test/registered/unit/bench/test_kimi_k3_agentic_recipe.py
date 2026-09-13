@@ -31,24 +31,28 @@ _mock_device = patch(
 _mock_device.start()
 
 
-def _load_recipe_module():
+MODULE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "amd"
+    / "agentic"
+    / "test_kimi_k3_mxfp4_agentic_mi35x.py"
+)
+
+
+def _load_recipe_module(name="_kimi_k3_agentic_recipe_under_test"):
     """Import the AMD benchmark by path: ``test/registered`` is not a package.
 
     Only the module object is bound here, so neither unittest nor pytest
     collects the MI35x test cases it defines out of this file.
     """
-    module_path = (
-        Path(__file__).resolve().parents[2]
-        / "amd"
-        / "agentic"
-        / "test_kimi_k3_mxfp4_agentic_mi35x.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_kimi_k3_agentic_recipe_under_test", module_path
-    )
+    spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -297,6 +301,17 @@ class TestResolvedBatchLimits(CustomTestCase):
         # be what loses a completed benchmark.
         limits = recipe.resolved_batch_limits("http://127.0.0.1:1")
         self.assertIn("error", limits)
+
+
+class TestModeSelection(CustomTestCase):
+    def test_an_unknown_mode_fails_loudly(self):
+        # Both cases are skipUnless-gated on AGENTIC_MODE, so a typo'd dispatch
+        # input would otherwise publish an empty run as a passing benchmark.
+        with (
+            patch.dict(os.environ, {"AGENTIC_MODE": "relpay"}, clear=False),
+            self.assertRaises(ValueError),
+        ):
+            _load_recipe_module("_kimi_k3_agentic_recipe_bad_mode")
 
 
 if __name__ == "__main__":

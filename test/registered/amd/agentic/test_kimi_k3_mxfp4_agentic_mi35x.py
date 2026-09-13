@@ -133,6 +133,10 @@ MODEL_PATH = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 # configuration, and each skips the other's case rather than launching a second
 # 1.56 TB server it would not use.
 MODE = os.environ.get("AGENTIC_MODE", "replay")
+if MODE not in ("replay", "eval"):
+    # Both cases are skipUnless-gated on this, so a typo'd dispatch input would
+    # otherwise publish an empty run as a passing benchmark.
+    raise ValueError(f"AGENTIC_MODE must be 'replay' or 'eval', got {MODE!r}")
 
 # The recipe refuses anything but TP8: MXFP4 K3 is ~195 GB per GPU of the 288 GB
 # a gfx950 carries, so TP8 is the only topology it fits in. Not a knob.
@@ -532,7 +536,7 @@ def render_report(
         f"### Kimi-K3 MXFP4 agentic replay, no-DCP arm "
         f"[{os.getenv('GPU_CONFIG', 'MI35x')}]\n\n"
         f"{_workload_rows(arm, limits)}"
-        f"{trace_summary}"
+        f"{trace_summary}\n"
         f"| metric | value |\n| --- | --- |\n"
         f"| completed turns | {result.get('completed')} |\n"
         f"| duration (s) | {result.get('duration', 0):.1f} |\n"
@@ -699,7 +703,7 @@ class TestKimiK3Mxfp4AgenticEvalMI35x(_KimiK3AgenticServer):
         self.publish(
             f"### Kimi-K3 MXFP4 agentic recipe, GSM8K "
             f"[{os.getenv('GPU_CONFIG', 'MI35x')}]\n\n"
-            f"{_workload_rows(self.arm, limits)}"
+            f"{_workload_rows(self.arm, limits)}\n"
             f"| metric | value |\n| --- | --- |\n"
             f"| gsm8k questions | {EVAL_NUM_EXAMPLES} ({EVAL_NUM_SHOTS}-shot) |\n"
             f"| gsm8k accuracy | {accuracy:.3f} |\n"
