@@ -836,6 +836,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
 
+    def test_lfm2_vl_is_registered(self):
+        vl_config = SimpleNamespace(architectures=["Lfm2VlForConditionalGeneration"])
+        with override_platform(is_sm100=True):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "Lfm2VlForConditionalGeneration",
+                    SimpleNamespace(attention_backend=None),
+                    vl_config,
+                ),
+                [("_lfm2_overrides", {"attention_backend": "flashinfer"})],
+            )
+        with override_platform(is_sm100=False):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "Lfm2VlForConditionalGeneration",
+                    SimpleNamespace(attention_backend=None),
+                    vl_config,
+                ),
+                [],
+            )
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
@@ -2824,6 +2845,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             self.assertEqual(
                 _lfm2_overrides(_args(), None), {"attention_backend": "flashinfer"}
+            )
+            # LFM2-VL shares the ShortConv language model and its declaration.
+            self.assertEqual(
+                _lfm2_overrides(
+                    _args(),
+                    SimpleNamespace(architectures=["Lfm2VlForConditionalGeneration"]),
+                ),
+                {"attention_backend": "flashinfer"},
+            )
+            self.assertEqual(
+                _lfm2_overrides(_args(attention_backend="triton"), None), {}
             )
         with override_platform(is_sm100=False):
             self.assertEqual(_minicpm_v4_6_overrides(_args(), None), {})
