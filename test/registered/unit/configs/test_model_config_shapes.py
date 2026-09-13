@@ -6,6 +6,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     _quant_config_to_dict,
+    compute_mla_mscale_scaling,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -138,6 +139,37 @@ class TestModelConfigShapes(CustomTestCase):
         quant_config = SimpleNamespace(to_dict=lambda: {"quant_method": "test"})
 
         self.assertEqual(_quant_config_to_dict(quant_config), {"quant_method": "test"})
+
+    def test_mla_branches_derive_scaling(self):
+        base_scaling = 1 / math.sqrt(128 + 64)
+        rope_scaling = {"rope_type": "yarn", "factor": 2.0, "mscale_all_dim": 1.0}
+        cases = [
+            ("KimiVLForConditionalGeneration", {}, base_scaling),
+            ("MiniCPM3ForCausalLM", {}, base_scaling),
+            ("DeepseekVL2ForCausalLM", {"use_mla": True}, base_scaling),
+            (
+                "KimiVLForConditionalGeneration",
+                {"rope_scaling": rope_scaling},
+                compute_mla_mscale_scaling(rope_scaling, base_scaling),
+            ),
+        ]
+
+        for arch, extra, expected_scaling in cases:
+            with self.subTest(arch=arch, rope_scaling=extra.get("rope_scaling")):
+                config_kwargs = dict(
+                    architectures=[arch],
+                    kv_lora_rank=512,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    rope_scaling=None,
+                )
+                config_kwargs.update(extra)
+                text_config = _make_text_config(**config_kwargs)
+                model_config = self._derive_shapes(text_config)
+
+                self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+                self.assertAlmostEqual(model_config.scaling, expected_scaling)
 
 
 if __name__ == "__main__":
