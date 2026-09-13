@@ -2001,11 +2001,18 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
-                # paged-only SWA path only; ragged keeps its custom prefix
-                # mask, spec-verify keeps its tree mask
+                # Paged-only SWA path. DFlash verify is a linear block without a
+                # tree mask, so its layer still needs the kernel's moving window.
                 window_left=(
                     sliding_window_size
-                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
+                    if (
+                        wrapper_id == 0
+                        and not use_ragged
+                        and (
+                            spec_info is None
+                            or spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                        )
+                    )
                     else -1
                 ),
             )
