@@ -20,8 +20,8 @@ use crate::policies::{
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    WorkerModeLabel,
+    CacheAwareDecision, LocalityBlocks, MetricsRegistry, PolicySelectionFailureReason,
+    RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -370,6 +370,10 @@ pub async fn chat_completions(
     let use_global_affinity_probe = ctx.bucket_selector.is_enabled()
         && policy.is_bucket_affinity_policy()
         && session_affinity_mode != SessionAffinityMode::Bucket;
+    // Terminal cache-aware outcome, set inside the selection block below and
+    // booked once a worker resolves. Starts at the pre-lookup state: a
+    // selection that never reaches the cache path leaves it there.
+    let cache_aware_decision = Cell::new(CacheAwareDecision::LookupUnavailable);
     let worker = {
         let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
         let select_prefill_in_domain = |domain: &CandidateDomain,
@@ -484,6 +488,15 @@ pub async fn chat_completions(
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
         let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
             .then(|| {
+                // Set BEFORE the snapshot bail below: `lookup_unavailable` is
+                // documented to be the one decision that books no blocks, and
+                // leaving it set while a signal exists would break that on any
+                // early return. Today the bail is unreachable for this policy
+                // (it always requests a snapshot), but the metric's contract
+                // should not rest on an admission-path property.
+                if external_prefix.is_some() {
+                    cache_aware_decision.set(CacheAwareDecision::NoCandidates);
+                }
                 let snapshot = load_snapshot.as_ref()?;
                 let global_range = CandidateRange::global(&workers);
                 let cache_ctx =
@@ -518,6 +531,7 @@ pub async fn chat_completions(
                 ctx.metrics
                     .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
                 let Some(decision) = cache_decision.decision else {
+                    cache_aware_decision.set(CacheAwareDecision::CandidatesExhausted);
                     selection_failure_reason
                         .set(PolicySelectionFailureReason::CacheCandidatesExhausted);
                     return None;
@@ -542,6 +556,7 @@ pub async fn chat_completions(
                 );
                 ctx.metrics
                     .record_policy_decision("cache_aware", "cache_candidate");
+                cache_aware_decision.set(CacheAwareDecision::CacheHit);
                 Some(decision.selected)
             })
             .flatten();
@@ -607,6 +622,16 @@ pub async fn chat_completions(
                 policy_selection_failed(&ctx, &model_str, selection_failure_reason.get())
             })?
     };
+
+    if ctx.config.model.policy == PolicyKind::CacheAware {
+        record_cache_locality(
+            &ctx.metrics,
+            &model_str,
+            external_prefix.as_ref(),
+            cache_aware_decision.get(),
+            &worker.url,
+        );
+    }
 
     // Decode selection starts after Final P.
     //
@@ -1075,6 +1100,109 @@ pub async fn chat_completions(
     }
 }
 
+/// What the cache-aware locality metrics need out of one prefix lookup, once
+/// the winning worker is known. Pure so the arithmetic — the part that decides
+/// whether a dashboard reads a hit rate above 100% — is testable without a
+/// router.
+struct LocalitySample {
+    blocks: LocalityBlocks,
+    /// `Tiers::SLOTS` label, `none`, or `unknown`. See
+    /// [`MetricsRegistry::record_selected_owner_tier`].
+    selected_tier: &'static str,
+    /// Whether the first queried block hash is carried by the tree. `None`
+    /// when the provider did not ask — it only asks on a miss, which is the
+    /// only case this attributes.
+    block0_in_tree: Option<bool>,
+}
+
+/// Decompose one lookup against the worker the request was actually sent to.
+///
+/// The nesting the counters promise — `selected <= matched <= query` — is the
+/// ROUTER's invariant to enforce, not the provider's, so both counts are
+/// clamped here rather than trusted. `query` is the outer clamp because a
+/// provider may legitimately report a worker holding a longer chain than was
+/// asked about. `matched` is the inner one because `best_prefix_blocks` and
+/// the per-worker depths are two numbers the provider computes separately:
+/// the in-process tree derives both from one descent and cannot disagree, but
+/// the out-of-process indexer is a separate service on a wire contract that
+/// only documents the relationship. A violation renders as a hit rate above
+/// 100% and a negative loss bar on every panel built from these, which is a
+/// poor way to learn an indexer is out of contract.
+///
+/// The debug assertion in `CacheAwareBlocks` stays rather than being made
+/// redundant by the clamp: the clamp keeps a release build's charts honest,
+/// the assertion is what fails a test build loudly enough to go fix the
+/// provider instead of silently flattening its numbers.
+fn locality_sample(signal: &ExternalPrefixSignal, selected_url: &str) -> LocalitySample {
+    let query = signal.query_blocks as u64;
+    let (matched, selected) = match &signal.outcome {
+        sgl_kv_indexer::PrefixOutcome::Matched {
+            matches,
+            best_prefix_blocks,
+        } => {
+            let matched = u64::from(*best_prefix_blocks).min(query);
+            let selected = matches
+                .iter()
+                .find(|m| m.address == selected_url)
+                .map_or(0, |m| u64::from(m.matched_prefix_blocks))
+                .min(matched);
+            (matched, selected)
+        }
+        sgl_kv_indexer::PrefixOutcome::Empty => (0, 0),
+    };
+    let selected_tier = match &signal.tree_view {
+        // A holder below `cache_threshold` still reports the tier it holds on:
+        // `selected_overlap_blocks_total` credits its blocks, so suppressing
+        // the tier here would leave those blocks tier-less.
+        Some(view) if selected > 0 => view
+            .owner_tiers
+            .get(selected_url)
+            .copied()
+            .unwrap_or("none"),
+        Some(_) => "none",
+        None => "unknown",
+    };
+    LocalitySample {
+        blocks: LocalityBlocks {
+            query,
+            matched,
+            selected,
+        },
+        selected_tier,
+        block0_in_tree: signal
+            .tree_view
+            .as_ref()
+            .and_then(|view| view.block0_in_tree),
+    }
+}
+
+/// Book one cache-aware selection's locality against the decision that
+/// produced it.
+///
+/// A selection with no lookup contributes only the decision counter — there is
+/// no prefix to attribute, and inventing a zero would drag every ratio toward
+/// zero for a reason that has nothing to do with the cache.
+fn record_cache_locality(
+    metrics: &MetricsRegistry,
+    model_id: &str,
+    signal: Option<&ExternalPrefixSignal>,
+    decision: CacheAwareDecision,
+    selected_url: &str,
+) {
+    let Some(signal) = signal else {
+        metrics.record_cache_aware_selection(model_id, decision, None);
+        return;
+    };
+    let sample = locality_sample(signal, selected_url);
+    metrics.record_cache_aware_selection(model_id, decision, Some(sample.blocks));
+    metrics.record_selected_owner_tier(model_id, sample.selected_tier);
+    if sample.blocks.matched == 0 {
+        if let Some(present) = sample.block0_in_tree {
+            metrics.record_zero_match_block0(model_id, present);
+        }
+    }
+}
+
 fn resolve_prefix_query(
     result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
     model: &str,
@@ -1449,6 +1577,7 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::TreePrefixView;
 
     /// An unavailable indexer must never fail a request that min-load routing
     /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
@@ -1947,5 +2076,139 @@ mod tests {
             ),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+    fn matched_signal(
+        best: u32,
+        holders: &[(&str, u32)],
+        tree_view: Option<TreePrefixView>,
+    ) -> ExternalPrefixSignal {
+        ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: holders
+                    .iter()
+                    .map(|(url, blocks)| sgl_kv_indexer::PrefixMatch {
+                        worker_id: (*url).to_string(),
+                        address: (*url).to_string(),
+                        matched_prefix_blocks: *blocks,
+                    })
+                    .collect(),
+                best_prefix_blocks: best,
+            },
+            query_blocks: 100,
+            tree_view,
+        }
+    }
+
+    fn tree_view(owners: &[(&str, &'static str)], block0_in_tree: Option<bool>) -> TreePrefixView {
+        TreePrefixView {
+            owner_tiers: owners
+                .iter()
+                .map(|(url, tier)| ((*url).to_string(), *tier))
+                .collect(),
+            block0_in_tree,
+        }
+    }
+
+    /// `matched` is the fleet best and `selected` is what the request will
+    /// actually get. Conflating them is the misreading the whole metric set
+    /// exists to prevent: here the gate routed off a 90-block owner onto a
+    /// 30-block one, and only `selected` shows it.
+    #[test]
+    fn locality_sample_separates_the_fleet_best_from_the_worker_taken() {
+        let signal = matched_signal(90, &[("http://a", 90), ("http://b", 30)], None);
+        let sample = locality_sample(&signal, "http://b");
+        assert_eq!(
+            sample.blocks,
+            LocalityBlocks {
+                query: 100,
+                matched: 90,
+                selected: 30,
+            }
+        );
+    }
+
+    /// A worker not in the match list holds nothing of this prefix — the
+    /// ordinary min-load fallback.
+    #[test]
+    fn locality_sample_credits_an_unlisted_winner_with_nothing() {
+        let signal = matched_signal(90, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://elsewhere");
+        assert_eq!(sample.blocks.selected, 0);
+        assert_eq!(sample.blocks.matched, 90);
+    }
+
+    /// A provider may report a deeper chain than was asked about. The nesting
+    /// the counters promise is the router's invariant, so clamp rather than
+    /// render a hit rate above 100%.
+    #[test]
+    fn locality_sample_clamps_a_provider_that_overshoots_the_query() {
+        let signal = matched_signal(400, &[("http://a", 400)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 100);
+        assert_eq!(sample.blocks.selected, 100);
+    }
+
+    /// A provider whose fleet best is computed over a different candidate set
+    /// than its per-worker depths reports a holder DEEPER than the best. That
+    /// is out of contract, and unclamped it renders as a hit rate above 100%
+    /// and a negative loss bar on every panel built from these counters.
+    #[test]
+    fn locality_sample_clamps_a_holder_deeper_than_the_reported_fleet_best() {
+        let signal = matched_signal(40, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 40);
+        assert_eq!(
+            sample.blocks.selected, 40,
+            "selected must never exceed matched, whatever the provider says",
+        );
+    }
+
+    #[test]
+    fn locality_sample_reports_the_selected_workers_own_tier() {
+        let signal = matched_signal(
+            90,
+            &[("http://a", 90), ("http://b", 30)],
+            Some(tree_view(
+                &[("http://a", "device"), ("http://b", "host")],
+                None,
+            )),
+        );
+        assert_eq!(locality_sample(&signal, "http://a").selected_tier, "device");
+        assert_eq!(
+            locality_sample(&signal, "http://b").selected_tier,
+            "host",
+            "the winner's own tier, not the fleet best's",
+        );
+        assert_eq!(
+            locality_sample(&signal, "http://elsewhere").selected_tier,
+            "none",
+            "a winner holding nothing has no tier",
+        );
+    }
+
+    /// The indexer path cannot answer the tier question. Reporting `device`
+    /// there would read as a fleet serving every hit in place.
+    #[test]
+    fn locality_sample_reports_unknown_tier_without_a_tree_view() {
+        let signal = matched_signal(90, &[("http://a", 90)], None);
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.selected_tier, "unknown");
+        assert_eq!(sample.block0_in_tree, None);
+    }
+
+    #[test]
+    fn locality_sample_carries_block0_presence_for_a_zero_match() {
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
+            query_blocks: 100,
+            tree_view: Some(tree_view(&[], Some(true))),
+        };
+        let sample = locality_sample(&signal, "http://a");
+        assert_eq!(sample.blocks.matched, 0);
+        assert_eq!(
+            sample.block0_in_tree,
+            Some(true),
+            "carried but unreachable is a router-side linkage fault, not an engine gap",
+        );
     }
 }

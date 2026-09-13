@@ -38,7 +38,45 @@
 //! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
 //! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
+//! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_cache_aware_query_blocks_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_matched_overlap_blocks_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_selected_overlap_blocks_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
+//! | `sgl_router_selected_owner_tier_total` | Counter | `model_id`, `tier` |
+//! | `sgl_router_zero_match_block0_total` | Counter | `model_id`, `presence` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//!
+//! # Reading cache locality against the engine
+//!
+//! The `query`/`matched`/`selected` block counters decompose the router's view
+//! of cache locality into terms that can be subtracted. The ratio to compare
+//! against the engine's
+//! `sglang:cached_tokens_total / sglang:prompt_tokens_total` is
+//! `selected / query`, NOT `matched / query` — the latter is the fleet-wide
+//! best and reads structurally high, because the router meters the deepest
+//! prefix ANYONE holds even on the selections where it then routed somewhere
+//! else. `matched - selected` is locality the routing decision gave up, and it
+//! is attributable to a decision bucket because all three counters share the
+//! `(model_id, decision)` key.
+//!
+//! The residual between `selected / query` and the engine's number is NOT
+//! one-directional. It runs high when cache state changed between selection
+//! and prefill (the engine evicted what the tree still lists), and low when a
+//! worker serves traffic while publishing no KV events — a `/server_info`
+//! probe that failed at registration, or a page-size disagreement, both of
+//! which leave a worker fully routable and permanently absent from the tree.
+//! Such a worker reads `selected = 0` on every selection that lands on it,
+//! indistinguishable from one that genuinely holds nothing, so a
+//! `selected / query` sitting *below* the engine's hit rate points at the
+//! subscriber fleet rather than at eviction.
+//!
+//! Block counts convert to the engine's token units by multiplying by
+//! `sgl_router_kv_block_size`. The query-block denominator rounds a partial
+//! trailing block up to a whole one, so per request it can overstate the
+//! engine's token count by up to one block less a token — averaging half a
+//! block on uniformly distributed lengths, which is where the two denominators
+//! agree in aggregate.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -83,6 +121,18 @@ const TTFT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
     0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
     400.0,
+];
+
+/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
+/// 16-64 tokens each and `MAX_CHAT_BODY_BYTES` bounds context length, putting
+/// the practical ceiling for a maximum-length context in the low tens of
+/// thousands of blocks. The ladder spans 0 -> ~8k blocks at the resolution
+/// worth charting; `+Inf` catches the longer-context tail. The leading `0.0`
+/// edge is load-bearing: a zero-overlap selection is the most common outcome
+/// on an unhealthy fleet, and without its own bucket it would be
+/// indistinguishable from a one-block match.
+const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -214,6 +264,113 @@ impl ActiveLoadKind {
     }
 }
 
+/// Terminal outcome of one cache-aware prefill selection. Exactly one is
+/// recorded per request routed by the cache-aware policy that resolved a
+/// worker, so the labels sum to the cache-aware request rate less the
+/// selections that ended in a 503.
+///
+/// Most of those 503s are in `sgl_router_policy_selection_failures_total`,
+/// but not all: an out-of-process indexer that rejects the query contract
+/// raises the same error without going through the recorder, so reconciling
+/// the two counters can leave a small unexplained gap on indexer deployments.
+/// Do not treat their sum as a closed accounting of cache-aware requests.
+///
+/// The vocabulary is deliberately the set of outcomes the routing path can
+/// tell apart TODAY. Where the policy collapses a distinction — a tree miss,
+/// a match that failed `cache_affinity_min_matched_tokens`, and an owner that
+/// is not a live worker all return the same `None` from
+/// `CacheAwarePolicy::propose_prefill` — this collapses it too rather than
+/// reaching into the policy for a finer split.
+/// `sgl_router_zero_match_block0_total` is the finer split that does not need
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAwareDecision {
+    /// A prefix owner won the selection.
+    CacheHit,
+    /// The lookup ran and produced no usable candidate: nothing matched,
+    /// nothing cleared the cache gate, or no owner was a live worker. The
+    /// request fell back to the ordinary min-load path.
+    NoCandidates,
+    /// The lookup produced candidates and hard admission or the pressure
+    /// guard rejected every one of them, so locality was given up to
+    /// capacity. Distinct from [`Self::NoCandidates`] because the fix is
+    /// different: this one is a sizing problem, that one a cache problem.
+    CandidatesExhausted,
+    /// No prefix lookup happened at all — no routing tokens, no block size
+    /// established from the fleet yet, or no prefix provider configured. A
+    /// router that has just started reads this until the first worker reports
+    /// its page size, which is the honest answer to "why is my hit rate 0".
+    LookupUnavailable,
+}
+
+impl CacheAwareDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::NoCandidates => "no_candidates",
+            Self::CandidatesExhausted => "candidates_exhausted",
+            Self::LookupUnavailable => "lookup_unavailable",
+        }
+    }
+}
+
+/// One selection's locality triple as the call site computes it, before it is
+/// booked. A struct rather than three `u64` arguments because the three are
+/// mutually constrained and swapping two of them at a call site would be
+/// silent — and would render as a hit rate above 100%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalityBlocks {
+    /// Blocks the request hashed to — the denominator.
+    pub query: u64,
+    /// Blocks the deepest holder in the fleet has.
+    pub matched: u64,
+    /// Blocks the worker this request was actually sent to has.
+    pub selected: u64,
+}
+
+/// The block counts one cache-aware selection contributes, held per
+/// `(model_id, decision)`.
+///
+/// The three answer three different questions about the same request, and the
+/// differences between them are the point:
+///
+/// * `query` — how much prefix the request has. The denominator.
+/// * `matched` — how much of it the *best* worker in the fleet holds. The
+///   ceiling: what a router with no load constraints could have reused.
+/// * `selected` — how much of it the worker actually picked holds. What the
+///   engine should be able to reuse, modulo eviction between now and prefill.
+///
+/// They nest: `selected <= matched <= query`, per booking and therefore
+/// (addition preserves it) for the totals. [`Self::record`] asserts it in
+/// debug builds — every ratio charted off these counters assumes it, and a
+/// violation renders as a hit rate above 100% or a negative loss bar, which is
+/// worth catching at the booking site rather than in Grafana.
+#[derive(Debug, Default)]
+struct CacheAwareBlocks {
+    query: AtomicU64,
+    matched: AtomicU64,
+    selected: AtomicU64,
+}
+
+impl CacheAwareBlocks {
+    /// Add one selection's contribution to all three counters.
+    ///
+    /// Not atomic as a group: a scrape landing between the adds sees a partial
+    /// booking. That is fine for counters read through `rate()` over any
+    /// multi-scrape window — the increments are never lost, only briefly
+    /// displaced. What the shared key DOES buy is that a numerator can never
+    /// be attributed to a different decision than its denominator.
+    fn record(&self, query: u64, matched: u64, selected: u64) {
+        debug_assert!(
+            selected <= matched && matched <= query,
+            "locality decomposition must nest: selected {selected} <= matched {matched} <= query {query}",
+        );
+        self.query.fetch_add(query, Ordering::Relaxed);
+        self.matched.fetch_add(matched, Ordering::Relaxed);
+        self.selected.fetch_add(selected, Ordering::Relaxed);
+    }
+}
+
 /// The shared metrics registry, held on `AppContext`. Cheap to clone — all
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
@@ -244,6 +401,15 @@ pub struct MetricsRegistry {
     cache_pressure_guard_compared_total: AtomicU64,
     cache_pressure_guard_override_total: AtomicU64,
     cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
+    /// The three block counters that decompose cache-aware locality, kept in
+    /// one map value so a selection books all of them against one key and they
+    /// can never disagree about which decision they belong to. Rendered as
+    /// three metric families sharing `(model_id, decision)`.
+    cache_aware_blocks: Mutex<HashMap<CacheAwareDecisionKey, Arc<CacheAwareBlocks>>>,
+    overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    selected_owner_tier_total: Mutex<HashMap<SelectedTierKey, Arc<AtomicU64>>>,
+    zero_match_block0_total: Mutex<HashMap<ZeroMatchKey, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -292,6 +458,30 @@ pub struct WorkerSnapshot {
 struct ActiveLoadKey {
     worker_url: String,
     kind: &'static str,
+}
+
+/// Key shared by `cache_aware_decisions_total` and the three block counters,
+/// so a numerator and its denominator always carry the same labels.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct CacheAwareDecisionKey {
+    model_id: String,
+    decision: &'static str,
+}
+
+/// Key for [`MetricsRegistry::record_selected_owner_tier`]. `tier` is a
+/// `Tiers::SLOTS` label, `none`, or `unknown` — see that method.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct SelectedTierKey {
+    model_id: String,
+    tier: &'static str,
+}
+
+/// Key for [`MetricsRegistry::record_zero_match_block0`]. `presence` is
+/// `in_tree` or `absent` — see that method.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct ZeroMatchKey {
+    model_id: String,
+    presence: &'static str,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -555,6 +745,108 @@ impl MetricsRegistry {
         let mut guard = self.cache_monitor_decisions_total.lock();
         let counter = guard
             .entry(source)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Book one cache-aware selection: its terminal decision, and — when the
+    /// lookup ran — the query / fleet-best / selected block triple under the
+    /// same `(model_id, decision)` key.
+    ///
+    /// `blocks` is `None` for a selection with no lookup to attribute
+    /// (`lookup_unavailable`), which is why
+    /// `sgl_router_cache_aware_decisions_total` is the larger of the two
+    /// totals and the block counters must never be used as a request count.
+    ///
+    /// Panics in debug builds if the triple does not nest — see
+    /// [`CacheAwareBlocks`].
+    pub fn record_cache_aware_selection(
+        &self,
+        model_id: &str,
+        decision: CacheAwareDecision,
+        blocks: Option<LocalityBlocks>,
+    ) {
+        let key = CacheAwareDecisionKey {
+            model_id: model_id.to_owned(),
+            decision: decision.as_str(),
+        };
+        let mut guard = self.cache_aware_decisions_total.lock();
+        let counter = guard
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        let Some(blocks) = blocks else {
+            return;
+        };
+        let mut guard = self.cache_aware_blocks.lock();
+        let entry = guard.entry(key).or_default().clone();
+        drop(guard);
+        entry.record(blocks.query, blocks.matched, blocks.selected);
+
+        let mut guard = self.overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks.matched as f64);
+    }
+
+    /// Book the cheapest storage tier on which the SELECTED worker holds this
+    /// request's matched prefix, in `Tiers::SLOTS` vocabulary (`device`,
+    /// `host`, `disk`, `external`) so it joins with
+    /// `sgl_router_kv_tree_blocks`.
+    ///
+    /// Two labels are not tiers. `none` means the chosen worker holds no part
+    /// of this prefix — every `no_candidates` selection, and any hit whose
+    /// winner is not the owner. `unknown` means the tier is not observable on
+    /// this deployment: the out-of-process indexer's wire contract carries no
+    /// medium, so an indexer fleet reads `unknown` on every selection rather
+    /// than a fabricated `device`.
+    ///
+    /// `host / (device + host)` is the fraction of affinity routes that count
+    /// on a load-back rather than an in-place hit — the number that says
+    /// whether the host tier is carrying the fleet.
+    pub fn record_selected_owner_tier(&self, model_id: &str, tier: &'static str) {
+        let key = SelectedTierKey {
+            model_id: model_id.to_owned(),
+            tier,
+        };
+        let mut guard = self.selected_owner_tier_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Split a ZERO-overlap cache-aware selection by whether the request's
+    /// FIRST queried block hash exists anywhere in the KV tree.
+    ///
+    /// A zero match is the most common outcome on an unhealthy fleet and is
+    /// also completely ambiguous. `absent` means no node carries that hash:
+    /// the engines never published the block, or published and then removed it
+    /// — an engine-side gap. `in_tree` means the hash IS carried but the
+    /// root-anchored walk could not reach it — a linkage problem on the router
+    /// side. The two call for work in different repositories, and a zero
+    /// `matched` alone cannot tell them apart.
+    ///
+    /// Recorded only for a zero-overlap selection whose provider can answer
+    /// (the in-process tree), so it is a strict subset of
+    /// `sgl_router_cache_aware_decisions_total` and never exceeds the zero
+    /// bucket of `sgl_router_overlap_blocks`.
+    pub fn record_zero_match_block0(&self, model_id: &str, present_in_tree: bool) {
+        let key = ZeroMatchKey {
+            model_id: model_id.to_owned(),
+            presence: if present_in_tree { "in_tree" } else { "absent" },
+        };
+        let mut guard = self.zero_match_block0_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -940,6 +1232,123 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_cache_monitor_decisions_total{{source=\"{}\"}} {}\n",
                 source, value,
+            ));
+        }
+        drop(guard);
+
+        // cache_aware_decisions_total — one terminal outcome per selection
+        out.push_str(
+            "# HELP sgl_router_cache_aware_decisions_total Cache-aware prefill selections by terminal decision: cache_hit = a prefix owner won; no_candidates = the lookup ran and produced no usable owner; candidates_exhausted = owners existed and admission or the pressure guard rejected every one; lookup_unavailable = no prefix lookup happened (no routing tokens, no fleet block size yet, or no provider configured). Selections that ended in a 503 are in sgl_router_policy_selection_failures_total instead.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
+        let guard = self.cache_aware_decisions_total.lock();
+        let mut entries: Vec<(&CacheAwareDecisionKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.decision).cmp(&(&b.0.model_id, b.0.decision)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_aware_decisions_total{{model_id=\"{}\",decision=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.decision,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // The locality triple — three families off one keyed value, rendered
+        // together so a reader meets the denominator before the numerators.
+        let guard = self.cache_aware_blocks.lock();
+        let mut entries: Vec<(&CacheAwareDecisionKey, &Arc<CacheAwareBlocks>)> =
+            guard.iter().collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.decision).cmp(&(&b.0.model_id, b.0.decision)));
+        for (name, help, pick) in [
+            (
+                "sgl_router_cache_aware_query_blocks_total",
+                "Block hashes the request was looked up on — the denominator of every locality ratio. Emitted only for selections that reached the lookup, so it does NOT join with sgl_router_cache_aware_decisions_total on decision=\"lookup_unavailable\".",
+                (|b: &CacheAwareBlocks| b.query.load(Ordering::Relaxed))
+                    as fn(&CacheAwareBlocks) -> u64,
+            ),
+            (
+                "sgl_router_matched_overlap_blocks_total",
+                "Blocks held by the BEST-matching worker in the fleet, by terminal decision. Counter form of sgl_router_overlap_blocks_sum; an upper bound on reusable prefix, not what was routed to.",
+                (|b: &CacheAwareBlocks| b.matched.load(Ordering::Relaxed))
+                    as fn(&CacheAwareBlocks) -> u64,
+            ),
+            (
+                "sgl_router_selected_overlap_blocks_total",
+                "Blocks held by the worker actually SELECTED, by terminal decision. Divided by query blocks this is the router's prediction of the engine's cache hit rate; its shortfall against matched blocks is locality the routing decision gave up. Reads 0 for a worker that publishes no KV events, which is indistinguishable here from one holding nothing.",
+                (|b: &CacheAwareBlocks| b.selected.load(Ordering::Relaxed))
+                    as fn(&CacheAwareBlocks) -> u64,
+            ),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n"));
+            out.push_str(&format!("# TYPE {name} counter\n"));
+            for (key, blocks) in &entries {
+                out.push_str(&format!(
+                    "{name}{{model_id=\"{}\",decision=\"{}\"}} {}\n",
+                    escape_label(&key.model_id),
+                    key.decision,
+                    pick(blocks),
+                ));
+            }
+        }
+        drop(guard);
+
+        // overlap_blocks histogram — distribution behind matched_overlap_blocks_total
+        out.push_str(
+            "# HELP sgl_router_overlap_blocks Fleet-best overlap-block count observed at cache-aware selection. The distribution behind sgl_router_matched_overlap_blocks_total: the le=\"0\" bucket is the zero-match share, which sgl_router_zero_match_block0_total then attributes to the engine or the router.\n",
+        );
+        out.push_str("# TYPE sgl_router_overlap_blocks histogram\n");
+        let guard = self.overlap_blocks.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = &guard[model_id];
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
+        }
+        drop(guard);
+
+        // selected_owner_tier_total — which tier the chosen worker holds it on
+        out.push_str(
+            "# HELP sgl_router_selected_owner_tier_total Cache-aware selections by the cheapest storage tier on which the CHOSEN worker holds the matched prefix, in the same vocabulary as sgl_router_kv_tree_blocks: device = served in place, host = served by load-back from host memory, disk / external = from a storage backend. Two labels are not tiers: none = the chosen worker holds no part of this prefix, unknown = the deployment's prefix provider does not report tiers (the out-of-process indexer).\n",
+        );
+        out.push_str("# TYPE sgl_router_selected_owner_tier_total counter\n");
+        let guard = self.selected_owner_tier_total.lock();
+        let mut entries: Vec<(&SelectedTierKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.tier).cmp(&(&b.0.model_id, b.0.tier)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_selected_owner_tier_total{{model_id=\"{}\",tier=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.tier,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // zero_match_block0_total — whose fault a zero match is
+        out.push_str(
+            "# HELP sgl_router_zero_match_block0_total Zero-overlap cache-aware selections split by whether the request's FIRST queried block hash exists anywhere in the KV tree. absent = the fleet never published that block or removed it (engine-side gap); in_tree = the hash is carried but the root-anchored walk could not reach it (router-side linkage). Strict subset of sgl_router_cache_aware_decisions_total, and never more than the le=\"0\" bucket of sgl_router_overlap_blocks.\n",
+        );
+        out.push_str("# TYPE sgl_router_zero_match_block0_total counter\n");
+        let guard = self.zero_match_block0_total.lock();
+        let mut entries: Vec<(&ZeroMatchKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.presence).cmp(&(&b.0.model_id, b.0.presence)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_zero_match_block0_total{{model_id=\"{}\",presence=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.presence,
+                value,
             ));
         }
         drop(guard);
@@ -1369,6 +1778,193 @@ mod tests {
         assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
         assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
         assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
+    }
+
+    /// Every new family renders `model_id` through `escape_label`. A model id
+    /// with a quote or a backslash in it would otherwise emit a line the
+    /// Prometheus text parser rejects, and a rejected line takes the WHOLE
+    /// scrape with it — not just that series.
+    #[test]
+    fn locality_families_escape_the_model_label() {
+        let reg = MetricsRegistry::new();
+        let model = r#"mod"el\x"#;
+        reg.record_cache_aware_selection(
+            model,
+            CacheAwareDecision::CacheHit,
+            Some(LocalityBlocks {
+                query: 10,
+                matched: 4,
+                selected: 4,
+            }),
+        );
+        reg.record_selected_owner_tier(model, "device");
+        reg.record_zero_match_block0(model, false);
+
+        let out = reg.render();
+        let escaped = r#"mod\"el\\x"#;
+        for family in [
+            "sgl_router_cache_aware_decisions_total",
+            "sgl_router_cache_aware_query_blocks_total",
+            "sgl_router_matched_overlap_blocks_total",
+            "sgl_router_selected_overlap_blocks_total",
+            "sgl_router_selected_owner_tier_total",
+            "sgl_router_zero_match_block0_total",
+        ] {
+            let want = format!(r#"{family}{{model_id="{escaped}""#);
+            assert!(out.contains(&want), "missing {want} in:\n{out}");
+        }
+        assert!(out.contains(&format!(
+            r#"sgl_router_overlap_blocks_count{{model_id="{escaped}"}} 1"#
+        )));
+        assert!(
+            !out.contains(&format!(r#"model_id="{model}""#)),
+            "a raw unescaped model id must never reach the exposition",
+        );
+    }
+
+    #[test]
+    fn locality_triple_shares_one_decision_key() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_selection(
+            "tiny",
+            CacheAwareDecision::CacheHit,
+            Some(LocalityBlocks {
+                query: 100,
+                matched: 80,
+                selected: 80,
+            }),
+        );
+        reg.record_cache_aware_selection(
+            "tiny",
+            CacheAwareDecision::CandidatesExhausted,
+            Some(LocalityBlocks {
+                query: 100,
+                matched: 90,
+                selected: 0,
+            }),
+        );
+
+        let out = reg.render();
+        for (name, decision, value) in [
+            (
+                "sgl_router_cache_aware_query_blocks_total",
+                "cache_hit",
+                100,
+            ),
+            ("sgl_router_matched_overlap_blocks_total", "cache_hit", 80),
+            ("sgl_router_selected_overlap_blocks_total", "cache_hit", 80),
+            (
+                "sgl_router_cache_aware_query_blocks_total",
+                "candidates_exhausted",
+                100,
+            ),
+            (
+                "sgl_router_matched_overlap_blocks_total",
+                "candidates_exhausted",
+                90,
+            ),
+            // The whole point of the split: locality the CAPACITY decision
+            // gave up must not be averaged into the hit bucket.
+            (
+                "sgl_router_selected_overlap_blocks_total",
+                "candidates_exhausted",
+                0,
+            ),
+        ] {
+            let want = format!(r#"{name}{{model_id="tiny",decision="{decision}"}} {value}"#);
+            assert!(out.contains(&want), "missing {want} in:\n{out}");
+        }
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_hit"} 1"#
+        ));
+    }
+
+    /// A selection with no lookup books a decision and nothing else — a zero
+    /// triple would drag every ratio down for a reason unrelated to the cache.
+    #[test]
+    fn a_selection_without_a_lookup_contributes_no_blocks() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_selection("tiny", CacheAwareDecision::LookupUnavailable, None);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="lookup_unavailable"} 1"#
+        ));
+        assert!(
+            !out.contains(r#"sgl_router_cache_aware_query_blocks_total{model_id="tiny""#),
+            "no lookup means no denominator; got:\n{out}"
+        );
+        assert!(
+            !out.contains(r#"sgl_router_overlap_blocks_count{model_id="tiny"}"#),
+            "and no histogram observation; got:\n{out}"
+        );
+    }
+
+    /// The histogram tracks the FLEET-BEST overlap, so its `le="0"` bucket is
+    /// the zero-match share that `zero_match_block0_total` then attributes.
+    #[test]
+    fn overlap_histogram_observes_matched_and_keeps_a_zero_bucket() {
+        let reg = MetricsRegistry::new();
+        for matched in [0, 0, 40] {
+            reg.record_cache_aware_selection(
+                "tiny",
+                CacheAwareDecision::CacheHit,
+                Some(LocalityBlocks {
+                    query: 100,
+                    matched,
+                    selected: matched,
+                }),
+            );
+        }
+
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_overlap_blocks_count{model_id="tiny"} 3"#));
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="0"} 2"#));
+        // 40 lands in le=64, not le=32.
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="32"} 2"#));
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="64"} 3"#));
+    }
+
+    #[test]
+    fn tier_and_zero_match_counters_render_their_labels() {
+        let reg = MetricsRegistry::new();
+        reg.record_selected_owner_tier("tiny", "device");
+        reg.record_selected_owner_tier("tiny", "host");
+        reg.record_selected_owner_tier("tiny", "host");
+        reg.record_selected_owner_tier("tiny", "unknown");
+        reg.record_zero_match_block0("tiny", true);
+        reg.record_zero_match_block0("tiny", false);
+        reg.record_zero_match_block0("tiny", false);
+
+        let out = reg.render();
+        for want in [
+            r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="device"} 1"#,
+            r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="host"} 2"#,
+            r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="unknown"} 1"#,
+            r#"sgl_router_zero_match_block0_total{model_id="tiny",presence="in_tree"} 1"#,
+            r#"sgl_router_zero_match_block0_total{model_id="tiny",presence="absent"} 2"#,
+        ] {
+            assert!(out.contains(want), "missing {want} in:\n{out}");
+        }
+    }
+
+    /// The nesting the dashboards assume is asserted at the booking site, so a
+    /// call site that swaps two counts fails here rather than rendering a hit
+    /// rate above 100%.
+    #[test]
+    #[should_panic(expected = "locality decomposition must nest")]
+    #[cfg(debug_assertions)]
+    fn a_selection_that_beats_the_fleet_best_is_rejected() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_selection(
+            "tiny",
+            CacheAwareDecision::CacheHit,
+            Some(LocalityBlocks {
+                query: 100,
+                matched: 10,
+                selected: 20,
+            }),
+        );
     }
 
     #[test]
