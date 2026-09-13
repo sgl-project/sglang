@@ -38,6 +38,7 @@ on:
         options:
           - 'all'
           - qwen35-mxfp4-agentic-mtp-mi35x
+          - kimi-k3-mxfp4-agentic-mi35x
       workload_env:
         description: 'Optional workload overrides, space separated (e.g. "AGENTIC_NUM_CONVERSATIONS=128 AGENTIC_MAX_TURNS=20")'
         required: false
@@ -142,5 +143,84 @@ jobs:
             -e AGENTIC_KV_OFFLOADING=${{ matrix.point.kv_offloading }} \
             -e AGENTIC_MODE=${{ matrix.point.mode }} \
             python3 run_suite.py --hw amd --suite nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
+  # Kimi-K3 MXFP4, AgentX coding-agent replay and eval (no DCP, no DSPARK)
+  # ==============================================================================
+  kimi-k3-mxfp4-agentic-mi35x:
+    name: ${{ format('kimi-k3-mxfp4-agentic-mi35x {0} ({1})', matrix.point.name, matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version == 'all' && '["rocm10", "rocm724", "rocm720"]' || format('["{0}"]', inputs.rocm_version || 'rocm10')) }}
+        # The recipe sweeps concurrency 1, 4, 8, 16, 32 and 48 and launches a
+        # server per point. Each point here is one 8-GPU MI35x slot spent
+        # loading a 1.56 TB checkpoint, so the schedule takes the two ends of
+        # the sweep -- which are also the recipe's two HiCache rows, 80 GB below
+        # concurrency 8 and 145 GB above -- plus its eval pass. The rest are one
+        # workload_env override away (AGENTIC_CONCURRENCY=16).
+        point:
+          - { name: c4-hicache80, concurrency: 4, mode: replay }
+          - { name: c48-hicache145, concurrency: 48, mode: replay }
+          # AgentX scores one configuration rather than the whole sweep, so this
+          # takes the top of the sweep. It is the first point to drop if the
+          # 8-GPU MI35x budget gets tight: nightly-8-gpu-mi35x-kimi-k3-rocm720
+          # already scores K3, though on the Day-0 recipe rather than this one.
+          - { name: c48-eval-gsm8k, concurrency: 48, mode: eval }
+    if: github.repository == 'sgl-project/sglang' && (!inputs.benchmark_select || inputs.benchmark_select == 'all' || inputs.benchmark_select == 'kimi-k3-mxfp4-agentic-mi35x')
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      # Matches nightly-8-gpu-mi35x-kimi-k3-rocm720 rather than the Qwen job
+      # above: K3 runs on the aiter MXFP4 MoE and KDA kernels, so the aiter
+      # build is not skipped here.
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            moonshotai/Kimi-K3 1600
+
+      # Longer than the Qwen points: the 1.56 TB MXFP4 checkpoint dominates
+      # startup before any turn is replayed, which is why the sibling K3
+      # accuracy and perf steps each budget 300 minutes of their own.
+      - name: Kimi-K3-MXFP4 agentic replay (${{ matrix.point.name }})
+        timeout-minutes: 360
+        env:
+          WORKLOAD_ENV: ${{ inputs.workload_env }}
+        run: |
+          > github_summary.md  # Clear summary file
+          ENV_ARGS=()
+          for override in $WORKLOAD_ENV; do
+            ENV_ARGS+=(-e "$override")
+          done
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            "${ENV_ARGS[@]}" \
+            -e AGENTIC_CONCURRENCY=${{ matrix.point.concurrency }} \
+            -e AGENTIC_MODE=${{ matrix.point.mode }} \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-kimi-k3-agentic --nightly --timeout-per-file 18000 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
