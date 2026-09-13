@@ -58,8 +58,7 @@ class GPQAEval(Eval):
         ]
         if invalid_fields:
             raise ValueError(
-                "GPQA semantic fields must contain non-empty strings: "
-                f"{invalid_fields}"
+                f"GPQA semantic fields must contain non-empty strings: {invalid_fields}"
             )
         examples = [
             {field: row[field] for field in GPQA_SOURCE_FIELDS}
