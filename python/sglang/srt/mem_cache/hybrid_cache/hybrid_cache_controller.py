@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
@@ -92,13 +92,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HybridCacheController(BaseHiCacheController):
-    @staticmethod
-    def _uses_shared_host_layout(host_pool: Any) -> bool:
-        return (
-            isinstance(host_pool, HostKVCache)
-            and host_pool.shared_allocation_domain is not None
-        )
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -358,7 +351,7 @@ class HybridCacheController(BaseHiCacheController):
         self, extra_pools: Optional[list[PoolTransfer]]
     ) -> bool:
         anchor_pool = self.mem_pool_host.anchor_entry.host_pool
-        if not self._uses_shared_host_layout(anchor_pool):
+        if not uses_shared_host_layout(anchor_pool):
             return False
         domain = anchor_pool.shared_allocation_domain
         for transfer in extra_pools or []:
@@ -370,7 +363,7 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
             if entry is not None and (
-                not self._uses_shared_host_layout(entry.host_pool)
+                not uses_shared_host_layout(entry.host_pool)
                 or entry.host_pool.shared_allocation_domain is not domain
             ):
                 return False
@@ -407,7 +400,7 @@ class HybridCacheController(BaseHiCacheController):
             entry
             for entry in self.mem_pool_host.entries
             if entry.name not in requested_names
-            and self._uses_shared_host_layout(entry.host_pool)
+            and uses_shared_host_layout(entry.host_pool)
             and entry.host_pool.shared_allocation_domain is domain
         )
 
@@ -610,7 +603,7 @@ class HybridCacheController(BaseHiCacheController):
         self, operation: StorageOperation, need_size: int, *, empty: bool = True
     ) -> bool:
         anchor = self.mem_pool_host.anchor_entry
-        if not self._uses_shared_host_layout(anchor.host_pool):
+        if not uses_shared_host_layout(anchor.host_pool):
             return super().can_fit_prefetch_host_buffers(operation, need_size)
         domain = anchor.host_pool.shared_allocation_domain
         requests, _ = self._shared_prefetch_requests(operation, need_size)
@@ -626,7 +619,7 @@ class HybridCacheController(BaseHiCacheController):
         return bool(fits)
 
     def prefetch_rate_limited(self) -> bool:
-        if self.host_memory_mode == "buffer_only" and self._uses_shared_host_layout(
+        if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(
             self.mem_pool_host.anchor_entry.host_pool
         ):
             # Shared-arena occupancy includes the Full and SWA byte footprint.
@@ -638,7 +631,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
-        if not self._uses_shared_host_layout(anchor.host_pool):
+        if not uses_shared_host_layout(anchor.host_pool):
             return super().alloc_prefetch_host_buffers(operation, need_size)
 
         requests, independent_transfers = self._shared_prefetch_requests(
@@ -698,36 +691,7 @@ class HybridCacheController(BaseHiCacheController):
                 return self.move_hybrid_indices(op)
             return op.host_indices, op.device_indices, op.pool_transfers
 
-        def move_for_pool(host_pool, host_indices, device_indices):
-            if self._uses_shared_host_layout(host_pool):
-                return host_indices, device_indices
-            if getattr(host_pool, "can_use_write_back_jit", False):
-                if host_indices.is_cuda:
-                    host_indices = host_indices.cpu()
-                return host_indices, device_indices
-            return self.move_indices(host_indices, device_indices)
-
-        host_indices, device_indices = move_for_pool(
-            host_group.anchor_entry.host_pool,
-            op.host_indices,
-            op.device_indices,
-        )
-        pool_transfers = []
-        for transfer in op.pool_transfers or []:
-            entry = host_group.entry_map[transfer.name]
-            transfer_host_indices, transfer_device_indices = move_for_pool(
-                entry.host_pool,
-                transfer.host_indices,
-                transfer.device_indices,
-            )
-            pool_transfers.append(
-                replace(
-                    transfer,
-                    host_indices=transfer_host_indices,
-                    device_indices=transfer_device_indices,
-                )
-            )
-        return host_indices, device_indices, pool_transfers or None
+        return self.move_hybrid_indices(op, write_back_jit=True)
 
     def _l2_transfers(
         self,
@@ -949,44 +913,44 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
+    def _move_pool_indices(
+        self, host_pool, host_indices, device_indices, *, write_back_jit: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if uses_shared_host_layout(host_pool):
+            return host_indices, device_indices
+        if write_back_jit and getattr(host_pool, "can_use_write_back_jit", False):
+            if host_indices.is_cuda:
+                host_indices = host_indices.cpu()
+            return host_indices, device_indices
+        return self.move_indices(host_indices, device_indices)
+
     def move_hybrid_indices(
-        self, operation: CacheOperation
+        self, operation: CacheOperation, *, write_back_jit: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
-        if self._uses_shared_host_layout(anchor_pool):
-            host_indices, device_indices = (
-                operation.host_indices,
-                operation.device_indices,
-            )
-        else:
-            host_indices, device_indices = self.move_indices(
-                operation.host_indices, operation.device_indices
-            )
+        host_indices, device_indices = self._move_pool_indices(
+            self.mem_pool_host.anchor_entry.host_pool,
+            operation.host_indices,
+            operation.device_indices,
+            write_back_jit=write_back_jit,
+        )
         resolved_pool_transfers = None
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
-                host_pool = self.mem_pool_host.entry_map[transfer.name].host_pool
-                if self._uses_shared_host_layout(host_pool):
-                    transfer_host_indices, transfer_device_indices = (
+                transfer_host_indices, transfer_device_indices = (
+                    self._move_pool_indices(
+                        self.mem_pool_host.entry_map[transfer.name].host_pool,
                         transfer.host_indices,
                         transfer.device_indices,
+                        write_back_jit=write_back_jit,
                     )
-                else:
-                    transfer_host_indices, transfer_device_indices = self.move_indices(
-                        transfer.host_indices, transfer.device_indices
-                    )
-                # Keep the original PoolTransfer unchanged because tree-owned
-                # transfers may still reference radix-tree host state. The
-                # controller only needs a normalized execution-time copy.
+                )
+                # Tree-owned transfers keep their original radix-tree indices.
                 resolved_pool_transfers.append(
-                    PoolTransfer(
-                        name=transfer.name,
+                    replace(
+                        transfer,
                         host_indices=transfer_host_indices,
                         device_indices=transfer_device_indices,
-                        keys=transfer.keys,
-                        hit_policy=transfer.hit_policy,
-                        indices_from_pool=transfer.indices_from_pool,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers

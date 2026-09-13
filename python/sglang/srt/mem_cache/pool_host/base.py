@@ -4,7 +4,7 @@ import abc
 import logging
 import threading
 from functools import wraps
-from typing import Optional
+from typing import Optional, TypeGuard
 
 import psutil
 import torch
@@ -27,6 +27,13 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
+    return (
+        isinstance(host_pool, HostKVCache)
+        and host_pool.shared_allocation_domain is not None
+    )
 
 
 def ranks_per_host() -> int:
