@@ -99,6 +99,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
                     "dsa_topk_backend",
+                    "enable_dsa_fused_indexer",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
