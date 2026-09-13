@@ -394,6 +394,7 @@ class DiffusionServerBase:
         case: DiffusionTestCase,
         perf_record: RequestPerfRecord,
         request_index: int = 1,
+        load_time_ms: float | None = None,
     ) -> None:
         """Validate metrics and record results."""
         if perf_record is None:
@@ -426,6 +427,7 @@ class DiffusionServerBase:
         )
 
         summary = validator.collect_metrics(perf_record)
+        summary.load_time_ms = load_time_ms
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
 
@@ -441,6 +443,7 @@ class DiffusionServerBase:
 
         # disabling stage checks must not disable the request's e2e guard
         validator.validate_e2e(summary)
+        validator.validate_load_inclusive_e2e(summary)
 
         if case.run_perf_check:
             if current_platform.is_cuda():
@@ -523,6 +526,7 @@ class DiffusionServerBase:
             # the last chunk's record supplies memory peaks, not the session's e2e
             summary.e2e_ms = e2e_ms
 
+        summary.load_time_ms = ctx.load_time_ms
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
@@ -540,6 +544,7 @@ class DiffusionServerBase:
                 step_fractions=BASELINE_CONFIG.step_fractions,
             )
         validator.validate_e2e(summary)
+        validator.validate_load_inclusive_e2e(summary)
         validate_realtime_perf_stats(
             case.id,
             chunk_stats,
@@ -585,12 +590,21 @@ class DiffusionServerBase:
                 f"[performance] {case.id}: E2E duration missing or invalid: "
                 f"{summary.e2e_ms!r}"
             )
+        if summary.load_time_ms is None or not (
+            math.isfinite(summary.load_time_ms) and summary.load_time_ms > 0
+        ):
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: Load duration missing or invalid: "
+                f"{summary.load_time_ms!r}"
+            )
         result = {
             "class_name": type(self).__name__,
             "test_name": case.id,
             "request_index": request_index,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
+            "load_time_ms": summary.load_time_ms,
+            "load_inclusive_e2e_ms": summary.load_time_ms + summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
@@ -693,6 +707,7 @@ class DiffusionServerBase:
             "stages_ms": stages_formatted,
             "denoise_step_ms": denoise_steps_formatted,
             "expected_e2e_ms": round(max(s.e2e_ms for s in summaries), 2),
+            "expected_load_ms": round(max(s.load_time_ms for s in summaries), 2),
             "expected_avg_denoise_ms": round(
                 max(s.avg_denoise_ms for s in summaries), 2
             ),
@@ -1710,7 +1725,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         else:
             run_case_check(
                 "performance",
-                lambda: self._validate_and_record(case, perf_record, request_index),
+                lambda: self._validate_and_record(
+                    case, perf_record, request_index, diffusion_server.load_time_ms
+                ),
             )
 
         if case.server_args.custom_validator == "mesh":

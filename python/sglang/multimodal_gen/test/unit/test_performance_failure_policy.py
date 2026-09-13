@@ -25,7 +25,7 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
         DiffusionSamplingParams(prompt="test"),
         run_perf_check=False,
     )
-    scenario = ScenarioConfig({}, {}, 1000, 0, 0)
+    scenario = ScenarioConfig({}, {}, 1000, 0, 0, expected_load_ms=100)
     monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case.id, scenario)
     monkeypatch.setattr(common, "_PENDING_BASELINE_DUMPS", {})
     server = common.DiffusionServerBase()
@@ -38,7 +38,7 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
         steps=[],
         total_duration_ms=2000 if generate_baseline else 1000,
     )
-    server._validate_and_record(case, record)
+    server._validate_and_record(case, record, load_time_ms=100)
     assert len(server._perf_results) == 1
     assert bool(common._PENDING_BASELINE_DUMPS) == generate_baseline
 
@@ -105,7 +105,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                     run_consistency_check=False, run_models_api_check=False,
                     run_perf_check=not PROBLEM.startswith("e2e_only_") and PROBLEM not in ("missing_record", "missing_e2e", "missing_log"),
                 )
-                scenario = ScenarioConfig({}, {}, 1000, 100, 100)
+                scenario = ScenarioConfig({}, {}, 1000, 100, 100, expected_load_ms=100)
                 if PROBLEM == "e2e_only_zero_baseline":
                     scenario.expected_e2e_ms = 0
                 if PROBLEM == "e2e_only_nan_baseline":
@@ -128,11 +128,11 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                         stages=[], steps=[100],
                         total_duration_ms=None if PROBLEM == "missing_e2e" else 2000,
                     ), b""
-                context = None
+                context = SimpleNamespace(load_time_ms=100)
                 if PROBLEM == "missing_log":
                     log_path = tmp_path / "empty-perf.jsonl"
                     log_path.write_text("")
-                    context = SimpleNamespace(perf_log_path=log_path)
+                    context = SimpleNamespace(perf_log_path=log_path, load_time_ms=100)
                     monkeypatch.setattr(server, "_client", lambda ctx: None)
                     def generate(*args):
                         requests.append(1)

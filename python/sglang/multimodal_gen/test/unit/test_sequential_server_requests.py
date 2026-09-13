@@ -1,6 +1,7 @@
 import json
 import os
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -33,7 +34,7 @@ def test_request_warmup_is_separate_from_guarded_requests(harness, monkeypatch, 
         ]
     )
     monkeypatch.setattr(runner, "run_and_collect", generate)
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert generate.call_count == 3
     assert len(runner._perf_results) == 2
     assert runner._validate_consistency.call_count == 2
@@ -54,7 +55,7 @@ def test_request_warmup_requires_e2e(harness, monkeypatch, duration):
     with pytest.raises(
         test_server_common.PerformanceValidationError, match="warmup.*E2E"
     ):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert generate.call_count == 1
 
 
@@ -66,7 +67,7 @@ def test_request_after_warmup_still_enforces_e2e(harness, monkeypatch):
     generate = Mock(side_effect=[(_perf_record(), b"output"), (slow, b"output")])
     monkeypatch.setattr(runner, "run_and_collect", generate)
     with pytest.raises(test_server_common.PerformanceValidationError, match="E2E"):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert generate.call_count == 2
 
 
@@ -98,6 +99,7 @@ def harness(monkeypatch):
         expected_avg_denoise_ms=5,
         expected_median_denoise_ms=5,
         estimated_full_test_time_s=1,
+        expected_load_ms=100,
         load_peak_vram_mb=1000,
         runtime_peak_vram_mb=2000,
     )
@@ -159,7 +161,7 @@ def test_each_request_failure_fails_case(harness, monkeypatch, bad_request, fail
         outputs[bad_request] = RuntimeError("server request failed")
     generate = Mock(side_effect=outputs)
     monkeypatch.setattr(runner, "run_and_collect", generate)
-    ctx = object()
+    ctx = SimpleNamespace(load_time_ms=100)
 
     terminal = failure in {"performance", "load_peak", "runtime_peak", "missing_memory"}
     error_type = (
@@ -193,7 +195,7 @@ def test_both_requests_pass(harness, monkeypatch):
         "run_and_collect",
         Mock(side_effect=[(_perf_record(), b"first"), (_perf_record(), b"second")]),
     )
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert runner._validate_consistency.call_count == 2
     assert [call.args[1] for call in runner._validate_consistency.call_args_list] == [
         b"first",
@@ -218,7 +220,7 @@ def test_e2e_is_required_even_without_threshold_checks(
         test_server_common.PerformanceValidationError,
         match="E2E duration missing or invalid",
     ):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert generate.call_count == 1
     assert not runner._perf_results
 
@@ -229,7 +231,7 @@ def test_disabled_threshold_checks_still_record_e2e(harness, monkeypatch):
     monkeypatch.setattr(
         runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
     )
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert [r["e2e_ms"] for r in runner._perf_results] == [100, 100]
 
 
@@ -243,7 +245,7 @@ def test_request_artifacts_do_not_overwrite_each_other(harness, monkeypatch, tmp
         return _perf_record(), b"output"
 
     monkeypatch.setattr(runner, "run_and_collect", generate)
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert artifact_dirs == [str(tmp_path / f"request-{i}") for i in (1, 2)]
     assert os.environ["SGLANG_DIFFUSION_ARTIFACT_DIR"] == str(tmp_path)
 
@@ -261,7 +263,7 @@ def test_later_skip_cannot_hide_earlier_failure(harness, monkeypatch):
         ),
     )
     with pytest.raises(pytest.fail.Exception, match="failed first"):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
 
 
 def test_second_request_cannot_be_skipped_after_first_passes(harness, monkeypatch):
@@ -272,7 +274,7 @@ def test_second_request_cannot_be_skipped_after_first_passes(harness, monkeypatc
         Mock(side_effect=[(_perf_record(), b"output"), pytest.skip.Exception("skip")]),
     )
     with pytest.raises(pytest.fail.Exception, match="Required request skipped"):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
 
 
 def test_empty_content_is_not_a_consistency_pass(harness):
@@ -299,7 +301,7 @@ def test_audio_checked_even_when_video_consistency_fails(
         runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
     )
     with pytest.raises(pytest.fail.Exception, match="audio consistency.*wrong audio"):
-        runner.test_diffusion_generation(case, object())
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert runner._validate_consistency.call_count == 2
     assert runner._validate_audio_consistency.call_count == 2
 
@@ -374,7 +376,7 @@ def test_gt_generation_runs_both_requests(harness, monkeypatch):
     monkeypatch.setattr(runner, "run_and_collect", generate)
     save = Mock()
     monkeypatch.setattr(runner, "_save_gt_output", save)
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     assert [(call.args[0].id, call.args[1]) for call in save.call_args_list] == [
         ("first", b"first"),
         ("first", b"second"),
@@ -396,7 +398,7 @@ def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     monkeypatch.setattr(
         runner, "run_and_collect", Mock(side_effect=[(r, b"output") for r in records])
     )
-    runner.test_diffusion_generation(case, object())
+    runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
     summaries = test_server_common._PENDING_BASELINE_DUMPS[case.id]
     assert len(summaries) == 2
     log = Mock()

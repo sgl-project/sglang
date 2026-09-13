@@ -115,6 +115,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    expected_load_ms: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
     # Peak of the warmup calibration probe (the default workload's full shape
@@ -146,6 +147,7 @@ class ScenarioConfig:
             expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
             expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            expected_load_ms=optional_float("expected_load_ms"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
             warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
@@ -476,6 +478,7 @@ class PerformanceSummary:
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
     denoising_stages: set[str] = field(default_factory=set)
+    load_time_ms: float | None = None
 
     @staticmethod
     def from_req_perf_record(
