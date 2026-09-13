@@ -239,6 +239,12 @@ class UnifiedLRUList:
         self.cache[node.id] = node
         self._add_node(node)
 
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        assert prev_node.id in self.cache
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
+
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
         del self.cache[node.id]
@@ -409,6 +415,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -1307,8 +1314,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # owner (b + P) % N on both sides of the split).
         new_node.rotation_base = child.rotation_base
 
-        self._for_each_component_lru(child, UnifiedLRUList.remove_node)
-
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -1334,11 +1339,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 new_child_node_id=child.id,
             )
 
+        # Splitting does not access the suffix; retain its recency and place
+        # the inherited prefix beside it, in the same session partition.
         self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
+            new_node,
+            lambda lru, node: lru.insert_after(child, node),
+            skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
 
@@ -2039,6 +2045,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def set_host_memory_buffer_only(self) -> None:
+        self.is_host_memory_buffer_only = True
 
     def insert_host(
         self,

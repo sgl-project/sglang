@@ -22,7 +22,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 Choose your hardware, then choose the operating point that matches your workload:
 
-- **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
+- **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
 Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
@@ -94,7 +94,7 @@ The deployment recipes use the checkpoint's generation configuration. Override s
 
 ### Choose a strategy
 
-Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
+Start with **Low Latency** for chat and agent workloads. It drafts from the checkpoint's MTP head at a fixed depth (5 steps, top-k 1, 6 draft tokens) with natural acceptance. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
 
 Strategy labels describe the workload goal, not a hardware restriction. Both strategies stay available when you switch hardware; only the verification badge changes.
 
@@ -102,7 +102,7 @@ Strategy labels describe the workload goal, not a hardware restriction. Both str
 
 The **Speculative** card in the Playground changes the algorithm without leaving the selected strategy:
 
-- **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
+- **EAGLE / MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
 - **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
 - **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
 
@@ -122,7 +122,7 @@ On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 
 
 ### Decode context parallelism
 
-Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 with both KV pairings on the earlier TP4/EP4 recipe and queued for re-measurement on the current command; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
 
 ### Extend the cache hierarchy
 
@@ -152,7 +152,7 @@ The base recipes accept image and video content through the OpenAI-compatible ch
 
 ### 3.4 Encoder disaggregation
 
-Encoder disaggregation separates vision preprocessing from language inference. The verified topology uses one 4x GB300 node shared by an encoder-only TP4 process on port 30001 and a language-only TP4/EP4 process on port 30000. Start the encoder first.
+Encoder disaggregation separates vision preprocessing from language inference. The verified topology uses one 4x GB300 node shared by an encoder-only TP4 process on port 30001 and a language-only TP4 process on port 30000. Start the encoder first.
 
 <Accordion title="Encoder server (GB300)">
 
@@ -167,20 +167,20 @@ sglang serve \
 
 </Accordion>
 
+{/* TODO: re-validate encoder disaggregation with this language-server command; the 238,080-visual-token run used the earlier TP4/EP4 deep_gemm command with adaptive MTP. */}
 <Accordion title="Language server (GB300)">
 
 ```bash Command
 sglang serve \
   --model-path zai-org/GLM-5.3-Flash \
   --tp-size 4 \
-  --ep-size 4 \
   --attention-backend dsa \
   --dsa-prefill-backend tilelang \
   --dsa-decode-backend tilelang \
   --linear-attn-backend triton \
   --kv-cache-dtype bfloat16 \
   --quantization fp8 \
-  --moe-runner-backend deep_gemm \
+  --moe-runner-backend flashinfer_trtllm \
   --max-running-requests 64 \
   --chunked-prefill-size 8192 \
   --max-prefill-tokens 8192 \
@@ -189,7 +189,6 @@ sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
-  --speculative-adaptive \
   --language-only \
   --encoder-urls http://localhost:30001 \
   --mem-fraction-static 0.78 \
@@ -261,7 +260,7 @@ Operational notes:
 
 - Give each role a distinct `--nccl-port` when both share one node.
 - Single-node NIXL needs `UCX_NET_DEVICES=lo` and `UCX_TLS=tcp,cuda_copy,cuda_ipc,self,sm` in both server environments.
-- The validated arm used the triton MoE runner; deep_gemm under PD is untested.
+- The validated arm used the triton MoE runner; the flashinfer_trtllm runner from the deployment recipes is untested under PD.
 
 Known limitations:
 
