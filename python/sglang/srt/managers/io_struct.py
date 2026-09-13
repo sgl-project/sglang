@@ -54,6 +54,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalProcessorOutput,
@@ -351,6 +352,16 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Versioned KV-hint envelope, set by a trusted orchestrator after worker
+    # selection and never by an application client. Passed through untouched to
+    # the HiCache storage backends, each of which reads only the action types it
+    # implements. Accepts a plain dict from HTTP/gRPC; normalization converts it
+    # to KvHintsEnvelope. A hint describes one request's prefix, so a batch
+    # carries one envelope per request.
+    kv_hints: Optional[
+        Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
+    ] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -536,6 +547,11 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if isinstance(self.kv_hints, list):
+            raise ValueError("kv_hints should be a single envelope for one request.")
+        self.kv_hints = (
+            decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -560,6 +576,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_kv_hints(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -821,6 +838,28 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_kv_hints(self, num):
+        """Normalize kv_hints for batch processing."""
+        if self.kv_hints is None:
+            return
+        if isinstance(self.kv_hints, (dict, KvHintsEnvelope)):
+            # One envelope broadcast to the batch: every request shares the
+            # orchestrator's routing decision, which is what a router sending a
+            # single decision for a fanned-out prompt means.
+            self.kv_hints = [decode_kv_hints_envelope(self.kv_hints)] * num
+        elif isinstance(self.kv_hints, list):
+            if len(self.kv_hints) != self.batch_size:
+                raise ValueError(
+                    "The length of kv_hints should be equal to the batch size."
+                )
+            self.kv_hints = [
+                decode_kv_hints_envelope(value) if value else None
+                for value in self.kv_hints
+            ]
+            self.kv_hints = self.kv_hints * self.parallel_sample_num
+        else:
+            raise ValueError("kv_hints should be a list or a dict.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -952,6 +991,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1067,6 +1107,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # See GenerateReqInput.kv_hints.
+    kv_hints: Optional[KvHintsEnvelope] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
