@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import masks_like
 
 
 def should_apply_wan_ti2v(batch: Req, server_args: ServerArgs) -> bool:
@@ -65,7 +64,8 @@ def prepare_wan_ti2v_latents(
     assert latent_model_input.ndim == 5
 
     latent_for_mask = latent_model_input.squeeze(0)
-    _, reserved_frames_masks = masks_like([latent_for_mask], zero=True)
+    reserved_frames_masks = [torch.ones_like(latent_for_mask)]
+    reserved_frames_masks[0][:, 0] = 0
     reserved_frames_mask = reserved_frames_masks[0].unsqueeze(0)
 
     latents = (

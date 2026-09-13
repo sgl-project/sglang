@@ -63,7 +63,7 @@ OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     "--disable-radix-cache",
     "--speculative-algorithm",

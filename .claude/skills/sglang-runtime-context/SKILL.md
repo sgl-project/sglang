@@ -544,10 +544,12 @@ ONE thread — do not design for TBO threads that don't exist.
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
-4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
-   call sites must not grow. The replacement for a *decision* is a bag leaf, a named
-   accessor, or the owning runner's stamp — not `get_server_args().field`, which the
-   read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
+4. **The legacy accessor is retired** (`test_runtime_context.py`): every
+   `get_global_server_args()` call now raises, because it answered with the record --
+   a caller reading a field resolution had decided got a stale value and no error.
+   The replacement for a *decision* is a bag leaf, a named accessor, or the owning
+   runner's stamp — not `get_server_args().field`, which the read ratchet below pins
+   at zero. `runtime_context.get_server_args()` is only for the
    whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
 5. **Global config read ratchet** (`test_global_config_read_ratchet.py`): baselines are
    **0** for both the direct `get_server_args().field` and the alias form (function-local
@@ -622,7 +624,7 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
-`test_global_config_read_ratchet.py`, `test_legacy_global_ratchet.py`,
+`test_global_config_read_ratchet.py`,
 `test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
 `test_runtime_context.py` — the last one doubles
 as executable documentation of every tier's semantics).

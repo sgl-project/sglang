@@ -33,6 +33,7 @@ export const config = {
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
       s.hicache === "off" &&
+      s.bcg === "off" &&
       s.dcp === "off"
     );
   },
@@ -65,6 +66,20 @@ export const config = {
             "--dsa-prefill-backend tilelang",
             "--dsa-decode-backend tilelang",
           ],
+        },
+      ],
+    },
+    {
+      id: "bcg",
+      title: "Breakable Cuda Graph",
+      default: "off",
+      options: [
+        { id: "off", label: "Off" },
+        {
+          id: "on",
+          label: "On",
+          flags: ["--cuda-graph-backend-prefill breakable"],
+          hints: ["Enables breakable prefill CUDA graphs; requires a build with PR #38522."],
         },
       ],
     },
@@ -331,6 +346,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -362,6 +378,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -393,6 +410,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -416,7 +434,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -426,6 +444,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -472,7 +491,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -518,7 +537,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -564,7 +583,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -594,6 +613,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         s.mmTransport === "auto" && s.hicache === "off"
           ? "verified"
           : "unverified",
@@ -623,6 +643,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -645,6 +666,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         s.mmTransport === "auto" && s.hicache === "off"
           ? "verified"
           : "unverified",
@@ -674,6 +696,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -694,7 +717,8 @@ sgl-eval run gsm8k \\
       match: { hw: "b200", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -720,6 +744,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -740,7 +765,8 @@ sgl-eval run gsm8k \\
       match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -766,6 +792,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [

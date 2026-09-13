@@ -91,8 +91,12 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
 # major to it -- under build isolation torch is absent and the match is skipped.
 # Pinned (v0.0.10b2) so image builds are reproducible; bump via --build-arg.
 ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
-RUN . /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 && \
+# Keep setvars.sh's stderr and don't chain with `&&`: an optional component's
+# vars.sh can exit non-zero while SYCL is still exported. `set -e` fails on pip.
+RUN set -e; \
+    . /opt/intel/oneapi/setvars.sh --force || \
+      echo "setvars.sh exited $? -- continuing; pip will fail loudly if SYCL is missing"; \
     TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
-    git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
+      git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]

@@ -230,6 +230,19 @@ class ExecKernel:
             resolvable=True,
         ),
     ] = None
+    dsv4_attn_backend: A[
+        str,
+        Arg(
+            help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
+            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "switches the SWA/compressed KV pools to a "
+            "uniform 512-dim FP8 layout and runs decode and sparse prefill "
+            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
+            "choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "trtllm"],
+            resolvable=True,
+        ),
+    ] = "auto"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
@@ -847,6 +860,16 @@ class ExecOffload:
         "Steps to prefetch in offloading.",
     ] = 1
     offload_mode: A[str, "Mode of offloading."] = "cpu"
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
 
 
 @dataclasses.dataclass

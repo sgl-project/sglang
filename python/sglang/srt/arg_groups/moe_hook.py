@@ -429,7 +429,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
             "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
             f"required={graph_tokens}, capacity={capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
-            "the environment value or lower --cuda-graph-max-bs."
+            "the environment value or lower --cuda-graph-max-bs-decode."
         )
 
 

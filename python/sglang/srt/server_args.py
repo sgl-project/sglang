@@ -41,16 +41,13 @@ import logging
 import tempfile
 import uuid
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, NoReturn
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
 )
 from sglang.srt.arg_groups.argparse_actions import (
-    DeprecatedAction,
-    DeprecatedAliasStoreAction,
-    DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
@@ -61,13 +58,8 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import (
-    get_context,
-    get_platform,
-    publish,
-)
+from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
@@ -210,8 +202,9 @@ class ServerArgs:
        A few arguments cannot use the annotation style and must be
        registered manually in ``add_cli_args``:
 
-       - **Deprecated flags** that redirect to another field via
-         ``DeprecatedAction`` / ``DeprecatedAliasStoreAction`` / etc.
+       - **Deprecated flags** that redirect to another field via one of the
+         ``Deprecated*Action`` classes in ``arg_groups/argparse_actions.py``
+         (that module's header says which shape fits which migration).
        - **Dynamic choices** computed at runtime (e.g. ``reasoning_parser``
          whose choices come from a plugin registry).
        - The ``--config`` meta-argument (not a dataclass field).
@@ -434,174 +427,13 @@ class ServerArgs:
         )
 
         # --- Deprecated argument registrations ---
-        parser.add_argument(
-            "--enable-expert-distribution-metrics",
-            action=DeprecatedAction,
-            error_message=(
-                "--enable-expert-distribution-metrics is no longer supported. Use "
-                "--expert-balancedness-report-mode with one of: off, server_log, "
-                "prometheus, both."
-            ),
-            help=(
-                "Removed. Use --expert-balancedness-report-mode with one of: "
-                "off, server_log, prometheus, both."
-            ),
-        )
-        parser.add_argument(
-            "--stream-output",
-            action=DeprecatedStoreTrueAction,
-            dest="incremental_streaming_output",
-            new_flag="--incremental-streaming-output",
-            help="[Deprecated] Use --incremental-streaming-output instead.",
-        )
-        parser.add_argument(
-            "--prefill-round-robin-balance",
-            action=DeprecatedAction,
-            help="Note: --prefill-round-robin-balance is deprecated now.",
-        )
-        parser.add_argument(
-            "--collect-tokens-histogram",
-            action=DeprecatedAction,
-            help="Deprecated. Token histograms are now automatically collected when --enable-metrics is set.",
-        )
-        parser.add_argument(
-            "--nsa-prefill-backend",
-            dest="dsa_prefill_backend",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-prefill-backend",
-            default=argparse.SUPPRESS,
-            type=str,
-            choices=[
-                "flashmla_sparse",
-                "flashmla_sparse_q8",
-                "flashmla_kv",
-                "flashmla_auto",
-                "flashinfer_sparse_mla",
-                "fa3",
-                "tilelang",
-                "aiter",
-                "trtllm",
-            ],
-            help="[Deprecated] Use --dsa-prefill-backend instead.",
-        )
-        parser.add_argument(
-            "--nsa-decode-backend",
-            dest="dsa_decode_backend",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-decode-backend",
-            default=argparse.SUPPRESS,
-            type=str,
-            choices=[
-                "flashmla_sparse",
-                "flashmla_sparse_q8",
-                "flashmla_kv",
-                "flashmla_auto",
-                "flashinfer_sparse_mla",
-                "fa3",
-                "tilelang",
-                "aiter",
-                "trtllm",
-            ],
-            help="[Deprecated] Use --dsa-decode-backend instead.",
-        )
-        parser.add_argument(
-            "--speculative-dflash-draft-window-size",
-            type=int,
-            dest="speculative_draft_window_size",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--speculative-draft-window-size",
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            "--mamba-scheduler-strategy",
-            dest="mamba_radix_cache_strategy",
-            type=str,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--mamba-radix-cache-strategy",
-            default=ServerArgs.mamba_radix_cache_strategy,
-            help="Deprecated alias for --mamba-radix-cache-strategy.",
-        )
-        parser.add_argument(
-            "--cuda-graph-max-bs",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-decode",
-            dest="cuda_graph_max_bs_decode",
-            help="Deprecated alias for --cuda-graph-max-bs-decode.",
-        )
-        parser.add_argument(
-            "--cuda-graph-bs",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-decode",
-            dest="cuda_graph_bs_decode",
-            help="Deprecated alias for --cuda-graph-bs-decode.",
-        )
+        # `disable_cuda_graph` is `no_cli=True`, so this deprecated spelling is
+        # its only command-line entry point.
         parser.add_argument(
             "--disable-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
-        )
-        parser.add_argument(
-            "--enable-breakable-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.BREAKABLE,
-            new_flag="--cuda-graph-backend-prefill=breakable",
-            help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
-        )
-        parser.add_argument(
-            "--disable-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.DISABLED,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
-        )
-        parser.add_argument(
-            "--enforce-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.TC_PIECEWISE,
-            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
-            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
-            "Explicitly setting the prefill backend now skips the auto-disable "
-            "cascade automatically.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-tokens",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-prefill",
-            dest="cuda_graph_bs_prefill",
-            help="Deprecated alias for --cuda-graph-bs-prefill.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-compiler",
-            type=str,
-            choices=["eager", "inductor"],
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-tc-compiler",
-            dest="cuda_graph_tc_compiler",
-            help="Deprecated alias for --cuda-graph-tc-compiler.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-max-tokens",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-prefill",
-            dest="cuda_graph_max_bs_prefill",
-            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
-        )
-        parser.add_argument(
-            "--enable-gdn-replayssm-spec",
-            dest="enable_linear_replayssm_spec",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-linear-replayssm-spec",
-            help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -648,6 +480,11 @@ class ServerArgs:
         # the record exists to remember, and the decision it meant to record
         # belongs in the stash, where it carries a source and does not destroy
         # the input it was derived from.
+        # Underscore names are mostly the record's own bookkeeping --
+        # `_input_frozen`, `_raw_input`, `_resolved_overrides`, the memo slots
+        # -- which resolution writes on purpose. A *field* spelled that way is
+        # still configuration, so the test cannot be on spelling alone or that
+        # one leaf stays writable on a read-only record.
         if not name.startswith("_") or name in _underscore_field_names():
             if getattr(self, "_input_frozen", False):
                 raise AttributeError(
@@ -770,11 +607,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
-# NOTE: The process-wide ServerArgs is owned by the runtime context
-# (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
-# for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites.
-# Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.
@@ -792,6 +624,12 @@ def _underscore_field_names() -> frozenset:
     )
 
 
+# NOTE: The process-wide ServerArgs is owned by the runtime context
+# (sglang.srt.runtime_context). The two publish functions below are LEGACY
+# shims kept for the existing call-sites; they hand over the same live object
+# by reference. Do not add new call-sites. The third function is retired and
+# only raises.
+# Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
@@ -806,11 +644,23 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     publish(server_args, role="tokenizer")
 
 
-def get_global_server_args() -> ServerArgs:
-    """Legacy accessor shim — prefer ``get_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
+def get_global_server_args() -> NoReturn:
+    """Retired. It raises, because what it used to return is the problem: the
+    record answers with the operator's *input*, so a caller reading a field
+    resolution decided got a stale value and no error.
 
-    return get_context().server_args
+    The name survives so that a caller importing it from this module lands on
+    a message instead of an ImportError. Annotated ``NoReturn`` so a type
+    checker rejects the call rather than accepting the attribute access after
+    it. The message lives once, in the exception.
+    """
+    raise RuntimeError(
+        "get_global_server_args() is retired. Read the value that is in effect "
+        "from its namespace bag -- `get_exec().kernel.attention_backend`, "
+        "`get_schedule().max_running_requests`, and so on "
+        "(sglang.srt.runtime_context). For the operator's raw input, which is a "
+        "different question, `get_server_args()` still answers it."
+    )
 
 
 @contextmanager
