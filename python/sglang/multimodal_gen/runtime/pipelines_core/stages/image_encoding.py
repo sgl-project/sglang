@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+    peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -544,9 +545,15 @@ class LTX2ImageEncodingStage(PipelineStage):
             "condition_image_encoder"
         ):
             modules = {"condition_image_encoder": self._condition_image_encoder}
+            residency_manager = peek_global_component_residency_manager()
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
+                pin_budget=(
+                    residency_manager.host_pin_budget
+                    if residency_manager is not None
+                    else None
+                ),
                 component_names=(
                     None
                     if server_args.component_residency is not None

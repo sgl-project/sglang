@@ -41,6 +41,10 @@ _LEGACY_CUDA_PREFIXES = ("stress",)
 
 _TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
 
+# Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
+# carries the `-kernel-` infix `kernel` needs, and these launch device work.
+_VENDOR_DIRS = {"amd", "mlx", "musa", "npu", "xpu"}
+
 
 def _defines_testcase(tree: ast.AST) -> bool:
     """True if the file defines unittest classes, statically or via type()."""
@@ -126,6 +130,8 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
 
     parts = path.split("/")
     relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
+    if relative_parts and relative_parts[0] in _VENDOR_DIRS:
+        return []
     if len(relative_parts) < 3 or relative_parts[0] not in _TEST_KINDS:
         return [
             f"{path}: registered tests must live under "

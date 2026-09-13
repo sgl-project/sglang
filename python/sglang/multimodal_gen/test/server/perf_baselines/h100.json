@@ -3150,14 +3150,6 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 141.9
         },
-        "mova_360p_ring1_uly2": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
-            "estimated_full_test_time_s": 211.8
-        },
         "zimage_image_t2i_2_gpus_non_square": {
             "stages_ms": {
                 "InputValidationStage": 0.04,
