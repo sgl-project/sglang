@@ -49,6 +49,31 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
 
+### 3.3 Breakable CUDA graph for FLUX.1-dev
+
+For repeated `quality=lossless` requests, FLUX.1-dev supports breakable CUDA graph (BCG) execution with the native backend. BCG captures DiT segments during startup and replays them for the warmed resolutions. It can reduce recurring host launch overhead without enabling `torch.compile`.
+
+The following configuration was validated on two NVIDIA H200 GPUs with BF16 weights, PyTorch 2.13, and CUDA 13.0. Set `HF_TOKEN` to a Hugging Face token with access to the checkpoint before downloading it.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --backend sglang \
+  --num-gpus 2 --tp-size 2 \
+  --component-residency dit=resident \
+  --enable-torch-compile false \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 1024x1024 \
+  --quality lossless \
+  --width 1024 --height 1024 \
+  --num-inference-steps 50 --guidance-scale 3.5 --seed 42 \
+  --prompt "A futuristic cyberpunk city at night, neon lights reflecting on wet streets"
+```
+
+Confirm `[Diffusion BCG] captured` in the log, then compare warmed request latency with eager execution on the same GPUs. Capture time and graph memory are additional startup costs. Add other served resolutions to `--warmup-resolutions`; a request with an uncaptured signature falls back to eager.
+
+FLUX.1-dev uses a fixed 512-token T5 conditioning sequence, so changing `--bcg-text-buckets` does not create additional prompt-length graphs. Its request-gated DiT fusions at `quality=high` and `extra-high` cannot be combined with BCG: the runtime rejects those requests because the captured graph uses the lossless branches. FLUX.2 and quantized transformer overrides require separate validation.
+
 ## 4. API Usage
 
 For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
