@@ -75,6 +75,7 @@ curl -sS "http://localhost:30010/v1/models"
       "max_model_len": null,
       "num_gpus": 4,
       "task_type": "T2V",
+      "supported_task_types": ["T2V"],
       "dit_precision": "bf16",
       "vae_precision": "fp16",
       "pipeline_name": "WanPipeline",
@@ -95,6 +96,37 @@ curl -sS "http://localhost:30010/v1/models/wan-t2v"
 ---
 
 ## Endpoints
+
+### Select a request task
+
+`GET /v1/models` reports `task_type` (the configured default) and
+`supported_task_types` (the tasks implemented by that configured pipeline).
+`GET /model_info` also reports the supported `output_types`. A pipeline may
+support image and video output on one server when its implementation and
+loaded components provide both paths.
+
+Send the optional SGLang extension `task_type` as a case-insensitive enum name:
+
+| Interface | Task field | Output constraint |
+| --- | --- | --- |
+| `POST /v1/images/generations` JSON | `"task_type": "t2i"` | Image |
+| `POST /v1/images/edits` multipart | `-F task_type=i2i` | Image |
+| `POST /v1/videos` JSON or multipart | `"task_type": "i2v"` or `-F task_type=i2v` | Video |
+| OpenAI Python client | `extra_body={"task_type": "t2i"}` | Selected endpoint |
+| Native Python `generate` sampling parameters | `"task_type": "t2i"` | Selected task |
+| `sglang generate` | `--task-type t2i` | Selected task |
+
+Choose only a task in the server's advertised set. An unsupported task, a task
+with the wrong output type for the endpoint, or missing required conditioning
+returns HTTP 400. For example, `i2v` needs image input, while `v2v` and `f2v`
+need video input. Model-specific size, frame count, and reference constraints
+still apply.
+
+If you omit `task_type`, the server uses the endpoint and supplied inputs to
+choose a compatible task, preferring its default when compatible. It asks for
+an explicit task if several alternatives remain (for example `v2v` versus
+`f2v`). Pipelines with one task keep that task as their default. Sending a
+request never changes the server default or subsequent requests.
 
 ### Model-specific request fields
 

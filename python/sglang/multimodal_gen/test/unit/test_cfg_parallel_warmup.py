@@ -772,6 +772,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_based_expected = {
             ModelTaskType.T2I: False,
             ModelTaskType.T2V: False,
+            ModelTaskType.V2V: False,
+            ModelTaskType.F2V: False,
             ModelTaskType.TI2I: True,
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,

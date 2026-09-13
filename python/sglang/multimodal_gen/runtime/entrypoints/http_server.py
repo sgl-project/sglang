@@ -173,23 +173,28 @@ async def get_models(request: Request):
         Use /v1/models instead for OpenAI-compatible model discovery.
         This endpoint will be removed in a future version.
     """
-    from sglang.multimodal_gen.registry import get_model_info
+    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
+        get_served_pipeline_class,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
-    model_info = get_model_info(server_args.model_path, model_id=server_args.model_id)
+    pipeline_cls = get_served_pipeline_class(server_args)
 
     response = {
         "model_path": server_args.model_path,
         "num_gpus": server_args.num_gpus,
         "task_type": server_args.pipeline_config.task_type.name,
+        "supported_task_types": [
+            task.name for task in server_args.pipeline_config.get_supported_task_types()
+        ],
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
         "vae_decode_precision": server_args.pipeline_config.vae_decode_precision,
     }
 
-    if model_info:
-        response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
-        response["pipeline_class"] = model_info.pipeline_cls.__name__
+    if pipeline_cls:
+        response["pipeline_name"] = pipeline_cls.pipeline_name
+        response["pipeline_class"] = pipeline_cls.__name__
 
     return response
 
@@ -219,34 +224,35 @@ async def model_info_endpoint(request: Request):
     Returns fields compatible with the LLM engine's /model_info so that
     the model gateway can detect capabilities for diffusion workers.
     """
-    from sglang.multimodal_gen.registry import get_model_info
+    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
+        get_served_pipeline_class,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
     task_type = server_args.pipeline_config.task_type
+    supported_tasks = server_args.pipeline_config.get_supported_task_types()
 
     try:
-        registry_info = get_model_info(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
+        pipeline_cls = get_served_pipeline_class(server_args)
     except Exception:
         logger.warning("Failed to resolve model info from registry", exc_info=True)
-        registry_info = None
+        pipeline_cls = None
 
     return {
         # Fields consumed by the model gateway for worker discovery
         "model_path": server_args.model_path,
         "is_generation": True,
         "model_type": "diffusion",
-        "architectures": (
-            [registry_info.pipeline_cls.__name__] if registry_info else None
-        ),
+        "architectures": [pipeline_cls.__name__] if pipeline_cls else None,
         # Fields matching the LLM engine's /model_info shape
-        "has_image_understanding": task_type.accepts_image_input(),
+        "has_image_understanding": any(
+            task.accepts_image_input() for task in supported_tasks
+        ),
         "has_audio_understanding": False,
         # Diffusion-specific fields
         "task_type": task_type.name,
+        "supported_task_types": [task.name for task in supported_tasks],
+        "output_types": sorted({task.data_type().name for task in supported_tasks}),
         "is_image_gen": task_type.is_image_gen(),
     }
 
