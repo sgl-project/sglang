@@ -15,6 +15,7 @@ import psutil
 import pynvml
 
 _ROOT_ENV = "SGLANG_DIFFUSION_DIAGNOSTICS_DIR"
+_GPU_ENV = "SGLANG_DIFFUSION_DIAGNOSTICS_GPU"
 _ATTEMPT_ENV = "SGLANG_DIFFUSION_DIAGNOSTICS_ATTEMPT_DIR"
 _PERFORMANCE_ENV = (
     "OMP_NUM_THREADS",
@@ -248,6 +249,7 @@ class AttemptDiagnostics:
                 run_id=os.environ.get("GITHUB_RUN_ID"),
                 run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),
                 partition=os.environ.get("DIFFUSION_PARTITION_ID"),
+                gpu_sampling=os.environ.get(_GPU_ENV) == "1",
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"[diagnostics] initialization failed: {type(exc).__name__}")
@@ -270,10 +272,12 @@ class AttemptDiagnostics:
                 target=self._sample_processes, args=(pid,), daemon=True
             )
             self.process_thread.start()
-            self.thread = threading.Thread(
-                target=self._sample, args=(pid,), daemon=True
-            )
-            self.thread.start()
+            # nvml ownership queries can contend with the worker's driver calls
+            if os.environ.get(_GPU_ENV) == "1":
+                self.thread = threading.Thread(
+                    target=self._sample, args=(pid,), daemon=True
+                )
+                self.thread.start()
 
     def observe(self, chunk: bytes):
         if not self.events:

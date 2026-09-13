@@ -50,6 +50,7 @@ def test_attempt_environment_is_allowlisted(monkeypatch, tmp_path):
 
 def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
     monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path))
+    monkeypatch.setenv(perf_diagnostics._GPU_ENV, "1")
     entered = threading.Event()
     release = threading.Event()
 
@@ -89,6 +90,32 @@ def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
     assert _events(diagnostics.directory / "events.jsonl")[-1][
         "process_sampler_stopped"
     ]
+
+
+def test_default_sampling_does_not_query_nvml(monkeypatch, tmp_path):
+    monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path))
+    monkeypatch.delenv(perf_diagnostics._GPU_ENV, raising=False)
+    queried = threading.Event()
+    monkeypatch.setattr(perf_diagnostics.pynvml, "nvmlInit", queried.set)
+    diagnostics = perf_diagnostics.AttemptDiagnostics(1)
+    try:
+        diagnostics.start(os.getpid())
+        path = diagnostics.directory / "processes.jsonl"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text().endswith("\n"):
+                break
+            time.sleep(0.05)
+    finally:
+        diagnostics.finish(0)
+    assert not queried.is_set()
+    assert diagnostics.thread is None
+    assert not diagnostics.process_thread.is_alive()
+    assert not (diagnostics.directory / "resources.jsonl").exists()
+    sample = _events(path)[0]
+    assert set(sample["host_pressure"]) == {"io", "memory"}
+    assert any(p["pid"] == os.getpid() for p in sample["processes"])
+    assert _events(diagnostics.directory / "events.jsonl")[0]["gpu_sampling"] is False
 
 
 def test_host_pressure_sample(monkeypatch):
@@ -302,6 +329,7 @@ def test_attempt_artifacts_keep_failures_and_real_request_producer(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path / "diagnostics"))
+    monkeypatch.delenv(perf_diagnostics._GPU_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     # the real request producer flushes before the child fails; no pytest
     # session-finish hook is needed to preserve the failed attempt
@@ -336,8 +364,9 @@ sys.exit(int(sys.argv[2]))
         records = _events(directory / "requests.jsonl")
         assert [r["result"]["e2e_ms"] for r in records] == [expected_e2e] * 2
         assert [r["result"]["request_index"] for r in records] == [1, 2]
-        resources = _events(directory / "resources.jsonl")
-        assert any(r["event"] == "resources" and r["processes"] for r in resources)
+        processes = _events(directory / "processes.jsonl")
+        assert any(r["processes"] for r in processes)
+        assert not (directory / "resources.jsonl").exists()
         events = _events(directory / "events.jsonl")
         assert events[-1]["returncode"] == expected_rc
         assert events[-1]["sampler_stopped"] is True

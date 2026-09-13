@@ -12,7 +12,15 @@ Each invocation and retry gets a unique `attempt-N-*` directory:
 | --- | --- |
 | `events.jsonl` | Actual checkout SHA, selected dependency versions, CI run/attempt/partition, observed case/module/worker/stage log boundaries, and subprocess exit status |
 | `requests.jsonl` | Every formal request's existing E2E/stage/step/memory metrics, flushed before assertions, including cases with `run_perf_check=False` |
-| `resources.jsonl` | Approximately 1 Hz process-tree CPU time, I/O, RSS, page faults and context switches; attributed GPU utilization, clocks, power/limit, temperature and throttle reasons |
+| `processes.jsonl` | Approximately 1 Hz process-tree CPU, I/O, memory, fault and scheduler counters, plus host I/O and memory pressure |
+| `resources.jsonl` (GPU opt-in only) | Process counters and attributed GPU utilization, clocks, power/limit, temperature and throttle reasons, including NVML query durations |
+
+GPU sampling requires `SGLANG_DIFFUSION_DIAGNOSTICS_GPU=1` in addition to the
+diagnostics directory. It is off by default: NVML process-ownership queries can
+contend with inference driver calls and perturb the latency being measured.
+Use it for a separate diagnostic replay, not the clean performance comparison.
+Process/pressure sampling and request metrics remain enabled without it; the
+attempt metadata records whether GPU sampling was enabled.
 
 JSONL is flushed per event so completed evidence survives interrupted pytest
 sessions. A missing `attempt_end` means incomplete, not success. The workflow
