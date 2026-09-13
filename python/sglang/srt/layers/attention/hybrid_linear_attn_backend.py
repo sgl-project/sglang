@@ -33,9 +33,15 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_spec,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -379,7 +385,11 @@ class MambaAttnBackendBase(AttentionBackend):
         chunk boundary. Also returns ``track_ssm_h_batch_src``: the batch rows of
         the unaligned tracked seqs, used to integer-index the fp32 snapshot
         buffer on the KDA path so the copy stays free of GPU syncs."""
-        state_chunk_size = self.mamba_chunk_size
+        state_chunk_size = (
+            self.mamba_chunk_size
+            if not is_npu()
+            else mamba_cache_chunk_size()
+        )
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
