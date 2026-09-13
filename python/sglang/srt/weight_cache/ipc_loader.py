@@ -557,7 +557,16 @@ class IpcModelLoader(BaseModelLoader):
                 f"dtype={engine_config.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            send_msg(
+                sock,
+                {
+                    "type": "fetch_state",
+                    "config": engine_config.to_dict(),
+                    # Lets the daemon report which engine PIDs it has served in
+                    # its `status` snapshot. Optional: older daemons ignore it.
+                    "client_pid": os.getpid(),
+                },
+            )
             result = recv_msg(sock)
 
             if result.get("status") != "ok":

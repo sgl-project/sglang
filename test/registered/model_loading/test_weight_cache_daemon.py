@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -49,6 +50,15 @@ PROMPTS = [
 def _gpu_uuids(tp_size: int) -> list:
     # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
     return [current_platform.get_device_uuid(i) for i in range(tp_size)]
+
+
+def _run_status_cli(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "sglang.srt.weight_cache.status", *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
 
 @unittest.skipIf(
@@ -346,6 +356,31 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
         )
+
+    def test_status_cli(self):
+        """The status CLI must find the live daemon by discovery and report the
+        client-mode server above as a served, live client."""
+        (device_uuid,) = self.gpu_uuids
+        proc = _run_status_cli("--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = {row["label"]: row for row in json.loads(proc.stdout)}
+        self.assertIn(device_uuid, rows, f"daemon not discovered: {rows.keys()}")
+        row = rows[device_uuid]
+        self.assertTrue(row["reachable"], row.get("error"))
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["config"]["model_path"], self.model)
+        self.assertEqual(row["config"]["tp_size"], self.tp_size)
+        self.assertGreater(row["num_tensors"], 0)
+        self.assertGreater(row["load_seconds"], 0)
+        self.assertGreaterEqual(row["serve_count"], 1)
+        self.assertEqual(row["mismatch_count"], 0)
+        self.assertGreaterEqual(row["live_client_count"], 1)
+
+        # Human-readable form renders the same daemon without error.
+        proc = _run_status_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"{device_uuid}  pid {row['pid']}  up ", proc.stdout)
+        self.assertIn("mismatch 0", proc.stdout)
 
 
 class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):
