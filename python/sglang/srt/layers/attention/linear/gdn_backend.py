@@ -559,6 +559,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
     _aiter_gdn_reject_logged = False
+    _aiter_gdn_engaged_logged = False
 
     def _try_aiter_fused_gdn_decode(
         self,
@@ -614,6 +615,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             pad_slot_id=self.pad_slot_id,
         )
         layer._gdn_onorm_consumed = True
+        if not GDNAttnBackend._aiter_gdn_engaged_logged:
+            rank0_log(
+                "AITER fused GDN decode engaged: split + Conv1D + recurrence + "
+                "gated RMSNorm in one launch"
+            )
+            GDNAttnBackend._aiter_gdn_engaged_logged = True
         return out
 
     def forward_decode(
