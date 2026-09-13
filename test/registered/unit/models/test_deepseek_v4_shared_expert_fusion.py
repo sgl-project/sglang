@@ -10,6 +10,8 @@ from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
     is_shared_experts_fusion_disabled,
 )
+from sglang.srt.models import deepseek_v2
+from sglang.srt.models import deepseek_v4 as deepseek_v4_module
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
@@ -114,6 +116,32 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                 SimpleNamespace(n_shared_experts=1), matched
             )
         )
+
+    def test_nextn_post_load_builds_native_megamoe_shared_weights(self):
+        """The standalone NextN decoder must not miss native shared prep."""
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        nn.Module.__init__(moe)
+        model = object.__new__(DeepseekV4ForCausalLM)
+        nn.Module.__init__(model)
+        model.model = SimpleNamespace(decoder=SimpleNamespace(mlp=moe))
+
+        with (
+            patch.object(deepseek_v4_module, "_FP8_WO_A_GEMM", False),
+            patch.object(
+                deepseek_v4_module,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_megamoe=lambda: True),
+            ),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.build_mega_moe_shared_expert_weights"
+            ) as build_shared,
+        ):
+            model.post_load_weights(
+                is_nextn=True,
+                weight_names={"model.decoder.mlp.shared_experts.w1.weight"},
+            )
+
+        build_shared.assert_called_once_with(moe, force=True)
 
     def test_dspark_entry_class_uses_the_v4_gate(self):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""
