@@ -741,6 +741,16 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 weights_to_load - loaded_weights, [], component_name
             )
 
+            # process_weights_after_loading for unquantized linear
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None or not isinstance(
+                    quant_method, UnquantizedLinearMethod
+                ):
+                    continue
+                if hasattr(quant_method, "process_weights_after_loading"):
+                    quant_method.process_weights_after_loading(module)
+
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
                 if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
