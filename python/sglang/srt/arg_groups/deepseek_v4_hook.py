@@ -169,24 +169,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
 
-    if get_platform().is_hip or get_platform().is_npu or get_platform().is_musa:
-        # Protected platform implementations still consume the legacy runtime
-        # fields. Generic backends use enable_prefill_cp/cp_strategy directly.
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_prefill_context_parallel=False,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            dsa_prefill_cp_mode="round-robin-split",
-        )
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
@@ -244,10 +226,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", cfg.enable_dp_attention),
-            (
-                "context parallelism",
-                cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
-            ),
+            ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -301,7 +280,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
-            or cfg.enable_prefill_context_parallel
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "

@@ -2763,6 +2763,14 @@
             "runtime_peak_allocated_mb": 56951.0,
             "estimated_full_test_time_s": 186.0
         },
+        "ltx_2_5_diffusion_decoder_2gpus": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 545.1
+        },
         "ltx_2_3_two_stage_ti2v_2gpus": {
             "stages_ms": {
                 "InputValidationStage": 3.21,

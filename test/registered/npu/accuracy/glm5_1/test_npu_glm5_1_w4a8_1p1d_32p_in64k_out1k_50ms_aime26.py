@@ -13,7 +13,7 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {
@@ -164,6 +164,9 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
 }
 
 
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestNPUGLM5_1_W4A8_PD_SEP_AIME2026(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.1-w4a8 PD separation on AIME2026"""
 

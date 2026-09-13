@@ -146,20 +146,12 @@ def is_cp_v2_active(forward_batch) -> bool:
 
 def is_mla_prefill_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
-    if enable_cp_v2():
-        return is_cp_enabled() and uses_mla_backend()
-    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
+    return enable_cp_v2() and is_cp_enabled() and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch) -> bool:
     """Return whether this MLA forward batch is using prefill CP."""
-    if enable_cp_v2():
-        return is_mla_prefill_cp_enabled() and is_cp_v2_active(forward_batch)
-    return (
-        getattr(forward_batch, "attn_cp_metadata", None) is not None
-        and is_mla_prefill_cp_enabled()
-        and forward_batch.forward_mode.is_context_parallel_extend()
-    )
+    return is_mla_prefill_cp_enabled() and is_cp_v2_active(forward_batch)
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -265,18 +257,10 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
-    if is_cp_v2_active(forward_batch):
-        strategy = get_cp_strategy()
-        assert strategy is not None
-        return strategy.gather_kv_cache(x, forward_batch, stream)
-
-    # HIP/NPU still materialize their protected platform layout through the
-    # legacy collective until those backends migrate independently.
-    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-
-    return cp_all_gather_rerange_output(
-        x, get_parallel().attn_cp_size, forward_batch, stream
-    )
+    assert is_cp_v2_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return strategy.gather_kv_cache(x, forward_batch, stream)
 
 
 @contextmanager

@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -259,6 +259,9 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Class default: some decode pools borrow another __init__ (see
+    # DecodeReqToTokenPool) but inherit alloc_rows.
+    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
 
     def __init__(
         self,
@@ -322,6 +325,8 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
+        if self._on_alloc_rows is not None:
+            self._on_alloc_rows(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -346,6 +351,10 @@ class ReqToTokenPool:
     def attach_aux_cache(self, aux_cache: Any) -> None:
         assert self._aux_cache is None
         self._aux_cache = aux_cache
+
+    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+        assert self._on_alloc_rows is None
+        self._on_alloc_rows = hook
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:

@@ -96,7 +96,6 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "triton",
     "--speculative-eagle-topk",
     1,
-    "--disable-radix-cache",
     "--disable-custom-all-reduce",
     "--watchdog-timeout",
     9000,
