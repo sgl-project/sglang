@@ -28,7 +28,11 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKOnlyPool,
+    MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -1414,9 +1418,17 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
-    Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
+    Returns ``MHATokenToKVPoolMXFP8Host`` for the block-scaled MXFP8 pool (its
+    UE8M0 scales must travel with the payload),
+    ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if isinstance(device_pool, MHATokenToKVPoolMXFP8):
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
+            MHATokenToKVPoolMXFP8Host,
+        )
+
+        return MHATokenToKVPoolMXFP8Host
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
