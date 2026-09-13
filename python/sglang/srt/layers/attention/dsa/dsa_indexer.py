@@ -42,6 +42,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
+    get_lora,
     get_parallel,
     get_schedule,
 )
@@ -54,6 +55,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_module,
     is_cuda,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -250,6 +252,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
+        # Projection fusion is independent of CUDA's fused rotary/cache path.
+        # The fused loader accepts BF16 or block-FP8 weights; LoRA needs the
+        # original modules. Keep the new ROCm path opt-in pending wider coverage.
+        self.use_dsa_indexer_projection_fusion = self.use_dsa_indexer_fusion or (
+            _is_hip
+            and is_gfx942_supported()
+            and envs.SGLANG_ROCM_DSA_INDEXER_PROJECTION_FUSION.get()
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and not is_neox_style
+            and not get_lora().enable_lora
+            and (
+                quant_config is None
+                or (
+                    quant_config.get_name() == "fp8"
+                    and not getattr(quant_config, "use_mxfp8", False)
+                    and getattr(quant_config, "weight_block_size", None) == [128, 128]
+                )
+            )
+        )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -272,7 +293,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        if self.use_dsa_indexer_fusion:
+        if self.use_dsa_indexer_projection_fusion:
             self.wk_weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim + self.n_heads,
@@ -457,7 +478,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                if self.use_dsa_indexer_fusion:
+                if self.use_dsa_indexer_projection_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
                     key, _ = self.wk(x)
@@ -476,7 +497,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            if self.use_dsa_indexer_fusion:
+            if self.use_dsa_indexer_projection_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
@@ -526,8 +547,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         x: torch.Tensor,
         positions: torch.Tensor,
     ):
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        if self.use_dsa_indexer_projection_fusion:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -1535,7 +1558,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
         # absent then; short-circuit before touching it.
-        weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
+        weights_proj_lora = not self.use_dsa_indexer_projection_fusion and getattr(
             self.weights_proj, "set_lora", False
         )
 
@@ -1588,7 +1611,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if not self.use_dsa_indexer_fusion:
+            if not self.use_dsa_indexer_projection_fusion:
                 if weights_proj_lora:
                     weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
                 else:
@@ -1605,7 +1628,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            if self.use_dsa_indexer_fusion:
+            if self.use_dsa_indexer_projection_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
@@ -1695,6 +1718,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         self.softmax_scale,
                         q_scale,
                     )
+                elif self.use_dsa_indexer_projection_fusion:
+                    weights = self._scale_head_gates(weights_raw, q_scale)
                 else:
                     if weights_proj_lora:
                         raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
@@ -1705,7 +1730,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         self.softmax_scale,
                         q_scale,
                     )
-            elif self.use_dsa_indexer_fusion:
+            elif self.use_dsa_indexer_projection_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
