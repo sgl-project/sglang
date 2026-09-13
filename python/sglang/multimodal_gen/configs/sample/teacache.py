@@ -63,7 +63,10 @@ class TeaCacheParams(CacheParams):
         return self.coefficients
 
     def get_skip_boundaries(
-        self, num_inference_steps: int, do_cfg: bool
+        self,
+        num_inference_steps: int,
+        do_cfg: bool,
+        cfg_parallel: bool = False,
     ) -> tuple[int, int]:
         def _resolve_boundary(value: int | float) -> int:
             if isinstance(value, float):
@@ -75,7 +78,9 @@ class TeaCacheParams(CacheParams):
         start_skipping = _resolve_boundary(self.start_skipping)
         end_skipping = _resolve_boundary(self.end_skipping)
 
-        if do_cfg:
+        # Serial CFG performs two local forwards per diffusion timestep. CFG
+        # parallel performs one branch per rank, so its boundaries stay unchanged.
+        if do_cfg and not cfg_parallel:
             start_skipping *= 2
             end_skipping *= 2
 

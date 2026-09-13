@@ -39,6 +39,7 @@ class TeaCacheContext:
         current_timestep: Current denoising timestep index (0-indexed).
         num_inference_steps: Total number of inference steps.
         do_cfg: Whether classifier-free guidance is enabled.
+        is_cfg_parallel: Whether CFG branches execute on separate ranks.
         is_cfg_negative: True if currently processing negative CFG branch.
         teacache_thresh: Threshold for accumulated L1 distance.
         coefficients: Polynomial coefficients for L1 rescaling.
@@ -48,6 +49,7 @@ class TeaCacheContext:
     current_timestep: int
     num_inference_steps: int
     do_cfg: bool
+    is_cfg_parallel: bool
     is_cfg_negative: bool  # For CFG branch selection
     teacache_thresh: float
     coefficients: list[float]
@@ -263,6 +265,7 @@ class TeaCacheMixin:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
@@ -281,16 +284,19 @@ class TeaCacheMixin:
         current_timestep = forward_context.current_timestep
         num_inference_steps = forward_batch.num_inference_steps
         do_cfg = forward_batch.do_classifier_free_guidance
+        is_cfg_parallel = bool(get_global_server_args().enable_cfg_parallel)
         is_cfg_negative = forward_batch.is_cfg_negative
 
-        # Reset at first timestep
-        if current_timestep == 0 and not self.is_cfg_negative:
+        # Serial CFG resets once on the positive branch. Under CFG parallel,
+        # each rank owns its own model state and must reset its local branch.
+        if current_timestep == 0 and (is_cfg_parallel or not is_cfg_negative):
             self.reset_teacache_state()
 
         return TeaCacheContext(
             current_timestep=current_timestep,
             num_inference_steps=num_inference_steps,
             do_cfg=do_cfg,
+            is_cfg_parallel=is_cfg_parallel,
             is_cfg_negative=is_cfg_negative,
             teacache_thresh=teacache_params.teacache_thresh,
             coefficients=teacache_params.get_coefficients(),
