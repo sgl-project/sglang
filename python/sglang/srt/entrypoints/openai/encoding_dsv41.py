@@ -27,6 +27,12 @@ LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 
+# ASCII-pipe spelling of IMAGE_PLACEHOLDER. User-supplied text that happens to
+# contain the literal fullwidth-bar token is rewritten to this spelling
+# instead of being rejected, so it can never be confused with a genuine
+# image placeholder inserted by _process_image_blocks for real image content.
+IMAGE_PLACEHOLDER_ESCAPED = "<|deepseek_image|>"
+
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
     "action": "<｜action｜>",
@@ -551,10 +557,26 @@ def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
     return record
 
 
+def _escape_image_placeholder(text: str) -> str:
+    """Rewrite a literal image-placeholder token to its ASCII-pipe spelling.
+
+    Applied to user-supplied text (never to a placeholder this module inserts
+    itself for a genuine image block), so the escaped spelling can never be
+    mistaken for a real image placeholder downstream.
+    """
+    return text.replace(IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER_ESCAPED)
+
+
 def _process_image_blocks(
     blocks: List[Any], image_placeholder: str = IMAGE_PLACEHOLDER
 ) -> Tuple[List[Any], List[Dict[str, Any]]]:
-    """Replace image blocks with placeholders and collect their records in order."""
+    """Replace image blocks with placeholders and collect their records in order.
+
+    Any literal image-placeholder token found in user-supplied text (a text
+    block, or a tool-result block's text content) is escaped to its
+    ASCII-pipe spelling rather than rejected; only a genuine image/image_url
+    block inserts the real placeholder.
+    """
     new_blocks: List[Any] = []
     images: List[Dict[str, Any]] = []
     for block in blocks:
@@ -573,32 +595,41 @@ def _process_image_blocks(
             )
             new_blocks.append(block)
             images.extend(nested_images)
+        elif block.get("type") == "tool_result" and isinstance(
+            block.get("content"), str
+        ):
+            content = block.get("content", "")
+            if IMAGE_PLACEHOLDER in content:
+                block = copy.copy(block)
+                block["content"] = _escape_image_placeholder(content)
+            new_blocks.append(block)
         elif block.get("type") == "text":
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
-                raise ValueError(
-                    f"Text block contains image placeholder '{IMAGE_PLACEHOLDER}': "
-                    f"'{text[:100]}'. Images should be separate content blocks."
-                )
+                block = copy.copy(block)
+                block["text"] = _escape_image_placeholder(text)
             new_blocks.append(block)
         else:
             new_blocks.append(block)
     return new_blocks, images
 
 
-def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
-    """Reject user-supplied image placeholder tokens in textual fields."""
+def _escape_image_sp_tokens(msg: Dict[str, Any]) -> None:
+    """Escape user-supplied image placeholder tokens in textual fields.
+
+    A literal image-placeholder token typed or echoed back by the user (in
+    ``content``, ``reasoning_content``, or a tool message's ``content``) is
+    rewritten in place to its ASCII-pipe spelling instead of being rejected,
+    so it can never be mistaken for a genuine image placeholder this module
+    inserts for real image content.
+    """
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
-        raise ValueError(
-            f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
-            "Images should be provided as image content blocks."
-        )
+        msg["content"] = _escape_image_placeholder(content)
+
     reasoning_content = msg.get("reasoning_content")
     if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
-        raise ValueError(
-            f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
-        )
+        msg["reasoning_content"] = _escape_image_placeholder(reasoning_content)
 
 
 def process_image_messages(
@@ -609,7 +640,7 @@ def process_image_messages(
     images: List[Dict[str, Any]] = []
     for msg in messages:
         msg = copy.deepcopy(msg)
-        _validate_no_image_sp_tokens(msg)
+        _escape_image_sp_tokens(msg)
 
         if isinstance(msg.get("content"), list) and "content_blocks" not in msg:
             msg["content_blocks"] = msg.pop("content")
