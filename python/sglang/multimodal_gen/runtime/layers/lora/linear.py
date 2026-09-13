@@ -349,8 +349,9 @@ class BaseLayerWithLoRA(nn.Module):
             )
             for start in range(0, lora_B_2d.shape[0], chunk_rows):
                 end = min(start + chunk_rows, lora_B_2d.shape[0])
-                chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
-                data_2d[start:end].add_(chunk_delta, alpha=scale)
+                data_2d[start:end].addmm_(
+                    lora_B_2d[start:end], lora_A_sliced, alpha=scale
+                )
 
     def _should_merge_in_fp32(
         self,
