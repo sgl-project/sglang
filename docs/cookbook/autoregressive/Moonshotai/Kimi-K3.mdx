@@ -283,7 +283,8 @@ Pending update...
 
 K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **HiCache** card in the [Playground above](#playground) for long multi-turn workloads.
 
-- On the DCP recipes (Blackwell Balanced / High-Throughput, in both the `Unified` and `Decode` roles), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 with Spec Decode off keeps DCP. Only DCP goes: the MLA KV reverts to TP-replicated, but the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP while B200 Unified keeps its `--pp-size 2` / `--ep-size`.
+- On the DCP recipes (Blackwell Balanced / High-Throughput, `Unified` and `Decode` roles), **L1+L2 keeps DCP**, with Spec Decode off or on DSPARK. On B200 the DSPARK pipeline collapse scales it too (PP2 × DCPEP8 → DCPEP16).
+- **L3 drops the DCP flags** on those recipes (storage keys are not dcp_rank-aware yet; the command hints call it out, and per-request KV capacity shrinks). Only DCP goes: the MLA KV reverts to TP-replicated while the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP and B200 Unified keeps its `--pp-size 2` / `--ep-size`.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
 
 <a id="pd-disaggregation" />
