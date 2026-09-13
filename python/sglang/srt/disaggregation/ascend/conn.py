@@ -35,6 +35,9 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _is_npu_dsa_layout(self) -> bool:
+        return getattr(self.kv_args, "kv_buf_groups", 1) == 3
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
@@ -66,6 +69,18 @@ class AscendKVManager(MooncakeKVManager):
             lens.extend(component_lens)
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
+            raise RuntimeError(
+                "Ascend DSA PD requires matching prefill/decode DCP sizes, got "
+                f"prefill={self.dcp_size}, decode={dst_dcp_size}"
+            )
+        return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        # The common DCP packer is CUDA-only. Ascend uses the unpacked path.
+        self._dcp_pack_buffers = []
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
