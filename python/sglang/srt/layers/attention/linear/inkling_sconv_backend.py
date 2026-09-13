@@ -85,6 +85,8 @@ class InklingShortConvMetadata(msgspec.Struct):
     # [B, conv_kernel - 1] input positions whose conv window feeds the prefix
     # cache. Extend only, and only when tracking is on.
     track_conv_indices: Optional[torch.Tensor] = None
+    # Kernel-facing checkpoint slots. ForwardBatch retains the virtual source.
+    track_cache_indices: Optional[torch.Tensor] = None
 
 
 class InklingShortConvAttnBackend(ShortConvAttnBackend):
@@ -251,8 +253,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def _prepare_slot_indices(self, forward_batch: ForwardBatch):
         self._reset_step_state()
-        if not self._slot_gather_recordable:
-            self._prepare_track_indices(forward_batch)
+        self._prepare_track_indices(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         n = req_pool_indices.shape[0]
         buf = self._cache_indices_buf
@@ -278,18 +279,18 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def _prepare_track_indices(self, forward_batch: ForwardBatch):
         # Replay metadata views may omit optional checkpoint tracking.
         indices = getattr(forward_batch, "mamba_track_indices", None)
-        if indices is None:
+        if indices is None or self._slot_gather_recordable:
+            self.sconv_metadata.track_cache_indices = indices
             return
         n = indices.shape[0]
         assert n <= self._graph_track_indices.shape[0], (
             "checkpoint-index buffer too small for the forward batch"
         )
-        # Scheduler and replay input buffers remain virtual. Only the forward
-        # view is rebound, as in MambaAttnBackendBase; every Inkling track-save
-        # consumer (including fused kernels) then sees physical slot IDs.
+        # Keep the batch virtual across repeated eager metadata initialization
+        # and across draft backends. Captured consumers read this fixed buffer.
         out = self._graph_track_indices[:n]
         out.copy_(self._translate_mamba_indices(indices))
-        forward_batch.mamba_track_indices = out
+        self.sconv_metadata.track_cache_indices = out
 
     def _refresh_sconv_metadata(
         self, forward_batch: ForwardBatch, *, on_graph_path: bool
@@ -468,6 +469,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             rows = forward_batch.batch_size
             forward_batch.mamba_track_mask = self._graph_track_inert_mask[:rows]
             forward_batch.mamba_track_indices = self._graph_track_inert_indices[:rows]
+            self.sconv_metadata.track_cache_indices = self._graph_track_inert_indices[
+                :rows
+            ]
             forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[:rows]
         rows = forward_batch.batch_size
         query_start_loc = self.sconv_metadata.query_start_loc
@@ -613,6 +617,7 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
             and self.supports_draft_extend_metadata_staging
         ):
             self.short_conv_backend._reset_step_state()
+            self.short_conv_backend._prepare_track_indices(forward_batch)
             self.short_conv_backend._refresh_sconv_metadata(
                 forward_batch, on_graph_path=True
             )
