@@ -26,7 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
-from sglang.srt.runtime_context import LoRABatchLayout, get_parallel
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -243,10 +243,11 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if configured; DP-attention idle forwards take the base
         # path (see lora_active).
-        if self.lora_active:
-            # The backend's run_lora_a_embedding now handles both regular
-            # and extra tokens efficiently with CUDA graph support
-            base_output = self.apply_lora(base_output, input_, batch_info)
+        with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+            if self.lora_active:
+                # The backend's run_lora_a_embedding now handles both regular
+                # and extra tokens efficiently with CUDA graph support
+                base_output = self.apply_lora(base_output, input_, batch_info)
 
         return base_output
 

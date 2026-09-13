@@ -2496,7 +2496,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
-            lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
         ):
             with _mlp_ctx:
                 hidden_states = self.mlp(

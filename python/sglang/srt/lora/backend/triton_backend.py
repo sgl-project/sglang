@@ -149,6 +149,13 @@ def gather_dp_attention_lora_batch_info(
         graph_batch_info.bs = num_global_tokens
         graph_batch_info.num_segments = num_global_tokens
         graph_batch_info.expected_tokens = num_global_tokens
+        if graph_batch_info.moe_lora_info is not None:
+            graph_batch_info.moe_lora_info = MoELoRABatchInfo(
+                seg_indptr=graph_batch_info.seg_indptr[: num_global_tokens + 1],
+                req_to_lora=graph_batch_info.weight_indices[:num_global_tokens],
+                adapter_enabled=graph_batch_info.moe_lora_info.adapter_enabled,
+                token_lora_mapping=graph_batch_info.weight_indices[:num_global_tokens],
+            )
         global_batch_info = graph_batch_info
     global_batch_info.has_active_lora = has_global_active_lora
 
@@ -686,14 +693,9 @@ class TritonLoRABackend(BaseLoRABackend):
             self.lm_head_batch_info, self.lm_head_pass_batch_infos = lm_head_batch_infos
 
         is_decode = not forward_batch.is_extend_in_batch
-        if is_decode:
-            if self.batch_info is not previous_local_batch_info:
-                self.sgemm_batch_info = self._build_sgemm_routing(self.batch_info)
-            self.global_sgemm_batch_info = self._build_sgemm_routing(
-                self.global_batch_info
-            )
-        else:
-            self.global_sgemm_batch_info = None
+        if is_decode and self.batch_info is not previous_local_batch_info:
+            self.sgemm_batch_info = self._build_sgemm_routing(self.batch_info)
+        self.global_sgemm_batch_info = self._build_sgemm_routing(self.global_batch_info)
 
     def prepare_lora_token_segments(
         self,
