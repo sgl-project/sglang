@@ -224,9 +224,7 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
-            custom_logit_processor_row_indices=(
-                processor_indices if cls is SamplingBatchInfo else None
-            ),
+            custom_logit_processor_row_indices=processor_indices,
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
@@ -395,7 +393,7 @@ class SamplingBatchInfo:
                 mask[keep_indices_device]
             )  # ignore the custom logit processor whose mask is all False
         }
-        self._filter_custom_logit_processor_row_indices(keep_indices)
+        self._filter_processor_rows(keep_indices)
         self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         # If the custom logit processor is an empty dict, set the flag to False,
@@ -450,7 +448,7 @@ class SamplingBatchInfo:
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
-            self._merge_custom_logit_processor_row_indices(other)
+            self._merge_processor_rows(other)
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
@@ -522,9 +520,7 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def _filter_custom_logit_processor_row_indices(
-        self, keep_indices: List[int]
-    ) -> None:
+    def _filter_processor_rows(self, keep_indices: List[int]) -> None:
         if self.custom_logit_processor_row_indices is None:
             return
 
@@ -539,9 +535,7 @@ class SamplingBatchInfo:
                 )
         self.custom_logit_processor_row_indices = indices
 
-    def _merge_custom_logit_processor_row_indices(
-        self, other: SamplingBatchInfo
-    ) -> None:
+    def _merge_processor_rows(self, other: SamplingBatchInfo) -> None:
         left_indices = self.custom_logit_processor_row_indices
         right_indices = other.custom_logit_processor_row_indices
         if left_indices is None or right_indices is None:

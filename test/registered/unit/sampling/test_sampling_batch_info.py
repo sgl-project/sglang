@@ -767,15 +767,6 @@ class TestFromScheduleBatch(CustomTestCase):
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
 
-        class ExtendedSamplingBatchInfo(SamplingBatchInfo):
-            pass
-
-        extended = ExtendedSamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertIsNone(extended.custom_logit_processor_row_indices)
-        extended_proc, extended_mask = extended.custom_logit_processor[key]
-        self.assertIsInstance(extended_proc, DisallowedTokensLogitsProcessor)
-        self.assertTrue(torch.equal(extended_mask, mask))
-
 
 if __name__ == "__main__":
     unittest.main()
