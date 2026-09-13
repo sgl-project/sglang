@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -81,6 +82,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
+    _use_aiter,
     _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -105,6 +107,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
     set_weight_attrs,
@@ -1220,7 +1223,36 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         "experts are quantized."
                     )
         if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+            if not (
+                _use_aiter
+                and is_gfx942_supported()
+                and envs.SGLANG_ROCM_GLM_SHARED_EXPERTS_FUSION.get()
+            ):
+                return "Shared experts fusion requires CUDA or opted-in gfx942 AITER."
+            if text_config.n_shared_experts != 1:
+                return "The gfx942 path supports exactly one fused shared expert."
+            if quant_config is not None and (
+                quant_config.get_name() != "fp8"
+                or getattr(quant_config, "weight_block_size", None) != [128, 128]
+                or getattr(quant_config, "use_mxfp8", False)
+                or getattr(quant_config, "is_fp4_experts", False)
+            ):
+                return "The gfx942 path supports BF16 or 128x128 block FP8 only."
+            if quant_config is not None and any(
+                is_layer_skipped(
+                    f"model.layers.{i}.mlp.{part}",
+                    quant_config.ignored_layers,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                )
+                for i in range(
+                    getattr(text_config, "first_k_dense_replace", 0),
+                    text_config.num_hidden_layers,
+                )
+                for part in ("shared_experts", "experts")
+            ):
+                return (
+                    "The gfx942 FP8 path does not fuse quantization-excluded experts."
+                )
         if _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
