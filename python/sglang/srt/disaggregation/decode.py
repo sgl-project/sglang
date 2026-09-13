@@ -76,7 +76,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    supports_swa_byte_budget,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -432,10 +432,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _supports_unified_swa_reservation(self) -> bool:
-        allocator = self.token_to_kv_pool_allocator
-        return (
-            isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-            and allocator.supports_asymmetric_reservation
+        return supports_swa_byte_budget(self.token_to_kv_pool_allocator)
+
+    def _uses_swa_reservation(self) -> bool:
+        return self._uses_swa_tail_prealloc() or supports_swa_byte_budget(
+            self.scheduler.token_to_kv_pool_allocator
         )
 
     def _unified_swa_reservation_fits(
@@ -448,10 +449,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         empty_pool: bool = False,
     ) -> bool:
         allocator = self.token_to_kv_pool_allocator
-        if not self._supports_unified_swa_reservation():
-            return True
-        assert isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-
         full_evictable = swa_evictable = 0
         if not empty_pool:
             full_evictable = self._radix_full_evictable()
@@ -484,7 +481,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         *,
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
-        uses_swa_tail_prealloc: bool,
     ) -> bool:
         if self._supports_unified_swa_reservation():
             return self._unified_swa_reservation_fits(
@@ -493,9 +489,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
             )
-        if not uses_swa_tail_prealloc:
+        if swa_allocatable_tokens is None:
             return full_tokens <= full_allocatable_tokens
-        assert swa_allocatable_tokens is not None
         return (
             full_tokens <= full_allocatable_tokens
             and swa_tokens <= swa_allocatable_tokens
@@ -514,7 +509,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
         if self._supports_unified_swa_reservation():
-            assert isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
             full_required = ceil_align(full_len, page_size)
             swa_required = ceil_align(swa_tail_len, page_size)
             evict_from_tree_cache(
@@ -931,16 +925,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
-        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        uses_unified_swa = False
-        if not uses_swa_tail_prealloc:
-            allocator = self.scheduler.token_to_kv_pool_allocator
-            uses_unified_swa = (
-                isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-                and allocator.supports_asymmetric_reservation
-            )
-        uses_swa_reservation = uses_swa_tail_prealloc or uses_unified_swa
-        if uses_swa_reservation:
+        swa_allocatable_tokens = None
+        if self._uses_swa_reservation():
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(count_retracted=False)
             )
@@ -961,10 +947,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 full_required,
                 swa_required,
                 full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=(
-                    swa_allocatable_tokens if uses_swa_reservation else None
-                ),
-                uses_swa_tail_prealloc=uses_swa_tail_prealloc,
+                swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 break
 
@@ -981,7 +964,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.is_retracted = False
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
-            if uses_swa_reservation:
+            if swa_allocatable_tokens is not None:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                     count_retracted=False,
                     extra_reserved_reqs=len(resumed_reqs),
@@ -1242,16 +1225,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        uses_unified_swa = False
-        if not uses_swa_tail_prealloc:
-            allocator = self.scheduler.token_to_kv_pool_allocator
-            uses_unified_swa = (
-                isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-                and allocator.supports_asymmetric_reservation
-            )
-        uses_swa_reservation = uses_swa_tail_prealloc or uses_unified_swa
-        swa_allocatable_tokens = 0
-        if uses_swa_reservation:
+        swa_allocatable_tokens = None
+        if self._uses_swa_reservation():
             retractable_swa_tokens = sum(
                 self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
             )
@@ -1435,23 +1410,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     swa_required,
                     swa_len + max_new_tokens - retractable_swa_tokens,
                 )
-            elif uses_unified_swa:
+            elif swa_allocatable_tokens is not None:
                 swa_required_for_admission = full_required_for_admission
 
             if not self._prealloc_reservation_fits(
                 full_required_for_admission,
                 swa_required_for_admission,
                 full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=(
-                    swa_allocatable_tokens if uses_swa_reservation else None
-                ),
-                uses_swa_tail_prealloc=uses_swa_tail_prealloc,
+                swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
 
-            if uses_swa_tail_prealloc or uses_unified_swa:
+            if swa_allocatable_tokens is not None:
                 reclaim_error = self._reclaim_swa_tail_capacity(
                     swa_len,
                     decode_req.req.rid,
@@ -1494,7 +1466,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
-            if uses_swa_reservation:
+            if swa_allocatable_tokens is not None:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                     retractable_tokens=retractable_tokens,
                     retractable_swa_tokens=retractable_swa_tokens,
@@ -1812,7 +1784,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
-        elif self._uses_swa_tail_prealloc() or self._supports_unified_swa_reservation():
+        elif self._uses_swa_reservation():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if get_disagg().disaggregation_decode_enable_radix_cache:
                 available_size += self._radix_full_evictable()
