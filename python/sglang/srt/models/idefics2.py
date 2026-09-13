@@ -37,7 +37,6 @@ from sglang.srt.utils import add_prefix, is_npu
 
 
 class Idefics2VisionMLP(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -70,7 +69,6 @@ class Idefics2VisionMLP(nn.Module):
 
 
 class Idefics2EncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -241,7 +239,6 @@ class Idefics2VisionEmbeddings(nn.Module):
         )
 
         for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
-
             if tgt_sizes is not None:
                 nb_patches_h = tgt_sizes[batch_idx][0]
                 nb_patches_w = tgt_sizes[batch_idx][1]
@@ -284,7 +281,6 @@ class Idefics2VisionEmbeddings(nn.Module):
 
 
 class Idefics2VisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

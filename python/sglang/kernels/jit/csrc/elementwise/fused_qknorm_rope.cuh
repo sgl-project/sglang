@@ -30,7 +30,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sglang {
 
 // ---------------------------------------------------------------------------
 // YaRN-aware frequency computation
@@ -343,4 +343,4 @@ void fused_qk_norm_rope(
           rotary_dim);
 }
 
-}  // namespace
+}  // namespace sglang

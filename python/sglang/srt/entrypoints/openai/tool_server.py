@@ -72,7 +72,6 @@ def post_process_tools_description(
 
 
 class ToolServer(ABC):
-
     @abstractmethod
     def has_tool(self, tool_name: str):
         pass
@@ -86,7 +85,6 @@ class ToolServer(ABC):
 
 
 class MCPToolServer(ToolServer):
-
     def __init__(self):
         self.harmony_tool_descriptions = {}
 
@@ -143,7 +141,6 @@ class MCPToolServer(ToolServer):
 
 
 class DemoToolServer(ToolServer):
-
     def __init__(self, *, enable_python: bool = True):
         from sglang.srt.entrypoints.tool import (
             HarmonyBrowserTool,

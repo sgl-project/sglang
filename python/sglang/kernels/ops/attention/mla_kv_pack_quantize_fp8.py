@@ -189,21 +189,21 @@ def mla_kv_pack_quantize_fp8(
         torch.bfloat16,
         torch.float16,
     ), f"k_nope must be bf16/fp16, got {k_nope.dtype}"
-    assert (
-        k_pe.dtype == k_nope.dtype and v.dtype == k_nope.dtype
-    ), "k_nope, k_pe, v must share dtype"
+    assert k_pe.dtype == k_nope.dtype and v.dtype == k_nope.dtype, (
+        "k_nope, k_pe, v must share dtype"
+    )
     assert fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
     s, num_heads, qk_nope = k_nope.shape
     qk_rope = k_pe.shape[-1]
     v_head = v.shape[-1]
 
-    assert (
-        v.shape[0] == s and v.shape[1] == num_heads
-    ), f"v shape {tuple(v.shape)} mismatches k_nope {tuple(k_nope.shape)}"
-    assert (
-        k_pe.shape[0] == s
-    ), f"k_pe first dim {k_pe.shape[0]} mismatches k_nope first dim {s}"
+    assert v.shape[0] == s and v.shape[1] == num_heads, (
+        f"v shape {tuple(v.shape)} mismatches k_nope {tuple(k_nope.shape)}"
+    )
+    assert k_pe.shape[0] == s, (
+        f"k_pe first dim {k_pe.shape[0]} mismatches k_nope first dim {s}"
+    )
     assert k_nope.stride(-1) == 1, "k_nope must have stride-1 inner dim"
     assert v.stride(-1) == 1, "v must have stride-1 inner dim"
     assert k_pe.stride(-1) == 1, "k_pe must have stride-1 inner dim"

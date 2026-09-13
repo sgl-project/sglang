@@ -1,9 +1,11 @@
+import fcntl
 import logging
 import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -16,8 +18,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
@@ -35,10 +41,9 @@ _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
-# Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
-)
+# Force redirect deep_gemm cache_dir. Defaults under SGLANG_CACHE_DIR so it
+# sits with the other compiled-kernel caches; SGLANG_DG_CACHE_DIR still wins.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
@@ -46,7 +51,7 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
@@ -68,9 +73,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         #   8192, 9008, ... 16384 (step 16)
         # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels
         next_m, sample_step = 1024, 2
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         max_prefill_bs = (
-            min(server_args.chunked_prefill_size, 32 * 1024)
-            if server_args.chunked_prefill_size >= 1
+            min(chunked_prefill_size, 32 * 1024)
+            if chunked_prefill_size >= 1
             else 16 * 1024
         )
         while next_m < max_prefill_bs:
@@ -82,14 +88,15 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     else:
         # When fast warmup isn't enabled, generate m_max and compile all the covered Ms.
         m_max = 1024 * 16
-        if server_args.chunked_prefill_size < 1:
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if chunked_prefill_size < 1:
             m_max = 1024 * 64
-        elif server_args.chunked_prefill_size > 8192:
-            m_max = server_args.chunked_prefill_size * 2
+        elif chunked_prefill_size > 8192:
+            m_max = chunked_prefill_size * 2
         m_max = min(1024 * 128, m_max)
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
-    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+    _IS_FIRST_RANK_ON_NODE = get_device().base_gpu_id == gpu_id
 
     # Check if is the first rank on node.
     # Default each rank will try compile all Ms to
@@ -108,6 +115,29 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+@contextmanager
+def _local_rank_compile_lock(
+    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
+):
+    """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
+
+    Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
+    the same order, so without a lock N local ranks nvcc-compile N identical
+    copies of every kernel. The lock holder compiles into the shared cache;
+    waiters then find the cubins already present and their pass over the M
+    list is execution warmup only.
+    """
+    lock_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{kernel_type.name}_n{n}_k{k}_g{num_groups}.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 # TODO improve code
@@ -146,13 +176,14 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+        with _local_rank_compile_lock(kernel_type, n, k, num_groups):
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -175,7 +206,9 @@ def _compile_deep_gemm_one_type_all(
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+        memory_budget = get_available_gpu_memory(
+            device="cuda", gpu_id=torch.cuda.current_device()
+        )
 
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
@@ -192,7 +225,7 @@ def _compile_deep_gemm_one_type_all(
                     kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
                 )
                 > memory_budget
-                and max_m > 4096
+                and max_m > 2048
             ):
                 max_m = max_m // 2
             logger.warning(
@@ -444,7 +477,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     cp = max(get_cp_padding_align_size(), 1)
 
     attn_tp_size = get_parallel().attn_tp_size
-    mlp_sync = require_mlp_sync(model_runner.server_args)
+    mlp_sync = require_mlp_sync()
 
     def _align(bs: int) -> int:
         # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
@@ -469,7 +502,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
 
     # In PD, prefill-only nodes never decode (indexer would OOM at large
     # bs) and decode-only nodes never extend.
-    disagg_mode = model_runner.server_args.disaggregation_mode
+    disagg_mode = get_disagg().disaggregation_mode
     run_decode = model_runner.is_generation and disagg_mode != "prefill"
     run_extend = disagg_mode != "decode"
 

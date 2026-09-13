@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_layer
 
 
 @dataclass
@@ -30,8 +29,6 @@ class ErnieImageArchConfig(DiTArchConfig):
             r"(.*)\.mlp\.up_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 1, 2),
         }
     )
-
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
 
     def __post_init__(self):
         super().__post_init__()

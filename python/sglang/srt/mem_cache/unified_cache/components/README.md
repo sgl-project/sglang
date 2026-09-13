@@ -111,7 +111,7 @@ Find the longest cached prefix for a token sequence.
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter
    - Updates `last_access_time` with decreasing timestamps up the path (parent < child)
    - Concatenates matched device indices via `torch.cat` (concat length ≤ K, subsumed by O(K))
-   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes the static `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
+   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
 
 ---
 
@@ -127,7 +127,7 @@ Insert a key-value pair into the tree.
 | **Mutation** | Creates new leaf nodes; updates component data on overlapping nodes; frees duplicate KV indices; may split nodes; updates LRU lists and evictable sizes |
 | **Complexity** | **O(K + D·C)** |
 
-**Algorithm detail** (`_insert_helper`):
+**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_commit_step` / `_insert_tail_step`):
 1. At each existing node, calls `_touch_node` → promotes to MRU via `node_has_component_data()`
 2. If key diverges mid-node, calls `_split_node` → `redistribute_on_node_split()` per component
 3. For each overlapping node, calls `update_component_on_insert_overlap()` per component — returns `consumed_from` index; the tree frees `value[dup_start:consumed_from]` as duplicate pool indices
@@ -180,34 +180,51 @@ Lock a node to protect it (and its ancestors) from eviction.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Called when a request begins using a cached prefix — prevents eviction of nodes it depends on |
-| **Inputs** | `node` — the last matched node (deepest) |
-| **Output** | `IncLockRefResult(swa_uuid_for_lock)` |
-| **Mutation** | Increments `lock_ref` per component along the path; moves tokens from evictable to protected size counters |
+| **Inputs** | `node` — the last matched node (deepest); `skip_lock_components` names components to leave untaken (the decode hold passes `(MAMBA,)`) |
+| **Output** | `IncLockRefResult(node_id, swa_uuid_for_lock, skipped_lock_components)` — the receipt the matching release must replay: the anchor node, the SWA boundary, and the skipped set |
+| **Mutation** | Increments `lock_ref` per component along its contiguous segment; moves data-bearing tokens from evictable to protected size counters |
 | **Complexity** | **O(D)** — Full: node to root; SWA: up to window boundary O(min(D, W)); Mamba: O(1).|
 
-**Algorithm detail:** Calls `acquire_component_lock()` for each component.
+**Algorithm detail:** Calls `acquire_component_lock()` for each component. A lock
+covers a contiguous node segment and counts **every** node in it — tombstones
+included (they carry no tokens, so sizes only move for data-bearing nodes).
 
 | Component | Strategy |
 |-----------|----------|
 | Full | **Path-lock**: walks from node to root, `lock_ref += 1` on every ancestor. On first lock (`lock_ref: 0→1`), moves tokens from `component_evictable_size_` to `component_protected_size_`. |
-| SWA | **Window-lock**: walks upward, accumulating SWA value lengths until `sliding_window_size` is filled. Records a `component_uuid` at the boundary node for `dec_lock_ref` to know where to stop. |
-| Mamba | **Single-node lock**: only `lock_ref += 1` on the node itself (mamba state is per-leaf, not per-path). |
+| SWA | **Segment-lock**: walks upward, `lock_ref += 1` on every node (tombstones included), accumulating position coverage (`len(key)`) until `sliding_window_size` is filled. Always stamps a boundary `component_uuid` at the last locked node; a `None` uuid in the receipt means the walk reached the root. |
+| Mamba | **Single-node lock**: only `lock_ref += 1` on the node itself (mamba state is per-leaf, not per-path). Taken unless the acquire lists it in `skip_lock_components`; the receipt records the skipped set. The core names no component: it drives whatever the tree registered through the same interface. |
 
 ---
 
-### `dec_lock_ref(node, params?) → DecLockRefResult`
+### `dec_lock_ref(node, params, skip_swa=False) → DecLockRefResult`
 
-Unlock a previously locked node path.
+Unlock a previously locked node path by replaying the acquire's receipt.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Called when a request finishes — releases eviction protection |
-| **Inputs** | `node`, optional `params.swa_uuid_for_lock` for SWA boundary detection |
+| **Inputs** | `node`; required `params` receipt (`node_id` anchor, `swa_uuid_for_lock` boundary, `skipped_lock_components`); `skip_swa=True` after an earlier `dec_swa_lock_only`. A receipt whose anchor is not `node` is a protocol violation (assert): a mispaired release would otherwise walk another holder's segment. |
 | **Output** | `DecLockRefResult()` |
-| **Mutation** | Decrements `lock_ref` per component; moves tokens from protected back to evictable when `lock_ref` reaches 0 |
+| **Mutation** | Decrements `lock_ref` per component along the same segment the acquire counted; moves tokens from protected back to evictable when `lock_ref` reaches 0 |
 | **Complexity** | **O(D)** — symmetric to `inc_lock_ref` |
 
-**Algorithm detail:** Calls `release_component_lock()` for each component. Full walks to root; SWA walks up until matching `component_uuid`; Mamba decrements single node.
+**Algorithm detail:** Releases auxiliary components before Full; every walk
+refreshes the evictable-leaf membership of each node whose last lock it drops,
+so the order is not load-bearing for the leaf sets. Full walks to root; SWA
+stops at the receipt boundary; components in `skipped_lock_components` are
+left alone. `skip_swa=True` also skips lower-priority components already
+released by `dec_swa_lock_only`. The host-side `dec_host_lock_ref` takes the
+same required receipt.
+
+---
+
+### `dec_swa_lock_only(node, params) → DecSwaLockOnlyResult`
+
+Early-release only the SWA portion of a lock (decode advanced past the
+window), plus strictly-lower-priority co-located locks (e.g. Mamba) the
+receipt proves were taken. The eventual full release must pass
+`skip_swa=True`. At most once per (node, boundary uuid) pair.
 
 ---
 
@@ -242,7 +259,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 | **Purpose** | During chunked prefill, insert partial results so the next chunk can match the prefix |
 | **Inputs** | `req` — the in-progress request |
 | **Output** | `None` |
-| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
+| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
 | **Complexity** | **O(K + D·C)** — two tree traversals: insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
@@ -252,7 +269,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 4. Writes new prefix indices into `req_to_token_pool`
 5. `dec_lock_ref()` on old `req.last_node`
 6. `inc_lock_ref()` on new matched node
-7. Updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`
+7. Updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`
 8. `cleanup_after_caching_req()` per component
 
 ---
@@ -267,15 +284,15 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 |------|---------|-----------|----------|
 | `create_match_validator(match_device_only=False)` | Return a per-match stateful predicate that decides whether a node is a valid match boundary. Full: requires Full device data, or host backup when `match_device_only=False`. SWA: tracks accumulated window length across device/host data. Mamba: requires Mamba device data, or host backup when `match_device_only=False`. | `_match_prefix_helper` | *abstract* |
 | `finalize_match_result_in_tree_core()` | Tree-side post-processing inside the match walk. Full/SWA: host-hit sums. Mamba: records `branching_seqlen` + the host-hit bump. | `_match_post_processor` | pass-through |
-| `finalize_match_result_in_cache()` | Static, cache-level finalize after the walk (receives the cache + NodeId-based result), dispatched class-level by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
+| `finalize_match_result_in_cache()` | Cache-level finalize after the walk (receives the params + NodeId-based result), dispatched by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
 
 ### Insert Phase
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_helper` | returns `prefix_len` |
-| `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_helper` | no-op |
-| `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_helper` | no-op |
+| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_walk_step` | returns `prefix_len` |
+| `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_walk_step` | no-op |
+| `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_commit_step` | no-op |
 
 ### Node Split
 
@@ -329,7 +346,7 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 
 ## Construction
 
-`UnifiedRadixCache` is constructed directly from `mem_cache/registry.py` when `SGLANG_ENABLE_UNIFIED_RADIX_TREE` is enabled. The registry sets `params.tree_components` before construction:
+`UnifiedRadixCache` is the default tree cache and is constructed directly from `mem_cache/registry.py`. The registry sets `params.tree_components` before construction:
 
 - Regular full-attention models → `(ComponentType.FULL,)`
 - Hybrid SWA models → `(ComponentType.FULL, ComponentType.SWA)`

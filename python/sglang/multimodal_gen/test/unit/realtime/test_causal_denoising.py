@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -19,6 +20,61 @@ class _Progress:
 
     def update(self):
         self.count += 1
+
+
+def test_causal_transformer_prepares_dit_before_forward(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import causal_denoising
+
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage._component_residency_manager = object()
+    calls = []
+
+    def manage_dit(self, model, phase, batch):
+        del self
+        calls.append(("prepare", model, phase, batch))
+
+    def transformer(latents, *args, **kwargs):
+        del args, kwargs
+        calls.append(("forward",))
+        return latents
+
+    stage._manage_dit_use_site = MethodType(manage_dit, stage)
+    stage.transformer = transformer
+    monkeypatch.setattr(
+        causal_denoising,
+        "precision_autocast_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        causal_denoising,
+        "set_forward_context",
+        lambda **kwargs: nullcontext(),
+    )
+
+    batch = SimpleNamespace()
+    latents = torch.zeros(1)
+    result = stage._forward_causal_transformer(
+        batch,
+        latent_model_input=latents,
+        prompt_embeds=None,
+        timestep=torch.zeros(1),
+        kv_cache=[],
+        crossattn_cache=[],
+        current_start_tokens=0,
+        start_frame=0,
+        image_kwargs={},
+        pos_cond_kwargs={},
+        current_timestep=0,
+        attn_metadata=None,
+        target_dtype=torch.float16,
+        autocast_enabled=False,
+    )
+
+    assert result is latents
+    assert calls == [
+        ("prepare", transformer, "transformer", batch),
+        ("forward",),
+    ]
 
 
 def test_causal_dmd_chunk_loop_uses_model_input_builder():

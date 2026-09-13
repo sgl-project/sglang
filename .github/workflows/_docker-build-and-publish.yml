@@ -1,7 +1,7 @@
 name: Build and Publish Multi-Arch Docker Images
 
-# Reusable workflow: builds CUDA 12 + CUDA 13 images for amd64 and arm64,
-# then creates multi-arch manifests with caller-specified tags.
+# Reusable workflow: builds CUDA 13 images for amd64 and arm64, then creates
+# multi-arch manifests with caller-specified tags.
 
 on:
   workflow_call:
@@ -26,7 +26,7 @@ on:
         type: string
         default: ""
       tag_config:
-        description: 'JSON array of {"cuda":"cu129|cu130","tags":["tag1","tag2"]}. Tags support {version} substitution.'
+        description: 'JSON array of {"cuda":"cu130","tags":["tag1","tag2"]}. Tags support {version} substitution.'
         required: true
         type: string
       use_environment:
@@ -50,7 +50,6 @@ jobs:
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
     outputs:
-      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     steps:
       - name: Delete huge unnecessary tools folder
@@ -69,16 +68,14 @@ jobs:
           set -euo pipefail
           BUILD_COMMIT="$(git rev-parse HEAD)"
           BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          for CUDA_VARIANT in cu129 cu130; do
-            python3 scripts/ci/utils/docker_build_metadata_args.py \
-              --cuda "${CUDA_VARIANT}" \
-              --tag-config "${TAG_CONFIG}" \
-              --image-repo "${IMAGE_REPO}" \
-              --sgl-version "${SGL_VERSION}" \
-              --build-commit "${BUILD_COMMIT}" \
-              --build-url "${BUILD_URL}" \
-              > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
-          done
+          python3 scripts/ci/utils/docker_build_metadata_args.py \
+            --cuda cu130 \
+            --tag-config "${TAG_CONFIG}" \
+            --image-repo "${IMAGE_REPO}" \
+            --sgl-version "${SGL_VERSION}" \
+            --build-commit "${BUILD_COMMIT}" \
+            --build-url "${BUILD_URL}" \
+            > /tmp/docker-metadata-cu130.args
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -106,35 +103,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push AMD64 image (CUDA 12)
-        id: build-cu129
-        run: |
-          VERSION_ARG=""
-          if [ -n "${SGL_VERSION}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
-          fi
-          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu129.args
-
-          docker buildx build \
-            --target ${{ inputs.docker_target }} \
-            --platform linux/amd64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=12.9.1 \
-            --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=0 \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            "${METADATA_ARGS[@]}" \
-            ${VERSION_ARG} \
-            ${{ inputs.extra_build_args }} \
-            --metadata-file /tmp/metadata-cu129.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
       - name: Build and push AMD64 image (CUDA 13)
         id: build-cu130
         run: |
@@ -149,9 +117,8 @@ jobs:
             --platform linux/amd64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
@@ -173,7 +140,6 @@ jobs:
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
     outputs:
-      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     steps:
       - name: Delete huge unnecessary tools folder
@@ -192,16 +158,14 @@ jobs:
           set -euo pipefail
           BUILD_COMMIT="$(git rev-parse HEAD)"
           BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          for CUDA_VARIANT in cu129 cu130; do
-            python3 scripts/ci/utils/docker_build_metadata_args.py \
-              --cuda "${CUDA_VARIANT}" \
-              --tag-config "${TAG_CONFIG}" \
-              --image-repo "${IMAGE_REPO}" \
-              --sgl-version "${SGL_VERSION}" \
-              --build-commit "${BUILD_COMMIT}" \
-              --build-url "${BUILD_URL}" \
-              > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
-          done
+          python3 scripts/ci/utils/docker_build_metadata_args.py \
+            --cuda cu130 \
+            --tag-config "${TAG_CONFIG}" \
+            --image-repo "${IMAGE_REPO}" \
+            --sgl-version "${SGL_VERSION}" \
+            --build-commit "${BUILD_COMMIT}" \
+            --build-url "${BUILD_URL}" \
+            > /tmp/docker-metadata-cu130.args
 
       - name: Prune Docker to reclaim disk space
         run: |
@@ -218,35 +182,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ARM64 image (CUDA 12)
-        id: build-cu129
-        run: |
-          VERSION_ARG=""
-          if [ -n "${SGL_VERSION}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
-          fi
-          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu129.args
-
-          docker buildx build \
-            --target ${{ inputs.docker_target }} \
-            --platform linux/arm64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=12.9.1 \
-            --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=1 \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            "${METADATA_ARGS[@]}" \
-            ${VERSION_ARG} \
-            ${{ inputs.extra_build_args }} \
-            --metadata-file /tmp/metadata-cu129.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
       - name: Build and push ARM64 image (CUDA 13)
         id: build-cu130
         run: |
@@ -261,9 +196,8 @@ jobs:
             --platform linux/arm64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
@@ -296,22 +230,13 @@ jobs:
           TAG_CONFIG: ${{ inputs.tag_config }}
           SGL_VERSION: ${{ inputs.sgl_version }}
           IMAGE_REPO: ${{ inputs.image_repo }}
-          X86_CU129: ${{ needs.build-x86.outputs.digest-cu129 }}
           X86_CU130: ${{ needs.build-x86.outputs.digest-cu130 }}
-          ARM64_CU129: ${{ needs.build-arm64.outputs.digest-cu129 }}
           ARM64_CU130: ${{ needs.build-arm64.outputs.digest-cu130 }}
           SHORT_SHA: ${{ github.sha }}
         run: |
           echo "${TAG_CONFIG}" | jq -c '.[]' | while read -r entry; do
-            CUDA=$(echo "${entry}" | jq -r '.cuda')
-
-            if [ "${CUDA}" = "cu129" ]; then
-              X86_DIGEST="${X86_CU129}"
-              ARM64_DIGEST="${ARM64_CU129}"
-            else
-              X86_DIGEST="${X86_CU130}"
-              ARM64_DIGEST="${ARM64_CU130}"
-            fi
+            X86_DIGEST="${X86_CU130}"
+            ARM64_DIGEST="${ARM64_CU130}"
 
             TAG_ARGS=""
             for tag in $(echo "${entry}" | jq -r '.tags[]'); do

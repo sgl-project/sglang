@@ -76,11 +76,11 @@ def rope_pool_fused(
 
     if q_shape != (q_shape[0], num_qo_heads, head_dim):
         raise ValueError(
-            "q shape must be [num_tokens, num_qo_heads, head_dim], " f"got {q.shape}"
+            f"q shape must be [num_tokens, num_qo_heads, head_dim], got {q.shape}"
         )
     if k_shape != (q_shape[0], num_kv_heads, head_dim):
         raise ValueError(
-            "k shape must be [num_tokens, num_kv_heads, head_dim], " f"got {k.shape}"
+            f"k shape must be [num_tokens, num_kv_heads, head_dim], got {k.shape}"
         )
     if v_shape != k_shape:
         raise ValueError(f"v shape must match k shape, got {v.shape} vs {k.shape}")

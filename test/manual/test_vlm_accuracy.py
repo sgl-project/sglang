@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import download_image_with_retry
 
@@ -141,16 +142,18 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         return inputs
 
     def get_sglang_model(self):
+        server_args = ServerArgs(
+            model_path=self.model_path,
+            disable_cuda_graph=True,
+        )
+        publish(server_args, role="scheduler")
         self.model_runner = ModelRunner(
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
             ps=ParallelState.trivial(),
             nccl_port=12435,
-            server_args=ServerArgs(
-                model_path=self.model_path,
-                disable_cuda_graph=True,
-            ),
+            server_args=server_args,
         )
         return self.model_runner.model
 
@@ -209,8 +212,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 # per image
                 if len(pixel_b) != len(tgt_b):
                     raise ValueError(
-                        "Inconsistent N lengths, found: "
-                        f"{len(pixel_b)} vs {len(tgt_b)}"
+                        f"Inconsistent N lengths, found: {len(pixel_b)} vs {len(tgt_b)}"
                     )
                 for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                     pixel_values_flat += [pixel_n]

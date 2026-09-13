@@ -25,7 +25,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 template <
     int NUM_LOGICAL,
@@ -114,4 +114,4 @@ void lp_post(
       static_cast<const int64_t*>(log2phy.data_ptr()));
 }
 
-}  // namespace
+}  // namespace sglang

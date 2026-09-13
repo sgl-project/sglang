@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 struct TrieNode {
@@ -140,3 +142,5 @@ class Trie {
 };
 
 }  // namespace ngram
+
+}  // namespace sglang

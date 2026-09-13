@@ -55,6 +55,9 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     kv_lens_host: Optional[torch.Tensor] = None
     max_q_len: Optional[int] = None
     max_kv_len: Optional[int] = None
+    # Per-row upper bound (capped padded variant); rows never exceed it, so
+    # dense [bs, cap] consumers stay in bounds. None = full-coverage variant.
+    cap: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.verify_lens_cpu is None:
@@ -64,6 +67,11 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         if min(self.verify_lens_cpu) < 1:
             raise ValueError(
                 f"every request must verify the anchor (verify_len >= 1), got "
+                f"{self.verify_lens_cpu}"
+            )
+        if self.cap is not None and max(self.verify_lens_cpu) > self.cap:
+            raise ValueError(
+                f"capped layout has a row exceeding cap={self.cap}: "
                 f"{self.verify_lens_cpu}"
             )
         if self.total_verify_tokens != sum(self.verify_lens_cpu):
@@ -89,6 +97,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         graph_num_tokens: int,
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
+        cap: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -103,6 +112,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             qo_indptr_device=indptr.qo_indptr,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            cap=cap,
         )
 
     @classmethod
@@ -154,7 +164,16 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             device=device,
         )
 
-    def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:
+    def padded_to_bucket(
+        self, *, padded_bs: int, cap: Optional[int] = None
+    ) -> RaggedVerifyLayout:
+        """Pad to the captured slot count. The full-coverage variant (cap=None)
+        keeps sum(verify_lens) == graph_num_tokens, so padding rows (or, with
+        no padding rows, the last real row) can exceed the per-request verify
+        window. Dense-layout consumers (mamba/KDA) must pass cap=N: rows are
+        clamped to N and the layout no longer covers the tier's leftover
+        tokens -- those collapse into the consumer's ghost slot. Real tokens
+        map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
@@ -165,11 +184,14 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             bs=self.bs,
             padded_bs=padded_bs,
         )
+        if cap is not None:
+            padded = torch.clamp(padded, max=cap)
 
         return RaggedVerifyLayout._assemble_device(
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
-            total_verify_tokens=self.graph_num_tokens,
+            total_verify_tokens=None if cap is not None else self.graph_num_tokens,
+            cap=cap,
         )
 
 

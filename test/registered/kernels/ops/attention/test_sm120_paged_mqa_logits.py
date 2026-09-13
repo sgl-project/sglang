@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 # DSv4 indexer cache layout (fixed by deepseek_v4_memory_pool.DeepSeekV4IndexerPool):
@@ -149,9 +149,9 @@ def _compare(
     # Invalid positions in SM120 output must be -inf
     positions = torch.arange(max_seq_len, device=sm120.device)
     invalid = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
-    assert torch.all(
-        torch.isinf(sm120[invalid]) & (sm120[invalid] < 0)
-    ), "SM120 output must fill invalid positions with -inf"
+    assert torch.all(torch.isinf(sm120[invalid]) & (sm120[invalid] < 0)), (
+        "SM120 output must fill invalid positions with -inf"
+    )
 
 
 class TestSM120PagedMqaLogitsTorch(CustomTestCase):

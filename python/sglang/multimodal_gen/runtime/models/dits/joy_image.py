@@ -9,6 +9,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -67,6 +68,16 @@ def fused_add_gate(
         torch.Tensor: residual + x * gate.unsqueeze(1)
     """
     return torch.addcmul(residual, x, gate.unsqueeze(1))
+
+
+def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Complex-valued RoPE table from a hoisted cat([cos, sin], dim=-1)
+    cos_sin_cache tensor, split back in half.
+    """
+    if freqs_cis is None:
+        return None
+    cos, sin = freqs_cis.chunk(2, dim=-1)
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
 
 
 class ModulateWan(nn.Module):
@@ -219,6 +230,8 @@ class MMDoubleStreamBlock(nn.Module):
         vec: torch.Tensor,
         vis_freqs_cis: Optional[torch.Tensor] = None,
         txt_freqs_cis: Optional[torch.Tensor] = None,
+        vis_complex_freqs: Optional[torch.Tensor] = None,
+        txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
@@ -267,6 +280,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.img_attn_k_norm,
             head_dim=img_q.shape[-1],
             cos_sin_cache=vis_freqs_cis,
+            freqs_complex=vis_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -294,6 +308,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.txt_attn_k_norm,
             head_dim=txt_q.shape[-1],
             cos_sin_cache=txt_freqs_cis,
+            freqs_complex=txt_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -348,9 +363,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
 
     _supports_gradient_checkpointing = True
-    _fsdp_shard_conditions = JoyImageDiTConfig()._fsdp_shard_conditions
-    _compile_conditions = JoyImageDiTConfig()._compile_conditions
-    _supported_attention_backends = JoyImageDiTConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_double_blocks]
+    _compile_conditions = [is_blocks_or_double_blocks]
     param_names_mapping = JoyImageDiTConfig().param_names_mapping
     reverse_param_names_mapping = JoyImageDiTConfig().reverse_param_names_mapping
     lora_param_names_mapping = JoyImageDiTConfig().lora_param_names_mapping
@@ -555,6 +569,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         txt_suffix_len = txt.shape[1] if sequence_shard_enabled else 0
 
+        vis_complex_freqs = _joy_complex_freqs(vis_freqs_cis)
+        txt_complex_freqs = _joy_complex_freqs(txt_freqs_cis)
+
         # Pass through DiT blocks
         for block in self.double_blocks:
             img, txt = block(
@@ -563,6 +580,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vec,
                 vis_freqs_cis,
                 txt_freqs_cis,
+                vis_complex_freqs=vis_complex_freqs,
+                txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
             )
 

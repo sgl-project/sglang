@@ -22,12 +22,14 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import jinja2
 import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
+
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,15 @@ def _has_toggle_default_assignment(
 
 REASONING_MODE_RULES = (
     DetectionRule(
+        name="k2_v3_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="always"),
+        predicate=lambda ctx: (
+            ctx.has_text("<ifm|think>")
+            and ctx.has_text("<ifm|think_fast>")
+            and ctx.has_text("reasoning_effort")
+        ),
+    ),
+    DetectionRule(
         name="gpt_oss_channel_markers",
         value=ReasoningToggleConfig(special_case="always"),
         predicate=lambda ctx: ctx.has_text("<|channel|>"),
@@ -151,27 +162,41 @@ REASONING_MODE_RULES = (
     DetectionRule(
         name="force_reasoning_pattern",
         value=ReasoningToggleConfig(special_case="always"),
-        predicate=lambda ctx: ctx.has_pattern(r"<\|im_start\|>assistant\\n<think>\\n")
-        and not ctx.has_text("enable_thinking")
-        and not ctx.has_text("thinking"),
+        predicate=lambda ctx: (
+            ctx.has_pattern(r"<\|im_start\|>assistant\\n<think>\\n")
+            and not ctx.has_text("enable_thinking")
+            and not ctx.has_text("thinking")
+        ),
     ),
     DetectionRule(
         name="mistral_reasoning_effort",
         value=ReasoningToggleConfig(special_case="mistral"),
-        predicate=lambda ctx: ctx.has_text("reasoning_effort")
-        and ctx.has_text("[THINK]"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort") and ctx.has_text("[THINK]")
+        ),
+    ),
+    DetectionRule(
+        name="hunyuan_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="hunyuan_effort"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("reasoning_mode_token")
+            and ctx.has_text("no_think")
+        ),
     ),
     DetectionRule(
         name="explicit_enable_thinking_default_false",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=False
         ),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
-            re.DOTALL,
-        )
-        or _has_toggle_default_assignment(ctx, "enable_thinking", False),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
+                re.DOTALL,
+            )
+            or _has_toggle_default_assignment(ctx, "enable_thinking", False)
+        ),
     ),
     DetectionRule(
         name="nemotron_3_super_low_effort",
@@ -180,58 +205,65 @@ REASONING_MODE_RULES = (
             default_enabled=True,
             effort_kwarg="low_effort",
         ),
-        predicate=lambda ctx: ctx.has_text("low_effort")
-        and ctx.has_text("truncate_history_thinking"),
+        predicate=lambda ctx: (
+            ctx.has_text("low_effort") and ctx.has_text("truncate_history_thinking")
+        ),
     ),
     DetectionRule(
         name="enable_thinking_default_true",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=True
         ),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+enable_thinking\s*=\s*(?:true|True)\s*%}",
-            re.DOTALL,
-        )
-        or ctx.has_pattern(
-            r"set\s+enable_thinking\s*=\s*enable_thinking\s+if\s+enable_thinking\s+is\s+defined\s+else\s+(?:true|True)"
-        )
-        or ctx.has_pattern(
-            r"enable_thinking\s+is\s+defined\s+and\s+(?:enable_thinking\s+is\s+false|not\s+enable_thinking)"
-        )
-        or ctx.has_pattern(
-            r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
-        )
-        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
-        or _has_toggle_default_assignment(ctx, "enable_thinking", True),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+enable_thinking\s*=\s*(?:true|True)\s*%}",
+                re.DOTALL,
+            )
+            or ctx.has_pattern(
+                r"set\s+enable_thinking\s*=\s*enable_thinking\s+if\s+enable_thinking\s+is\s+defined\s+else\s+(?:true|True)"
+            )
+            or ctx.has_pattern(
+                r"enable_thinking\s+is\s+defined\s+and\s+(?:enable_thinking\s+is\s+false|not\s+enable_thinking)"
+            )
+            or ctx.has_pattern(
+                r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
+            )
+            or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
+            or _has_toggle_default_assignment(ctx, "enable_thinking", True)
+        ),
     ),
     DetectionRule(
         name="explicit_thinking_default_false",
         value=ReasoningToggleConfig(toggle_param="thinking", default_enabled=False),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
-            re.DOTALL,
-        )
-        or _has_toggle_default_assignment(ctx, "thinking", False),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
+                re.DOTALL,
+            )
+            or _has_toggle_default_assignment(ctx, "thinking", False)
+        ),
     ),
     DetectionRule(
         name="thinking_default_true",
         value=ReasoningToggleConfig(toggle_param="thinking", default_enabled=True),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+thinking\s*=\s*(?:true|True)\s*%}",
-            re.DOTALL,
-        )
-        or ctx.has_pattern(
-            r"set\s+thinking\s*=\s*thinking\s+if\s+thinking\s+is\s+defined\s+else\s+(?:true|True)"
-        )
-        or ctx.has_pattern(
-            r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
-        )
-        or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
-        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
-        or _has_toggle_default_assignment(ctx, "thinking", True),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+thinking\s*=\s*(?:true|True)\s*%}",
+                re.DOTALL,
+            )
+            or ctx.has_pattern(
+                r"set\s+thinking\s*=\s*thinking\s+if\s+thinking\s+is\s+defined\s+else\s+(?:true|True)"
+            )
+            or ctx.has_pattern(
+                r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
+            )
+            or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
+            or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
+            or _has_toggle_default_assignment(ctx, "thinking", True)
+        ),
     ),
 )
 
@@ -274,6 +306,26 @@ def _is_kimi_k2(ctx):
     return ctx.has_vocab("<|tool_calls_section_begin|>")
 
 
+def _is_k2_v3(ctx):
+    return (
+        ctx.has_text("<ifm|think>")
+        and ctx.has_text("<ifm|tool_calls>")
+        and ctx.has_text("<ifm|tool_call>")
+    )
+
+
+def _is_granite_thinking_parser(ctx):
+    # Nemotron-3 templates share the same <parameter= tool-call block, so it
+    # cannot discriminate; defer_loading is Granite's deferred tool loading.
+    return (
+        ctx.has_text("truncate_history_thinking")
+        and ctx.has_text("defer_loading")
+        and ctx.reasoning_config is not None
+        and ctx.reasoning_config.toggle_param == "enable_thinking"
+        and ctx.reasoning_config.default_enabled is True
+    )
+
+
 def _is_nemotron_3(ctx):
     return ctx.has_text("truncate_history_thinking") and (
         ctx.reasoning_config is not None
@@ -296,9 +348,26 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm53(ctx):
+    # GLM-5.3 keeps the GLM-4.5 prompt and tool-call format but replaces the
+    # enable_thinking toggle with an always-on "Reasoning Effort:" header.
+    return (
+        ctx.has_text("[gMASK]<sop>")
+        and ctx.has_text("Reasoning Effort:")
+        and not ctx.has_text("enable_thinking")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
+def _is_glm_family(ctx):
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
-    return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    return _is_glm_family(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
@@ -333,8 +402,16 @@ def _is_hunyuan(ctx):
     sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
         r"^<tool_sep(?::[^>]+)?>$"
     )
-    return (tc and sep) or (
-        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    return (
+        (tc and sep)
+        or (
+            tc
+            and ctx.reasoning_config
+            == ReasoningToggleConfig(special_case="hunyuan_effort")
+            and ctx.has_vocab_pattern(r"^<arg_key(?::[^>]+)?>$")
+            and ctx.has_vocab_pattern(r"^<arg_value(?::[^>]+)?>$")
+        )
+        or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
     )
 
 
@@ -429,6 +506,7 @@ def _is_deepseek_r1_think_tags(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
@@ -436,8 +514,13 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+    DetectionRule(
+        name="granite_thinking_parser",
+        value="granite_thinking_parser",
+        predicate=_is_granite_thinking_parser,
+    ),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
@@ -463,6 +546,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
@@ -476,7 +560,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
@@ -625,26 +709,21 @@ def detect_inline_system_support(chat_template: Optional[str]) -> bool:
         return False
 
 
-def _resolve_auto_parser(
-    server_args,
+def _detect_auto_parser(
     attr: str,
     ctx: TemplateDetectionContext,
     rules: Tuple[DetectionRule, ...],
     label: str,
-) -> None:
-    """Resolve a single auto parser, updating server_args in place."""
+) -> Optional[str]:
+    """The parser one auto field resolves to (``None`` disables it)."""
     detected = match_rules(ctx, rules, label)
     if detected:
-        server_args.override(source="template-detection", **{attr: detected})
         logger.info(
             f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
         )
-    else:
-        logger.warning(
-            f"--{attr.replace('_', '-')}=auto specified but could not detect "
-            f"{label} from chat template. Disabling {label}."
-        )
-        server_args.override(source="template-detection", **{attr: None})
+        return detected
+    _log_undetected_parser(attr, label)
+    return None
 
 
 def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
@@ -658,60 +737,73 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
-def _disable_auto_parser(server_args, attr: str, label: str) -> None:
+def _log_undetected_parser(attr: str, label: str) -> None:
     logger.warning(
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
-    server_args.override(source="template-detection", **{attr: None})
 
 
-def _resolve_architecture_auto_parsers(server_args) -> None:
+def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
+    """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.utils.hf_transformers_utils import get_config
 
+    cfg = resolving_view(server_args)
     config = get_config(
-        server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=getattr(server_args, "revision", None),
-        model_config_parser=getattr(server_args, "model_config_parser", "auto"),
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=getattr(cfg, "revision", None),
+        model_config_parser=getattr(cfg, "model_config_parser", "auto"),
     )
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
+    model_type = getattr(config, "model_type", "")
 
-    if "DeepseekV4" in arch:
+    if "KimiK3" in arch or model_type == "kimi_k3":
+        reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
     else:
-        return
+        return {}
 
+    resolved = {}
     for attr, detected in (
         ("reasoning_parser", reasoning_parser),
         ("tool_call_parser", tool_call_parser),
     ):
-        if getattr(server_args, attr) == "auto":
-            server_args.override(source="template-detection", **{attr: detected})
+        if attr in needs:
+            resolved[attr] = detected
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
                 f"from model architecture '{arch}'"
             )
+    return resolved
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve --reasoning-parser=auto and --tool-call-parser=auto before scheduler.
+    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
+    chat template, before anything publishes ``server_args``.
 
-    This performs a lightweight tokenizer load to detect parsers from the chat
-    template. Called early in engine init before scheduler subprocesses are spawned.
+    Performs a lightweight tokenizer load, so it runs once in engine init. The
+    decision goes to this instance's declaration stash, so every holder of it
+    carries it -- the schedulers it forks, the HTTP server, the tokenizer
+    workers it is serialized for -- and each publishes bags projected from it.
+    The fields stay what the operator passed.
     """
-    needs_reasoning = server_args.reasoning_parser == "auto"
-    needs_tool_call = server_args.tool_call_parser == "auto"
-
-    if not needs_reasoning and not needs_tool_call:
+    cfg = resolving_view(server_args)
+    needs = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(cfg, attr) == "auto"
+    )
+    if not needs:
         return
 
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    chat_template_arg = getattr(server_args, "chat_template", None)
+    chat_template_arg = getattr(cfg, "chat_template", None)
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
     except Exception as e:
@@ -724,8 +816,8 @@ def resolve_auto_parsers(server_args) -> None:
     tokenizer = None
     try:
         tokenizer = get_tokenizer(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
@@ -738,6 +830,8 @@ def resolve_auto_parsers(server_args) -> None:
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
+
+    detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
@@ -747,38 +841,26 @@ def resolve_auto_parsers(server_args) -> None:
             )
         else:
             try:
-                _resolve_architecture_auto_parsers(server_args)
+                detected.update(_architecture_auto_parsers(server_args, needs))
             except Exception as e:
                 logger.warning(
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
-        if needs_reasoning:
-            if server_args.reasoning_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "reasoning_parser", "reasoning parser"
-                )
-        if needs_tool_call:
-            if server_args.tool_call_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "tool_call_parser", "tool-call parser"
-                )
-        return
+        for attr, label in (
+            ("reasoning_parser", "reasoning parser"),
+            ("tool_call_parser", "tool-call parser"),
+        ):
+            if attr in needs and attr not in detected:
+                _log_undetected_parser(attr, label)
+                detected[attr] = None
+    else:
+        for attr, rules, label in (
+            ("reasoning_parser", REASONING_PARSER_RULES, "reasoning parser"),
+            ("tool_call_parser", TOOL_CALL_PARSER_RULES, "tool-call parser"),
+        ):
+            if attr in needs:
+                detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
-    if needs_reasoning:
-        _resolve_auto_parser(
-            server_args,
-            "reasoning_parser",
-            ctx,
-            REASONING_PARSER_RULES,
-            "reasoning parser",
-        )
-
-    if needs_tool_call:
-        _resolve_auto_parser(
-            server_args,
-            "tool_call_parser",
-            ctx,
-            TOOL_CALL_PARSER_RULES,
-            "tool-call parser",
-        )
+    if detected:
+        declare_resolution(server_args, "template-detection", **detected)

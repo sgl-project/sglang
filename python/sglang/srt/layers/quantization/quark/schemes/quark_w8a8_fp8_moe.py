@@ -35,7 +35,6 @@ if _use_aiter:
 
 
 class QuarkW8A8FP8MoE(QuarkMoEScheme):
-
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.is_static_input_scheme: bool = False
         self.input_qscheme = None
@@ -135,9 +134,9 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
 
         # INPUT_SCALES
         if self.is_static_input_scheme:
-            assert (
-                self.input_qscheme == "per_tensor"
-            ), "Only per-tensor quantization is supported for static input scales"
+            assert self.input_qscheme == "per_tensor", (
+                "Only per-tensor quantization is supported for static input scales"
+            )
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )

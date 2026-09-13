@@ -14,7 +14,6 @@ logger = init_logger(__name__)
 
 
 class RaiseNotImplementedAction(argparse.Action):
-
     def __call__(self, parser, namespace, values, option_string=None):
         raise NotImplementedError(f"The {option_string} option is not yet implemented")
 

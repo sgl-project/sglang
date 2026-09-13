@@ -31,7 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
 
 
@@ -290,6 +290,8 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("experts", prefix),
             routing_method_type=routing_method_type,
+            # The decoder reads this buffer on another stream, so in-place races it.
+            inplace=False,
         )
 
         num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -310,13 +312,10 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         )
         assert self.shared_expert_combination_strategy in ("average", "sum")
 
-        # Auxiliary CUDA stream so shared_experts can overlap with the
-        # gate + routed-experts path inside a captured CUDA graph. Only used
-        # during capture/replay; outside capture the sync overhead outweighs it.
+        # Leased by role, not per layer. A stream per layer gives the caching
+        # allocator a segregated pool each, and prefill graph capture then OOMs.
         self.alt_stream = (
-            torch.cuda.Stream()
-            if is_cuda() and self.shared_experts is not None
-            else None
+            get_stream("alt") if is_cuda() and self.shared_experts is not None else None
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -329,9 +328,7 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
             return final_hidden_states.view(orig_shape)
 
-        # FusedMoE.experts can write back into its input buffer (observed for
-        # the unquantized triton BF16 path). Snapshot the post-norm input so
-        # the shared-expert branch sees the original layernorm output.
+        # Unnecessary now that experts is inplace=False, but sharing measured slower.
         shared_input = hidden_states.clone()
 
         if self.alt_stream is not None and get_is_capture_mode():
@@ -405,6 +402,10 @@ class Cohere2MoeDecoderLayer(nn.Module):
         self.input_layernorm = Cohere2MoeLayerNorm(config.hidden_size, eps=norm_eps)
         self.tp_size = get_parallel().tp_size
 
+        # The parallel block makes attn(norm(x)) and mlp(norm(x)) independent, so
+        # the two chains are safe to run concurrently on a second side stream.
+        self.mlp_stream = get_stream("alt_mlp") if is_cuda() else None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -416,12 +417,31 @@ class Cohere2MoeDecoderLayer(nn.Module):
         # sum-then-allreduce, halving per-layer all-reduces.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        mlp_out = self.mlp(hidden_states)
+        if (
+            self.mlp_stream is not None
+            and get_is_capture_mode()
+            and forward_batch.forward_mode.is_decode()
+        ):
+            # Decode only. A prefill chunk already saturates the GPU, so there the
+            # split buys nothing and costs event overhead.
+            current_stream = torch.cuda.current_stream()
+            self.mlp_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.mlp_stream):
+                mlp_out = self.mlp(hidden_states)
+            attn_out = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            # Neither tensor needs record_stream, both stay referenced until here.
+            current_stream.wait_stream(self.mlp_stream)
+        else:
+            attn_out = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            mlp_out = self.mlp(hidden_states)
         combined = attn_out + mlp_out
         if self.tp_size > 1:
             combined = tensor_model_parallel_all_reduce(combined)

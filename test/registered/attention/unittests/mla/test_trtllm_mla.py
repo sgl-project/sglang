@@ -1,18 +1,13 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 # trtllm_mla goes through FlashInfer's XQA MLA path. Per PLAN.md and the
 # project's is_sm120_supported helper (device_capability_majors=[12]), the
@@ -47,8 +42,8 @@ _SUPPORTED, _SKIP_REASON = _supported()
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not _SUPPORTED, _SKIP_REASON)

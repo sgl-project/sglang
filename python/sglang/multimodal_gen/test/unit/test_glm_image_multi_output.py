@@ -30,7 +30,7 @@ class _RecordingGlmImageAR(GlmImageAR):
     def generate_prior_tokens(self, **kwargs):
         self.initial_seeds.append(torch.initial_seed())
         output_idx = len(self.initial_seeds)
-        return torch.full((1, 4), output_idx, dtype=torch.long), None
+        return torch.full((1, 4), output_idx, dtype=torch.long), None, None
 
 
 class _DummySchedulerConfig(dict):
@@ -50,6 +50,7 @@ class _DummyScheduler:
 
 class _RecordingBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
     def __init__(self):
+        self.text_encoder = None
         self.transformer = SimpleNamespace(
             config=SimpleNamespace(
                 in_channels=4,
@@ -105,10 +106,13 @@ def test_ar_stage_generates_one_prior_per_requested_output():
         image_path=None,
         num_outputs_per_prompt=2,
         seed=11,
+        extra={},
     )
 
     with patch.object(
-        glm_stage, "get_local_torch_device", return_value=torch.device("cpu")
+        glm_stage.current_platform,
+        "get_local_torch_device",
+        return_value=torch.device("cpu"),
     ):
         result = stage.forward(batch, SimpleNamespace())
 
@@ -133,7 +137,9 @@ def test_before_denoising_expands_latents_and_conditions_for_requested_outputs()
     )
 
     with patch.object(
-        glm_stage, "get_local_torch_device", return_value=torch.device("cpu")
+        glm_stage.current_platform,
+        "get_local_torch_device",
+        return_value=torch.device("cpu"),
     ):
         result = stage.forward(batch, SimpleNamespace())
 

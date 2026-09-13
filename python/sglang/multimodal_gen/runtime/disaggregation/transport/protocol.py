@@ -6,11 +6,8 @@ in frame[0] and JSON payload in frame[1].
 """
 
 import json
-import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 TRANSFER_MAGIC = b"__transfer__"
 
@@ -37,14 +34,11 @@ class TransferStagedMsg:
     msg_type: str = TransferMsgType.STAGED
     request_id: str = ""
     data_size: int = 0
-    manifest: dict = None
+    manifest: dict = field(default_factory=dict)
     session_id: str = ""
     pool_ptr: int = 0
     slot_offset: int = 0
-
-    def __post_init__(self):
-        if self.manifest is None:
-            self.manifest = {}
+    scalar_fields: dict = field(default_factory=dict)
 
 
 @dataclass

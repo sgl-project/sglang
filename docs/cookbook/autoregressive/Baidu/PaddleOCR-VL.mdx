@@ -1,0 +1,318 @@
+---
+title: PaddleOCR-VL
+description: "Deploy PaddleOCR-VL 1.6 / 1.5 / 0.9B with SGLang — Baidu's 0.9B NaViT + ERNIE-4.5 document-parsing VLM for OCR, tables, formulas and charts in 109 languages, on a single H100, H200 or B200."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick a release and your hardware to generate the launch command. The model is 0.9B and single-GPU, so there is one serving recipe per platform; the axis that actually moves cost is **Page Resolution**, which caps how many image tokens one page is worth.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/PaddlePaddle/paddleocr-vl.jsx";
+
+<Deployment config={config} />
+
+## Playground
+
+Use the Playground to layer tensor parallelism on top of the selected deployment cell. At this size TP is a latency knob, not a capacity one — the weights fit on one GPU.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**PaddleOCR-VL** is Baidu's compact document-parsing vision-language model: a NaViT-style dynamic-resolution SigLIP vision encoder feeding an **ERNIE-4.5-0.3B** language backbone, 0.9B parameters in total, released under **Apache 2.0**. It recognizes text, tables, formulas, charts and seals across **109 languages**, and is small enough that a single GPU serves it comfortably.
+
+SGLang serves **this model**, which is the recognition stage of PaddleOCR's document-parsing pipeline — not the pipeline itself. Layout and region detection, cropping, reading order and the assembly of markdown or JSON stay in PaddleOCR, which calls a model endpoint once per region. That split is why the model is prompt-conditioned rather than instruction-following: the caller decides whether a crop is a table, a formula or a chart (§3.1), and SGLang is the backend that answers.
+
+All three releases share an identical `config.json` (same `PaddleOCRVLForConditionalGeneration` architecture, same tower and backbone dimensions), so one SGLang recipe serves every variant and only the model path changes.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Variant</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Total params</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6">PaddleOCR-VL-1.6</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>0.9B</td>
+      <td style={{padding: "9px 12px"}}>Latest. Best tables, Chinese characters and seals; drop-in for 1.5.</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5">PaddleOCR-VL-1.5</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>0.9B</td>
+      <td style={{padding: "9px 12px"}}>Previous generation; pin it if you have calibrated against its output.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/PaddlePaddle/PaddleOCR-VL">PaddleOCR-VL</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>0.9B</td>
+      <td style={{padding: "9px 12px"}}>The original 0.9B release.</td>
+    </tr>
+  </tbody>
+</table>
+
+**Recommended generation:** greedy decoding (`temperature=0`) with a per-page `max_tokens` budget — the model card uses 512 for a single region and the reference server allows more for a full page. These are informational; do not hardcode them in library code.
+
+**Resources:** [Hugging Face](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6) · [PaddleOCR on GitHub](https://github.com/PaddlePaddle/PaddleOCR)
+
+## 2. Configuration Tips
+
+- **Page resolution is the main cost knob.** The vision tower and the prefill both scale with the patch count of a page. `max_pixels` is expressed in 28x28 units (patch size 14 with a 2x2 merge), so `max_pixels / 784` is the image-token budget per page. The checkpoint's own default is 1280 tokens; the **Page Resolution** selector in the Deploy panel emits the corresponding `--mm-process-config` value. Lower it for clean born-digital PDFs, raise it for dense scans and small print.
+- **Prompt selects the task.** PaddleOCR-VL is prompt-conditioned rather than instruction-following — use the exact task strings in §3.1. A free-form question will not behave like a chat model.
+- **Leave `--trust-remote-code` off.** The checkpoints ship their own `configuration_paddleocr_vl.py` / `processing_paddleocr_vl.py`, but `transformers` 5.12 supports `paddleocr_vl` natively — and the bundled remote image processor is the slower of the two implementations (measured 87.4 ms vs 39.1 ms per 1080p page). Passing the flag pins SGLang to the remote copy. Serving without it produced byte-identical OCR output on every page we checked and about 5% more requests per second at 32-way concurrency.
+- **Preprocessing is parallelized for you.** A full-resolution page costs tens of milliseconds of CPU to resize, normalize and patchify, which caps throughput long before the GPU saturates, so this model runs the image processor across several workers by default. `--mm-processor-worker-num` overrides the count; raising it past the default did not help in our measurements.
+- **Keep the radix cache on for repeated pages.** Unlike whole-document batch OCR over unique scans, a workload that re-asks about the same page (different task prompts on one image) reuses the image prefix. Add `--disable-radix-cache` only if every request carries a different page.
+- **The saturated-throughput flags earn their place.** A page is ~2700 tokens, so the default 8192-token prefill budget packs only three of them into a forward. Raising it to 16384 and letting decode ride along in the same batch (`--enable-mixed-chunk`, `--num-continuous-decode-steps 2`) measured +11% requests per second at 32-way concurrency and cut queued TTFT by 23%, with single-stream latency unchanged. Measured on an H200; on a smaller card lower `--chunked-prefill-size` until it fits.
+- **Prefill CUDA graph is on for this model.** SGLang normally switches the breakable prefill graph off for every multimodal architecture; PaddleOCR-VL is allowlisted back in, which is worth 16.1 ms → 11.5 ms of single-stream TTFT on text-only prompts. Image-carrying batches are rejected at graph replay and run eager, so this helps mixed and text traffic, not pure page parsing. No flag needed.
+- **Tensor parallelism is optional.** The weights are under 2 GB in BF16; TP>1 only shortens the vision-encoder and prefill critical path, at the cost of a collective per layer. Measure before adopting it.
+- **Context length.** The backbone advertises 131072 positions, but a parsed page rarely needs more than a few thousand tokens. The recipe pins `--context-length 16384` so the KV pool stays small and concurrency stays high; raise it only if you batch many pages into one request.
+
+### Measured on one H200
+
+One 1080p page (~2700 image tokens) in, 128 tokens out, prefix cache disabled, median TTFT:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Configuration</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>TTFT, 1 stream</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>req/s at 32 concurrent</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>With <code>--trust-remote-code</code> (remote image processor)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>219 ms</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>10.9</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}>Recipe above (native image processor)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}><strong>114 ms</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}><strong>11.3</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+Throughput at saturation is bound by the vision tower, which runs full attention over
+every patch of the page — so the **Page Resolution** selector is the lever that moves it,
+not tensor parallelism.
+
+## 3. Advanced Usage
+
+### 3.1 Task prompts
+
+PaddleOCR-VL exposes its capabilities through a small set of fixed prompts. Send the prompt as the text part and the page as the image part of the same user turn.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Prompt</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Task</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>OCR:</code></td>
+      <td style={{padding: "9px 12px"}}>Plain text recognition.</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><code>Table Recognition:</code></td>
+      <td style={{padding: "9px 12px"}}>Table structure and cell contents.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>Formula Recognition:</code></td>
+      <td style={{padding: "9px 12px"}}>Mathematical expressions.</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><code>Chart Recognition:</code></td>
+      <td style={{padding: "9px 12px"}}>Chart contents.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>Spotting:</code></td>
+      <td style={{padding: "9px 12px"}}>Text with locations. Benefits from the high-detail resolution setting.</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><code>Seal Recognition:</code></td>
+      <td style={{padding: "9px 12px"}}>Seals and stamps (1.6).</td>
+    </tr>
+  </tbody>
+</table>
+
+Structured tasks answer in the model's own markup, not HTML: `Table Recognition:` returns OTSL-style cell tokens (`<fcel>` per cell, `<nl>` per row), so a caller that wants HTML or markdown converts them itself.
+
+<Accordion title="Table Recognition Output">
+
+```text Output
+<fcel>Methods<fcel>R<fcel>P<fcel>F<fcel>FPS<nl><fcel>SegLink [26]<fcel>70.0<fcel>86.0<fcel>77.0<fcel>8.9<nl><fcel>PixelLink [4]<fcel>73.2<fcel>83.0<fcel>77.8<fcel>-<nl><fcel>TextSnake [18]<fcel>73.9<fcel>83.2<fcel>78.3<fcel>1.1<nl>
+... (one <fcel> per cell, one <nl> per row, to the end of the table)
+```
+
+</Accordion>
+
+<Accordion title="OCR Request (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="PaddlePaddle/PaddleOCR-VL-1.6",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OCR:"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/release/2.9/doc/imgs_en/img_12.jpg"
+                    },
+                },
+            ],
+        }
+    ],
+    max_tokens=2048,
+)
+
+print(response.choices[0].message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+ACKNOWLEDGEMENTS
+We would like to thank all the designers and contributors who have been involved in the
+production of this book; their contributions have been indispensable to its creation. We would
+also like to express our gratitude to all the producers for their invaluable opinions and
+assistance throughout this project. And to the many others whose names are not credited but
+have made specific input in this book, we thank you for your continuous support.
+```
+
+</Accordion>
+
+### 3.2 Parsing a multi-page document
+
+The model parses one page per request. Render each page to an image, then fan the pages out concurrently — SGLang batches the vision encoders of in-flight requests into a single forward, so concurrency is what keeps the GPU busy on a model this small.
+
+<Accordion title="Concurrent Page Parsing (Python)">
+
+```python Example
+import base64
+from concurrent.futures import ThreadPoolExecutor
+
+import pymupdf
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+
+def render(page, dpi=200):
+    pixmap = page.get_pixmap(dpi=dpi)
+    return base64.b64encode(pixmap.tobytes("png")).decode("ascii")
+
+
+def parse(page_png_b64):
+    response = client.chat.completions.create(
+        model="PaddlePaddle/PaddleOCR-VL-1.6",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "OCR:"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{page_png_b64}"
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=2048,
+    )
+    return response.choices[0].message.content
+
+
+document = pymupdf.open("your_document.pdf")
+pages = [render(page) for page in document]
+
+with ThreadPoolExecutor(max_workers=16) as pool:
+    for index, text in enumerate(pool.map(parse, pages)):
+        print(f"--- page {index + 1} ---")
+        print(text)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+--- page 1 ---
+(a) Total-Text
+(b) Total-Text
+(c) CTW1500
+(d) CTW1500
+
+Figure 8. Visual experimental results. The blue contours are boundary proposals, and the
+green contours are final detection boundaries.
+Table 6. Experimental results on CTW-1500.
+Methods
+Ext
+R
+P
+F
+FPS
+TextSnake [18]
+Syn
+85.3
+67.9
+75.6
+-
+... (page continues)
+--- page 2 ---
+... (one block per page, in page order)
+```
+
+</Accordion>

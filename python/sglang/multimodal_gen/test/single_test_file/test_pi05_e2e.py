@@ -58,7 +58,7 @@ def _action_request_kwargs(tag: str) -> dict:
         "state": np.linspace(
             -0.5,
             0.5,
-            _env_int("SGLANG_PI05_E2E_STATE_DIM", 32),
+            _env_int("SGLANG_PI05_E2E_STATE_DIM", 14),
             dtype=np.float32,
         ),
         "noise": rng.standard_normal((action_horizon, action_dim)).astype(np.float32),
@@ -77,7 +77,7 @@ def pi05_generator():
     kwargs = {
         "model_path": _MODEL_PATH,
         "num_gpus": num_gpus,
-        "warmup": False,
+        "warmup_mode": "off",
         "trust_remote_code": False,
     }
     if num_gpus > 1:
@@ -138,9 +138,9 @@ def test_pi05_python_action_e2e(pi05_generator):
     _assert_action_output(output)
 
 
-def test_pi05_python_action_consistency(pi05_generator):
-    first = pi05_generator.generate_action(_action_request_kwargs("consistency"))
-    second = pi05_generator.generate_action(_action_request_kwargs("consistency"))
+def test_pi05_python_action_repeatability_and_cache(pi05_generator):
+    first = pi05_generator.generate_action(_action_request_kwargs("repeatability"))
+    second = pi05_generator.generate_action(_action_request_kwargs("repeatability"))
     _assert_action_output(first, expect_cache_hit=False)
     _assert_action_output(second, expect_cache_hit=True)
 

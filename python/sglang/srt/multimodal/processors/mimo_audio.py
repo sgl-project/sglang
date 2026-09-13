@@ -169,9 +169,9 @@ class MiMoAudioPipeline:
         Output: (mel-spectrogram tensor [T, n_mels], audio_token_len int).
         """
         self._ensure_audio_dependencies()
-        assert isinstance(
-            audio, (str, bytes, tuple)
-        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        assert isinstance(audio, (str, bytes, tuple)), (
+            f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        )
         if isinstance(audio, tuple):
             waveform, original_sr = audio
         else:
@@ -186,18 +186,14 @@ class MiMoAudioPipeline:
                     dl_start = time.perf_counter()
                     timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                     try:
-                        with common.get_mm_http_session().get(
-                            audio, stream=True, timeout=timeout
-                        ) as response:
-                            response.raise_for_status()
-                            dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
-                            if dl_elapsed_ms > 1000.0:
-                                content_len = len(response.content)
-                                logger.warning(
-                                    f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
-                                    f"size={content_len / 1024:.1f}KB, url={audio}"
-                                )
-                            file = io.BytesIO(response.content)
+                        content = common.download_remote_media(audio, timeout=timeout)
+                        dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
+                        if dl_elapsed_ms > 1000.0:
+                            logger.warning(
+                                f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
+                                f"size={len(content) / 1024:.1f}KB, url={audio}"
+                            )
+                        file = io.BytesIO(content)
                     except Exception as e:
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         logger.error(
@@ -260,9 +256,9 @@ class MiMoAudioPipeline:
         if isinstance(audio, (str, bytes, tuple)):
             return self.preprocess_audio(audio)
 
-        assert (
-            audio.shape[1] >= self.audio_channels
-        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        assert audio.shape[1] >= self.audio_channels, (
+            f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        )
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels].to(torch.long)
         padded_T = (

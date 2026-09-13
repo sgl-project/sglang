@@ -14,6 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
@@ -22,6 +23,7 @@ from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
@@ -33,20 +35,11 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.runtime_context import get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
-    {
-        "GptOssForCausalLM",
-        "MiMoV2FlashForCausalLM",
-        "MiMoV2ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "DeepseekV3ForCausalLM",
-    }
-)
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
@@ -59,7 +52,7 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
 
     return (
         not model_runner.is_draft_worker
-        and model_runner.server_args.enable_dsa_cache_layer_split
+        and get_parallel().enable_dsa_cache_layer_split
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )
@@ -125,17 +118,8 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-def enable_cp_v2() -> bool:
-    """Return whether the CP-v2 path is enabled for this process."""
-    from sglang.srt.environ import envs
-
-    return bool(envs.SGLANG_ENABLE_CP_V2.get())
-
-
-def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
-    if not enable_cp_v2():
-        return False
+def is_cp_active(forward_batch) -> bool:
+    """Return whether the current forward batch is running through CP."""
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -151,9 +135,19 @@ def is_cp_v2_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
+def is_mla_cp_enabled() -> bool:
+    """Return whether prefill CP is configured for an MLA attention backend."""
+    return is_cp_enabled() and uses_mla_backend()
+
+
+def is_mla_cp_active(forward_batch) -> bool:
+    """Return whether this MLA forward batch is using prefill CP."""
+    return is_mla_cp_enabled() and is_cp_active(forward_batch)
+
+
 def prepare_cp_forward(forward_batch) -> None:
-    """Build CP-v2 metadata for an active context-parallel prefill batch."""
-    assert is_cp_v2_active(forward_batch)
+    """Build CP metadata for an active context-parallel prefill batch."""
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
 
@@ -176,9 +170,7 @@ def prepare_cp_forward(forward_batch) -> None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
-            forward_batch.attn_cp_metadata.per_rank_actual_token[
-                get_parallel().attn_cp_rank
-            ]
+            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
         )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
@@ -190,35 +182,125 @@ def cp_split_before_forward(
     complete_position_ids: Any,
     forward_batch,
 ) -> Tuple[Optional[Any], Optional[Any]]:
-    """Shard embeddings and positions for CP-v2 model-runner forwarding."""
-    assert is_cp_v2_active(forward_batch)
+    """Shard embeddings and positions for CP model-runner forwarding."""
+    assert is_cp_active(forward_batch)
+    assert complete_hidden_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch),
+        cp_shard_position_ids(complete_position_ids, forward_batch),
+    )
+
+
+def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
-    return (
-        strategy.shard_hidden_states(complete_hidden_states, forward_batch),
-        strategy.shard_position_ids(complete_position_ids, forward_batch),
-    )
+    return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
+
+
+def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert complete_position_ids is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.shard_position_ids(complete_position_ids, forward_batch)
+
+
+def cp_interleave_input_ids(input_ids: Any, forward_batch):
+    assert is_cp_active(forward_batch)
+    if not get_moe_a2a_backend().is_none():
+        return cp_shard_hidden_states(input_ids, forward_batch)
+
+    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    padded_input_ids = input_ids.new_zeros(physical_tokens)
+    padded_input_ids[: input_ids.shape[0]] = input_ids
+    return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
-    """Gather CP-v2 hidden states at the model boundary when this batch is active."""
-    assert is_cp_v2_active(forward_batch)
+    """Gather CP hidden states at the model boundary when this batch is active."""
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
 
     if isinstance(x, tuple):
-        hidden_states, *rest = x
-        hidden_states = strategy.gather_hidden_states(
-            hidden_states, forward_batch, stream
+        gathered = tuple(
+            (
+                strategy.gather_hidden_states(item, forward_batch, stream)
+                if item is not None
+                else None
+            )
+            for item in x
         )
         # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
-        if len(rest) == 1 and rest[0] is None:
-            return hidden_states
-        return (hidden_states, *rest)
+        if len(gathered) == 2 and gathered[1] is None:
+            return gathered[0]
+        return gathered
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
+
+
+def cp_materialize_global_token_order(
+    x: Any, forward_batch, stream: Optional[Any] = None
+):
+    """Materialize a CP tensor in the global logical token order."""
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return strategy.gather_kv_cache(x, forward_batch, stream)
+
+
+@contextmanager
+def cp_shard_model_inputs(
+    complete_hidden_states: Any,
+    complete_position_ids: Any,
+    forward_batch,
+    complete_input_ids: Optional[Any] = None,
+):
+    """Restore the shared batch so logits processing keeps full-batch metadata."""
+    assert is_cp_active(forward_batch)
+    sharded_hidden_states = cp_shard_hidden_states(
+        complete_hidden_states, forward_batch
+    )
+    sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+    model_input_ids = (
+        cp_shard_hidden_states(complete_input_ids, forward_batch)
+        if complete_input_ids is not None
+        else None
+    )
+
+    had_input_ids_global = hasattr(forward_batch, "input_ids_global")
+    input_ids_global_backup = getattr(forward_batch, "input_ids_global", None)
+    if complete_input_ids is not None:
+        forward_batch.input_ids_global = cp_interleave_input_ids(
+            complete_input_ids, forward_batch
+        )
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    spec_hidden_states = getattr(spec_info, "hidden_states", None)
+    spec_hidden_states_backup = None
+    if (
+        spec_hidden_states is not None
+        and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
+    ):
+        spec_hidden_states_backup = spec_hidden_states
+        spec_info.hidden_states = cp_shard_hidden_states(
+            spec_hidden_states, forward_batch
+        )
+
+    try:
+        yield sharded_hidden_states, sharded_positions, model_input_ids
+    finally:
+        if spec_hidden_states_backup is not None:
+            spec_info.hidden_states = spec_hidden_states_backup
+        if had_input_ids_global:
+            forward_batch.input_ids_global = input_ids_global_backup
+        elif hasattr(forward_batch, "input_ids_global"):
+            delattr(forward_batch, "input_ids_global")
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -239,11 +321,16 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "CP_V2_DEFAULT_MODEL_CLASSES",
-    "enable_cp_v2",
     "get_cp_strategy",
-    "is_cp_v2_active",
+    "is_cp_active",
+    "is_mla_cp_enabled",
+    "is_mla_cp_active",
     "cp_gather_after_forward",
+    "cp_materialize_global_token_order",
+    "cp_interleave_input_ids",
+    "cp_shard_hidden_states",
+    "cp_shard_model_inputs",
+    "cp_shard_position_ids",
     "cp_split_before_forward",
     "prepare_cp_forward",
     "is_glm_dsa_cache_layer_split_enabled",

@@ -4,7 +4,7 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
-PROFILE_DIR = "performance_profiles_deepseek_v32"
+RESULT_DIR = "performance_results_deepseek_v32"
 
 
 class TestNightlyDeepseekV32Performance(unittest.TestCase):
@@ -91,8 +91,8 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
 
     def test_bench_one_batch(self):
         failed_variants = []

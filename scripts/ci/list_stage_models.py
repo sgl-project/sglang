@@ -28,8 +28,8 @@ How `file -> models` is resolved (best effort, recall-favoring)
 How `runner label -> models` is aggregated
     Registration/prewarm decisions are made per GH runner *label* (a runner's
     `runs-on` tag), not per suite. Each suite's runner_config maps to a label
-    via scripts/ci/runner_configs.yml (several configs can share one label,
-    e.g. `4-gpu-h100` and `deepep-4-gpu-h100`), so `runner_labels` carries the
+    via scripts/ci/runner_configs.yml (runner configs may share a label), so
+    `runner_labels` carries the
     per-label UNION -- the set a runner registered under that label must have
     cached before it takes jobs. Suites without a mappable runner_config are
     listed in `unmapped_suites`.
@@ -103,12 +103,6 @@ _FILE_EXTENSIONS = (
     ".pth",
     ".onnx",
 )
-
-# Non-test helper files under test/registered/ (skipped by basename, matching
-# scripts/ci/check_registered_tests.py). run_suite.py skips `cpu/utils.py` by
-# path; excluding every `utils.py` by basename is a superset that drops no
-# CUDA-registered test (the other `utils.py` registers CPU only).
-_NON_TEST_BASENAMES = frozenset({"conftest.py", "__init__.py", "utils.py"})
 
 
 def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
@@ -273,11 +267,13 @@ def collect_suite_files(
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
-    pattern = os.path.join(repo_root, "test", "registered", "**", "*.py")
+    # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
         f
-        for f in glob.glob(pattern, recursive=True)
-        if os.path.basename(f) not in _NON_TEST_BASENAMES
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"), recursive=True
+        )
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     )
 
     suite_files: Dict[str, List[str]] = {}
@@ -367,9 +363,8 @@ def load_runner_labels(path: str) -> Dict[str, str]:
     """Parse ``{runner_config: runs_on label}`` out of runner_configs.yml.
 
     The mapping is what turns per-suite model sets into per-runner-LABEL sets:
-    a runner is registered under a `runs_on` label (several runner_configs can
-    share one, e.g. `4-gpu-h100` and `deepep-4-gpu-h100` both run on
-    `4-gpu-h100`), so a runner's cache must cover the union of every suite
+    a runner is registered under a `runs_on` label (runner configs may share a
+    label), so a runner's cache must cover the union of every suite
     that can land on its label. Raises ValueError on an entry without
     `runs_on` or a file with no entries at all -- a format drift must fail
     the workflow loudly, not silently empty the label aggregation.

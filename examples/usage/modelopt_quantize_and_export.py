@@ -213,7 +213,7 @@ def deploy_exported_model(
         outputs = llm.generate(prompts, sampling_params)
 
         for i, output in enumerate(outputs):
-            print(f"Prompt {i+1}: {prompts[i]}")
+            print(f"Prompt {i + 1}: {prompts[i]}")
             print(f"Output: {output['text']}")
             print()
 

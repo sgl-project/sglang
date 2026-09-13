@@ -46,14 +46,13 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
 
         if not matched:
             logger.warning(
-                f"No modules matched hook spec '{spec_name}' "
-                f"patterns={target_patterns}"
+                f"No modules matched hook spec '{spec_name}' patterns={target_patterns}"
             )
             continue
 
         for module_name, module in matched:
             _ = module.register_forward_hook(hook)
-            logger.info(f"Registered forward hook '{spec_name}' " f"on {module_name}")
+            logger.info(f"Registered forward hook '{spec_name}' on {module_name}")
 
 
 def resolve_callable(path: Optional[str]) -> Optional[Callable]:

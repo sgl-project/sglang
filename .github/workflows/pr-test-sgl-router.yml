@@ -108,6 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
       - name: Verify dynamo-* SHA pin
         run: |
           set -euo pipefail
@@ -160,17 +163,17 @@ jobs:
 
       - name: cargo check
         working-directory: experimental/sgl-router
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets
 
       - name: cargo clippy
         working-directory: experimental/sgl-router
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo fmt
         working-directory: experimental/sgl-router
         run: |
           rustup toolchain install nightly --profile minimal --component rustfmt
-          cargo +nightly fmt -- --check
+          cargo +nightly fmt --all -- --check
 
       # cargo-deny 0.19.6+ required for CVSS 4.0 parsing.
       - name: Install cargo-deny
@@ -195,6 +198,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
 
       - name: Install OS deps (libssl, pkg-config)
         run: |
@@ -246,7 +252,7 @@ jobs:
         # the Qwen3-0.6B tokenizer.json. Filter is matched against the
         # full test path `tokenizer::parity::parity_matrix`; substring
         # `parity_matrix` is unique to that test.
-        run: cargo test --release -- --skip parity_matrix
+        run: cargo test --release --workspace -- --skip parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates
@@ -366,7 +372,7 @@ jobs:
         working-directory: experimental/sgl-router
         run: |
           source "$HOME/.cargo/env"
-          cargo build --release
+          cargo build --release --workspace
 
       # Install SGLang from the local checkout in editable mode (no PyPI
       # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs

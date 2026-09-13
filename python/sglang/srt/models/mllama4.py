@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4VisionMLP(nn.Module):
-
     def __init__(
         self,
         input_size: int,
@@ -115,7 +114,6 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
 
 
 class Llama4VisionPixelShuffleMLP(nn.Module):
-
     def __init__(
         self,
         config,
@@ -155,7 +153,6 @@ def apply_position_embedding(q, k, freqs_ci, shape):
 
 
 class Llama4VisionEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -226,7 +223,6 @@ class Llama4VisionEncoderLayer(nn.Module):
 
 
 class Llama4VisionEncoder(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -272,7 +268,6 @@ class Llama4VisionEncoder(nn.Module):
 
 
 class Llama4UnfoldConvolution(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -350,7 +345,6 @@ class Llama4VisionRotaryEmbedding(nn.Module):
 
 
 class Llama4VisionModel(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -476,9 +470,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 "Please not that this warning might be inaccurate if the weights haven't been fully downloaded"
             )
 
-        self.has_vision = (
-            self.has_vision_weights and get_server_args().enable_multimodal
-        )
+        self.has_vision = self.has_vision_weights and get_mm().enable_multimodal
 
         if self.has_vision:
             # TODO: make this more general

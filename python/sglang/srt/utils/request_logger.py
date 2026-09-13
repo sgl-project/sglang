@@ -206,7 +206,6 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
-                    "mm_data_mooncake",
                     "lora_path",
                     "sampling_params",
                 }
@@ -220,7 +219,6 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
-                    "mm_data_mooncake",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}

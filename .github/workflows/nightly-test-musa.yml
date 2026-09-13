@@ -66,7 +66,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.gate.outputs.run_job == 'true'
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
@@ -74,7 +74,6 @@ jobs:
         if: steps.gate.outputs.run_job == 'true'
         timeout-minutes: 30
         run: |
-          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8.py
           pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
           pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py
           pytest python/sglang/kernels/aot/tests/speculative/test_speculative_sampling.py
@@ -111,7 +110,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -154,7 +153,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -206,7 +205,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -255,7 +254,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh

@@ -9,4 +9,4 @@ description = "Rust-accelerated multimodal preprocessing for SGLang"
 requires-python = ">=3.10"
 
 [tool.maturin]
-module-name = "_core"
+module-name = "_multimodal"

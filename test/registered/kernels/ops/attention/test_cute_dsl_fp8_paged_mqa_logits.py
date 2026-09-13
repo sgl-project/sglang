@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=180, stage="nightly", runner_config="4-gpu-b200")
 
 BLOCK_KV = 64
 HEAD_DIM = 128

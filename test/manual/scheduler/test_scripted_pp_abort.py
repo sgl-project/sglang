@@ -14,7 +14,7 @@ def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
         if all(
             h.kv_pages == 0
             and h.lock_refs == 0
-            and (h.req is None or h.req.req_pool_idx is None)
+            and (h.req is None or h.req.kv.req_pool_idx is None)
             for h in handles
         ):
             return

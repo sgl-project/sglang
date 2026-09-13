@@ -21,7 +21,6 @@ BSA_BLOCK_SIZE = 128
 
 
 class BlockSparseAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -126,7 +125,6 @@ class BlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class BlockSparseAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -187,7 +185,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.attentions.block_sparse_attention(
+        return torch.ops.attentions.ada_block_sparse_attention(
             query=query,
             key=key,
             value=value,

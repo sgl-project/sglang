@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sgl_router::config::{Cli, LogFormat};
+use sgl_router::config::{CachePrefixProvider, Cli, LogFormat, PolicyKind};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
     init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
 
     tracing::info!(
+        configured_decode_policy = ?cfg.model.decode_policy,
         "sgl-router {} starting on {}:{}",
         env!("CARGO_PKG_VERSION"),
         cfg.server.host,
@@ -98,24 +99,47 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let cache_aware_uses_indexer = cfg.model.policy == PolicyKind::CacheAware
+        && cfg
+            .model
+            .cache_aware
+            .as_ref()
+            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::Indexer);
+    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = cache_aware_uses_indexer
+        .then_some(cfg.model.cache_aware.as_ref())
+        .flatten()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|indexer| {
+            let config = prefix_index_config(indexer);
+            sgl_kv_indexer::GrpcPrefixIndex::new(config)
+                .map(|index| Arc::new(index) as Arc<dyn sgl_kv_indexer::PrefixIndex>)
+                .context("configure KV Indexer client")
+        })
+        .transpose()?;
 
-    // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // Build the local prefix index and block metadata used by the Radix Tree
+    // provider. An external Indexer only needs hash metadata, so it does not
+    // subscribe to the local KV-event stream.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
-        Arc::clone(&block_size_oracle),
-    );
+    let kv_event_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("default http client builds");
+    let kv_index = if prefix_index.is_some() {
+        sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    } else {
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    };
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
             kv_index.tree(),
-            Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
         )
         .context("build policy registry")?,
@@ -163,16 +187,30 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.radix_tree_prefix_provider = (cfg.model.policy == PolicyKind::CacheAware
+        && cfg
+            .model
+            .cache_aware
+            .as_ref()
+            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
+    .then(|| {
+        sgl_router::policies::prefix_provider::RadixTreePrefixProvider::new(
+            kv_index.tree(),
+            Arc::clone(&block_size_oracle),
+        )
+    });
+    app_ctx.block_size_oracle = block_size_oracle;
+    app_ctx.engine_load = kv_index.engine_load();
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
@@ -198,6 +236,18 @@ async fn main() -> Result<()> {
     server_result
 }
 
+/// Build the external Indexer client with the Router's bounded query settings.
+fn prefix_index_config(
+    indexer: &sgl_router::config::KvIndexerEndpointConfig,
+) -> sgl_kv_indexer::PrefixIndexConfig {
+    sgl_kv_indexer::PrefixIndexConfig {
+        endpoint: indexer.url.clone(),
+        query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+        max_inflight: indexer.query_max_inflight,
+    }
+}
+
+/// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),
@@ -208,6 +258,18 @@ async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_index_config_preserves_router_limits() {
+        let config = prefix_index_config(&sgl_router::config::KvIndexerEndpointConfig {
+            url: "http://127.0.0.1:50051".to_string(),
+            query_timeout_ms: 25,
+            query_max_inflight: 17,
+        });
+        assert_eq!(config.endpoint, "http://127.0.0.1:50051");
+        assert_eq!(config.query_deadline, std::time::Duration::from_millis(25));
+        assert_eq!(config.max_inflight, 17);
+    }
 
     #[tokio::test]
     async fn install_signal_handlers_returns_both() {

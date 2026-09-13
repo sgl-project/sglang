@@ -2,10 +2,11 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -49,7 +50,6 @@ def _serial_batched_fill(entries, vocab_mask):
 
 
 class TestMergeBiasTensor(CustomTestCase):
-
     def test_both_none_returns_none(self):
         """Test that merging two None tensors returns None."""
         result = merge_bias_tensor(None, None, 2, 3, DEVICE, 0.0)
@@ -94,15 +94,61 @@ class TestMergeBiasTensor(CustomTestCase):
 
 # SamplingBatchInfo.__len__
 class TestSamplingBatchInfoLen(CustomTestCase):
-
     def test_len_matches_batch_size(self):
         """Test that __len__ returns batch size (number of temperature rows)."""
         info = _make_info(batch_size=5)
         self.assertEqual(len(info), 5)
 
 
-class TestMergeCustomLogitProcessor(CustomTestCase):
+class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
+        info = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_mask_batch_indices)
+        other = _make_info(
+            batch_size=1,
+            return_sampling_masks=[True],
+            sampling_mask_batch_indices=torch.tensor([0]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.return_sampling_masks, [False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
 
+    def test_filter_rebuilds_row_indices(self):
+        info = _make_info(
+            batch_size=4,
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor([1, 3]),
+        )
+
+        info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
+
+        self.assertEqual(info.return_sampling_masks, [True, False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+
+    def test_merge_offsets_rhs_row_indices(self):
+        lhs = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        rhs = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 2]),
+        )
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
+        self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
+
+
+class TestMergeCustomLogitProcessor(CustomTestCase):
     def test_both_none_returns_none(self):
         """Test that merging two None processor dicts returns None."""
         result = SamplingBatchInfo.merge_custom_logit_processor(
@@ -149,7 +195,6 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
-
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
@@ -197,10 +242,80 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
 
+    def test_apply_logits_bias_without_penalizer_orchestrator(self):
+        info = _make_info(batch_size=1, penalizer_orchestrator=None)
+        logits = torch.zeros(1, VOCAB_SIZE)
+
+        info.apply_logits_bias(logits)
+
+        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
+
+    def test_observer_sees_production_constraint_boundary(self):
+        events = []
+
+        class Observer:
+            def before_grammar(self, logits, sampling_info):
+                events.append(("before", logits.clone()))
+                return object()
+
+        grammar = MagicMock()
+        grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: logits.fill_(
+            -4.0
+        )
+        info = _make_info(batch_size=1)
+        info.acc_additive_penalties = torch.ones(1, VOCAB_SIZE)
+        info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
+        info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
+        logits = torch.zeros(1, VOCAB_SIZE)
+
+        state = info.apply_logits_bias_with_observer(logits, observer=Observer())
+
+        self.assertIsNotNone(state)
+        self.assertTrue(torch.equal(events[0][1], torch.ones_like(logits)))
+        self.assertEqual(len(events), 1)
+        self.assertTrue(torch.equal(logits, torch.full_like(logits, -2.0)))
+        grammar.apply_vocab_mask.assert_called_once()
+
+    def test_observer_path_preserves_production_logit_transforms(self):
+        class Observer:
+            def before_grammar(self, logits, sampling_info):
+                return object()
+
+        def make_info():
+            grammar = MagicMock()
+            grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: (
+                logits.add_(vocab_mask)
+            )
+            info = _make_info(batch_size=1)
+            info.acc_additive_penalties = torch.linspace(
+                -0.5, 0.5, VOCAB_SIZE
+            ).unsqueeze(0)
+            info.acc_scaling_penalties = torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(
+                0
+            )
+            info.grammar_mask = GrammarMask(
+                grammar,
+                torch.linspace(-2.0, 0.0, VOCAB_SIZE).unsqueeze(0),
+            )
+            info.logit_bias = torch.linspace(0.0, 1.0, VOCAB_SIZE).unsqueeze(0)
+            return info
+
+        ordinary = make_info()
+        observed = make_info()
+        ordinary_logits = torch.linspace(-3.0, 3.0, VOCAB_SIZE).unsqueeze(0)
+        observed_logits = ordinary_logits.clone()
+
+        ordinary.apply_logits_bias(ordinary_logits)
+        observed.apply_logits_bias_with_observer(
+            observed_logits,
+            observer=Observer(),
+        )
+
+        self.assertTrue(torch.equal(observed_logits, ordinary_logits))
+
 
 # update_penalties
 class TestUpdatePenalties(CustomTestCase):
-
     def test_required_creates_penalties_tensor(self):
         """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
         orch = MagicMock(is_required=True)
@@ -224,7 +339,6 @@ class TestUpdatePenalties(CustomTestCase):
 
 # update_regex_vocab_mask
 class TestUpdateRegexVocabMask(CustomTestCase):
-
     def test_no_grammars_clears_mask(self):
         """Test that None grammars clears the grammar_mask."""
         info = _make_info(batch_size=1)
@@ -307,7 +421,6 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 
 # filter_batch
 class TestFilterBatch(CustomTestCase):
-
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
         info = _make_info(batch_size=3)
@@ -362,7 +475,6 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
-
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
@@ -441,7 +553,6 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-
     def test_returns_copy_without_orchestrator(self):
         """Test that copy_for_forward returns a copy with orchestrator set to None."""
         orch = MagicMock(is_required=False)
@@ -454,6 +565,21 @@ class TestCopyForForward(CustomTestCase):
 
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # from_schedule_batch reads these two flags from the exec bag; give
+        # each test a mutable stand-in so it does not depend on a published
+        # (or leaked) process context.
+        self._exec_ns = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            features=SimpleNamespace(enable_custom_logit_processor=False),
+        )
+        exec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_exec",
+            return_value=self._exec_ns,
+        )
+        exec_patch.start()
+        self.addCleanup(exec_patch.stop)
 
     def _make_req(
         self,
@@ -486,11 +612,8 @@ class TestFromScheduleBatch(CustomTestCase):
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_basic_construction(self, mock_server_args):
+    def test_basic_construction(self):
         """Test that from_schedule_batch correctly extracts sampling params from requests."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(temp=0.8, top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -503,11 +626,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_greedy_detection(self, mock_server_args):
+    def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_k=1)]
         batch = MagicMock()
@@ -516,11 +636,8 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_logit_bias_construction(self, mock_server_args):
+    def test_logit_bias_construction(self):
         """Test that logit_bias dict is converted to a tensor with correct values."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(logit_bias={"5": 2.0, "10": -1.0})]
         batch = MagicMock()
@@ -532,11 +649,9 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
         self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_deterministic_seed(self, mock_server_args):
+    def test_deterministic_seed(self):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        mock_server_args.return_value.enable_deterministic_inference = True
-        mock_server_args.return_value.enable_custom_logit_processor = False
+        self._exec_ns.deterministic.enable_deterministic_inference = True
 
         reqs = [self._make_req(seed=123), self._make_req(seed=None)]
         batch = MagicMock()
@@ -547,11 +662,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_from_schedule_batch_sampling_flags(self, mock_server_args):
+    def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -563,11 +675,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_no_logit_bias_when_all_none(self, mock_server_args):
+    def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(), self._make_req()]
         batch = MagicMock()
@@ -576,15 +685,13 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_custom_logit_processor_merging(self, mock_server_args):
+    def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
         from sglang.srt.sampling.custom_logit_processor import (
             DisallowedTokensLogitsProcessor,
         )
 
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = True
+        self._exec_ns.features.enable_custom_logit_processor = True
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
         req1 = self._make_req()

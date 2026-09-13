@@ -66,8 +66,18 @@ def _to_sglang_rope_scaling(rope_params: Dict[str, Any]) -> Optional[Dict[str, A
         if key in rope_params:
             out[key] = rope_params[key]
     if "attention_factor" in rope_params:
-        # HF spells it attention_factor; SGLang's factory reads attn_factor.
-        out["attn_factor"] = rope_params["attention_factor"]
+        # attention_factor is the final YaRN mscale; SGLang multiplies attn_factor
+        # onto its own default, so divide that out to avoid squaring the scale.
+        # Drop mscale/mscale_all_dim so the embedding uses that simple default as
+        # its base (yarn.py picks the mscale/mscale_all_dim ratio when both are set).
+        from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale_simple
+
+        out.pop("mscale", None)
+        out.pop("mscale_all_dim", None)
+        factor = float(rope_params.get("factor", 1.0) or 1.0)
+        out["attn_factor"] = rope_params["attention_factor"] / yarn_get_mscale_simple(
+            factor
+        )
     return out
 
 
@@ -104,6 +114,7 @@ class LagunaConfig(PretrainedConfig):
         moe_routed_scaling_factor: float = 1.0,
         moe_router_logit_softcapping: float = 0.0,
         moe_apply_router_weight_on_input: bool = False,
+        moe_router_score_func: str = "sigmoid",
         # Per-layer-type rope dict; nested under "full_attention" / "sliding_attention".
         rope_parameters: Optional[Dict[str, Any]] = None,
         partial_rotary_factor: Optional[float] = None,
@@ -145,6 +156,8 @@ class LagunaConfig(PretrainedConfig):
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
         self.moe_router_logit_softcapping = moe_router_logit_softcapping
         self.moe_apply_router_weight_on_input = moe_apply_router_weight_on_input
+        # Router scoring nonlinearity: "sigmoid" (default) or "sqrtsoftplus".
+        self.moe_router_score_func = moe_router_score_func
 
         # Synthesise per-layer schedules when the caller omits them so the model
         # file can index by layer_id without per-call guards.

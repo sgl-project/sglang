@@ -22,7 +22,10 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
-from sglang.srt.function_call.utils import safe_literal_eval
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
     """Get parameter type from tool schema."""
     for tool in tools:
         if tool.function.name == func_name:
-            props = tool.function.parameters.get("properties", {})
+            props = get_schema_properties(tool.function.parameters)
             if param_name in props:
                 return props[param_name].get("type", "string")
     return "string"

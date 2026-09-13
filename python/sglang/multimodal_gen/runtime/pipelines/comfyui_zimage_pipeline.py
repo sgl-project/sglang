@@ -38,8 +38,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+    set_mixed_precision_policy,
+)
 
 logger = init_logger(__name__)
 
@@ -309,7 +311,10 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             # Check if we should use FSDP
-            use_fsdp = server_args.use_fsdp_inference
+            use_fsdp = server_args.should_use_fsdp_for_component("transformer")
+            component_starts_on_cpu = server_args.should_start_component_on_cpu(
+                "transformer"
+            )
             if current_platform.is_mps():
                 use_fsdp = False
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
@@ -325,7 +330,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 shard_model(
                     model,
-                    cpu_offload=server_args.dit_cpu_offload,
+                    cpu_offload=False,
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
@@ -355,7 +360,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 get_local_torch_device(),
                 default_dtype,
                 strict=True,
-                cpu_offload=server_args.dit_cpu_offload,
+                cpu_offload=component_starts_on_cpu and not use_fsdp,
                 param_names_mapping=param_names_mapping_fn,
             )
 

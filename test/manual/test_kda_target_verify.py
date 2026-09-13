@@ -104,15 +104,15 @@ def test_kda_target_verify_equivalence():
             state_diff = (cached_state - decode_state).abs().max().item()
             status = "OK" if state_diff < 1e-5 else "FAIL"
             print(f"  step={step} req={req_idx}: diff={state_diff:.6e} [{status}]")
-            assert (
-                state_diff < 1e-5
-            ), f"Intermediate state mismatch at step={step}, req={req_idx}: {state_diff}"
+            assert state_diff < 1e-5, (
+                f"Intermediate state mismatch at step={step}, req={req_idx}: {state_diff}"
+            )
 
     ssm_unchanged_diff = (ssm_states_verify - ssm_states_base).abs().max().item()
     print(f"SSM state in-place change (should be 0): {ssm_unchanged_diff:.6e}")
-    assert (
-        ssm_unchanged_diff == 0.0
-    ), f"target_verify modified ssm_states in-place! diff: {ssm_unchanged_diff}"
+    assert ssm_unchanged_diff == 0.0, (
+        f"target_verify modified ssm_states in-place! diff: {ssm_unchanged_diff}"
+    )
 
     print("\nPASSED: KDA target_verify matches sequential decode!")
 

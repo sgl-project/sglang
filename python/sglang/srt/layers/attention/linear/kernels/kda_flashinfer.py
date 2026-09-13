@@ -57,6 +57,33 @@ def _get_flashinfer_kda_kernel():
     return _flashinfer_kda_available, _flashinfer_recurrent_kda
 
 
+def build_fused_accept_indices(
+    *,
+    slots: torch.Tensor,
+    scratch_steps: int,
+    draft_token_num: int,
+    accept_lens_pool: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slot-indexed verify indices + accept lengths for fused-accept mode.
+
+    Row n of the returned ``[N, T]`` index tensor addresses the scratch slots of
+    the request holding mamba slot ``slots[n]``. A padded row (``slots[n] < 0``)
+    yields ONLY negative indices (``-scratch_steps + step`` with
+    ``step < scratch_steps``), which recurrent_kda treats as inactive — the
+    padding contract must survive any refactor of this arithmetic. The nat
+    gather clamps padded slots to row 0 of the pool; their value is never
+    consumed (inactive rows). All ops are device-side and capture-safe.
+    """
+    step = torch.arange(draft_token_num, device=slots.device, dtype=torch.int32)
+    ssm_state_indices = (
+        slots.to(torch.int32)[:, None] * scratch_steps + step[None, :]
+    ).contiguous()  # [N, T]
+    num_accepted_tokens = accept_lens_pool.index_select(
+        0, slots.clamp(min=0).to(torch.int64)
+    )
+    return ssm_state_indices, num_accepted_tokens
+
+
 class FlashInferKDAKernel(LinearAttnKernelBase):
     """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1.
 
@@ -78,7 +105,50 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # Cache the constant per-(row-map, batch, T) verify scatter indices
         # (ssm_state_indices), which never change across verify calls.
         self._verify_idx_cache: dict = {}
+        # State pools whose stride layout has been validated against the
+        # recurrent_kda contract (per-layer views are pool-stable, so id() is
+        # a stable key — same lifetime argument as _gate_cache).
+        self._state_contract_ok: set = set()
         logger.info("Using FlashInfer KDA kernel")
+
+    def _check_state_stride_contract(self, ssm_states: torch.Tensor) -> None:
+        """One-time (per pool view) check that ``ssm_states`` matches the
+        layout ``recurrent_kda`` was compiled for.
+
+        The kernel's state argument is a CuTe fake tensor of shape
+        ``[N, HV, V, K]`` with stride ``(sym_int64(divisibility=16), V*K, K, 1)``
+        and ``assumed_align=32`` (flashinfer ``kda_kernels/recurrent_kda.py``):
+        the slot stride is free — which is what lets the envelope-strided pools
+        (unified memory / page-major layout, slot stride = per-slot envelope
+        pitch) be passed in and updated IN PLACE on the cu_seqlens path — but
+        the inner strides are compiled-in constants and the divisibility /
+        alignment are hard assumptions. A pool violating them would mis-address
+        state in-kernel without any error; fail loudly here instead.
+        """
+        key = id(ssm_states)
+        if key in self._state_contract_ok:
+            return
+        if ssm_states.dim() != 4:
+            raise ValueError(
+                f"recurrent_kda needs a [N, HV, V, K] state pool; got "
+                f"shape {tuple(ssm_states.shape)}"
+            )
+        _, hv, v, k = ssm_states.shape
+        if ssm_states.stride()[1:] != (v * k, k, 1):
+            raise ValueError(
+                "recurrent_kda state inner strides must be compact "
+                f"(V*K, K, 1)=({v * k}, {k}, 1); got {ssm_states.stride()[1:]} "
+                "(only the slot stride may be non-compact)"
+            )
+        base_bytes = ssm_states.storage_offset() * ssm_states.element_size()
+        if ssm_states.stride(0) % 16 != 0 or base_bytes % 32 != 0:
+            raise ValueError(
+                "recurrent_kda state pool breaks the compiled stride contract: "
+                f"slot stride {ssm_states.stride(0)} elements must be a multiple "
+                f"of 16 and the base byte offset {base_bytes} a multiple of 32 "
+                "(sym_int64(divisibility=16) / assumed_align=32)"
+            )
+        self._state_contract_ok.add(key)
 
     # ---- gate / beta normalization (shared by decode + verify) ----
 
@@ -118,6 +188,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         batch_size = cache_indices.shape[0]
@@ -125,6 +196,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         head_k_dim = q.shape[3]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
+
+        # The committed pool goes into the kernel as-is (in-place update); under
+        # unified memory / page-major it is an envelope-strided view, which the
+        # cu_seqlens path supports — verify the compiled contract once per pool.
+        self._check_state_stride_contract(ssm_states)
 
         # Pack each request as a length-1 sequence ([1, B, ...] + cu_seqlens) so
         # recurrent_kda indexes the committed pool IN-KERNEL via ssm_state_indices.
@@ -144,9 +220,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
 
         A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
 
-        # Softplus gate (lower_bound=None) to match the Triton KDA decode path;
-        # in-place state update into the committed pool (no rollback for decode).
-        # query_start_loc is the decode cu_seqlens (one token per request).
+        # Gate contract matches the Triton decode path (safe gate when
+        # lower_bound set); in-place state update, no rollback for decode.
         output_fi, _ = self._recurrent_kda(
             q=query_fi,
             k=key_fi,
@@ -160,7 +235,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            lower_bound=None,
+            lower_bound=lower_bound,
             cu_seqlens=query_start_loc.to(torch.int32),
             ssm_state_indices=cache_indices.to(torch.int32),
         )
@@ -186,6 +261,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
+        fused_accept_state_indices: Optional[torch.Tensor] = None,
+        fused_accept_num_accepted: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if retrieve_parent_token is not None:
@@ -223,36 +301,54 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 f"but intermediate_ssm only has {scratch_steps}."
             )
 
-        base_rows = intermediate_state_indices[:batch_size]
-        cache_key = (
-            id(intermediate_state_indices),
-            batch_size,
-            draft_token_num,
-            scratch_steps,
-        )
-        ssm_state_indices = self._verify_idx_cache.get(cache_key)
-        if ssm_state_indices is None:
-            # The fast seed copy below assumes row n in scratch belongs to request n.
-            expected = torch.arange(
-                batch_size, device=base_rows.device, dtype=base_rows.dtype
+        if fused_accept_state_indices is not None:
+            # Fused-accept mode: rows are the requests' mamba SLOTS (stable for
+            # the request lifetime, unlike batch positions), so last round's
+            # checkpoints are addressable this round. The kernel seeds each row
+            # from slot[nat - 1] (nat = last round's accept length, gathered
+            # from accept_lens_pool; fresh requests were staged with nat = 1 at
+            # extend) and overwrites all T slots in place — no committed-pool
+            # seed copy here and no SSM commit scatter after verify. Padded
+            # graph rows carry slot -1: every derived index stays negative,
+            # which recurrent_kda treats as inactive. Both tensors are built
+            # once per forward by the backend (see KDAAttnBackend), so the 20
+            # KDA layers of a step share one build.
+            ssm_state_indices = fused_accept_state_indices
+            num_accepted_tokens = fused_accept_num_accepted
+        else:
+            num_accepted_tokens = None
+            base_rows = intermediate_state_indices[:batch_size]
+            cache_key = (
+                id(intermediate_state_indices),
+                batch_size,
+                draft_token_num,
+                scratch_steps,
             )
-            if not torch.equal(base_rows, expected):
-                raise RuntimeError(
-                    "FlashInfer KDA verify requires an identity intermediate row-map "
-                    "(verify_intermediate_state_indices must be arange)."
+            ssm_state_indices = self._verify_idx_cache.get(cache_key)
+            if ssm_state_indices is None:
+                # The fast seed copy below assumes row n in scratch belongs to
+                # request n.
+                expected = torch.arange(
+                    batch_size, device=base_rows.device, dtype=base_rows.dtype
                 )
-            step = torch.arange(draft_token_num, device=q.device, dtype=torch.int32)
-            ssm_state_indices = (
-                base_rows.to(torch.int32)[:, None] * scratch_steps + step[None, :]
-            ).contiguous()  # [N, T]
-            self._verify_idx_cache[cache_key] = ssm_state_indices
+                if not torch.equal(base_rows, expected):
+                    raise RuntimeError(
+                        "FlashInfer KDA verify requires an identity intermediate "
+                        "row-map (verify_intermediate_state_indices must be arange)."
+                    )
+                step = torch.arange(draft_token_num, device=q.device, dtype=torch.int32)
+                ssm_state_indices = (
+                    base_rows.to(torch.int32)[:, None] * scratch_steps + step[None, :]
+                ).contiguous()  # [N, T]
+                self._verify_idx_cache[cache_key] = ssm_state_indices
 
-        # Seed step 0 from committed state, then recurrent_kda overwrites it with
-        # token-0 post-state. Padded graph rows clamp to slot 0; their output is ignored.
-        base_state = ssm_states.index_select(
-            0, cache_indices[:batch_size].clamp(min=0).to(torch.int64)
-        )
-        scratch[:batch_size, 0].copy_(base_state)
+            # Seed step 0 from committed state, then recurrent_kda overwrites it
+            # with token-0 post-state. Padded graph rows clamp to slot 0; their
+            # output is ignored.
+            base_state = ssm_states.index_select(
+                0, cache_indices[:batch_size].clamp(min=0).to(torch.int64)
+            )
+            scratch[:batch_size, 0].copy_(base_state)
 
         # Same storage as scratch, flattened over the allocated step stride.
         state_pool = scratch.view(
@@ -272,10 +368,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            lower_bound=None,
+            lower_bound=lower_bound,
             cu_seqlens=query_start_loc.to(torch.int32),
             ssm_state_indices=ssm_state_indices,
             num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
         )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)

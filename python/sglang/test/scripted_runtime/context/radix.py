@@ -25,6 +25,30 @@ def _node_lock_ref(node: Any) -> int:
     return node.lock_ref
 
 
+def resolve_node(tree_cache: Any, node_handle: Any) -> Any:
+    """Resolve whatever a req or match result carries into a tree node.
+
+    ``UnifiedRadixCache`` hands out NodeIds (ints); every other cache hands out
+    the node object itself. Returns None when the handle no longer maps to a
+    live node, which only happens once the node has been freed -- and a freed
+    node holds no locks.
+    """
+    resolve = getattr(tree_cache, "resolve_node_handle", None)
+    if resolve is None:
+        return node_handle
+    try:
+        return resolve(node_handle)
+    except KeyError:
+        return None
+
+
+def to_node_handle(tree_cache: Any, node: Any) -> Any:
+    """Inverse of `resolve_node`: what the tree_cache lock APIs accept."""
+    if isinstance(node, UnifiedTreeNode):
+        return node.id
+    return node
+
+
 def _collect_node_attr(
     ctx: ScriptedContext, get_value: Callable[[Any], int]
 ) -> Dict[int, int]:

@@ -16,6 +16,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **MiniMax-H3**: Joint video-and-audio generation, server mode only (`SGLDiffusion Generate H3`)
 
 ### Mode 1: Server Mode (HTTP API)
 Connect to a standalone SGLang Diffusion server.
@@ -34,6 +35,35 @@ Leverage SGLang's high-performance sampling directly within ComfyUI while using 
 2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. SGLang will handle the sampling process efficiently.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+## Adding a Model
+
+Pick the mode before writing code; the wrong one costs several hundred lines
+of weight mapping that buys nothing.
+
+Take **Server Mode** when the model needs conditioning ComfyUI cannot supply
+(audio, reference materials, task routing), emits more than one modality, or
+has its own request contract. Reproducing that inside ComfyUI would duplicate
+stages the server already runs.
+
+- If the request fits the existing `generate_image` / `generate_video` fields,
+  there is nothing to write — point the existing nodes at the server.
+- If the model has extra request fields, pass them via `extra_fields`. The
+  request schemas accept unknown keys, so `core/server_api.py` needs no
+  per-model change.
+- Add a node in `nodes.py` only to surface those inputs as ComfyUI widgets.
+  `SGLDiffusionGenerateH3` is the worked example.
+
+Take **Integrated Mode** only when the model denoises a single latent tensor
+that ComfyUI already knows how to build and decode, so its KSampler can drive
+the loop unchanged. Each model then needs:
+
+- `runtime/pipelines/comfyui_<model>_pipeline.py` mapping ComfyUI's
+  single-file checkpoint layout onto the native module tree (350-690 lines in
+  the existing three)
+- an executor in `executors/` adapting latent layout and conditioning to `Req`
+- entries in both `pipeline_class_dict` and `executor_class_dict` in
+  `core/generator.py`
 
 ## Example Workflows
 

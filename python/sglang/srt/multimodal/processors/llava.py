@@ -1,8 +1,10 @@
 import asyncio
 import os
+from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
 import numpy as np
+import requests
 from transformers.models.auto.processing_auto import (
     PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
 )
@@ -27,7 +29,13 @@ from sglang.srt.multimodal.mm_utils import (
     process_anyres_image,
 )
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import ImageData, load_image, logger
+from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+    logger,
+)
 from sglang.utils import get_exception_traceback
 
 
@@ -44,21 +52,24 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
     @staticmethod
-    def _process_single_image_task(
-        image_data: Union[str, bytes, ImageData],
+    def _preprocess_image_task(
+        image_input,
+        image_hash,
         image_aspect_ratio: Optional[str] = None,
         image_grid_pinpoints: Optional[str] = None,
         processor=None,
     ):
-
+        # CPU-bound decode + preprocessing. `image_input` is either the raw bytes
+        # of a remote image (already fetched off the cpu pool) or a local/inline
+        # input load_image can resolve without network. Either way decode happens
+        # here, parallel across cpu workers, and only compact data crosses the
+        # process boundary (never a decoded image).
         image_processor = processor.image_processor
 
         try:
-            url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url, False)
+            image, image_size = load_image(image_input, False)
             if image_size is not None:
                 # It is a video with multiple images
-                image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
                 for i in range(len(pixel_values)):
                     pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
@@ -66,7 +77,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return pixel_values, image_hash, image_size
             else:
                 # It is an image
-                image_hash = hash(url)
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
@@ -90,8 +100,32 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values = pixel_values.astype(np.float16)
 
                 return pixel_values, image_hash, image.size
+        except CLIENT_MEDIA_EXCEPTIONS as error:
+            raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            raise
+
+    async def _fetch_remote_image_bytes(self, url):
+        # Fetch a remote image's compressed bytes in the io thread pool, retrying
+        # only transient network failures. Each attempt is bounded by
+        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
+        loop = asyncio.get_running_loop()
+        max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
+        delay = 0.5
+        for attempt in range(max_retries + 1):
+            try:
+                return await loop.run_in_executor(
+                    self.io_executor, get_image_bytes, url
+                )
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ):
+                if attempt >= max_retries:
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2
 
     async def _process_single_image(
         self,
@@ -99,24 +133,53 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         aspect_ratio: str,
         grid_pinpoints: str,
     ):
+        url = image_data.url if isinstance(image_data, ImageData) else image_data
+        image_hash = hash(url) if isinstance(url, (str, bytes)) else None
+
+        # Only remote URLs hit the network, and that fetch is what used to sit
+        # inside the cpu-preprocess timeout budget. Pull it into the io pool so a
+        # slow fetch can't starve cpu workers or trip the CPU timeout. Local and
+        # inline inputs (file://, data:, base64, bytes) decode instantly in the
+        # worker, so pass them through unchanged.
+        image_input = url
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            image_input = await self._fetch_remote_image_bytes(url)
+
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(
-                self.cpu_executor,
-                LlavaImageProcessor._process_single_image_task,
-                image_data,
+            executor = self.cpu_executor
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            deadline = loop.time() + timeout
+            try:
+                # ProcessPoolExecutor.submit() can itself block after a worker
+                # exits. Keep submission off the request event loop so the
+                # timeout can still replace the failed pool.
+                process_future = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        executor.submit,
+                        LlavaImageProcessor._preprocess_image_task,
+                        image_input,
+                        image_hash,
+                        aspect_ratio,
+                        grid_pinpoints,
+                        self._processor,
+                    ),
+                    timeout=timeout,
+                )
+                remaining = max(0.0, deadline - loop.time())
+                return await asyncio.wait_for(
+                    asyncio.wrap_future(process_future), timeout=remaining
+                )
+            except (BrokenProcessPool, asyncio.TimeoutError):
+                self._replace_broken_cpu_executor(executor)
+                raise
+        else:
+            return LlavaImageProcessor._preprocess_image_task(
+                image_input,
+                image_hash,
                 aspect_ratio,
                 grid_pinpoints,
                 self._processor,
-            )
-            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
-            return await asyncio.wait_for(fut, timeout=timeout)
-        else:
-            return self._process_single_image_task(
-                image_data,
-                aspect_ratio,
-                grid_pinpoints,
-                self._processor.image_processor,
             )
 
     def _process_precomputed_image_data(self, image_data: List[Dict]) -> Dict:

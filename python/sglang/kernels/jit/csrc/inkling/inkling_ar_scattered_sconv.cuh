@@ -55,7 +55,7 @@
 #include <type_traits>
 #include <unordered_map>
 
-namespace {
+namespace sglang {
 
 constexpr uint32_t kSsVecElems = 8;  // bf16x8 = 16 B
 constexpr int kSsPadSlot = -1;
@@ -2031,4 +2031,4 @@ struct SsconvNormDecodeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

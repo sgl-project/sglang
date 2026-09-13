@@ -1,4 +1,4 @@
-"""Utilities for running nightly performance benchmarks with profiling."""
+"""Utilities for running nightly performance benchmarks."""
 
 import json
 import os
@@ -19,16 +19,16 @@ from sglang.test.test_utils import (
 
 
 class NightlyBenchmarkRunner:
-    """Helper class for running nightly performance benchmarks with profiling.
+    """Helper class for running nightly performance benchmarks.
 
     This class encapsulates common patterns used across nightly performance tests,
-    including profile directory management, benchmark command construction,
+    including result directory management, benchmark command construction,
     result parsing, and report generation.
     """
 
     def __init__(
         self,
-        profile_dir: str,
+        result_dir: str,
         test_name: str,
         base_url: str,
         gpu_config: str = None,
@@ -36,12 +36,12 @@ class NightlyBenchmarkRunner:
         """Initialize the benchmark runner.
 
         Args:
-            profile_dir: Directory to store performance profiles
+            result_dir: Directory to store benchmark results
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
             gpu_config: Optional GPU configuration string (e.g., "2-gpu-h100", "8-gpu-b200")
         """
-        self.profile_dir = profile_dir
+        self.result_dir = result_dir
         self.test_name = test_name
         self.base_url = base_url
         self.gpu_config = gpu_config or os.environ.get("GPU_CONFIG", "")
@@ -51,38 +51,32 @@ class NightlyBenchmarkRunner:
         if self.gpu_config:
             header += f" ({self.gpu_config})"
         header += "\n"
-        self.full_report = header + BenchmarkResult.help_str()
+        self.full_report = header
 
-    def setup_profile_directory(self) -> None:
-        """Create the profile directory if it doesn't exist."""
-        os.makedirs(self.profile_dir, exist_ok=True)
+    def setup_result_directory(self) -> None:
+        """Create the result directory if it doesn't exist."""
+        os.makedirs(self.result_dir, exist_ok=True)
 
-    def generate_profile_filename(
-        self, model_path: str, variant: str = ""
-    ) -> Tuple[str, str]:
-        """Generate unique profile filename and path for the model.
+    def generate_result_filename(self, model_path: str, variant: str = "") -> str:
+        """Generate a unique result filename for the model.
 
         Args:
             model_path: Path to the model (e.g., "deepseek-ai/DeepSeek-V3.1")
             variant: Optional variant suffix (e.g., "basic", "mtp", "dsa")
 
         Returns:
-            Tuple of (profile_path_prefix, json_output_file)
+            Path to the JSON result file
         """
         timestamp = int(time.time())
         model_safe_name = model_path.replace("/", "_")
 
         # Build filename with optional variant
         if variant:
-            profile_filename = f"{model_safe_name}_{variant}_{timestamp}"
             json_filename = f"results_{model_safe_name}_{variant}_{timestamp}.json"
         else:
-            profile_filename = f"{model_safe_name}_{timestamp}"
             json_filename = f"results_{model_safe_name}_{timestamp}.json"
 
-        profile_path_prefix = os.path.join(self.profile_dir, profile_filename)
-
-        return profile_path_prefix, json_filename
+        return os.path.join(self.result_dir, json_filename)
 
     def build_benchmark_command(
         self,
@@ -90,11 +84,9 @@ class NightlyBenchmarkRunner:
         batch_sizes: List[int],
         input_lens: Tuple[int, ...],
         output_lens: Tuple[int, ...],
-        profile_path_prefix: str,
         json_output_file: str,
         extra_args: Optional[List[str]] = None,
         server_args: Optional[List[str]] = None,
-        enable_profile: bool = True,
     ) -> List[str]:
         """Build the benchmark command with all required arguments.
 
@@ -103,11 +95,9 @@ class NightlyBenchmarkRunner:
             batch_sizes: List of batch sizes to test
             input_lens: Tuple of input lengths to test
             output_lens: Tuple of output lengths to test
-            profile_path_prefix: Prefix for profile output files
             json_output_file: Path to JSON output file
             extra_args: Optional extra arguments to append to command
             server_args: Optional server launch arguments to record in metrics
-            enable_profile: Whether to enable profiling (default True for NVIDIA)
 
         Returns:
             List of command arguments ready for subprocess.run()
@@ -131,17 +121,6 @@ class NightlyBenchmarkRunner:
             "--no-append-to-github-summary",
             "--trust-remote-code",
         ]
-
-        # Add profiling flags only if enabled (disabled for AMD tests)
-        if enable_profile and profile_path_prefix:
-            command.extend(
-                [
-                    "--profile",
-                    "--profile-by-stage",
-                    "--profile-output-dir",
-                    profile_path_prefix,
-                ]
-            )
 
         if extra_args:
             command.extend(extra_args)
@@ -227,7 +206,6 @@ class NightlyBenchmarkRunner:
         other_args: Optional[List[str]] = None,
         variant: str = "",
         extra_bench_args: Optional[List[str]] = None,
-        enable_profile: bool = True,
         timeout: Optional[int] = None,
         env: Optional[dict] = None,
     ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
@@ -235,7 +213,7 @@ class NightlyBenchmarkRunner:
 
         This method handles:
         - Server launch and cleanup
-        - Profile filename generation
+        - Result filename generation
         - Benchmark command construction and execution
         - Result loading and parsing
         - Fetching speculative decoding accept length (for MTP/EAGLE)
@@ -248,7 +226,6 @@ class NightlyBenchmarkRunner:
             other_args: Arguments to pass to server launch
             variant: Optional variant suffix (e.g., "basic", "mtp")
             extra_bench_args: Extra arguments for the benchmark command
-            enable_profile: Whether to enable profiling (default True for NVIDIA)
             timeout: Optional timeout for server launch (defaults to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
             env: Environment dict for subprocess
 
@@ -275,9 +252,7 @@ class NightlyBenchmarkRunner:
             )
 
             # Generate filenames
-            profile_path_prefix, json_output_file = self.generate_profile_filename(
-                model_path, variant
-            )
+            json_output_file = self.generate_result_filename(model_path, variant)
 
             # Build and run benchmark command
             # Prepare extra args with run_name if variant is specified
@@ -290,11 +265,9 @@ class NightlyBenchmarkRunner:
                 batch_sizes,
                 input_lens,
                 output_lens,
-                profile_path_prefix,
                 json_output_file,
                 extra_args=bench_args,
                 server_args=other_args,
-                enable_profile=enable_profile,
             )
 
             result, cmd_success = self.run_benchmark_command(command, model_description)
@@ -346,7 +319,7 @@ class NightlyBenchmarkRunner:
             results: List of BenchmarkResult objects to add to report
         """
         if results:
-            report_part = generate_markdown_report(self.profile_dir, results, variant)
+            report_part = generate_markdown_report(results, variant)
             self.full_report += report_part + "\n"
 
     def write_final_report(self) -> None:

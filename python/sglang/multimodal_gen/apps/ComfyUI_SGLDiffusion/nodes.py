@@ -576,6 +576,222 @@ class SGLDiffusionGenerateVideo:
         return (video, video_path)
 
 
+class SGLDiffusionGenerateH3:
+    """Node to generate joint video and audio with MiniMax-H3.
+
+    H3 denoises a packed video+audio sequence in one pass and routes its
+    conditioning by task rather than by a single reference slot, so it needs
+    its own request shape (`task` / `conditions` / `target`) that the generic
+    video node does not model. The returned MP4 carries both streams.
+    """
+
+    TASKS = ["t2va", "fl2va", "ref2va"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sgld_client": ("SGLD_CLIENT",),
+                "positive_prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Text prompt. Reference material is addressed "
+                        "positionally as <Picture 1>, <Video 1>, <Audio 1>",
+                    },
+                ),
+                "task": (
+                    cls.TASKS,
+                    {
+                        "default": "t2va",
+                        "tooltip": "t2va: text only. fl2va: first/last keyframes. "
+                        "ref2va: image, video, and audio references",
+                    },
+                ),
+            },
+            "optional": {
+                "first_frame": (
+                    "IMAGE",
+                    {"tooltip": "fl2va: becomes the clip's first frame"},
+                ),
+                "last_frame": (
+                    "IMAGE",
+                    {"tooltip": "fl2va: becomes the clip's last frame"},
+                ),
+                "reference_image": (
+                    "IMAGE",
+                    {
+                        "tooltip": "ref2va: guides identity and style; not "
+                        "preserved as an endpoint frame"
+                    },
+                ),
+                "reference_video": (
+                    "STRING",
+                    {"default": "", "tooltip": "ref2va: path or URL to a video"},
+                ),
+                "reference_audio": (
+                    "STRING",
+                    {"default": "", "tooltip": "ref2va: path or URL to audio"},
+                ),
+                "negative_prompt": ("STRING", {"default": ""}),
+                "seed": ("INT", {"default": 1101, "min": -1, "max": 2**32 - 1}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
+                "short_edge": ("INT", {"default": 768, "min": 256, "max": 1536}),
+                "aspect_ratio": (
+                    ["16:9", "9:16", "1:1", "auto"],
+                    {"default": "16:9"},
+                ),
+                "duration_seconds": (
+                    "FLOAT",
+                    {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.5},
+                ),
+                "flow_shift": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 30.0}),
+                "audio_flow_shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 30.0},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "video_path")
+    FUNCTION = "generate"
+    CATEGORY = "SGLDiffusion"
+    OUTPUT_NODE = False
+
+    @staticmethod
+    def _material_uri(value: str) -> str:
+        """Local paths become file:// URIs; remote URLs are passed through."""
+        if value.startswith(("http://", "https://", "file://")):
+            return value
+        return f"file://{os.path.abspath(value)}"
+
+    def generate(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        positive_prompt: str,
+        task: str,
+        first_frame: torch.Tensor = None,
+        last_frame: torch.Tensor = None,
+        reference_image: torch.Tensor = None,
+        reference_video: str = "",
+        reference_audio: str = "",
+        negative_prompt: str = "",
+        seed: int = 1101,
+        steps: int = 50,
+        short_edge: int = 768,
+        aspect_ratio: str = "16:9",
+        duration_seconds: float = 5.0,
+        flow_shift: float = 12.0,
+        audio_flow_shift: float = 3.0,
+    ):
+        """Build H3's task-shaped request and submit it through the server API."""
+        if not positive_prompt:
+            raise ValueError("Prompt cannot be empty")
+
+        # 1. keyframes carry a frame_index and are preserved as endpoints;
+        #    references are semantic material and keep request order, because
+        #    the prompt addresses them positionally per modality
+        conditions = []
+        if first_frame is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(first_frame)),
+                    "role": "keyframe",
+                    "frame_index": 0,
+                }
+            )
+        if last_frame is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(last_frame)),
+                    "role": "keyframe",
+                    "frame_index": -1,
+                }
+            )
+        if reference_image is not None:
+            conditions.append(
+                {
+                    "type": "image",
+                    "uri": self._material_uri(get_image_path(reference_image)),
+                    "role": "reference",
+                }
+            )
+        if reference_video:
+            conditions.append(
+                {
+                    "type": "video",
+                    "uri": self._material_uri(reference_video),
+                    "role": "reference",
+                }
+            )
+        if reference_audio:
+            conditions.append(
+                {
+                    "type": "audio",
+                    "uri": self._material_uri(reference_audio),
+                    "role": "reference",
+                }
+            )
+
+        # 2. reject wiring the server would reject anyway, but name the input
+        #    the user has to change
+        if task == "fl2va" and not (first_frame is not None or last_frame is not None):
+            raise ValueError("fl2va requires first_frame, last_frame, or both")
+        if task == "ref2va" and not conditions:
+            raise ValueError(
+                "ref2va requires at least one of reference_image, "
+                "reference_video, or reference_audio"
+            )
+        if task == "t2va" and conditions:
+            raise ValueError("t2va takes no conditioning inputs; pick another task")
+
+        # 3. `target` resolves the aligned canvas and frame count; the `size`
+        #    the server API always sends is unused by H3
+        extra_fields = {
+            "task": task,
+            "conditions": conditions,
+            "target": {
+                "short_edge": short_edge,
+                "aspect_ratio": aspect_ratio,
+                "duration_seconds": duration_seconds,
+            },
+            "flow_shift": flow_shift,
+            "audio_flow_shift": audio_flow_shift,
+        }
+
+        request_params = {
+            "prompt": positive_prompt,
+            "seconds": int(duration_seconds),
+            "num_inference_steps": steps,
+            "output_path": folder_paths.get_temp_directory(),
+            "extra_fields": extra_fields,
+        }
+        if negative_prompt:
+            request_params["negative_prompt"] = negative_prompt
+        if seed >= 0:
+            request_params["seed"] = seed
+
+        try:
+            response = sgld_client.generate_video(**request_params)
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
+
+        video_path = response.get("file_path", "")
+        # H3 aligns the canvas server-side, so the resolved size is only known
+        # from the response; short_edge and aspect_ratio cannot reconstruct it
+        resolved_size = response.get("size", "")
+        if resolved_size:
+            width, height = (int(v) for v in resolved_size.split("x"))
+        else:
+            width = height = short_edge
+        video = convert_video_to_comfy_video(video_path, height, width)
+
+        return (video, video_path)
+
+
 class SGLDiffusionServerSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
 
@@ -696,6 +912,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
+    "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
@@ -707,6 +924,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
+    "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
