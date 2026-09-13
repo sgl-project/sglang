@@ -650,6 +650,35 @@ class MultimodalProcessorOutput(
                 padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
         return padded_input_ids
 
+    @staticmethod
+    def build_token_modalities(
+        input_ids, mm_items: List[MultimodalDataItem]
+    ) -> Optional[List[int]]:
+        """Build the pre-padding token modality map from item offsets."""
+        if input_ids is None or not mm_items:
+            return None
+        if isinstance(input_ids, torch.Tensor):
+            num_tokens = input_ids.numel()
+        else:
+            num_tokens = len(flatten_nested_list(input_ids))
+        token_modalities = [0] * num_tokens
+        for item in mm_items:
+            if not item.offsets:
+                continue
+            modality = item.modality.value
+            for start, end in item.offsets:
+                if start < 0 or end < start or end >= num_tokens:
+                    raise ValueError(
+                        "Invalid multimodal token offsets: "
+                        f"offset=({start}, {end}), num_tokens={num_tokens}"
+                    )
+                if any(token_modalities[index] for index in range(start, end + 1)):
+                    raise ValueError(
+                        f"Overlapping multimodal token offsets at ({start}, {end})"
+                    )
+                token_modalities[start : end + 1] = [modality] * (end - start + 1)
+        return token_modalities
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -660,6 +689,7 @@ class MultimodalInputs:
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
+    token_modalities: Optional[List[int]] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -702,7 +732,9 @@ class MultimodalInputs:
                 item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: MultimodalProcessorOutput):
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+    ):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
@@ -743,6 +775,12 @@ class MultimodalInputs:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
+        token_modalities = (
+            MultimodalProcessorOutput.build_token_modalities(obj.input_ids, mm_items)
+            if requires_mm_token_modalities
+            else None
+        )
+
         for item in mm_items:
             item.set_pad_value()
 
@@ -754,6 +792,7 @@ class MultimodalInputs:
         mm_inputs = MultimodalInputs(
             mm_items=mm_items,
             padded_input_ids=obj.padded_input_ids,
+            token_modalities=token_modalities,
         )
         optional_args = [
             "mrope_positions",
@@ -820,6 +859,12 @@ class MultimodalInputs:
             self_arg = getattr(self, arg, None)
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
+
+        if other.token_modalities is not None:
+            if self.token_modalities is None:
+                self.token_modalities = list(other.token_modalities)
+            else:
+                self.token_modalities += other.token_modalities
 
         mrope_positions = self.mrope_positions
         if mrope_positions is not None:

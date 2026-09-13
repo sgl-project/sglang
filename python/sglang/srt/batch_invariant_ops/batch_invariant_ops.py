@@ -279,6 +279,8 @@ def matmul_persistent(
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
+    element_size = a.element_size()
+    deepgemm_tma_aligned = (N * element_size) % 16 == 0 and (K * element_size) % 16 == 0
 
     if (
         _ENABLE_MM_DEEPGEMM
@@ -288,6 +290,7 @@ def matmul_persistent(
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and deepgemm_tma_aligned
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)

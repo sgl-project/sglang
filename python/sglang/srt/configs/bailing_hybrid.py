@@ -26,9 +26,18 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
 )
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeVisionConfig
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
+
+
+def is_bailing_multi_gate_enabled(config: PretrainedConfig) -> bool:
+    """Select MultiRouter only when the checkpoint config declares it."""
+    return (
+        bool(getattr(config, "multi_gate", False))
+        or getattr(config, "router_type", "topN") == "MultiRouter"
+    )
 
 
 class HybridLayerType(enum.Enum):
@@ -76,7 +85,7 @@ class BailingHybridConfig(PretrainedConfig):
         use_qk_norm=True,
         num_nextn_predict_layers=0,
         mtp_loss_scaling_factor=0,
-        moe_router_enable_expert_bias=True,
+        moe_router_enable_expert_bias=False,
         routed_scaling_factor=1.0,
         layer_group_size=1,
         group_norm_size=1,
@@ -225,3 +234,72 @@ class BailingHybridConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+class BailingMoeV3VLConfig(PretrainedConfig):
+    model_type = "bailing_moe_v3_vl"
+
+    def __init__(
+        self,
+        text_config=None,
+        vision_config=None,
+        image_token_id=157157,
+        video_token_id=156909,
+        vision_start_token_id=157158,
+        vision_end_token_id=157159,
+        tie_word_embeddings=False,
+        mrope_section=None,
+        **kwargs,
+    ):
+        if isinstance(vision_config, dict):
+            vision_config = dict(vision_config)
+            # The public Bailing checkpoint omits deepstack entirely. Do not
+            # inherit Qwen3-VL's architecture-specific deepstack defaults.
+            vision_config.setdefault("deepstack_visual_indexes", [])
+            vision_config = Qwen3VLMoeVisionConfig(**vision_config)
+        elif vision_config is None:
+            vision_config = Qwen3VLMoeVisionConfig(deepstack_visual_indexes=[])
+
+        if isinstance(text_config, dict):
+            text_config = BailingHybridConfig(**text_config)
+        elif text_config is None:
+            text_config = BailingHybridConfig()
+
+        self.vision_config = vision_config
+        self.text_config = text_config
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
+
+        if mrope_section is None:
+            mrope_section = text_config.rope_parameters.get(
+                "mrope_section", [8, 12, 12]
+            )
+        self.mrope_section = mrope_section
+        text_config.rope_parameters.update(
+            rope_type="default",
+            mrope_section=mrope_section,
+            video_rope=True,
+        )
+
+        if self.text_config.architectures is None:
+            self.text_config.architectures = ["BailingMoeV3ForCausalLM"]
+
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    @property
+    def rope_scaling(self):
+        """The language model's effective RoPE parameters (v5 backcompat alias)."""
+        return self.text_config.rope_parameters
+
+    @rope_scaling.setter
+    def rope_scaling(self, value):
+        # A top-level rope_scaling override (e.g. --json-model-override-args
+        # '{"rope_scaling": ...}') targets the language model's rope. Merge it
+        # into the text config's rope_parameters so the mrope_section and
+        # video_rope markers injected above survive the override.
+        if isinstance(value, dict) and hasattr(self, "text_config"):
+            self.text_config.rope_parameters.update(value)
+        else:
+            PretrainedConfig.rope_scaling.fset(self, value)
