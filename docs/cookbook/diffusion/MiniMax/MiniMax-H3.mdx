@@ -1531,7 +1531,7 @@ peak memory.
 
 ### VDN-H3 on B200
 
-A 4× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
+An 8× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
 on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
 102 latent frames, about 104k packed rows), `task: "t2va"`,
 `num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`
@@ -1541,26 +1541,31 @@ every forward of the served request is steady state; without those flags the
 first forward pays about 3 s of allocator growth and kernel setup. "Steady
 s/NFE" is the mean of forwards 2 to 8. The OpenVDN reference rows ran the released
 inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
-and the same clip length:
+and the same clip length, with its Ulysses layout (`parallel.softmax_ranks`)
+swept at every GPU count rather than assumed. Every row below comes from one
+campaign, one arm at a time on an otherwise idle node; a repeated arm moves by
+about 3% across nodes, so treat smaller differences as noise:
 
 | Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
 | --- | ---: | ---: | ---: | ---: |
 | OpenVDN published, FP8, 8× B200 Ulysses 5+3 ([openvdn.github.io](https://openvdn.github.io/)) | 1.40 | 11.2 s | – | – |
-| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.91 | 63.3 s | – | – |
-| OpenVDN reference, FP8, 1× B200 | 6.47 | 51.7 s | – | – |
-| OpenVDN reference, FP8, 4× B200 Ulysses (standard / 3+1 branch-parallel) | 2.68 / 2.61 | 21.4 / 20.9 s | – | – |
-| SGLang, BF16, 1× B200, DiT layerwise offload (auto policy) | 7.86 | 64.1 s | 9.5 s | 147,608 MB |
-| SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
-| SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
-| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
-| SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
-| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.93** | **7.45 s** | 1.5 s | 77,704 MB |
-| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models), 8× B200 Ulysses8 | 1.05 | 8.4 s | 1.5 s | 76,828 MB |
+| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.66 | 61.2 s | – | – |
+| OpenVDN reference, FP8, 1× B200 | 6.25 | 50.0 s | – | – |
+| OpenVDN reference, FP8, 2× B200 Ulysses (standard / 1+1 branch-parallel) | 4.87 / 5.04 | 39.0 / 40.3 s | – | – |
+| OpenVDN reference, FP8, 4× B200 Ulysses (3+1 branch-parallel) | 2.59 | 20.7 s | – | – |
+| OpenVDN reference, FP8, 8× B200 Ulysses (5+3 / 4+4 / standard) | 1.40 / 1.47 / 1.52 | 11.2 / 11.7 / 12.2 s | – | – |
+| SGLang, `--quantization bf16`, 1× B200 | 7.45 | 58.8 s | 8.8 s | 156,298 MB |
+| SGLang, `--quantization fp8` (→ online `mxfp8` on SM100+), 1× B200 | 6.03 | 47.6 s | 8.7 s | 128,418 MB |
+| SGLang default (online `mxfp8`), 2× B200 Ulysses2, `--performance-mode speed`, served-shape warmup | **3.30** | **25.9 s** | 4.7 s | 106,738 MB |
+| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | 2.06 | 16.2 s | 2.3 s | 108,434 MB |
+| SGLang default (online `mxfp8`), 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **1.67** | **13.1 s** | 2.4 s | 85,244 MB |
+| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.88** | **6.9 s** | 1.5 s | 79,972 MB |
+| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models; on SM100+ `--quantization fp8` resolves to `mxfp8`, so this arm selects the per-channel path explicitly), 8× B200 Ulysses8 | 0.98 | 7.7 s | 1.5 s | 79,504 MB |
 
-On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.93 s/NFE
-(7.5 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.88 s/NFE
+(7.0 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
 branch-parallel layout; the whole request (text encoding, 8 forwards, joint
-decode) completes in 9.3 s after warmup. At this GPU count the step is
+decode) completes in 9.0 s after warmup. At this GPU count the step is
 launch- and copy-bound in the linear branch rather than FLOP-bound: the scans
 fold the 102 frames into per-chunk composites plus one chain over the chunks
 with both directions per launch (the chunked window only reads states at
@@ -1574,29 +1579,32 @@ cuBLASLt's block-scaled GEMM; the activation quant is fused into the adaLN
 modulation and SwiGLU producers, so no standalone quant pass runs). The
 prompt's text state joins
 the frames' Cholesky batch as a virtual frame. OpenVDN's branch-parallel layout was measured slower here (1.39
-s/NFE at 5+3, 1.49 at 6+2): with 11 to 12 heads per softmax rank the window
+s/NFE at 5+3, 1.49 at 6+2, against that pass's 0.93 baseline): with 11 to 12 heads per softmax rank the window
 attention and its gathers grow faster than the linear ranks shrink; splitting
 each rank's heads into two pipelined all-to-all groups also lost (1.10 s/NFE)
 to smaller attention kernels and doubled branch launches. The profile of one
 rank is 31% window FlashAttention, 24% fp8 GEMM, 12% NCCL, the rest small
 kernels.
 Against the published 8× B200 headline (1.40 s/NFE, 11.2
-GPU-seconds per NFE), the SGLang 4× B200 FP8 run spends 9.8 GPU-seconds per
-NFE, with half the GPUs and half the all-to-all fan-out. On the same host and GPU count the
-SGLang path is 10-13% faster per NFE than the released stack (2.34 vs 2.61 /
-2.68 s), and the 8-forward denoise is 18.7 s against their 20.9 / 21.4 s. In BF16 the single-GPU path matches the released tuned BF16 stack
-(7.86 vs 7.91 s/NFE); the single-GPU FP8 gap (7.49 vs 6.47 s) is the online
-FP8 GEMM path, not the hybrid attention.
+GPU-seconds per NFE), the SGLang 4× B200 run spends 6.7 GPU-seconds per
+NFE, with half the GPUs and half the all-to-all fan-out. At equal GPU count
+SGLang is 1.48× faster at two cards (3.30 vs 4.87 s/NFE), 1.55× at four
+(1.67 vs 2.59) and 1.60× at eight (0.88 vs 1.40), while on one card the two
+stacks are within 4% of each other (6.03 vs 6.25 s/NFE quantized, 7.45 vs 7.66
+in BF16). The advantage is therefore parallel scaling rather than per-GPU
+kernel work: SGLang holds 86-91% parallel efficiency from 2 to 8 cards against
+the reference stack's 56-64%, and sweeping the reference stack's own layout
+does not close it (its best split is 8% better than standard Ulysses at eight
+cards, 1.40 against 1.52 s/NFE).
 
-On one B200 the auto memory policy streams the DiT layers from host memory
-(the 62 GB DiT, the 66 GB conditioner and the VAEs do not all fit resident
-with the 120 GB headroom the policy keeps); keeping the FP8 DiT resident with
-`--layerwise-offload-components text_encoder` changes nothing measurable, so
-the single-GPU rows are compute-bound. The BF16 DiT does not fit resident at
-this clip length on one 183 GB card (the 104k-row activations alone take
-about 100 GB). Per DiT block the hybrid attention costs about 117 ms at this
-shape (window FlashAttention 46 ms, projections 24 ms, the linear branch and
-its fused kernels the rest). A static-tile block-sparse Triton kernel was
+On one B200 both single-GPU rows now run with the DiT resident under the auto
+memory policy, at 128 GB peak quantized and 156 GB in BF16 of the card's 183 GB,
+so no `--layerwise-offload-components` flag is needed at this clip length and
+the single-GPU rows are compute-bound. Per DiT block the hybrid attention was
+profiled at about 117 ms at this shape (window FlashAttention 46 ms,
+projections 24 ms, the linear branch and its fused kernels the rest) when the
+earlier single-GPU rows were taken; that split was not re-measured in this pass,
+and the single-GPU step has dropped about 20% since. A static-tile block-sparse Triton kernel was
 measured at 226 ms against 169 ms for the decomposed FlashAttention path and
 is not shipped.
 
@@ -1627,8 +1635,8 @@ measured 15.7 to 17.0 s/NFE on a shared host.
 | 8× RTX PRO 6000 Ulysses8 (default `mxfp8`) | 5.43 | 43.1 s | 3.5 s | 77,704 MB |
 | 8× RTX PRO 6000 Ulysses8, per-channel `fp8` | 5.47 | 43.4 s | 3.5 s | 77,236 MB |
 
-For comparison the same code on B200 measures 6.23 / 3.34 / 1.73 / 0.89 s/NFE
-at 1 / 2 / 4 / 8 cards (NVLink, 87% parallel efficiency at 8).
+For comparison the same code on B200 measures 6.03 / 3.30 / 1.67 / 0.88 s/NFE
+at 1 / 2 / 4 / 8 cards (NVLink, 86% parallel efficiency at 8).
 
 ### H200 topology comparison
 
