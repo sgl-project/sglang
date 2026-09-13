@@ -329,6 +329,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     kv_injector=self._kv_injector,
                 ),
+                simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
             )
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
@@ -783,7 +784,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            and self._simulate_acc_len <= 0
+            # A simulated-acceptance run can fold too: the epilogue stages the
+            # drawn length in device memory before the replay, so the in-graph
+            # accept reproduces what the eager override would have written.
+            and (
+                self._simulate_acc_len <= 0
+                or self._verify_executor.verify_epilogue.folds_simulated_accept
+            )
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
