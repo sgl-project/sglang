@@ -11,6 +11,7 @@ descriptor packs ``data_ptr()`` values, which only overflows off CUDA (#35047).
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -18,6 +19,7 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
     build_conv_slot_descriptor,
     fused_clear_conv_slots,
     fused_copy_conv_slots,
+    warmup_fused_copy_conv_slots,
 )
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import get_device_module
@@ -55,6 +57,24 @@ CONFIGS = [
     ([128], 1, 64),  # single conv tensor
     ([256, 6144], 2, 32),  # mixed shapes, 2 layers
 ]
+
+
+class TestMambaSlotFusedWarmup(CustomTestCase):
+    def test_warmup_uses_disjoint_one_slot_cow_indices(self):
+        convs = [torch.zeros(1, 2, CONV_LEN, 8, dtype=torch.bfloat16)]
+        desc = build_conv_slot_descriptor(convs)
+        with patch(
+            "sglang.srt.mem_cache.mamba_slot_fused.fused_copy_conv_slots"
+        ) as copy:
+            warmup_fused_copy_conv_slots(desc)
+
+        copy.assert_called_once()
+        called_desc, src, dst = copy.call_args.args
+        self.assertIs(called_desc, desc)
+        self.assertEqual(src.dtype, torch.int32)
+        self.assertEqual(dst.dtype, torch.int32)
+        self.assertEqual(src.tolist(), [0])
+        self.assertEqual(dst.tolist(), [1])
 
 
 def _make_convs(dims, num_layers, pool, device, seed):
