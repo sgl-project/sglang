@@ -40,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -137,6 +138,8 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    swa_custom_mask: Optional[torch.Tensor] = None
+    swa_mask_indptr: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -387,6 +390,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
         self._verify_mask = None
+        self.cuda_graph_swa_custom_mask = None
+        self.swa_mask_indptr = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -611,6 +616,34 @@ class TritonAttnBackend(AttentionBackend):
         seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+        swa_mask = getattr(spec_info, "swa_custom_mask", None)
+        if (
+            self._verify_mask is not None
+            and self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+        ):
+            if self.cuda_graph_swa_custom_mask is None:
+                # Allocate at EAGLE/SWA warmup, before capture; retain stable
+                # addresses as request lengths change across graph replays.
+                self.cuda_graph_swa_custom_mask = torch.ones(
+                    self._verify_mask.max_bs
+                    * self.num_draft_tokens
+                    * (self.sliding_window_size + self.num_draft_tokens),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.swa_mask_indptr = torch.zeros_like(self.mask_indptr)
+            if swa_mask is None:
+                # Capture/idle stubs carry a fully visible placeholder mask.
+                self.cuda_graph_swa_custom_mask.fill_(True)
+            else:
+                self.cuda_graph_swa_custom_mask[: swa_mask.numel()].copy_(swa_mask)
+                self.cuda_graph_swa_custom_mask[swa_mask.numel() :].fill_(True)
+            self.swa_mask_indptr[: bs + 1] = (
+                window_kv_indptr[: bs + 1] + qo_indptr
+            ) * num_draft_tokens
         return (
             qo_indptr,
             kv_indptr,
@@ -1036,6 +1069,19 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=lean_Op,
             lean_locks=lean_locks,
         )
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            and window_kv_indptr is not None
+        ):
+            self.forward_metadata.swa_custom_mask = getattr(
+                spec_info, "swa_custom_mask", None
+            )
+            if self.forward_metadata.swa_custom_mask is not None:
+                self.forward_metadata.swa_mask_indptr = (
+                    window_kv_indptr + qo_indptr
+                ) * max_extend_len
 
     def init_cuda_graph_state(
         self,
@@ -1204,6 +1250,11 @@ class TritonAttnBackend(AttentionBackend):
                 lean_locks=self.cuda_graph_lean_locks,
             )
         elif forward_mode.is_target_verify():
+            use_swa_mask = (
+                swa
+                and spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            )
             custom_mask = (
                 self._verify_mask.buffer
                 if self._verify_mask is not None
@@ -1233,6 +1284,12 @@ class TritonAttnBackend(AttentionBackend):
                     self.cuda_graph_window_num_kv_splits if swa else None
                 ),
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                swa_custom_mask=self.cuda_graph_swa_custom_mask
+                if use_swa_mask
+                else None,
+                swa_mask_indptr=self.swa_mask_indptr[: bs + 1]
+                if use_swa_mask
+                else None,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
@@ -1681,6 +1738,19 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        custom_mask = self.forward_metadata.custom_mask
+        mask_indptr = self.forward_metadata.mask_indptr
+        use_swa_mask = (
+            sliding_window_size >= 0
+            and self.forward_metadata.swa_custom_mask is not None
+        )
+        if use_swa_mask:
+            custom_mask = self.forward_metadata.swa_custom_mask
+            mask_indptr = self.forward_metadata.swa_mask_indptr
+            # The compact mask already uses tree depths for the window bound.
+            sliding_window_size = -1
+            window_kv_offsets = None
+
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
@@ -1705,6 +1775,7 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = None
         if (
             verify_fwd is not None
+            and not use_swa_mask
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
@@ -1744,9 +1815,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            custom_mask,
             causal,
-            self.forward_metadata.mask_indptr,
+            mask_indptr,
             self.forward_metadata.max_extend_len,
             k_descale,
             v_descale,
@@ -1760,6 +1831,7 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            skip_prefix_custom_mask=not use_swa_mask,
         )
         return o
 
@@ -2100,6 +2172,16 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        custom_mask = self.forward_metadata.custom_mask
+        mask_indptr = self.forward_metadata.mask_indptr
+        if (
+            sliding_window_size >= 0
+            and self.forward_metadata.swa_custom_mask is not None
+        ):
+            custom_mask = self.forward_metadata.swa_custom_mask
+            mask_indptr = self.forward_metadata.swa_mask_indptr
+            sliding_window_size = -1
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2113,8 +2195,8 @@ class TritonAttnBackend(AttentionBackend):
             unified_kv_indices,
             prefix_lens,
             self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            custom_mask=custom_mask,
+            mask_indptr=mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,

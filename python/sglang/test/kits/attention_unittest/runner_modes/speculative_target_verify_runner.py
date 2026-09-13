@@ -301,7 +301,30 @@ def _expected_case_and_masks_for_spec_verify(
         )
 
     masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    if _is_eagle_swa(case, spec_kind):
+        # A sibling's flattened index is not its logical token position.
+        # Define visibility from the tree and token positions, independently
+        # of the backend's windowed KV layout.
+        depth = (
+            _draft_tree_mask(
+                draft_token_num=_check_target_verify_case(case),
+                topk=topk,
+                device=device,
+            ).sum(dim=1)
+            - 1
+        )
+        for prefix_len, mask in zip(case.prefix_lens, masks_by_req):
+            query_pos = prefix_len + depth
+            key_pos = torch.cat((torch.arange(prefix_len, device=device), query_pos))
+            mask &= key_pos[None, :] >= query_pos[:, None] - case.sliding_window_size
+        return replace(case, sliding_window_size=None), masks_by_req
     return case, masks_by_req
+
+
+def _is_eagle_swa(case, spec_kind: SpecVerifyKind) -> bool:
+    return (
+        spec_kind == "eagle" and getattr(case, "sliding_window_size", None) is not None
+    )
 
 
 def _make_retrieve_tensors(
@@ -376,10 +399,19 @@ def _make_spec_verify_input(
         "eagle": EagleVerifyInput,
         "frozen_kv_mtp": FrozenKVMTPVerifyInput,
     }[spec_kind]
-    return verify_cls(
+    positions = batch.positions
+    if _is_eagle_swa(case, spec_kind):
+        depth = (
+            _draft_tree_mask(
+                draft_token_num=draft_token_num, topk=topk, device=device
+            ).sum(dim=1)
+            - 1
+        )
+        positions = torch.cat([prefix_len + depth for prefix_len in case.prefix_lens])
+    verify_input = verify_cls(
         draft_token=batch.input_ids,
         custom_mask=custom_mask,
-        positions=batch.positions,
+        positions=positions,
         retrieve_index=retrieve_index,
         retrieve_next_token=retrieve_next_token,
         retrieve_next_sibling=retrieve_next_sibling,
@@ -396,6 +428,29 @@ def _make_spec_verify_input(
         seq_lens_sum=batch.seq_lens_sum,
         seq_lens_cpu=batch.seq_lens_cpu,
     )
+    if _is_eagle_swa(case, spec_kind) and case.backend in (
+        "flashinfer",
+        "triton",
+    ):
+        from sglang.srt.speculative.eagle_info import apply_eagle_swa_mask
+
+        compact_case = replace(
+            case,
+            prefix_lens=tuple(
+                min(n, case.sliding_window_size) for n in case.prefix_lens
+            ),
+        )
+        _, verify_input.swa_custom_mask = _make_custom_masks(
+            compact_case, topk=topk, device=device
+        )
+        apply_eagle_swa_mask(
+            verify_input.swa_custom_mask,
+            batch.seq_lens,
+            positions.view(case.batch_size, draft_token_num),
+            case.sliding_window_size,
+        )
+        verify_input.swa_mask_window = case.sliding_window_size
+    return verify_input
 
 
 def _make_eagle_verify_input(

@@ -250,6 +250,7 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
                 for attr in (
                     "draft_token",
                     "custom_mask",
+                    "swa_custom_mask",
                     "positions",
                     "retrieve_index",
                     "retrieve_next_token",
