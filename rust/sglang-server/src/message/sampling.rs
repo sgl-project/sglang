@@ -232,6 +232,12 @@ pub struct SamplingParams {
     pub stop_str_max_len: usize,
     #[serde(skip_deserializing)]
     pub stop_regex_max_len: usize,
+    /// Sampling values before Python-compatible greedy normalization rewrites
+    /// `temperature=0` to `temperature=1, top_k=1`.
+    #[serde(skip_deserializing)]
+    pub original_temperature: Option<f64>,
+    #[serde(skip_deserializing)]
+    pub original_top_k: Option<i64>,
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
     #[serde(skip_deserializing)]
     pub is_normalized: bool,
@@ -379,6 +385,8 @@ impl Default for SamplingParams {
             stop_regex_strs: Vec::new(),
             stop_str_max_len: 0,
             stop_regex_max_len: 0,
+            original_temperature: None,
+            original_top_k: None,
             is_normalized: false,
             explicit_fields: BTreeSet::new(),
         }
@@ -407,6 +415,8 @@ impl SamplingParams {
         if self.is_normalized {
             return;
         }
+        self.original_temperature = Some(self.temperature);
+        self.original_top_k = Some(self.top_k);
         // Moved out, not cloned: `normalize_stops` clears both aliases anyway.
         self.stop_strs = take_one_or_many(self.stop.take());
         self.stop_regex_strs = take_one_or_many(self.stop_regex.take());
@@ -714,7 +724,9 @@ mod tests {
 
     #[test]
     fn greedy_sets_temp_one_topk_one() {
-        let sp = norm(r#"{"temperature": 0.0}"#);
+        let sp = norm(r#"{"temperature": 0.0, "top_k": -1}"#);
+        assert_eq!(sp.original_temperature, Some(0.0));
+        assert_eq!(sp.original_top_k, Some(-1));
         assert_eq!(sp.temperature, 1.0);
         assert_eq!(sp.top_k, 1);
         assert!(sp.is_normalized);
@@ -768,6 +780,8 @@ mod tests {
         assert_eq!(get(&w, "max_new_tokens").unwrap().as_i64(), Some(64));
         assert_eq!(get(&w, "ignore_eos").unwrap().as_bool(), Some(true));
         assert_eq!(get(&w, "top_k").unwrap().as_i64(), Some(TOP_K_ALL));
+        assert_eq!(get(&w, "original_temperature").unwrap().as_f64(), Some(0.7));
+        assert_eq!(get(&w, "original_top_k").unwrap().as_i64(), Some(TOP_K_ALL));
         assert_eq!(get(&w, "is_normalized").unwrap().as_bool(), Some(true));
         assert_eq!(get(&w, "stop_str_max_len").unwrap().as_i64(), Some(0));
         // Unset optionals ride as null, NOT omitted: the msgpack wire is
@@ -788,7 +802,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 31 wire slots, in Python's declaration order.
+    /// The 33 wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -830,6 +844,8 @@ mod tests {
         "stop_regex_strs",
         "stop_str_max_len",
         "stop_regex_max_len",
+        "original_temperature",
+        "original_top_k",
         "is_normalized",
     ];
 
@@ -865,6 +881,8 @@ mod tests {
             no_stop_trim: true,
             stream_interval: Some(30),
             sampling_seed: Some(31),
+            original_temperature: Some(0.32),
+            original_top_k: Some(33),
             ..Default::default()
         };
         let buf = rmp_serde::to_vec(&sp).expect("serializes");
@@ -900,6 +918,8 @@ mod tests {
         assert_eq!(arr[at("no_stop_trim")].as_bool(), Some(true));
         assert_eq!(arr[at("stream_interval")].as_i64(), Some(30));
         assert_eq!(arr[at("sampling_seed")].as_i64(), Some(31));
+        assert_eq!(arr[at("original_temperature")].as_f64(), Some(0.32));
+        assert_eq!(arr[at("original_top_k")].as_i64(), Some(33));
         // Unset optionals ride as nil rather than being skipped.
         assert!(arr[at("stop")].is_nil());
         assert!(arr[at("logit_bias")].is_nil());

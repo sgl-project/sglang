@@ -571,7 +571,9 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         algo_states = None
-        if self.dllm_algorithm.fdfo and batch is not None:
+        if batch is not None and (
+            self.dllm_algorithm.fdfo or self.dllm_algorithm.needs_full_prefill
+        ):
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
         (
@@ -580,6 +582,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
+            dllm_done_per_req_cpu,
         ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
 
         return GenerationBatchResult(
@@ -587,6 +590,7 @@ class TpModelWorker(BaseTpWorker):
             next_token_ids=next_token_ids,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
+            dllm_done_per_req_cpu=dllm_done_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
