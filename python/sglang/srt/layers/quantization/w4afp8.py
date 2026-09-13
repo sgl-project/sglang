@@ -82,11 +82,15 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
+            ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
         )
 
