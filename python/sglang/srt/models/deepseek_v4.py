@@ -962,7 +962,7 @@ class MQALayer(MqaAttentionBase):
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
         if alt_streams is not None and (
-            (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            ((_is_cuda or _is_hip) and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         ):
             self.alt_streams = alt_streams[:3]
@@ -1310,7 +1310,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 1
@@ -1338,66 +1338,20 @@ class MQALayer(MqaAttentionBase):
                     compressor=self.indexer.compressor,
                 )
 
-        x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-        else:
-            q_lora, _ = self.wq_a(x_linear)
-            qkv_a = None
-
-        if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
-                q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
-                    q_lora,
-                    self.q_norm.weight,
-                    self.q_norm.variance_epsilon,
-                )
-                q, _ = self.wq_b(q_for_wqb)
-            else:
-                q_lora = self.q_norm(q_lora)
-                q, _ = self.wq_b(q_lora)
-
-            kv = (
-                qkv_a[..., self.q_lora_rank :]
-                if qkv_a is not None
-                else self.wkv(x_linear)[0]
-            )
-
-            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
-                fused_qk_norm_rope_swa_store,
-            )
-
-            token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
-            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
-
-            q = fused_qk_norm_rope_swa_store(
-                q=q,
-                kv=kv,
-                q_norm_weight=None,
-                kv_norm_weight=self.kv_norm.weight,
-                q_rms_eps=self.eps,
-                kv_rms_eps=self.eps,
-                rope_head_dim=self.qk_rope_head_dim,
-                cos_cache=self.cos_cache,
-                sin_cache=self.sin_cache,
-                positions=positions,
-                swa_cache=swa_cache,
-                swa_loc=swa_loc,
-                swa_page_size=swa_page_size,
-                q_out=q_out,
-                dtype=x.dtype,
-            )
-        else:
-            q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
-
-        del qkv_a
+        # Same Q projections + backend-correct KV store the single-stream path
+        # runs, on the capture stream, while the compressors above overlap on
+        # their side streams. Using the shared helper (rather than a hand-copied
+        # Q/KV block) keeps this path on the unified_kv store when that backend
+        # is active, instead of the drifted non-unified SWA write it used to do
+        # (which crashed decode capture: the unified pool has no swa_kv_pool --
+        # see sgl-project/sglang#38662). Multi-stream prepare is decode/verify
+        # capture only: decode fuses the cache write and hands back kv=None,
+        # while unified target-verify defers its causally indexed write and
+        # returns a contiguous kv for the backend to store, exactly as the
+        # single-stream path does.
+        q, q_lora, kv = self._forward_prepare_qkv(
+            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+        )
 
         if self.indexer is not None:
             current_stream.wait_stream(stream_compressor)
@@ -1413,9 +1367,9 @@ class MQALayer(MqaAttentionBase):
         elif self.compressor is not None:
             current_stream.wait_stream(stream_compressor)
 
-        return q
+        return q, kv
 
-    def _forward_prepare(
+    def _forward_prepare_qkv(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
@@ -1423,7 +1377,17 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Attention Q projections plus the fused KV cache write.
+
+        Returns ``(q, q_lora, kv)``. ``q_lora`` is the post-norm low-rank query
+        the C4 indexer also consumes; ``kv`` is non-None only on the paths that
+        hand a bf16 KV intermediate back to the caller (unified_kv 2-source
+        prefill and DSA/NSA prefill-CP). Split out of ``_forward_prepare`` so the
+        ROCm multi-stream path runs the *same* kernels and the *same*
+        backend-correct KV store instead of a hand-copied subset that had drifted
+        onto the non-unified SWA buffer (wrong once unified_kv_triton is active).
+        """
         x_linear = x_quant if x_quant is not None else x
 
         if self.fuse_wqa_wkv:
@@ -1605,6 +1569,27 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        return q, q_lora, kv
+
+    def _forward_prepare(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Single-stream prepare: Q/KV projections, then indexer, then compressor."""
+        q, q_lora, kv = self._forward_prepare_qkv(
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            q_out,
+            x_quant=x_quant,
+        )
+
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1678,7 +1663,7 @@ class MQALayer(MqaAttentionBase):
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
-                q = self._forward_prepare_multi_stream_hip(
+                q, kv = self._forward_prepare_multi_stream_hip(
                     x,
                     positions,
                     forward_batch,
@@ -1695,6 +1680,7 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
+                kv = None
             else:
                 q = self._forward_prepare_multi_stream(
                     x,
@@ -1704,7 +1690,7 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
-            kv = None
+                kv = None
         else:
             q, kv = self._forward_prepare(
                 x,

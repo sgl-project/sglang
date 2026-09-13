@@ -413,7 +413,16 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+            # Multi-stream overlap stays off by default on ROCm, but an explicit
+            # export now wins instead of being clobbered. With the device-resident
+            # ordering-edge runtime (ROCm/rocm-systems#11212) cutting the
+            # per-dispatch multi-queue cost, and the split-K decode scratch made
+            # stream-safe (SplitKBufferPool keyed per stream), the gfx95
+            # attention-prologue overlap in MQALayer._forward_prepare_multi_stream_hip
+            # is safe to opt into. Unconditionally forcing the env off made it
+            # unreachable.
+            if not envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.is_set():
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
     elif model_arch in ["GptOssForCausalLM"]:
