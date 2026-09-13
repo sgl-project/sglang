@@ -1,28 +1,21 @@
-"""MI35x Qwen 3.5 GSM8K lm-eval Evaluation Test (8-GPU)
+"""MI35x Qwen 3.5 GSM8K sgl-eval Evaluation Test (8-GPU)
 
 Tests Qwen/Qwen3.5-397B-A17B (MoE, Hybrid Attention with Gated Delta Networks)
-with lm-eval GSM8K benchmark on MI35x, matching the AMD Day 0 article.
+with sgl-eval GSM8K benchmark on MI35x; historical thresholds require recalibration.
 
 Registry: nightly-amd-accuracy-8-gpu-mi35x-qwen35 suite
 """
 
 import os
 import unittest
-from pathlib import Path
-
-import numpy as np
-import requests
-import yaml
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.kits.lm_eval_kit import LMEvalMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 register_amd_ci(
@@ -34,17 +27,21 @@ SERVER_LAUNCH_TIMEOUT = 3600
 TP_SIZE = 8
 
 
-class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
-    """Qwen 3.5 GSM8K lm-eval Test for AMD MI35x."""
+class TestQwen35EvalMI35x(GSM8KMixin, CustomTestCase):
+    """Qwen 3.5 GSM8K sgl-eval Test for AMD MI35x."""
 
-    model_config_name = "lm_eval_configs/Qwen3.5-397B-A17B.yaml"
+    gsm8k_score_threshold = 0.9704 * (1 - 0.05)
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_max_tokens = 2048
+    gsm8k_thinking = True
 
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-    def test_lm_eval(self):
+    def test_gsm8k(self):
         """Override to handle server lifecycle and write results to summary."""
         other_args = [
             "--tp",
@@ -69,36 +66,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
         )
 
         try:
-            requests.get(self.base_url + "/flush_cache")
-
-            eval_config = yaml.safe_load(
-                Path(self.model_config_name).read_text(encoding="utf-8")
-            )
-            results = self.launch_lm_eval(eval_config)
-            rtol = eval_config.get("rtol", self.default_rtol)
-            model_name = eval_config.get("model_name", self.model)
-
-            success = True
-            summary = f"### lm-eval accuracy ({model_name})\n"
-            summary += "| task | metric | expected | measured | status |\n"
-            summary += "| ---- | ------ | -------- | -------- | ------ |\n"
-            for task in eval_config["tasks"]:
-                for metric in task["metrics"]:
-                    expected = metric["value"]
-                    measured = results["results"][task["name"]][metric["name"]]
-                    passed = bool(np.isclose(expected, measured, rtol=rtol))
-                    status = "✅" if passed else "❌"
-                    summary += f"| {task['name']} | {metric['name']} | {expected:.4f} | {measured:.4f} | {status} |\n"
-                    print(
-                        f"{task['name']} | {metric['name']}: "
-                        f"expected={expected:.3f} | measured={measured:.3f} | rtol={rtol}"
-                    )
-                    success = success and passed
-
-            if is_in_ci():
-                write_github_step_summary(summary)
-
-            self.assertTrue(success, "lm-eval validation failed")
+            super().test_gsm8k()
         finally:
             kill_process_tree(process.pid)
 

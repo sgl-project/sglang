@@ -34,7 +34,6 @@ class TestDeepseekV3FP4SymmetricMemory(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 1319
     gsm8k_num_threads = 1319
-    gsm8k_num_shots = 8
 
 
 if __name__ == "__main__":

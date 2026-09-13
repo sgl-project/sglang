@@ -69,7 +69,6 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
     # Shot count, TP and floor match the single-server Inkling case, so its 0.900
     # is a peer number rather than a rough reference. A dropped or misaligned state
     # component collapses generation to near zero, which is what the floor catches.
-    gsm8k_num_shots = 10
     gsm8k_score_threshold = 0.80
 
     @classmethod

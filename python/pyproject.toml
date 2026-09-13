@@ -170,7 +170,6 @@ test = [
   "expecttest",
   "granian>=2.6.0",
   "jsonlines",
-  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   # 4.9.3 is what sgl-eval's math_verify grader needs (latex2sympy2_extended
   # raises ImportError on 4.7.x); pinned here so other test deps cannot pull

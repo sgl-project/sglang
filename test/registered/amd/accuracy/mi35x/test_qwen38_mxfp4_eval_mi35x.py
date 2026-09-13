@@ -35,10 +35,7 @@ Perf runs only once accuracy has passed (see ``accuracy_passed``): a server
 that decodes garbage still benchmarks fine, so publishing its throughput would
 be worse than publishing nothing.
 
-The scorer extracts the last number in the reply and the server runs with no
-``--reasoning-parser``, so a ``<think>`` block still scores: the reasoning
-stays in ``message.content`` rather than being split into ``reasoning_content``,
-which would leave ``content`` empty and score 0.
+GSM8K uses sgl-eval chat prompts and grading with thinking disabled.
 
 MXFP4 needs gfx95x, so this is MI35x-only and ROCm 7.2-only; it does not
 register on gfx942 (MI300/MI325).
@@ -120,7 +117,7 @@ class TestQwen38Mxfp4MI35x(CustomTestCase):
         cls.max_tokens = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "2048"))
 
     def test_a_gsm8k_accuracy(self):
-        """GSM8K few-shot accuracy must clear the AMD-published gate."""
+        """sgl-eval GSM8K accuracy must clear the AMD-published gate."""
         process = popen_launch_server(
             QWEN38_MXFP4_MODEL_PATH,
             self.base_url,

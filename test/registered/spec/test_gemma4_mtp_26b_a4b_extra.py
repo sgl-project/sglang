@@ -112,11 +112,9 @@ class TestGemma4MTP26BA4B(CustomTestCase):
             base_url=cls.base_url,
             model=TARGET_PATH,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            num_shots=5,
         )
 
     @staticmethod

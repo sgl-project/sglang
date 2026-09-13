@@ -366,15 +366,16 @@ Standard 5-shot, `temperature=0`, `max_tokens=4096`, model defaults to thinking-
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.run_eval \
-  --base-url http://127.0.0.1:30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --model XiaomiMiMo/MiMo-V2.5 \
-  --eval-name gsm8k \
   --num-examples 200 \
   --num-threads 8 \
   --max-tokens 4096 \
   --temperature 0.0
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 > `run_eval.py` automatically appends `/v1` to `--base-url`; pass the bare `host:port` URL (without trailing `/v1`), otherwise requests resolve to `/v1/v1/chat/completions` and 404.
 
@@ -749,13 +750,14 @@ Pro's 3-layer MTP behaves very differently on natural text vs uniform-random tok
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.run_eval \
-  --base-url http://127.0.0.1:30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --model XiaomiMiMo/MiMo-V2.5-Pro \
-  --eval-name gsm8k \
   --num-examples 200 \
   --num-threads 4
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 The `accept_rate` and `accept_length` rows below are not part of `run_eval`'s own output — they were aggregated from the server-side `Decode batch ... accept rate: X accept len: Y` log lines emitted during the GSM8K run (307 batches total).
 

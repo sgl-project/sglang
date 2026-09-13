@@ -51,9 +51,7 @@ def normalize_answer_text(text: str | None) -> str:
     if text is None:
         return ""
     text = str(text).strip().strip("$").strip()
-    gsm8k_answer = re.search(r"####\s*([^\n]+)", text)
-    if gsm8k_answer:
-        text = gsm8k_answer.group(1).strip()
+
     text = re.sub(r"\\(?:boxed|fbox)\s*\{(.+)\}\s*$", r"\1", text)
     text = text.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
     text = re.sub(r"\\(?:left|right|bigl|bigr|Bigl|Bigr|big|Big)", "", text)

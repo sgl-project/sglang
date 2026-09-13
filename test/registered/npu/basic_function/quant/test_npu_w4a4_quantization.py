@@ -41,7 +41,6 @@ class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
     # GSM8K Configs
     accuracy = 0.80  # GSM8K accuracy ≥0.80
     num_questions = 1319
-    gsm8k_num_shots = 5
     gsm8k_parallel = 64
 
 

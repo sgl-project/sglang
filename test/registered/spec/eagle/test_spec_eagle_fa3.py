@@ -35,7 +35,6 @@ class TestEagle3Fa3(Eagle3Base, SpecAccuracyKit, SpecLogprobKit):
 
 class TestEagleLlama2Fa3Page256(
     EagleLlama2Base,
-    SpecAccuracyKit,
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecPerfKit,

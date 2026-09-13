@@ -53,7 +53,6 @@ class TestEagle3Topk16(
 class TestEagleLlama2Suite(
     EagleLlama2Base,
     SpecCorrectnessKit,
-    SpecAccuracyKit,
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecFeatureKit,

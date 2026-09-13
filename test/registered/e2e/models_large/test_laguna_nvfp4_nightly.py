@@ -43,7 +43,6 @@ class TestLagunaNVFP4Nightly(unittest.TestCase):
                 dataset="gsm8k",
                 baseline_accuracy=baseline,
                 num_examples=200,
-                num_shots=5,
                 num_threads=128,
                 max_tokens=4096,
                 temperature=1.0,

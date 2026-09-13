@@ -51,8 +51,8 @@ python3 -m sglang.test.run_eval --host 127.0.0.1 --port <port> --eval-name gsm8k
 
 - Expected accuracy: **> 0.8** for capable models (Qwen3-8B, Llama-3.1-8B-Instruct, etc.)
 - This is a quick sanity check, not a rigorous benchmark.
-- `sglang.test.few_shot_gsm8k` is deprecated; use the unified `run_eval` entrypoint.
-- If you intentionally need the old completion-style GSM8K path, add `--api completion`.
+- GSM8K and MMLU always use `sgl-eval`; `run_eval` delegates to it.
+- Do not reintroduce a raw completion evaluator for GSM8K or MMLU.
 - If accuracy is unexpectedly low, something is wrong — do not proceed to profiling.
 
 ### Step 4: Generate the profile

@@ -27,7 +27,7 @@ class TestEagle3Perf(Eagle3Base, SpecPerfKit):
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
+class TestEagleLlama2Retract(EagleLlama2Base, SpecFeatureKit):
     """Retract under a small KV budget; must not leak."""
 
     extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract

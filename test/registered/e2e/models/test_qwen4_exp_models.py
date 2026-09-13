@@ -42,7 +42,6 @@ class _Qwen4ExpServer:
     speculative_args: list[str] = []
     model = try_cached_model(MODEL)
     base_url = DEFAULT_URL_FOR_TEST
-    gsm8k_backend = "sgl_eval"
     gsm8k_thinking = True
     gsm8k_num_examples = 200
     gsm8k_num_threads = 32

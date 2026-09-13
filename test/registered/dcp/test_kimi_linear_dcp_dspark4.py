@@ -192,11 +192,9 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
                     base_url=self.base_url,
                     model=KIMI_LINEAR_MODEL,
                     eval_name="gsm8k",
-                    api="completion",
                     max_tokens=512,
                     num_examples=200,
                     num_threads=GSM8K_NUM_THREADS,
-                    num_shots=5,
                 )
             )
             return captured_outputs + max_graph_outputs, float(metrics["score"])

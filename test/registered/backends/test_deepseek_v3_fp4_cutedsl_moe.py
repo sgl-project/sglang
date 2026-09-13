@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -62,15 +62,14 @@ class TestDeepseekV3FP4CuteDSLMoEEP4(CustomTestCase):
 
     def test_a_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=1319,
-            parallel=1319,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1319,
+            num_threads=1319,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4-cutedsl-moe-ep4)\n"

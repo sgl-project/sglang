@@ -1,32 +1,27 @@
-"""AMD GROK2 GSM8K Completion Evaluation Test (8-GPU)
+"""AMD GROK2 sgl-eval GSM8K Chat Evaluation Test (8-GPU)
 
-Tests Grok-2 model using few-shot completion benchmark on MI300X.
+Tests Grok-2 model using sgl-eval chat benchmark on MI300X.
 
 Registry: nightly-amd-8-gpu-grok2 suite
 """
 
-import ast
 import os
-import re
-import time
 import unittest
-
-import numpy as np
+from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - GROK2 accuracy tests (~25 min)
 register_amd_ci(est_time=1500, suite="nightly-amd-accuracy-8-gpu-grok2", nightly=True)
 
-INVALID = -9999999
 
 GROK2_MODEL_PATH = os.environ.get("GROK2_MODEL_PATH", "xai-org/grok-2")
 GROK2_TOKENIZER_PATH = os.environ.get(
@@ -34,70 +29,22 @@ GROK2_TOKENIZER_PATH = os.environ.get(
 )
 
 
-def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def get_few_shot_examples(lines, k):
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
-
-
-def get_answer_value(answer_str):
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
-        return INVALID
-    try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
-        return INVALID
-
-
-def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
-
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
-    questions = []
-    labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    arguments = [{"question": q} for q in questions]
-
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+def run_gsm8k_benchmark(base_url, num_questions=200, parallel=64):
+    """Run the canonical sgl-eval GSM8K benchmark."""
+    metrics = run_eval(
+        SimpleNamespace(
+            eval_name="gsm8k",
+            base_url=base_url,
+            num_examples=num_questions,
+            num_threads=parallel,
+            max_tokens=2048,
         )
-
-    backend = RuntimeEndpoint(base_url)
-    sgl.set_default_backend(backend)
-
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments, temperature=0, num_threads=parallel, progress_bar=True
     )
-    latency = time.perf_counter() - tic
-
-    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
-    acc = np.mean(np.array(preds) == np.array(labels))
-    return float(acc), float(latency)
+    return metrics["score"], metrics["latency"]
 
 
 class TestGrok2EvalAMD(unittest.TestCase):
-    """GROK2 GSM8K Completion Evaluation Test for AMD MI300X."""
+    """GROK2 sgl-eval GSM8K Chat Evaluation Test for AMD MI300X."""
 
     @classmethod
     def setUpClass(cls):
@@ -106,7 +53,7 @@ class TestGrok2EvalAMD(unittest.TestCase):
         cls.accuracy_threshold = 0.915
 
     def test_grok2_accuracy(self):
-        """Test Grok-2 with GSM8K completion benchmark."""
+        """Test Grok-2 with sgl-eval GSM8K chat benchmark."""
         env = os.environ.copy()
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"

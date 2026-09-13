@@ -1,6 +1,6 @@
-"""AMD Kimi-K2.6 GSM8K Completion Evaluation Test (8-GPU)
+"""AMD Kimi-K2.6 sgl-eval GSM8K Chat Evaluation Test (8-GPU)
 
-Tests moonshotai/Kimi-K2.6 with GSM8K few-shot benchmark on MI325.
+Tests moonshotai/Kimi-K2.6 with sgl-eval GSM8K benchmark on MI325.
 
 Kimi-K2.6 shares the same architecture as Kimi-K2.5 (per the model card the
 deployment method is directly reused), so the AMD server arguments match the
@@ -17,7 +17,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -38,7 +38,7 @@ TP_SIZE = 8
 
 
 class TestKimiK26EvalAMD(CustomTestCase):
-    """Kimi-K2.6 GSM8K Completion Evaluation Test for AMD MI325."""
+    """Kimi-K2.6 sgl-eval GSM8K Chat Evaluation Test for AMD MI325."""
 
     @classmethod
     def setUpClass(cls):
@@ -71,19 +71,18 @@ class TestKimiK26EvalAMD(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_kimi_k26_gsm8k_accuracy(self):
-        """Test Kimi-K2.6 with GSM8K few-shot completion benchmark."""
+        """Test Kimi-K2.6 with sgl-eval sgl-eval GSM8K chat benchmark."""
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=1319,
-            parallel=1319,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1319,
+            num_threads=1319,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         acc = metrics["accuracy"]
 
         passed = acc >= ACCURACY_THRESHOLD

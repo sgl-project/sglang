@@ -45,10 +45,9 @@ bench:
 
   # Correctness gate run through the PD path after the perf sweep. Mirrors the
   # single-node registered test test/registered/amd/test_deepseek_v4_flash_fp8.py
-  # (full GSM8K, 8-shot, accuracy > 0.91). A regression here fails the nightly
+  # (full sgl-eval GSM8K, sgl-eval chat, accuracy > 0.91). A regression here fails the nightly
   # even when throughput looks fine ("fast but wrong").
   accuracy:
     enabled: true
-    num_shots: 8
     num_questions: 1319    # full GSM8K test set
     threshold: 0.91

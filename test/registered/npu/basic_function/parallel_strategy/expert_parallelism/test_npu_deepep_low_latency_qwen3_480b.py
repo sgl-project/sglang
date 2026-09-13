@@ -80,7 +80,6 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     # GSM8K Configs
     accuracy = 0.91  # GSM8K accuracy ≥0.91
     num_questions = 200
-    gsm8k_num_shots = 8
 
 
 if __name__ == "__main__":

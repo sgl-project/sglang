@@ -49,7 +49,6 @@ class TestNvidiaNemotron3SuperBF16(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=200,
             max_tokens=16000,
             num_threads=200,

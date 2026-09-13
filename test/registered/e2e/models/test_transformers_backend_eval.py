@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import (
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=66, stage="base-b", runner_config="1-gpu-small")
@@ -32,11 +32,10 @@ class TestTransformersBackendEval(DefaultServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=self.gsm8k_num_questions,
-            max_new_tokens=512,
-            parallel=self.gsm8k_parallel,
+            eval_name="gsm8k",
+            num_examples=self.gsm8k_num_questions,
+            max_tokens=512,
+            num_threads=self.gsm8k_parallel,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
