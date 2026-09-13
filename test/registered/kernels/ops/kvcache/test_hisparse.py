@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    load_blocks_to_device_buffer_mha,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
@@ -348,6 +349,83 @@ def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     )
     assert torch.equal(
         state["lru_slots"].cpu(), torch.tensor([[0, 3, 1, 2]], dtype=torch.int16)
+    )
+
+
+def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block() -> None:
+    """A partial newest block must not consume slots for its invalid tail."""
+    sparse_block_size = 4
+    hot_buffer_size = 8
+    host_k = _host_cache()
+    host_v = _host_cache()
+    host_v.add_(1000)
+    device_k = torch.full(
+        (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
+    device_v = torch.full_like(device_k, -1)
+    device_buffer_locs = torch.arange(
+        hot_buffer_size + 1, dtype=torch.int32, device=DEVICE
+    ).view(1, -1)
+    device_buffer_tokens = torch.tensor(
+        [[0, 1, 2, 3, -1, -1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    for slot, token in enumerate([0, 1, 2, 3]):
+        device_k[device_buffer_locs[0, slot]].copy_(host_k[token], non_blocking=True)
+        device_v[device_buffer_locs[0, slot]].copy_(host_v[token], non_blocking=True)
+    device_k[device_buffer_locs[0, hot_buffer_size]].copy_(
+        host_k[10], non_blocking=True
+    )
+    device_v[device_buffer_locs[0, hot_buffer_size]].copy_(
+        host_v[10], non_blocking=True
+    )
+
+    top_k_blocks = torch.tensor([[0, 2]], dtype=torch.int32, device=DEVICE)
+    out = torch.full(
+        (1, top_k_blocks.size(1) * sparse_block_size),
+        -1,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE).view(
+        1, -1
+    )
+    load_blocks_to_device_buffer_mha(
+        top_k_blocks=top_k_blocks,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=torch.arange(
+            HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
+        ).view(1, -1),
+        device_buffer_locs=device_buffer_locs,
+        host_cache_k=host_k,
+        host_cache_v=host_v,
+        device_buffer_k=device_k,
+        device_buffer_v=device_v,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([11], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=ITEM_SIZE_BYTES,
+        hot_buffer_size=hot_buffer_size,
+        sparse_block_size=sparse_block_size,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        out.cpu(), torch.tensor([[0, 1, 2, 3, 4, 5, 8, -1]], dtype=torch.int32)
+    )
+    assert torch.equal(device_k[4].cpu(), host_k[8])
+    assert torch.equal(device_v[4].cpu(), host_v[8])
+    assert torch.equal(device_k[5].cpu(), host_k[9])
+    assert torch.equal(device_v[5].cpu(), host_v[9])
+    assert torch.equal(
+        device_buffer_tokens.cpu(),
+        torch.tensor([[0, 1, 2, 3, 8, 9, -1, -1, -1]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        lru_slots.cpu(), torch.tensor([[6, 7, 4, 5, 0, 1, 2, 3]], dtype=torch.int16)
     )
 
 
