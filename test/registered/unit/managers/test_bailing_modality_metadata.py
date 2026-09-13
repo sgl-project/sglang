@@ -44,7 +44,9 @@ class TestBailingModalityMetadata(CustomTestCase):
             input_ids=[100, 11, 11, 101, 12, 12, 102],
         )
 
-        inputs = MultimodalInputs.from_processor_output(output)
+        inputs = MultimodalInputs.from_processor_output(
+            output, requires_mm_token_modalities=True
+        )
 
         self.assertEqual(
             inputs.token_modalities,
@@ -60,6 +62,21 @@ class TestBailingModalityMetadata(CustomTestCase):
         )
         self.assertNotEqual(items[0].pad_value, 11)
         self.assertNotEqual(items[1].pad_value, 12)
+
+    def test_offset_validation_only_runs_for_multirouter(self):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(1, 3)],
+            feature=torch.ones(1),
+        )
+        output = MultimodalProcessorOutput(mm_items=[item], input_ids=[100, 101])
+
+        inputs = MultimodalInputs.from_processor_output(output)
+        self.assertIsNone(inputs.token_modalities)
+        with self.assertRaisesRegex(ValueError, "Invalid multimodal token offsets"):
+            MultimodalInputs.from_processor_output(
+                output, requires_mm_token_modalities=True
+            )
 
     def test_chunked_metadata_is_identical_on_every_pp_stage(self):
         """Each PP stage must independently receive the same active token map."""

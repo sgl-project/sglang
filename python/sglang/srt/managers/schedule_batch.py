@@ -732,7 +732,9 @@ class MultimodalInputs:
                 item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: MultimodalProcessorOutput):
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+    ):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
@@ -773,8 +775,10 @@ class MultimodalInputs:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
-        token_modalities = MultimodalProcessorOutput.build_token_modalities(
-            obj.input_ids, mm_items
+        token_modalities = (
+            MultimodalProcessorOutput.build_token_modalities(obj.input_ids, mm_items)
+            if requires_mm_token_modalities
+            else None
         )
 
         for item in mm_items:

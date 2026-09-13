@@ -2163,7 +2163,8 @@ class Scheduler(
                     tokenized_req.mm_inputs, MultimodalInputs
                 ):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
-                        tokenized_req.mm_inputs
+                        tokenized_req.mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
             except Exception as error:
                 local_error = f"{type(error).__name__}: {error}"
@@ -2590,7 +2591,10 @@ class Scheduler(
         if self.dp_tp_group.rank_in_group == 0:
             try:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
             except Exception as error:
                 result = _MultimodalInputBroadcast(
@@ -2621,7 +2625,10 @@ class Scheduler(
                 result = obj_list[0]
             else:
                 result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                    inputs=MultimodalInputs.from_processor_output(
+                        raw_mm_inputs,
+                        requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+                    )
                 )
 
         if result.error is not None:
@@ -2636,7 +2643,10 @@ class Scheduler(
 
         if get_mm().enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs)
-        return MultimodalInputs.from_processor_output(mm_inputs)
+        return MultimodalInputs.from_processor_output(
+            mm_inputs,
+            requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
+        )
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
