@@ -24,7 +24,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
     )
 if _is_cuda or _is_hip:
@@ -351,19 +353,13 @@ class MambaPoolHost(HostKVCache):
                 src_layout_dim=item_size * num_layers,
             )
         elif io_backend == "direct":
-            if src_indices.device.type != "cuda":
-                src_indices = src_indices.to(dst.device, non_blocking=True)
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(dst.device, non_blocking=True)
-            item_size = MambaPoolHost._item_size_per_index(dst)
-            transfer_kv_mamba_pf_lf(
-                src=src,
-                dst=dst,
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[src],
+                dst_ptrs=[dst],
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 layer_id=layer_id,
-                item_size=item_size,
-                src_layout_dim=item_size * num_layers,
+                page_size=1,
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
@@ -400,19 +396,13 @@ class MambaPoolHost(HostKVCache):
                 num_layers=num_layers,
             )
         elif io_backend == "direct":
-            if src_indices.device.type != "cuda":
-                src_indices = src_indices.to(src_layers.device, non_blocking=True)
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(src_layers.device, non_blocking=True)
-            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            transfer_kv_mamba_lf_pf(
+            src_ptrs = [src_layers[i] for i in range(num_layers)]
+            transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=src_ptrs,
-                dst=dst,
+                dst_ptrs=[dst],
                 src_indices=src_indices,
                 dst_indices=dst_indices,
-                item_size=item_size,
-                dst_layout_dim=item_size * num_layers,
-                num_layers=num_layers,
+                page_size=1,
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
