@@ -5,7 +5,7 @@ Day-0 recipe as the accuracy test (sgl-project/sglang#32548), so the two are
 directly comparable and a perf regression cannot be confused with a config
 difference.
 
-This runs as the step after the eval inside nightly-8-gpu-mi35x-kimi-k3-rocm720
+This runs as the step after the eval inside nightly-8-gpu-mi35x-kimi-k3
 rather than as a job of its own, which is how every other combined accuracy plus
 performance job in that workflow is arranged. Sharing the job means the 1.56 TB
 checkpoint is already in the container cache, and it takes one 8-GPU MI35x slot

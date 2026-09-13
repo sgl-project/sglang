@@ -45,7 +45,6 @@ on:
           - rocm10
           - rocm724
           - rocm720
-          - rocm700
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
