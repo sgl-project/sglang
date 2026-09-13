@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -51,6 +52,57 @@ def test_real_process_counters():
     assert sample["minor_faults"] >= 0
     assert sample["major_faults"] >= 0
     assert sample["io"]["read_bytes"] >= 0
+    assert set(sample["kernel"]) == {"syscall", "wchan"}
+
+
+def test_kernel_sample_does_not_retain_arguments(monkeypatch):
+    def read(path):
+        return (
+            "16 0xsecret 0xprivate 0xaddress\n"
+            if path.name == "syscall"
+            else "futex_wait_queue\n"
+        )
+
+    monkeypatch.setattr(perf_diagnostics.Path, "read_text", read)
+    assert perf_diagnostics._kernel_sample(123) == {
+        "syscall": "16",
+        "wchan": "futex_wait_queue",
+    }
+
+
+def test_restricted_kernel_sample_preserves_process_counters(monkeypatch):
+    original = perf_diagnostics.Path.read_text
+
+    def read(path):
+        if path.name in ("syscall", "wchan"):
+            raise PermissionError()
+        return original(path)
+
+    monkeypatch.setattr(perf_diagnostics.Path, "read_text", read)
+    sample = perf_diagnostics._process_sample(psutil.Process())
+    assert sample["rss_bytes"] > 0
+    assert sample["kernel"] == {
+        "syscall": {"error": "PermissionError"},
+        "wchan": {"error": "PermissionError"},
+    }
+
+
+def test_live_child_kernel_sample():
+    with subprocess.Popen(
+        [sys.executable, "-c", "print('ready', flush=True); input()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert child.stdout.readline().strip() == "ready"
+            sample = perf_diagnostics._process_sample(psutil.Process(child.pid))
+            assert sample["pid"] == child.pid
+            assert set(sample["kernel"]) == {"syscall", "wchan"}
+            for value in sample["kernel"].values():
+                assert isinstance(value, dict) or value is None or " " not in value
+        finally:
+            child.communicate("\n", timeout=5)
 
 
 def test_unavailable_gpu_field_is_explicit():

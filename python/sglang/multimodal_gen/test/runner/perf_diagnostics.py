@@ -68,7 +68,21 @@ def _process_sample(process):
             "minor_faults": int(stat[7]),
             "major_faults": int(stat[9]),
             "context_switches": process.num_ctx_switches()._asdict(),
+            "kernel": _kernel_sample(process.pid),
         }
+
+
+def _kernel_sample(pid):
+    # sample the main thread without ptrace; never retain syscall arguments
+    result = {}
+    for name in ("wchan", "syscall"):
+        try:
+            value = Path(f"/proc/{pid}/{name}").read_text().strip()
+            result[name] = value.split()[0] if value else None
+        except OSError as exc:
+            # restricted procfs must not discard the other process counters
+            result[name] = {"error": type(exc).__name__}
+    return result
 
 
 def _nvml_value(call, *args):
@@ -148,6 +162,7 @@ class AttemptDiagnostics:
                 attempt=attempt,
                 commit=commit.stdout.strip() if commit.returncode == 0 else None,
                 packages=packages,
+                machine=os.uname().machine,
                 run_id=os.environ.get("GITHUB_RUN_ID"),
                 run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),
                 partition=os.environ.get("DIFFUSION_PARTITION_ID"),
