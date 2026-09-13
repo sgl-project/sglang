@@ -22,7 +22,11 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm4_moe_detector import (
+    Glm4MoeDetector,
+    GlmSpecialTokenConfig,
+    generate_glm_grammar,
+)
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
@@ -119,6 +123,10 @@ class FunctionCallParser:
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
+        if isinstance(detector, Glm47MoeDetector):
+            detector.use_full_assistant_constraint = not any(
+                tool.function.strict for tool in tools
+            )
         self.detector = detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
@@ -272,8 +280,35 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
 
-        # Highest priority: model-native structural_tag when available.
         try:
+            if (
+                isinstance(self.detector, Glm47MoeDetector)
+                and self.detector.use_full_assistant_constraint
+            ):
+                functions = (
+                    [
+                        tool.function
+                        for tool in self.tools
+                        if not isinstance(tool_choice, ToolChoice)
+                        or tool.function.name == tool_choice.function.name
+                    ]
+                    if self.tools and tool_choice != "none"
+                    else None
+                )
+                return (
+                    "full_assistant_ebnf",
+                    generate_glm_grammar(
+                        enable_thinking=thinking_mode,
+                        functions=functions,
+                        special_tokens=GlmSpecialTokenConfig(),
+                        chat_template_version="glm47",
+                        accommodate_chat_template=True,
+                        allow_multiple_assistant_turns=False,
+                        required=is_required,
+                        parallel_tool_calls=parallel_tool_calls,
+                    ),
+                )
+            # Highest priority: model-native structural_tag when available.
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
