@@ -213,15 +213,16 @@ class TestDSV4FlashInferTopK(CustomTestCase):
 class TestDSV4TopKDispatch(CustomTestCase):
     def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
         page_table = torch.zeros((1, 1), dtype=torch.int32)
-        c4_seq_lens = torch.ones(1, dtype=torch.int32)
+        compressed_seq_lens = torch.ones(1, dtype=torch.int32)
         page_indices = torch.full((1, 512), -1, dtype=torch.int32)
         raw_indices = torch.full_like(page_indices, -1)
         topk_metadata = torch.zeros((2, 2), dtype=torch.int32)
 
         indexer_metadata = object.__new__(PagedIndexerMetadata)
         indexer_metadata.page_size = 256
+        indexer_metadata.compressed_page_size = 64
         indexer_metadata.page_table = page_table
-        indexer_metadata.c4_seq_lens = c4_seq_lens
+        indexer_metadata.compressed_seq_lens = compressed_seq_lens
         indexer_metadata.topk_metadata = topk_metadata
 
         logits = torch.empty((1, 65), dtype=torch.float32)
@@ -272,7 +273,7 @@ class TestDSV4TopKDispatch(CustomTestCase):
         topk_v2.assert_called_once()
         args = topk_v2.call_args.args
         self.assertIs(args[0], logits)
-        torch.testing.assert_close(args[1], c4_seq_lens)
+        torch.testing.assert_close(args[1], compressed_seq_lens)
         torch.testing.assert_close(args[2], page_table)
         torch.testing.assert_close(args[3], page_indices)
         self.assertEqual(args[4], 64)
