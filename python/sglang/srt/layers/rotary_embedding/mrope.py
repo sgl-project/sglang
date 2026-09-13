@@ -250,6 +250,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)

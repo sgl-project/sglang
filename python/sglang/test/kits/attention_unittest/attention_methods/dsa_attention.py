@@ -240,6 +240,7 @@ class TinyDSAModelConfig:
         self.kv_lora_rank = kv_lora_rank
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
