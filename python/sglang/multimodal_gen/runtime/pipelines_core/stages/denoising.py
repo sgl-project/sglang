@@ -2254,6 +2254,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 len(cfg_policy.branches) == 2
                 and get_classifier_free_guidance_world_size() == 2
+                and not cfg_policy.parallel_uses_serial_arithmetic
             ):
                 return run_two_branch_cfg_parallel(
                     cfg_policy,
