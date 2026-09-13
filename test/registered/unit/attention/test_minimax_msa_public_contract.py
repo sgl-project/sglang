@@ -243,6 +243,44 @@ def test_prefill_forwards_tp4_public_contract(monkeypatch):
     }
 
 
+def test_prefill_splits_ragged_eager_batches_without_device_length_reads(monkeypatch):
+    q, k, v, q2k, page_table, seq_lens = _production_inputs()
+    q = q[:3]
+    q2k = q2k[:, :3]
+    public_prefill = Mock(side_effect=lambda **kwargs: kwargs["q"])
+    monkeypatch.setattr(
+        msa,
+        "_load_flashinfer_msa",
+        lambda: (public_prefill, Mock(), Mock(), Mock()),
+    )
+
+    out = msa._flashinfer_prefill(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        topk_idx=q2k,
+        req_to_token=torch.empty(2, 256, dtype=torch.int32),
+        slot_ids=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1, 3], dtype=torch.int32),
+        seq_lens=seq_lens,
+        prefix_lens=torch.tensor([127, 254], dtype=torch.int32),
+        block_size_k=128,
+        sm_scale=128**-0.5,
+        page_table=page_table,
+        graph_state=None,
+        seqlens_cpu=[1, 2],
+    )
+
+    assert torch.equal(out, q)
+    assert public_prefill.call_count == 2
+    first, second = [call.kwargs for call in public_prefill.call_args_list]
+    assert first["q"].shape[0] == 1
+    assert second["q"].shape[0] == 2
+    assert first["cu_seqlens_q"].tolist() == [0, 1]
+    assert second["cu_seqlens_q"].tolist() == [0, 2]
+    assert first["page_table"].shape[0] == second["page_table"].shape[0] == 1
+
+
 def test_decode_forwards_tp4_public_contract(monkeypatch):
     q, k, v, q2k, page_table, seq_lens = _production_inputs()
     q = q[:2]

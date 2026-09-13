@@ -432,6 +432,7 @@ def _flashinfer_prefill(
     sm_scale: float | None,
     page_table: torch.Tensor | None,
     graph_state: FlashInferMSAGraphState | None,
+    seqlens_cpu: list[int] | None = None,
 ) -> torch.Tensor:
     prefill, _, _, _ = _load_flashinfer_msa()
     if topk_idx.shape[-1] != 16:
@@ -460,20 +461,63 @@ def _flashinfer_prefill(
         kv_lens = graph_state.stage("seqused_k", kv_lens)
         q_offsets = graph_state.stage("q_offset", q_offsets)
         workspace = graph_state.workspace
-    try:
+
+    def run_prefill(
+        q_arg: torch.Tensor,
+        q2k_arg: torch.Tensor,
+        cu_q_arg: torch.Tensor,
+        page_table_arg: torch.Tensor,
+        kv_lens_arg: torch.Tensor,
+        q_offsets_arg: torch.Tensor,
+        workspace_arg,
+    ) -> torch.Tensor:
         return prefill(
-            q=q,
+            q=q_arg,
             k=k_paged,
             v=v_paged,
-            q2k_indices=q2k,
-            cu_seqlens_q=cu_q,
+            q2k_indices=q2k_arg,
+            cu_seqlens_q=cu_q_arg,
             causal=True,
             softmax_scale=sm_scale,
-            page_table=page_table,
-            seqused_k=kv_lens,
-            q_offset=q_offsets,
-            workspace=workspace,
+            page_table=page_table_arg,
+            seqused_k=kv_lens_arg,
+            q_offset=q_offsets_arg,
+            workspace=workspace_arg,
         )
+
+    try:
+        if seqlens_cpu and len(set(seqlens_cpu)) > 1:
+            if graph_state is not None:
+                raise MSAUnavailableError(
+                    "ragged FlashInfer MSA prefill is only supported outside CUDA graph capture"
+                )
+            if (
+                len(seqlens_cpu) != page_table.shape[0]
+                or sum(seqlens_cpu) != q.shape[0]
+            ):
+                raise MSAUnavailableError(
+                    "ragged FlashInfer MSA prefill received inconsistent CPU lengths"
+                )
+            outputs = []
+            q_start = 0
+            for request_index, q_len in enumerate(seqlens_cpu):
+                q_end = q_start + q_len
+                if q_len:
+                    outputs.append(
+                        run_prefill(
+                            q[q_start:q_end],
+                            q2k[:, q_start:q_end],
+                            cu_q[request_index : request_index + 2]
+                            - cu_q[request_index],
+                            page_table[request_index : request_index + 1],
+                            kv_lens[request_index : request_index + 1],
+                            q_offsets[request_index : request_index + 1],
+                            None,
+                        )
+                    )
+                q_start = q_end
+            return torch.cat(outputs, dim=0)
+        return run_prefill(q, q2k, cu_q, page_table, kv_lens, q_offsets, workspace)
     except (AttributeError, TypeError, ValueError) as err:
         raise MSAUnavailableError("FlashInfer MSA prefill rejected the call") from err
 
@@ -496,6 +540,7 @@ def msa_sparse_prefill_main(
     page_table: torch.Tensor | None = None,
     graph_state: FlashInferMSAGraphState | None = None,
     backend: str | None = None,
+    seqlens_cpu: list[int] | None = None,
 ) -> torch.Tensor:
     """Drop-in for flash_prefill_with_gqa_share_sparse using MSA fmha_sm100.
 
@@ -529,6 +574,7 @@ def msa_sparse_prefill_main(
             sm_scale=sm_scale,
             page_table=page_table,
             graph_state=graph_state,
+            seqlens_cpu=seqlens_cpu,
         )
     if backend != "fmha_sm100":
         raise MSAUnavailableError("no MSA prefill backend supports this input")

@@ -171,6 +171,7 @@ def minimax_sparse_prefill(
                 backend=msa_backend,
                 page_table=msa_page_table,
                 graph_state=msa_graph_state,
+                seqlens_cpu=seqlens_cpu,
             )
         except MSAUnavailableError as err:
             from .msa import msa_runtime_fallback_allowed
