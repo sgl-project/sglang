@@ -2952,6 +2952,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
+        # Use the cached backend: the global differs under speculative decoding.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
@@ -2985,7 +2986,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path
-        if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
+        if moe_runner_backend.is_flashinfer_trtllm() and hasattr(layer, "g1_scale_c"):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
@@ -3021,7 +3022,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return self.runner.run(dispatch_output, quant_info)
 
-        if self.enable_flashinfer_cutedsl_moe:
+        if moe_runner_backend.is_flashinfer_cutedsl():
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                 CuteDslFp4MoeQuantInfo,
                 ensure_cutedsl_wrapper,
@@ -3077,7 +3078,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             return self.runner.run(dispatch_output, quant_info)
 
-        if self.enable_flashinfer_cutlass_moe:
+        if moe_runner_backend.is_flashinfer_cutlass():
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 FlashInferCutlassMoeQuantInfo,
             )
