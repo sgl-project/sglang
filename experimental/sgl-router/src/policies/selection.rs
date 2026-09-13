@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prefill worker selection: the ladder that turns a policy proposal into a
-//! committed worker.
+//! Worker selection: the two ladders that turn a policy proposal into a
+//! committed worker — [`select_prefill_worker`] and [`select_decode_peer`].
 //!
-//! WHY this is a module rather than a block inside the chat handler: the ladder
-//! has several rungs — cache-candidate resolution, the global session-affinity
-//! probe, per-domain admission, the capacity fallback — and each rung fails into
-//! the next. Rungs get added over time, and the assertions worth writing are
-//! almost always about the ladder as a whole ("a saturated fleet still routes",
-//! "a sampled choice never lands on a rejected worker"), not about one rung in
-//! isolation. Written as closures inside an HTTP handler those assertions can
-//! only be expressed as end-to-end HTTP tests; written here they are unit tests.
+//! WHY this is a module rather than a block inside the chat handler: each
+//! ladder has several rungs — cache-candidate resolution, the global
+//! session-affinity probe, per-domain admission, the capacity fallback — and
+//! each rung fails into the next. Rungs get added over time, and the
+//! assertions worth writing are almost always about a ladder as a whole ("a
+//! saturated fleet still routes", "a sampled choice never lands on a rejected
+//! worker"), not about one rung in isolation. Written as closures inside an
+//! HTTP handler those assertions can only be expressed as end-to-end HTTP
+//! tests; written here they are unit tests.
+//!
+//! Both ladders live here rather than one per module because `CandidateDomain`
+//! already carries `stage: RoutingStage`: prefill and decode are two
+//! configurations of one idea, so a rung added to one and not the other has to
+//! be visible on one screen.
 //!
 //! The module owns the decision and reports why; it does not own the HTTP
 //! response. Mapping a failed selection onto a status code stays in the route.
@@ -38,13 +44,12 @@ use crate::workers::Worker;
 /// Everything one prefill selection reads. Collaborators first, then the
 /// per-request facts.
 pub(crate) struct PrefillSelectionInputs<'a> {
-    pub policy: &'a Arc<dyn Policy>,
+    pub policy: &'a dyn Policy,
     pub policy_kind: PolicyKind,
     pub bucket_selector: &'a BucketSelector,
     pub metrics: &'a MetricsRegistry,
+    /// Names the model in the selection context and in the log lines.
     pub model_id: &'a ModelId,
-    /// Model name, for log lines only.
-    pub model_str: &'a str,
     pub body: Option<&'a [u8]>,
     pub routing_key: Option<&'a str>,
     pub session_id: Option<&'a str>,
@@ -57,45 +62,48 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     /// two in step for the ingress caller.
     pub load_snapshot: Option<&'a EngineLoadSnapshot>,
     pub workers: &'a [Arc<Worker>],
-    pub bucket_request: BucketRequest,
+    pub ttft_slo_ms: Option<u64>,
+    pub tps_slo: Option<f64>,
     /// The configured mode. Without Bucket partitioning all modes reduce to
     /// the single global domain, and the ladder applies that reduction itself.
     pub session_affinity_mode: SessionAffinityMode,
 }
 
-/// The outcome of one selection: the worker if the ladder found one, and the
-/// reason the last rung to record one gave. `failure_reason` is meaningful
-/// only when `selected` is `None`.
-pub(crate) struct PrefillSelection {
-    pub selected: Option<Arc<Worker>>,
-    pub failure_reason: PolicySelectionFailureReason,
-}
-
-/// Runs the prefill selection ladder.
-pub(crate) fn select_prefill_worker(inputs: &PrefillSelectionInputs<'_>) -> PrefillSelection {
+/// Runs the prefill selection ladder. `Err` carries the reason the last rung
+/// to record one gave up with; the route maps it onto a status code.
+pub(crate) fn select_prefill_worker(
+    inputs: &PrefillSelectionInputs<'_>,
+) -> Result<Arc<Worker>, PolicySelectionFailureReason> {
     let mut selector = Selector {
         inputs,
+        // Prefill reserves no peak sequence room: the decode peer, not the
+        // prefill worker, holds the KV for the tokens still to be generated.
+        bucket_request: BucketRequest {
+            input_tokens: inputs.request_input_tokens,
+            expected_peak_sequence_tokens: None,
+            ttft_slo_ms: inputs.ttft_slo_ms,
+            tps_slo: inputs.tps_slo,
+        },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
     };
     let selected = selector.run();
-    PrefillSelection {
-        selected,
-        failure_reason: selector.failure_reason,
-    }
+    selected.ok_or(selector.failure_reason)
 }
 
-/// Carries the failure reason across rungs. Each rung that gives up overwrites
-/// it, so the reported reason is the one the last rung to record any gave —
-/// a rung that returns `None` without recording leaves the previous reason
-/// standing.
+/// Carries the per-request bucket request and the failure reason across rungs.
+/// Each rung that gives up overwrites the reason, so the reported one is what
+/// the last rung to record any gave — a rung that returns `None` without
+/// recording leaves the previous reason standing.
 struct Selector<'a> {
     inputs: &'a PrefillSelectionInputs<'a>,
+    bucket_request: BucketRequest,
     failure_reason: PolicySelectionFailureReason,
 }
 
 impl<'a> Selector<'a> {
     fn run(&mut self) -> Option<Arc<Worker>> {
         let inputs = self.inputs;
+        let bucket_request = self.bucket_request;
         // Without Bucket partitioning all modes reduce to the single global
         // domain, so reduce once here rather than trusting every caller to.
         let session_affinity_mode = if inputs.bucket_selector.is_enabled() {
@@ -133,32 +141,38 @@ impl<'a> Selector<'a> {
                 inputs.bucket_selector.prefill_affinity_domain(
                     inputs.workers,
                     &primary,
-                    inputs.bucket_request,
+                    bucket_request,
                 )
             })
             // Rebuild the backup inside the primary's own Bucket.
             .and_then(|domain| self.select_in_domain(&domain, true, false, false));
 
         cache_winner.or_else(|| {
-            // Materialize normal domains only when Cache-Aware has no winner.
-            let prefill_domains = inputs
-                .bucket_selector
-                .prefill_domains(inputs.workers, inputs.bucket_request);
+            // Materializing the normal domains clones the member list of every
+            // Bucket, so build them only on the rung that actually reads them.
+            let prefill_domains = || {
+                inputs
+                    .bucket_selector
+                    .prefill_domains(inputs.workers, bucket_request)
+            };
             if inputs.policy_kind == PolicyKind::CacheAware {
                 // Cache miss or failure retries ordered domains with ordinary P2.
-                return self.select_domains(&prefill_domains, false, false);
+                return self.select_domains(&prefill_domains(), false, false);
             }
-            global_affinity_worker.or_else(|| match session_affinity_mode {
+            if let Some(worker) = global_affinity_worker {
+                return Some(worker);
+            }
+            match session_affinity_mode {
                 SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
-                    self.select_domains(&prefill_domains, true, true)
+                    self.select_domains(&prefill_domains(), true, true)
                 }
                 SessionAffinityMode::GlobalPreserve => {
-                    self.select_domains(&prefill_domains, false, false)
+                    self.select_domains(&prefill_domains(), false, false)
                 }
                 SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
-                    self.select_domains(&prefill_domains, true, true)
+                    self.select_domains(&prefill_domains(), true, true)
                 }
-            })
+            }
         })
     }
 
@@ -175,6 +189,7 @@ impl<'a> Selector<'a> {
 
     fn cache_winner(&mut self) -> Option<Arc<Worker>> {
         let inputs = self.inputs;
+        let bucket_request = self.bucket_request;
         if inputs.policy_kind != PolicyKind::CacheAware {
             return None;
         }
@@ -183,7 +198,7 @@ impl<'a> Selector<'a> {
         let cache_ctx = self
             .base_context(global_range.id)
             .with_load_snapshot(snapshot)
-            .with_prefill_cache_bucket(inputs.bucket_selector, inputs.bucket_request);
+            .with_prefill_cache_bucket(inputs.bucket_selector, bucket_request);
         let PrefillProposal::CacheCandidates(proposal) = inputs
             .policy
             .propose_prefill(global_range.workers, &cache_ctx)?
@@ -215,7 +230,7 @@ impl<'a> Selector<'a> {
             .iter()
             .find(|candidate| candidate.worker.id == decision.selected.id)?;
         tracing::debug!(
-            model = %inputs.model_str,
+            model = %inputs.model_id,
             policy = ?ProposalKind::CacheAffinity,
             range = %decision.candidate_range_id,
             selected = %decision.selected.url,
@@ -331,7 +346,7 @@ impl<'a> Selector<'a> {
                 .metrics
                 .record_policy_decision(&inputs.policy_kind.to_string(), reason);
             tracing::debug!(
-                model = %inputs.model_str,
+                model = %inputs.model_id,
                 policy = ?proposal.kind,
                 range = %decision.candidate_range_id,
                 primary = %decision.primary.url,
@@ -344,7 +359,7 @@ impl<'a> Selector<'a> {
             Some(decision.selected)
         } else {
             tracing::debug!(
-                model = %inputs.model_str,
+                model = %inputs.model_id,
                 policy = ?proposal.kind,
                 range = %candidate_range.id,
                 selected = %proposal.primary.url,
@@ -409,8 +424,8 @@ fn prefill_policy_reason(
 pub(crate) struct DecodeSelectionInputs<'a> {
     pub decode_policy_kind: DecodePolicyKind,
     pub bucket_selector: &'a BucketSelector,
-    /// Model name, for log lines only.
-    pub model_str: &'a str,
+    /// Names the model in the log lines.
+    pub model_id: &'a ModelId,
     /// URL of the committed prefill worker; `legacy_host_affinity` pairs the
     /// decode peer against it.
     pub prefill_url: &'a str,
@@ -419,6 +434,9 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     pub requested_max_output_tokens: Option<u64>,
     pub ttft_slo_ms: Option<u64>,
     pub tps_slo: Option<f64>,
+    /// Required: every rung resolves its proposal against the snapshot, so
+    /// without one the ladder reports no peer at all rather than picking one
+    /// blind.
     pub load_snapshot: Option<&'a EngineLoadSnapshot>,
 }
 
@@ -432,6 +450,9 @@ pub(crate) struct DecodeSelectionInputs<'a> {
 /// `None` means no domain yielded a peer; the route maps that onto its own
 /// status code, as it does for prefill.
 pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<Arc<Worker>> {
+    // Every rung resolves against the snapshot, so without one no domain can
+    // yield a peer and there is nothing worth building.
+    let snapshot = inputs.load_snapshot?;
     let request_kv_tokens = projected_decode_kv_tokens(
         inputs.request_input_tokens,
         inputs.requested_max_output_tokens,
@@ -452,11 +473,10 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         },
     );
     let decode_policy = build_decode_policy(inputs.decode_policy_kind);
+    let decode_ctx = DecodeSelectionContext::new()
+        .with_load_snapshot(snapshot)
+        .with_prefill_url(inputs.prefill_url);
     let select_in_domain = |decode_domain: &CandidateDomain, allow_capacity_fallback: bool| {
-        let snapshot = inputs.load_snapshot?;
-        let decode_ctx = DecodeSelectionContext::new()
-            .with_load_snapshot(snapshot)
-            .with_prefill_url(inputs.prefill_url);
         let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
         let decode_decision = if allow_capacity_fallback {
             resolve_decode_with_capacity_fallback(
@@ -469,7 +489,7 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
             resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)
         }?;
         tracing::debug!(
-            model = %inputs.model_str,
+            model = %inputs.model_id,
             policy = ?inputs.decode_policy_kind,
             range = %decode_decision.candidate_range_id,
             primary = %decode_decision.primary.url,
@@ -500,10 +520,239 @@ fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>)
 
 #[cfg(test)]
 mod tests {
-    use super::{prefill_policy_reason, projected_decode_kv_tokens};
-    use crate::config::PolicyKind;
-    use crate::policies::admission::DecisionReason;
-    use crate::policies::ProposalKind;
+    use super::{
+        prefill_policy_reason, projected_decode_kv_tokens, select_decode_peer,
+        select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
+    };
+    use crate::config::{DecodePolicyKind, PolicyKind, SessionAffinityMode};
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
+    use crate::policies::buckets::BucketSelector;
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::{Policy, ProposalKind, SelectionProposal};
+    use crate::server::metrics::{MetricsRegistry, PolicySelectionFailureReason};
+    use crate::workers::Worker;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    /// `(worker, tokens already held, published KV capacity)`.
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_native_cache_workers(
+            7,
+            entries
+                .iter()
+                .map(|(worker, used, capacity)| {
+                    (
+                        worker.url.clone(),
+                        NativeCacheWorkerLoad {
+                            num_running_reqs: 0,
+                            num_waiting_reqs: 0,
+                            num_waiting_uncached_tokens: 0,
+                            num_used_tokens: *used,
+                            num_total_tokens: *used,
+                            max_total_num_tokens: *capacity,
+                            max_running_requests: 64,
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
+                            captured_at: Instant::now(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Power-of-two prefill, Bucket partitioning off, no session affinity —
+    /// the single global domain, which is what isolates the ladder's rungs.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_inputs<'a>(
+        policy: &'a dyn Policy,
+        bucket_selector: &'a BucketSelector,
+        metrics: &'a MetricsRegistry,
+        model_id: &'a ModelId,
+        workers: &'a [Arc<Worker>],
+        load_snapshot: Option<&'a EngineLoadSnapshot>,
+        request_input_tokens: u64,
+    ) -> PrefillSelectionInputs<'a> {
+        PrefillSelectionInputs {
+            policy,
+            policy_kind: PolicyKind::PowerOfTwo,
+            bucket_selector,
+            metrics,
+            model_id,
+            body: None,
+            routing_key: None,
+            session_id: None,
+            request_input_tokens,
+            request_tokens: None,
+            external_prefix: None,
+            load_snapshot,
+            workers,
+            ttft_slo_ms: None,
+            tps_slo: None,
+            session_affinity_mode: SessionAffinityMode::Bucket,
+        }
+    }
+
+    fn decode_inputs<'a>(
+        bucket_selector: &'a BucketSelector,
+        model_id: &'a ModelId,
+        decode_workers: &'a [Arc<Worker>],
+        load_snapshot: Option<&'a EngineLoadSnapshot>,
+        request_input_tokens: u64,
+    ) -> DecodeSelectionInputs<'a> {
+        DecodeSelectionInputs {
+            decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            bucket_selector,
+            model_id,
+            prefill_url: "http://prefill:30000",
+            decode_workers,
+            request_input_tokens,
+            requested_max_output_tokens: None,
+            ttft_slo_ms: None,
+            tps_slo: None,
+            load_snapshot,
+        }
+    }
+
+    #[test]
+    fn an_empty_fleet_reports_the_proposal_empty_failure() {
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let workers: Vec<Arc<Worker>> = Vec::new();
+        let loads = snapshot(&[]);
+
+        let outcome = select_prefill_worker(&prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            64,
+        ));
+
+        assert!(matches!(
+            outcome,
+            Err(PolicySelectionFailureReason::ProposalEmpty)
+        ));
+    }
+
+    #[test]
+    fn a_saturated_fleet_still_routes_through_the_capacity_fallback() {
+        let full = worker("full");
+        let also_full = worker("also-full");
+        let workers = vec![Arc::clone(&full), Arc::clone(&also_full)];
+        let loads = snapshot(&[(&full, 100, 100), (&also_full, 100, 100)]);
+
+        // Without this the test would pass even if the strict rung had served
+        // the request, and would prove nothing about the fallback rung.
+        let range = CandidateRange::global(&workers);
+        assert!(
+            resolve_prefill_admitted(
+                &range,
+                &SelectionProposal::with_backup(Arc::clone(&full), Arc::clone(&also_full)),
+                64,
+                &loads,
+            )
+            .is_none(),
+            "fixture must saturate every worker so the strict rung admits none",
+        );
+
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+
+        let selected = select_prefill_worker(&prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            64,
+        ))
+        .expect("the capacity fallback must still place the request");
+        assert!(selected.id == full.id || selected.id == also_full.id);
+    }
+
+    #[test]
+    fn a_sampled_choice_never_lands_on_a_rejected_worker() {
+        let full = worker("full");
+        let roomy = worker("roomy");
+        let workers = vec![Arc::clone(&full), Arc::clone(&roomy)];
+        let loads = snapshot(&[(&full, 100, 100), (&roomy, 0, 100_000)]);
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+
+        // Power-of-two samples its pair at random, so one pass proves nothing
+        // about which rung answered.
+        for _ in 0..32 {
+            let selected = select_prefill_worker(&prefill_inputs(
+                &policy,
+                &buckets,
+                &metrics,
+                &model,
+                &workers,
+                Some(&loads),
+                64,
+            ))
+            .expect("one worker has room");
+            assert_eq!(selected.id, roomy.id);
+        }
+    }
+
+    #[test]
+    fn the_decode_ladder_reports_no_peer_without_a_load_snapshot() {
+        let peer = worker("decode");
+        let workers = vec![Arc::clone(&peer)];
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+
+        assert!(select_decode_peer(&decode_inputs(&buckets, &model, &workers, None, 64)).is_none());
+        assert!(
+            select_decode_peer(&decode_inputs(
+                &buckets,
+                &model,
+                &workers,
+                Some(&snapshot(&[(&peer, 0, 100_000)])),
+                64,
+            ))
+            .is_some(),
+            "the same fleet routes as soon as a snapshot is available",
+        );
+    }
+
+    #[test]
+    fn a_saturated_decode_fleet_still_routes_through_the_capacity_fallback() {
+        let full = worker("decode-full");
+        let also_full = worker("decode-also-full");
+        let workers = vec![Arc::clone(&full), Arc::clone(&also_full)];
+        let loads = snapshot(&[(&full, 100, 100), (&also_full, 100, 100)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+
+        let selected =
+            select_decode_peer(&decode_inputs(&buckets, &model, &workers, Some(&loads), 64))
+                .expect("the capacity fallback must still place the decode peer");
+        assert!(selected.id == full.id || selected.id == also_full.id);
+    }
 
     #[test]
     fn decode_kv_projection_includes_the_explicit_output_budget() {
