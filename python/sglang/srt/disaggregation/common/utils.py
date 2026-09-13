@@ -34,6 +34,8 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
+    # Backend-local ownership token used to isolate a reused bootstrap room.
+    room_owner: Optional[str] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

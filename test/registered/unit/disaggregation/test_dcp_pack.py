@@ -255,6 +255,29 @@ class TestTryDcpPack(CustomTestCase):
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
 
+    def test_try_pack_does_not_cross_rank_region(self):
+        pack = torch.zeros(128, dtype=torch.uint8)
+        buf = type(
+            "Buf",
+            (),
+            {
+                "buffer": pack,
+                "get_ptr": lambda self: 0x1000,
+                "get_size": lambda self: pack.numel(),
+            },
+        )()
+
+        packed = try_pack_dcp_src(
+            pack_buffer=buf,
+            kv_data_ptrs=[0x2000],
+            src_token_indices=np.arange(5, dtype=np.int64),
+            token_item_lens=[8],
+            pack_offset_bytes=32,
+            pack_limit_bytes=64,
+        )
+
+        self.assertIsNone(packed)
+
 
 if __name__ == "__main__":
     unittest.main()
