@@ -20,6 +20,11 @@ on:
         type: string
         required: false
         default: 'dev'
+      validation_only:
+        description: "Build and test without publishing wheels"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
@@ -100,9 +105,11 @@ jobs:
           - arch_label: sm90
             runner: 8-gpu-h200
             wheel_arch: x86_64
+            timeout: 60
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
+            timeout: 60
           # The sm120 tests require a runner with RTX 6000. It causes OOM on 5090 runners.
           # - arch_label: sm120
           #   runner: 1-gpu-5090
@@ -110,8 +117,9 @@ jobs:
           - arch_label: sm100-aarch64
             runner: 4-gpu-gb300
             wheel_arch: aarch64
+            timeout: 60
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
 
@@ -138,16 +146,70 @@ jobs:
           # deep_gemm imports torch before loading _C.so, so torch must preload the
           # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
           python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
-          python3 -m pip install numpy
+          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.2"
           python3 -m pip install dist/*.whl
+          # Torch pins NCCL 2.29.7, but this DeepEP wheel requires 2.30.7.
+          # Override it after every dependency-resolving pip command.
+          python3 -m pip install "nvidia-nccl-cu13==2.30.7" --force-reinstall --no-deps
+          nccl_lib=$(python3 -c "from importlib.metadata import distribution; print(distribution('nvidia-nccl-cu13').locate_file('nvidia/nccl/lib'))")
+          export LD_LIBRARY_PATH="${nccl_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
+          python3 - <<'PY'
+          import ctypes
+          import sys
+          import torch
+          import deep_ep
+          from tile_kernels.moe import top2_sum_gate
+
+          # torch.cuda.nccl.version() reports Torch's compiled version, not the loaded library.
+          nccl_version = ctypes.c_int()
+          assert ctypes.CDLL("libnccl.so.2").ncclGetVersion(ctypes.byref(nccl_version)) == 0
+          assert nccl_version.value == 23007, nccl_version.value
+          assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is required"
+          sys.path.insert(0, "DeepGEMM/third-party")
+          from tilelang_ops import ref_mhc
+          assert ref_mhc.has_baseline(), "Mega mHC reference operators are unavailable"
+          print("DeepGEMM test dependencies ready; NCCL:", nccl_version.value)
+          PY
+
+      - name: Install Compute Sanitizer 2025.4.1
+        env:
+          WHEEL_ARCH: ${{ matrix.wheel_arch }}
+        run: |
+          set -euo pipefail
+          # CUDA 13.1.1's standalone sanitizer fixes Python tensor retention in
+          # host backtraces. Keep the wheel and runtime on CUDA 13.0.
+          case "${WHEEL_ARCH}" in
+            x86_64)
+              sanitizer_arch=linux-x86_64
+              sanitizer_sha256=b9637777a31cd0f0ffe1e965523e8b0d382019b8496855fd688c886988583cf4
+              ;;
+            aarch64)
+              sanitizer_arch=linux-sbsa
+              sanitizer_sha256=1dc68ccb146032bcdc9d932569c865d68e3966ecf136940ca38fd7d5abfda4ac
+              ;;
+            *) echo "Unsupported sanitizer architecture: ${WHEEL_ARCH}" >&2; exit 1 ;;
+          esac
+          archive="cuda_sanitizer_api-${sanitizer_arch}-13.1.118-archive"
+          install_dir="${RUNNER_TEMP}/deepgemm-compute-sanitizer"
+          mkdir -p "${install_dir}"
+          curl -fsSL --retry 3 \
+            "https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/${sanitizer_arch}/${archive}.tar.xz" \
+            -o "${install_dir}/${archive}.tar.xz"
+          echo "${sanitizer_sha256}  ${install_dir}/${archive}.tar.xz" | sha256sum -c -
+          tar -xJf "${install_dir}/${archive}.tar.xz" -C "${install_dir}"
+          sanitizer="${install_dir}/${archive}/bin/compute-sanitizer"
+          "${sanitizer}" --version
+          echo "COMPUTE_SANITIZER=${sanitizer}" >> "${GITHUB_ENV}"
 
       - name: Run DeepGEMM test suite
         run: |
           chmod +x "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
-          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh"
+          "${{ github.workspace }}/DeepGEMM/sgl_deep_gemm/run_tests.sh" --release
 
   release-cu130:
+    if: ${{ !inputs.validation_only }}
     needs: [build-cu130-matrix, test-cu130]
     runs-on: ubuntu-latest
     steps:

@@ -794,6 +794,12 @@ class Envs:
     MOONCAKE_TENANT_ID = EnvStr("default")
 
     # ===================================================================
+    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    # ===================================================================
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
+
+    # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
@@ -1538,6 +1544,8 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
