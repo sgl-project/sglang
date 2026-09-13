@@ -475,6 +475,31 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         row.zero_()
         self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
 
+    def _coalesce_adjacent_page_segments(self, segments):
+        """Merge only contiguous row ranges that split one physical page."""
+        merged = []
+        for free_index, start_pos in segments:
+            if free_index.numel() == 0:
+                continue
+            if merged:
+                previous, previous_start = merged[-1]
+                previous_end = previous_start + previous.numel()
+                if (
+                    start_pos == previous_end
+                    and start_pos // self.page_size
+                    == (previous_end - 1) // self.page_size
+                ):
+                    merged[-1] = (torch.cat((previous, free_index)), previous_start)
+                    continue
+            merged.append((free_index, start_pos))
+        return merged
+
+    def free_segments(self, segments):
+        super().free_segments(self._coalesce_adjacent_page_segments(segments))
+
+    def free_full_segments(self, segments):
+        super().free_full_segments(self._coalesce_adjacent_page_segments(segments))
+
     def available_size(self):
         return min(
             super().available_size(),
