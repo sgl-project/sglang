@@ -88,6 +88,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_aux_hidden_state_keys: tuple[str, ...] = (),
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -140,6 +141,10 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            for key in pp_proxy_aux_hidden_state_keys:
+                pp_proxy_tensors[key] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=dtype
                 )
         else:
             pp_proxy_tensors = None
@@ -377,6 +382,9 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_aux_hidden_state_keys=getattr(
+                mr.model, "pp_proxy_aux_hidden_state_keys", ()
+            ),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 

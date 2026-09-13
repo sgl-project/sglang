@@ -3099,7 +3099,15 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        dspark_aux_hidden_states: dict[int, torch.Tensor] = {}
+        if capture_dspark and not self.pp_group.is_first_rank:
+            # Carry completed captures from earlier stages without concatenating
+            # or projecting them at each PP boundary.
+            dspark_aux_hidden_states = {
+                layer_id: pp_proxy_tensors[f"dspark_aux_hidden_states_{layer_id}"]
+                for layer_id in self.dspark_layers_to_capture
+                if layer_id < self.start_layer
+            }
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
@@ -3163,7 +3171,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    dspark_aux_hidden_states[i] = completed.mean(dim=1)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -3171,7 +3179,15 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states.flatten(1),
+                    **{
+                        f"dspark_aux_hidden_states_{layer_id}": aux
+                        for layer_id, aux in dspark_aux_hidden_states.items()
+                    },
+                }
+            )
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -3181,7 +3197,10 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), [
+                dspark_aux_hidden_states[layer_id]
+                for layer_id in self.dspark_layers_to_capture
+            ]
 
         return hidden_states, pre_hc_head
 
@@ -3255,14 +3274,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
+        """Configure global capture layers on every PP rank before graph capture."""
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
+        layer_ids = list(layer_ids)
+        if not layer_ids or len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DSPARK capture layer_ids must be nonempty and unique.")
+        if any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids):
+            raise ValueError(
+                "DSPARK capture layer_ids must be valid model layer indices."
+            )
         self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_layers_to_capture = layer_ids
+        # Graph and warmup inputs only need captures produced before this stage.
+        self.pp_proxy_aux_hidden_state_keys = tuple(
+            f"dspark_aux_hidden_states_{layer_id}"
+            for layer_id in layer_ids
+            if layer_id < self.model.start_layer
+        )
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
