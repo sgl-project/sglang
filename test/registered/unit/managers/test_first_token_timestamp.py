@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def accumulator():
+def accumulator(force_interval=50):
     return _GenerationStreamAccumulator(
         return_logprob=False,
         return_hidden_states=False,
@@ -34,15 +34,15 @@ def accumulator():
         spec_algorithm=SimpleNamespace(is_none=lambda: True),
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
-        default_force_stream_interval=50,
+        default_force_stream_interval=force_interval,
         get_cached_tokens_details=lambda req: None,
         current_weight_version=None,
     )
 
 
 class TestFirstTokenFlush(unittest.TestCase):
-    def emit(self, req):
-        acc = accumulator()
+    def emit(self, req, force_interval=50):
+        acc = accumulator(force_interval)
         acc.accept(req=req)
         return acc.to_payload(dp_rank=0, is_idle_batch=False)
 
@@ -67,6 +67,46 @@ class TestFirstTokenFlush(unittest.TestCase):
         req._finished = True
         req.finished_reason = SimpleNamespace(to_json=lambda: {"type": "length"})
         self.assertEqual(self.emit(req).output_ids, [list(range(50, 53))])
+        self.assertTrue(req.finished_output)
+
+    def test_speculative_steps_flush_when_crossing_force_interval(self):
+        cases = (
+            (50, [1, 8, 49, 53, 99, 106, 128], [1, 53, 106, 128]),
+            (50, [8, 49, 53, 99, 106, 128], [8, 53, 106, 128]),
+            (50, [1, 112, 113, 128], [1, 112, 128]),
+            (3, [1, 2, 4, 5, 8, 10], [1, 4, 8, 10]),
+            (1, [1, 8, 9], [1, 8, 9]),
+        )
+        for interval, counts, expected_flushes in cases:
+            with self.subTest(interval=interval, counts=counts):
+                req = _FakeReq("test", [])
+                flushes, received = [], []
+                for count in counts:
+                    req.output_ids = req.output_ids_through_stop = list(range(count))
+                    if count == counts[-1]:
+                        req._finished = True
+                        req.finished_reason = SimpleNamespace(
+                            to_json=lambda: {"type": "length"}
+                        )
+                    payload = self.emit(req, interval)
+                    if payload is not None:
+                        flushes.append(count)
+                        received.extend(payload.output_ids[0])
+                self.assertEqual(flushes, expected_flushes)
+                self.assertEqual(received, list(range(counts[-1])))
+
+    def test_empty_output_preserves_metadata_flush(self):
+        req = _FakeReq("test", [])
+        payload = self.emit(req)
+        self.assertEqual(payload.output_ids, [[]])
+        self.assertEqual(payload.finished_reasons, [None])
+        self.assertFalse(req.finished_output)
+
+    def test_empty_finished_request_still_flushes(self):
+        req = _FakeReq("test", [], finished=True)
+        payload = self.emit(req)
+        self.assertEqual(payload.output_ids, [[]])
+        self.assertIsNotNone(payload.finished_reasons[0])
         self.assertTrue(req.finished_output)
 
     def test_first_output_waits_for_stop_prefix_to_clear(self):
@@ -175,9 +215,29 @@ class TestNonstreamMetrics(unittest.IsolatedAsyncioTestCase):
                         output_length=output_length,
                         skip_detokenizer=skip_detokenizer,
                     ):
-                        await self._check_request(mode, output_length, skip_detokenizer)
+                        await self._check_request(
+                            mode,
+                            list(range(1, output_length + 1)),
+                            skip_detokenizer,
+                            [1, 16] if output_length == 16 else [1, 50, 100, 128],
+                        )
 
-    async def _check_request(self, mode, output_length, skip_detokenizer):
+    async def test_speculative_payloads_preserve_ttft_and_final_response(self):
+        for mode in (DisaggregationMode.NULL, DisaggregationMode.DECODE):
+            for skip_detokenizer in (False, True):
+                for counts, expected_flushes in (
+                    ([1, 8, 49, 53, 99, 106, 128], [1, 53, 106, 128]),
+                    ([8, 49, 53, 99, 106, 128], [8, 53, 106, 128]),
+                    ([1, 112, 128], [1, 112, 128]),
+                ):
+                    with self.subTest(
+                        mode=mode, skip_detokenizer=skip_detokenizer, counts=counts
+                    ):
+                        await self._check_request(
+                            mode, counts, skip_detokenizer, expected_flushes
+                        )
+
+    async def _check_request(self, mode, counts, skip_detokenizer, expected_flushes):
         manager = _make_tokenizer_manager(self)
         manager.disaggregation_mode = mode
         manager.enable_metrics = True
@@ -207,8 +267,9 @@ class TestNonstreamMetrics(unittest.IsolatedAsyncioTestCase):
             "sglang.srt.observability.req_time_stats.time",
             SimpleNamespace(perf_counter=lambda: clock.now),
         ):
-            for count in range(1, output_length + 1):
-                req.output_ids.append(10)
+            output_length = counts[-1]
+            for count in counts:
+                req.output_ids.extend([10] * (count - len(req.output_ids)))
                 if count == output_length:
                     req._finished = True
                     req.finished_reason = SimpleNamespace(
@@ -223,15 +284,15 @@ class TestNonstreamMetrics(unittest.IsolatedAsyncioTestCase):
                 flushes.append(count)
                 if not skip_detokenizer:
                     payload = detokenizer.handle_batch_token_id_out(payload)
-                # The first token is ready at 101; include 200 ms for delivery
+                # The first block is ready at 101; include 200 ms for delivery
                 # and detokenization, then 10 ms per additional generated token.
-                clock.now = 101.2 + (count - 1) * 0.01
+                clock.now = 101.2 + (count - counts[0]) * 0.01
                 await manager._handle_batch_output(payload)
                 self.assertAlmostEqual(state.time_stats.first_token_time, 101.2)
                 self.assertEqual(state.event.is_set(), count == output_length)
                 self.assertEqual(len(state.out_list), int(count == output_length))
 
-        self.assertEqual(flushes, [1, 16] if output_length == 16 else [1, 50, 100, 128])
+        self.assertEqual(flushes, expected_flushes)
         self.assertEqual(state.out_list[0]["output_ids"], [10] * output_length)
         if not skip_detokenizer:
             self.assertEqual(state.out_list[0]["text"], "x" * output_length)
@@ -241,7 +302,7 @@ class TestNonstreamMetrics(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(observe.call_args.args[1], 1.2)
         self.assertEqual(observe.call_args.kwargs, {"stream": False})
         self.assertAlmostEqual(
-            state.time_stats.get_e2e_latency(), 1.2 + (output_length - 1) * 0.01
+            state.time_stats.get_e2e_latency(), 1.2 + (output_length - counts[0]) * 0.01
         )
 
 
