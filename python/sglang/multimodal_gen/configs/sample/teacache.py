@@ -56,11 +56,29 @@ class TeaCacheParams(CacheParams):
         default=None, repr=False
     )
     use_ret_steps: bool | None = None
+    # Per-expert overrides for MoE (Wan2.2 "high"/"low"); None for single-transformer.
+    expert_coefficients: dict[str, list[float]] | None = None
+    expert_thresh: dict[str, float] | None = None
 
-    def get_coefficients(self) -> list[float]:
+    def get_coefficients(self, expert: str | None = None) -> list[float]:
+        if (
+            expert is not None
+            and self.expert_coefficients is not None
+            and expert in self.expert_coefficients
+        ):
+            return self.expert_coefficients[expert]
         if self.coefficients_callback is not None:
             return self.coefficients_callback(self)
         return self.coefficients
+
+    def get_thresh(self, expert: str | None = None) -> float:
+        if (
+            expert is not None
+            and self.expert_thresh is not None
+            and expert in self.expert_thresh
+        ):
+            return self.expert_thresh[expert]
+        return self.teacache_thresh
 
     def get_skip_boundaries(
         self, num_inference_steps: int, do_cfg: bool
@@ -80,3 +98,14 @@ class TeaCacheParams(CacheParams):
             end_skipping *= 2
 
         return start_skipping, end_skipping
+
+    def is_step_boundary(self, current_timestep: int, num_inference_steps: int) -> bool:
+        """Force-compute boundary keyed on the global step index.
+
+        Uses the per-step (non-CFG-doubled) boundaries so it is correct for MoE
+        dual-transformer schedules, where an expert's local counter starts at 0
+        mid-schedule: the global step still forces the first steps and the final
+        step regardless of which expert runs them.
+        """
+        start, end = self.get_skip_boundaries(num_inference_steps, do_cfg=False)
+        return current_timestep < start or current_timestep >= end
