@@ -83,11 +83,12 @@ def topk_transform_bf16_small(
     indexer's consumer rows), fused with a page-table transform.
 
     Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
-    ``seq_lens[b]`` scores; a selected index ``i`` is written as
-    ``page_table[b, i // page_size] * page_size + i % page_size``, in no
-    particular order, and ``-1`` fills the slots past ``min(k, seq_lens[b])``.
-    Selection is by a 13-bit fp16-derived key, exact for bf16 in fp16's normal
-    range; ties within a key are broken arbitrarily.
+    ``seq_lens[b]`` scores (``k`` at most 2048); a selected index ``i`` is
+    written as ``page_table[b, i // page_size] * page_size + i % page_size``,
+    in no particular order, and ``-1`` fills the slots past
+    ``min(k, seq_lens[b])``. Selection is exact (two radix passes over the raw
+    bf16 bytes locate the k-th largest value); which of the elements equal to
+    it fill the last slots is arbitrary. NaN scores are not supported.
     """
     _jit_topk_bf16_small_module().topk_transform(
         scores, seq_lens, page_table, out_page_indices, page_size
