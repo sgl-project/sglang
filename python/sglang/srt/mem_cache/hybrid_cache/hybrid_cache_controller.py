@@ -597,6 +597,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        operation.restorable_prefix_pages = hit_result.restorable_prefix_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
