@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention import gdn_fused_decode_aiter
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -557,6 +558,64 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
 
+    _aiter_gdn_reject_logged = False
+
+    def _try_aiter_fused_gdn_decode(
+        self,
+        layer: RadixLinearAttention,
+        projected_qkvz: torch.Tensor,
+        projected_ba: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Fully-fused AITER decode, or None to fall through to the usual chain.
+
+        Returns the *post-norm* output and marks the model's output-norm stash
+        consumed, so the model skips its own gated RMSNorm. Falling short of the
+        contract falls back rather than raising -- this is a capability, not a
+        mode.
+        """
+        stash = getattr(layer, "_gdn_onorm_args", None)
+        if stash is None:
+            return None
+        norm_weight, norm_eps, conv_bias = stash
+
+        ok, reason = gdn_fused_decode_aiter.covered(
+            projected_qkvz,
+            projected_ba,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            layer.conv_weights,
+            conv_bias,
+            layer.activation,
+            None,
+        )
+        if not ok:
+            if not GDNAttnBackend._aiter_gdn_reject_logged:
+                rank0_log(f"AITER fused GDN decode not covered, falling back: {reason}")
+                GDNAttnBackend._aiter_gdn_reject_logged = True
+            return None
+
+        out, _, _ = gdn_fused_decode_aiter.run(
+            projected_qkvz=projected_qkvz,
+            projected_ba=projected_ba,
+            conv_state=conv_states,
+            ssm_state=ssm_states,
+            state_indices=cache_indices,
+            conv_weight=layer.conv_weights,
+            conv_bias=conv_bias,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            norm_weight=norm_weight,
+            scale=layer.head_k_dim**-0.5,
+            norm_eps=norm_eps,
+            pad_slot_id=self.pad_slot_id,
+        )
+        layer._gdn_onorm_consumed = True
+        return out
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -600,6 +659,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "(projected_qkvz, projected_ba)"
                 )
             projected_qkvz, projected_ba = mixed_qkv
+            # AITER gfx950 fully-fused decode: split + Conv1D + recurrence +
+            # gated RMSNorm in one launch. Consumes the model's output-norm
+            # stash; leaving it unconsumed makes the model apply its own norm.
+            fused = self._try_aiter_fused_gdn_decode(
+                layer,
+                projected_qkvz,
+                projected_ba,
+                conv_states,
+                ssm_states,
+                cache_indices,
+            )
+            if fused is not None:
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
+                return fused, None
             eligible, eligibility_reason = (
                 can_use_fused_qkvzba_causal_conv1d_update_contiguous(
                     projected_qkvz,
