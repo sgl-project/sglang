@@ -49,6 +49,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     send_routing_key: bool
     num_turns: int
     ordered: bool
+    include_cache_prefix: bool = False
     group_distribution: str = "uniform"
     zipf_alpha: Optional[float] = None
 
@@ -95,6 +96,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             send_routing_key=getattr(args, "gsp_send_routing_key", False),
             num_turns=getattr(args, "gsp_num_turns", 1),
             ordered=getattr(args, "gsp_ordered", False),
+            include_cache_prefix=getattr(args, "gsp_prewarm_prefixes", False),
             group_distribution=group_distribution,
             zipf_alpha=zipf_alpha,
         )
@@ -115,6 +117,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             num_turns=self.num_turns,
             fast_prepare=self.fast_prepare,
             ordered=self.ordered,
+            include_cache_prefix=self.include_cache_prefix,
             group_distribution=self.group_distribution,
             zipf_alpha=self.zipf_alpha,
         )
@@ -164,6 +167,7 @@ def sample_generated_shared_prefix_requests(
     num_turns: int = 1,
     fast_prepare: bool = False,
     ordered: bool = False,
+    include_cache_prefix: bool = False,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
 ) -> List[DatasetRow]:
@@ -199,7 +203,12 @@ def sample_generated_shared_prefix_requests(
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            cached_rows = pickle.load(f)
+        if not include_cache_prefix or all(
+            getattr(row, "cache_prefix", None) is not None for row in cached_rows
+        ):
+            return cached_rows
+        print("Cached data has no prefix metadata; regenerating it for prewarming.")
 
     if not should_cache:
         print(f"\nCache bypassed ({range_ratio=}, {send_routing_key=}, {num_turns=})")
@@ -235,6 +244,14 @@ def sample_generated_shared_prefix_requests(
 
     system_prompts = [
         gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
+    ]
+    cache_prefixes = [
+        f"{system_prompt}\n\n" if system_prompt_lens[i] > 0 else None
+        for i, system_prompt in enumerate(system_prompts)
+    ]
+    cache_prefix_lens = [
+        len(tokenizer.encode(prefix)) if prefix is not None else None
+        for prefix in cache_prefixes
     ]
 
     # shape: (num_groups, prompts_per_group, num_turns)
@@ -292,6 +309,8 @@ def sample_generated_shared_prefix_requests(
                 prompt_len=prompt_len,
                 output_len=output_len_val,
                 routing_key=routing_key,
+                cache_prefix=cache_prefixes[sampled_g],
+                cache_prefix_len=cache_prefix_lens[sampled_g],
             )
         )
         total_input_tokens += prompt_len
