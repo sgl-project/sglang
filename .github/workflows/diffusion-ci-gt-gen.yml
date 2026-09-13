@@ -604,3 +604,73 @@ jobs:
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+
+  multimodal-diffusion-gen-5090:
+    # The 5090 canary suite is six cases; it is generated whole rather than
+    # partitioned, so it needs no entry in the partition plan.
+    needs: compute-diffusion-partitions
+    if: needs.compute-diffusion-partitions.result == 'success'
+    runs-on: 1-gpu-5090
+    timeout-minutes: 150
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Prepare AOT dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Generate outputs
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
+            --suite 1-gpu-5090 \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}-5090
+          path: python/${{ env.OUTPUT_NAME }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
