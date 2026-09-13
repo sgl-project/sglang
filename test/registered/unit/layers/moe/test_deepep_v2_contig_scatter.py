@@ -13,19 +13,11 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 DEVICE = "cuda"
 HIDDEN = 256
 SCALE_HIDDEN = HIDDEN // 128
-# _fwd_kernel_ep_scatter_psum_init requires the row count to be BLOCK_E-aligned,
-# which matches the 128-row expert alignment DeepEP v2 dispatches with.
+# Match the scatter kernel's BLOCK_E alignment.
 ALIGN = 128
 
 
 class TestDeepEPv2ContigScatter(CustomTestCase):
-    """Guards `ep_scatter_from_psum`, the DeepEP v2 prefill permute.
-
-    PR #35758 gave `_fwd_kernel_ep_scatter_2` two new positional arguments and
-    updated only the DeepEP v1 caller, so every deepep_v2 prefill raised
-    `TypeError: dynamic_func() missing 2 required positional arguments`.
-    """
-
     # Local expert ids per (token, slot); -1 marks a route to a remote expert,
     # and 7 is out of this rank's expert range.
     RECV_TOPK = [
@@ -91,11 +83,9 @@ class TestDeepEPv2ContigScatter(CustomTestCase):
             for slot, expert in enumerate(slots):
                 dest = index[token][slot]
                 if not 0 <= expert < self.NUM_LOCAL_EXPERTS:
-                    # Remote and out-of-range routes must land on the sentinel;
-                    # the post-permute gather reads this as "no contribution".
+                    # -1 suppresses this route in the post-permute gather.
                     self.assertEqual(dest, -1, msg=f"{token=} {slot=} {expert=}")
                     continue
-                # Each accepted route owns a distinct row inside its expert's slab.
                 self.assertTrue(
                     ALIGN * expert <= dest < ALIGN * (expert + 1),
                     msg=f"{token=} {slot=} {expert=} {dest=}",

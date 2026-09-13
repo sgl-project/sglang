@@ -1691,8 +1691,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
     deepep_v2_total_expanded = dispatch_output.total_expanded
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
-    # BF16 dispatch carries no activation scales; the BF16 grouped GEMM below
-    # consumes the rows as they arrive.
     is_fp8 = hidden_states_scale is not None
     if not is_fp8 and hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(

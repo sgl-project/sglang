@@ -246,8 +246,7 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
 
 
 def _deepep_v2_experts_are_fp8(quant_method) -> bool:
-    # Unquantized experts run the DeepGEMM BF16 grouped GEMM; every other
-    # method deepep_v2 accepts is FP8 blockwise.
+    # All other supported quantization methods are blockwise FP8.
     return not isinstance(quant_method, UnquantizedFusedMoEMethod)
 
 
@@ -257,7 +256,6 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
         return
 
     if isinstance(quant_method, UnquantizedFusedMoEMethod):
-        # BF16 experts: dispatch stays unquantized end to end.
         return
 
     config = (

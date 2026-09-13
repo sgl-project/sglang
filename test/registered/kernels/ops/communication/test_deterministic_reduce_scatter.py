@@ -45,8 +45,7 @@ def group():
 @pytest.mark.parametrize("use_graph", [False, True])
 def test_batch_and_destination_invariance(group, dtype, use_graph):
     torch.manual_seed(42 + group.rank_in_group)
-    # Each rank contributes different values, repeated at every token position.
-    # Unlike small integers, these expose changes in floating-point sum order.
+    # Non-integer contributions expose changes in floating-point sum order.
     token = torch.randn(2048, device="cuda", dtype=dtype)
     reference = None
     for local_tokens in (1, 2, 3, 8, 32, 128):
@@ -64,8 +63,7 @@ def test_batch_and_destination_invariance(group, dtype, use_graph):
         else:
             group.reduce_scatter_tensor(output, input_)
 
-        # Gather every destination, not just rank 0, to detect a token's change
-        # when it migrates to a different shard as a serving batch grows.
+        # Compare all destinations to catch rank-dependent reduction order.
         all_outputs = torch.empty_like(input_)
         dist.all_gather_into_tensor(all_outputs, output, group=group.device_group)
         if reference is None:

@@ -373,12 +373,7 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 def get_deepep_v2_dispatcher_output_dtype(
     experts_are_fp8: bool,
 ) -> DispatcherOutputDtype:
-    """Resolve the wire dtype DeepEP v2 dispatches in.
-
-    DeepEP v2 hands its receive buffer straight to the DeepGEMM grouped GEMM,
-    which picks its FP8 or BF16 kernel from the expert weight dtype, so the
-    wire dtype follows the checkpoint rather than the operator.
-    """
+    """Match the dispatch dtype to the expert weights consumed by DeepGEMM."""
     required = (
         DispatcherOutputDtype.FP8 if experts_are_fp8 else DispatcherOutputDtype.BF16
     )

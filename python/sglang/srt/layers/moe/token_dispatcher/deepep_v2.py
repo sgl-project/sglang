@@ -182,11 +182,9 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
-        # ElasticBuffer's `deterministic=True` sort is deliberately not enabled.
-        # The expert GEMM is row-independent and combine follows the handle's
-        # slot pointers, so sorting receive rows is unnecessary for batch
-        # invariance. The sort also uses dynamic indexing that cannot be
-        # captured by the decode CUDA graph.
+        # Receive sorting is unnecessary: GEMMs are row-independent and combine
+        # follows handle slot pointers. Leave deterministic=True off because its
+        # dynamic indexing is incompatible with CUDA graph capture.
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -310,8 +308,6 @@ class _DeepEPv2Impl:
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
         if not self.use_fp8_dispatch:
-            # BF16 experts read activations unquantized, so the wire carries
-            # them as they are and no scales come back.
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
         elif use_masked:

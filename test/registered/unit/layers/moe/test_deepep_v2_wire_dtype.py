@@ -69,7 +69,6 @@ def _fake_quant(hidden_states, block_size, **kwargs):
 class _DeepEPv2WireDtypeBase(CustomTestCase):
     def setUp(self):
         reset_context()
-        # `_get_allow_hybrid_mode` reads the published `exec.moe` bag.
         self._published = get_context().override_server_args(model_path="dummy")
         self._published.install()
         _FakeBuffer.last = None
