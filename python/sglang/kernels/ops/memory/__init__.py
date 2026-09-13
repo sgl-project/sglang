@@ -43,6 +43,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="memory.kv_slot_checksum",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.kv_checksum:kv_slot_checksum",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="memory.memcpy_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",

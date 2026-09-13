@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -44,6 +45,12 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+)
+from sglang.srt.disaggregation.kv_checksum import (
+    ROOM_SLOT_CHECKSUM_DIGEST,
+    ROOM_SLOT_CHECKSUM_SIG,
+    ROOM_SLOT_CHECKSUM_TOKENS,
+    digest_to_u64,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -321,6 +328,9 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    # Digest of the KV that landed in this request's slots, computed for the
+    # whole committing batch in one launch (see DecodeTransferQueue).
+    kv_checksum_actual: Optional[int] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -2094,6 +2104,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
+        self.kv_checksummer = scheduler.disagg_kv_checksummer
+        self.kv_corrupt_prob = envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.get()
+        # A prefill with a different layout signature cannot be compared
+        # against; say so once rather than per request.
+        self._logged_checksum_signatures: Set[int] = set()
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
@@ -2107,6 +2122,109 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
+
+    def _compute_kv_checksums(
+        self, polls: List[int], rids_to_check: Optional[List[str]]
+    ) -> None:
+        """Digest the landed KV of every request about to commit, in one launch.
+
+        Batched on purpose: reading a digest back costs a device sync, and one
+        sync per committing batch is affordable where one per request would not
+        be. Requests whose prefill shipped no comparable digest are left out.
+        """
+        checksummer = self.kv_checksummer
+        if checksummer is None:
+            return
+
+        rooms: List[int] = []
+        slot_tensors: List[torch.Tensor] = []
+        pending: List[DecodeRequest] = []
+        for decode_req, poll in zip(self.queue, polls):
+            decode_req.kv_checksum_actual = None
+            if poll != KVPoll.Success:
+                continue
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if _is_fake_transfer(decode_req.req):
+                continue
+            num_tokens = self._expected_checksum_tokens(decode_req)
+            if num_tokens is None:
+                continue
+            req = decode_req.req
+            start = len(req.origin_input_ids) - num_tokens
+            slots = self.scheduler.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, start : len(req.origin_input_ids)
+            ]
+            slots = self.scheduler.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                slots
+            )
+            if self.kv_corrupt_prob > 0 and random.random() < self.kv_corrupt_prob:
+                logger.warning(
+                    "SGLANG_TEST_DISAGG_KV_CORRUPT_PROB: clobbering a KV row of "
+                    "request %s to exercise the checksum",
+                    req.rid,
+                )
+                checksummer.corrupt_rows_for_test(slots)
+            pending.append(decode_req)
+            rooms.append(req.bootstrap_room or 0)
+            slot_tensors.append(slots)
+
+        if not pending:
+            return
+        digests = checksummer.compute(rooms, slot_tensors).tolist()
+        for decode_req, digest in zip(pending, digests):
+            decode_req.kv_checksum_actual = digest_to_u64(digest)
+
+    def _expected_checksum_tokens(self, decode_req: DecodeRequest) -> Optional[int]:
+        """Token count the prefill's digest covers, or None if not comparable."""
+        checksummer = self.kv_checksummer
+        row = self.metadata_buffers.bootstrap_room[decode_req.metadata_buffer_index]
+        signature = int(row[ROOM_SLOT_CHECKSUM_SIG].item())
+        if signature == 0:
+            # Prefill has the check off, or could not digest its pool.
+            return None
+        if signature != checksummer.signature:
+            if signature not in self._logged_checksum_signatures:
+                self._logged_checksum_signatures.add(signature)
+                logger.warning(
+                    "PD KV checksum skipped: prefill layout signature 0x%016x does "
+                    "not match this decode's 0x%016x. The two sides must agree on "
+                    "KV layout (TP width, layer count) and on "
+                    "SGLANG_DISAGGREGATION_KV_CHECKSUM settings.",
+                    signature,
+                    checksummer.signature,
+                )
+            return None
+        num_tokens = int(row[ROOM_SLOT_CHECKSUM_TOKENS].item())
+        if not 0 <= num_tokens <= len(decode_req.req.origin_input_ids):
+            return None
+        return num_tokens
+
+    def _kv_checksum_error(
+        self, decode_req: DecodeRequest, output_bootstrap_room: torch.Tensor
+    ) -> Optional[str]:
+        """Message describing the KV mismatch, or None when the KV checks out."""
+        if self.kv_checksummer is None or _is_fake_transfer(decode_req.req):
+            return None
+        actual = decode_req.kv_checksum_actual
+        if actual is None:
+            return None
+        expected = digest_to_u64(
+            int(output_bootstrap_room[ROOM_SLOT_CHECKSUM_DIGEST].item())
+        )
+        if actual == expected:
+            return None
+        num_tokens = int(output_bootstrap_room[ROOM_SLOT_CHECKSUM_TOKENS].item())
+        return (
+            f"KV cache corruption detected: request {decode_req.req.rid} "
+            f"(bootstrap_room={decode_req.req.bootstrap_room}) received KV whose "
+            f"checksum is 0x{actual:016x}, but the prefill sent 0x{expected:016x} "
+            f"for the same {num_tokens} tokens. Metadata buffer index: "
+            f"{decode_req.metadata_buffer_index}. The metadata is intact, so the "
+            f"KV pages this request was allocated were written by something else "
+            f"-- a slot reused while a transfer was still in flight, or a stale "
+            f"sender writing after an abort."
+        )
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2169,6 +2287,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prepare_abort(
                 decode_req.req,
                 "Metadata corruption detected - bootstrap_room mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+
+        # The room check above proves where the metadata came from; this proves
+        # the KV sitting in our slots is the KV that was sent for it.
+        checksum_error = self._kv_checksum_error(decode_req, output_bootstrap_room)
+        if checksum_error is not None:
+            logger.error(checksum_error)
+            prepare_abort(
+                decode_req.req,
+                "KV cache corruption detected - checksum mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             decode_req.kv_receiver.clear()
@@ -2325,6 +2457,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
+
+        self._compute_kv_checksums(polls, rids_to_check)
 
         transferred_reqs = []
         indices_to_remove = set()
