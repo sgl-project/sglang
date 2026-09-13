@@ -1114,7 +1114,9 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1124,7 +1126,9 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )

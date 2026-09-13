@@ -171,6 +171,16 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
+    def capture_token_capacity(self, max_token_pool_size: int) -> int:
+        """Host capture rows are indexed by request-token IDs, not kernel IDs.
+
+        Unified IDs span the whole virtual table even when admission is capped.
+        The logical page size also covers DCP-widened request-token IDs.
+        """
+        if self.is_translating:
+            return self._full_v2p_table.numel() * self.page_size
+        return max_token_pool_size + self.page_size
+
     # -- per-batch view --------------------------------------------------------
 
     @property
