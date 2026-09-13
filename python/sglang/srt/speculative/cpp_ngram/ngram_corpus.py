@@ -15,6 +15,7 @@ class NgramCorpus:
     def __init__(
         self,
         max_trie_depth=18,
+        max_sam_match_depth=None,
         min_bfs_breadth=1,
         max_bfs_breadth=8,
         draft_token_num=8,
@@ -23,10 +24,13 @@ class NgramCorpus:
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
     ) -> None:
+        if max_sam_match_depth is None:
+            max_sam_match_depth = max_trie_depth
         cls = get_ngram_corpus_cls()
         self._obj = cls(
             capacity=capacity,
             max_trie_depth=max_trie_depth,
+            max_sam_match_depth=max_sam_match_depth,
             min_bfs_breadth=min_bfs_breadth,
             max_bfs_breadth=max_bfs_breadth,
             draft_token_num=draft_token_num,

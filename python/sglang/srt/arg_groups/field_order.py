@@ -301,6 +301,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_ngram_max_bfs_breadth",
     "speculative_ngram_match_type",
     "speculative_ngram_max_trie_depth",
+    "speculative_ngram_max_sam_match_depth",
     "speculative_ngram_capacity",
     "speculative_ngram_external_corpus_path",
     "speculative_ngram_external_sam_budget",
