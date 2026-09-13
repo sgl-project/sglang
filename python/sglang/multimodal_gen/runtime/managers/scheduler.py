@@ -563,6 +563,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._requires_sequential_multi_output(base_req, candidate_req):
+            return "sequential_multi_output"
         if self._has_realtime_session(base_req) or self._has_realtime_session(
             candidate_req
         ):
@@ -593,9 +595,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
 
+    def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
+        pipeline_config = self.server_args.pipeline_config
+        return (
+            pipeline_config.supports_sequential_multi_output_inference()
+            and not pipeline_config.supports_sequential_dit_inference()
+            and any(max(1, int(req.num_outputs_per_prompt or 1)) > 1 for req in reqs)
+        )
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._requires_sequential_multi_output(base_req, candidate_req):
             return False
 
         if self._has_realtime_session(base_req) or self._has_realtime_session(
