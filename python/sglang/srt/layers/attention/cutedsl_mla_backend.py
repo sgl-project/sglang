@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism."""
 
+    # This kernel does not support varlen queries.
+    supports_varlen_absorbed_mla = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
