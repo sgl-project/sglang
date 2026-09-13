@@ -67,9 +67,44 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         self.assertEqual(captured["bmm2_scale"], 1.0)
         self.assertEqual(captured["kv_scale_format"], "arbitrary_fp32")
         self.assertEqual(captured["skip_softmax_threshold_scale_factor"], 0.25)
+        self.assertFalse(captured["return_lse"])
         self.assertNotIn("backend", captured)
         self.assertEqual(tuple(output.shape), (2, 8, 512))
         self.assertTrue(torch.all(output == 2))
+
+    def test_returns_lse_without_changing_its_layout_or_values(self):
+        for tokens in (1, 6):
+            with self.subTest(tokens=tokens):
+                expected_lse = torch.arange(tokens * 8, dtype=torch.float32).view(
+                    tokens, 8
+                )
+                expected_lse[0, 0] = -torch.inf
+
+                def fake_op(**kwargs):
+                    self.assertTrue(kwargs["return_lse"])
+                    query = kwargs["query"]
+                    output = query.new_full((*query.shape[:-1], 512), 3)
+                    return output, expected_lse
+
+                with self._mock_flashinfer(fake_op):
+                    output, lse = flashinfer_sparse_mla_forward(
+                        q=torch.zeros((tokens, 8, 576), dtype=torch.bfloat16),
+                        kv_cache=torch.zeros((128, 1, 656), dtype=torch.uint8),
+                        indices=torch.zeros((tokens, 4), dtype=torch.int32),
+                        seq_lens=torch.ones(tokens, dtype=torch.int32),
+                        workspace_buffer=torch.zeros(1024, dtype=torch.uint8),
+                        page_size=64,
+                        kv_cache_dim=656,
+                        qk_nope_head_dim=192,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                        sm_scale=0.125,
+                        skip_softmax_threshold_scale_factor=None,
+                        return_lse=True,
+                    )
+                self.assertEqual(tuple(output.shape), (tokens, 8, 512))
+                self.assertTrue(torch.all(output == 3))
+                self.assertIs(lse, expected_lse)
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):

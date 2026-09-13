@@ -79,6 +79,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -1662,6 +1663,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            draft_forward_guard(enabled=self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

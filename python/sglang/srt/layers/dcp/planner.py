@@ -22,6 +22,7 @@ import torch
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
+    create_packed_dsa_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
@@ -46,7 +47,8 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
-    # dcp_kv_buffer tokens' layout
+    # Generic dcp_kv_buffer tokens' layout (packed DSA instead keeps all
+    # requests' prefix rows together per rank, followed by the same extend tail):
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
     #   rank0_rn.prefix_tokens, rank1_rn.prefix_tokens, ..., rank7_rn.prefix_tokens,
@@ -100,25 +102,56 @@ def prepare_decode_context_parallel_metadata(
     extend_cu_lens[1:] = torch.cumsum(extend_seq_lens, dim=0)
     extend_cu_lens = extend_cu_lens[:-1]
 
-    create_dcp_kv_indices[(len(seq_lens),)](
-        dcp_kv_indptr,
-        extend_seq_lens,
-        extend_cu_lens,
-        extend_prefix_lens,
-        extend_cu_prefix_lens,
-        dcp_kv_indices,
-        extend_prefix_lens_sum,
-        parallel.dcp_size,
-    )
+    packed_layout = getattr(get_attn_backend(), "dcp_packed_kv_layout", None)
+    dcp_prefix_storage_tokens = None
+    dcp_total_local_prefix_tokens = None
+    if packed_layout is not None:
+        if any(int(length) % parallel.dcp_size for length in extend_prefix_lens_cpu):
+            raise ValueError(
+                "Packed DSA DCP requires DCP-aligned cached prefix lengths"
+            )
+        if kv_buffer_shape[-1] != packed_layout.bytes_per_token:
+            raise ValueError("Packed DSA DCP cache does not match its declared layout")
+        dcp_prefix_storage_tokens = extend_prefix_lens_sum
+        dcp_total_local_prefix_tokens = extend_prefix_lens_sum // parallel.dcp_size
+        create_packed_dsa_dcp_kv_indices[(len(seq_lens),)](
+            dcp_kv_indptr,
+            extend_seq_lens,
+            extend_cu_lens,
+            extend_prefix_lens,
+            extend_cu_prefix_lens,
+            dcp_kv_indices,
+            dcp_total_local_prefix_tokens,
+            dcp_prefix_storage_tokens,
+            parallel.dcp_size,
+        )
+    else:
+        create_dcp_kv_indices[(len(seq_lens),)](
+            dcp_kv_indptr,
+            extend_seq_lens,
+            extend_cu_lens,
+            extend_prefix_lens,
+            extend_cu_prefix_lens,
+            dcp_kv_indices,
+            extend_prefix_lens_sum,
+            parallel.dcp_size,
+        )
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     translator = get_attn_backend().kv_index_translator
     dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     )
+    buffer_tokens = seq_lens_sum
+    if packed_layout is not None:
+        buffer_tokens = (
+            (buffer_tokens + packed_layout.page_size - 1)
+            // packed_layout.page_size
+            * packed_layout.page_size
+        )
     dcp_kv_buffer = torch.empty(
         (
-            seq_lens_sum,
+            buffer_tokens,
             *kv_buffer_shape[1:],
         ),
         dtype=kv_cache_dtype,
@@ -130,6 +163,8 @@ def prepare_decode_context_parallel_metadata(
         dcp_kv_indices=dcp_kv_indices,
         dcp_local_prefix_kv_indices=dcp_local_prefix_kv_indices,
         dcp_extend_prefix_lens_sum=extend_prefix_lens_sum,
+        dcp_prefix_storage_tokens=dcp_prefix_storage_tokens,
+        dcp_total_local_prefix_tokens=dcp_total_local_prefix_tokens,
     )
     return attn_dcp_metadata
 

@@ -163,6 +163,54 @@ def create_dcp_kv_indices(
 
 
 @triton.jit
+def create_packed_dsa_dcp_kv_indices(
+    kv_indptr,
+    extend_lens_ptr,
+    extend_cu_lens_ptr,
+    extend_prefix_lens_ptr,
+    extend_cu_prefix_lens_ptr,
+    kv_indices_ptr,
+    total_local_prefix_len,
+    prefix_storage_len,
+    dcp_world_size: tl.constexpr,
+):
+    """Build logical-to-physical indices for rank-major packed DSA KV.
+
+    ``all_gather_into_tensor`` naturally produces one contiguous block per DCP
+    rank.  Keeping that layout avoids a full-size transpose and request-order
+    copy.  Ordinary EXTEND prefixes are allocator-page aligned, hence every
+    request contributes ``prefix_len / dcp_world_size`` rows to every rank.
+    """
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+    prefix_len = tl.load(extend_prefix_lens_ptr + pid)
+    prefix_start = tl.load(extend_cu_prefix_lens_ptr + pid)
+    kv_ind_start = tl.load(kv_indptr + pid)
+    local_req_start = prefix_start // dcp_world_size
+    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < prefix_len
+        owner = offset % dcp_world_size
+        local_offset = local_req_start + offset // dcp_world_size
+        data = owner * total_local_prefix_len + local_offset
+        tl.store(kv_indices_ptr + kv_ind_start + offset, data, mask=mask)
+
+    extend_len = tl.load(extend_lens_ptr + pid)
+    extend_start = tl.load(extend_cu_lens_ptr + pid)
+    num_loop = tl.cdiv(extend_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < extend_len
+        data = prefix_storage_len + extend_start + offset
+        tl.store(
+            kv_indices_ptr + kv_ind_start + prefix_len + offset,
+            data,
+            mask=mask,
+        )
+
+
+@triton.jit
 def update_kv_lens_and_indices(
     kv_lens: torch.Tensor,
     kv_lens_cumsum: torch.Tensor,
