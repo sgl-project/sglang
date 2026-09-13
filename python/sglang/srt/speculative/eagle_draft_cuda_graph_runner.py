@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool_compress,
+    is_deepseek_dsa,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -31,6 +35,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -278,15 +283,41 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-        # Metadata glue graph is intentionally not used for the EAGLE draft
-        # runner.  FlashInferMLAMultiStepDraftBackend.init_forward_metadata_out_graph
-        # re-plans the per-step CUDA-graph wrappers that were already captured
-        # (decode_cuda_graph_metadata dict entries).  Capturing that re-plan
-        # into a secondary glue graph would corrupt the wrapper's internal GPU
-        # state on replay.  The main decode runner (DecodeCudaGraphRunner) is
-        # where the glue graph saves latency; draft metadata is cheaper and
-        # already amortised over speculative_num_steps.
-        self._metadata_glue = None
+        self._metadata_glue = self._init_metadata_glue()
+
+    def _init_metadata_glue(self):
+        config = self.model_runner.model_config.hf_text_config
+        if (
+            not envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+            or not is_deepseek_dsa(config)
+            or not get_dsa_index_kpool_compress(config)
+            or self.topk != 1
+            or self.speculative_num_steps != 5
+            or get_spec().speculative_num_draft_tokens != 6
+            or get_exec().overlap.enable_two_batch_overlap
+            or self.enable_pdmux
+            or self.model_runner.lora_manager is not None
+        ):
+            return None
+
+        # DSA imports deep_gemm on CUDA; other draft backends do not require it.
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnMultiStepBackend,
+        )
+
+        # FlashInfer MLA wrapper replanning cannot be replayed in a glue graph.
+        if not isinstance(self.draft_attn_backend, DeepseekSparseAttnMultiStepBackend):
+            return None
+        leaves = self.draft_attn_backend.attn_backends
+        if not leaves or not all(
+            leaf.dsa_decode_impl == "trtllm"
+            and leaf.dsa_index_kpool == 4
+            and leaf.real_page_size == 64
+            and leaf.dsa_index_topk == 2048
+            for leaf in leaves
+        ):
+            return None
+        return MetadataGlueGraph(self.device, leaves=leaves)
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -667,12 +698,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
-        # each speculative step).  The glue-graph optimisation is not applied
-        # here — see __init__ comment for why.
-        self.draft_attn_backend.init_forward_metadata_out_graph(
-            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
-        )
+        metadata_view = SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
+        if (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_bs == bs
+        ):
+            # Unpadded ForwardBatch inputs can change address between replays.
+            metadata_view.seq_lens = buffers.seq_lens[:bs]
+            metadata_view.req_pool_indices = buffers.req_pool_indices[:bs]
+            self._metadata_glue.run(self.draft_attn_backend, metadata_view, bs)
+        else:
+            self.draft_attn_backend.init_forward_metadata_out_graph(metadata_view)
         self.raw_bs = raw_bs
         self.bs = bs
 
