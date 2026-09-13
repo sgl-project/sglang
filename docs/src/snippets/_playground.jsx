@@ -1547,13 +1547,32 @@ export const Playground = ({ config }) => {
         ],
       };
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
+      const isNpu = sel.hw === "a3"
+        || (config.hardware || []).some((hw) => hw.id === sel.hw && hw.vendor === "npu");
+      const deviceLines = isNpu
+        ? [
+            `docker run --privileged --shm-size=${config.dockerShmSize || "16g"}`,
+            "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",
+            "  --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7",
+            "  --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11",
+            "  --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15",
+            "  --device=/dev/davinci_manager",
+            "  --device=/dev/hisi_hdc",
+            "  -v /usr/local/sbin:/usr/local/sbin",
+            "  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver",
+            "  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware",
+            "  -v /etc/ascend_install.info:/etc/ascend_install.info",
+            "  -v /var/queue_schedule:/var/queue_schedule",
+            "  -v ~/.cache/:/root/.cache/",
+          ]
+        : ["docker run --gpus all", "  --shm-size 32g"];
       const dockerLines = [
-        "docker run --gpus all",
-        "  --shm-size 32g",
+        ...deviceLines,
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
-        "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
+        ...(isNpu ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
+        ...(typeof config.dockerMounts === "function"
+          ? config.dockerMounts(sel) : (config.dockerMounts || [])).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
@@ -1988,7 +2007,13 @@ export const Playground = ({ config }) => {
   const saveEnv = (next) => {
     setEnv(next);
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+    window.dispatchEvent(new CustomEvent(STORAGE_KEY, { detail: next }));
   };
+  useEffect(() => {
+    const onEnv = (event) => setEnv((previous) => ({ ...previous, ...event.detail }));
+    window.addEventListener(STORAGE_KEY, onEnv);
+    return () => window.removeEventListener(STORAGE_KEY, onEnv);
+  }, []);
 
   // Base selection — live-linked to the Deployment panel via URL hash + custom event
   // (history.replaceState doesn't fire hashchange, hence the event too).
@@ -2311,7 +2336,9 @@ export const Playground = ({ config }) => {
   const curlEnv = (pdRouter && pdRouter.port != null)
     ? { ...env, CURL_PORT: String(pdRouter.port) }
     : env;
-  const curlText = interpolate(config.curl || "", curlEnv, modelName);
+  const curlTemplate = typeof config.curl === "function"
+    ? config.curl(base, baseCell) : config.curl;
+  const curlText = interpolate(curlTemplate || "", curlEnv, modelName);
   const routerText = pdRouter && pdRouter.command
     ? interpolate(pdRouter.command, {
         ...env,
