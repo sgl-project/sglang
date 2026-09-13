@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=528, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=569, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -51,7 +51,7 @@ class TestDeepseek(CustomTestCase):
                 "dynamic",
                 "--eplb-algorithm",
                 "deepseek",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "256",
                 "--max-running-requests",
                 "2048",
@@ -112,7 +112,7 @@ class TestDeepseekMTP(CustomTestCase):
                 "dynamic",
                 "--eplb-algorithm",
                 "deepseek",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
                 "--max-running-requests",
                 "512",

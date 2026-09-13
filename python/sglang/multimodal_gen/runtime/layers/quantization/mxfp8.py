@@ -76,6 +76,12 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
             return NPUMXFP8LinearMethod(self)
+        if not self.is_checkpoint_fp8_serialized:
+            from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_online import (
+                MXFP8OnlineLinearMethod,
+            )
+
+            return MXFP8OnlineLinearMethod(self)
         return SRTFp8LinearMethod(self)
 
 

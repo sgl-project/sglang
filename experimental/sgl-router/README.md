@@ -57,18 +57,27 @@ sgl-router \
   --model-id qwen3 \
   --tokenizer-path /models/qwen3/tokenizer.json \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
-  --policy cache_aware_zmq \
+  --policy cache_aware \
+  --cache-prefix-provider indexer \
   --kv-indexer-endpoint http://10.0.0.10:50051 \
   --kv-indexer-query-timeout-ms 100 \
   --kv-indexer-query-max-inflight 32
 ```
 
-The existing cache-aware policy and thresholds are reused. When configured, the
-Indexer replaces the Router-local radix tree as the cache signal. A successful
-query with no usable match selects by minimum active load; connection failures,
-timeouts, local admission rejection, and server rejection fail the Router
-request with `503` rather than silently switching signals. The timeout and local
-concurrency bound default to 100ms and 32 respectively.
+The Indexer replaces the Router-local radix tree as the native Cache-Aware
+signal. Query timeouts and local concurrency are bounded by the two Indexer
+options, which default to 100 ms and 32 respectively.
+
+## Upgrading from `cache_aware_zmq`
+
+The `cache_aware_zmq` policy has been removed. Configurations using it should
+select `--policy cache_aware` and choose a native cache-prefix source: the
+Router-local radix tree (the default), or the external Indexer shown above.
+
+The legacy `--cache-threshold`, `--balance-abs-threshold`, and
+`--balance-rel-threshold` flags have also been removed. They do not have
+one-to-one replacements; remove them and review the current `sgl-router
+--help` output when tuning Cache-Aware routing.
 
 ## License
 

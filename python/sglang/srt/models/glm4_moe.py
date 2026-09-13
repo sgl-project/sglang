@@ -468,6 +468,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),

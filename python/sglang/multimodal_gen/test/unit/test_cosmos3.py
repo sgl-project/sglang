@@ -1907,18 +1907,6 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
         self.assertEqual(sp.condition_frame_indexes, [0, 1])
         self.assertEqual(sp.condition_video_keep, "first")
 
-    def test_action_fields_default_none(self):
-        sp = Cosmos3SamplingParams(prompt="t")
-        for field in (
-            "action_mode",
-            "domain_id",
-            "domain_name",
-            "raw_action_dim",
-            "action_fps",
-            "action",
-        ):
-            self.assertIsNone(getattr(sp, field))
-
 
 class TestCosmos3CaptionMetadata(unittest.TestCase):
     """Structured captions get generation metadata; prose prompts opt out."""

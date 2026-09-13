@@ -18,6 +18,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import publish
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -65,6 +69,10 @@ class TestForwardSplitPrefill(CustomTestCase):
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
         )
+        cls.model_runner.alloc_memory_pool()
+        cls.model_runner.init_attention_backends()
+        cls.model_runner.init_cuda_graphs()
+        set_forward_context(ForwardContext(attn_backend=cls.model_runner.attn_backend))
 
         cls.tokenizer = get_tokenizer(
             cls.server_args.tokenizer_path,
@@ -118,6 +126,11 @@ class TestForwardSplitPrefill(CustomTestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         batch.prepare_for_extend()
+        if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                self.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
         if is_split_prefill:
             # For split prefill, we need to set the forward mode to SPLIT_PREFILL
             batch.forward_mode = ForwardMode.SPLIT_PREFILL
@@ -186,7 +199,7 @@ class TestForwardSplitPrefill(CustomTestCase):
 
         # Method 1: Normal extend (prefill)
         print("Running normal extend (prefill)...")
-        normal_result = self.model_runner.forward_extend(forward_batch_normal)
+        normal_result = self.model_runner.forward(forward_batch_normal).logits_output
 
         # Method 2: Split prefill
         print("Running split prefill...")

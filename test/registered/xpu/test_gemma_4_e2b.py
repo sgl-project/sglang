@@ -130,8 +130,8 @@ from sglang.test.ci.ci_register import register_xpu_ci
 # Single e2e test: boot + a short Q&A.
 register_xpu_ci(
     est_time=240,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="OOM on stage-b XPU runner (server launch fails with --mem-fraction-static)",
+    suite="nightly-xpu-1-gpu",
+    nightly=True,
 )
 
 if __name__ == "__main__":

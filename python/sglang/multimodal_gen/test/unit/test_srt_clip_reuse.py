@@ -34,12 +34,6 @@ class _FakeProjection(nn.Module):
         return hidden_states, None
 
 
-def test_mmgen_clip_reuses_srt_components():
-    assert mmgen_clip.CLIPEncoder is srt_clip.CLIPEncoder
-    assert mmgen_clip.CLIPTextEmbeddings is srt_clip.CLIPTextEmbeddings
-    assert mmgen_clip.CLIPVisionEmbeddings is srt_clip.CLIPVisionEmbeddings
-
-
 def test_clip_encoder_propagates_causal_semantics():
     with (
         patch.object(srt_clip, "CLIPAttention", return_value=nn.Identity()) as attn,

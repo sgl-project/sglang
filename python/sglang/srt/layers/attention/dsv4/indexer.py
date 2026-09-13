@@ -19,12 +19,14 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
+    logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -630,7 +632,7 @@ class C4IndexerBackendMixin:
         # reading logits, so DeepGEMM can receive an empty range for them.
         if self.dsa_topk_backend.is_sgl_kernel():
             ke = torch.where(ke - ks > c4_indexer.index_topk, ke, ks)
-        c4_page_size = indexer_metadata.c4_page_size
+        c4_page_size = indexer_metadata.compressed_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
@@ -791,7 +793,7 @@ class C4IndexerBackendMixin:
             return F.pad(tensor, pad, value=value)
 
         c4_seq_lens = match_num_queries(
-            indexer_metadata.c4_seq_lens, value=0 if use_aiter_fp4 else 1
+            indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
         )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
@@ -835,14 +837,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -854,7 +856,7 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
             elif self.dsa_topk_backend.is_flashinfer():
@@ -863,17 +865,24 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+            elif self.dsa_topk_backend.should_use_topk_v2():
                 topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
-                    indexer_metadata.topk_metadata,
+                    indexer_metadata.compressed_page_size,
+                    # The cached plan routes rows by their index in the full
+                    # range, so a chunk needs one built over its own rows.
+                    (
+                        indexer_metadata.topk_metadata
+                        if rows == all_rows or not is_hip()
+                        else plan_topk_v2(c4_seq_lens[rows])
+                    ),
+                    row_raw_indices,
                 )
             else:
                 topk_transform_paged(
@@ -881,7 +890,7 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
 
@@ -897,24 +906,46 @@ class C4IndexerBackendMixin:
             run_topk_transform(all_rows, logits)
         elif use_aiter_fp4:
             q_fp4, q_scale = q
-            logits = aiter_fp4_paged_mqa_logits(
-                q_fp4=q_fp4,
-                q_scale=q_scale,
-                k_payload=token_to_kv_pool.get_index_k_fp4_payload_buffer(
-                    c4_indexer.layer_id
-                ),
-                k_scale=token_to_kv_pool.get_index_k_fp4_scale_buffer(
-                    c4_indexer.layer_id
-                ),
-                weights=weights,
-                page_table=page_table,
-                c4_seq_lens=c4_seq_lens,
-                weight_scale=c4_indexer.weight_scale,
-                is_decode=forward_batch.forward_mode.is_decode(),
-                decode_workspace=metadata.fp4_decode_workspace,
-                prefill_workspace=metadata.fp4_prefill_workspace,
+            is_decode = forward_batch.forward_mode.is_decode()
+            # Hoisted: these await this layer's KV transfer, which every chunk
+            # would otherwise re-await.
+            k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
+                c4_indexer.layer_id
             )
-            run_topk_transform(all_rows, logits)
+            k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+
+            def run_fp4_indexer(rows: slice) -> None:
+                logits = aiter_fp4_paged_mqa_logits(
+                    q_fp4=q_fp4[rows],
+                    q_scale=q_scale[rows],
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    weights=weights[rows],
+                    page_table=page_table[rows],
+                    c4_seq_lens=c4_seq_lens[rows],
+                    weight_scale=c4_indexer.weight_scale,
+                    is_decode=is_decode,
+                    decode_workspace=metadata.fp4_decode_workspace,
+                    prefill_workspace=metadata.fp4_prefill_workspace,
+                )
+                run_topk_transform(rows, logits)
+
+            # The scores are the layer's largest transient and their width tracks
+            # context length, so prefill splits the rows into whatever fits the
+            # pooled logits block and reduces each chunk before the next one
+            # reuses it. Rows are scored and reduced independently, so this
+            # matches a single pass. Decode's rectangle is bounded by its capture
+            # shapes, so it always stays whole.
+            rows_per_chunk = (
+                query_rows if is_decode else logits_rows_per_chunk(page_table)
+            )
+            if rows_per_chunk >= query_rows:
+                run_fp4_indexer(all_rows)
+            else:
+                for start in range(0, query_rows, max(1, rows_per_chunk)):
+                    run_fp4_indexer(
+                        slice(start, min(start + rows_per_chunk, query_rows))
+                    )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
@@ -934,7 +965,7 @@ class C4IndexerBackendMixin:
                     _c4sl[rows],
                     page_table[rows],
                     metadata,
-                    indexer_metadata.max_c4_seq_len,
+                    indexer_metadata.max_compressed_seq_len,
                     False,
                 )
                 run_topk_transform(rows, logits)
@@ -960,7 +991,7 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                        compressed_seq_lens=indexer_metadata.compressed_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
                     )

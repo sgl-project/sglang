@@ -144,6 +144,12 @@ def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
     get_resources().experts_capturer = capturer
 
 
+def destroy_global_experts_capturer():
+    if (capturer := get_resources().experts_capturer) is not None:
+        capturer.destroy()
+    get_resources().experts_capturer = None
+
+
 def extract_routed_experts_from_meta_info(data):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32

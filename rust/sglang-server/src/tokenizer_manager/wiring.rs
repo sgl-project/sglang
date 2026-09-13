@@ -25,7 +25,7 @@ pub enum TmEvent {
     Tokenized(Request),
     /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
     /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
-    /// sidecar (`Server.take_mm_result`), not this event.
+    /// result store (`Server.take_mm_result`), not this event.
     MmEncoded { rid: Rid, input_ids: Vec<i32> },
     /// An MM worker rejected a request parked in `Encoding` (bad media URL,
     /// unsupported modality, preprocess error, …).

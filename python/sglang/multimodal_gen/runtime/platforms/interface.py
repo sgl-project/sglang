@@ -8,13 +8,13 @@ import enum
 import random
 from collections.abc import Callable
 from functools import lru_cache
+from pkgutil import resolve_name
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -36,6 +36,7 @@ class AttentionBackendEnum(enum.Enum):
     SPARGE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN_H3 = enum.auto()
+    HYBRID_WINDOW_ATTN_H3 = enum.auto()
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
@@ -59,6 +60,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+            AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3,
             AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
@@ -435,13 +437,27 @@ class Platform:
         return True
 
     @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        """Whether the accelerator draws from the same physical pool as the host.
+
+        On such a part (DGX Spark's GB10, Jetson) a device allocation is host
+        memory the kernel no longer has, and a host copy of a mapped weight is
+        a second copy of bytes the page cache already holds.
+        """
+        return False
+
+    @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
-        return resolve_obj_by_qualname(attention_cls_str)
+        return resolve_name(attention_cls_str)
+
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        """Check if a tensor is on the current platform's device."""
+        return t.is_cuda
 
 
 class UnspecifiedPlatform(Platform):

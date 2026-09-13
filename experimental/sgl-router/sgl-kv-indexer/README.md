@@ -133,7 +133,8 @@ sgl-router \
   --model-id <model-id> \
   --tokenizer-path <huggingface-repo-or-tokenizer> \
   --worker-urls http://127.0.0.1:30000 \
-  --policy cache_aware_zmq \
+  --policy cache_aware \
+  --cache-prefix-provider indexer \
   --kv-indexer-endpoint http://127.0.0.1:50051 \
   --kv-indexer-query-timeout-ms 100 \
   --kv-indexer-query-max-inflight 32

@@ -28,7 +28,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=23, stage="base-b", runner_config="1-gpu-large")
 
 T, H, HV, K, V, SLOTS = 4, 4, 16, 128, 128, 16
 DEVICE = "cuda"

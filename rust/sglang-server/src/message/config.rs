@@ -15,6 +15,7 @@
 //! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
 //! the rest is pure Rust.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -118,6 +119,9 @@ pub struct ServerArgs {
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
     /// frames.
     pub skip_tokenizer_init: bool,
+    /// Start accepting health checks immediately instead of waiting for the
+    /// main process's startup warmup request to finish.
+    pub skip_server_warmup: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -129,6 +133,8 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
+    pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -168,10 +174,12 @@ impl ServerArgs {
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
+        skip_server_warmup,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
@@ -198,10 +206,12 @@ impl ServerArgs {
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
+        skip_server_warmup: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -226,10 +236,12 @@ impl ServerArgs {
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
+            skip_server_warmup,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
@@ -262,10 +274,12 @@ impl Default for ServerArgs {
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
+            skip_server_warmup: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,

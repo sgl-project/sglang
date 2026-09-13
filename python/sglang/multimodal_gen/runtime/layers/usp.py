@@ -41,6 +41,20 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 
+def drop_a2a_staging_buffers() -> None:
+    """Release the cached all-to-all staging buffers on this rank.
+
+    The cache only ever grows to the largest message seen, so a warmup probe
+    at the full serving shape leaves buffers sized for it behind; the caller
+    releases them at a point every rank reaches together.
+    """
+    if not _A2A_STAGING_BUFFERS:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _A2A_STAGING_BUFFERS.clear()
+
+
 def _a2a_staging_buffer(
     role: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
