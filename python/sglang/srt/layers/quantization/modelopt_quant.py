@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -2741,10 +2742,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp4_moe_weights_for_flashinfer_trtllm,
+                trtllm_nvfp4_hidden_alignment,
             )
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            align_fp4_moe_weights_for_flashinfer_trtllm(
+                layer,
+                hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                    self.quant_config.use_per_token_activation,
+                    layer.moe_runner_config.is_gated,
+                ),
+            )
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -2887,6 +2895,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if (
+            self.quant_config.use_per_token_activation
+            and not moe_runner_config.is_gated
+        ):
+            # FlashInfer's fast-math per-token requant of the GEMM1 output
+            # (nvfp4QuantAndPerTokenScaleKernel) maps an all-zero row to
+            # rcp(0) = inf and stores NaN block scales. RELU^2 experts emit
+            # all-zero rows routinely, so take the exact-math path that guards
+            # rowAmax == 0. TODO: remove once flashinfer-ai/flashinfer#5031
+            # ships in a release.
+            os.environ.setdefault("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+
         if moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
@@ -3014,6 +3034,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
+                padded_hidden_size=getattr(layer, "trtllm_padded_hidden_size", None),
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,

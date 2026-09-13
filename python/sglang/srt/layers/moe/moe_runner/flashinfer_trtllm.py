@@ -515,46 +515,69 @@ def _align_fp4_moe_weights(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     is_gated: bool,
-    min_alignment: int = 16,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Pad intermediate size so FlashInfer TRTLLM FP4 kernels' alignment holds.
+    intermediate_alignment: int = 16,
+    hidden_alignment: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Zero-pad intermediate and hidden sizes to the TRT-LLM FP4 kernel alignments.
 
-    Returns (w13, w13_scale, w2, w2_scale, padded_intermediate).
+    Intermediate padding is transparent to callers. Hidden padding (K of GEMM1,
+    N of GEMM2) also requires zero-padding the activations at runtime and
+    slicing the MoE output back; see trtllm_nvfp4_hidden_alignment.
+
+    Returns (w13, w13_scale, w2, w2_scale, padded_intermediate, padded_hidden).
     """
     num_experts, hidden_size, intermediate_packed = w2.shape
     intermediate = intermediate_packed * 2  # FP4 packs 2 values per byte
 
-    padded_intermediate = round_up_to_multiple(intermediate, min_alignment)
-    if padded_intermediate == intermediate:
-        return w13, w13_scale, w2, w2_scale, intermediate
+    padded_intermediate = round_up_to_multiple(intermediate, intermediate_alignment)
+    padded_hidden = round_up_to_multiple(hidden_size, hidden_alignment)
+    if padded_intermediate == intermediate and padded_hidden == hidden_size:
+        return w13, w13_scale, w2, w2_scale, intermediate, hidden_size
 
-    logger.info(
-        "FP4 MoE: padding intermediate size from %d to %d (alignment=%d)",
-        intermediate,
-        padded_intermediate,
-        min_alignment,
-    )
+    if padded_intermediate != intermediate:
+        logger.info(
+            "FP4 MoE: padding intermediate size from %d to %d (alignment=%d)",
+            intermediate,
+            padded_intermediate,
+            intermediate_alignment,
+        )
+    if padded_hidden != hidden_size:
+        logger.info(
+            "FP4 MoE: padding hidden size from %d to %d (alignment=%d)",
+            hidden_size,
+            padded_hidden,
+            hidden_alignment,
+        )
 
     up_mult = 2 if is_gated else 1
     padded_gate_up = up_mult * padded_intermediate
 
-    padded_w13 = w13.new_zeros((num_experts, padded_gate_up, w13.shape[2]))
-    padded_w13[:, : w13.shape[1], :] = w13
-
-    padded_w2 = w2.new_zeros((num_experts, hidden_size, padded_intermediate // 2))
-    padded_w2[:, :, : w2.shape[2]] = w2
+    # w13: [E, gate_up, hidden/2], scale [E, gate_up, hidden/16]
+    padded_w13 = w13.new_zeros((num_experts, padded_gate_up, padded_hidden // 2))
+    padded_w13[:, : w13.shape[1], : w13.shape[2]] = w13
 
     padded_w13_scale = w13_scale.new_zeros(
-        (num_experts, padded_gate_up, w13_scale.shape[2])
+        (num_experts, padded_gate_up, padded_hidden // 16)
     )
-    padded_w13_scale[:, : w13_scale.shape[1], :] = w13_scale
+    padded_w13_scale[:, : w13_scale.shape[1], : w13_scale.shape[2]] = w13_scale
+
+    # w2: [E, hidden, intermediate/2], scale [E, hidden, intermediate/16]
+    padded_w2 = w2.new_zeros((num_experts, padded_hidden, padded_intermediate // 2))
+    padded_w2[:, :hidden_size, : w2.shape[2]] = w2
 
     padded_w2_scale = w2_scale.new_zeros(
-        (num_experts, hidden_size, padded_intermediate // 16)
+        (num_experts, padded_hidden, padded_intermediate // 16)
     )
-    padded_w2_scale[:, :, : w2_scale.shape[2]] = w2_scale
+    padded_w2_scale[:, :hidden_size, : w2_scale.shape[2]] = w2_scale
 
-    return padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_intermediate
+    return (
+        padded_w13,
+        padded_w13_scale,
+        padded_w2,
+        padded_w2_scale,
+        padded_intermediate,
+        padded_hidden,
+    )
 
 
 def _compute_g1_scale_c(
@@ -583,11 +606,31 @@ def _compute_g1_scale_c(
     return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
 
 
-def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
+def trtllm_nvfp4_hidden_alignment(
+    use_per_token_activation: bool, is_gated: bool
+) -> int:
+    """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
+
+    The per-token (dynamic activation scale) non-gated variant ships far fewer
+    tile configs than the static one: at Nemotron's hidden size 2688 it has 44
+    tactics and the heuristic default fails with "No valid config found", while
+    a 512-aligned hidden size has 192. Every other variant runs unpadded.
+    """
+    if use_per_token_activation and not is_gated:
+        return 512
+    return 1
+
+
+def align_fp4_moe_weights_for_flashinfer_trtllm(
+    layer: Module, hidden_alignment: int = 1
+) -> None:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
     This function handles the weight transformation needed for FP4 TRTLLM MoE:
     - Pads intermediate dimension for kernel alignment constraints
+    - Pads hidden dimension to `hidden_alignment` (see
+      trtllm_nvfp4_hidden_alignment); the padded size is recorded on
+      `layer.trtllm_padded_hidden_size` for runtime activation padding
     - Reorders weights for gated activation GEMM
     - Shuffles weights and scales for transposed MMA output
     - Computes the output scale factors
@@ -602,18 +645,26 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     w2_weight_scale = cast(torch.Tensor, layer.w2_weight_scale)
 
     is_gated = layer.moe_runner_config.is_gated
-    min_alignment = 16 if is_gated else 128
 
     # Pad for kernel alignment before shuffle/reorder
-    w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, intermediate_size = (
-        _align_fp4_moe_weights(
-            w13_weight,
-            w13_weight_scale,
-            w2_weight,
-            w2_weight_scale,
-            is_gated,
-            min_alignment,
-        )
+    (
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        intermediate_size,
+        padded_hidden_size,
+    ) = _align_fp4_moe_weights(
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        is_gated,
+        intermediate_alignment=16 if is_gated else 128,
+        hidden_alignment=hidden_alignment,
+    )
+    layer.trtllm_padded_hidden_size = (
+        padded_hidden_size if padded_hidden_size != layer.hidden_size else None
     )
 
     (
@@ -1248,6 +1299,9 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 
     routing_method_type: int
     use_per_token_activation: bool = False
+    # Hidden size the weights were padded to (see _align_fp4_moe_weights);
+    # None means the weights match the activation width.
+    padded_hidden_size: Optional[int] = None
 
     gemm1_alpha: Optional[torch.Tensor] = None
     gemm1_beta: Optional[torch.Tensor] = None
@@ -1317,6 +1371,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
+    unpadded_hidden_size = hidden_states.shape[-1]
+    hidden_pad = 0
+    if quant_info.padded_hidden_size is not None:
+        assert hidden_states_scale is None, (
+            "Hidden-dim padding needs unquantized activations; pre-quantized "
+            "FP4 dispatch is not supported with padded TRTLLM MoE weights."
+        )
+        hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
+        hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
     if hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
@@ -1371,6 +1434,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         and not use_routed_topk
         and TopKOutputChecker.format_is_bypassed(topk_output)
     )
+    if defer_finalize and hidden_pad > 0:
+        raise NotImplementedError(
+            "Deferred finalize is not supported with hidden-dim padded TRTLLM "
+            "NVFP4 MoE weights (per-token activation scaling, non-gated experts)."
+        )
 
     symm_output = None
     if not defer_finalize:
@@ -1501,6 +1569,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             )
         else:
             result = result[0]
+
+    if hidden_pad > 0:
+        result = result[..., :unpadded_hidden_size]
 
     return StandardCombineInput(hidden_states=result)
 
