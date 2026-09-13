@@ -63,6 +63,14 @@ on:
         type: string
         default: '300'
         description: 'timeout-minutes for the Run test step'
+      use_coverage_runner:
+        description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
+      upload_test_logs:
+        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -227,6 +235,9 @@ jobs:
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
 
+          TEST_LOG_DIR="/tmp/test-logs"
+          mkdir -p "${TEST_LOG_DIR}"
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -384,12 +395,27 @@ jobs:
           fi
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
-          # under the structured path; PR runs only tee to /tmp/test_output.log.
+          # under the structured path; PR runs tee to ${TEST_LOG_DIR}/${tc_name}.log.
           # Use an array so the extra target is omitted when empty: passing an empty
           # string arg makes GNU tee fail (exit code 1) and flips the pipeline exit code.
-          LOG_TEE_TARGETS=("/tmp/test_output.log")
+          LOG_TEE_TARGETS=("${TEST_LOG_DIR}/${tc_name}.log")
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
+          fi
+
+          # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
+          # selected test files; the original run_suite.py execution below is preserved
+          # unchanged for the default (false) path.
+          if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            ${PYTHON_FOR_SGLANG} -u ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${test_suite} ${PARTITION_ARGS} ${{ inputs.is_nightly_pipeline_job && '--nightly' || '' }} -o /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
           fi
 
           # Run NPU test suite with run_suite.py.
@@ -412,11 +438,11 @@ jobs:
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]; then
-            metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
+            metric_count=$(grep -c '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" 2>/dev/null || echo 0)
             if [ "${metric_count}" -gt 0 ]; then
               echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
               echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
-              grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
+              grep '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" | while IFS= read -r line; do
                 metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
                 metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
                 echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
@@ -427,3 +453,12 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           exit ${test_exit_code}
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != 'true' && inputs.upload_test_logs == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

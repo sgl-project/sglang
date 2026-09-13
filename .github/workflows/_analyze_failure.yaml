@@ -1,0 +1,109 @@
+# Reusable workflow: cross-reference CI test failures with coverage-based
+# test recommendations. Called by pr-test-npu.yml's analyze-failure-report job.
+name: Analyze Failure Report
+
+on:
+  workflow_call:
+    inputs:
+      log_artifact_pattern:
+        type: string
+        required: true
+        description: 'Glob pattern for test log artifacts (e.g. selected-test-logs-*)'
+      recommendations_file:
+        type: string
+        required: true
+        description: 'Path to recommendations txt file committed in the repo (priority 2)'
+      recommendations_content:
+        type: string
+        required: false
+        default: ''
+        description: 'Content of recommendations from upstream job output (priority 1)'
+
+defaults:
+  run:
+    shell: bash -el {0}
+
+jobs:
+  analyze:
+    name: cross-reference failures with recommendations
+    continue-on-error: true  # Non-blocking on parse/read failure.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sglang repo
+        uses: actions/checkout@v4
+
+      # ----- Step 1: Locate recommendations (priority: output > committed file) -----
+      - name: Locate recommendations file
+        id: locate-recs
+        run: |
+          mkdir -p ./test-logs
+          COMMITTED_REC="${{ inputs.recommendations_file }}"
+
+          if [ -n "${{ inputs.recommendations_content }}" ]; then
+            echo "has_recommendations=true" >> $GITHUB_OUTPUT
+            echo "Using workflow output recommendations"
+            echo "${{ inputs.recommendations_content }}" > ./test-logs/_recommended.txt
+            echo "RECS_FILE=./test-logs/_recommended.txt" >> $GITHUB_ENV
+            echo "RECS_SOURCE=output" >> $GITHUB_ENV
+            COUNT=$(wc -l < ./test-logs/_recommended.txt)
+            echo "Recommendations count: ${COUNT}"
+          elif [ -f "${COMMITTED_REC}" ]; then
+            echo "has_recommendations=true" >> $GITHUB_OUTPUT
+            echo "Using committed recommendations: ${COMMITTED_REC}"
+            echo "${COMMITTED_REC}" > ./test-logs/_recommended.txt
+            echo "RECS_FILE=${COMMITTED_REC}" >> $GITHUB_ENV
+            echo "RECS_SOURCE=committed" >> $GITHUB_ENV
+            COUNT=$(wc -l < "${COMMITTED_REC}")
+            echo "Recommendations count: ${COUNT}"
+          else
+            echo "has_recommendations=false" >> $GITHUB_OUTPUT
+            echo "::notice::No recommended test cases detected, skipping subsequent analysis tasks."
+          fi
+
+      # ----- Step 2: Download test logs -----
+      - name: Download test logs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ inputs.log_artifact_pattern }}
+          path: ./test-logs
+          merge-multiple: true
+          continue-on-error: true
+
+      - name: Show downloaded logs structure
+        run: |
+          echo "Downloaded log files:"
+          find ./test-logs -type f | head -50 || echo "  (no logs found)"
+
+      # ----- Step 3: Run analysis -----
+      - name: Ensure regex is available
+        if: steps.locate-recs.outputs.has_recommendations != 'false'
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import regex" >/dev/null 2>&1; then
+            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages regex
+          fi
+          python3 -c "import regex; print('regex ok:', regex.__file__)"
+
+      - name: Run failure analysis
+        if: steps.locate-recs.outputs.has_recommendations != 'false'
+        id: analysis
+        continue-on-error: true
+        run: |
+          python3 scripts/ci/npu/precise-test/analyze_failure_report.py \
+            --log-dir ./test-logs \
+            --recommendations-file "${RECS_FILE}" \
+            --recommendations-source "${RECS_SOURCE:-none}" \
+            --output ./test-logs/failure_report.md
+
+      # ----- Step 4: Upload report -----
+      - name: Upload failure analysis report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-analysis-report
+          path: ./test-logs/failure_report.md
+          if-no-files-found: ignore
+          retention-days: 14

@@ -44,6 +44,14 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      use_coverage_runner:
+        description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
+      upload_test_logs:
+        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
+        type: boolean
+        default: false
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -228,10 +236,12 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          TEST_LOG_DIR: /tmp/test-logs
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
+          mkdir -p "${TEST_LOG_DIR}"
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
@@ -266,8 +276,39 @@ jobs:
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
+
+          # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
+          # selected test files; the original run_suite.py execution below is preserved
+          # unchanged for the default (false) path.
+          LOG_FILE="${TEST_LOG_DIR}/${{ inputs.self_name }}-part${{ matrix.partition }}.log"
+
+          if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${{ inputs.self_name }} \
+              --auto-partition-id ${{ matrix.partition }} \
+              --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
+              ${{ inputs.is_nightly_pipeline_job && '--nightly' || '' }} \
+              -o /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
+          fi
+
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG
+            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != 'true' && inputs.upload_test_logs == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

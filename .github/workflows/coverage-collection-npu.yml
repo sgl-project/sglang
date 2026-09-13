@@ -1,0 +1,352 @@
+# Coverage data collection pipeline for the NPU precision test selection:
+# 1. Run the NPU test suites with coverage instrumentation (all test jobs
+#    write coverage data into the shared cache dir under
+#    /root/.cache/tests/precise-test/{run_id}-attempt-{attempt}/).
+# 2. setup-covstub assembles the outputs: sglang source snapshot (covstub),
+#    test_case_map.json (test case -> covered lines), outputs.tar.gz.
+# 3. Upload the package and the map to OBS (bucket root, same objects as the
+#    download URLs in pr-test-npu.yml) for the downstream precision test
+#    selector.
+# pr-test-npu-finish is the final gate: it runs after both the tests and the
+# coverage collection, so a green check implies coverage data is uploaded.
+#
+# Manually triggered only (workflow_dispatch), like vllm-ascend's
+# schedule_test_coverage.yaml: PRs run the standard pr-test-npu.yml instead;
+# this pipeline builds the full coverage baseline on demand.
+name: Coverage Collection (NPU)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: npu-coverage-collection-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  set-image-config:
+    runs-on: ubuntu-latest
+    outputs:
+      CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
+      CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
+    steps:
+      # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
+      - name: Set image config
+        id: set-vars
+        run: |
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+          echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+
+  base-b-test-1-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-b-test-1-npu-a3
+      runner_config: linux-aarch64-a3-800t-2
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      use_coverage_runner: true
+    secrets: inherit
+
+  base-b-test-2-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-b-test-2-npu-a3
+      runner_config: linux-aarch64-a3-800t-2
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      use_coverage_runner: true
+    secrets: inherit
+
+  base-b-test-4-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-b-test-4-npu-a3
+      runner_config: linux-aarch64-a3-800t-4
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '120'
+      timeout_per_file: '3600'
+      partitions: '{"size":2,"arr":[0, 1]}'
+      use_coverage_runner: true
+    secrets: inherit
+
+  base-b-test-8-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-b-test-8-npu-a3
+      runner_config: linux-aarch64-a3-800t-8
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      use_coverage_runner: true
+    secrets: inherit
+
+  base-b-test-16-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: base-b-test-16-npu-a3
+      runner_config: linux-aarch64-a3-800t-16
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      run_timeout_minutes: '120'
+      timeout_per_file: '3600'
+      use_coverage_runner: true
+    secrets: inherit
+
+  base-c-test-acc-2-npu-a3:
+    name: base-c-test-acc-2-npu-a3
+    needs: [ set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-2
+      test_type: 'accuracy'
+      test_suite: base-c-test-acc-2-npu-a3
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      partitions: '{"size":2,"arr":[0,1]}'
+      use_coverage_runner: true
+
+  base-c-test-acc-16-npu-a3:
+    name: base-c-test-acc-16-npu-a3
+    needs: [ set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-16
+      test_type: 'accuracy'
+      test_suite: base-c-test-acc-16-npu-a3
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      use_coverage_runner: true
+
+  base-c-test-perf-2-npu-a3:
+    name: base-c-test-perf-2-npu-a3
+    needs: [ set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-2
+      test_type: 'perf'
+      test_suite: base-c-test-perf-2-npu-a3
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      use_coverage_runner: true
+
+  base-c-test-perf-16-npu-a3:
+    name: base-c-test-perf-16-npu-a3
+    needs: [ set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-16
+      test_type: 'perf'
+      test_suite: base-c-test-perf-16-npu-a3
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
+      use_coverage_runner: true
+
+
+  # ==================== Coverage Assembly & Upload ==================== #
+  # Runs after all test jobs (regardless of their result, if: always()) on a
+  # runner that shares /root/.cache with the test jobs. Assembles covstub,
+  # builds test_case_map.json, archives outputs.tar.gz and uploads both to OBS.
+  setup-covstub:
+    needs:
+      [
+        set-image-config,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+      ]
+    if: always()
+    runs-on: linux-aarch64-a3-800t-2
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Copy sglang source to covstub
+        run: |
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          mkdir -p "${COVSTUB}"
+          cp -r python/sglang "${COVSTUB}/"
+
+      - name: Build test case map
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match scripts/ci/npu/precise-test/run_tests_with_coverage.sh
+          # (GITHUB_RUN_STARTED_AT is identical across all jobs of one run,
+          # immune to cross-midnight splits).
+          COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+          COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          # Placed outside outputs/ so it is NOT included in outputs.tar.gz.
+          MAP_FILE="${RUN_DIR}/test_case_map.json"
+
+          echo "Coverage dir: ${COV_ROOT}"
+          echo "Source dir: ${COVSTUB}"
+
+          # Coverage data may be absent when all test jobs were skipped
+          # (e.g. by the changes filter). Skip map building in that case.
+          if [ ! -d "${COV_ROOT}" ]; then
+            echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
+            exit 0
+          fi
+
+          COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
+          echo "Found ${COVERAGE_FILE_COUNT} coverage files"
+          if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
+            echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
+            exit 0
+          fi
+
+          if ! python3 -c "import regex" 2>/dev/null; then
+            pip install regex \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+          fi
+
+          python3 scripts/ci/npu/precise-test/test_selector.py \
+            --build-map \
+            --coverage-dir "${COV_ROOT}" \
+            --source-dir "${COVSTUB}" \
+            --map-file "${MAP_FILE}"
+          test -s "${MAP_FILE}"
+          du -h "${MAP_FILE}"
+
+      - name: Archive outputs
+        run: |
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
+
+      - name: Upload outputs and map to OBS
+        continue-on-error: true
+        env:
+          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
+          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          export RUN_DIR
+
+          # Skip upload when no coverage data was collected this run (map build
+          # was skipped), so we never overwrite the historical package on OBS
+          # with an incomplete one.
+          if [ ! -s "${RUN_DIR}/test_case_map.json" ]; then
+            echo "::warning::test_case_map.json missing (no coverage data this run), skip OBS upload"
+            exit 0
+          fi
+
+          if ! python3 -c "import obs" 2>/dev/null; then
+            pip install esdk-obs-python --quiet \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install esdk-obs-python --quiet -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+          fi
+
+          python3 - <<'EOF'
+          import os
+          from obs import ObsClient
+
+          # Must match the download URLs in pr-test-npu.yml:
+          # https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/{outputs.tar.gz,test_case_map.json}
+          OBS_BUCKET = 'sglang-ascend'
+          run_dir = os.environ['RUN_DIR']
+
+          client = ObsClient(
+              access_key_id=os.environ['OBS_ACCESS_KEY'],
+              secret_access_key=os.environ['OBS_SECRET_KEY'],
+              server='https://obs.cn-east-3.myhuaweicloud.com'
+          )
+
+          uploads = [
+              (os.path.join(run_dir, 'outputs.tar.gz'), 'outputs.tar.gz'),
+              (os.path.join(run_dir, 'test_case_map.json'), 'test_case_map.json'),
+          ]
+          for local_path, obs_path in uploads:
+              resp = client.putFile(OBS_BUCKET, obs_path, local_path)
+              if resp.status < 300:
+                  print(f'Uploaded: {local_path} -> {obs_path}')
+              else:
+                  raise Exception(f'Failed to upload {local_path}: {resp.errorMessage}')
+          EOF
+
+  # ==================== Final Gate ==================== #
+  # Runs last: after the tests AND the coverage assembly/upload. A green check
+  # means both the tests passed and the coverage package was uploaded.
+  # Job id is kept stable because branch protection may reference this check.
+  pr-test-npu-finish:
+    needs:
+      [
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+        setup-covstub,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          # If the loop completes, all jobs were successful
+          echo "All jobs completed successfully"
+          exit 0
