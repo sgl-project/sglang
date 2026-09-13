@@ -185,6 +185,53 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(params["city"], "Tokyo")
         self.assertEqual(params["unit"], "celsius")
 
+    def test_streaming_single_quote_inside_json_value(self):
+        # A valid JSON argument value that contains a `: '...'` substring must
+        # not be corrupted by the Python-dict -> JSON conversion. Streaming the
+        # call character by character previously rewrote the inner single
+        # quotes and produced invalid JSON, dropping the arguments.
+        note_tool = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="note",
+                    parameters={
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                ),
+            )
+        ]
+        text = '<|python_tag|>{"name": "note", "arguments": {"text": "tip: \'be careful\'"}}'
+        detector = Llama32Detector()
+        all_calls = []
+        for ch in text:
+            all_calls.extend(detector.parse_streaming_increment(ch, note_tool).calls)
+
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "note")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["text"], "tip: 'be careful'")
+
+    def test_streaming_python_dict_syntax(self):
+        # Python-dict (single-quoted) output must still convert correctly when
+        # streamed, including when the call is delivered character by character.
+        text = "<|python_tag|>{'name': 'get_weather', 'arguments': {'city': 'Beijing'}}"
+        detector = Llama32Detector()
+        all_calls = []
+        for ch in text:
+            all_calls.extend(detector.parse_streaming_increment(ch, self.tools).calls)
+
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Beijing")
+
 
 if __name__ == "__main__":
     import unittest
