@@ -81,6 +81,14 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff). Opt-in, off by default.
+    SGLANG_HI3_COND_ENCODE_BATCHING: bool = False
+    # HunyuanImage-3: apply the post-decode output geometry (native crop/pad
+    # and exact-size resample) to hit the requested aspect ratio. On by
+    # default; set 0 to skip the plan and return the full decoded native
+    # bucket untouched.
+    SGLANG_HI3_OUTPUT_CROP: bool = True
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
@@ -382,6 +390,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff on OOM). Opt-in, off by
+    # default; the AR backbone resident on the same device makes full-batch
+    # encoding tight on memory, so it must be explicitly enabled.
+    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool("SGLANG_HI3_COND_ENCODE_BATCHING"),
+    # HunyuanImage-3: post-decode output geometry (native crop/pad plus
+    # exact-size resample). On by default; 0 returns the raw native bucket.
+    "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
