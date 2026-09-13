@@ -60,18 +60,6 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         }
     }
 
-    // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab
-    // bound — parity with the retired direct decode service: an unknown id is
-    // the tokenizer's error to report, and nothing here reaches the scheduler's
-    // embedding lookup.
-    if let RequestKind::Detokenize { token_ids } = &req.kind {
-        for &id in token_ids {
-            if u32::try_from(id).is_err() {
-                return Err(Error::Validation(format!("Token ID {id} is out of range")));
-            }
-        }
-    }
-
     // The scheduler only computes hidden states when launched for it, so without
     // this the request would 200 with `meta_info.hidden_states` silently absent
     // (Python `TokenizerManager._validate_one_request`).

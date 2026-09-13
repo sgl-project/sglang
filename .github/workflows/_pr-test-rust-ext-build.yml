@@ -116,8 +116,9 @@ jobs:
         with:
           path: |
             python/sglang/srt/rust_extensions/_*.so
+            rust/target/release/sglang-renderer
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', '!rust/target/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -130,6 +131,7 @@ jobs:
           if [ -n "${MATCHED_KEY}" ]; then
               echo "hit: ${MATCHED_KEY}"
               ls -l python/sglang/srt/rust_extensions/_*.so \
+                rust/target/release/sglang-renderer \
                 python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
           else
               echo "miss: ${PRIMARY_KEY}"
@@ -152,7 +154,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          # Archive holds package-relative paths, so it unpacks into python/sglang/srt/.
+          # Archive paths are relative to the repository root.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1
@@ -226,6 +228,14 @@ jobs:
           cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
               -p torch-sys -p sglang-radix-tree 2>/dev/null || true
           (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+          # The standalone executable is independent of the Python ABI.
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+              cargo build --manifest-path rust/Cargo.toml -p sglang-renderer \
+                  --release --features http --locked
+              renderer_release="${CARGO_TARGET_DIR}${CARGO_BUILD_TARGET:+/${CARGO_BUILD_TARGET}}/release"
+              mkdir -p rust/target/release
+              cp "${renderer_release}/sglang-renderer" rust/target/release/sglang-renderer
+          fi
           python - <<'PY'
           import importlib.util
           import os
@@ -296,14 +306,15 @@ jobs:
           )
           PY
 
-      # Both globs sit under python/sglang/srt/, which upload-artifact strips as the
-      # common prefix, so the collect job restores them by unpacking back into it.
+      # Keep all search paths in both matrix legs: even the absent 3.10 renderer
+      # makes the common prefix the repository root, preserving native module paths.
       - name: Upload this interpreter's modules
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}-build-py${{ matrix.python-version }}
           path: |
             python/sglang/srt/rust_extensions/_*.so
+            rust/target/release/sglang-renderer
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
           if-no-files-found: error
           retention-days: 1
@@ -339,7 +350,7 @@ jobs:
         with:
           pattern: ${{ inputs.artifact_name }}-build-py*
           merge-multiple: true
-          path: python/sglang/srt
+          path: .
 
       # First point that sees every interpreter, which is what the suffix-set check
       # compares. MAX_GLIBC belongs here rather than in the restore job: these are
@@ -347,7 +358,9 @@ jobs:
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
-        run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+        run: |
+          chmod +x rust/target/release/sglang-renderer
+          bash scripts/ci/utils/stage_rust_ext_modules.sh
 
       # Without it the entry saved below lands under a version no reader with zstd
       # can find. This runner's image ships without it.
@@ -361,14 +374,15 @@ jobs:
         with:
           path: |
             python/sglang/srt/rust_extensions/_*.so
+            rust/target/release/sglang-renderer
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', '!rust/target/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          # Archive holds package-relative paths, so it unpacks into python/sglang/srt/.
+          # Archive paths are relative to the repository root.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1

@@ -60,10 +60,8 @@ async fn await_control_result(
                 StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err((code, e.to_string()).into_response())
         }
-        // A control request never receives generation frames or service-call data.
-        Some(ResponseItem::Frame(_))
-        | Some(ResponseItem::Done(_))
-        | Some(ResponseItem::Data(_)) => Err((
+        // A control request never receives generation frames.
+        Some(ResponseItem::Frame(_)) | Some(ResponseItem::Done(_)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected generation output for control request",
         )

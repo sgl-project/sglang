@@ -78,16 +78,6 @@ impl From<FinishKind> for FinishReason {
 }
 
 impl FinishReason {
-    /// Returns the wire type without reserializing the finish reason.
-    pub fn kind_name(&self) -> Option<&str> {
-        match self {
-            FinishReason::Known(FinishKind::Stop { .. }) => Some("stop"),
-            FinishReason::Known(FinishKind::Length { .. }) => Some("length"),
-            FinishReason::Known(FinishKind::Abort(_)) => Some("abort"),
-            FinishReason::Unknown(fields) => fields.get("type").and_then(|value| value.as_str()),
-        }
-    }
-
     /// The stop this request matched, if it stopped on one. `None` for
     /// length/abort and for an unknown type.
     pub fn matched(&self) -> Option<&Matched> {
