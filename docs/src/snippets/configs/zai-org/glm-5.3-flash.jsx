@@ -173,8 +173,7 @@ export const config = {
     "mi355x|mxfp4": "OneNexus/GLM-5.3-Flash-MXFP4",
   },
 
-  // The ROCm image alone predates this PR; use the pinned source overlay and
-  // model directories in the MI355X preparation section of the cookbook.
+  // MI355X uses a ROCm environment; the Docker images below are NVIDIA-only.
   runModes: (s) => s.hw === "mi355x" ? ["python"] : ["python", "docker"],
 
   placeholders: {
@@ -392,9 +391,7 @@ sgl-eval run gsm8k \\
       verified: false,
       env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
       flags: [
-        "--model-path ./model-glm53-fp8",
-        "--tokenizer-path ./tokenizer-glm53",
-        "--served-model-name {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--quantization fp8",
         "--tp-size 4", "--ep-size 4",
@@ -424,9 +421,7 @@ sgl-eval run gsm8k \\
       verified: false,
       env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
       flags: [
-        "--model-path ./model-glm53-mxfp4",
-        "--tokenizer-path ./tokenizer-glm53",
-        "--served-model-name {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--quantization quark",
         "--tp-size 4", "--ep-size 4",
@@ -455,9 +450,7 @@ sgl-eval run gsm8k \\
       verified: false,
       env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
       flags: [
-        "--model-path ./model-glm53-fp8",
-        "--tokenizer-path ./tokenizer-glm53",
-        "--served-model-name {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--trust-remote-code", "--quantization fp8",
         "--tp-size 4", "--ep-size 4", "--context-length 262144",
         "--page-size 64", "--mem-fraction-static 0.82",
@@ -478,9 +471,7 @@ sgl-eval run gsm8k \\
       verified: false,
       env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
       flags: [
-        "--model-path ./model-glm53-mxfp4",
-        "--tokenizer-path ./tokenizer-glm53",
-        "--served-model-name {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--trust-remote-code", "--quantization quark",
         "--tp-size 4", "--ep-size 4", "--context-length 262144",
         "--page-size 64", "--mem-fraction-static 0.82",

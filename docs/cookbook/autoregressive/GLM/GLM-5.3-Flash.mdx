@@ -16,36 +16,9 @@ Use an SGLang build that includes GLM-5.3-Flash support.
 docker pull lmsysorg/sglang:glm-5.3-flash
 ```
 
-For the listed NVIDIA hardware, the deployment panel can render a complete `docker run` command. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup. MI355X uses the separate ROCm preparation below.
+For the listed NVIDIA hardware, the deployment panel can render a complete `docker run` command. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
 
-</Accordion>
-
-<Accordion title="Prepare MI355X (FP8 or MXFP4)">
-
-Use four MI355X GPUs on one ROCm host and an SGLang build that includes
-[PR #39273](https://github.com/sgl-project/sglang/pull/39273). See the
-[MXFP4 model card](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4)
-for ROCm image and dependency setup.
-
-Download your chosen checkpoint and the shared tokenizer below. Run the
-generated **Python** command from this directory inside the ROCm environment.
-
-```bash Command
-# FP8 checkpoint
-hf download zai-org/GLM-5.3-Flash \
-  --revision 690b705278a3a58e538fcb37c2ca8b5f9511213c \
-  --local-dir model-glm53-fp8
-# Or MXFP4 checkpoint
-hf download OneNexus/GLM-5.3-Flash-MXFP4 \
-  --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
-  --local-dir model-glm53-mxfp4
-# Shared tokenizer for either checkpoint
-hf download OneNexus/GLM-5.3-Flash-MXFP4 \
-  --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
-  --include config.json generation_config.json processor_config.json \
-    tokenizer.json tokenizer_config.json chat_template.jinja \
-  --local-dir tokenizer-glm53
-```
+For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd_gpu) and run the generated **Python** command on four GPUs. Select FP8 or [MXFP4](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4); SGLang downloads the model and tokenizer automatically.
 
 </Accordion>
 
