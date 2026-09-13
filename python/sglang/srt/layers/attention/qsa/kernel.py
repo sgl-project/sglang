@@ -268,6 +268,50 @@ def expand_qsa_block_indices(
     )
 
 
+@triton.jit
+def _zero_padded_group_locs_kernel(
+    group_locs,
+    compressed_locs,
+    group_stride: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if tl.load(compressed_locs + row) != 0:
+        return
+    cols = tl.arange(0, BLOCK)
+    tl.store(
+        group_locs + row * group_stride + cols,
+        tl.zeros([BLOCK], dtype=tl.int64),
+        mask=cols < COMPRESS_RATIO,
+    )
+
+
+def zero_padded_group_locs(
+    group_locs: torch.Tensor,
+    compressed_locs: torch.Tensor,
+) -> torch.Tensor:
+    """Point the write plan's no-op rows at token row 0, in place.
+
+    A row is a no-op when it targets reserved compressed slot 0; real writes
+    never target it. Only those rows are stored to, so planned rows keep the
+    member spans the caller computed.
+    """
+
+    rows = group_locs.shape[0]
+    if rows == 0:
+        return group_locs
+    compress_ratio = group_locs.shape[1]
+    _zero_padded_group_locs_kernel[(rows,)](
+        group_locs,
+        compressed_locs,
+        group_locs.stride(0),
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK=triton.next_power_of_2(compress_ratio),
+    )
+    return group_locs
+
+
 def qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
