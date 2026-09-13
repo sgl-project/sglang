@@ -370,7 +370,9 @@ def maybe_load_fsdp_model(
         )
         register_fsdp_entrypoints(model)
 
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    param_names_mapping_fn = get_param_names_mapping(
+        model.param_names_mapping, valid_target_names=set(model.state_dict())
+    )
 
     # 2. load model from disk
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)

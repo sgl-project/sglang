@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
     peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -417,6 +418,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
+                pin_budget=get_global_component_residency_manager(
+                    self.pipeline, self.server_args
+                ).host_pin_budget,
                 component_names=(
                     None
                     if self.server_args.component_residency is not None
@@ -1367,13 +1371,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         merge batched output
         """
-        if parts.output_file_paths:
-            merged.output_file_paths = parts.output_file_paths
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(
                 metrics for metrics in parts.metrics_list if metrics is not None
             )
+        if merged.error is not None:
+            return
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
         if parts.tensor_outputs:
             merged.output = torch.cat(parts.tensor_outputs, dim=0)
         elif parts.list_outputs:

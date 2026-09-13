@@ -105,6 +105,23 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                ).resolve_once()
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",
@@ -237,12 +254,19 @@ class TestPrepareServerArgs(CustomTestCase):
             resolution_result(inherited, "speculative_draft_model_quantization"),
             "modelopt_fp4",
         )
+        # The provenance bit, not the public field: `from_server_args` reads
+        # `cfg._speculative_draft_quantization_explicitly_set` to tell an
+        # inherited draft quantization from one the operator asked for, and
+        # resolution decided the value without consuming that evidence.
         self.assertFalse(
             resolution_result(
                 inherited, "_speculative_draft_quantization_explicitly_set"
             )
         )
 
+        # And across the hop that matters: the scheduler and the draft worker
+        # rebuild the record from its fields and resolve again, so the bit has
+        # to survive `asdict` and come back the same the second time.
         reconstructed = ServerArgs(**dataclasses.asdict(inherited))
         handle_missing_default_values(reconstructed)
 

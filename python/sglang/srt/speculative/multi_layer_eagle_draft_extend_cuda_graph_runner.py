@@ -812,7 +812,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         out = runner.replay(
             self.bs, self.seq_lens_sum, self._replay_spec_info, self.seq_lens_cpu
         )
-        self._publish_shared_read_done(step)
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens
         num_logit_rows = raw_bs if self.prune_draft_extend_logits else raw_num_tokens
@@ -829,14 +828,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             out.topk_p[:raw_bs],
             out.topk_index[:raw_bs],
         )
-
-    def _publish_shared_read_done(self, step: int) -> None:
-        if step != self.speculative_num_steps - 1:
-            return
-        runner = self.runners[step]
-        read_done = runner.device_module.Event()
-        read_done.record()
-        runner.model_runner.shared_read_done_event = read_done
 
     def clone_draft_probs(self) -> torch.Tensor:
         """Materialize the in-graph-written proposal q [raw_bs, num_steps, vocab]
@@ -998,6 +989,4 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                     out.topk_p[:raw_bs],
                     out.topk_index[:raw_bs],
                 )
-        result = self._cached[step]
-        self._publish_shared_read_done(step)
-        return result
+        return self._cached[step]

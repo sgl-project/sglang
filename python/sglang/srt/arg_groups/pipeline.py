@@ -91,6 +91,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
+
+    handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
@@ -231,6 +234,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    # After the model overrides: Qwen4-Exp declares the PLE offload default there.
+    handle_offload_compatibility(server_args)
 
     # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)

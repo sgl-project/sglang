@@ -14,8 +14,10 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+import weakref
 
 import psutil
+import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -282,6 +284,14 @@ class HostPinBudget:
             self.available_bytes / GIB_BYTES,
         )
         return False
+
+    def release(self, weight_bytes: int) -> None:
+        """Return an allowance when its pinned storage is no longer owned."""
+        self.committed_bytes -= weight_bytes
+
+    def track_storage(self, storage: torch.UntypedStorage) -> None:
+        """Tie an already booked allowance to the storage's last owner."""
+        weakref.finalize(storage, self.release, storage.nbytes())
 
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:

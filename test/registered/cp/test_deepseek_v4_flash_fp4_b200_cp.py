@@ -203,7 +203,7 @@ class TestDSV4FlashFP4B200_CP_DSpark(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """DSPARK speculation + prefill CP (interleave, CP_V2, attn_cp=tp)."""
+    """DSPARK speculation + prefill CP (interleave, CP, attn_cp=tp)."""
 
     gsm8k_accuracy_thres = 0.90
 

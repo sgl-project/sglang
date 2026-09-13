@@ -224,7 +224,7 @@ jobs:
               '',
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
-              `Latest PR Test (AMD ROCm 7.2): ${amdStart}${amdText}${amdEnd}`,
+              `Latest PR Test (AMD ROCm 10): ${amdStart}${amdText}${amdEnd}`,
               outerEnd,
             ].join('\n');
 

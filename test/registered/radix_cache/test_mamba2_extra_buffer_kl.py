@@ -48,7 +48,7 @@ class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):
         "256",
         "--mem-fraction-static",
         "0.8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         # The 512-token decode turns must cross a track boundary for the tree
         # to hold decode-seeded states; halve the default interval (must stay

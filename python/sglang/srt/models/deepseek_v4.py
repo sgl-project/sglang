@@ -79,7 +79,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    is_cp_v2_active,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -3568,7 +3568,7 @@ class DeepseekV4Model(nn.Module):
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
-            is_cp_v2_active(forward_batch) and forward_batch.forward_mode.is_extend()
+            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
         if self.engram_hasher is not None:
             if cp_extend:

@@ -36,8 +36,8 @@
  * a clean PDL handoff.
  *
  * Expert-weight dtype is templated on ``TypeExpW`` so we accept both bf16
- * and fp32 topk weights. FlashInfer returns bf16 for packed routing and
- * preserves the caller's weight dtype for unpacked routing.
+ * and fp32 topk weights: the trtllm deferred finalize returns bf16 for packed
+ * routing and the caller's own fp32 weights for unpacked routing.
  *
  * Expert-weight scale convention: in our target backends
  * (flashinfer trtllm nvfp4 + unquantized), ``apply_routed_scaling_factor_on_output``

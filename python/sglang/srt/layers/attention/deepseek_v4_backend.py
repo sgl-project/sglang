@@ -99,7 +99,7 @@ from sglang.srt.layers.cp.interleave import (
 )
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    is_cp_v2_active,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
@@ -594,7 +594,7 @@ class DSV4AttnMetadata:
 
     def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
         assert self.page_table.dim() == 2
-        # CP-v2 pads causal metadata for per-rank partitioning, while cache-write
+        # CP pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
         # length; legacy paths use the metadata length.
         if num_tokens is None:
@@ -1266,8 +1266,8 @@ class DeepseekV4AttnBackend(
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
-        cp_v2_active = forward_batch is not None and is_cp_v2_active(forward_batch)
-        if cp_v2_active:
+        cp_active = forward_batch is not None and is_cp_active(forward_batch)
+        if cp_active:
             if cp_metadata is None:
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
@@ -1301,11 +1301,11 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             dspark_block_size=dspark_block_size,
             dspark_swa_buffers=dspark_swa_buffers,
-            num_tokens=num_tokens if cp_v2_active else None,
+            num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(extend_seq_lens_cpu),
         )
-        if cp_v2_active:
+        if cp_active:
             core_attn_metadata.apply_cp_reindex(
                 num_tokens=num_tokens, local_index=cp_metadata.local_index
             )
@@ -1457,7 +1457,7 @@ class DeepseekV4AttnBackend(
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
-            if is_cp_v2_active(forward_batch)
+            if is_cp_active(forward_batch)
             else None
         )
 
@@ -2279,7 +2279,7 @@ class DeepseekV4AttnBackend(
     ) -> None:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
         # first layer. DFLASH/DSPARK have no later prefill draft-extend reader;
-        # CP-v2 shards the query layout that this global snapshot assumes.
+        # CP shards the query layout that this global snapshot assumes.
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
             return
@@ -2289,7 +2289,7 @@ class DeepseekV4AttnBackend(
             envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and self.model_runner.spec_algorithm.is_dflash_family()
-            and not is_cp_v2_active(forward_batch)
+            and not is_cp_active(forward_batch)
         )
         if not snapshot_shared_prefill_reads:
             return
@@ -2335,7 +2335,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        if is_cp_v2_active(forward_batch):
+        if is_cp_active(forward_batch):
             query_lens = torch.tensor(
                 interleave_rows_per_request(
                     _as_int_list(extend_seq_lens_cpu),
