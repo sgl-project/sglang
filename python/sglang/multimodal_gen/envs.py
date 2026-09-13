@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -302,6 +303,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaln_proj weights; keep off until an e2e trajectory gate clears it.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
+    # Opt-in native BF16 MiniMax-H3 TP2 x U2 QKV weight sharding.
+    "SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV": _lazy_bool(
+        "SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

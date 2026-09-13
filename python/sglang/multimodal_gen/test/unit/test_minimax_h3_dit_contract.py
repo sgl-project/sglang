@@ -501,6 +501,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     torch.nn.Module.__init__(attention)
     attention.head_dim = 128
     attention.num_heads = 8
+    attention.qkv_num_heads = 8
     attention.softmax_scale = 128**-0.5
     attention.prefix = "test.attn"
     attention._cube_sparse_capable = False
