@@ -336,8 +336,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         page_size = self.page_size
         full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
         swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
-        if swa_pages > full_pages:
-            return None
+        # Restoring host SWA for device-resident FULL can require more new
+        # SWA pages than new FULL pages; only the shared budget constrains it.
 
         compacted = empty_pool or not self.lazy_compaction or self._compaction_allowed()
 
@@ -509,8 +509,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         page_size = self.page_size
         num_full_pages = (int(full_tokens) + page_size - 1) // page_size
         num_swa_pages = (int(swa_tokens) + page_size - 1) // page_size
-        if num_swa_pages > num_full_pages:
-            return False
         if self._fits_page_demand(
             num_full_pages,
             num_swa_pages,

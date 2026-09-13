@@ -625,7 +625,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                 max_full = min(12, full_evictable) // page_size
                 max_swa = min(8, swa_evictable) // page_size
                 for full_pages in range(9):
-                    for swa_pages in range(full_pages + 1):
+                    for swa_pages in range(9):
                         feasible = [
                             (full * page_size, swa * page_size)
                             for swa in range(max_swa + 1)
@@ -652,6 +652,25 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                                 ),
                                 feasible[0] if feasible else None,
                             )
+
+    def test_restore_swa_without_allocating_more_full(self):
+        _, allocator, _ = self._build(page_size=4)
+        indices = allocator.alloc(8)
+        full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
+        allocator.free_swa(indices)
+
+        self.assertEqual(allocator.reclaim_plan(0, 8), (0, 0))
+        self.assertTrue(allocator.can_reserve(0, 8))
+        self.assertTrue(allocator.ensure_capacity(0, 8))
+        allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_kv_indices_for_transfer(indices), full_before
+            )
+        )
+        self.assertTrue(
+            bool((allocator.swa_attn_allocator.translate_kv_loc(indices) > 0).all())
+        )
 
     def test_empty_pool_reservation_matches_packed_byte_boundary(self):
         page_size = 4
