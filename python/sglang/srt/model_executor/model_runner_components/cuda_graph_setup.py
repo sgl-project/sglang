@@ -122,6 +122,27 @@ def index_attention_layers_by_global_id(
     return indexed_attention, indexed_companions
 
 
+def _resolve_full_prefill_max_requests(
+    model_runner, configured_max: Optional[int]
+) -> int:
+    """Resolve FullCG's fixed request axis.
+
+    Ordinary MHA reads cached K/V directly from the paged cache, so its graph
+    topology does not grow with the number of prefix chunks. Capture every
+    request slot by default. MLA's request-slot count is coupled to its
+    prefix-chunk shape, so retain its conservative historical default.
+    """
+    request_pool_size = model_runner.req_to_token_pool.size
+    if configured_max is not None:
+        return min(configured_max, request_pool_size)
+    if not model_runner.use_mla_backend:
+        return request_pool_size
+    return min(
+        max(get_schedule().chunked_prefill_size // 512, 1),
+        request_pool_size,
+    )
+
+
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
     memory_phase: str
@@ -400,11 +421,8 @@ def capture_prefill_graph(
         return result(eager_runner)
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
-        max_capture_requests = prefill_config.full_prefill_max_req
-        if max_capture_requests is None:
-            max_capture_requests = max(get_schedule().chunked_prefill_size // 512, 1)
-        max_capture_requests = min(
-            max_capture_requests, model_runner.req_to_token_pool.size
+        max_capture_requests = _resolve_full_prefill_max_requests(
+            model_runner, prefill_config.full_prefill_max_req
         )
         # Resolve Full's fixed request-axis shape once, just like bs below.
         prefill_config.full_prefill_max_req = max_capture_requests
