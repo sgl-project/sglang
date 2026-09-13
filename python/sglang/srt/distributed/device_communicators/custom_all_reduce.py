@@ -293,18 +293,47 @@ class CustomAllreduce:
                 )
         elif self.use_amd_deterministic_impl:
             inp_size = inp.numel() * inp.element_size()
-            if inp_size < self.max_size:
+            if inp_size <= self.max_size:
                 reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
                 ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
             else:
-                self.register_buffer(inp)
-                ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+                self._deterministic_all_reduce_oversized(inp, out)
         else:  # normal AMD ROCm path
             if registered:
                 ops.all_reduce_reg(self._ptr, inp, out)
             else:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
+
+    def _deterministic_all_reduce_oversized(
+        self, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Reduce an input larger than `self.buffer` one piece at a time.
+
+        Registering the input instead would be cheaper per call, but each
+        registration permanently consumes a `rank_data` slot, so a server that
+        keeps seeing oversized inputs (a large `chunked_prefill_size` is enough
+        to produce one per forward pass) eventually dies with "Rank data buffer
+        is overflowed". Splitting cannot change the result of any element: an
+        all-reduce is elementwise, and the 1-stage kernel accumulates ranks in
+        a fixed order regardless of how many elements it is given.
+        """
+        # `should_custom_ar` only guarantees weak contiguity, so alias the flat
+        # memory span the kernel reads rather than going through `view`.
+        flat_inp = inp.as_strided((inp.numel(),), (1,))
+        flat_out = out.as_strided((out.numel(),), (1,))
+        reg_buffer = self.buffer.view(inp.dtype)
+        # `max_size` is a multiple of 16 bytes, so every piece keeps the 16-byte
+        # size and alignment the kernel requires.
+        chunk = self.max_size // inp.element_size()
+        for beg in range(0, flat_inp.numel(), chunk):
+            piece = flat_inp[beg : beg + chunk]
+            ops.deterministic_all_reduce_unreg(
+                self._ptr,
+                piece,
+                reg_buffer[: piece.numel()],
+                flat_out[beg : beg + chunk],
+            )
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
