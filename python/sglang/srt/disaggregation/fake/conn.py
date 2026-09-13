@@ -61,6 +61,9 @@ class FakeKVSender(BaseKVSender):
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
+    def poll_pp_consensus(self) -> KVPoll:
+        return self.poll()
+
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 

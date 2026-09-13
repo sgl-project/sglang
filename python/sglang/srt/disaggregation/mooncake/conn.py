@@ -2554,6 +2554,28 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         else:
             return self.conclude_state
 
+    def poll_pp_consensus(self) -> KVPoll:
+        if self.conclude_state is None:
+            status = self.kv_mgr.check_status_pp_consensus(self.bootstrap_room)
+            # Hold Success until all staging chunks transferred: a deferred
+            # chunk can still be pending, and concluding now would drop it.
+            if (
+                status == KVPoll.Success
+                and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            ):
+                return KVPoll.Transferring
+            if status in (KVPoll.Success, KVPoll.Failed):
+                self.conclude_state = status
+                self.trace_ctx.trace_req_finish()
+            elif status == KVPoll.Bootstrapping:
+                timeout_result = self._check_bootstrap_timeout()
+                if timeout_result is not None:
+                    return timeout_result
+
+            return status
+        else:
+            return self.conclude_state
+
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
