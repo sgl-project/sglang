@@ -949,6 +949,12 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
+    if sampling_batch_info.custom_logit_processor_row_indices is not None:
+        _apply_custom_logit_processor_with_indices(
+            logits, sampling_batch_info, num_tokens_in_batch
+        )
+        return
+
     for _, (
         processor,
         batch_mask,
@@ -972,6 +978,32 @@ def apply_custom_logit_processor(
             logits[batch_mask],
             custom_params,
         )
+
+        logger.debug(
+            f"Custom logit processor {processor.__class__.__name__} is applied."
+        )
+
+
+def _apply_custom_logit_processor_with_indices(
+    logits: torch.Tensor,
+    sampling_batch_info: SamplingBatchInfo,
+    num_tokens_in_batch: int,
+) -> None:
+    for key, (processor, _) in sampling_batch_info.custom_logit_processor.items():
+        rows, indices = sampling_batch_info.custom_logit_processor_row_indices[key]
+        if num_tokens_in_batch != 1:
+            indices = (
+                indices[:, None] * num_tokens_in_batch
+                + torch.arange(num_tokens_in_batch, device=logits.device)
+            ).flatten()
+        selected = logits.index_select(0, indices)
+        custom_params = [
+            sampling_batch_info.custom_params[i]
+            for i in rows
+            for _ in range(num_tokens_in_batch)
+        ]
+        result = processor(selected, custom_params)
+        logits.index_copy_(0, indices, result)
 
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
