@@ -8,6 +8,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.moe.utils import MoeA2ABackend  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
@@ -16,6 +17,86 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def test_megamoe_draft_gather_preserves_dp_counts(self):
+        counts = [0, 3, 7, 2]
+        logprob_counts = [0, 1, 3, 1]
+        cases = [
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, "EAGLE", MoeA2ABackend.NONE, True),
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, None, MoeA2ABackend.NONE, False),
+            (
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                "EAGLE",
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                False,
+            ),
+            (MoeA2ABackend.NONE, None, MoeA2ABackend.NONE, True),
+            (MoeA2ABackend.FLASHINFER, None, MoeA2ABackend.NONE, True),
+        ]
+        parallel = SimpleNamespace(
+            enable_dp_attention=True,
+            dp_size=4,
+            tp_size=4,
+            moe_dense_tp_size=1,
+            enable_dp_lm_head=True,
+        )
+        for target, speculative_algorithm, draft, expected_gather in cases:
+            with (
+                self.subTest(
+                    target=target,
+                    speculative_algorithm=speculative_algorithm,
+                    draft=draft,
+                ),
+                patch("sglang.srt.utils.common.get_parallel", return_value=parallel),
+                patch(
+                    "sglang.srt.utils.common.get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(elastic_ep_backend=None)
+                    ),
+                ),
+                patch(
+                    "sglang.srt.utils.common.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_algorithm=speculative_algorithm
+                    ),
+                ),
+                patch(
+                    "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
+                    return_value=target,
+                ),
+                patch(
+                    "sglang.srt.layers.moe.utils.get_speculative_moe_a2a_backend",
+                    return_value=draft,
+                ),
+            ):
+                gather = dp_attn.require_mlp_tp_gather()
+                self.assertEqual(gather, expected_gather)
+                for rank in range(4):
+                    batch = SimpleNamespace()
+                    sync_info = SimpleNamespace(
+                        num_tokens=counts[rank],
+                        num_tokens_for_logprob=logprob_counts[rank],
+                        global_num_tokens=counts,
+                        global_num_tokens_for_logprob=logprob_counts,
+                        is_extend_in_batch=True,
+                        tbo_split_seq_index=None,
+                        global_forward_mode=ForwardMode.EXTEND,
+                        can_run_decode_cuda_graph=False,
+                        can_run_prefill_cuda_graph=False,
+                        prefill_cuda_graph_max_prefix_len=0,
+                    )
+                    dp_attn._update_gather_batch(batch, sync_info, gather)
+                    self.assertEqual(
+                        batch.global_num_tokens,
+                        counts if expected_gather else [counts[rank]],
+                    )
+                    self.assertEqual(
+                        batch.global_num_tokens_for_logprob,
+                        logprob_counts if expected_gather else [logprob_counts[rank]],
+                    )
+                    if expected_gather:
+                        self.assertEqual(batch.global_num_tokens[rank], counts[rank])
+                        self.assertEqual(max(batch.global_num_tokens), 7)
+
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=1))

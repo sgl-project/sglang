@@ -166,5 +166,36 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
     }
 
 
+class TestFlashinferMegaMoeBackendNvFp4OnlineW4A16(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    backend = "flashinfer_megamoe"
+    # MegaMoE supports SwiGLU; Nemotron's non-gated activation is unsupported.
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    extra_args = [
+        "--dtype",
+        "bfloat16",
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "flashinfer_megamoe",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+    ]
+    eval_args = {"api": "completion", "max_tokens": 512}
+    extra_env = {
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        # Convert every routed expert: MegaMoE cannot run excluded FP8 experts.
+        "SGLANG_FP4_IGNORED_LAYERS": "",
+    }
+
+
 if __name__ == "__main__":
     unittest.main()

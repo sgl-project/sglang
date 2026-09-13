@@ -3836,7 +3836,10 @@ def require_mlp_tp_gather():
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import (
+        get_moe_a2a_backend,
+        get_speculative_moe_a2a_backend,
+    )
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3865,6 +3868,15 @@ def require_mlp_tp_gather():
             # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
+            return True
+        elif (
+            get_moe_a2a_backend().is_flashinfer_megamoe()
+            and get_spec().speculative_algorithm is not None
+            and get_speculative_moe_a2a_backend().is_none()
+        ):
+            # MegaMoE keeps expert inputs local, but its standard-communication
+            # draft gathers across DP ranks. Preserve the shared batch's full
+            # token counts and synchronize graph buckets for that draft.
             return True
         elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
