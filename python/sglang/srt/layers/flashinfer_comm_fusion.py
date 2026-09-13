@@ -1,5 +1,6 @@
 import inspect
 import logging
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -37,6 +38,70 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_trtllm_moe_allreduce = None
+
+_TRTLLM_MOE_ALLREDUCE_API_NAME = "trtllm_moe_allreduce_fusion"
+_TRTLLM_MOE_ALLREDUCE_BACKEND = "cake"
+_TRTLLM_MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)
+_TRTLLM_MOE_ALLREDUCE_REQUIRED_PARAMS = (
+    "world_size",
+    "world_rank",
+    "token_num",
+    "hidden_dim",
+    "workspace_ptrs",
+    "launch_with_pdl",
+    "residual_in",
+    "rms_gamma",
+    "rms_eps",
+    "scale_factor",
+    "moe_reduction_device_num_experts",
+    "moe_reduction_scale_input",
+    "moe_reduction_active_experts_token_input",
+    "moe_reduction_token_input",
+    "layout_code",
+    "moe_allreduce_out",
+    "residual_out",
+    "norm_out",
+    "quant_out",
+    "scale_out",
+    "weight_bias",
+    "backend",
+)
+
+
+def _get_flashinfer_trtllm_moe_allreduce_api(comm):
+    """Return the exact pure MoE all-reduce API when it is available."""
+
+    candidate = getattr(comm, _TRTLLM_MOE_ALLREDUCE_API_NAME, None)
+    if not callable(candidate):
+        return None
+    try:
+        parameters = inspect.signature(candidate).parameters
+    except (TypeError, ValueError):
+        return None
+    if tuple(parameters) != _TRTLLM_MOE_ALLREDUCE_REQUIRED_PARAMS:
+        return None
+    if any(
+        parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for parameter in tuple(parameters.values())[:-1]
+    ):
+        return None
+    if tuple(parameters.values())[-1].kind is not inspect.Parameter.KEYWORD_ONLY:
+        return None
+    return candidate
+
+
+def _cake_moe_allreduce_topology_supported(device_sm: int, world_size: int) -> bool:
+    return (device_sm in (100, 103) and world_size == 4) or (
+        device_sm == 100 and world_size == 8
+    )
+
+
+def _cake_moe_allreduce_lamport_workspace_supported(
+    token_num: int, hidden_dim: int, world_size: int
+) -> bool:
+    required_bytes = token_num * hidden_dim * 2 * world_size
+    return token_num > 0 and required_bytes <= _TRTLLM_MAX_COMM_SIZE
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -109,6 +174,9 @@ if is_flashinfer_available():
             )
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
+            )
+            _flashinfer_trtllm_moe_allreduce = (
+                _get_flashinfer_trtllm_moe_allreduce_api(comm)
             )
         else:
             _flashinfer_allreduce_unavailable = True
@@ -253,10 +321,9 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     buffer_size = world_size * max_token_num * hidden_dim * 2
     flag_size = world_size * 256 * 4
 
-    max_comm_size = 2147483647 & ~((1 << 21) - 1)
     lamport_comm_size = min(
         world_size * max_token_num * hidden_dim * elem_size,
-        max_comm_size,
+        _TRTLLM_MAX_COMM_SIZE,
     )
     lamport_buffer_size = lamport_comm_size * 3
 
@@ -755,6 +822,235 @@ def ensure_workspace_initialized(
         _sync_allreduce_unavailable_across_tp()
 
     return workspace_manager.initialized
+
+
+@dataclass(frozen=True)
+class FlashInferTrtllmMoeAllReducePayload:
+    """Inputs carried from a routed MoE producer to the next layer RMSNorm."""
+
+    active_experts_token_input: torch.Tensor
+    scale_input: torch.Tensor
+    token_input: torch.Tensor
+    workspace_ptrs: torch.Tensor
+    world_rank: int
+    world_size: int
+    launch_with_pdl: bool
+
+
+def materialize_flashinfer_trtllm_moe_allreduce_layout(
+    gemm2_out: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert the routed MoE output into the pure reduction API layout.
+
+    The producer exposes permuted expert rows plus a flattened token-major
+    row map (``token * top_k + expert``). A ``[tokens, top_k]`` view is also
+    accepted. The reduction API consumes expert-major dense tensors instead.
+    """
+
+    if gemm2_out.ndim != 2:
+        raise ValueError("gemm2_out must have shape [rows, hidden_dim]")
+    if expert_weights.ndim != 2:
+        raise ValueError("expert_weights must have shape [tokens, top_k]")
+    if expanded_idx_to_permuted_idx.shape not in (
+        expert_weights.shape,
+        (expert_weights.numel(),),
+    ):
+        raise ValueError(
+            "expanded_idx_to_permuted_idx must have shape [tokens * top_k] "
+            "or [tokens, top_k]"
+        )
+    if expanded_idx_to_permuted_idx.dtype != torch.int32:
+        raise ValueError("expanded_idx_to_permuted_idx must use torch.int32")
+
+    tokens, top_k = expert_weights.shape
+    hidden_dim = gemm2_out.shape[1]
+    expert_major_indices = (
+        expanded_idx_to_permuted_idx.reshape(tokens, top_k).transpose(0, 1)
+        .contiguous()
+        .reshape(-1)
+        .to(torch.int64)
+    )
+    active_experts_token_input = gemm2_out.index_select(
+        0, expert_major_indices
+    ).reshape(top_k, tokens, hidden_dim)
+    scale_input = expert_weights.transpose(0, 1).to(torch.float32).contiguous()
+    return active_experts_token_input, scale_input
+
+
+def _is_flashinfer_trtllm_moe_allreduce_execution_route_supported() -> bool:
+    """Whether the execution schema can carry a tensor payload across layers."""
+
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+
+    return not (
+        get_exec().overlap.enable_two_batch_overlap
+        or is_in_tc_piecewise_cuda_graph()
+        or is_in_breakable_cuda_graph()
+    )
+
+
+def prepare_flashinfer_trtllm_moe_allreduce_payload(
+    *,
+    gemm2_out: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    top_k: int,
+    launch_with_pdl: bool,
+) -> Optional[FlashInferTrtllmMoeAllReducePayload]:
+    """Prepare a pure MoE reduction payload, or return ``None`` for fallback."""
+
+    if _flashinfer_trtllm_moe_allreduce is None or _flashinfer_allreduce_unavailable:
+        return None
+
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    parallel = get_parallel()
+    device_sm = get_platform().device_sm
+    if not (
+        _cake_moe_allreduce_topology_supported(device_sm, parallel.moe_tp_size)
+        and _is_flashinfer_trtllm_moe_allreduce_execution_route_supported()
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "trtllm"
+        and get_moe_runner_backend().is_flashinfer_trtllm()
+        and parallel.tp_size == parallel.moe_tp_size
+        and parallel.moe_ep_size == 1
+        and parallel.attn_dp_size == 1
+        and parallel.pp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.dcp_size == 1
+    ):
+        return None
+
+    tokens = expert_weights.shape[0] if expert_weights.ndim == 2 else -1
+    tensors = (
+        gemm2_out,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        shared_expert_output,
+    )
+    if not (
+        gemm2_out.ndim == 2
+        and expert_weights.ndim == 2
+        and expanded_idx_to_permuted_idx.shape
+        in (expert_weights.shape, (expert_weights.numel(),))
+        and shared_expert_output.ndim == 2
+        and _cake_moe_allreduce_lamport_workspace_supported(
+            tokens, 7168, parallel.moe_tp_size
+        )
+        and top_k == 8
+        and expert_weights.shape == (tokens, top_k)
+        and gemm2_out.shape[0] >= tokens * top_k
+        and gemm2_out.shape[1] == 7168
+        and shared_expert_output.shape == (tokens, 7168)
+        and gemm2_out.dtype in (torch.float16, torch.bfloat16)
+        and expert_weights.dtype == gemm2_out.dtype
+        and shared_expert_output.dtype == gemm2_out.dtype
+        and expanded_idx_to_permuted_idx.dtype == torch.int32
+        and all(t.is_cuda and t.is_contiguous() for t in tensors)
+        and all(t.device == gemm2_out.device for t in tensors)
+    ):
+        return None
+
+    coordinator = get_moe_tp_group()
+    expected_group = (coordinator.device_group, coordinator.cpu_group)
+    manager = _get_workspace_manager(use_attn_tp_group=False)
+    workspace = manager.workspace
+    workspace_ptrs = getattr(workspace, "workspace_tensor", None)
+    if not (
+        manager.initialized
+        and manager.backend == "trtllm"
+        and getattr(workspace, "backend", None) == "trtllm"
+        and manager.group == expected_group
+        and manager.rank == parallel.moe_tp_rank
+        and manager.world_size == parallel.moe_tp_size
+        and manager.dtype == gemm2_out.dtype
+        and manager.max_token_num is not None
+        and manager.max_token_num >= tokens
+        and manager.hidden_dim is not None
+        and manager.hidden_dim >= 7168
+        and isinstance(workspace_ptrs, torch.Tensor)
+        and workspace_ptrs.dtype == torch.int64
+        and workspace_ptrs.is_cuda
+        and workspace_ptrs.is_contiguous()
+        and workspace_ptrs.device == gemm2_out.device
+        and workspace_ptrs.numel() >= 3 * manager.world_size + 1
+        and manager.is_buffer_size_sufficient(
+            token_num=tokens,
+            hidden_dim=7168,
+            dtype=gemm2_out.dtype,
+            use_oneshot=True,
+        )
+    ):
+        return None
+
+    active_experts_token_input, scale_input = (
+        materialize_flashinfer_trtllm_moe_allreduce_layout(
+            gemm2_out,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+        )
+    )
+    return FlashInferTrtllmMoeAllReducePayload(
+        active_experts_token_input=active_experts_token_input,
+        scale_input=scale_input,
+        token_input=shared_expert_output,
+        workspace_ptrs=workspace_ptrs,
+        world_rank=manager.rank,
+        world_size=manager.world_size,
+        launch_with_pdl=launch_with_pdl,
+    )
+
+
+def run_flashinfer_trtllm_moe_allreduce(
+    payload: FlashInferTrtllmMoeAllReducePayload,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run pure MoE reduction + all-reduce + residual + RMSNorm."""
+
+    if _flashinfer_trtllm_moe_allreduce is None:
+        raise RuntimeError("FlashInfer pure MoE all-reduce API is unavailable")
+
+    tokens, hidden_dim = payload.token_input.shape
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(residual)
+    _flashinfer_trtllm_moe_allreduce(
+        world_size=payload.world_size,
+        world_rank=payload.world_rank,
+        token_num=tokens,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=payload.workspace_ptrs,
+        launch_with_pdl=payload.launch_with_pdl,
+        residual_in=residual,
+        rms_gamma=norm_weight,
+        rms_eps=eps,
+        scale_factor=1.0,
+        moe_reduction_device_num_experts=(
+            payload.active_experts_token_input.shape[0]
+        ),
+        moe_reduction_scale_input=payload.scale_input,
+        moe_reduction_active_experts_token_input=(
+            payload.active_experts_token_input
+        ),
+        moe_reduction_token_input=payload.token_input,
+        layout_code=None,
+        moe_allreduce_out=None,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=None,
+        scale_out=None,
+        weight_bias=0.0,
+        backend=_TRTLLM_MOE_ALLREDUCE_BACKEND,
+    )
+    return norm_out, residual_out
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(

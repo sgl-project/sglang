@@ -1013,7 +1013,31 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,
+                trtllm_moe_enable_pdl,
             )
+
+            if (
+                get_forward().fuse_mlp_allreduce
+                and not get_attn_tp_context().input_scattered
+            ):
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    prepare_flashinfer_trtllm_moe_allreduce_payload,
+                )
+
+                allreduce_payload = prepare_flashinfer_trtllm_moe_allreduce_payload(
+                    gemm2_out=final_hidden_states.gemm2_out,
+                    expert_weights=final_hidden_states.expert_weights,
+                    expanded_idx_to_permuted_idx=(
+                        final_hidden_states.expanded_idx_to_permuted_idx
+                    ),
+                    shared_expert_output=shared_output,
+                    top_k=final_hidden_states.top_k,
+                    launch_with_pdl=trtllm_moe_enable_pdl(
+                        final_hidden_states.expert_weights.shape[0]
+                    ),
+                )
+                if allreduce_payload is not None:
+                    return allreduce_payload
 
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
                 final_hidden_states,
@@ -2419,6 +2443,29 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _consume_flashinfer_trtllm_moe_allreduce(
+        self,
+        hidden_states: Any,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[Any, Optional[torch.Tensor], bool]:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            FlashInferTrtllmMoeAllReducePayload,
+            run_flashinfer_trtllm_moe_allreduce,
+        )
+
+        if not isinstance(hidden_states, FlashInferTrtllmMoeAllReducePayload):
+            return hidden_states, residual, False
+        assert residual is not None, (
+            "A deferred MoE all-reduce payload requires an existing residual"
+        )
+        hidden_states, residual = run_flashinfer_trtllm_moe_allreduce(
+            hidden_states,
+            residual,
+            self.input_layernorm.weight.data,
+            self.input_layernorm.variance_epsilon,
+        )
+        return hidden_states, residual, True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2432,6 +2479,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
+        hidden_states, residual, pre_normalized = (
+            self._consume_flashinfer_trtllm_moe_allreduce(hidden_states, residual)
+        )
         hidden_states_orig = hidden_states
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -2440,6 +2490,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 quant_format=self._resolve_gfx95_quant_format(),
+                pre_normalized=pre_normalized,
             )
         )
 
@@ -2504,7 +2555,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
 
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                FlashInferTrtllmMoeAllReducePayload,
+            )
+
+            if not isinstance(hidden_states, FlashInferTrtllmMoeAllReducePayload):
+                hidden_states._sglang_needs_allreduce_fusion = True
 
         if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
