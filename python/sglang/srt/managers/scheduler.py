@@ -1171,6 +1171,12 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.max_req_input_len = self.get_max_admissible_input_len(
+            self.max_req_input_len,
+            self.max_total_num_tokens,
+            self.page_size,
+            get_parallel().attn_dcp_size,
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2519,11 +2525,11 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget:
+        # Keep every positive output budget within PrefillAdder's paged budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
+        # smaller than max_total_num_tokens. If no positive budget remains,
+        # request intake separately rejects prompts that cannot pass the raw
+        # input + page_size capacity gate at all.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
         req.sampling_params.max_new_tokens = max(
             0,
@@ -2540,6 +2546,24 @@ class Scheduler(
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
+
+    @staticmethod
+    def get_max_admissible_input_len(
+        max_req_input_len: int,
+        max_total_num_tokens: int,
+        page_size: int,
+        attn_dcp_size: int,
+    ) -> int:
+        """Return the threshold for the base PrefillAdder capacity gate.
+
+        ``validate_input_length`` rejects inputs with ``len >= threshold``.
+        Keep one allocator page beyond the raw input, matching the first
+        ``PrefillAdder.add_one_req`` total-token gate after output clipping.
+        This prevents a request that passes the public input-length check but
+        can never pass scheduler admission.
+        """
+        total_capacity = max_total_num_tokens * attn_dcp_size
+        return min(max_req_input_len, total_capacity - page_size)
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -2980,9 +3004,6 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -2991,8 +3012,14 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        # Initialize after validation so auto-truncation is reflected in the
+        # output budget rather than leaving a formerly too-long prompt with a
+        # clipped zero-token generation budget.
+        self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -3396,6 +3423,7 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -3726,6 +3754,13 @@ class Scheduler(
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
+            running_batch.batch_is_full = False
+
+        if running_batch.is_empty():
+            # `batch_is_full` is an admission hint for the current running
+            # batch. It must not survive after that batch drains (for example,
+            # when a queued request that returned NO_TOKEN is cancelled), or
+            # the fast path below skips the waiting queue indefinitely.
             running_batch.batch_is_full = False
 
         if (
