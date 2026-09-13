@@ -390,8 +390,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""
-        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
         hf_config = self.draft_runner.model_config.hf_config
         if (
             not _qsa_index_share_requested(hf_config)
@@ -401,6 +399,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             or not isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
         ):
             return
+
+        # Imported here rather than at function entry: the module pulls in
+        # tilelang, and every EAGLE/NEXTN model reaches this function, so a
+        # top-of-function import makes an unrelated tilelang import failure
+        # fatal to speculative decoding on models that never use QSA.
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
         if get_spec().speculative_adaptive:
             # Adaptive speculation switches SpecRuntimeState between the draft-extend
             # capture and the decode lookup; per-state index buffers would not match.
