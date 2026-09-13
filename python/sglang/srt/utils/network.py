@@ -13,17 +13,28 @@ import zmq
 
 logger = logging.getLogger(__name__)
 
+MAX_VALID_PORT = 65535
+
 
 def get_open_port() -> int:
     from sglang.srt.environ import envs
 
     port = envs.SGLANG_PORT.get()
     if port is not None:
-        while True:
+        if not (1 <= port <= MAX_VALID_PORT):
+            raise ValueError(
+                f"SGLANG_PORT must be between 1 and {MAX_VALID_PORT}, got {port}"
+            )
+        start_port = port
+        while port <= MAX_VALID_PORT:
             if is_port_available(port):
                 return port
-            logger.info("Port %d is already in use, trying port %d", port, port + 1)
+            if port < MAX_VALID_PORT:
+                logger.info("Port %d is already in use, trying port %d", port, port + 1)
             port += 1
+        raise RuntimeError(
+            f"No available TCP port at or above SGLANG_PORT={start_port}"
+        )
     sock = try_bind_socket()
     port = sock.getsockname()[1]
     sock.close()
@@ -48,9 +59,6 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
                 pass
 
     return None
-
-
-MAX_VALID_PORT = 65535
 
 
 def wait_port_available(
