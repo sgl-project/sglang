@@ -65,6 +65,27 @@ def record_request(result: dict) -> None:
             print(f"[diagnostics] request write failed: {type(exc).__name__}")
 
 
+def _host_pressure_sample():
+    # host-wide pressure, not attributable to this worker without its counters
+    result = {}
+    for resource in ("io", "memory"):
+        try:
+            rows = {}
+            for line in Path(f"/proc/pressure/{resource}").read_text().splitlines():
+                kind, *fields = line.split()
+                if kind not in ("some", "full"):
+                    continue
+                values = dict(field.split("=", 1) for field in fields)
+                rows[kind] = {
+                    key: int(values[key]) if key == "total" else float(values[key])
+                    for key in ("avg10", "avg60", "avg300", "total")
+                }
+            result[resource] = rows
+        except (OSError, ValueError, KeyError) as exc:
+            result[resource] = {"error": type(exc).__name__}
+    return result
+
+
 def _process_sample(process):
     with process.oneshot():
         # comm can contain spaces/parentheses; fields here start at stat field 3
@@ -298,6 +319,7 @@ class AttemptDiagnostics:
                         stream,
                         "processes",
                         processes=rows,
+                        host_pressure=_host_pressure_sample(),
                         sample_started_wall_time_ns=started_wall_time_ns,
                         sample_seconds=time.monotonic() - started,
                     )

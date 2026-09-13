@@ -76,6 +76,7 @@ def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
             time.sleep(0.05)
         assert len(samples) >= 2
         assert not release.is_set()
+        assert all(set(s["host_pressure"]) == {"io", "memory"} for s in samples)
         assert all(
             any(p["pid"] == os.getpid() and "kernel" in p for p in s["processes"])
             for s in samples
@@ -88,6 +89,39 @@ def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
     assert _events(diagnostics.directory / "events.jsonl")[-1][
         "process_sampler_stopped"
     ]
+
+
+def test_host_pressure_sample(monkeypatch):
+    monkeypatch.setattr(
+        perf_diagnostics.Path,
+        "read_text",
+        lambda self: (
+            "some avg10=1.25 avg60=2.0 avg300=0.5 total=123456\n"
+            "full avg10=0.25 avg60=1.0 avg300=0.0 total=456\n"
+        ),
+    )
+    sample = perf_diagnostics._host_pressure_sample()
+    assert set(sample) == {"io", "memory"}
+    assert sample["io"]["some"] == {
+        "avg10": 1.25,
+        "avg60": 2.0,
+        "avg300": 0.5,
+        "total": 123456,
+    }
+    assert sample["memory"]["full"]["total"] == 456
+
+
+def test_host_pressure_unavailable_does_not_stop_sampling(monkeypatch):
+    def unavailable(path):
+        if str(path).endswith("/io"):
+            raise PermissionError("unavailable")
+        return "some invalid\n"
+
+    monkeypatch.setattr(perf_diagnostics.Path, "read_text", unavailable)
+    assert perf_diagnostics._host_pressure_sample() == {
+        "io": {"error": "PermissionError"},
+        "memory": {"error": "ValueError"},
+    }
 
 
 def test_fragmented_boundaries_do_not_save_arbitrary_logs(monkeypatch, tmp_path):
