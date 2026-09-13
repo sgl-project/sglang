@@ -100,6 +100,20 @@ _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+_sm120_ba_linear = None
+
+
+def should_enable_sm120_ba_gemm(backend: Bf16GemmBackend) -> bool:
+    """Do not override explicit backend or numerical reproducibility choices."""
+    return (
+        _is_cuda
+        and envs.SGLANG_ENABLE_SM120_BA_GEMM.get()
+        and backend.is_auto()
+        and not get_exec().deterministic.enable_deterministic_inference
+        and not is_batch_invariant_mode_enabled()
+        and torch.cuda.get_device_capability() == (12, 0)
+    )
+
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -203,6 +217,7 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
 
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
+    global _sm120_ba_linear
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _splitk_tactic
     global _run_splitk_dense
@@ -220,6 +235,12 @@ def initialize_bf16_gemm_config() -> None:
         )
 
     backend = Bf16GemmBackend(backend_str)
+
+    _sm120_ba_linear = None
+    if should_enable_sm120_ba_gemm(backend):
+        from sglang.kernels.ops.gemm.sm120_ba_gemm import sm120_ba_linear
+
+        _sm120_ba_linear = sm120_ba_linear
 
     if backend.is_gemv():
         if torch.cuda.get_device_capability()[0] != 9:
@@ -479,6 +500,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        elif (
+            _sm120_ba_linear is not None
+            and not torch.compiler.is_compiling()
+            and not is_batch_invariant_mode_enabled()
+            and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "in_proj_ba"
+        ):
+            return _sm120_ba_linear(x, layer.weight, bias)
 
         elif (
             get_bf16_gemm_backend().is_cutedsl()
