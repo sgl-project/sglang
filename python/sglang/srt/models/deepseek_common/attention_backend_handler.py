@@ -242,6 +242,16 @@ def handle_attention_triton(attn, forward_batch):
     if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
+    # Under DCP the latent prefix is sharded across ranks: the absorbed MLA
+    # extend attends each rank's shard and merges by LSE, whereas the MHA
+    # prefix paths re-gather the whole prefix on every chunk.
+    if (
+        get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and _get_sum_extend_prefix_lens(forward_batch) > 0
+    ):
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     # Kimi-K3 with an FP8 latent cache uses dense 192/128 K/V for cached
     # prefixes. Always select chunked-KV here: its fast path packs the prefix
     # once and fuses it with the current chunk in the normal extend kernel.

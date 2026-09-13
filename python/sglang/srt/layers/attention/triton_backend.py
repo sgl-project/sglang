@@ -1844,6 +1844,58 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
+    def _forward_extend_dcp_gathered(
+        self,
+        q_local: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        logits_soft_cap: float,
+        dcp_md,
+    ):
+        prefix_lens = forward_batch.extend_prefix_lens
+        bs = prefix_lens.shape[0]
+        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=q_local.device)
+        kv_indptr[1:] = torch.cumsum(prefix_lens, dim=0)
+        prefix_sum = int(dcp_md.dcp_extend_prefix_lens_sum)
+        kv_indices = torch.arange(prefix_sum, dtype=torch.int64, device=q_local.device)
+        k_buf = dcp_md.dcp_kv_buffer
+        v_buf = k_buf[..., : layer.v_head_dim]
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+        o = torch.empty(
+            (q_local.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=q_local.dtype,
+            device=q_local.device,
+        )
+        self.extend_attention_fwd(
+            q_local,
+            k.contiguous(),
+            v.contiguous(),
+            o,
+            k_buf,
+            v_buf,
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            None,
+            causal,
+            None,
+            self.forward_metadata.max_extend_len,
+            k_descale,
+            v_descale,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _forward_extend_dcp(
         self,
         q: torch.Tensor,
@@ -1867,6 +1919,22 @@ class TritonAttnBackend(AttentionBackend):
         group = get_parallel().dcp_group
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         total_tokens, local_heads, _ = q_local.shape
+
+        dcp_md = forward_batch.attn_dcp_metadata
+        if (
+            self.use_mla
+            and layer.tp_k_head_num == 1
+            and dcp_md is not None
+            and dcp_md.dcp_kv_buffer is not None
+            and dcp_md.dcp_extend_prefix_lens_sum
+        ):
+            # The planner gathered every request's latent prefix, contiguous
+            # and in position order, into dcp_kv_buffer[:prefix_sum]; run the
+            # regular extend kernel against it instead of all-gathering q for
+            # all DCP heads and all-reducing a full output per layer.
+            return self._forward_extend_dcp_gathered(
+                q_local, k, v, layer, forward_batch, causal, logits_soft_cap, dcp_md
+            )
 
         kv_indptr = self.forward_metadata.kv_indptr
         kv_indices = self.forward_metadata.kv_indices
