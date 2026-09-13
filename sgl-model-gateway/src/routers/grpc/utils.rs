@@ -26,10 +26,7 @@ use crate::{
         },
         generate::GenerateFinishReason,
     },
-    reasoning_parser::{
-        ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
-        ReasoningParser,
-    },
+    reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser},
     routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
     tokenizer::{
         cache::CachedTokenizer,
@@ -42,6 +39,8 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
+
+const THINK_START_TOKEN: &str = "<think>";
 
 /// Resolve tokenizer from registry and cache it in request context.
 ///
@@ -516,6 +515,14 @@ pub(crate) fn process_chat_messages(
     })
 }
 
+/// Return whether the rendered generation prompt opened a reasoning block.
+///
+/// Some chat templates place `<think>` in the prefill, so generated text begins
+/// with reasoning content and only contains the closing `</think>` marker.
+pub(crate) fn reasoning_started_in_prefill(prompt: &str) -> bool {
+    prompt.trim_end().ends_with(THINK_START_TOKEN)
+}
+
 /// Create a StopSequenceDecoder from stop parameters
 pub(crate) fn create_stop_decoder(
     tokenizer: &Arc<dyn Tokenizer>,
@@ -766,41 +773,14 @@ pub(crate) fn check_tool_parser_availability(
     }
 }
 
-/// Get the appropriate reasoning parser for a model
-///
-/// If a parser name is explicitly configured, use that parser.
-/// Otherwise, auto-detect based on the model name.
-/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
-pub(crate) fn get_reasoning_parser(
-    reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&str>,
-    model: &str,
-) -> ReasoningPooledParser {
-    if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
-        reasoning_parser_factory
-            .registry()
-            .get_pooled_parser(parser_name)
-            .unwrap_or_else(|| {
-                warn!(
-                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
-                    parser_name
-                );
-                reasoning_parser_factory.get_pooled(model)
-            })
-    } else {
-        // Auto-detect based on model
-        reasoning_parser_factory.get_pooled(model)
-    }
-}
-
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
 pub(crate) fn create_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
+    reasoning_started_in_prefill: bool,
 ) -> Option<Box<dyn ReasoningParser>> {
-    if let Some(parser_name) = configured_parser {
+    let mut parser = if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
             .registry()
@@ -815,7 +795,17 @@ pub(crate) fn create_reasoning_parser(
     } else {
         // Auto-detect based on model
         reasoning_parser_factory.registry().create_for_model(model)
+    }?;
+
+    if reasoning_started_in_prefill {
+        // The parser API in reasoning-parser 1.0 has no state setter. Feeding the
+        // already-consumed marker initializes the same state without emitting it.
+        if let Err(e) = parser.parse_reasoning_streaming_incremental(THINK_START_TOKEN) {
+            warn!("Failed to initialize reasoning parser from prefill: {}", e);
+        }
     }
+
+    Some(parser)
 }
 
 /// Get the appropriate tool parser for a model
@@ -1237,5 +1227,51 @@ mod tests {
         assert_eq!(content_array.len(), 2);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    #[test]
+    fn test_reasoning_started_in_prefill_detection() {
+        assert!(reasoning_started_in_prefill(
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!reasoning_started_in_prefill(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(!reasoning_started_in_prefill(
+            "<think>reasoning from history</think>\n<|im_start|>assistant\n"
+        ));
+    }
+
+    #[test]
+    fn test_qwen3_prefill_reasoning_non_streaming() {
+        let factory = ReasoningParserFactory::new();
+        let mut parser = create_reasoning_parser(&factory, Some("qwen3"), "qwen3", true)
+            .expect("qwen3 parser should be available");
+
+        let result = parser
+            .detect_and_parse_reasoning("reasoning without an opening tag</think>final answer")
+            .unwrap();
+
+        assert_eq!(result.reasoning_text, "reasoning without an opening tag");
+        assert_eq!(result.normal_text, "final answer");
+    }
+
+    #[test]
+    fn test_qwen3_prefill_reasoning_streaming() {
+        let factory = ReasoningParserFactory::new();
+        let mut parser = create_reasoning_parser(&factory, Some("qwen3"), "qwen3", true)
+            .expect("qwen3 parser should be available");
+
+        let reasoning = parser
+            .parse_reasoning_streaming_incremental("reasoning without an opening tag")
+            .unwrap();
+        let answer = parser
+            .parse_reasoning_streaming_incremental("</think>final answer")
+            .unwrap();
+
+        assert_eq!(reasoning.reasoning_text, "reasoning without an opening tag");
+        assert!(reasoning.normal_text.is_empty());
+        assert!(answer.reasoning_text.is_empty());
+        assert_eq!(answer.normal_text, "final answer");
     }
 }

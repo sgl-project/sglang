@@ -68,6 +68,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        reasoning_started_in_prefill: bool,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -99,13 +100,14 @@ impl ResponseProcessor {
         let mut processed_text = final_text;
 
         if original_request.separate_reasoning && reasoning_parser_available {
-            let pooled_parser = utils::get_reasoning_parser(
+            let mut parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 &original_request.model,
-            );
+                reasoning_started_in_prefill,
+            )
+            .ok_or_else(|| "Reasoning parser is unavailable".to_string())?;
 
-            let mut parser = pooled_parser.lock().await;
             match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {
@@ -209,6 +211,7 @@ impl ResponseProcessor {
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
@@ -217,6 +220,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
+        reasoning_started_in_prefill: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
@@ -273,6 +277,7 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    reasoning_started_in_prefill,
                 )
                 .await
             {
@@ -461,5 +466,124 @@ impl ResponseProcessor {
         }
 
         Ok(result_array)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use llm_tokenizer::{
+        stop::StopSequenceDecoderBuilder,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+    };
+    use serde_json::json;
+    use smg_grpc_client::sglang_proto::GenerateComplete;
+
+    use super::*;
+
+    struct PrefillReasoningTokenizer {
+        special_tokens: SpecialTokens,
+    }
+
+    impl PrefillReasoningTokenizer {
+        fn new() -> Self {
+            Self {
+                special_tokens: SpecialTokens::default(),
+            }
+        }
+    }
+
+    impl Encoder for PrefillReasoningTokenizer {
+        fn encode(&self, _input: &str, _add_special_tokens: bool) -> Result<Encoding> {
+            Ok(Encoding::Plain(Vec::new()))
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            _add_special_tokens: bool,
+        ) -> Result<Vec<Encoding>> {
+            Ok(inputs.iter().map(|_| Encoding::Plain(Vec::new())).collect())
+        }
+    }
+
+    impl Decoder for PrefillReasoningTokenizer {
+        fn decode(&self, token_ids: &[u32], _skip_special_tokens: bool) -> Result<String> {
+            Ok(token_ids
+                .iter()
+                .filter_map(|token_id| match token_id {
+                    1 => Some("reasoning without an opening tag"),
+                    2 => Some("</think>"),
+                    3 => Some("final answer"),
+                    _ => None,
+                })
+                .collect())
+        }
+    }
+
+    impl Tokenizer for PrefillReasoningTokenizer {
+        fn vocab_size(&self) -> usize {
+            3
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.special_tokens
+        }
+
+        fn token_to_id(&self, _token: &str) -> Option<u32> {
+            None
+        }
+
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn prefilled_think_token_is_reflected_in_non_streaming_chat_choice() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(PrefillReasoningTokenizer::new());
+        let mut stop_decoder = StopSequenceDecoderBuilder::new(tokenizer.clone()).build();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "Why?"}]
+        }))
+        .unwrap();
+        let complete = ProtoGenerateComplete::Sglang(GenerateComplete {
+            output_ids: vec![1, 2, 3],
+            finish_reason: "stop".to_string(),
+            completion_tokens: 3,
+            ..Default::default()
+        });
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            None,
+            Some("qwen3".to_string()),
+        );
+
+        let choice = processor
+            .process_single_choice(
+                &complete,
+                0,
+                &request,
+                &tokenizer,
+                &mut stop_decoder,
+                0,
+                true,
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            choice.message.reasoning_content.as_deref(),
+            Some("reasoning without an opening tag")
+        );
+        assert_eq!(choice.message.content.as_deref(), Some("final answer"));
     }
 }
