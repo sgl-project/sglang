@@ -72,3 +72,22 @@ has a retryable infrastructure failure. Standalone infrastructure failures
 retain their existing retry policy. Valid failed measurements are recorded
 before threshold validation; realtime chunk and memory guards remain enabled
 according to their existing configuration.
+
+## Initial loading references
+
+The initial H100 loading references cover 28 cases with at least three distinct
+CI runs whose maximum/minimum startup-time ratio is at most 1.25. Each reference
+is the minimum measured `load_time_ms`, rounded to two decimals; repeated requests
+sharing one server do not count as separate startups. These are process-start to
+all-workers-ready measurements, excluding warmup, not checkpoint-I/O-only times.
+
+Sources are PR Test Base runs [34750203901](https://github.com/sgl-project/sglang/actions/runs/34750203901),
+[34751664379](https://github.com/sgl-project/sglang/actions/runs/34751664379),
+[34753876622](https://github.com/sgl-project/sglang/actions/runs/34753876622), and
+[34755864886](https://github.com/sgl-project/sglang/actions/runs/34755864886).
+Only saved valid loading measurements are used; this does not claim those runs
+passed all other checks. No E2E reference or tolerance is raised. Cross-run
+stability is a conservative selection criterion, not proof of an optimal load
+time. Cases with insufficient samples or greater variation remain uncalibrated
+and continue to fail the missing-loading-baseline check; B200 and 5090 references
+are not inferred from H100 or development H200 measurements.
