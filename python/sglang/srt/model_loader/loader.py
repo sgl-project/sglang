@@ -994,6 +994,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        DefaultModelLoader.postprocess_weights(model, target_device)
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1049,6 +1054,8 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+    @staticmethod
+    def postprocess_weights(model, target_device):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
