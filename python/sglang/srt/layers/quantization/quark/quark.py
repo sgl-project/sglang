@@ -383,8 +383,6 @@ class QuarkConfig(QuantizationConfig):
             self.quant_config["layer_quant_config"] = hf_to_sglang_mapper.apply_dict(
                 layer_quant_config
             )
-        if self.kv_cache_group:
-            self.kv_cache_group = hf_to_sglang_mapper.apply_list(self.kv_cache_group)
 
     def _get_block_fp8_config(self, config: dict[str, Any]) -> Optional[Fp8Config]:
         weight = config.get("weight") or {}
@@ -927,7 +925,17 @@ class QuarkConfig(QuantizationConfig):
 
         # Quark may name each logical expert's projections while SGLang owns
         # one fused module. EPLB replicas do not add checkpoint expert IDs.
-        entries = (self.quant_config.get("layer_quant_config") or {}).items()
+        prefix_parts = layer_name.split(".")
+        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
+        entries = [
+            (pattern, config)
+            for pattern, config in layer_quant_config.items()
+            if len(parts := pattern.split(".")) > len(prefix_parts)
+            and all(
+                fnmatch.fnmatch(part, pattern_part)
+                for part, pattern_part in zip(prefix_parts, parts)
+            )
+        ]
         groups = [f"{layer_name}.{i}" for i in range(self.num_routed_experts)]
         shared = f"{layer_name.rsplit('.', 1)[0]}.shared_experts"
         if getattr(module, "num_fused_shared_experts", 0):

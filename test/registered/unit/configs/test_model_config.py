@@ -2,7 +2,6 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -60,37 +59,6 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 class TestDraftModelConfig(CustomTestCase):
     def test_nemotron_h_omni_is_multimodal(self):
         self.assertTrue(is_multimodal_model(["NemotronH_Omni_Reasoning_V3"]))
-
-    def test_explicit_unquantized_draft_skips_checkpoint_detection(self):
-        for quant_method in ("quark", "fp8"):
-            for is_draft, explicit, requested, expected in (
-                (True, True, None, None),
-                (True, False, None, quant_method),
-                (False, False, None, quant_method),
-                (True, True, quant_method, quant_method),
-            ):
-                with self.subTest(
-                    quant_method=quant_method,
-                    is_draft=is_draft,
-                    explicit=explicit,
-                    requested=requested,
-                ):
-                    config = object.__new__(ModelConfig)
-                    config.is_draft_model = is_draft
-                    config.is_draft_quantization_explicit = explicit
-                    config.quantization = requested
-                    with (
-                        patch.object(
-                            config,
-                            "_parse_quant_hf_config",
-                            return_value={"quant_method": quant_method},
-                        ),
-                        patch.object(
-                            config, "_find_quant_modelslim_config", return_value=None
-                        ),
-                    ):
-                        config._verify_quantization()
-                    self.assertEqual(config.quantization, expected)
 
     def test_qwen35_mtp_depth_is_synced_to_text_config(self):
         config = object.__new__(ModelConfig)

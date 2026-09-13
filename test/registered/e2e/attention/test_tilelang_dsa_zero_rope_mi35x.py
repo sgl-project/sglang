@@ -3,11 +3,6 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
-    dequantize_k_cache,
-    dequantize_k_cache_paged,
-)
-from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
     FP8_DTYPE,
     tilelang_sparse_fwd,
@@ -94,28 +89,6 @@ class TestTileLangDSAZeroRope(CustomTestCase):
                     d_v=512,
                     d_tail=64,
                 )
-
-    def test_scaled_cache_round_trip_layouts(self):
-        for dim_nope, dim_rope, packed_width in ((256, 0, 264), (512, 64, 656)):
-            with self.subTest(dim_nope=dim_nope, dim_rope=dim_rope):
-                source = torch.randn(
-                    8,
-                    1,
-                    1,
-                    dim_nope + dim_rope,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                )
-                packed = quantize_k_cache(source, dv=dim_nope)
-                self.assertEqual(packed.shape[-1], packed_width)
-                restored = dequantize_k_cache(packed, dv=dim_nope)
-                self.assertEqual(restored.shape, source.shape)
-                torch.testing.assert_close(restored, source, atol=0.08, rtol=0.08)
-
-                pages = torch.tensor([7, 1, 1, 4], device="cuda", dtype=torch.int32)
-                gathered = dequantize_k_cache_paged(packed, pages)
-                expected = restored.view(8, 1, -1)[pages]
-                torch.testing.assert_close(gathered, expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

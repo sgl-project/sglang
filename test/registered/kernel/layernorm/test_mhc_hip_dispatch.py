@@ -57,7 +57,7 @@ def _mhc_pre_oracle(residual, fn, scale, base, rms_eps, hc_eps, norm_weight, nor
         (8192, 4, 4096),  # M=8192
     ],
 )
-def test_mhc_hip_hc_pre_plus_caller_rmsnorm_matches_fp32_oracle(monkeypatch, shape):
+def test_mhc_hip_pre_and_post_match_torch_oracles(monkeypatch, shape):
     try:
         import aiter.ops.mhc  # noqa: F401
     except ImportError as exc:
@@ -123,6 +123,20 @@ def test_mhc_hip_hc_pre_plus_caller_rmsnorm_matches_fp32_oracle(monkeypatch, sha
     assert h_post.shape == (s, hc_mult)
     assert torch.isfinite(h_res).all()
     assert torch.isfinite(h_post).all()
+
+    x = torch.randn(s, hidden_size, device=device, dtype=torch.bfloat16)
+    actual_post = mhc.hc_post(x, residual.view(s, -1), h_post, h_res, hc_mult)
+    expected_post = mhc._mhc_post_torch(
+        x,
+        residual,
+        h_post.view(s, hc_mult, 1),
+        h_res.view(s, hc_mult, hc_mult),
+    ).view(s, -1)
+    post_diff = actual_post.float() - expected_post.float()
+    post_rel_rms = (
+        post_diff.square().mean().sqrt() / expected_post.float().square().mean().sqrt()
+    )
+    assert post_rel_rms < 0.005, f"post relative RMS {post_rel_rms.item():.6f} >= 0.005"
 
 
 if __name__ == "__main__":

@@ -1051,11 +1051,17 @@ class OpenAIServingChat(OpenAIServingBase):
     def _engine_prompt(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool
     ) -> tuple[str, Any]:
-        """Standard VLMs render a text prompt (with placeholder strings) for
-        the MM processor to tokenize. Token-first encoders instead produce
-        pre-rendered input_ids with single placeholder ids and leave the text
-        empty; pass those through rather than re-tokenizing an empty prompt.
-        """
+        """Keep text for prompts that need multimodal placeholder expansion."""
+        if (
+            is_multimodal
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+            and not processed_messages.image_data
+            and not processed_messages.video_data
+            and not processed_messages.audio_data
+            and not processed_messages.modalities
+        ):
+            return "input_ids", processed_messages.prompt_ids
         if is_multimodal and not chat_encoding.spec_renders_prompt_ids(
             self.chat_encoding_spec
         ):
@@ -1132,23 +1138,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle single vs multiple requests
         if request.input_ids is not None:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif (
-            is_multimodal
-            and self.chat_encoding_spec is None
-            and self.template_manager.chat_template_name is None
-            and getattr(
-                self.tokenizer_manager.model_config.hf_config, "model_type", None
-            )
-            == "glm5_next"
-            and not self._tokenizer_auto_adds_specials
-            and isinstance(processed_messages.prompt_ids, list)
-            and processed_messages.prompt_ids
-            and not processed_messages.image_data
-            and not processed_messages.video_data
-            and not processed_messages.audio_data
-            and not processed_messages.modalities
-        ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         else:
             prompt_key, prompt_value = self._engine_prompt(

@@ -1714,15 +1714,6 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        # Embedded MTP weights can stay BF16 in a quantized target checkpoint.
-        # The explicit draft "unquant" opt-out has already resolved to None.
-        if (
-            self.is_draft_model
-            and self.is_draft_quantization_explicit
-            and self.quantization is None
-        ):
-            return
-
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",

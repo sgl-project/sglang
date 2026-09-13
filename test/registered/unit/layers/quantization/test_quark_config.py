@@ -48,13 +48,11 @@ class TestWeightNameMapping(CustomTestCase):
                 "layer_type_quant_config": {},
                 "global_quant_config": {"weight": {"dtype": "fp4"}},
             },
-            kv_cache_group=["model.language_model.layers.0.self_attn"],
         )
         config.apply_weight_name_mapper(
             WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
         )
         self.assertEqual(config.exclude_layers, ["model.layers.0.mlp.gate"])
-        self.assertEqual(config.kv_cache_group, ["model.layers.0.self_attn"])
         self.assertIn(
             "model.layers.*.mlp.experts.*.gate_proj",
             config.quant_config["layer_quant_config"],
