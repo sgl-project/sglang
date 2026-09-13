@@ -209,6 +209,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        for graph in self._graphs.values():
+            graph.reset()
         self._graphs.clear()
         self._outputs.clear()
         self._output_buffer = None

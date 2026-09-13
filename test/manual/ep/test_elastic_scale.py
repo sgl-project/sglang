@@ -1,14 +1,18 @@
 """Manual tests for elastic EP scale-up.
 
 Test classes:
+  TestElasticScaleUp4To5CudaGraph       single-rank decode graph recapture
   TestElasticScaleUp4To6                primary + joiner scale-up (6 GPUs)
   TestElasticScaleUp4To5To6             two consecutive single-rank scale-ups
   TestElasticScaleUp4To8                full primary + joiner scale-up (8 GPUs)
+  TestElasticScaleUp4To6CudaGraph       mixed-TP decode graph recapture
+  TestElasticScaleUp4To5To6CudaGraph    repeated decode graph recapture
+  TestElasticScaleUp4To8CudaGraph       scale-up with decode graph recapture
 
-Run (8-GPU full scale-up):
+Run (8-GPU CUDA graph scale-up):
 
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
-        test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To8 \\
+        test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To8CudaGraph \\
         -v -s
 """
 
@@ -51,6 +55,18 @@ DISABLED_CUDA_GRAPH_ARGS = [
     "disabled",
     "--cuda-graph-backend-prefill",
     "disabled",
+]
+ELASTIC_CUDA_GRAPH_ARGS = [
+    "--cuda-graph-backend-decode",
+    "full",
+    "--cuda-graph-backend-prefill",
+    "disabled",
+    "--cuda-graph-bs-decode",
+    "1",
+    "2",
+    "4",
+    "8",
+    "16",
 ]
 
 
@@ -474,6 +490,54 @@ class TestElasticScaleUp4To8(_ElasticScaleUpEndToEndBase):
     TARGET_EP_SIZE = MAX_EP_SIZE
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE = None
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 5,
+    "4-to-5 CUDA graph scale-up E2E needs 5 GPUs.",
+)
+class TestElasticScaleUp4To5CudaGraph(_ElasticScaleUpEndToEndBase):
+    """Scale from four to five ranks and recapture decode CUDA graphs."""
+
+    JOIN_TP = 1
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = 5
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= MAX_EP_SIZE,
+    f"Full scale-up E2E needs {MAX_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUp4To8CudaGraph(_ElasticScaleUpEndToEndBase):
+    """Scale from four to eight ranks and recapture decode CUDA graphs."""
+
+    JOIN_TP = LAUNCH_EP_SIZE
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = MAX_EP_SIZE
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 6,
+    "4-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
+)
+class TestElasticScaleUp4To6CudaGraph(TestElasticScaleUp4To6):
+    """Recapture decode CUDA graphs across different local TP sizes."""
+
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 6,
+    "4-to-5-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
+)
+class TestElasticScaleUp4To5To6CudaGraph(TestElasticScaleUp4To5To6):
+    """Recapture decode CUDA graphs across two scale operations."""
+
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
 
 
 if __name__ == "__main__":

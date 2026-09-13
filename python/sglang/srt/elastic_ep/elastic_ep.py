@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import get_world_group, parallel_state
@@ -26,21 +27,34 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
-def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+class ScaleCohort(msgspec.Struct, frozen=True, kw_only=True):
+    target_ep_size: int
+    cuda_graph_enabled: bool
+
+
+def register_scale_cohort(
+    rank_offset: int, target_ep_size: int, cuda_graph_enabled: bool
+) -> None:
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
-    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+    payload = msgspec.json.encode(
+        ScaleCohort(
+            target_ep_size=target_ep_size,
+            cuda_graph_enabled=cuda_graph_enabled,
+        )
+    )
+    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", payload)
 
 
-def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     store = get_global_tcp_store()
     if store is None:
         return None
     key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
     if not store.check([key]):
         return None
-    return int(store.get(key).decode())
+    return msgspec.json.decode(store.get(key), type=ScaleCohort)
 
 
 @dataclass
@@ -260,6 +274,17 @@ class ElasticEPStateManager:
         return inst.pending_ep_size
 
     @classmethod
+    def get_data_plane_ep_size(cls) -> int:
+        inst = cls._instance
+        assert inst is not None, "Elastic EP state is not initialized."
+        if inst.pending_ep_size is not None and inst.scale_phase in (
+            "configuring_data_plane",
+            "syncing_new_world",
+        ):
+            return inst.pending_ep_size
+        return inst.effective_ep_size
+
+    @classmethod
     def get_scale_phase(cls) -> str:
         inst = cls._instance
         if inst is None:
@@ -318,14 +343,7 @@ def elastic_expanded_world_enabled() -> bool:
         return False
     if get_parallel().max_ep_size is None:
         return False
-    active_target_size = inst.effective_ep_size
-    if inst.pending_ep_size is not None and inst.scale_phase in (
-        "configuring_data_plane",
-        "syncing_new_world",
-    ):
-        active_target_size = inst.pending_ep_size
-
-    return active_target_size > inst.original_ep_size
+    return ElasticEPStateManager.get_data_plane_ep_size() > inst.original_ep_size
 
 
 def _refresh_ep_members() -> None:
