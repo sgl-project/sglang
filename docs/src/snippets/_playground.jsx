@@ -874,14 +874,13 @@ export const Playground = ({ config }) => {
         }).disabled) {
           return { flags, env };
         }
-        flags = h.stripFlagsByFirstToken(flags, [
-          "--speculative-algorithm", "--speculative-num-steps",
-          "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-          "--speculative-adaptive",
-          "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
-          "--linear-replayssm-cache-len",
-          "--speculative-ngram-max-bfs-breadth",
-        ]);
+        // Model-specific draft precision and acceptance settings belong to the
+        // old algorithm too; Off/DFlash must not inherit them from EAGLE.
+        flags = flags.filter((flag) => {
+          const head = flag.split(/[\s=]/)[0];
+          return !head.startsWith("--speculative-") &&
+            !["--enable-linear-replayssm-spec", "--linear-replayssm-cache-len"].includes(head);
+        });
         const preset = (fc.options || []).find((p) => p.id === value);
         if (preset?.flags?.length) flags = h.insertBeforeTail(flags, preset.flags);
         return { flags, env };

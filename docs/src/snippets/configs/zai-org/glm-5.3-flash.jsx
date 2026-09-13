@@ -1,7 +1,7 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: ["gb300", "h100", "h200", "b200", "b300", "gb200"],
+  supportedHardware: ["gb300", "h100", "h200", "b200", "b300", "gb200", "mi355x"],
 
   matchDims: [
     {
@@ -18,6 +18,12 @@ export const config = {
       options: [
         { id: "fp8", label: "FP8" },
         {
+          id: "mxfp4",
+          label: "MXFP4",
+          disabled: (s) => s.hw !== "mi355x",
+          disableReason: "The OneNexus Quark MXFP4 recipe is qualified on MI355X only.",
+        },
+        {
           id: "nvfp4",
           label: "NVFP4",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
@@ -28,7 +34,8 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
+    const pairing = s.hw === "mi355x" ? "fp8-tilelang"
+      : ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
@@ -47,8 +54,8 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200"].includes(s.hw),
-          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper GPUs.",
+          disabled: (s) => ["h100", "h200", "mi355x"].includes(s.hw),
+          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper or MI355X.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -56,6 +63,18 @@ export const config = {
             "--dsa-decode-backend trtllm",
           ],
           hints: ["Measured on GB300: faster than BF16 + TileLang with about 1.8x the KV token capacity."],
+        },
+        {
+          id: "fp8-tilelang",
+          label: "FP8 + TileLang (ROCm)",
+          disabled: (s) => s.hw !== "mi355x",
+          disableReason: "This FP8 KV + TileLang DSA pairing is qualified on ROCm, not CUDA.",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype fp8_e4m3",
+            "--dsa-prefill-backend tilelang",
+            "--dsa-decode-backend tilelang",
+          ],
         },
         {
           id: "bf16-tilelang",
@@ -78,6 +97,8 @@ export const config = {
         {
           id: "on",
           label: "On",
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "The breakable prefill CUDA graph path is not qualified on ROCm.",
           flags: ["--cuda-graph-backend-prefill breakable"],
           hints: ["Enables breakable prefill CUDA graphs; requires a build with PR #38522."],
         },
@@ -88,11 +109,13 @@ export const config = {
       title: "VLM Transport",
       default: "auto",
       options: [
-        { id: "auto", label: "Auto", subtitle: "Topology-aware" },
+        { id: "auto", label: "Auto", subtitle: "Topology-aware",
+          flags: (s) => s.hw === "mi355x" ? ["--mm-feature-transport cpu"] : [] },
         {
           id: "cpu",
           label: "CPU",
           subtitle: "Save GPU memory",
+          stripPrefixes: ["--mm-feature-transport"],
           flags: ["--mm-feature-transport cpu"],
         },
       ],
@@ -107,8 +130,14 @@ export const config = {
           id: "l2",
           label: "L1 + L2",
           subtitle: "Host memory",
-          flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
-          hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
+          flags: (s) => s.hw === "mi355x"
+            ? ["--enable-hierarchical-cache", "--hicache-ratio 0.50",
+              "--hicache-write-policy write_through", "--hicache-io-backend direct",
+              "--hicache-mem-layout page_first_direct"]
+            : ["--enable-hierarchical-cache", "--hicache-size 32"],
+          hints: (s) => s.hw === "mi355x"
+            ? ["Host cache matches the measured 0.50-ratio, write-through MI355X recipe; check available RAM."]
+            : ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
           id: "l3",
@@ -141,7 +170,12 @@ export const config = {
   modelNames: {
     default: "zai-org/GLM-5.3-Flash",
     nvfp4: "RadixArk/GLM-5.3-Flash-NVFP4",
+    "mi355x|mxfp4": "OneNexus/GLM-5.3-Flash-MXFP4",
   },
+
+  // The ROCm image alone predates this PR; use the pinned source overlay and
+  // model directories in the MI355X preparation section of the cookbook.
+  runModes: (s) => s.hw === "mi355x" ? ["python"] : ["python", "docker"],
 
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
@@ -257,6 +291,13 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
+            disable: [{ when: { hw: ["mi355x"] }, reason: "DeepGemm is a CUDA backend; MI355X uses AITER." }],
+          },
+          {
+            id: "aiter",
+            label: "AITER (ROCm)",
+            flags: ["--moe-runner-backend aiter"],
+            disable: [{ when: { hw: ["gb300", "h100", "h200", "b200", "b300", "gb200"] }, reason: "AITER is a ROCm backend." }],
           },
         ],
       },
@@ -329,6 +370,7 @@ sgl-eval run gsm8k \\
           // and a published image carries it.
           note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
           disable: [
+            { when: { hw: ["mi355x"] }, reason: "The FA4 draft-attention path is CUDA-only." },
             {
               when: { dpAttnOn: [true] },
               reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
@@ -341,6 +383,118 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
+    // Four MI355X VFs, TP4/EP4. The fixed-source AgentX comparison also used
+    // HiCache L2 and CPU multimodal transport. These cookbook commands are
+    // supported starting points, not post-merge measurements of every overlay.
+    {
+      match: { hw: "mi355x", strategy: "low-latency", quant: "fp8" },
+      nnodes: 1,
+      verified: false,
+      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      flags: [
+        "--model-path ./model-glm53-fp8",
+        "--tokenizer-path ./tokenizer-glm53",
+        "--served-model-name {{MODEL_NAME}}",
+        "--trust-remote-code",
+        "--quantization fp8",
+        "--tp-size 4", "--ep-size 4",
+        "--context-length 262144", "--page-size 64",
+        "--mem-fraction-static 0.82", "--max-running-requests 96",
+        "--cuda-graph-max-bs-decode 96", "--min-free-slots-delay 1",
+        "--chunked-prefill-size 8192", "--max-prefill-tokens 8192",
+        "--prefill-decode-interval 0",
+        "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
+        "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend aiter",
+        "--speculative-algorithm EAGLE", "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6",
+        "--speculative-attention-mode prefill",
+        "--speculative-accept-threshold-single 1.0",
+        "--speculative-accept-threshold-acc 1.0",
+        "--speculative-draft-model-quantization fp8",
+        "--speculative-moe-a2a-backend none",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47", "--watchdog-timeout 1800",
+        "--dist-timeout 600", "--host {{HOST_IP}}", "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", strategy: "low-latency", quant: "mxfp4" },
+      nnodes: 1,
+      verified: false,
+      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      flags: [
+        "--model-path ./model-glm53-mxfp4",
+        "--tokenizer-path ./tokenizer-glm53",
+        "--served-model-name {{MODEL_NAME}}",
+        "--trust-remote-code",
+        "--quantization quark",
+        "--tp-size 4", "--ep-size 4",
+        "--context-length 262144", "--page-size 64",
+        "--mem-fraction-static 0.82", "--max-running-requests 96",
+        "--cuda-graph-max-bs-decode 96", "--min-free-slots-delay 1",
+        "--chunked-prefill-size 8192", "--max-prefill-tokens 8192",
+        "--prefill-decode-interval 0",
+        "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
+        "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend aiter",
+        "--speculative-algorithm EAGLE", "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6",
+        "--speculative-attention-mode prefill",
+        "--speculative-accept-threshold-single 1.0",
+        "--speculative-accept-threshold-acc 1.0",
+        "--speculative-moe-a2a-backend none",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47", "--watchdog-timeout 1800",
+        "--dist-timeout 600", "--host {{HOST_IP}}", "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", strategy: "high-throughput", quant: "fp8" },
+      nnodes: 1,
+      verified: false,
+      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      flags: [
+        "--model-path ./model-glm53-fp8",
+        "--tokenizer-path ./tokenizer-glm53",
+        "--served-model-name {{MODEL_NAME}}",
+        "--trust-remote-code", "--quantization fp8",
+        "--tp-size 4", "--ep-size 4", "--context-length 262144",
+        "--page-size 64", "--mem-fraction-static 0.82",
+        "--max-running-requests 96", "--cuda-graph-max-bs-decode 96",
+        "--min-free-slots-delay 1", "--chunked-prefill-size 8192",
+        "--max-prefill-tokens 8192", "--prefill-decode-interval 0",
+        "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
+        "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend aiter",
+        "--reasoning-parser glm45", "--tool-call-parser glm47",
+        "--watchdog-timeout 1800", "--dist-timeout 600",
+        "--host {{HOST_IP}}", "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", strategy: "high-throughput", quant: "mxfp4" },
+      nnodes: 1,
+      verified: false,
+      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      flags: [
+        "--model-path ./model-glm53-mxfp4",
+        "--tokenizer-path ./tokenizer-glm53",
+        "--served-model-name {{MODEL_NAME}}",
+        "--trust-remote-code", "--quantization quark",
+        "--tp-size 4", "--ep-size 4", "--context-length 262144",
+        "--page-size 64", "--mem-fraction-static 0.82",
+        "--max-running-requests 96", "--cuda-graph-max-bs-decode 96",
+        "--min-free-slots-delay 1", "--chunked-prefill-size 8192",
+        "--max-prefill-tokens 8192", "--prefill-decode-interval 0",
+        "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
+        "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend aiter",
+        "--reasoning-parser glm45", "--tool-call-parser glm47",
+        "--watchdog-timeout 1800", "--dist-timeout 600",
+        "--host {{HOST_IP}}", "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,

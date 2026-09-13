@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, and GB300, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang on NVIDIA GPUs or MI355X, including official FP8 and OneNexus MXFP4 recipes on ROCm."
 tag: NEW
 ---
 
@@ -16,7 +16,44 @@ Use an SGLang build that includes GLM-5.3-Flash support.
 docker pull lmsysorg/sglang:glm-5.3-flash
 ```
 
-The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
+For the listed NVIDIA hardware, the deployment panel can render a complete `docker run` command. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup. MI355X uses the separate ROCm preparation below.
+
+</Accordion>
+
+<Accordion title="Prepare MI355X (official FP8 or OneNexus MXFP4)">
+
+Use four MI355X GPUs on one ROCm host. The MI355X commands require the
+[runtime changes in PR #39273](https://github.com/sgl-project/sglang/pull/39273),
+which also include the serving changes from #38547. The stock ROCm image alone
+does not include this PR. Follow the
+[pinned ROCm image, source-overlay, and Native Transformers setup](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4/blob/81433d9bc3cac517e4904518c3d020dd245a2fb8/reproduction/public-serving-recipe.md)
+before launching the Python-tab command. Its relative model/tokenizer paths
+refer to the directory containing these downloads: make that directory the
+working directory in the prepared ROCm environment (bind-mount it there if
+using a container). The exact benchmark container instead mounted the selected
+checkpoint at `/model` and the tokenizer at `/tokenizer`; change those two
+paths if reusing that launch verbatim. The measured run used four gfx950 VFs;
+adjust device access and NUMA placement to your host.
+
+```bash Command
+hf download zai-org/GLM-5.3-Flash \
+  --revision 690b705278a3a58e538fcb37c2ca8b5f9511213c \
+  --local-dir model-glm53-fp8
+hf download OneNexus/GLM-5.3-Flash-MXFP4 \
+  --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
+  --local-dir model-glm53-mxfp4
+hf download OneNexus/GLM-5.3-Flash-MXFP4 \
+  --revision f3fe4f720f75ebfe339cd3ca0ff9683d1c77b2c1 \
+  --include config.json generation_config.json processor_config.json \
+    tokenizer.json tokenizer_config.json chat_template.jinja \
+  --local-dir tokenizer-glm53
+```
+
+The FP8 and MXFP4 commands use the same pinned tokenizer and FP8 KV cache;
+only the checkpoint and its declared quantization path differ. The MI355X
+selector exposes Python commands because no published image includes the PR
+source yet. The source-qualified MXFP4 serving checks and the frozen AgentX
+frontier are [recorded separately](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4/tree/81433d9bc3cac517e4904518c3d020dd245a2fb8/reproduction).
 
 </Accordion>
 
@@ -27,9 +64,9 @@ Choose your hardware, then choose the operating point that matches your workload
 
 Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
-The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
+The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration used a host tier, and the merged source has not been remeasured. Do not treat the CUDA benchmark rows as MI355X measurements.
 
-**Breakable Cuda Graph** defaults to **Off**. Select **On** to add `--cuda-graph-backend-prefill breakable` to the generated command. This requires a build that includes [PR #38522](https://github.com/sgl-project/sglang/pull/38522).
+**Breakable Cuda Graph** defaults to **Off**. On NVIDIA, select **On** to add `--cuda-graph-backend-prefill breakable` to the generated command. This requires a build that includes [PR #38522](https://github.com/sgl-project/sglang/pull/38522); the option is disabled on MI355X.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
@@ -71,7 +108,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100 and H200</td>
+      <td style={{padding: "9px 12px"}}>Official FP8 weights, or OneNexus Quark MXFP4 on MI355X; FP8 KV cache by default on Blackwell and MI355X, BF16 KV cache on H100 and H200</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -96,7 +133,7 @@ The deployment recipes use the checkpoint's generation configuration. Override s
 
 Start with **Low Latency** for chat and agent workloads. It drafts from the checkpoint's MTP head at a fixed depth (5 steps, top-k 1, 6 draft tokens) with natural acceptance. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
 
-Strategy labels describe the workload goal, not a hardware restriction. Both strategies stay available when you switch hardware; only the verification badge changes.
+Strategy labels describe the workload goal, not a hardware restriction. Both strategies stay available when you switch hardware; only the verification badge changes. On MI355X, the measured AgentX frontier used Low Latency (EAGLE 5/1/6); High Throughput is an unmeasured speculation-off starting point.
 
 ### Change the speculative algorithm
 
@@ -106,7 +143,7 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 - **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
 - **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
 
-Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason.
+Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason. DFlash2's FA4 draft path is also disabled on MI355X.
 
 ### Size both memory pools
 
@@ -118,7 +155,7 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
 
 ### Decode context parallelism
 
@@ -130,9 +167,9 @@ Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill 
 
 ### Multimodal memory
 
-All strategies enable multimodal serving. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+All strategies enable multimodal serving. On MI355X, text, image, and an image-bearing follow-up were qualified; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
 
-The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
+The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
 ## 3. Advanced usage
 
