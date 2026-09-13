@@ -18,6 +18,12 @@ from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mla as fml,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mla_rocm as fmr,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -140,6 +146,81 @@ class TestCPMLADispatch(CustomTestCase):
                                 abh._handle_attention_backend(attn, batch, "fa3"),
                                 expected,
                             )
+
+
+class TestRocmDcpDecodeLseGuard(CustomTestCase):
+    """aiter's decode kernels never return LSE, which DCP's cross-rank merge
+    needs; forward_absorb_rocm_core must fail clearly instead of crashing on
+    "not enough values to unpack" inside attn_mqa_for_dcp_decode. See
+    sgl-project/sglang#38709."""
+
+    def test_dcp_decode_on_dsa_backend_raises_clear_error(self):
+        # "dsa" is in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS, matching the
+        # reported repro (glm_moe_dsa). _skip_rope_for_dsa_tilelang_fused=False
+        # routes past the tilelang fast path into the branch that calls
+        # attn_mqa_for_dcp_decode.
+        fake_self = SimpleNamespace(
+            current_attention_backend="dsa",
+            _skip_rope_for_dsa_tilelang_fused=lambda: False,
+            _fuse_rope_for_trtllm_mla=lambda forward_batch: False,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: True, is_target_verify=lambda: False
+            )
+        )
+        with mock.patch.object(
+            fml, "get_parallel", lambda: SimpleNamespace(dcp_enabled=True)
+        ):
+            with self.assertRaises(NotImplementedError):
+                fmr.DeepseekMLARocmForwardMixin.forward_absorb_rocm_core(
+                    fake_self,
+                    q_pe=None,
+                    k_pe=None,
+                    q_nope_out=None,
+                    k_nope=None,
+                    forward_batch=forward_batch,
+                    zero_allocator=None,
+                    positions=None,
+                    topk_indices=None,
+                    llama_4_scaling=None,
+                )
+
+    def test_non_dcp_decode_on_dsa_backend_does_not_raise(self):
+        # Same backend, DCP disabled -- must reach attn_mqa unaffected by the
+        # guard.
+        fake_self = SimpleNamespace(
+            current_attention_backend="dsa",
+            _skip_rope_for_dsa_tilelang_fused=lambda: False,
+            _fuse_rope_for_trtllm_mla=lambda forward_batch: False,
+            attn_mqa=mock.Mock(return_value="attn_output"),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: True, is_target_verify=lambda: False
+            )
+        )
+        with mock.patch.object(
+            fml, "get_parallel", lambda: SimpleNamespace(dcp_enabled=False)
+        ):
+            try:
+                fmr.DeepseekMLARocmForwardMixin.forward_absorb_rocm_core(
+                    fake_self,
+                    q_pe=None,
+                    k_pe=None,
+                    q_nope_out=None,
+                    k_nope=None,
+                    forward_batch=forward_batch,
+                    zero_allocator=None,
+                    positions=None,
+                    topk_indices=None,
+                    llama_4_scaling=None,
+                )
+            except NotImplementedError:
+                self.fail("guard raised even though DCP decode is disabled")
+            except Exception:
+                pass  # post-attn_mqa tensor plumbing is out of scope here
+        fake_self.attn_mqa.assert_called_once()
 
 
 if __name__ == "__main__":
