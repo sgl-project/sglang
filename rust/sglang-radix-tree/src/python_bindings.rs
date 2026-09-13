@@ -301,6 +301,8 @@ struct InspectionMatchResultInput {
     #[pyo3(attribute)]
     swa_host_hit_length: usize,
     #[pyo3(attribute)]
+    swa_branching_seqlen: Option<usize>,
+    #[pyo3(attribute)]
     mamba_host_hit_length: usize,
     #[pyo3(attribute)]
     mamba_branching_seqlen: Option<usize>,
@@ -516,6 +518,7 @@ pub struct InsertParamsBinding {
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
+    pub swa_branching_seqlen: Option<usize>,
     pub chunked: bool,
     pub priority: i64,
     pub track_adopted_ranges: bool,
@@ -524,7 +527,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -534,6 +537,7 @@ impl InsertParamsBinding {
         session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
+        swa_branching_seqlen: Option<usize>,
         chunked: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
@@ -548,6 +552,7 @@ impl InsertParamsBinding {
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
+            swa_branching_seqlen,
             chunked,
             priority,
             track_adopted_ranges,
@@ -564,6 +569,7 @@ pub struct MatchResultBinding {
     best_match_node_id: NodeId,
     host_hit_length: usize,
     swa_host_hit_length: usize,
+    swa_branching_seqlen: Option<usize>,
     mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     full_kv_hit_length: usize,
@@ -580,6 +586,7 @@ impl MatchResultBinding {
             best_match_node_id: result.best_match_node_id,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
+            swa_branching_seqlen: result.swa_branching_seqlen,
             mamba_host_hit_length: result.mamba_host_hit_length,
             mamba_branching_seqlen: result.mamba_branching_seqlen,
             full_kv_hit_length: result.full_kv_hit_length,
@@ -597,6 +604,7 @@ pub struct InsertResultBinding {
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
     mamba_exist: bool,
+    swa_branch_inserted: bool,
     adopted_ranges: Option<HashMap<u8, Vec<(usize, usize)>>>,
     cache_actions: Py<PyList>,
 }
@@ -636,6 +644,7 @@ impl InsertResultBinding {
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,
+            swa_branch_inserted: result.swa_branch_inserted,
             adopted_ranges: result.adopted_ranges.map(|ranges| {
                 ranges
                     .into_iter()
@@ -1022,6 +1031,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -1058,6 +1068,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
+            swa_branching_seqlen: params.swa_branching_seqlen,
             chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -1358,6 +1369,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().is_full_device_evicted(node_id))
             .map_err(node_access_error)
+    }
+
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
+    fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().set_host_memory_buffer_only());
+    }
+
+    /// Whether the host tier runs as a storage staging buffer, not a cache.
+    fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_host_memory_buffer_only)
     }
 
     /// Mark the host tier (HiCache) as wired.
@@ -2307,6 +2328,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node: best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2318,6 +2340,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             best_match_node_id,
             host_hit_length,
             swa_host_hit_length,
+            swa_branching_seqlen,
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
@@ -2618,6 +2641,16 @@ macro_rules! tree_core_binding {
             /// Whether the node's FULL device value has been evicted.
             fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 self.inner.is_full_device_evicted(py, node_id)
+            }
+
+            /// Mark the host tier as buffer-only; wired after the host pools are built.
+            fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+                self.inner.set_host_memory_buffer_only(py)
+            }
+
+            /// Whether the host tier runs as a storage staging buffer, not a cache.
+            fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+                self.inner.is_host_memory_buffer_only(py)
             }
 
             /// Mark the host tier (HiCache) as wired.
