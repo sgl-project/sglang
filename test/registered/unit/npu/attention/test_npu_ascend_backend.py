@@ -153,6 +153,7 @@ class TestForwardMetadata(unittest.TestCase):
             "seq_lens",
             "actual_seq_lengths_q",
             "actual_seq_lengths_q_pa",
+            "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
             "swa_mask",
             "prefix_lens",

@@ -116,12 +116,12 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
     assert noise_pred is not None, "noise_pred should not be None in OutputBatch"
     assert isinstance(noise_pred, torch.Tensor), "noise_pred should be a torch.Tensor"
-    assert (
-        noise_pred.device.type == "cuda"
-    ), f"noise_pred should be on cuda, got {noise_pred.device}"
-    assert (
-        noise_pred.dtype == torch.bfloat16
-    ), f"noise_pred should be bfloat16, got {noise_pred.dtype}"
+    assert noise_pred.device.type == "cuda", (
+        f"noise_pred should be on cuda, got {noise_pred.device}"
+    )
+    assert noise_pred.dtype == torch.bfloat16, (
+        f"noise_pred should be bfloat16, got {noise_pred.dtype}"
+    )
 
     print("✓ Successfully retrieved noise_pred from OutputBatch (Edit Mode)!")
     print(f"  noise_pred shape: {noise_pred.shape}")

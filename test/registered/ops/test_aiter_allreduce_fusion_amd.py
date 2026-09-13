@@ -158,7 +158,6 @@ def _run_residual_accuracy_check():
 
 
 class TestAiterAllreduceFusionAmd(unittest.TestCase):
-
     @staticmethod
     def _gpu_count():
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -409,11 +408,15 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 )
             )
             stack.enter_context(mock.patch.object(comm, "_use_aiter", use_aiter))
+            # moe_ep_size/moe_tp_size of 1 keep the hybrid EP+TP guard inactive
+            # so the aiter branch is what decides.
             stack.enter_context(
                 mock.patch.object(
                     comm,
                     "get_parallel",
-                    lambda: types.SimpleNamespace(tp_size=tp_world_size),
+                    lambda: types.SimpleNamespace(
+                        tp_size=tp_world_size, moe_ep_size=1, moe_tp_size=1
+                    ),
                 )
             )
             # the gate reads get_exec().comm.enable_aiter_allreduce_fusion

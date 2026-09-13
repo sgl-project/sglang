@@ -11,13 +11,13 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.runtime_context import (
     attention_backends,
     get_context,
+    get_observability,
     get_schedule,
 )
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +48,8 @@ def maybe_disable_chunked_prefix_cache(
         logger.info("Chunked prefix cache is turned on.")
 
 
-def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
-    if server_args.msprobe_dump_config is None:
+def create_msprobe_debugger() -> Optional[Any]:
+    if get_observability().msprobe_dump_config is None:
         return None
 
     try:
@@ -62,7 +62,7 @@ def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
         return None
 
     seed_all(mode=True)
-    return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
+    return PrecisionDebugger(config_path=get_observability().msprobe_dump_config)
 
 
 def resolve_pp_proxy_topk_size(

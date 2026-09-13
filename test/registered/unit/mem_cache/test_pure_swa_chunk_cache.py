@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
@@ -21,10 +21,13 @@ class _FakeAllocator:
 
 
 class _FakeReq:
-    req_pool_idx = 0
-    swa_evict_floor = 3
-    cache_protected_len = 0
-    kv = SimpleNamespace(swa_evicted_seqlen=6)
+    def __init__(self):
+        self.kv = SimpleNamespace(
+            req_pool_idx=0,
+            swa_evicted_seqlen=6,
+            swa_evict_floor=3,
+            cache_protected_len=0,
+        )
 
     def pop_committed_kv_cache(self):
         return 8
@@ -51,7 +54,7 @@ class TestPureSWAChunkCache(CustomTestCase):
     def test_finished_req_skips_protected_prefix(self):
         cache = self._make_cache()
         req = _FakeReq()
-        req.cache_protected_len = 2
+        req.kv.cache_protected_len = 2
 
         cache.cache_finished_req(req, kv_len_to_handle=8)
 

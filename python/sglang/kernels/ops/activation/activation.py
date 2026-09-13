@@ -134,6 +134,11 @@ def run_activation(
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
+        # The JIT kernel indexes expert ids as int32. Routing ids may arrive as
+        # int64 (e.g. from torch.topk) and torch.compile realizes them at their
+        # true dtype, so normalize here instead of asserting downstream.
+        if expert_ids.dtype != torch.int32:
+            expert_ids = expert_ids.to(torch.int32)
         _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
     return out
 
@@ -157,9 +162,9 @@ def run_unary_activation(
     Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
     ``out`` share the same shape.
     """
-    assert (
-        op_name in SUPPORTED_UNARY_ACTIVATIONS
-    ), f"Unsupported unary activation: {op_name}"
+    assert op_name in SUPPORTED_UNARY_ACTIVATIONS, (
+        f"Unsupported unary activation: {op_name}"
+    )
     if out is None:
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)

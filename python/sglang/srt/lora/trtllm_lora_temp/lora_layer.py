@@ -140,15 +140,15 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         layer._quant_info.w2_weight = _g2.reshape(_g2.shape[0], _g2.shape[1], -1)
         return
 
-    assert getattr(
-        quant_method, "block_quant", False
-    ), "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
-    assert (
-        not use_mxfp8
-    ), "experimental_sgl_trtllm LoRA currently targets the non-MX FP8 Qwen path."
-    assert (
-        weight_block_size is not None
-    ), "experimental_sgl_trtllm LoRA needs the FP8 weight block size."
+    assert getattr(quant_method, "block_quant", False), (
+        "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
+    )
+    assert not use_mxfp8, (
+        "experimental_sgl_trtllm LoRA currently targets the non-MX FP8 Qwen path."
+    )
+    assert weight_block_size is not None, (
+        "experimental_sgl_trtllm LoRA needs the FP8 weight block size."
+    )
     w13_weight_scale = getattr(base_layer, "w13_weight_scale_inv", None)
     if w13_weight_scale is None:
         w13_weight_scale = getattr(base_layer, "w13_weight_scale", None)

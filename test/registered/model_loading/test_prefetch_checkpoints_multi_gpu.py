@@ -4,7 +4,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=300, stage="weekly", runner_config="4-gpu-h100")
 
 PROMPTS = [
     "Hello, my name is",

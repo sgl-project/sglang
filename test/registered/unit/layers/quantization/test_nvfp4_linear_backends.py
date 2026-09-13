@@ -30,7 +30,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="4-gpu-b200")
 
 # (M, N, K). The second shape hits the padding paths: N=160 is not a multiple
 # of 128 (TRTLLM shuffle pad) and K=336 is neither a multiple of 32 (CUTLASS

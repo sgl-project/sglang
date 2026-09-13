@@ -1,7 +1,7 @@
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.jit.minicpm_sala import get_block_table
+from sglang.kernels.ops.minicpm_sala import get_block_table
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

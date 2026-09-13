@@ -1069,8 +1069,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")

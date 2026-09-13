@@ -181,9 +181,9 @@ class TestPDRolloutTypeChange:
 
             by_type = _get_workers_by_type(pd_gateway)
             logger.info("Workers by type: %s", json.dumps(by_type, indent=2))
-            assert (
-                "prefill" in by_type
-            ), f"Expected prefill, got: {list(by_type.keys())}"
+            assert "prefill" in by_type, (
+                f"Expected prefill, got: {list(by_type.keys())}"
+            )
 
         finally:
             _safe_delete_pod(pod_name)
@@ -257,12 +257,12 @@ class TestPDRolloutTypeChange:
             by_type = _get_workers_by_type(pd_gateway)
             logger.info("After rollout: %s", json.dumps(by_type, indent=2))
 
-            assert (
-                "decode" in by_type
-            ), f"Expected decode worker after rollout, got: {list(by_type.keys())}"
-            assert (
-                "prefill" not in by_type
-            ), "Stale prefill worker persists after rollout"
+            assert "decode" in by_type, (
+                f"Expected decode worker after rollout, got: {list(by_type.keys())}"
+            )
+            assert "prefill" not in by_type, (
+                "Stale prefill worker persists after rollout"
+            )
 
         finally:
             _safe_delete_pod(pod_name)

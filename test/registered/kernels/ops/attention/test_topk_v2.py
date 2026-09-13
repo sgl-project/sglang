@@ -31,12 +31,13 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
-    topk_transform_512_v2,
+    topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
@@ -95,9 +96,9 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
                 print(
                     f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}"
                 )
-        assert len(our) == min(
-            k, L
-        ), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        assert len(our) == min(k, L), (
+            f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        )
     assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
 
 
@@ -164,7 +165,7 @@ def _run(scores, seq_lens, page_table, inv_cpu, k):
     batch = scores.shape[0]
     metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
-    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
+    topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
     return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
@@ -176,10 +177,24 @@ def _run_raw(scores, seq_lens, k):
     batch = scores.shape[0]
     metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
-    topk_transform_512_v2(scores, seq_lens, None, out, PAGE_SIZE, metadata)
+    topk_transform_paged_v2(scores, seq_lens, None, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
     return [[v for v in out_cpu[i] if v != -1] for i in range(batch)]
+
+
+def _run_dual(scores, seq_lens, page_table, inv_cpu, k):
+    batch = scores.shape[0]
+    metadata = _plan(seq_lens)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    raw = torch.full_like(out, -1)
+    topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+    out_cpu = out.cpu().tolist()
+    raw_cpu = raw.cpu().tolist()
+    transformed_raw = [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
+    direct_raw = [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
+    return transformed_raw, direct_raw
 
 
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
@@ -267,6 +282,27 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize(
+    "batch,seq", [(8, 256), (8, 8192), (4, 32768), (2, 131072), (31, 131072)]
+)
+@torch.inference_mode()
+def test_topk_v2_dual_output(batch: int, seq: int) -> None:
+    """The dual mode returns the same selection before and after page transform."""
+    k = 512
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 2)
+    device = "cuda"
+    scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+
+    transformed_raw, direct_raw = _run_dual(scores, seq_lens, page_table, inv_cpu, k)
+    for row in range(batch):
+        assert sorted(transformed_raw[row]) == sorted(direct_raw[row])
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
 
 
 # --- ragged entry point ------------------------------------------------------

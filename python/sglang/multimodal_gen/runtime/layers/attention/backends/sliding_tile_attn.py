@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.layers.attention.mask_strategy import dict_to_3d_list
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -22,7 +23,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 try:
     from st_attn import sliding_tile_attention
@@ -35,7 +35,6 @@ logger = init_logger(__name__)
 
 
 class RangeDict(dict):
-
     def __getitem__(self, item: int) -> str:
         for key in self.keys():
             if isinstance(key, tuple):
@@ -81,7 +80,6 @@ class SlidingTileAttentionMetadata(AttentionMetadata):
 
 
 class SlidingTileAttentionMetadataBuilder(AttentionMetadataBuilder):
-
     def __init__(self):
         pass
 
@@ -105,7 +103,6 @@ class SlidingTileAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class SlidingTileAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

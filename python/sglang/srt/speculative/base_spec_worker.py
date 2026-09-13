@@ -19,7 +19,10 @@ if TYPE_CHECKING:
         UpdateWeightsFromIPCReqInput,
     )
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import (
+        ModelRunner,
+        SamplingPrewarmResult,
+    )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -94,6 +97,10 @@ class EagleDraftWorkerBase(ABC):
     @property
     def weight_load_time(self) -> float:
         return sum(runner.weight_load_time for runner in self.draft_runners)
+
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        return sum(runner.preloaded_weights_bytes for runner in self.draft_runners)
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -210,6 +217,15 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is None:
             return 0.0
         return self.draft_worker.weight_load_time
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        return self.target_worker.model_runner.prewarm_sampling()
+
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        if self.draft_worker is None:
+            return 0
+        return self.draft_worker.preloaded_weights_bytes
 
     @property
     def last_shared_read_runner(self):

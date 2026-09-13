@@ -9,7 +9,6 @@ import zmq
 from msgspec.msgpack import Decoder
 
 from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
@@ -20,9 +19,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=540, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=369, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
@@ -51,7 +51,7 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "120000",
                 "--chunked-prefill-size",
                 "2048",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",
@@ -93,7 +93,7 @@ class TestQwen35WithHiCache(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
 
     def _run_gsm8k(self):

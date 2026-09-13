@@ -256,9 +256,9 @@ class TestGatewayRestart:
                 "-l",
                 "app=smg-gateway-restart",
             )
-            assert res.get(
-                "items"
-            ), "No pods found for selector app=smg-gateway-restart"
+            assert res.get("items"), (
+                "No pods found for selector app=smg-gateway-restart"
+            )
             old_pod = res["items"][0]["metadata"]["name"]
             _kubectl(
                 "delete",
@@ -304,9 +304,9 @@ class TestGatewayRestart:
             logger.info("Workers after restart: %s", urls_after)
 
             # No duplicates: each pod should appear exactly once.
-            assert len(urls_after) == len(
-                set(urls_after)
-            ), f"Duplicate worker registrations after gateway restart: {urls_after}"
+            assert len(urls_after) == len(set(urls_after)), (
+                f"Duplicate worker registrations after gateway restart: {urls_after}"
+            )
             # Set equality: the same workers come back, neither dropped
             # nor duplicated.
             assert set(urls_after) == set(urls_before), (
@@ -364,9 +364,9 @@ class TestPodIpChange:
 
             ip_before = _get_pod_ip(pod_name)
             urls_before = {w["url"] for w in _get_workers(gateway_url)["workers"]}
-            assert any(
-                ip_before in url for url in urls_before
-            ), f"Expected initial worker URL containing {ip_before}, got {urls_before}"
+            assert any(ip_before in url for url in urls_before), (
+                f"Expected initial worker URL containing {ip_before}, got {urls_before}"
+            )
             logger.info("Pod IP before: %s, urls: %s", ip_before, urls_before)
 
             # Force-delete and wait until the registry no longer references
@@ -384,9 +384,11 @@ class TestPodIpChange:
             )
             _wait_for_pod_gone(pod_name)
             _poll_until(
-                lambda: not any(
-                    ip_before in w["url"]
-                    for w in _get_workers(gateway_url).get("workers", [])
+                lambda: (
+                    not any(
+                        ip_before in w["url"]
+                        for w in _get_workers(gateway_url).get("workers", [])
+                    )
                 ),
                 f"stale worker for IP {ip_before} removed",
                 timeout=RECONCILIATION_WAIT_SECS,
@@ -431,9 +433,9 @@ class TestPodIpChange:
                 f"Expected exactly one worker URL containing current IP "
                 f"{ip_after}, got {matching_after} (all urls: {urls_after})"
             )
-            assert not any(
-                ip_before in u for u in urls_after
-            ), f"Stale URL with old IP {ip_before} still in registry: {urls_after}"
+            assert not any(ip_before in u for u in urls_after), (
+                f"Stale URL with old IP {ip_before} still in registry: {urls_after}"
+            )
         finally:
             _safe_force_delete(pod_name)
 
@@ -496,9 +498,11 @@ class TestGracefulDrain:
             # without affecting whether *this* pod's IP got removed. The
             # meaningful timing guarantee (`elapsed < grace_secs`) is below.
             _poll_until(
-                lambda: not any(
-                    pod_ip in w["url"]
-                    for w in _get_workers(gateway_url).get("workers", [])
+                lambda: (
+                    not any(
+                        pod_ip in w["url"]
+                        for w in _get_workers(gateway_url).get("workers", [])
+                    )
                 ),
                 f"worker for ip {pod_ip} deregistered after graceful delete",
                 timeout=RECONCILIATION_WAIT_SECS,

@@ -20,7 +20,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(CMAKE_CXX_STANDARD 17)
+set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
 # CUDA
@@ -125,7 +126,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler"
     "-fPIC"
     "-gencode=arch=compute_90,code=sm_90"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
@@ -255,9 +256,7 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
-    "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
@@ -270,13 +269,11 @@ set(SOURCES
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
-    "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
-    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/infllm_v2/max_pooling.cu"
@@ -305,12 +302,6 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
 set(INCLUDES
@@ -399,7 +390,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler"
         "-fPIC"
         "-gencode=arch=compute_90a,code=sm_90a"
-        "-std=c++17"
+        "-std=c++${SGL_KERNEL_CXX_STANDARD}"
         "-DCUTE_USE_PACKED_TUPLE=1"
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
         "-DCUTLASS_VERSIONS_GENERATED"
@@ -493,7 +484,7 @@ endif()
 set(INFLLM_FLASH_CUDA_FLAGS
     "-DNDEBUG"
     "-O3"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-Xcompiler"
     "-fPIC"
     "-U__CUDA_NO_HALF_OPERATORS__"

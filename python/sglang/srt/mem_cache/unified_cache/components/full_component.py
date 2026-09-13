@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -22,10 +23,13 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
     TreeComponent,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -102,8 +106,8 @@ class FullComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
-            return (
-                lambda node: node.component_data[self.component_type].value is not None
+            return lambda node: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -277,18 +281,20 @@ class FullComponent(TreeComponent):
         root = self.tree_core.root_node
         cur = node
 
-        # Skip the bottom evicted segment
+        # The bottom device-evicted segment is locked too (no ledger move —
+        # nothing is on device); a load-back that materializes a value under
+        # lock credits protected directly.
         while cur is not root and cur.component_data[ct].value is None:
-            result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
+            cur.component_data[ct].lock_ref += 1
             cur = cur.parent
 
         # Lock the device-on segment up to root
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            assert cd.value is not None, (
+                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
@@ -303,7 +309,7 @@ class FullComponent(TreeComponent):
     def release_component_lock(
         self,
         node: UnifiedTreeNode,
-        params: Optional[DecLockRefParams],
+        params: DecLockRefParams,
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
@@ -311,7 +317,6 @@ class FullComponent(TreeComponent):
             cd = node.component_data[ct]
             if cd.host_lock_ref == 0:
                 return
-            # Mirror of `acquire`. write_back uses a pure counter.
             if cd.host_value is None and not self.tree_core.is_write_back:
                 return
             cd.host_lock_ref -= 1
@@ -319,17 +324,13 @@ class FullComponent(TreeComponent):
             return
 
         root = self.tree_core.root_node
-        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
         while cur != root:
-            if cur.id in skip_lock_node_ids:
-                cur = cur.parent
-                continue
             cd = cur.component_data[ct]
-            assert cd.value is not None
-            assert cd.lock_ref > 0
-
-            if cd.lock_ref == 1:
+            assert cd.lock_ref > 0, (
+                f"FULL segment release hit lock_ref=0 on node {cur.id}"
+            )
+            if cd.lock_ref == 1 and cd.value is not None:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] += key_len
                 self.tree_core.component_protected_size_[ct] -= key_len
@@ -418,26 +419,96 @@ class FullComponent(TreeComponent):
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
-                # Full uses leaf sets, not LRU
-                self.tree_core.component_evictable_size_[ct] += n_len
+                # Full uses leaf sets, not LRU. A value materialized under
+                # lock is protected; the last release moves it to evictable.
+                if cd.lock_ref > 0:
+                    self.tree_core.component_protected_size_[ct] += n_len
+                else:
+                    self.tree_core.component_evictable_size_[ct] += n_len
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)
+
+    def _full_allocator(self):
+        """The allocator that owns the full-attention pool alone."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=value.to(torch.int64),
+                keys=list(node.hash_value),
+            )
+
+        if not keys:
+            return None
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+        if phase == LinkerTransferPhase.LOAD:
+            allocator = self._full_allocator()
+            num_tokens = len(keys) * self.cache.page_size
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(num_tokens=shortfall))
+            slots = allocator.alloc(num_tokens)
+            if slots is None:
+                return None
+
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=slots.to(torch.int64),
+                keys=list(keys),
+            )
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self._full_allocator().free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._full_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._full_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
+                # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free(indices)
+                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
                 else:
-                    alloc.free(indices)
+                    alloc.free_segment(indices, start_pos=0)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"

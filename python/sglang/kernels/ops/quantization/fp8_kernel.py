@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_xpu,
@@ -45,6 +46,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_gfx1250 = is_gfx1250_supported()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -267,9 +269,9 @@ def _per_token_group_quant_8bit_raw(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_hip:
@@ -583,9 +585,9 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    assert eps == 1e-10, (
+        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    )
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
         f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
@@ -612,9 +614,9 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if (
@@ -674,9 +676,9 @@ def sglang_per_token_group_quant_fp8_row_padded(
     bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` must be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     supported_group_sizes = (
@@ -724,9 +726,9 @@ def sglang_per_token_group_quant_fp8_ue8m0(
     group_size: int,
     eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert (
-        x.shape[-1] % group_size == 0
-    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    assert x.shape[-1] % group_size == 0, (
+        f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    )
     assert x.is_contiguous(), "x must be contiguous"
 
     *x_batch, x_q_mn, x_q_k = x.shape
@@ -1008,6 +1010,109 @@ def _w8a8_block_fp8_matmul(
 
         scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def _w8a8_block_fp8_matmul_gfx1250(
+    # Pointers to inputs and output
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Shape for matmul
+    M,
+    N,
+    K,
+    # Block size for block-wise quantization
+    group_n,
+    group_k,
+    # Stride for inputs and output
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    needs_masking: tl.constexpr,
+):
+    """
+    gfx1250 (RDNA4) block-fp8 matmul.
+    The shared ``_w8a8_block_fp8_matmul`` is unusable on gfx1250.
+      1. fp8 ``tl.dot`` faults at runtime
+      2. software pipelining (``num_stages`` > 1) miscompiles and yields NaN.
+      3. the ``offs % M`` / ``offs % N`` modulo-wrap index trick is
+         intermittently miscompiled into out-of-bounds addresses.
+    """
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # No modulo-wrap on gfx1250; use explicit masks instead.
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    m_mask = offs_am < M
+    n_mask = offs_bn < N
+
+    offs_am_c = tl.where(m_mask, offs_am, 0)
+    offs_bn_c = tl.where(n_mask, offs_bn, 0)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am_c[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn_c[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am_c * stride_As_m
+    offs_bsn = offs_bn_c // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_mask = offs_k < K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        a_s = tl.load(As_ptrs, mask=m_mask, other=0.0)
+        b_s = tl.load(Bs_ptrs, mask=n_mask, other=0.0)
+
+        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
+
+        # Upcast fp8 to bf16 in-register
+        accumulator += (
+            tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16)) * a_s[:, None] * b_s[None, :]
+        )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         As_ptrs += scale_step_k * stride_As_k
@@ -1361,9 +1466,9 @@ def prepare_block_fp8_matmul_inputs(
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     elif As.dtype == torch.int:
-        assert (
-            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
-        ), f"{A.shape=} {As.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1], (
+            f"{A.shape=} {As.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -1379,9 +1484,9 @@ def prepare_block_fp8_matmul_inputs(
         assert triton.cdiv(K, block_k) == Bs.shape[1]
     elif Bs.dtype == torch.int:
         assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-        assert (
-            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
-        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1], (
+            f"{B.shape=} {Bs.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -1474,14 +1579,18 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    if _is_gfx1250:
+        config = {**config, "num_stages": 1}
+        kernel = _w8a8_block_fp8_matmul_gfx1250
+    else:
+        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
-
-    kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 
     kernel[grid](
         A,
@@ -1823,9 +1932,9 @@ if _is_hip:
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
             elif _has_vllm:
@@ -1864,9 +1973,9 @@ else:
                 )  # False for dynamic
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             sgl_per_tensor_quant_fp8(
                 input, output, scale, is_static=True
             )  # True for static
@@ -1945,9 +2054,9 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert A.dim() == 2
     assert A.is_contiguous(), "`A` is not contiguous"
-    assert (
-        A.shape[-1] % group_size == 0
-    ), "the last dimension of `A` cannot be divisible by `group_size`"
+    assert A.shape[-1] % group_size == 0, (
+        "the last dimension of `A` cannot be divisible by `group_size`"
+    )
 
     a_q = torch.empty_like(A, device=A.device, dtype=fp8_dtype)
     M, K = A.shape[0], A.shape[1]

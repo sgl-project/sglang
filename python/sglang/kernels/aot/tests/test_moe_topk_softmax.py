@@ -41,13 +41,13 @@ def test_topkfast_softmax(num_tokens, num_experts, topk):
     topk_weights_ref, topk_indices_ref = torch.topk(softmax_output, topk, dim=-1)
 
     # Verify the top-k weights and indices match the torch native ones
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
+    )
 
-    assert compare_topk_values(
-        gating_output, topk_indices_ref.int(), topk_indices
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    assert compare_topk_values(gating_output, topk_indices_ref.int(), topk_indices), (
+        f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -79,13 +79,13 @@ def test_topk_softmax(num_tokens, num_experts, topk):
     topk_weights_ref, topk_indices_ref = torch.topk(softmax_output, topk, dim=-1)
 
     # Verify the top-k weights and indices match the torch native ones
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
+    )
 
-    assert compare_topk_values(
-        gating_output, topk_indices_ref.int(), topk_indices
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    assert compare_topk_values(gating_output, topk_indices_ref.int(), topk_indices), (
+        f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -122,13 +122,13 @@ def test_topk_softmax_dtype_regression(num_tokens, num_experts, topk, dtype):
         gating_output.float(),
     )
 
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: SGLang old interface={topk_indices_ref} vs SGLang new interface={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: SGLang old interface={topk_indices_ref} vs SGLang new interface={topk_weights}"
+    )
 
-    assert compare_topk_values(
-        gating_output, topk_indices_ref.int(), topk_indices
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    assert compare_topk_values(gating_output, topk_indices_ref.int(), topk_indices), (
+        f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -171,13 +171,13 @@ def test_topk_softmax_renormalize(num_tokens, num_experts, topk):
     )
     topk_weights_ref = topk_weights_ref / topk_weights_ref.sum(dim=-1, keepdim=True)
 
-    assert torch.allclose(
-        topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
-    ), f"Weights mismatch: SGLang w/o fused renormalize={topk_indices_ref} vs SGLang w/ fused renormalize={topk_weights}"
+    assert torch.allclose(topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3), (
+        f"Weights mismatch: SGLang w/o fused renormalize={topk_indices_ref} vs SGLang w/ fused renormalize={topk_weights}"
+    )
 
-    assert compare_topk_values(
-        gating_output, topk_indices_ref.int(), topk_indices
-    ), f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    assert compare_topk_values(gating_output, topk_indices_ref.int(), topk_indices), (
+        f"Values at the two indices are not equal: torch={topk_indices_ref}, SGLang={topk_indices}, values={gating_output}"
+    )
 
 
 if __name__ == "__main__":

@@ -76,7 +76,7 @@ class _TokenToKVPool:
             extra_key_buffer if extra_key_buffer is not None else swa_key_buffer
         )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.swa_window_size = page_size
+        self.swa_page_size = page_size
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
@@ -84,7 +84,7 @@ class _TokenToKVPool:
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _ = layer_id
-        return self.swa_window_size
+        return self.swa_page_size
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
@@ -203,6 +203,7 @@ def _make_sparse_prefill_case(
         ),
         page_size=page_size,
     )
+    backend.token_to_kv_pool = token_to_kv_pool
 
     generator = torch.Generator(device=device)
     generator.manual_seed(11)
@@ -441,9 +442,10 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
 
     bf16_capture = _Capture()
     q8_capture = _Capture()
-    with _patched_sparse_kernels(
-        bf16_capture, q8_capture
-    ), _patched_compressed_sparse_cache_paths(compress_ratio):
+    with (
+        _patched_sparse_kernels(bf16_capture, q8_capture),
+        _patched_compressed_sparse_cache_paths(compress_ratio),
+    ):
         bf16_out = backend._forward_prefill_sparse(
             q=q,
             layer_id=0,

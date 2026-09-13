@@ -29,9 +29,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         self.state_indices_list_gdn = []
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         for i in range(max_bs):
             self.state_indices_list.append(
@@ -252,9 +252,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

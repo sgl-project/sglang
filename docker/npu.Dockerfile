@@ -33,7 +33,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
 
-WORKDIR /workspace
+WORKDIR /sgl-workspace
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
@@ -55,6 +55,7 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     clang \
     locales \
     ccache \
+    ffmpeg \
     openssl \
     libssl-dev \
     pkg-config \
@@ -70,12 +71,6 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-
-### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
-
-### Install zbal
-RUN ${PIP_INSTALL} memfabric-zbal==1.2.0
 
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router

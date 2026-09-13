@@ -103,15 +103,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
@@ -261,9 +261,9 @@ def register_custom_op_from_extern(
     name = op_name or fn.__name__
     computed_args = computed_args or {}
 
-    assert not (
-        out_shape is not None and fake_impl is not None
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (out_shape is not None and fake_impl is not None), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
 
     # If computed_args specified, create a wrapper with a reduced signature
     # that computes the excluded args inside the op body.

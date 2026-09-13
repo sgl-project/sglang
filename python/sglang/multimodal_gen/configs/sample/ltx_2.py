@@ -22,6 +22,7 @@ class LTX2SamplingParams(SamplingParams):
 
     # Audio specific
     generate_audio: bool = True
+    use_diffusion_decoder: bool = False
 
     # Denoising parameters
     guidance_scale: float = 4.0

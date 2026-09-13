@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -35,8 +36,9 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
+    get_exec,
     get_flags,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -113,16 +115,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -140,6 +140,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []  # disables patch_model torch.compile wrapping
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -196,7 +197,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     (self.max_bs, self.model_runner.model_config.vocab_size),
                     dtype=torch.float32,
                 )
-                if self.model_runner.server_args.speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
                 else None
             )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
@@ -237,7 +238,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk = (
             torch.zeros(
-                (self.max_bs, self.eagle_worker.dsa_index_topk),
+                (self.max_bs, self.eagle_worker.dsa_seed_topk_width),
                 dtype=torch.int32,
                 device=model_runner.device,
             )
@@ -276,6 +277,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+        # Metadata glue graph is intentionally not used for the EAGLE draft
+        # runner.  FlashInferMLAMultiStepDraftBackend.init_forward_metadata_out_graph
+        # re-plans the per-step CUDA-graph wrappers that were already captured
+        # (decode_cuda_graph_metadata dict entries).  Capturing that re-plan
+        # into a secondary glue graph would corrupt the wrapper's internal GPU
+        # state on replay.  The main decode runner (DecodeCudaGraphRunner) is
+        # where the glue graph saves latency; draft metadata is cheaper and
+        # already amortised over speculative_num_steps.
+        self._metadata_glue = None
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -318,7 +329,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
 
         return is_bs_supported
 
@@ -331,6 +344,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
@@ -604,7 +618,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (
-            self.model_runner.server_args.speculative_use_rejection_sampling
+            get_spec().speculative_use_rejection_sampling
             and forward_batch.sampling_info is not None
         ):
             self.temperatures[:raw_bs].copy_(
@@ -653,8 +667,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        # forward_batch.batch_size was overwritten to bs above when padding.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
+        # each speculative step).  The glue-graph optimisation is not applied
+        # here — see __init__ comment for why.
+        self.draft_attn_backend.init_forward_metadata_out_graph(
+            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
+        )
         self.raw_bs = raw_bs
         self.bs = bs
 

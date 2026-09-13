@@ -93,7 +93,7 @@ class TestKimiK25MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (Kimi-K2.5-MXFP4)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (Kimi-K2.5-MXFP4)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.92)
 
@@ -105,7 +105,7 @@ class TestKimiK25MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (Kimi-K2.5-MXFP4)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (Kimi-K2.5-MXFP4)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 30)

@@ -335,7 +335,7 @@ def report(manifest: TraceManifest) -> None:
     print(f"  decode tokens   : {manifest.num_decode_tokens}")
     print(f"  total tokens    : {total}")
     print(f"  decode share    : {decode_share:.1%}")
-    print(f"  wall clock      : {manifest.elapsed_seconds/60:.1f} min")
+    print(f"  wall clock      : {manifest.elapsed_seconds / 60:.1f} min")
     if manifest.calibration_mode == "rac":
         print(
             "\nThe decode share is the activation mass that prompt-only "

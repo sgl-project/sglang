@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=578, stage="extra-b", runner_config="8-gpu-h200")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
@@ -114,7 +114,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             cls.bootstrap_port,
             "--tp",
             "4",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
@@ -137,7 +137,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             "4",
             "--base-gpu-id",
             "4",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
@@ -342,7 +342,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             cls.bootstrap_port,
             "--tp",
             "4",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
@@ -365,7 +365,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "4",
             "--base-gpu-id",
             "4",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices

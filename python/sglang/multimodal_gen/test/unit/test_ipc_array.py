@@ -5,10 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from sglang.multimodal_gen.runtime import ipc_array
 from sglang.multimodal_gen.runtime.ipc_array import (
     NumpyArrayFileRef,
+    TorchTensorFileRef,
     is_local_endpoint,
     materialize_file_refs,
     spill_large_arrays_to_file_refs,
@@ -66,8 +68,8 @@ def test_spill_removes_temp_file_when_save_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(tempfile, "mkstemp", tracked_mkstemp)
     monkeypatch.setattr(np, "save", fail_save)
 
-    with pytest.raises(OSError, match="simulated write failure"):
-        spill_large_arrays_to_file_refs(array)
+    # A failed spill falls back to sending the payload inline.
+    assert spill_large_arrays_to_file_refs(array) is array
 
     assert created_paths
     assert not created_paths[0].exists()
@@ -79,3 +81,55 @@ def test_local_endpoint_detection():
     assert is_local_endpoint("ipc:///tmp/sgl.sock")
     assert is_local_endpoint("inproc://scheduler")
     assert not is_local_endpoint("tcp://10.0.0.2:30000")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.uint8])
+def test_spill_large_tensors_round_trips(monkeypatch, tmp_path, dtype):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    elements = (
+        ipc_array._MIN_FILE_REF_BYTES // torch.empty((), dtype=dtype).element_size()
+    )
+    tensor = torch.arange(elements, dtype=torch.int64).to(dtype).reshape(2, -1)
+
+    spilled = spill_large_arrays_to_file_refs([tensor])
+
+    assert isinstance(spilled[0], TorchTensorFileRef)
+    spilled_path = Path(spilled[0].ref.path)
+    assert spilled_path.exists()
+
+    materialized = materialize_file_refs(spilled)[0]
+
+    assert materialized.dtype == tensor.dtype
+    assert materialized.shape == tensor.shape
+    assert torch.equal(materialized, tensor)
+    assert not spilled_path.exists()
+
+
+def test_non_contiguous_tensor_round_trips(monkeypatch, tmp_path):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    elements = ipc_array._MIN_FILE_REF_BYTES // 2
+    tensor = torch.arange(elements, dtype=torch.float32).reshape(2, -1).T
+
+    materialized = materialize_file_refs(spill_large_arrays_to_file_refs(tensor))
+
+    assert torch.equal(materialized, tensor)
+
+
+def test_small_tensors_are_kept_inline():
+    tensor = torch.zeros(16)
+
+    spilled = spill_large_arrays_to_file_refs((tensor,))
+
+    assert spilled[0] is tensor
+
+
+def test_tensor_spill_falls_back_inline_when_shm_is_full(monkeypatch, tmp_path):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    tensor = torch.zeros(ipc_array._MIN_FILE_REF_BYTES, dtype=torch.uint8)
+
+    def fail_save(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(np, "save", fail_save)
+
+    assert spill_large_arrays_to_file_refs(tensor) is tensor

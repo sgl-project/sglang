@@ -22,6 +22,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: prefill
     spec:
       restartPolicy: Always
@@ -125,6 +126,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: decode
     spec:
       restartPolicy: Always
@@ -228,6 +230,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: router
     spec:
       hostNetwork: True

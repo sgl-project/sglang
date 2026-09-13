@@ -22,6 +22,9 @@ struct CodecFP : public CodecBase {
   static constexpr int kWorldSize = world_size;
   static constexpr int kRankAtoms = kAtoms / kWorldSize;
 
+  // No block scale to protect, so the bf16 -> fp16 cast scale is the only range guard.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Fp;
+
   // Codec tile size process by this workgroup.
   // Each thread processes atoms of f16x8_t (16B).
   static constexpr int kRankTransmittedTileSize = kBlockSize * kRankAtoms * sizeof(int32x4_t);
@@ -53,6 +56,9 @@ struct CodecFP : public CodecBase {
 template <typename T, int world_size>
 struct CodecQ4 : public CodecBase {
   static constexpr int kWorldSize = world_size;
+
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of fp16x8_t (16B),
@@ -191,6 +197,9 @@ struct CodecQ4 : public CodecBase {
 template <typename T, int world_size>
 struct CodecQ6 : public CodecBase {
   static constexpr int kWorldSize = world_size;
+
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of fp16x8_t (16B),
@@ -350,6 +359,9 @@ template <typename T, int world_size>
 struct CodecQ8 : public CodecBase {
   static constexpr int kWorldSize = world_size;
 
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
+
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of f16x8_t (16B),
   // into a int8x8_t (8B) and a f16 scale shared among 32 values.
@@ -486,12 +498,37 @@ struct CodecQ8 : public CodecBase {
   }
 };
 
+// Keep the scale on the f32 side of the narrowing conversion. With nothing in
+// between, LLVM reassociates (bf16_as_f32 * scale) -> fp16 into
+// fp16(bf16_as_f32) * scale, which clips values above 65504 before the range
+// guard is applied.
+//
+// The barrier is what blocks that: it forces the scaled values into registers
+// the optimizer cannot see through, so the multiply has to happen before the
+// narrowing. Naming a conversion instruction would do the same, but only where
+// that instruction exists -- v_cvt_pk_f16_f32 is not part of the CDNA ISA, so
+// spelling it out fails to assemble for gfx942. The narrowing itself is left to
+// __float22half2_rn, which every target implements and which matches the
+// round-to-nearest conversion the quantized path above uses.
+__quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value, float scale) {
+  float2 scaled = __bfloat1622float2(value);
+  scaled.x *= scale;
+  scaled.y *= scale;
+
+  asm volatile("" : "+v"(scaled.x), "+v"(scaled.y));
+  return __float22half2_rn(scaled);
+}
+
 // Twoshot All Reduce
 template <typename T, class Codec, bool cast_bf2half>
 struct AllReduceTwoshot {
   static_assert(sizeof(T) == 2);
 
   static constexpr int kWorldSize = Codec::kWorldSize;
+
+  // Power of two, so both multiplies are exact.
+  static constexpr float kCastScale = static_cast<float>(1 << Codec::kCastScaleLog2);
+  static constexpr float kCastInvScale = 1.0f / kCastScale;
 
   __device__ static void
   run(T const* __restrict__ input,
@@ -524,8 +561,15 @@ struct AllReduceTwoshot {
         half2 half_buf[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float2 f = __bfloat1622float2(bf_buf[j]);
-          half_buf[j] = __float22half2_rn(f);
+          if constexpr (Codec::kCastScaleLog2 == 0) {
+            float2 f = __bfloat1622float2(bf_buf[j]);
+            // S=1 for quantized codecs; preserve their existing conversion path.
+            f.x *= kCastInvScale;
+            f.y *= kCastInvScale;
+            half_buf[j] = __float22half2_rn(f);
+          } else {
+            half_buf[j] = scaled_bfloat162_to_half2(bf_buf[j], kCastInvScale);
+          }
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
       }
@@ -620,6 +664,9 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);
+          // Undo the load-side scale; the fp32 intermediate cannot overflow.
+          f.x *= kCastScale;
+          f.y *= kCastScale;
           bf16_buf[j] = __float22bfloat162_rn(f);
         }
         buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer.descriptor, dst_offset, 0, 0);

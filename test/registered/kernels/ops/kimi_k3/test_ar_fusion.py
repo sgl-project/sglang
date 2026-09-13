@@ -102,9 +102,9 @@ def _init_comm() -> CustomAllReduceV2:
     comm = CustomAllReduceV2(
         cpu_group, device, max_pull_size=1 * MB, max_push_size=2 * MB
     )
-    if comm.disabled or comm.mc_base_ptr == 0:
+    if comm.disabled or not comm.has_multicast:
         raise RuntimeError("ar_fusion requires CustomAllReduceV2 with multicast")
-    all_reduce.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    all_reduce.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -165,7 +165,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     x = _int_input(n, bs, per_rank=True)
     residual = _int_input(n, bs + 7, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    all_reduce.all_reduce_push_res(world, x, residual, ws_mc_base=comm.mc_base_ptr)
+    all_reduce.all_reduce_push_res(world, x, residual)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -240,9 +240,7 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     x = _int_input(n, num_tokens + 41 + rows_per_token, per_rank=True)
     weight = _int_input(NORM_DIM, 43, per_rank=False) + 1
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_push_norm(
-        world, x, weight, 1e-6, num_norm_rows=num_tokens, ws_mc_base=comm.mc_base_ptr
-    )
+    all_reduce.all_reduce_push_norm(world, x, weight, 1e-6, num_norm_rows=num_tokens)
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
@@ -250,10 +248,13 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
 FIN_TOPK = 16
 
 
-def _build_permuted_layout(num_tokens: int, seed: int):
+def _build_permuted_layout(
+    num_tokens: int, seed: int, w_dtype: torch.dtype = torch.float32
+):
     """trtllm-gen permuted gemm2 layout (rows grouped by expert, per-expert
     tile padding). Deterministic on CPU: idx/weights are identical on every
-    rank (TP semantics — same routing), gemm2 values are per-rank."""
+    rank (TP semantics — same routing), gemm2 values are per-rank.
+    ``w_dtype`` is the routing-weight dtype the deferred finalize hands back."""
     num_experts, tile = 896, 8
     gen = torch.Generator(device="cpu").manual_seed(seed)
     topk_ids = torch.stack(
@@ -270,7 +271,7 @@ def _build_permuted_layout(num_tokens: int, seed: int):
     for i, e in enumerate(topk_ids.flatten().tolist()):
         idx[i] = bases[e] + fill[e]
         fill[e] += 1
-    weights = torch.rand(num_tokens, FIN_TOPK, generator=gen).to(torch.bfloat16)
+    weights = torch.rand(num_tokens, FIN_TOPK, generator=gen).to(w_dtype)
     num_rows = int(padded.sum())
     g = torch.Generator(device="cpu").manual_seed(seed * 31 + dist.get_rank())
     gemm2 = (torch.randn(num_rows, NORM_DIM, generator=g) * 2).to(torch.bfloat16)
@@ -298,19 +299,20 @@ def _finalize_norm_ref(gemm2, idx, weights, norm_w, eps: float) -> torch.Tensor:
     return (total * factor * norm_w.float()).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("bs", PUSH_BS)
 @torch.inference_mode()
-def test_ar_fusion_finalize_push_norm(bs: int):
+def test_ar_fusion_finalize_push_norm(bs: int, w_dtype: torch.dtype):
     comm = _init_comm()
     world = comm.world_size
     eps = 1e-6
-    gemm2, idx, weights = _build_permuted_layout(bs, seed=bs + 23)
+    gemm2, idx, weights = _build_permuted_layout(bs, seed=bs + 23, w_dtype=w_dtype)
     g = torch.Generator(device="cpu").manual_seed(77)
     norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
     ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
     out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
     all_reduce.finalize_all_reduce_push_norm(
-        world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+        world, out, gemm2, idx, weights, norm_w, eps
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -327,16 +329,21 @@ def test_ar_fusion_finalize_push_norm_stress():
     norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
     for it in range(12):
         bs = (1, 8, 32)[it % 3]
-        gemm2, idx, weights = _build_permuted_layout(bs, seed=9000 + it)
+        # alternate the routing-weight precision: both kernel instantiations
+        # share the one push workspace
+        w_dtype = (torch.float32, torch.bfloat16)[it % 2]
+        gemm2, idx, weights = _build_permuted_layout(
+            bs, seed=9000 + it, w_dtype=w_dtype
+        )
         ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
         out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
         all_reduce.finalize_all_reduce_push_norm(
-            world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+            world, out, gemm2, idx, weights, norm_w, eps
         )
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         x = _int_input(bs * H, 8000 + it, per_rank=True)
         ref2 = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, x, None)
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
@@ -382,7 +389,7 @@ def test_ar_fusion_stress_mixed():
         num_blocks = (1, 2, 4, 8)[it % 4]
         x = _int_input(n, 3000 + it, per_rank=True)
         ref = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, x, None)
         torch.testing.assert_close(x, ref, atol=0, rtol=0)
         y = buf[:n]
         y.copy_(_int_input(n, 4000 + it, per_rank=True))
@@ -407,7 +414,7 @@ def test_ar_fusion_graph_capture():
     gz, mc_z = buf[n : 2 * n], mc + n * buf.element_size()
 
     def _run_all():
-        all_reduce.all_reduce_push_res(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, gx, gres)
         all_reduce.all_reduce_pull_res(world, gy, gres, input_mc_ptr=mc_y)
         all_reduce.all_reduce_pull_res(world, gz, gres, input_mc_ptr=mc_z)
 

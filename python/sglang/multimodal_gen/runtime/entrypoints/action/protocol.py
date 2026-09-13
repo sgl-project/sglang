@@ -17,6 +17,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
+    build_cosmos3_action_sampling_params,
+    cosmos3_action_metadata,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -112,7 +116,12 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         }
     for name in ("image", "image_path", "input_reference"):
         if name in normalized:
-            normalized[name] = _normalize_image_value(normalized[name])
+            value = normalized[name]
+            normalized[name] = (
+                [_normalize_image_value(item) for item in value]
+                if isinstance(value, (list, tuple))
+                else _normalize_image_value(value)
+            )
     state = normalized.get("state")
     if isinstance(state, dict):
         normalized["state"] = _decode_tensor_payload(state)
@@ -148,57 +157,15 @@ def images_from_observation(
 def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
-        defaults = Cosmos3SamplingParams()
-        return {
-            "object": "action.metadata",
-            "model": server_args.served_model_name,
-            "model_path": server_args.model_path,
-            "policy_family": "cosmos3",
-            "input": {
-                "modalities": ["image", "video"],
-                "supported_resolutions": [
-                    list(resolution) for resolution in defaults.supported_resolutions
-                ],
-                "state_dim": None,
-            },
-            "output": {
-                "action_type": "continuous",
-                "action_horizon": 16,
-                "action_dim": None,
-                "padded_action_dim": pipeline_config.dit_config.arch_config.action_dim,
-                "dtype": "float32",
-            },
-            "runtime": {
-                "parallelism": {
-                    "num_gpus": server_args.num_gpus,
-                    "tp_size": server_args.tp_size,
-                    "sp_degree": server_args.sp_degree,
-                    "ulysses_degree": server_args.ulysses_degree,
-                    "ring_degree": server_args.ring_degree,
-                }
-            },
-            "defaults": {
-                "action_mode": "policy",
-                "action_horizon": 16,
-                "num_inference_steps": defaults.num_inference_steps,
-                "height": 480,
-                "width": 832,
-                "fps": 5,
-            },
-            "capabilities": {
-                "action_modes": ["policy", "inverse_dynamics"],
-                "realtime_websocket": True,
-                "openpi_websocket": False,
-                "batch_inputs": False,
-                "multiple_candidates": False,
-            },
-        }
+        return cosmos3_action_metadata(server_args)
 
     policy_family = getattr(
         pipeline_config,
         "policy_family",
         type(pipeline_config).__name__.removesuffix("PipelineConfig").lower(),
     )
+    prefix_graph_enabled = pipeline_config.prefix_cuda_graph_available()
+    action_graph_enabled = pipeline_config.action_cuda_graph_available()
     return {
         "object": "action.metadata",
         "model": server_args.served_model_name,
@@ -219,6 +186,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "runtime": {
             "materialize_dtype": pipeline_config.materialize_dtype,
             "enable_autocast": pipeline_config.enable_autocast,
+            "cuda_graph": {
+                "prefix_enabled": prefix_graph_enabled,
+                "prefix_max_entries": pipeline_config.prefix_cuda_graph_max_entries,
+                "action_enabled": action_graph_enabled,
+                "action_max_entries": pipeline_config.action_cuda_graph_max_entries,
+                "prompt_token_buckets": list(pipeline_config.prompt_token_buckets),
+            },
             "parallelism": {
                 "num_gpus": server_args.num_gpus,
                 "tp_size": server_args.tp_size,
@@ -236,11 +210,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "prefix_cache": (
                 "auto" if pipeline_config.enable_global_prefix_cache else False
             ),
-            "cuda_graph": "auto" if pipeline_config.enable_action_cuda_graph else False,
+            "cuda_graph": (
+                "auto" if prefix_graph_enabled or action_graph_enabled else False
+            ),
         },
         "capabilities": {
             "exact_prefix_cache": True,
-            "cuda_graph": pipeline_config.enable_action_cuda_graph,
+            "cuda_graph": prefix_graph_enabled or action_graph_enabled,
             "realtime_websocket": True,
             "openpi_websocket": True,
             "batch_inputs": False,
@@ -423,134 +399,6 @@ def _build_action_model_sampling_params(
     return sp
 
 
-def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
-    image = None
-    for name in ("image", "image_path", "input_reference"):
-        if name in observation:
-            image = observation[name]
-            break
-
-    if image is None:
-        images = observation.get("images")
-        if not images:
-            return None
-        if not isinstance(images, dict) or len(images) != 1:
-            raise ValueError(
-                "Cosmos3 policy input requires exactly one observation image"
-            )
-        image = next(iter(images.values()))
-    if isinstance(image, np.ndarray):
-        if image.dtype != np.uint8:
-            raise ValueError("Cosmos3 observation image arrays must use uint8 dtype")
-        return Image.fromarray(image)
-    return image
-
-
-def _build_cosmos3_action_sampling_params(
-    payload: dict[str, Any],
-    server_args: ServerArgs,
-    sampling_params_cls: type[Cosmos3SamplingParams],
-) -> Cosmos3SamplingParams:
-    observation = _action_request_to_observation(payload)
-    parameters = dict(payload.get("parameters") or {})
-    options = {**observation, **parameters}
-    action_mode = str(options.get("action_mode", "policy")).strip().lower()
-    if action_mode == "forward_dynamics":
-        raise ValueError(
-            "Cosmos3 forward_dynamics produces video; use /v1/videos instead"
-        )
-    if action_mode not in ("policy", "inverse_dynamics"):
-        raise ValueError(
-            "Cosmos3 action endpoint supports action_mode='policy' or "
-            "'inverse_dynamics'"
-        )
-
-    action_horizon = options.get("action_horizon")
-    num_frames = options.get("num_frames")
-    if action_horizon is None and num_frames is None:
-        action_horizon = 16
-    if action_horizon is not None:
-        action_horizon = int(action_horizon)
-        if action_horizon <= 0:
-            raise ValueError("action_horizon must be a positive integer")
-        expected_num_frames = action_horizon + 1
-        if num_frames is not None and int(num_frames) != expected_num_frames:
-            raise ValueError(
-                "Cosmos3 requires num_frames == action_horizon + 1, got "
-                f"num_frames={num_frames}, action_horizon={action_horizon}"
-            )
-        num_frames = expected_num_frames
-    else:
-        num_frames = int(num_frames)
-        if num_frames <= 1:
-            raise ValueError("Cosmos3 action num_frames must be greater than 1")
-    if (num_frames - 1) % 4 != 0:
-        raise ValueError(
-            "Cosmos3 action_horizon must be divisible by 4 so num_frames "
-            "is compatible with the temporal VAE"
-        )
-
-    image_path = _cosmos3_image_from_observation(observation)
-    video_path = options.get("video_path") or observation.get("video")
-    if action_mode == "policy" and image_path is None:
-        raise ValueError("Cosmos3 policy input requires an observation image")
-    if action_mode == "inverse_dynamics" and video_path is None:
-        raise ValueError("Cosmos3 inverse_dynamics input requires an observation video")
-    if image_path is not None and video_path is not None:
-        raise ValueError("Cosmos3 action requests accept either an image or a video")
-
-    domain_id = options.get("domain_id")
-    domain_name = options.get("domain_name")
-    raw_action_dim = options.get("raw_action_dim")
-    if domain_id is None and not domain_name:
-        raise ValueError("Cosmos3 action requests require domain_name or domain_id")
-    if domain_id is not None and not domain_name and raw_action_dim is None:
-        raise ValueError("raw_action_dim is required when only domain_id is provided")
-
-    prompt = observation.get("prompt") or observation.get("task") or ""
-    sampling_kwargs = {
-        "request_id": payload.get("request_id") or payload.get("id"),
-        "prompt": prompt,
-        "image_path": image_path,
-        "video_path": video_path,
-        "action_mode": action_mode,
-        "domain_id": domain_id,
-        "domain_name": domain_name,
-        "raw_action_dim": raw_action_dim,
-        "action_fps": options.get("action_fps"),
-        "action_view_point": options.get("action_view_point", "ego_view"),
-        "action_normalization": options.get("action_normalization", "quantile"),
-        "action_stats_path": server_args.pipeline_config.action_stats_path,
-        "num_frames": num_frames,
-        "fps": int(options.get("fps", 5)),
-        "height": int(options.get("height", 480)),
-        "width": int(options.get("width", 832)),
-        "num_inference_steps": int(options.get("num_inference_steps", 35)),
-        "guidance_scale": float(options.get("guidance_scale", 1.0)),
-        "seed": int(options.get("seed", 42)),
-        "flow_shift": options.get("flow_shift"),
-        "max_sequence_length": options.get("max_sequence_length"),
-        "condition_frame_indexes": options.get("condition_frame_indexes"),
-        "condition_video_keep": options.get("condition_video_keep", "first"),
-        "use_duration_template": False,
-        "use_system_prompt": False,
-        "use_guardrails": options.get("use_guardrails"),
-        "save_output": False,
-        "return_file_paths_only": False,
-        "return_frames": False,
-    }
-    supported_fields = _sampling_params_field_names(sampling_params_cls)
-    sp = sampling_params_cls(
-        **{
-            name: value
-            for name, value in sampling_kwargs.items()
-            if name in supported_fields and value is not None
-        }
-    )
-    sp._adjust(server_args)
-    return sp
-
-
 def build_action_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
@@ -563,8 +411,9 @@ def build_action_sampling_params(
             sampling_params_cls,
         )
     if issubclass(sampling_params_cls, Cosmos3SamplingParams):
-        return _build_cosmos3_action_sampling_params(
+        return build_cosmos3_action_sampling_params(
             payload,
+            _action_request_to_observation(payload),
             server_args,
             sampling_params_cls,
         )
@@ -594,23 +443,44 @@ def action_generation_response(
     preserve_numpy: bool = False,
 ) -> dict[str, Any]:
     actions = output["actions"]
-    if isinstance(actions, np.ndarray):
-        action_shape = list(actions.shape)
-        action_values = actions if preserve_numpy else actions.tolist()
-    else:
-        horizon = len(actions) if isinstance(actions, list) else 0
-        action_dim = len(actions[0]) if horizon and isinstance(actions[0], list) else 0
-        action_shape = [horizon, action_dim]
-        action_values = actions
-    action = {
-        "type": "continuous",
-        "dtype": "float32",
-        "shape": action_shape,
-        "values": action_values,
-    }
-    for name in ("action_mode", "domain_id", "raw_action_dim"):
-        if output.get(name) is not None:
-            action[name] = output[name]
+    action_array = np.asarray(actions)
+    if any(size == 0 for size in action_array.shape):
+        raise ValueError(
+            "action output dimensions must be non-zero, got "
+            f"{tuple(action_array.shape)}"
+        )
+    if action_array.ndim == 2:
+        action_array = action_array[None]
+    elif action_array.ndim != 3:
+        raise ValueError(
+            "action output must have shape [H, D] or [B, H, D], got "
+            f"{tuple(action_array.shape)}"
+        )
+
+    data = []
+    for input_index, action_values in enumerate(action_array):
+        action_shape = list(action_values.shape)
+        if not preserve_numpy:
+            action_values = action_values.tolist()
+        action = {
+            "type": "continuous",
+            "dtype": "float32",
+            "shape": action_shape,
+            "values": action_values,
+        }
+        for name in ("action_mode", "domain_id", "raw_action_dim"):
+            if output.get(name) is not None:
+                action[name] = output[name]
+        data.append(
+            {
+                "index": input_index,
+                "input_index": input_index,
+                "candidate_index": 0,
+                "action": action,
+            }
+        )
+
+    action_shape = data[0]["action"]["shape"]
 
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
@@ -623,15 +493,9 @@ def action_generation_response(
         "object": "action.generation",
         "created": int(time.time()),
         "model": server_args.served_model_name,
-        "data": [
-            {
-                "index": 0,
-                "input_index": 0,
-                "candidate_index": 0,
-                "action": action,
-            }
-        ],
+        "data": data,
         "usage": {
+            "batch_size": len(data),
             "action_horizon": action_shape[0] if action_shape else 0,
             "action_dim": action_shape[1] if len(action_shape) > 1 else 0,
             "denoise_steps": output.get("parameters", {}).get(

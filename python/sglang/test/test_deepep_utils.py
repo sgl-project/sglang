@@ -192,9 +192,9 @@ def bench_kineto(
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
-        assert (
-            sum([name in line for line in prof_lines]) == 1
-        ), f"Errors of the kernel {name} in the profiling table"
+        assert sum([name in line for line in prof_lines]) == 1, (
+            f"Errors of the kernel {name} in the profiling table"
+        )
 
     # Save chrome traces
     if trace_path is not None:

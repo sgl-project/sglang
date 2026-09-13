@@ -185,8 +185,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         if any(fn is None for fn in (dynamic_mxfp4_quant, shuffle_weight, gemm_a4w4)):
             raise RuntimeError(
-                "aiter MXFP4 kernels not available. "
-                "Install aiter with MXFP4 support."
+                "aiter MXFP4 kernels not available. Install aiter with MXFP4 support."
             )
 
         weight_data = layer.weight.data

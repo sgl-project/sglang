@@ -1,0 +1,266 @@
+---
+title: Qwen3.8-Flash-Next
+description: "Deploy Qwen3.8-Flash-Next with SGLang — day-0 recipes for Qwen's 176B-parameter (6B active) GDN + QSA hybrid Mixture-of-Experts preview of the Qwen4 architecture, on NVIDIA and AMD."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+Qwen3.8-Flash-Next support is not in a tagged release yet, so build the model-support PR rather than installing from PyPI:
+
+```bash Command
+pip install -U uv
+uv venv --python 3.12 && source .venv/bin/activate
+
+# Qwen3.8-Flash-Next model support:
+# https://github.com/sgl-project/sglang/pull/36497
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/36497/head && git checkout FETCH_HEAD
+uv pip install -e python
+```
+
+<Note>
+Model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497). Once it is in a release, `uv pip install sglang` is enough and this whole step goes away.
+</Note>
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+**NVIDIA datacenter GPUs** (H200 / B200 / B300 / GB300): the launch image, since this is a day-0 model with no release cut yet:
+
+```bash Command
+docker pull lmsysorg/sglang:qwen38flashnext
+```
+
+**DGX Spark and RTX PRO 6000**: the `qwen4-main-squashed` build (`4ccff141db`), which carries the ModelOpt MIXED_PRECISION loader ([#38121](https://github.com/sgl-project/sglang/pull/38121)), the file-backed PLE table backend ([#37068](https://github.com/sgl-project/sglang/pull/37068)), and the router-kernel fixes for the MTP output collapse on GB10 ([#36811](https://github.com/sgl-project/sglang/pull/36811) via [#38308](https://github.com/sgl-project/sglang/pull/38308), [#38290](https://github.com/sgl-project/sglang/pull/38290)). The `qwen38flashnext` image predates both, so the command generator uses this image for those two hardware rows:
+
+```bash Command
+docker pull lmsysorg/sglang:dev-qwen38-next-local
+```
+
+**AMD GPUs** (MI350X / MI355X): the matching ROCm build. It targets CDNA4 (gfx950) and is **not** interchangeable with the CUDA image above:
+
+```bash Command
+docker pull lmsysorg/sglang-rocm:qwen38flashnext
+```
+
+For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + quantization to generate the launch command.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";
+import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-flash-next-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<a id="spark-note" />
+
+<Accordion title="DGX Spark notes (1x GB10 with the N-gram table on NVMe, or 2x GB10 TP=2)">
+
+The NVFP4 checkpoint is 126 GiB (78 GiB of experts and dense weights plus a 47.7 GiB FP8 N-gram table), so it does not fit one DGX Spark's 128 GB of unified memory, and `--ple-offload-embedding` does not help there: on GB10 the "offloaded" pinned-host table comes out of the same pool as the GPU weights. The two-node shape is TP=2 across two Sparks over the ConnectX-7 200GbE link, with `--no-ple-offload-embedding` keeping the table GPU-resident and sharded (~65 GB of weights per node). A single Spark works only with the table file-backed on NVMe (see the Single Spark bullet below).
+
+- **Launch order.** Start rank 1 first, then rank 0 within a few seconds. When re-launching, stop both ranks and confirm nothing listens on the rendezvous port before starting again: a new rank 1 attaching to a stale rank 0 store fails with a gloo "Connection reset by peer".
+- **NCCL.** The cross-node decode CUDA-graph deadlock seen on an earlier DGX Spark stack was on NCCL 2.28.x; both builds these images load have been verified here for TP=2 across two Sparks: `dev-qwen38-next-local` runs its pip NCCL 2.29.7 (a system 2.28.3 is also present but not loaded), `qwen38flashnext` its 2.30.7. Confirm with the startup log line `sglang is using nccl==…`, which reports the library actually loaded. If your Sparks also have a slower management NIC, pin `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` to the 200GbE interface; with `--dist-init-addr` on the 200GbE address the verified runs picked it without pinning.
+- **Memory.** Both cells run `--mem-fraction-static 0.85`, which leaves ~8–12 GiB of host memory free per node under load (measured through GSM8K at full concurrency and a 100k-token prefill). Two precautions for long-context work beyond that: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` stops variable-shape chunked-prefill buffers from fragmenting the caching allocator at 200k+ contexts, and a host-side watchdog that kills the server when `MemAvailable` drops below a few GiB, because a unified-memory exhaustion can take the whole box down and needs a power cycle to recover.
+- **Concurrency.** The hybrid GDN/QSA model reserves mamba state slots per running request (5 with the default `extra_buffer` radix strategy, 4 with `extra_buffer_lazy`), and the scheduler caps `--max-running-requests` to what the mamba pool admits; read the effective value from the startup log, not from `/get_server_info`. The cells pin `--max-mamba-cache-size` to requests × slots (24 × 5 = 120 for low latency, 96 × 4 = 384 for high throughput); raising concurrency further takes memory from the KV pool one-for-one.
+- **Flags.** The cells are the model card's TP=2 recipe without `--mamba-track-interval 64`: the default of 256 tokens satisfies the constraints (a multiple of the 64-token page, at least the 4 draft tokens) and leaves a ~40% larger KV pool (1.48M tokens at 24 concurrent with MTP, 1.07M at 96 without), at the cost of coarser prefix-cache reuse of the recurrent state. `--trust-remote-code` is not needed; the architecture is native to SGLang.
+- **Measured.** 100k-token prefill at 2,400–2,840 tok/s; MTP accept length 3.5–3.7 of 4 draft tokens on non-thinking output (lower, ~2.5, on thinking output).
+- **Single Spark (file-backed PLE table).** One GB10 holds the checkpoint only if the 47.7 GiB FP8 N-gram table leaves memory entirely: with **PLE Offload = On (NVMe file)** (`--ple-offload-embedding --ple-offload-backend file`, from [#37068](https://github.com/sgl-project/sglang/pull/37068), merged into `qwen4-main-squashed`) SGLang creates a sparse 47.7 GiB file under `$SGLANG_CACHE_DIR/ple/<model>` (relocate with `--ple-offload-dir`; put it on the local NVMe and mount that directory into the container), fills it on boot, and the gather kernel reads rows through the host page tables; the table's resident set stays at 0 while serving, with hot pages in page cache (capped at 8 GiB by `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB`). The 78.3 GiB of experts and dense weights stay resident (the server logs ~80 GB after load, which also counts the CUDA context and allocator overhead) and `--mem-fraction-static 0.85` leaves ~12–18 GB for the pools, so concurrency is pinned low: **8 requests with MTP** (40 fp32 mamba slots of ~113 MB each) or **24 without** (96 slots on `extra_buffer_lazy`). Measured on `4ccff141db`: MTP cell 27.5 tok/s single-stream (TPOT 33.6 ms) and 71.7 tok/s output at 8; no-MTP cell 15.9 tok/s single-stream and 83 tok/s output at 24; host memory never below 10 GiB. **Boot-time caveat:** every boot rewrites the whole table through the mapping; on an already-populated file that is a read-modify-write per 4 KiB page with readahead disabled (`MADV_RANDOM`), ~17 MB/s and ~55 minutes; on a fresh sparse file it fills at GB/s and the boot takes ~10 minutes. Until that is fixed upstream, delete the previous `ple_table_*.bin` before each boot.
+- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` is a ModelOpt MIXED_PRECISION checkpoint (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts) and needs the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121), merged into `qwen4-main-squashed` (the branch the Python install path builds and the `lmsysorg/sglang:dev-qwen38-next-local` image ships); the `qwen38flashnext` image predates it and cannot load this export. Do not pass `--quantization` for it (it resolves to `modelopt_mixed`), and pass `--moe-runner-backend flashinfer_cutlass` explicitly: the mixed-precision auto-default picks `flashinfer_trtllm` on GB10, which the NVFP4 MoE method rejects at autotune. Its MTP experts are FP8 block-scaled with 128-wide blocks and cannot be split across two ranks (640 / 2 = 320), so the two-node low-latency cell reads the MTP draft from the RadixArk export, the same trained head kept in BF16 there. On a single Spark (TP=1, file-backed table) nothing is sharded, so the export's own MTP head loads directly. The single-Spark NVDA cells use the same pins as the RDXA ones (8 requests with MTP, 24 without); the smaller fp8 draft leaves a 174k-token KV pool with MTP, against 93k for the RadixArk cell. Measured on the `qwen4-main-squashed` tip `4ccff141db` (#38121 merged) at TP=2: 47.4 tok/s single-stream with MTP, 253 tok/s output at 96 concurrent without, the same as the RadixArk export.
+
+</Accordion>
+
+<a id="rtx6000-note" />
+
+<Accordion title="RTX PRO 6000 notes (1x 96 GB, TP=1)">
+
+The NVFP4 checkpoint fits a single 96 GB RTX PRO 6000 Blackwell (SM120) only with the 47.7 GiB FP8 N-gram table in **CPU pinned memory** (`--ple-offload-embedding`, the forced setting of the PLE Offload row on this hardware): the other 78 GiB of the checkpoint loads onto the card. After the loader's temporaries are collected, 74.7 GiB stays resident without speculative decoding and 81.8 GiB with it (the draft head is 0.5 GiB; the rest is memory the loader still holds), leaving 19.4 GiB and 12.3 GiB of the 94.2 GiB the process can use. `--mem-fraction-static` keeps (1 − fraction) × 94.2 GiB of that as runtime slack and the pools take the rest: 6.6 GiB of slack and 12.8 GiB of pools at 0.93, 3.8 GiB and 8.3 GiB at 0.96. (The 81 GiB "mem usage" in the load log is the delta before that collection.) The host needs ≥ 64 GB of free RAM for the locked table (plus page cache for the checkpoint) and Docker needs `--ulimit memlock=-1`, or the pinned allocation fails.
+
+- **Concurrency.** The hybrid model reserves mamba state slots per running request, and the scheduler caps `--max-running-requests` to what the state pool admits: with the default `extra_buffer` strategy (5 fp32 slots per request at 0.109 GiB) that is 3 requests with MTP and 12 without on this card. The cells keep prefix caching on and get to 16 / 64 with three levers: `--mamba-radix-cache-strategy extra_buffer_lazy` (4 slots per request), `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` (3; a running request's prefix state is no longer pinned in the radix tree during decode, so it can be evicted, which trades cache retention, not numerics), and `--mamba-ssm-dtype bfloat16` (0.055 GiB per slot). `--max-mamba-cache-size` is pinned to requests × 3 (48 / 192). The ceilings from the pool arithmetic are ~20 requests with MTP (each request carries 4 intermediate draft states) and ~70 without; turning prefix caching off (`--disable-radix-cache`, 1 slot per request) reaches 24 / 96 on this card and was verified too, but re-prefills every prompt.
+- **Linear-attention kernels.** Left on auto. On SM120 the server resolves decode, prefill and verify to triton — the same GDN kernels the fp32 runs and the DGX Spark cells use; the bf16-state FlashInfer GDN auto-default applies only to SM100. An explicit `--linear-attn-decode-backend flashinfer` also runs on this card and measured the same TPOT (within 0.3 ms) and accuracy, so there is nothing to gain from pinning either.
+- **Memory headroom.** With the state pool pinned, the KV pool absorbs the rest of the static budget, so `--mem-fraction-static` is what sets the activation headroom. 4096-token prefill chunks of ShareGPT-length prompts peak 1.5–2.6 GB above the post-graph-capture level, and cells left with 2.4 GB free OOMed in the GDN short-conv during prefill. The cells keep ≥ 4 GB free after graph capture and ≥ 2.3 GB at the measured peak: 0.96 with MTP (78k-token KV pool, ~4.9k per request at 16) and 0.93 without (98k tokens, ~1.5k per request at 64; 0.94 gives 138k tokens with 2.3 GB at peak). `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set on both.
+- **Accuracy.** Full GSM8K, 1,319 questions, on the `lmsysorg/sglang:dev-qwen38-next-local` image, in two protocols. Chat completions API with thinking off, greedy, an 8,192-token budget, answer parsed from a final "The answer is N" line (the protocol of the DGX Spark rows, and the figure on the benchmark card): 96.9% for the MTP cell and 96.9% for the no-MTP cell (RadixArk export); 97.3% and 97.0% for the NVIDIA export. `python -m sglang.test.run_eval --eval-name gsm8k --num-examples 1319 --max-tokens 16384` (5-shot, greedy, last-number scorer, chat template with thinking on): 97.72% / 97.79% (RadixArk), 97.41% / 97.72% (NVIDIA). Measured on the `4ccff141db` build, which carries the #36811 and #38290 router fixes.
+- **Measured (1024-in / 256-out random prompts, `ignore_eos`).** MTP vs no-MTP at 1 request: TTFT 115 vs 116 ms median, TPOT 5.9 vs 11.4 ms, 148 vs 83 tok/s. At 16: TPOT 19.3 vs 25.6 ms, 613 vs 524 tok/s. No-MTP at 64: TPOT 55 ms, 861 tok/s, 3.4 req/s. ShareGPT chat (thinking off, ≤ 512 output tokens): 785 tok/s at 16-way with MTP, 1,258 tok/s at 64-way without. MTP accept length 3.3 of 4 on GSM8K / random prompts, 2.9 on long-form ShareGPT answers. On the `dev-qwen38-next-local` image (`4ccff141db`): 6.0 / 11.44 ms TPOT at 1 request (MTP / no MTP), 685 / 561 tok/s at 16, 909 tok/s at 64 without MTP, accept length 3.16.
+
+- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` runs on this card with the same shape, pools and flags as the RadixArk cells on the `lmsysorg/sglang:dev-qwen38-next-local` image (it carries the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121); `qwen38flashnext` cannot load this export). Do not pass `--quantization`: the checkpoint resolves to `modelopt_mixed`. Low latency keeps the in-checkpoint MTP head: at TP=1 its fp8 block-scaled experts need no sharding, and #38121 runs them on triton under the `flashinfer_cutlass` pin. The RadixArk BF16 draft measured the same here (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the cell stays single-checkpoint. Verified on that image (`4ccff141db`): full GSM8K in the Accuracy bullet above; 6.02 ms TPOT at 1 request with MTP, 675 output tok/s at 16; 906 output tok/s at 64 without, the same as the RadixArk export. The smaller fp8 draft leaves a ~170k-token KV pool at 16 concurrent.
+
+</Accordion>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Qwen3.8-Flash-Next** is a multimodal Mixture-of-Experts model released as an early preview of the architecture Qwen4 is being built on — the same role Qwen3-Next played for Qwen3.5, whose hybrid Gated DeltaNet + Gated Attention design then carried through the Qwen3.5, Qwen3.6, Qwen3.7 and Qwen3.8 series. Qwen is publishing the architectural changes ahead of the full Qwen4 family so the community can evaluate them independently.
+
+It has **176B total parameters — 51B of which is an N-gram embedding table — and 6B active per token**. Against Qwen3.7-Plus it cuts both training and inference cost substantially (training takes roughly 1/9 as much) while holding comparable overall quality. It takes text and images in, and the hosted production variant is served as `qwen3.8-flash` on QwenCloud.
+
+The upgrades span four axes:
+
+- **Attention — GDN + QSA hybrid.** Three of every four layers use Gated DeltaNet, which compresses history into a fixed-size recurrent state; the fourth is global attention running **Qwen Sparse Attention (QSA)**. A lightweight indexer aggregates the sequence into micro-blocks, scores importance at block level, and selects the relevant regions — so the indexing overhead shrinks along with the attention itself. Unlike approaches that reuse indices across layers, QSA compresses independently per layer, which suits an architecture that interleaves GDN and attention. Qwen measures up to 10.2× prefill and 6.6× decode speedups for the QSA attention kernel at 1M tokens.
+- **Residual — Gated Residual (GR).** The single residual stream widens into four parallel branches, with an element-wise dynamic gate controlling how much each layer reads from and writes back to each branch. Qwen reports one branch naturally becoming a long-range bus. The gate also suppresses activation outliers, and the residual state can be held in FP8.
+- **Embedding — N-gram Embedding.** Lookups keyed on the local context (current token plus a few preceding ones) rather than a single token, adding 51B parameters at almost no extra per-token compute. Because lookup addresses are known in advance, the table can live in host memory and be prefetched asynchronously alongside model compute. The final model uses a single such layer near the start of the network.
+- **Optimization — Muon.** Muon for the genuine 2-D linear maps (attention, GDN and MoE expert weights), AdamW for embeddings, the MoE router and GR's low-rank parameters, with fused QKV / SwiGLU / GDN projections split before orthogonalization. The scaling law was refit for the new architecture, and batch-size warmup was dropped — it cost 18.8% more optimizer steps without improving the result.
+
+Carried over from Qwen3-Next and refined through the Qwen3.5–Qwen3.8 series: an ultra-sparse MoE (large expert pool, few routed experts per token plus one shared expert) with global load balancing; a **multi-step-trained MTP module**, whose own full-attention layers are QSA as well, which is what keeps speculative acceptance high in practice; and the training-stability set of zero-centered RMSNorm with weight decay on norm weights, attention output gating, and normalized MoE router initialization.
+
+**Context length:** 262,144 native, extensible to 1,000,000 tokens with YaRN. **License:** see [the model card's LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
+
+**Recommended generation:** Qwen has not published sampling recommendations for this preview. SGLang applies the checkpoint's own `generation_config.json`, so leave `temperature` / `top_p` unset unless you have a measured reason not to.
+
+Each precision is its own repository:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "44%"}} />
+    <col style={{width: "38%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Repository</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Where it runs</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen/Qwen3.8-Flash-Next</a></td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8">Qwen/Qwen3.8-Flash-Next-FP8</a></td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>NVFP4 (RDXA)</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4">RadixArk/Qwen3.8-Flash-Next-NVFP4</a></td>
+      <td style={{padding: "9px 12px"}}>B200, B300, GB300, RTX PRO 6000, 1x or 2x DGX Spark (Blackwell only)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>NVFP4 (NVDA)</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4">nvidia/Qwen3.8-Flash-Next-NVFP4</a> (ModelOpt MIXED_PRECISION)</td>
+      <td style={{padding: "9px 12px"}}>RTX PRO 6000, 1x or 2x DGX Spark (needs <a href="https://github.com/sgl-project/sglang/pull/38121">#38121</a>: the <code>dev-qwen38-next-local</code> image or the Python install path)</td>
+    </tr>
+  </tbody>
+</table>
+
+**Resources:** [Qwen's announcement](https://qwen.ai/blog?id=qwen3.8-flash-next).
+
+## 2. Advanced Usage
+
+<Note>
+The `model` argument in the examples below is the BF16 repo id. Every precision is a **separate repo**, so `model` has to be the checkpoint the server was actually launched with — `…-Flash-Next-FP8` or `…-Flash-Next-NVFP4`. The Deploy panel's cURL snippet always shows the right id for the cell you have selected.
+</Note>
+
+### 2.1 Reasoning
+
+Qwen3.8-Flash-Next **always** reasons — thinking cannot be turned off. `--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) lets SGLang pick the matching parser from the checkpoint's chat template, and splits the thinking into `reasoning_content`, leaving `content` as the answer alone. The resolved name is logged at startup if you want to pin it explicitly later.
+
+Depth is requested with `reasoning_effort`. Qwen documents `xhigh` (the default), `medium` and `low` for the hosted model; SGLang forwards whatever you pass into the checkpoint's chat template.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-Flash-Next",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="xhigh",  # xhigh (default) | medium | low
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here once the weights are public.
+```
+
+</Accordion>
+
+### 2.2 Tool Calling
+
+Add `--tool-call-parser auto` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. As with the reasoning parser, SGLang resolves the concrete detector from the chat template at startup. No Deploy cell sets it, so this is an opt-in: add the flag to the generated command, or flip the chip in the Playground.
+
+Because this model always thinks, the final assistant turn can put text in `reasoning_content` rather than `content` — print both so a bare `None` doesn't mislead you.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-Flash-Next",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here once the weights are public.
+```
+
+</Accordion>

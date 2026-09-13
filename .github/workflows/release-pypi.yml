@@ -61,25 +61,23 @@ jobs:
         run: |
           cd python
           cp ../README.md ../LICENSE .
-          pip install build wheel setuptools setuptools-scm setuptools-rust
+          pip install \
+            build wheel "setuptools>=61.0" "setuptools-rust>=1.11" \
+            "setuptools-scm>=8.0" "torch==2.13.0"
           if [ -n "$RELEASE_VERSION" ]; then
             export SETUPTOOLS_SCM_PRETEND_VERSION="${RELEASE_VERSION#v}"
             echo "Pinning wheel version to $SETUPTOOLS_SCM_PRETEND_VERSION"
           fi
-          python3 -m build --wheel
+          python3 -m build --wheel --no-isolation
 
       # PyPI rejects plain `linux_x86_64` / `linux_aarch64` platform tags;
       # auditwheel rewrites the wheel's platform tag to a `manylinux_*` tag
       # and bundles any external native deps. The runner's glibc determines
       # the lowest acceptable manylinux policy.
-      - name: Repair wheel for manylinux
+      - name: Repair and smoke-test wheel
         run: |
-          cd python
           pip install auditwheel patchelf
-          mkdir -p dist-repaired
-          python3 -m auditwheel repair dist/*.whl -w dist-repaired/
-          rm dist/*.whl
-          mv dist-repaired/*.whl dist/
+          python3 scripts/release/prepare_sglang_wheel.py python/dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

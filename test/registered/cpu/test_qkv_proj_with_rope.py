@@ -14,7 +14,7 @@ from sglang.test.cpu_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
 
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
 qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope

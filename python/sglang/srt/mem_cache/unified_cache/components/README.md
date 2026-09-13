@@ -180,34 +180,51 @@ Lock a node to protect it (and its ancestors) from eviction.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Called when a request begins using a cached prefix — prevents eviction of nodes it depends on |
-| **Inputs** | `node` — the last matched node (deepest) |
-| **Output** | `IncLockRefResult(swa_uuid_for_lock)` |
-| **Mutation** | Increments `lock_ref` per component along the path; moves tokens from evictable to protected size counters |
+| **Inputs** | `node` — the last matched node (deepest); `skip_lock_components` names components to leave untaken (the decode hold passes `(MAMBA,)`) |
+| **Output** | `IncLockRefResult(node_id, swa_uuid_for_lock, skipped_lock_components)` — the receipt the matching release must replay: the anchor node, the SWA boundary, and the skipped set |
+| **Mutation** | Increments `lock_ref` per component along its contiguous segment; moves data-bearing tokens from evictable to protected size counters |
 | **Complexity** | **O(D)** — Full: node to root; SWA: up to window boundary O(min(D, W)); Mamba: O(1).|
 
-**Algorithm detail:** Calls `acquire_component_lock()` for each component.
+**Algorithm detail:** Calls `acquire_component_lock()` for each component. A lock
+covers a contiguous node segment and counts **every** node in it — tombstones
+included (they carry no tokens, so sizes only move for data-bearing nodes).
 
 | Component | Strategy |
 |-----------|----------|
 | Full | **Path-lock**: walks from node to root, `lock_ref += 1` on every ancestor. On first lock (`lock_ref: 0→1`), moves tokens from `component_evictable_size_` to `component_protected_size_`. |
-| SWA | **Window-lock**: walks upward, accumulating SWA value lengths until `sliding_window_size` is filled. Records a `component_uuid` at the boundary node for `dec_lock_ref` to know where to stop. |
-| Mamba | **Single-node lock**: only `lock_ref += 1` on the node itself (mamba state is per-leaf, not per-path). |
+| SWA | **Segment-lock**: walks upward, `lock_ref += 1` on every node (tombstones included), accumulating position coverage (`len(key)`) until `sliding_window_size` is filled. Always stamps a boundary `component_uuid` at the last locked node; a `None` uuid in the receipt means the walk reached the root. |
+| Mamba | **Single-node lock**: only `lock_ref += 1` on the node itself (mamba state is per-leaf, not per-path). Taken unless the acquire lists it in `skip_lock_components`; the receipt records the skipped set. The core names no component: it drives whatever the tree registered through the same interface. |
 
 ---
 
-### `dec_lock_ref(node, params?) → DecLockRefResult`
+### `dec_lock_ref(node, params, skip_swa=False) → DecLockRefResult`
 
-Unlock a previously locked node path.
+Unlock a previously locked node path by replaying the acquire's receipt.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Called when a request finishes — releases eviction protection |
-| **Inputs** | `node`, optional `params.swa_uuid_for_lock` for SWA boundary detection |
+| **Inputs** | `node`; required `params` receipt (`node_id` anchor, `swa_uuid_for_lock` boundary, `skipped_lock_components`); `skip_swa=True` after an earlier `dec_swa_lock_only`. A receipt whose anchor is not `node` is a protocol violation (assert): a mispaired release would otherwise walk another holder's segment. |
 | **Output** | `DecLockRefResult()` |
-| **Mutation** | Decrements `lock_ref` per component; moves tokens from protected back to evictable when `lock_ref` reaches 0 |
+| **Mutation** | Decrements `lock_ref` per component along the same segment the acquire counted; moves tokens from protected back to evictable when `lock_ref` reaches 0 |
 | **Complexity** | **O(D)** — symmetric to `inc_lock_ref` |
 
-**Algorithm detail:** Calls `release_component_lock()` for each component. Full walks to root; SWA walks up until matching `component_uuid`; Mamba decrements single node.
+**Algorithm detail:** Releases auxiliary components before Full; every walk
+refreshes the evictable-leaf membership of each node whose last lock it drops,
+so the order is not load-bearing for the leaf sets. Full walks to root; SWA
+stops at the receipt boundary; components in `skipped_lock_components` are
+left alone. `skip_swa=True` also skips lower-priority components already
+released by `dec_swa_lock_only`. The host-side `dec_host_lock_ref` takes the
+same required receipt.
+
+---
+
+### `dec_swa_lock_only(node, params) → DecSwaLockOnlyResult`
+
+Early-release only the SWA portion of a lock (decode advanced past the
+window), plus strictly-lower-priority co-located locks (e.g. Mamba) the
+receipt proves were taken. The eventual full release must pass
+`skip_swa=True`. At most once per (node, boundary uuid) pair.
 
 ---
 
@@ -242,7 +259,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 | **Purpose** | During chunked prefill, insert partial results so the next chunk can match the prefix |
 | **Inputs** | `req` — the in-progress request |
 | **Output** | `None` |
-| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
+| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
 | **Complexity** | **O(K + D·C)** — two tree traversals: insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
@@ -252,7 +269,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 4. Writes new prefix indices into `req_to_token_pool`
 5. `dec_lock_ref()` on old `req.last_node`
 6. `inc_lock_ref()` on new matched node
-7. Updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`
+7. Updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`
 8. `cleanup_after_caching_req()` per component
 
 ---

@@ -9,6 +9,7 @@ and the published instance stays as the launcher left it.
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     DetachHiCacheStorageReqInput,
@@ -18,7 +19,7 @@ from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheAttach(CustomTestCase):
@@ -69,7 +70,12 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         self.assertIsNone(
             get_context().resolved_server_args_dict()["hicache_storage_backend"]
         )
-        self.assertEqual(self.server_args.hicache_storage_backend, "file")
+        # The record is not written any more: the attach is a declaration on
+        # it and the detach is a bag override (asserted above), so the two are
+        # meant to differ here.
+        self.assertEqual(
+            resolution_result(self.server_args, "hicache_storage_backend"), "file"
+        )
 
 
 if __name__ == "__main__":

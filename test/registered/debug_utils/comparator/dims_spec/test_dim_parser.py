@@ -12,8 +12,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, stage="weekly", runner_config="cpu")
 
 
 class TestParseDim:

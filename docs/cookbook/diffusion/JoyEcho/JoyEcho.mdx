@@ -15,7 +15,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 Choose JoyEcho over a standard LTX pipeline when shots must share audiovisual memory. Its distilled 832×480 path prioritizes long-form continuity and throughput rather than the higher-resolution two-stage quality modes offered by LTX-2.3.
 
-Use `jdopensource/JoyAI-Echo` as `--model-path`; SGLang materializes the monolithic release through the built-in [JoyAI-Echo overlay](https://huggingface.co/Niehen6174/JoyAI-Echo-overlay).
+SGLang materializes the Echo 1.0 monolithic release through the built-in [JoyAI-Echo overlay](https://huggingface.co/Niehen6174/JoyAI-Echo-overlay). Prepare the pinned checkpoint below before running the examples.
 
 | Aspect | Standard LTX-2.3 | JoyEcho |
 | --- | --- | --- |
@@ -41,11 +41,33 @@ For platform-specific setup, see the [SGLang Diffusion installation guide](/docs
 
 ## 3. Model Deployment
 
+### 3.1 Prepare the Echo 1.0 checkpoint
+
+The native overlay requires `JoyAI-Echo-release.safetensors`. The upstream repository's Echo 1.5 revision does not contain that file. Download the [Echo 1.0 revision](https://huggingface.co/jdopensource/JoyAI-Echo/tree/4187f9a53c6eff3a76c51e79bd27f70d10f7591b) into the Hugging Face cache:
+
+```bash
+JOY_ECHO_MODEL_PATH=$(python - <<'PY'
+from huggingface_hub import snapshot_download
+
+print(snapshot_download(
+    repo_id="jdopensource/JoyAI-Echo",
+    revision="4187f9a53c6eff3a76c51e79bd27f70d10f7591b",
+    allow_patterns=["JoyAI-Echo-release.safetensors", "*.json", "*.md", "LICENSE"],
+))
+PY
+)
+```
+
+Use the returned cache path as `--model-path` and keep `--model-id jdopensource/JoyAI-Echo` when using local weights. The model ID lets BCG select JoyEcho's support policy. Initial startup also downloads and materializes the overlay and its text encoder dependencies.
+
+### 3.2 Serve the model
+
 JoyEcho uses the default `JoyEchoPipeline` registered for `jdopensource/JoyAI-Echo`. A single high-VRAM GPU (for example H100 or H200) is enough for the common 832x480 / 121-frame / 8-step setting.
 
 ```bash
 sglang serve \
-  --model-path jdopensource/JoyAI-Echo
+  --model-path "$JOY_ECHO_MODEL_PATH" \
+  --model-id jdopensource/JoyAI-Echo
 ```
 
 Optional environment variable for long runs:
@@ -58,7 +80,8 @@ For multi-GPU serving, tensor parallelism (TP) and **Ulysses sequence parallelis
 
 ```bash
 sglang serve \
-  --model-path jdopensource/JoyAI-Echo \
+  --model-path "$JOY_ECHO_MODEL_PATH" \
+  --model-id jdopensource/JoyAI-Echo \
   --num-gpus 2 \
   --ulysses-degree 2
 ```
@@ -84,7 +107,8 @@ JoyEcho SP currently targets **Ulysses-only** parallelism (`ulysses_degree=2`, `
 
 ```bash
 sglang generate \
-  --model-path jdopensource/JoyAI-Echo \
+  --model-path "$JOY_ECHO_MODEL_PATH" \
+  --model-id jdopensource/JoyAI-Echo \
   --prompt "A curious raccoon walks through a sunlit forest path" \
   --height 480 --width 832 --num-frames 121 --fps 25 \
   --num-inference-steps 8 --seed 42 \
@@ -96,7 +120,6 @@ Disable the memory bank for standalone clips with a config file:
 ```bash
 cat > /tmp/joy_echo_single.json <<'EOF'
 {
-  "model_path": "jdopensource/JoyAI-Echo",
   "prompt": "A curious raccoon walks through a sunlit forest path",
   "enable_memory_bank": false,
   "seed": 42,
@@ -108,7 +131,9 @@ cat > /tmp/joy_echo_single.json <<'EOF'
 }
 EOF
 
-sglang generate --config /tmp/joy_echo_single.json --save-output
+sglang generate --config /tmp/joy_echo_single.json \
+  --model-path "$JOY_ECHO_MODEL_PATH" --model-id jdopensource/JoyAI-Echo \
+  --save-output
 ```
 
 ### 4.3 Multi-shot generation
@@ -127,7 +152,6 @@ Pass multiple prompts as a list in a config file:
 ```bash
 cat > /tmp/joy_echo_4shot.json <<'EOF'
 {
-  "model_path": "jdopensource/JoyAI-Echo",
   "prompt": [
     "Shot 0: A raccoon wakes up in a cozy attic.",
     "Shot 1: The raccoon climbs down and opens the back door.",
@@ -145,14 +169,17 @@ cat > /tmp/joy_echo_4shot.json <<'EOF'
 }
 EOF
 
-sglang generate --config /tmp/joy_echo_4shot.json --save-output
+sglang generate --config /tmp/joy_echo_4shot.json \
+  --model-path "$JOY_ECHO_MODEL_PATH" --model-id jdopensource/JoyAI-Echo \
+  --save-output
 ```
 
 You can also pass prompts from a text file (one prompt per line) with `--prompt-path`:
 
 ```bash
 sglang generate \
-  --model-path jdopensource/JoyAI-Echo \
+  --model-path "$JOY_ECHO_MODEL_PATH" \
+  --model-id jdopensource/JoyAI-Echo \
   --prompt-path /tmp/joy_echo_shots.txt \
   --seed 42 \
   --height 480 --width 832 --num-frames 121 --fps 25 \
@@ -168,6 +195,40 @@ sglang generate \
 | `reset_memory_bank` | `true` | Clear the bank and shot counter at the start of a new session (`request_id` change or first shot). |
 
 Set `enable_memory_bank=false` when you want independent shots without cross-shot continuity.
+
+### 4.5 Measured two-H200 single-shot configuration
+
+For short independent clips, keep the text and audio/video components on GPU with `--component-residency=all=resident`. Full-stage profiles showed that this removes repeated host-to-device weight copies between component uses.
+
+The following configuration was measured on two H200s with Ulysses degree 2, TP1, PyTorch 2.11.0+cu130, 640x384, 33 frames, 8 steps and seed 42. It disables compilation and the memory bank:
+
+```bash
+cat > joy_echo_h200.json <<'EOF'
+{"enable_memory_bank": false}
+EOF
+
+CUDA_VISIBLE_DEVICES=0,1 sglang generate \
+  --model-path "$JOY_ECHO_MODEL_PATH" --model-id jdopensource/JoyAI-Echo \
+  --config joy_echo_h200.json --prompt "A curious raccoon" \
+  --width 640 --height 384 --num-frames 33 --num-inference-steps 8 --seed 42 \
+  --num-gpus 2 --ulysses-degree 2 \
+  --performance-mode manual --enable-torch-compile=false --quality lossless \
+  --component-residency=all=resident --warmup-mode request \
+  --save-output --perf-dump-path joy_echo_h200.json.perf
+```
+
+For BCG, add `--enable-breakable-cuda-graph --warmup-resolutions 640x384 --warmup-num-frames 33`. Check for successful `[Diffusion BCG] captured` logs and absence of request signature misses. Keep the same model ID, resolution, frame count and quality as warmup.
+
+Two fresh-process saved requests per configuration, after request warmup:
+
+| Lossless mode | Auto residency E2E | All resident E2E | Reduction | Peak reserved per rank, auto → resident |
+| --- | ---: | ---: | ---: | ---: |
+| Eager | 2.563 s | 2.366 s | 7.65% | 46.43 → 69.32 GiB |
+| BCG | 1.229 s | 1.058 s | 13.88% | 48.77–48.88 → 69.32 GiB |
+
+Loading, warmup and profiling are excluded from these timings. The paired eager profiles remove 71 pinned host-to-device copies (13.07 GB, 278.86 ms on the profiled rank), with the same 77,045 kernel launches. All eight lossless outputs have pixel-identical video frames; audio differences are comparable to baseline repeat variability. These results cover this compact single-shot workload, rather than the default 121-frame or multi-shot memory-bank workload.
+
+Use `quality=lossless` for this recipe. High-mode output did not pass the separate quality comparison, and high + BCG is rejected by the runtime. If a larger request exceeds available memory, return to auto residency or keep only selected components resident.
 
 ## 5. Practical Tips
 

@@ -259,7 +259,7 @@ class C128SidecarComponent(TreeComponent):
         cache_len = logical_len // group_tokens * group_tokens
         num_pages = cache_len // group_tokens
         insert_params.c128_value = self.cache.req_to_token_pool.req_to_c128_sidecar[
-            int(req.req_pool_idx), :num_pages
+            int(req.kv.req_pool_idx), :num_pages
         ].clone()
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 

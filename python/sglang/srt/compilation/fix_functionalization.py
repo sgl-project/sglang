@@ -119,9 +119,9 @@ class FixFunctionalizationPass(SGLangInductorPass):
         :param args: If we cannot use kwargs, specify args directly.
         If an arg is a string, `node.kwargs[arg]` is used.
         """  # noqa: E501
-        assert is_func(
-            node, auto_functionalized
-        ), f"node must be auto-functionalized, is {node} instead"
+        assert is_func(node, auto_functionalized), (
+            f"node must be auto-functionalized, is {node} instead"
+        )
 
         # Create a new call to the original function
         with graph.inserting_before(node):
