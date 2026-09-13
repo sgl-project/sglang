@@ -770,6 +770,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens=buffers.seq_lens[:bs],
             extend_seq_lens=buffers.extend_seq_lens[:bs],
             out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
+            mamba_track_indices=(
+                None
+                if buffers.mamba_track_indices is None
+                else buffers.mamba_track_indices[:bs]
+            ),
         )
         for backend in backends:
             backend.init_forward_metadata_out_graph(batch)

@@ -277,8 +277,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._refresh_cache_indices()
 
     def _prepare_track_indices(self, forward_batch: ForwardBatch):
-        # Replay metadata views may omit optional checkpoint tracking.
-        indices = getattr(forward_batch, "mamba_track_indices", None)
+        # Every metadata view must explicitly provide virtual IDs or None.
+        indices = forward_batch.mamba_track_indices
         if indices is None or self._slot_gather_recordable:
             self.sconv_metadata.track_cache_indices = indices
             return
