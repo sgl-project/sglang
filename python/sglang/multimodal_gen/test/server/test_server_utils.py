@@ -772,7 +772,7 @@ class PerformanceValidator:
             self._timing_tol(self.tolerances.e2e),
         )
 
-    def validate_load_inclusive_e2e(self, summary: PerformanceSummary) -> None:
+    def validate_load(self, summary: PerformanceSummary) -> None:
         load_ms = summary.load_time_ms
         expected_load_ms = self.scenario.expected_load_ms
         assert load_ms is not None and math.isfinite(load_ms) and load_ms > 0, (
@@ -784,9 +784,9 @@ class PerformanceValidator:
             and expected_load_ms > 0
         ), "Load baseline missing or invalid"
         self._assert_le(
-            "Load-inclusive E2E Latency (excluding warmup)",
-            load_ms + summary.e2e_ms,
-            expected_load_ms + self.scenario.expected_e2e_ms,
+            "Load Latency (excluding warmup)",
+            load_ms,
+            expected_load_ms,
             self._timing_tol(self.tolerances.e2e),
         )
 

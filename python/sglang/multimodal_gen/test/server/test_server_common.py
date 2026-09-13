@@ -443,7 +443,7 @@ class DiffusionServerBase:
 
         # disabling stage checks must not disable the request's e2e guard
         validator.validate_e2e(summary)
-        validator.validate_load_inclusive_e2e(summary)
+        validator.validate_load(summary)
 
         if case.run_perf_check:
             if current_platform.is_cuda():
@@ -544,7 +544,7 @@ class DiffusionServerBase:
                 step_fractions=BASELINE_CONFIG.step_fractions,
             )
         validator.validate_e2e(summary)
-        validator.validate_load_inclusive_e2e(summary)
+        validator.validate_load(summary)
         validate_realtime_perf_stats(
             case.id,
             chunk_stats,

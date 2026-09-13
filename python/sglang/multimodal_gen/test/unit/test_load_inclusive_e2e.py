@@ -38,13 +38,13 @@ def validator(monkeypatch):
 def test_slow_loading_fails_even_when_inference_passes(validator):
     summary = PerformanceSummary(1000, 0, 0, {}, [], {}, {}, load_time_ms=6000)
     validator.validate_e2e(summary)
-    with pytest.raises(AssertionError, match="Load-inclusive E2E"):
-        validator.validate_load_inclusive_e2e(summary)
+    with pytest.raises(AssertionError, match="Load Latency"):
+        validator.validate_load(summary)
 
 
 def test_fast_loading_cannot_hide_inference_regression(validator):
     summary = PerformanceSummary(2000, 0, 0, {}, [], {}, {}, load_time_ms=1000)
-    validator.validate_load_inclusive_e2e(summary)
+    validator.validate_load(summary)
     with pytest.raises(AssertionError, match="E2E Latency"):
         validator.validate_e2e(summary)
 
@@ -98,7 +98,7 @@ def test_baseline_script_preserves_required_load_measurement(monkeypatch, load_t
 def test_missing_or_invalid_load_duration_fails(validator, duration):
     summary = PerformanceSummary(1000, 0, 0, {}, [], {}, {}, load_time_ms=duration)
     with pytest.raises(AssertionError, match="Load duration missing or invalid"):
-        validator.validate_load_inclusive_e2e(summary)
+        validator.validate_load(summary)
 
 
 @pytest.mark.parametrize("duration", [None, 0, -1, float("nan"), float("inf")])
@@ -106,16 +106,23 @@ def test_missing_or_invalid_load_baseline_fails(validator, duration):
     validator.scenario.expected_load_ms = duration
     summary = PerformanceSummary(1000, 0, 0, {}, [], {}, {}, load_time_ms=4000)
     with pytest.raises(AssertionError, match="Load baseline missing or invalid"):
-        validator.validate_load_inclusive_e2e(summary)
+        validator.validate_load(summary)
 
 
-def test_repeated_requests_each_include_one_load(validator):
+def test_fast_inference_cannot_hide_loading_regression(validator):
+    summary = PerformanceSummary(1, 0, 0, {}, [], {}, {}, load_time_ms=5500)
+    validator.validate_e2e(summary)
+    with pytest.raises(AssertionError, match="Load Latency"):
+        validator.validate_load(summary)
+
+
+def test_repeated_requests_use_same_load_measurement(validator):
     for inference_ms in (1000, 900, 950):
         summary = PerformanceSummary(
             inference_ms, 0, 0, {}, [], {}, {}, load_time_ms=4000
         )
         validator.validate_e2e(summary)
-        validator.validate_load_inclusive_e2e(summary)
+        validator.validate_load(summary)
 
 
 @pytest.mark.parametrize("workers", [1, 2])
@@ -175,4 +182,4 @@ def test_server_load_clock_excludes_warmup(
         1000, 0, 0, {}, [], {}, {}, load_time_ms=context.load_time_ms
     )
     validator.validate_e2e(summary)
-    validator.validate_load_inclusive_e2e(summary)
+    validator.validate_load(summary)
