@@ -114,6 +114,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             patch.object(self.state, "mem_pool", None),
             patch.object(pool.torch.cuda, "MemPool"),
             patch.object(pool.torch.cuda, "use_mem_pool"),
+            patch.object(pool.torch.cuda, "current_stream"),
             patch.object(pool.torch.cuda, "memory_snapshot", return_value=snapshot),
             pool.borrow_graph_pool(user="test"),
         ):
@@ -127,15 +128,18 @@ class TestGraphPoolBorrow(CustomTestCase):
     def test_high_cursor_keeps_reusable_cached_segments(self):
         stub = MagicMock(cursor_bytes=600, freed_bytes=0)
         mem_pool = MagicMock()
+        stream = object()
 
         with (
             patch.object(pool, "graph_pool_borrow_enabled", return_value=True),
             patch.object(self.state, "stub", stub),
             patch.object(self.state, "mem_pool", mem_pool),
+            patch.object(self.state, "stream", stream),
             patch.object(self.state, "extents_total", 1000),
             patch.object(pool, "_teardown_borrow_pool") as teardown,
             patch.object(pool.torch, "empty"),
             patch.object(pool.torch.cuda, "use_mem_pool"),
+            patch.object(pool.torch.cuda, "current_stream", return_value=stream),
         ):
             with pool.borrow_graph_pool(user="test"):
                 pass
@@ -282,9 +286,35 @@ class TestGraphPoolBorrow(CustomTestCase):
                 self.assertEqual(c.data_ptr(), recycled_address)
                 del b, c
 
+            self.assertEqual(self.state.stream, torch.cuda.current_stream())
+            with (
+                torch.cuda.stream(stream),
+                self.assertRaisesRegex(
+                    RuntimeError, "stream that created the borrow pool"
+                ),
+            ):
+                with pool.borrow_graph_pool(user="wrong stream"):
+                    self.fail("cross-stream borrowing must fail before allocating")
+            self.assertIsNone(self.state.active_user)
+            with pool.borrow_graph_pool(user="same stream"):
+                reused = torch.empty(40 << 20, dtype=torch.uint8, device="cuda")
+                self.assertEqual(reused.data_ptr(), recycled_address)
+                del reused
+
             # Captures retire the persistent borrow pool. Its storage aliases
             # existing graph-pool runs, so the reserved footprint is unchanged.
             pool._teardown_borrow_pool()
+            self.assertIsNone(self.state.stream)
+            with torch.cuda.stream(stream), pool.borrow_graph_pool(user="new pool"):
+                self.assertEqual(self.state.stream, stream)
+                reused = torch.empty(40 << 20, dtype=torch.uint8, device="cuda")
+                self.assertTrue(on_a_run(reused))
+                del reused
+            pool._teardown_borrow_pool()
+            with pool.graph_pool_replay_scope():
+                graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(y, torch.ones_like(y)))
 
         self.assertEqual(torch.cuda.memory_reserved(device_id), reserved_before)
         del graph, y
