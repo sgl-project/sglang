@@ -96,11 +96,14 @@ def init_dcp_pack_buffers(
     max_tokens = max_prefill_buffer_tokens()
     if max_tokens <= 0:
         max_tokens = get_schedule().max_prefill_tokens
+    kv_item_lens = kv_args.kv_item_lens
+    if kv_args.num_draft_entries > 0:
+        kv_item_lens = kv_item_lens[: len(kv_item_lens) - kv_args.num_draft_entries]
     # Note(kpham-sgl): size = dcp_size x ceil(max_tokens / dcp_size)
     # x sum(per-layer token bytes). At 32,768 tokens and 61 MLA layers
     # x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
     size_bytes = dcp_pack_buffer_bytes(
-        kv_args.kv_item_lens, kv_args.page_size, max_tokens, dcp_size
+        kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"

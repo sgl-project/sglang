@@ -129,6 +129,39 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
                         self._server_args(**overrides), "transformer_2"
                     )
 
+    def test_unreadable_checkpoint_is_not_a_missing_implementation(self):
+        # the native fallback answers "no customized implementation for this
+        # architecture"; a checkpoint that cannot be read is a different failure,
+        # and routing it into the fallback reports a missing implementation for a
+        # model that has one
+        loader = TransformerLoader()
+        missing_shard = FileNotFoundError(
+            2, "No such file or directory", "/cache/transformer/shard-00002.safetensors"
+        )
+        customized_load = mock.patch.object(
+            loader, "_load_customized_with_context", side_effect=missing_shard
+        )
+        native_load = mock.patch.object(
+            loader, "_load_native_with_context", return_value=object()
+        )
+        available_memory = mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "component_loader.current_platform.get_available_gpu_memory",
+            return_value=0.0,
+        )
+
+        with customized_load, native_load as native, available_memory:
+            with self.assertRaises(FileNotFoundError) as caught:
+                loader.load(
+                    "/model/transformer_2",
+                    self._server_args(),
+                    "transformer_2",
+                    "diffusers",
+                )
+
+        self.assertIn("shard-00002.safetensors", str(caught.exception))
+        native.assert_not_called()
+
     def test_replicated_execution_keeps_native_fallback_available(self):
         self.assertIsNone(
             TransformerLoader().validate_native_fallback(

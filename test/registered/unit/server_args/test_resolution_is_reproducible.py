@@ -33,9 +33,14 @@ import tempfile
 import unittest
 import unittest.mock
 
+import msgspec
+import msgspec.structs
 import torch
 
-from sglang.srt.arg_groups.overrides import model_config_of, resolution_result
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolution_result,
+)
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -267,7 +272,7 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         the one of those that a shared mutable could corrupt.
         """
         out = {}
-        for field in dataclasses.fields(server_args):
+        for field in msgspec.structs.fields(server_args):
             if field.name in _NOT_COMPARABLE:
                 continue
             # The resolution result, not the field: a declaration-only resolver
@@ -480,15 +485,15 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
 
 
-class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
+class TestALateDeclarationKeepsTheResolution(_RestoresProcessState, CustomTestCase):
     """A resolved record copied with `dataclasses.replace` loses what makes it
     resolved, and the next publish resolves it a second time -- over values it
-    already decided. The Ray paths copy a resolved record to set
-    `dist_init_addr`, which is how they reach this.
+    already decided. The Ray paths declare `dist_init_addr` on a record that
+    has already resolved, which is how they reach this.
     """
 
     def _resolved(self):
-        config_dir = tempfile.mkdtemp(prefix="replace_resolved_")
+        config_dir = tempfile.mkdtemp(prefix="late_declaration_")
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as handle:
             json.dump(_MINI_CONFIG, handle)
@@ -509,12 +514,12 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
 
         `dataclasses.replace` copies the fields, so a bare copy re-runs
         resolution over the *same input* the parent got -- the DP-attention
-        halving and the conservativeness scaling apply once. `replace_resolved`
-        buys something else: it carries the parent's declarations and its
-        `model_config`, so the copy answers without resolving at all.
+        halving and the conservativeness scaling apply once. This is why the Ray
+        paths declare on the record they were handed instead of copying it: the
+        record arrives resolved, and a copy would throw that away.
         """
         parent = self._resolved()
-        bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
+        bare = msgspec.structs.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
             getattr(bare, "_resolution_finished", False),
             "a bare replace carried the flag; then this test proves nothing",
@@ -525,7 +530,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
                 resolution_result(parent, field.name),
                 resolution_result(bare, field.name),
             )
-            for field in dataclasses.fields(parent)
+            for field in msgspec.structs.fields(parent)
             if field.name not in ("dist_init_addr", "random_seed")
             and repr(resolution_result(parent, field.name))
             != repr(resolution_result(bare, field.name))
@@ -537,56 +542,34 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             "reading its own output again",
         )
 
-    def test_replace_resolved_keeps_the_parents_resolution(self):
-        parent = self._resolved()
-        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
-        self.assertTrue(getattr(copy_, "_resolution_finished", False))
-        drifted = {
-            field.name: (getattr(parent, field.name), getattr(copy_, field.name))
-            for field in dataclasses.fields(parent)
-            if field.name != "dist_init_addr"
-            and getattr(parent, field.name) != getattr(copy_, field.name)
-        }
-        self.assertEqual(
-            drifted,
-            {},
-            f"the copy differs from its parent beyond the change: {drifted}",
-        )
-        self.assertEqual(copy_.dist_init_addr, "1.2.3.4:5000")
+    def test_a_late_change_leaves_the_rest_of_the_resolution_alone(self):
+        """What the Ray paths do: declare one field on a record that has already
+        resolved, then hand it to the process that will publish it.
 
-    def test_the_copy_carries_what_resolution_left_on_the_record(self):
-        """Not just the stash and the flag.
-
-        `model_config_of()` memoizes on the record, and that cache is filled
-        during resolution. A copy that is marked resolved but arrives without it
-        cannot fill it -- the read-only guard refuses the cache write -- so the
-        first `model_config_of()` raises. That is what killed the Ray
-        schedulers, and it is why the carry is enumerated from the instance
-        rather than from a list of names.
+        The record stays resolved, so nothing re-derives; the field stays the
+        operator's input, because resolution does not write fields; and the
+        decision is what `resolution_result` answers.
         """
         parent = self._resolved()
-        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
-        fields = {field.name for field in dataclasses.fields(parent)}
-        missing = sorted(
-            name
-            for name in vars(parent)
-            if name not in fields and name not in vars(copy_)
+        declare_resolution(parent, "ray.test", dist_init_addr="1.2.3.4:5000")
+
+        self.assertTrue(getattr(parent, "_resolution_finished", False))
+        self.assertIsNone(
+            parent.dist_init_addr,
+            "the declaration wrote the field; the record is the operator's input",
         )
-        self.assertEqual(
-            missing,
-            [],
-            f"the copy did not carry what resolution left on the record: {missing}",
-        )
-        self.assertIsNotNone(model_config_of(copy_))
-        # Containers are copied, so the copy's declaration stays with it.
-        self.assertEqual(
-            len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)
-        )
+        self.assertEqual(resolution_result(parent, "dist_init_addr"), "1.2.3.4:5000")
 
     def test_the_change_reaches_the_bags(self):
         """The projection reads the raw snapshot plus the declarations, so a
-        change the copy only wrote to the field would publish the parent's raw
-        value."""
+        change written only to the field would publish the raw value instead.
+
+        This is the Ray hop: the actor receives the record by pickle, declares
+        its own `dist_init_addr`, and publishes. Nothing else may move --
+        publishing must not re-run resolution.
+        """
+        import pickle
+
         from sglang.srt.runtime_context import (
             get_parallel,
             get_schedule,
@@ -595,16 +578,17 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         )
 
         parent = self._resolved()
-        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        arrived = pickle.loads(pickle.dumps(parent))
+        declare_resolution(arrived, "ray.test", dist_init_addr="1.2.3.4:5000")
         self.addCleanup(reset_context)
         reset_context()
-        publish(copy_, role="scheduler")
+        publish(arrived, role="scheduler")
         self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
         self.assertEqual(
             get_schedule().chunked_prefill_size,
             resolution_result(parent, "chunked_prefill_size"),
-            "publishing the copy re-ran resolution; the bag disagrees with what "
-            "the parent's resolution decided",
+            "publishing re-ran resolution; the bag disagrees with what the "
+            "parent's resolution decided",
         )
 
 
