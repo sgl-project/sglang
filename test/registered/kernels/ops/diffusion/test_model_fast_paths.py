@@ -1074,6 +1074,76 @@ def test_wan_vae_rejects_empty_input() -> None:
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
 
 
+def _wan_tiny_decoder(seed=0):
+    torch.manual_seed(seed)
+    dec = wanvae.WanDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[True]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    return dec
+
+
+def _wan_decode_chunks(dec, chunks):
+    # Mirrors AutoencoderKLWan.decode: one latent frame per chunk, feature
+    # cache threaded through the contextvars the decoder reads.
+    n_conv = sum(isinstance(m, wanvae.WanCausalConv3d) for m in dec.modules())
+    cache = [None] * n_conv
+    outs = []
+    for i, z in enumerate(chunks):
+        tok_c = wanvae.feat_cache.set(cache)
+        tok_i = wanvae.feat_idx.set(0)
+        tok_f = wanvae.first_chunk.set(i == 0)
+        try:
+            outs.append(dec(z))
+        finally:
+            wanvae.feat_cache.reset(tok_c)
+            wanvae.feat_idx.reset(tok_i)
+            wanvae.first_chunk.reset(tok_f)
+    return torch.cat(outs, dim=2)
+
+
+@torch.no_grad()
+def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
+    # The lossless decoder (fused cat+pad, conv bias epilogue, bias+residual
+    # fold, bias deferred into norm2) must equal the pure aten module chain.
+    dec = _wan_tiny_decoder()
+    chunks = [_wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    fast = _wan_decode_chunks(dec, chunks)
+    saved = (
+        wanvae.cat_pad_channels_last_3d,
+        wanvae.conv_bias_epilogue,
+        wanvae.can_use_conv_bias_epilogue,
+    )
+    wanvae.cat_pad_channels_last_3d = None
+    wanvae.conv_bias_epilogue = None
+    wanvae.can_use_conv_bias_epilogue = None
+    try:
+        eager = _wan_decode_chunks(dec, chunks)
+    finally:
+        (
+            wanvae.cat_pad_channels_last_3d,
+            wanvae.conv_bias_epilogue,
+            wanvae.can_use_conv_bias_epilogue,
+        ) = saved
+    assert torch.equal(fast, eager)
+    # Deferred conv1 bias through the gated wrapper, gate off: still exact.
+    gate = VaeFastPathGate()
+    wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=wanvae.WanResidualBlock,
+        rms_norm_cls=WanRMS_norm,
+        label="test",
+    )
+    assert torch.equal(_wan_decode_chunks(dec, chunks), eager)
+    gate.enabled = True
+    out = _wan_decode_chunks(dec, chunks)
+    rel = ((out.float() - eager.float()).norm() / eager.float().norm()).item()
+    assert rel < 2e-2, rel
+
+
 @torch.no_grad()
 def test_wan_vae_time_interleave_matches_stack_and_keeps_layout() -> None:
     # time_conv output [B, 2C, T, H, W] -> interleaved [B, C, 2T, H, W].
