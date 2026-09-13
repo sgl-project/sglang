@@ -12,7 +12,7 @@
 # Rejected: PTPC-FP8 dense (SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED, no gain), --max-running-requests 64 (neutral; keep 48).
 source /scratch/run/best_config.sh
 export STEPS=2 DRAFT=3
-export MEMFRAC=0.9 CHUNK=16384
+export MEMFRAC=0.9 CHUNK=8192
 export ENVS2="$ENVS2 SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token"
 # Launch example (coordinator GPUs 0-3):
 #   source /scratch/run/best_lossy_config.sh; TAG=v9_lossy GPUS=0,1,2,3 PORT=30000 SPEC_ATTN=decode \
