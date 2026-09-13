@@ -3,7 +3,11 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
+from sglang.kernels.ops.attention.clamp_position import (
+    ClampPositionOp,
+    clamp_position,
+    clamp_position_cuda,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -12,6 +16,10 @@ register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 def _reference_clamp_position(seq_lens):
     return torch.clamp(seq_lens - 1, min=0).to(seq_lens.dtype)
+
+
+def _reference_public_clamp_position(seq_lens):
+    return torch.clamp(seq_lens - 1, min=0).to(torch.int64)
 
 
 @pytest.mark.parametrize("size", [1, 2, 127, 128, 255, 256, 1024, 4097])
@@ -40,6 +48,24 @@ class TestClampPosition:
         expected = _reference_clamp_position(seq_lens)
         result = clamp_position_cuda(seq_lens)
         assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_native(dtype: torch.dtype) -> None:
+    seq_lens = torch.tensor([0, 1, 5, 128], dtype=dtype)
+    expected = _reference_public_clamp_position(seq_lens)
+    result = ClampPositionOp().forward_native(seq_lens)
+    assert result.dtype == torch.int64
+    assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_public_dispatch(dtype: torch.dtype) -> None:
+    seq_lens = torch.tensor([0, 1, 5, 128], dtype=dtype, device="cuda")
+    expected = _reference_public_clamp_position(seq_lens)
+    result = clamp_position(seq_lens)
+    assert result.dtype == torch.int64
+    assert torch.equal(result, expected)
 
 
 if __name__ == "__main__":
