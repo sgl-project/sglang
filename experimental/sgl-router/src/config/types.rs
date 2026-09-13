@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::num::NonZeroU32;
 
 /// In-memory router configuration, built from CLI flags by
@@ -71,8 +72,7 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `fused_score` / `score_policy` /
-/// `session_aware` / `cache_aware` / `cache_aware_zmq` /
-/// `sticky`.
+/// `session_aware` / `cache_aware` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -94,14 +94,9 @@ pub enum PolicyKind {
     /// Selects a worker from session affinity.
     #[value(name = "session_aware")]
     SessionAware,
-    /// Selects cache-affine prefill candidates from external indexer data.
+    /// Selects cache-affine prefill candidates from the configured prefix provider.
     #[value(name = "cache_aware")]
     CacheAware,
-    /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
-    /// Requires the model to have a tokenizer loaded; cache_aware tuning
-    /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq")]
-    CacheAwareZmq,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
     /// stateful sessions land on the same backend. Tuning — header name,
@@ -109,6 +104,71 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+/// Policy used to select decode workers for PD requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DecodePolicyKind {
+    #[default]
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "legacy_host_affinity")]
+    LegacyHostAffinity,
+}
+
+/// Role served by a static bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketStage {
+    Prefill,
+    Decode,
+}
+
+/// SLO matching rules for a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloBucketPolicy {
+    #[default]
+    Disabled,
+    BestEffort,
+    SloFirst,
+}
+
+/// Static bucket configuration loaded at Router startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub buckets: Vec<BucketSpec>,
+    #[serde(default)]
+    pub ttft_slo_policy: SloBucketPolicy,
+    #[serde(default)]
+    pub tps_slo_policy: SloBucketPolicy,
+}
+
+/// Runtime capacity assigned to one role. Lower ranks have higher priority.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    pub id: String,
+    pub stage: BucketStage,
+    pub rank: u32,
+    pub worker_ids: Vec<String>,
+    #[serde(default)]
+    pub min_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub min_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub ttft_p95_at_capacity_ms: Option<u64>,
+    #[serde(default)]
+    pub tps_p05_at_capacity: Option<f64>,
+    #[serde(default)]
+    pub max_pending_prefill_tokens: Option<u64>,
 }
 
 impl std::fmt::Display for PolicyKind {
@@ -231,8 +291,12 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
+    /// Selection policy for the decode pool.
+    pub decode_policy: DecodePolicyKind,
+    /// Optional static bucket configuration. `None` uses the global domain.
+    pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
+    /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
@@ -306,46 +370,23 @@ fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
     Ok(w)
 }
 
-/// Per-model cache-aware tuning.
-#[derive(Debug, Clone)]
+/// Cache-Aware prefix-match source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CachePrefixProvider {
+    #[default]
+    #[value(name = "radix_tree")]
+    RadixTree,
+    #[value(name = "indexer")]
+    Indexer,
+}
+
+/// Per-model Cache-Aware configuration.
+#[derive(Debug, Clone, Default)]
 pub struct CacheAwareConfig {
-    /// Lower bound on `matched_blocks / total_blocks` for the tree match
-    /// to win the selection. Below this, the policy falls back to
-    /// min-load. Default 0.5 — a half-cached prompt is still a strong
-    /// signal but not so weak that random hash collisions could trigger
-    /// affinity to an arbitrary worker.
-    pub cache_threshold: f32,
-    /// Absolute load spread (`max - min`) above which the cache check is
-    /// skipped in favour of min-load. Default 32 — picked to dominate
-    /// over typical batch-of-8 effect.
-    pub balance_abs_threshold: usize,
-    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
-    /// that the absolute check is gated on. Default 1.1 — 10 % relative
-    /// difference triggers re-balancing.
-    pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration.
+    /// Prefix-match source for native Cache-Aware.
+    pub prefix_provider: CachePrefixProvider,
+    /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
-}
-
-impl Default for CacheAwareConfig {
-    fn default() -> Self {
-        Self {
-            cache_threshold: default_cache_threshold(),
-            balance_abs_threshold: default_balance_abs(),
-            balance_rel_threshold: default_balance_rel(),
-            kv_indexer_endpoint: None,
-        }
-    }
-}
-
-fn default_cache_threshold() -> f32 {
-    0.5
-}
-fn default_balance_abs() -> usize {
-    32
-}
-fn default_balance_rel() -> f32 {
-    1.1
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
@@ -395,6 +436,10 @@ pub struct AffinityConfig {
     pub stable_pair: bool,
     pub mode: AffinityMode,
     pub session_affinity_mode: SessionAffinityMode,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
     pub cache_affinity_min_matched_tokens: Option<u64>,
     pub cache_affinity_min_match_ratio: Option<f64>,
     pub cache_candidate_min_workers: usize,
@@ -412,6 +457,10 @@ impl Default for AffinityConfig {
             stable_pair: false,
             mode: AffinityMode::Soft,
             session_affinity_mode: SessionAffinityMode::Bucket,
+            pressure_guard: true,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.5,
             // Indexer prefix scans are truncated, so use an absolute token floor.
             cache_affinity_min_matched_tokens: Some(1_024),
             cache_affinity_min_match_ratio: None,
@@ -434,8 +483,7 @@ pub struct StickyConfig {
     /// Policy used to pick a worker when a request has no routing key, and
     /// to pick the initial worker when a new key is first seen. One of
     /// `round_robin` / `random` / `power_of_two` / `load_based` — the
-    /// dependency-free policies the factory can build standalone (no
-    /// `HashTree` / tokenizer / ZMQ feed).
+    /// dependency-free policies the factory can build standalone.
     pub fallback_policy: StickyFallbackKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.
@@ -553,9 +601,13 @@ pub enum K8sDiscoveryMode {
 /// invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set")]
+    #[error(
+        "discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set"
+    )]
     NoSelector,
-    #[error("discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both")]
+    #[error(
+        "discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both"
+    )]
     MixedModes,
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,

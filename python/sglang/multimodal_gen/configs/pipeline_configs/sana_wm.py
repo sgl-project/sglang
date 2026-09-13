@@ -56,6 +56,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     optional 6-DoF camera trajectory, optional Stage-2 LTX-2 refiner)."""
 
     task_type: ModelTaskType = ModelTaskType.TI2V
+    # The current two-stage path is not numerically invariant when its primary
+    # transformer and connectors are promoted after warmup.
+    supports_auto_residency: bool = False
 
     # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
     # resize + VAE-encode itself, so bypass the framework's generic TI2V
@@ -193,15 +196,16 @@ class SanaWMPipelineConfig(PipelineConfig):
 
         return (batch_size, z_dim, T_latent, H_sp, W_sp)
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         """Ensure (num_frames - 1) is divisible by VAE temporal stride."""
         t_stride = self.vae_stride[0]
         if (num_frames - 1) % t_stride != 0:
             adjusted = ((num_frames - 1) // t_stride) * t_stride + 1
-            logger.warning(
-                f"num_frames - 1 must be divisible by temporal stride {t_stride}. "
-                f"Rounding {num_frames} → {adjusted}."
-            )
+            if log_adjustment:
+                logger.warning(
+                    f"num_frames - 1 must be divisible by temporal stride {t_stride}. "
+                    f"Rounding {num_frames} → {adjusted}."
+                )
             return adjusted
         return num_frames
 

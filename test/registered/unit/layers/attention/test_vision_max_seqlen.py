@@ -9,7 +9,7 @@ from sglang.srt.models import kimi_k25
 from sglang.srt.models.kimi_k25 import MoonViT3dEncoder, MoonViTEncoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):

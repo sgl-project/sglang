@@ -8,6 +8,7 @@ from sglang.kernels.ops.kv_canary.consts import (
     RealKvHashMode,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -61,18 +62,18 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: ServerArgs) -> CanaryConfig:
-        mode_raw = server_args.kv_canary.strip().lower()
+        mode_raw = get_observability().kv_canary.strip().lower()
         if mode_raw not in ("none", "log", "raise"):
             raise ValueError(
                 f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
             )
 
-        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
+        real_kv_raw = get_observability().kv_canary_real_data.strip().upper()
 
         return cls(
             mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
-            sweep_interval=server_args.kv_canary_sweep_interval,
+            sweep_interval=get_observability().kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
             enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),

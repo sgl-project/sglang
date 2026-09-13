@@ -7,8 +7,6 @@ use crate::config::{
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware::CacheAwarePolicy,
-    cache_aware_zmq::CacheAwareZmqPolicy,
-    engine_load::EngineLoadTable,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
@@ -22,7 +20,6 @@ use crate::policies::{
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
-use crate::tokenizer::TokenizerRegistry;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,19 +50,10 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
-    tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
-    engine_load: Arc<EngineLoadTable>,
 ) -> Result<Arc<dyn Policy>> {
     validate_eligibility(model)?;
-    let inner = build_kind(
-        model.policy,
-        model,
-        &tree,
-        &tokenizers,
-        &block_size_oracle,
-        &engine_load,
-    )?;
+    let inner = build_kind(model.policy, model, &tree, &block_size_oracle)?;
     let Some(elig) = model.eligibility.as_ref().filter(|e| !e.filters.is_empty()) else {
         return Ok(inner);
     };
@@ -101,30 +89,14 @@ fn build_kind(
     kind: PolicyKind,
     model: &ModelConfig,
     tree: &Arc<HashTree>,
-    tokenizers: &Arc<TokenizerRegistry>,
     block_size_oracle: &Arc<BlockSizeOracle>,
-    engine_load: &Arc<EngineLoadTable>,
 ) -> Result<Arc<dyn Policy>> {
-    let (tree, tokenizers, block_size_oracle) = (
-        Arc::clone(tree),
-        Arc::clone(tokenizers),
-        Arc::clone(block_size_oracle),
-    );
+    let (tree, block_size_oracle) = (Arc::clone(tree), Arc::clone(block_size_oracle));
     Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq => {
-            let cache_cfg = model.cache_aware.clone().unwrap_or_default();
-            Arc::new(CacheAwareZmqPolicy::new(
-                cache_cfg,
-                tree,
-                tokenizers,
-                block_size_oracle,
-                Arc::clone(engine_load),
-            ))
-        }
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
         )),
@@ -222,13 +194,6 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq => Arc::new(CacheAwareZmqPolicy::new(
-            crate::config::CacheAwareConfig::default(),
-            Arc::new(HashTree::new()),
-            Arc::new(TokenizerRegistry::default()),
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             crate::config::AffinityConfig::default(),
         )),
@@ -252,34 +217,20 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
 pub fn build_registry(
     cfg: &Config,
     tree: Arc<HashTree>,
-    tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
-    engine_load: Arc<EngineLoadTable>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
     reg.insert(
         ModelId(m.id.clone()),
-        build_policy(
-            m,
-            Arc::clone(&tree),
-            Arc::clone(&tokenizers),
-            Arc::clone(&block_size_oracle),
-            Arc::clone(&engine_load),
-        )?,
+        build_policy(m, Arc::clone(&tree), Arc::clone(&block_size_oracle))?,
     );
     Ok(reg)
 }
 
 /// Builds a registry with empty cache-aware dependencies.
 pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
-    build_registry(
-        cfg,
-        Arc::new(HashTree::new()),
-        Arc::new(TokenizerRegistry::default()),
-        BlockSizeOracle::new(),
-        EngineLoadTable::new(),
-    )
+    build_registry(cfg, Arc::new(HashTree::new()), BlockSizeOracle::new())
 }
 
 #[cfg(test)]
@@ -386,6 +337,8 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
@@ -403,20 +356,24 @@ mod tests {
 
     #[test]
     fn build_policy_kind_only_covers_all_variants() {
-        for (kind, needs_load_snapshot) in [
-            (PolicyKind::RoundRobin, false),
-            (PolicyKind::Random, false),
-            (PolicyKind::PowerOfTwo, true),
-            (PolicyKind::LoadBased, true),
-            (PolicyKind::CacheAwareZmq, true),
-            (PolicyKind::SessionAware, true),
-            (PolicyKind::CacheAware, true),
-            (PolicyKind::Sticky, false),
+        for (kind, needs_load_snapshot, needs_dispatch_timestamps) in [
+            (PolicyKind::RoundRobin, false, false),
+            (PolicyKind::Random, false, false),
+            (PolicyKind::PowerOfTwo, true, false),
+            (PolicyKind::LoadBased, true, true),
+            (PolicyKind::SessionAware, true, false),
+            (PolicyKind::CacheAware, true, false),
+            (PolicyKind::Sticky, false, false),
         ] {
             let policy = build_policy_kind_only(kind).unwrap();
             assert_eq!(
                 policy.needs_load_snapshot(),
                 needs_load_snapshot,
+                "{kind:?}"
+            );
+            assert_eq!(
+                policy.needs_dispatch_timestamps(),
+                needs_dispatch_timestamps,
                 "{kind:?}"
             );
         }
@@ -536,54 +493,16 @@ mod tests {
     fn registry_assigns_configured_model() {
         let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(
-            &cfg,
-            tree,
-            tokenizers,
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
-    }
-
-    #[test]
-    fn cache_aware_zmq_builds_via_factory() {
-        let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
-        let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(
-            &cfg,
-            tree,
-            tokenizers,
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap();
-        let p = reg.get(&ModelId("modelA".into())).unwrap();
-        let dbg = format!("{p:?}");
-        assert!(
-            dbg.contains("CacheAwareZmqPolicy"),
-            "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
-        );
-        assert!(p.needs_load_snapshot());
     }
 
     #[test]
     fn load_based_builds_via_factory() {
         let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(
-            &cfg,
-            tree,
-            tokenizers,
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(
@@ -597,15 +516,7 @@ mod tests {
     fn sticky_builds_via_factory() {
         let cfg = cfg_with_model("modelA", PolicyKind::Sticky);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(
-            &cfg,
-            tree,
-            tokenizers,
-            BlockSizeOracle::new(),
-            EngineLoadTable::new(),
-        )
-        .unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(

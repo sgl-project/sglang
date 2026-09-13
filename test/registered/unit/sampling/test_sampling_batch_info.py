@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
@@ -98,6 +98,54 @@ class TestSamplingBatchInfoLen(CustomTestCase):
         """Test that __len__ returns batch size (number of temperature rows)."""
         info = _make_info(batch_size=5)
         self.assertEqual(len(info), 5)
+
+
+class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
+        info = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_mask_batch_indices)
+        other = _make_info(
+            batch_size=1,
+            return_sampling_masks=[True],
+            sampling_mask_batch_indices=torch.tensor([0]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.return_sampling_masks, [False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
+
+    def test_filter_rebuilds_row_indices(self):
+        info = _make_info(
+            batch_size=4,
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor([1, 3]),
+        )
+
+        info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
+
+        self.assertEqual(info.return_sampling_masks, [True, False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+
+    def test_merge_offsets_rhs_row_indices(self):
+        lhs = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        rhs = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 2]),
+        )
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
+        self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
 
 
 class TestMergeCustomLogitProcessor(CustomTestCase):

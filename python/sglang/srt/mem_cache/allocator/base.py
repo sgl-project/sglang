@@ -16,12 +16,26 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+class MambaFullCacheDonor(Protocol):
+    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
+
+    def flush_deferred_full_frees(self) -> None: ...
+
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        """Lower bound on new Full tokens before preparation can help."""
+        ...
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose layout-specific reclaim so Mamba capacity is queryable."""
+        ...
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -74,6 +88,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
+        """Return the shared-pool donor capability, if this allocator has one."""
+        return None
+
     def debug_print(self) -> str:
         return ""
 
@@ -121,10 +139,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         virtual-id pools must override."""
         return kv_indices
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def alloc_extend(self, *args, **kwargs):

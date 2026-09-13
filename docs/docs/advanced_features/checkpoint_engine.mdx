@@ -25,7 +25,7 @@ pip install 'checkpoint-engine[p2p]'
 
 The system consists of two main components:
 
-1. **SGLang Server**: Runs with `--wait-for-initial-weights` flag to wait for weights before becoming ready
+1. **SGLang Server**: Runs with `--checkpoint-engine-wait-weights-before-ready` flag to wait for weights before becoming ready
 2. **Checkpoint Engine Workers**: Separate processes (managed by torchrun) that load and distribute model weights
 
 The checkpoint engine uses a parameter server architecture with support for:
@@ -43,7 +43,7 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
     --load-format dummy \
-    --wait-for-initial-weights
+    --checkpoint-engine-wait-weights-before-ready
 ```
 
 **Terminal 2 - Run Checkpoint Engine:**
@@ -75,7 +75,7 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
     --load-format dummy \
-    --wait-for-initial-weights \
+    --checkpoint-engine-wait-weights-before-ready \
     --host [IP]
 ```
 
@@ -110,7 +110,7 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
     --load-format dummy \
-    --wait-for-initial-weights \
+    --checkpoint-engine-wait-weights-before-ready \
     --host [IP]
 ```
 
@@ -147,7 +147,7 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
     --load-format dummy \
-    --wait-for-initial-weights \
+    --checkpoint-engine-wait-weights-before-ready \
     --host [IP] \
     --dist-init-addr [IP]:9120 \
     --nnodes 2 \
@@ -185,7 +185,7 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp 8 \
     --load-format dummy \
-    --wait-for-initial-weights \
+    --checkpoint-engine-wait-weights-before-ready \
     --host [IP] \
     --dist-init-addr [IP]:9120 \
     --nnodes 2 \
@@ -220,7 +220,7 @@ torchrun --nproc-per-node 8 \
 ### SGLang Server Options
 
 - `--load-format dummy`: Use dummy format for initial loading (allows overlapping with other tasks)
-- `--wait-for-initial-weights`: Wait for checkpoint engine to provide weights before becoming ready
+- `--checkpoint-engine-wait-weights-before-ready`: Wait for checkpoint engine to provide weights before becoming ready
 - `--host`: Host address for multi-node setups
 - `--dist-init-addr`: Distributed initialization address for tensor parallelism
 

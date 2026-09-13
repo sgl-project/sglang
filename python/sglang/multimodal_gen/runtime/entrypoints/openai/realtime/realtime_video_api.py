@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
@@ -27,9 +30,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    ReleaseRealtimeSessionReq,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args

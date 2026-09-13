@@ -41,6 +41,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             ),
             component_weights_paths={},
             component_quantizations={},
+            component_quantization_ignored_layers={},
+            component_paths={},
+            batching_max_size=1,
             component_precisions={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
@@ -61,7 +64,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def _config_patch(self, config):
         return mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "image_encoder_loader.get_diffusers_component_config",
+            "text_encoder_loader.get_diffusers_component_config",
             return_value=config,
         )
 

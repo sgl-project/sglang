@@ -10,7 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
@@ -1016,6 +1016,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.tokenizer = object()
+        scheduler.disable_radix_cache = False
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
         scheduler._get_multimodal_inputs = MagicMock(

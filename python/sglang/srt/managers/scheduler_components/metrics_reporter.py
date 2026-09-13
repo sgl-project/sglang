@@ -248,10 +248,10 @@ class SchedulerMetricsReporter:
         self.kv_transfer_latency_ms: float = 0.0
 
         self.enable_mfu_metrics = False
-        self.decode_log_interval = self.scheduler.server_args.decode_log_interval
+        self.decode_log_interval = get_observability().decode_log_interval
 
         if self.enable_metrics:
-            self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics
+            self.enable_mfu_metrics = get_observability().enable_mfu_metrics
             if self.enable_mfu_metrics:
                 self._init_estimated_perf_constants()
                 self._mfu_log_flops = 0.0

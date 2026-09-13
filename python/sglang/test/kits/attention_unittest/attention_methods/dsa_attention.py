@@ -342,12 +342,11 @@ class DSAMockModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             dp_size=1,
             dsa_decode_backend=dsa_decode_backend,
-            dsa_prefill_cp_mode="round-robin-split",
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
             enable_dp_attention=False,
-            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",
@@ -1191,8 +1190,8 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
         # TRT-LLM Gen FMHA / MLA require Blackwell SM10.0 (B200 NVL).
         # SM10.3 (GB300) raises "Missing TRTLLM-GEN kernel" at runtime because
         # the kernel binary in the container isn't compiled for sm_103.
-        # Require exactly SM10.0 (same constraint as cutlass_mla) until the
-        # container ships sm_103-compiled TRTLLM-GEN kernels.
+        # Require exactly SM10.0 until the container ships sm_103-compiled
+        # TRTLLM-GEN kernels.
         if major != 10 or minor != 0:
             return (
                 False,
