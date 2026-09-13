@@ -113,6 +113,7 @@ INFO_RECORD_ENABLE_HINT = (
 
 class ServerContext(msgspec.Struct, frozen=True):
     base_url: str
+    control_url: str
     tokenizer_path: str
     tp_size: int
     dp_size: int
@@ -166,6 +167,7 @@ def out_paths(*, out: str) -> dict[str, Path]:
 def run_profile(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -204,6 +206,7 @@ def run_profile(
 
     context = fetch_server_context(
         base_url=base_url,
+        control_url=control_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
     )
@@ -340,6 +343,7 @@ def fit_profile(
 def profile_all(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -352,6 +356,7 @@ def profile_all(
 ) -> None:
     run_profile(
         base_url=base_url,
+        control_url=control_url,
         batch_sizes=batch_sizes,
         settings=settings,
         out=out,
@@ -410,17 +415,20 @@ def build_table_from_summaries(
 def fetch_server_context(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
 ) -> ServerContext:
-    response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
+    base_url = base_url.rstrip("/")
+    control_url = (control_url or base_url).rstrip("/")
+    response = requests.get(control_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
 
     speculative_algorithm = info.get("speculative_algorithm")
     if speculative_algorithm != "DSPARK":
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DSpark server: {control_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
             "measured from real static-mode DSpark verify steps; relaunch with "
             "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
@@ -434,7 +442,7 @@ def fetch_server_context(
 
     internal_states = info.get("internal_states") or []
     if not internal_states:
-        raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
+        raise RuntimeError(f"{control_url}/server_info returned no internal_states.")
     sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
@@ -503,6 +511,7 @@ def fetch_server_context(
 
     return ServerContext(
         base_url=base_url,
+        control_url=control_url,
         tokenizer_path=tokenizer_path,
         tp_size=int(info.get("tp_size", 1) or 1),
         dp_size=dp_size,
@@ -638,12 +647,12 @@ def run_one_round(
         return None
 
     if frac is not None:
-        set_forced_budget_frac(base_url=context.base_url, frac=frac)
+        set_forced_budget_frac(base_url=context.control_url, frac=frac)
 
     flush_cache(base_url=context.base_url)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(base_url=context.base_url)
+        for rows in fetch_rank_rows(base_url=context.control_url)
     ]
 
     start_time = time.monotonic()
@@ -664,7 +673,7 @@ def run_one_round(
         min_steady_seconds=settings.min_steady_seconds,
         timeout_seconds=settings.round_timeout_seconds,
     )
-    abort_all_requests(base_url=context.base_url)
+    abort_all_requests(base_url=context.control_url)
     load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
     if load_thread.is_alive():
         logger.warning(
@@ -684,7 +693,7 @@ def run_one_round(
             settings.min_steady_seconds,
         )
 
-    rank_rows = fetch_rank_rows(base_url=context.base_url)
+    rank_rows = fetch_rank_rows(base_url=context.control_url)
     if len(rank_rows) != len(watermarks):
         raise RuntimeError(
             f"DP rank count changed mid-profile: {len(watermarks)} -> {len(rank_rows)}."
@@ -765,7 +774,7 @@ def wait_for_aligned_steps(
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL_SECONDS)
         try:
-            rank_rows = fetch_rank_rows(base_url=context.base_url)
+            rank_rows = fetch_rank_rows(base_url=context.control_url)
         except Exception:
             logger.warning("Polling /server_info failed; retrying.", exc_info=True)
             continue
@@ -1271,6 +1280,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "base_url": context.base_url,
+        "control_url": context.control_url,
         "tp_size": context.tp_size,
         "dp_size": context.dp_size,
         "verify_num_draft_tokens": context.verify_num_draft_tokens,
@@ -1375,6 +1385,14 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="Base URL of the already-running DSpark server, e.g. "
         "http://localhost:30000. The profiler never launches a server.",
+    )
+    parser.add_argument(
+        "--control-url",
+        type=str,
+        default=None,
+        help="Optional direct Decode server URL for /server_info, forced-budget "
+        "control, record polling, and request abort. Keep --base-url pointed "
+        "at the PD router for /generate. Defaults to --base-url.",
     )
     parser.add_argument(
         "--fracs",
@@ -1543,6 +1561,7 @@ def cli_main() -> None:
     if args.command == "run":
         run_profile(
             base_url=args.base_url,
+            control_url=args.control_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
@@ -1560,6 +1579,7 @@ def cli_main() -> None:
     else:
         profile_all(
             base_url=args.base_url,
+            control_url=args.control_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
