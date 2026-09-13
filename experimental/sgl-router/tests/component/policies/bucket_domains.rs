@@ -107,91 +107,71 @@ fn prefill_best_effort_tries_non_slo_bucket_before_reserved_slo_capacity() {
 }
 
 #[test]
-fn cache_candidate_uses_uncached_work_range_but_full_context_and_own_ttft_profile() {
+fn prefill_domain_uses_full_input_as_extend_work_without_cache() {
     let short = worker("short", WorkerMode::Prefill);
     let long = worker("long", WorkerMode::Prefill);
     let mut short_bucket = bucket("p-short", BucketStage::Prefill, 10, &["short"]);
     short_bucket.max_extend_tokens = Some(64);
-    short_bucket.max_context_tokens = Some(4_096);
-    short_bucket.ttft_p95_at_capacity_ms = Some(80);
     let mut long_bucket = bucket("p-long", BucketStage::Prefill, 20, &["long"]);
     long_bucket.min_extend_tokens = Some(65);
-    long_bucket.max_context_tokens = Some(4_096);
-    long_bucket.ttft_p95_at_capacity_ms = Some(300);
     let selector = BucketSelector::new(Some(BucketConfig {
         buckets: vec![short_bucket, long_bucket],
-        ttft_slo_policy: SloBucketPolicy::SloFirst,
+        ttft_slo_policy: SloBucketPolicy::Disabled,
         tps_slo_policy: SloBucketPolicy::Disabled,
     }));
-    let workers = vec![Arc::clone(&short), Arc::clone(&long)];
-    let request = BucketRequest {
-        input_tokens: 256,
-        expected_peak_sequence_tokens: None,
-        ttft_slo_ms: Some(100),
-        tps_slo: None,
-    };
+
+    let domains = selector.prefill_domains(
+        &[short, long],
+        BucketRequest {
+            input_tokens: 256,
+            expected_peak_sequence_tokens: None,
+            ttft_slo_ms: None,
+            tps_slo: None,
+        },
+    );
 
     assert_eq!(
-        selector
-            .prefill_domains(&workers, request)
+        domains
             .iter()
             .map(|domain| domain.id.as_str())
             .collect::<Vec<_>>(),
-        ["p-long"],
-        "no-hit target selection uses E=L for extend-work compatibility"
-    );
-    let short_hit = CacheCandidate {
-        worker: Arc::clone(&short),
-        matched_prefix_tokens: 224,
-        uncached_tokens: 32,
-        candidate_range_id: "global".into(),
-        max_pending_prefill_tokens: None,
-    };
-    let bound = selector
-        .bind_prefill_cache_candidate(short_hit, request)
-        .expect("E=32 fits short work range and the full L=256 fits max context");
-    assert_eq!(bound.candidate_range_id, "p-short");
-
-    let long_hit = CacheCandidate {
-        worker: Arc::clone(&long),
-        matched_prefix_tokens: 0,
-        uncached_tokens: 256,
-        candidate_range_id: "global".into(),
-        max_pending_prefill_tokens: None,
-    };
-    assert!(
-        selector
-            .bind_prefill_cache_candidate(long_hit, request)
-            .is_none(),
-        "a cache candidate whose own Hard TTFT profile misses the request SLO is rejected"
+        ["p-long"]
     );
 }
 
 #[test]
-fn cache_candidate_without_bucket_configuration_keeps_global_metadata() {
-    let p = worker("p", WorkerMode::Prefill);
-    let selector = BucketSelector::new(None);
+fn cache_candidate_uses_bucket_metadata_without_extend_range_filtering() {
+    let cached = worker("cached", WorkerMode::Prefill);
+    let mut cached_bucket = bucket("p-cached", BucketStage::Prefill, 10, &["cached"]);
+    cached_bucket.max_extend_tokens = Some(8);
+    cached_bucket.max_pending_prefill_tokens = Some(64);
+    let selector = BucketSelector::new(Some(BucketConfig {
+        buckets: vec![cached_bucket],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    }));
     let candidate = CacheCandidate {
-        worker: p,
-        matched_prefix_tokens: 64,
-        uncached_tokens: 64,
-        candidate_range_id: "probe".into(),
-        max_pending_prefill_tokens: Some(1),
+        worker: cached,
+        matched_prefix_tokens: 128,
+        uncached_tokens: 128,
+        candidate_range_id: "global".into(),
+        max_pending_prefill_tokens: None,
     };
-    let bound = selector
-        .bind_prefill_cache_candidate(
+
+    let prepared = selector
+        .prepare_prefill_cache_candidate(
             candidate,
             BucketRequest {
-                input_tokens: 128,
+                input_tokens: 256,
                 expected_peak_sequence_tokens: None,
                 ttft_slo_ms: None,
                 tps_slo: None,
             },
         )
-        .expect("Step 1 always has a catch-all domain");
+        .expect("extend range does not constrain global cache affinity");
 
-    assert_eq!(bound.candidate_range_id, "global");
-    assert_eq!(bound.max_pending_prefill_tokens, None);
+    assert_eq!(prepared.candidate_range_id, "p-cached");
+    assert_eq!(prepared.max_pending_prefill_tokens, Some(64));
 }
 
 #[test]
@@ -332,20 +312,6 @@ fn membership_index_preserves_exact_matching_and_fleet_order() {
     assert_eq!(ids(0), ["w1", "w3"]);
     assert_eq!(ids(1), ["w1", "w3", "w9"]);
 
-    let candidate = CacheCandidate {
-        worker: Arc::clone(&workers[9]),
-        matched_prefix_tokens: 0,
-        uncached_tokens: 128,
-        candidate_range_id: "global".into(),
-        max_pending_prefill_tokens: None,
-    };
-    assert_eq!(
-        selector
-            .bind_prefill_cache_candidate(candidate, request)
-            .expect("w9 belongs to the hash-indexed bucket")
-            .candidate_range_id,
-        "set"
-    );
     assert_eq!(
         selector
             .prefill_affinity_domain(&workers, &workers[9], request)

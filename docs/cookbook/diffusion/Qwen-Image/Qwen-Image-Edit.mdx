@@ -44,6 +44,44 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
 
+### 3.3 Decompose an image into layers on H200
+
+`Qwen/Qwen-Image-Layered` returns separate RGBA images. For this model,
+`--num-frames 4` requests four output layers. The CLI saves all four PNGs,
+and `DiffGenerator.generate()` returns one result per layer.
+
+On Linux with NVIDIA CUDA and two H200 GPUs, you can run the conditional and
+unconditional branches on separate GPUs:
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0,1 sglang generate \
+  --model-path Qwen/Qwen-Image-Layered \
+  --num-gpus 2 \
+  --cfg-parallel-size 2 \
+  --tp-size 1 \
+  --ulysses-degree 1 \
+  --quality lossless \
+  --enable-torch-compile false \
+  --warmup-mode request \
+  --width 640 --height 640 --num-frames 4 \
+  --num-inference-steps 50 --guidance-scale 4.0 --seed 42 \
+  --image-path https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png \
+  --prompt "a high quality, cute halloween themed illustration, consistent style and lighting" \
+  --output-path outputs/qwen-layered \
+  --save-output
+```
+
+For a single H200, set `CUDA_VISIBLE_DEVICES=0`, `--num-gpus 1`, and
+`--cfg-parallel-size 1`. Both configurations use eager execution. Layered
+does not currently support breakable CUDA graph; enabling BCG falls back to
+eager execution.
+
+The Layered CFG policy gathers the branch predictions before applying the
+single-GPU arithmetic order, preserving BF16 rounding and alpha values in the
+validated fixed-seed example. Each GPU still holds a full DiT replica, so CFG
+parallelism reduces request latency without reducing the model memory needed
+on each GPU.
+
 ## 4. API Usage
 
 For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).

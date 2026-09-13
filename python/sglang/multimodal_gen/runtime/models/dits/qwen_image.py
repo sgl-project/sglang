@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -750,10 +751,18 @@ class QwenImageCrossAttention(nn.Module):
         self.prefix = prefix
         self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
         quant_name = _modelopt_quant_name(quant_config)
+        capability = current_platform.get_device_capability()
         self.use_fused_qkv_epilogue = quant_name in {
             "modelopt_fp4",
             "modelopt_fp8",
-        }
+        } or (
+            quant_config is None
+            and current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 9
+            and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
         self.use_fused_qkv = (
             isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
         )
@@ -977,6 +986,12 @@ class QwenImageCrossAttention(nn.Module):
                 make_contiguous=not self.use_fused_qkv_epilogue,
             )
 
+        freqs_complex = cross_attention_kwargs.get("freqs_complex")
+        if freqs_complex is not None:
+            img_complex, txt_complex = freqs_complex
+        else:
+            img_complex = txt_complex = None
+
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
         img_key = img_key.unflatten(-1, (self.local_num_heads, self.head_dim))
@@ -1004,6 +1019,10 @@ class QwenImageCrossAttention(nn.Module):
             and txt_cache is not None
             and not sp_text_sharded
             and sp_txt_pad == 0
+            # Masked attention packs the image and text segments separately.
+            # Its prefix tensors must go through the ordinary normalization.
+            and attn_mask is None
+            and encoder_hidden_states_mask is None
         ):
             joint_qkv = try_fused_qwen_qkv_epilogue(
                 img_query,
@@ -1040,6 +1059,7 @@ class QwenImageCrossAttention(nn.Module):
                     k_norm=self.norm_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=img_cache,
+                    freqs_complex=img_complex,
                     is_neox=False,
                     allow_inplace=True,
                 )
@@ -1050,6 +1070,7 @@ class QwenImageCrossAttention(nn.Module):
                     k_norm=self.norm_added_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=txt_cache,
+                    freqs_complex=txt_complex,
                     is_neox=False,
                     allow_inplace=True,
                 )
@@ -2272,6 +2293,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
+        freqs_complex: tuple[torch.Tensor, torch.Tensor] = None,
         additional_t_cond: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -2390,6 +2412,9 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if freqs_cis is not None:
                 img_cache, txt_cache = freqs_cis
                 freqs_cis = (img_cache, shard_like(txt_cache, txt_shard, dim=0))
+            if freqs_complex is not None:
+                img_complex, txt_complex = freqs_complex
+                freqs_complex = (img_complex, shard_like(txt_complex, txt_shard, dim=0))
             tail_meta = tail_attn_meta(
                 txt_shard,
                 encoder_hidden_states.shape[0],
@@ -2412,6 +2437,9 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             temb_txt_silu = temb_img_silu
 
         image_rotary_emb = freqs_cis
+        if freqs_complex is not None:
+            block_attention_kwargs["freqs_complex"] = freqs_complex
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
