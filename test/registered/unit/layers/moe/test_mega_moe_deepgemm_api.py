@@ -171,8 +171,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 "get_moe_a2a_backend",
                 return_value=SimpleNamespace(is_megamoe=lambda: True),
             ),
-            patch(
-                "sglang.srt.layers.quantization.fp8_utils.requant_weight_ue8m0",
+            patch.object(
+                mega_moe,
+                "_prepare_mega_moe_shared_weight_ue8m0",
                 side_effect=requant_results,
             ) as requant,
         ):
@@ -186,6 +187,101 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         transform_call = deep_gemm.transform_weights_for_mega_moe.call_args
         self.assertEqual(transform_call.args, requant_results)
         self.assertEqual(transform_call.kwargs, {"mma_type": "fp8xfp4"})
+
+    def test_native_shared_weight_expands_k128_scale_for_k32_consumption(self):
+        weight = torch.zeros((128, 512), dtype=torch.float8_e4m3fn)
+        raw_scale = torch.tensor([[1.0, 2.0, 4.0, 8.0]])
+        packed_scale = torch.zeros((128, 1), dtype=torch.int32)
+        packed_scale.format_ue8m0 = True
+        unpacked_scale = raw_scale.clone()
+        requantized_weight = torch.zeros_like(weight)
+        requantized_scale = torch.ones((128, 1), dtype=torch.int32)
+        native_scale = torch.empty_strided((128, 4), (1, 128), dtype=torch.int32)
+
+        for scale, should_unpack in (
+            (raw_scale, False),
+            (packed_scale, True),
+        ):
+            with (
+                self.subTest(should_unpack=should_unpack),
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.inverse_transform_scale_ue8m0",
+                    return_value=unpacked_scale,
+                ) as unpack,
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.requant_weight_ue8m0",
+                    return_value=(requantized_weight, requantized_scale),
+                ) as requant,
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.transform_scale_ue8m0",
+                    return_value=native_scale,
+                ) as transform,
+            ):
+                actual = mega_moe._prepare_mega_moe_shared_weight_ue8m0(
+                    weight, scale, [128, 128]
+                )
+
+            self.assertIs(actual[0], weight if should_unpack else requantized_weight)
+            self.assertIs(actual[1], native_scale)
+            if should_unpack:
+                requant.assert_not_called()
+                unpack.assert_called_once_with(packed_scale, mn=128)
+            else:
+                requant.assert_called_once_with(weight, raw_scale, [128, 128])
+                unpack.assert_called_once_with(requantized_scale, mn=128)
+            transform.assert_called_once()
+            torch.testing.assert_close(
+                transform.call_args.args[0],
+                torch.tensor(
+                    [
+                        [
+                            1.0,
+                            1.0,
+                            1.0,
+                            1.0,
+                            2.0,
+                            2.0,
+                            2.0,
+                            2.0,
+                            4.0,
+                            4.0,
+                            4.0,
+                            4.0,
+                            8.0,
+                            8.0,
+                            8.0,
+                            8.0,
+                        ]
+                    ]
+                ),
+            )
+            self.assertEqual(transform.call_args.kwargs, {"mn": 128})
+
+    def test_native_shared_weight_drops_packed_k_padding_before_expansion(self):
+        weight = torch.zeros((128, 256), dtype=torch.float8_e4m3fn)
+        packed_scale = torch.zeros((128, 1), dtype=torch.int32)
+        packed_scale.format_ue8m0 = True
+        unpacked_with_padding = torch.tensor([[1.0, 2.0, 0.0, 0.0]])
+        native_scale = torch.empty_strided((128, 2), (1, 128), dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.inverse_transform_scale_ue8m0",
+                return_value=unpacked_with_padding,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.transform_scale_ue8m0",
+                return_value=native_scale,
+            ) as transform,
+        ):
+            mega_moe._prepare_mega_moe_shared_weight_ue8m0(
+                weight, packed_scale, [128, 128]
+            )
+
+        torch.testing.assert_close(
+            transform.call_args.args[0],
+            torch.tensor([[1.0] * 4 + [2.0] * 4]),
+        )
 
     def test_native_shared_weights_reject_w4a4_routed_mode(self):
         moe = SimpleNamespace(

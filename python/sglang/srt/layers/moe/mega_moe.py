@@ -140,6 +140,60 @@ def _can_fuse_native_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     )
 
 
+def _prepare_mega_moe_shared_weight_ue8m0(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent K128 block-FP8 weights with MegaMoE's K32 scale layout."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        inverse_transform_scale_ue8m0,
+        requant_weight_ue8m0,
+        transform_scale_ue8m0,
+    )
+
+    assert weight.dim() == 2, f"Expected a matrix, got {weight.shape=}"
+    assert weight.dtype == torch.float8_e4m3fn, f"Unexpected {weight.dtype=}"
+    assert weight_block_size == [128, 128], f"Unsupported {weight_block_size=}"
+    mn, k = weight.shape
+    assert mn % 128 == 0 and k % 128 == 0, (
+        "MegaMoE shared FP8 weights require dimensions aligned to 128, "
+        f"got {weight.shape=}"
+    )
+
+    if getattr(weight_scale_inv, "format_ue8m0", False):
+        # The packed runtime representation still describes the original 128x128
+        # block quantization. Recover its logical scales before changing layout.
+        scale_k128 = inverse_transform_scale_ue8m0(weight_scale_inv, mn=mn)
+    else:
+        # DeepGEMM consumes exponent-only UE8M0 scales. Normalize arbitrary
+        # checkpoint FP32 scales once before adapting their granularity.
+        weight, packed_scale_k128 = requant_weight_ue8m0(
+            weight,
+            weight_scale_inv,
+            weight_block_size,
+        )
+        scale_k128 = inverse_transform_scale_ue8m0(packed_scale_k128, mn=mn)
+    # Packed UE8M0 pads its K-scale count to a multiple of four. Drop that
+    # physical padding before expanding each logical K128 scale into K32.
+    scale_k128 = scale_k128[..., : k // 128]
+
+    # Preserve every FP8 bit after the required UE8M0 normalization. Repeating
+    # each K128 scale for its four K32 subgroups gives DeepGEMM the exact same
+    # represented values without a second dequant/requant round trip.
+    scale_k32 = scale_k128.repeat_interleave(4, dim=-1)
+    out_scale = transform_scale_ue8m0(scale_k32, mn=mn)
+    assert out_scale.shape == (mn, k // (32 * 4)), (
+        "Unexpected MegaMoE shared-weight scale layout: "
+        f"{out_scale.shape=}, expected={(mn, k // (32 * 4))}"
+    )
+    assert out_scale.dtype == torch.int32 and out_scale.stride(-2) == 1, (
+        "MegaMoE shared-weight scales must be packed int32 and MN-major, "
+        f"got {out_scale.dtype=} {out_scale.stride()=}"
+    )
+    return weight, out_scale
+
+
 def build_mega_moe_shared_expert_weights(
     moe: DeepseekV2MoE, *, force: bool = False
 ) -> bool:
@@ -156,15 +210,10 @@ def build_mega_moe_shared_expert_weights(
 
     import deep_gemm
 
-    from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
-
     def as_ue8m0_pair(proj):
-        scale = proj.weight_scale_inv
-        if getattr(scale, "format_ue8m0", False):
-            return proj.weight.data, scale.data
-        return requant_weight_ue8m0(
+        return _prepare_mega_moe_shared_weight_ue8m0(
             proj.weight.data,
-            scale.data,
+            proj.weight_scale_inv,
             moe.shared_experts_weight_block_size,
         )
 
