@@ -150,21 +150,60 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa.
+        """Replay a graph, updating recorded operator inputs when needed.
+
+        Requires auto_dispatch_capture=True. With no update records, replay
+        directly without preparing or applying updates. Otherwise, run updates
+        in a background thread concurrently with replay, join the thread, and
+        re-raise any update exception in the caller.
 
         Two calling conventions:
-        1. (legacy) seq_lens + attr_name + attr_type:
-           Constructs cpu_update_input=[{attr_name: seq_lens}] internally.
-        2. cpu_update_input: A list of {attr_name: seq_lens} dicts,
-           one per speculative step.  Used by EAGLE draft runners.
+        1. Provide seq_lens and attr_name, with optional attr_type; leave
+           cpu_update_input=None. The method builds a one-element list for
+           broadcast to all records. For example:
+               seq_lens=[100, 200], attr_name="actual_seq_lengths_kv"
+           becomes:
+               [{"actual_seq_lengths_kv": [100, 200]}]
+           A Tensor instance as attr_type selects conversion of seq_lens to a
+           CPU int32 tensor. Its dtype and device are not used. Otherwise,
+           seq_lens is used unchanged.
+
+        2. Provide cpu_update_input as a list of update dictionaries; callers
+           can pass seq_lens=None. The list is forwarded unchanged to
+           graph.update(), and seq_lens, attr_name, and attr_type are ignored.
+           A one-element list broadcasts the same updates to all records:
+               [{"actual_seq_lengths_kv": [100, 200]}]
+           A longer list must contain one dictionary per record, in capture
+           order. This example requires exactly two update records:
+               [{"actual_seq_lengths_kv": [101, 201]},
+                {"actual_seq_lengths_kv": [102, 202]}]
+           The inner length lists describe requests, not update records.
+           Dictionaries may contain multiple input updates; supported keys
+           and values depend on the recorded operator and its update handler.
         """
+        graph = self._graphs[shape_key]
+        # Read the update record count and require automatic capture to be enabled.
+        # Fail if the capture state cannot be inspected.
+        try:
+            auto_dispatch_capture = graph.auto_dispatch_capture
+            update_count = len(graph.graph_dispatch_mode.graph_dispatch_records)
+        except (AttributeError, TypeError) as e:
+            raise RuntimeError(
+                "Cannot inspect NPU graph update records; "
+                "check torch_npu graph API compatibility"
+            ) from e
+        if not auto_dispatch_capture:
+            raise RuntimeError("NPU graph updates require auto_dispatch_capture=True")
+        # With no update records, skip graph.update() and replay directly.
+        if update_count == 0:
+            graph.replay()
+            return self._outputs[shape_key]
+
         if cpu_update_input is None:
             if isinstance(attr_type, torch.Tensor):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
 
-        graph = self._graphs[shape_key]
         update_errors: list[Exception] = []
 
         def _update():
