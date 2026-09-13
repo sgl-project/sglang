@@ -4,7 +4,6 @@ from typing import Tuple
 import torch
 
 from sglang.srt.disaggregation.layerwise_hooks import (
-    layerwise_save_kv_layer,
     layerwise_wait_transfer_done,
 )
 
@@ -85,8 +84,6 @@ class GroupedMatmulSwigluQuant(BaseMatmul):
         transposed: bool = True,
         **scale_args,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        layerwise_save_kv_layer(layer.layer_id)
-
         weight = getattr(layer, f"{weight_prefix}_weight", None)
         if weight is None:
             raise AttributeError(

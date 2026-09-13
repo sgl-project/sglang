@@ -43,7 +43,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.disaggregation.layerwise_hooks import (
     layerwise_finalize_send,
-    layerwise_save_kv_layer,
     layerwise_start_send,
 )
 from sglang.srt.configs.model_config import (
@@ -2463,8 +2462,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
-        if not self.is_layer_sparse:
-            layerwise_save_kv_layer(self.layer_id)
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
