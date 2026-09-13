@@ -11,7 +11,10 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ResponsesRequest,
+    ResponsesResponse,
+)
 from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_custom_tool_input,
     decode_custom_tool_input_prefix,
@@ -19,6 +22,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_custom_tool_input,
     encode_reasoning_state,
     label_developer_content,
+    split_namespaced_call,
 )
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -436,6 +440,214 @@ class ModelValidationTestCase(CustomTestCase):
         self.assertIsNone(serving._validate_model(None))
         self.assertIsNone(serving._validate_model("x"))
         self.assertIsNone(serving._validate_model("x:my-adapter"))
+
+
+NAMESPACE_TOOL = {
+    "type": "namespace",
+    "name": "weather",
+    "description": "Weather services.",
+    "tools": [
+        {"name": "lookup", "parameters": {"type": "object"}},
+        {"name": "wait", "strict": True},
+    ],
+}
+
+
+def _namespace_request(**kwargs) -> ResponsesRequest:
+    payload = {
+        "model": "x",
+        "input": "weather in Paris",
+        "tools": [NAMESPACE_TOOL],
+        "tool_choice": "required",
+        "store": False,
+    }
+    payload.update(kwargs)
+    return ResponsesRequest(**payload)
+
+
+class NamespaceDeclarationTestCase(CustomTestCase):
+    def test_members_flatten_to_qualified_function_tools(self):
+        # Pre-namespace support the declaration passed validation and was
+        # silently dropped, so the model never saw a callable and never
+        # called it.
+        request = _namespace_request(tool_choice="auto")
+        tools = OpenAIServingResponses._response_tools_to_chat_tools(request)
+        self.assertEqual(
+            [t.function.name for t in tools], ["weather.lookup", "weather.wait"]
+        )
+        # Inner description wins; the namespace description fills members
+        # that omit one; strict flags survive the flattening.
+        self.assertEqual(tools[0].function.description, "Weather services.")
+        self.assertEqual(tools[0].function.parameters, {"type": "object"})
+        self.assertTrue(tools[1].function.strict)
+
+    def test_only_declared_namespaces_split_on_call(self):
+        # An exact declaration outranks a prefix split, so a plain function
+        # whose name contains a dot is never reinterpreted; undeclared
+        # dotted names pass through unchanged.
+        request = _namespace_request(
+            tool_choice="auto",
+            tools=[NAMESPACE_TOOL, {"type": "function", "name": "weather.lookup"}],
+        )
+        OpenAIServingResponses._response_tools_to_chat_tools(request)
+        declared = {"weather.lookup"}
+        self.assertEqual(
+            split_namespaced_call("weather.lookup", {"weather"}, declared),
+            ("weather.lookup", None),
+        )
+        self.assertEqual(
+            split_namespaced_call("weather.wait", {"weather"}, declared),
+            ("wait", "weather"),
+        )
+        self.assertEqual(
+            split_namespaced_call("unrelated.dot", {"weather"}, declared),
+            ("unrelated.dot", None),
+        )
+
+
+class NamespaceReplayTestCase(CustomTestCase):
+    def test_namespaced_function_call_replay_requalifies(self):
+        # The chat template must see the flattened name the model was shown
+        # at declaration time, or the replayed turn is unrecognizable.
+        serving = make_serving()
+        message = serving._normalize_response_message_for_chat(
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "lookup",
+                "namespace": "weather",
+                "arguments": "{}",
+            }
+        )
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "weather.lookup")
+
+
+class NamespaceOutputTestCase(CustomTestCase):
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.reasoning_parser = None
+        self.serving.tool_call_parser = None
+
+    def test_required_call_splits_name_and_namespace(self):
+        request = _namespace_request()
+        output = self.serving._make_response_output_items(
+            request,
+            '[{"name": "weather.lookup", "parameters": {"city": "SF"}}]',
+            tokenizer=Mock(),
+            require_reasoning=False,
+        )
+        item = output[0].model_dump()
+        self.assertEqual(item["type"], "function_call")
+        self.assertEqual(item["name"], "lookup")
+        self.assertEqual(item["namespace"], "weather")
+
+    def test_namespaced_item_survives_response_serialization(self):
+        # The SDK unions type ``output`` through ``ResponseFunctionToolCall``,
+        # which serializes a subclass instance without ``namespace`` unless
+        # the widened arm leads; a response echoing a namespaced call must
+        # keep the field.
+        item = self.serving._make_tool_call_item(
+            "weather.lookup",
+            "{}",
+            custom_names=frozenset(),
+            namespaces={"weather"},
+            declared_names=frozenset(),
+        )
+        response = ResponsesResponse(model="x", status="completed", output=[item])
+        self.assertEqual(response.model_dump()["output"][0]["namespace"], "weather")
+
+
+class NamespaceStreamTestCase(CustomTestCase):
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.reasoning_parser = None
+        self.serving.tool_call_parser = None
+
+    def test_added_and_done_items_split_the_qualified_name(self):
+        request = _namespace_request(stream=True)
+        payload = '[{"name": "weather.lookup", "parameters": {"city": "SF"}}]'
+        chunks = []
+        sent = 0
+        while sent < len(payload):
+            sent += min(9, len(payload) - sent)
+            chunks.append(
+                engine_chunk(payload[:sent], sent, finish=sent == len(payload))
+            )
+        events = StreamFixture(self.serving, request).run(chunks)
+        types = event_types(events)
+        payloads = event_payloads(events)
+
+        self.assertIn("response.function_call_arguments.delta", types)
+        added = [
+            p for t, p in zip(types, payloads) if t == "response.output_item.added"
+        ]
+        self.assertEqual(added[0]["item"]["name"], "lookup")
+        self.assertEqual(added[0]["item"]["namespace"], "weather")
+        done = [p for t, p in zip(types, payloads) if t == "response.output_item.done"]
+        self.assertEqual(done[0]["item"]["namespace"], "weather")
+        completed = find_completed_event(events)["response"]
+        self.assertEqual(completed["output"][0]["namespace"], "weather")
+
+
+class NamespaceHarmonyTestCase(CustomTestCase):
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.use_harmony = True
+
+    def test_developer_message_renders_flattened_members(self):
+        from sglang.srt.entrypoints.harmony_utils import get_developer_message
+        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+
+        tools = [ResponseTool.model_validate(NAMESPACE_TOOL)]
+        dev_msg = get_developer_message("be helpful", tools)
+        rendered = str(dev_msg.to_dict())
+        for name in ("weather.lookup", "weather.wait"):
+            self.assertIn(name, rendered)
+
+    def test_output_items_split_the_qualified_name(self):
+        from openai_harmony import Message, Role
+
+        from sglang.srt.entrypoints.context import HarmonyContext
+
+        request = _namespace_request(tool_choice="auto")
+        namespaces = {"weather"}
+        declared = frozenset()
+        calls = [
+            Message.from_role_and_content(Role.ASSISTANT, '{"city": "SF"}')
+            .with_channel("commentary")
+            .with_recipient("functions.weather.lookup")
+            .with_content_type("json"),
+            Message.from_role_and_content(Role.ASSISTANT, "{}")
+            .with_channel("commentary")
+            .with_recipient("functions.unrelated.name")
+            .with_content_type("json"),
+        ]
+        context = HarmonyContext(calls, {})
+        context.num_init_messages = 0
+        output = self.serving._make_response_output_items_with_harmony(
+            context, namespaces, declared
+        )
+
+        namespaced = output[0].model_dump()
+        self.assertEqual(namespaced["name"], "lookup")
+        self.assertEqual(namespaced["namespace"], "weather")
+        # An undeclared dotted recipient keeps its full name unsplit.
+        self.assertEqual(output[1].name, "unrelated.name")
+
+    def test_namespaced_replay_requalifies_the_recipient(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_response_input
+
+        msg = parse_response_input(
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "lookup",
+                "namespace": "weather",
+                "arguments": "{}",
+            },
+            [],
+        )
+        self.assertEqual(msg.recipient, "functions.weather.lookup")
 
 
 if __name__ == "__main__":

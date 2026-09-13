@@ -39,6 +39,8 @@ from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
 )
 from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
 from openai.types.responses import (
@@ -1604,6 +1606,37 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
+class ResponseNamespacedFunctionToolCall(ResponseFunctionToolCall):
+    """A ``function_call`` emitted for a ``namespace`` tool declaration.
+
+    The chat pipeline only sees the qualified ``{namespace}.{name}``
+    function, so the split pair has to travel back on the item itself.
+    """
+
+    namespace: str
+
+
+# Streaming events and response payloads type ``item``/``output`` through the
+# SDK unions, whose ``ResponseFunctionToolCall`` arm serializes a subclass
+# instance and drops ``namespace``; the subclasses below widen the union with
+# the namespaced arm first so the field survives model_dump.
+class ResponseNamespacedOutputItemAddedEvent(ResponseOutputItemAddedEvent):
+    item: Union[ResponseNamespacedFunctionToolCall, ResponseOutputItem]
+
+
+class ResponseNamespacedOutputItemDoneEvent(ResponseOutputItemDoneEvent):
+    item: Union[ResponseNamespacedFunctionToolCall, ResponseOutputItem]
+
+
+ResponsesOutputItem = Union[
+    ResponseOutputMessage,
+    ResponseOutputItem,
+    ResponseReasoningItem,
+    ResponseNamespacedFunctionToolCall,
+    ResponseFunctionToolCall,
+]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
     ResponseOutputMessage,
@@ -1807,15 +1840,19 @@ class ResponsesRequest(BaseModel):
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
         """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` / ``custom`` tool survives, the
-        rest (web_search, mcp, ...) can't be forced through the tool-call
-        parser."""
+        object forms only a named ``function`` / ``custom`` tool survives (a
+        ``namespace`` field re-qualifies the inner name to the flattened form
+        the model saw), the rest (web_search, mcp, ...) can't be forced
+        through the tool-call parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
         )
+        namespace = tool_choice.get("namespace")
+        if namespace and name:
+            name = f"{namespace}.{name}"
         if tool_choice.get("type") in ("function", "custom") and name:
             return {"type": "function", "name": name}
         return "auto"
@@ -1917,14 +1954,7 @@ class ResponsesResponse(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     model: str
 
-    output: List[
-        Union[
-            ResponseOutputMessage,
-            ResponseOutputItem,
-            ResponseReasoningItem,
-            ResponseFunctionToolCall,
-        ]
-    ] = Field(default_factory=list)
+    output: List[ResponsesOutputItem] = Field(default_factory=list)
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]

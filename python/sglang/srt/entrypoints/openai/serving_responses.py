@@ -61,6 +61,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseNamespacedFunctionToolCall,
+    ResponseNamespacedOutputItemAddedEvent,
+    ResponseNamespacedOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponsesRequest,
     ResponsesResponse,
@@ -77,6 +80,9 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_custom_tool_input,
     encode_reasoning_state,
     label_developer_content,
+    namespace_members_to_chat_tools,
+    namespace_tool_names,
+    split_namespaced_call,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -288,14 +294,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
-        # ``tool_choice="required"`` needs a tool the parser can actually force.
+        # ``tool_choice="required"`` needs a tool the parser can actually force;
+        # ``namespace`` members flatten down to functions like ``custom`` does.
         if request.tool_choice == "required" and not any(
-            tool.type in ("function", "custom") for tool in (request.tools or [])
+            tool.type in ("function", "custom", "namespace")
+            for tool in (request.tools or [])
         ):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
-                'type="function" or type="custom"; other built-in tool types '
-                "cannot be forced."
+                'type="function", type="custom" or type="namespace"; other '
+                "built-in tool types cannot be forced."
             )
 
         tool_choice = request.effective_tool_choice()
@@ -737,7 +745,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             output = (
                 output_items
                 if output_items is not None
-                else self._make_response_output_items_with_harmony(context)
+                else self._make_response_output_items_with_harmony(
+                    context,
+                    namespace_tool_names(request.tools),
+                    {
+                        tool.name
+                        for tool in request.tools or []
+                        if tool.type in ("function", "custom") and tool.name
+                    },
+                )
             )
             # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
@@ -890,10 +906,20 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str]
-    ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
+        name: str,
+        arguments: str,
+        custom_names: set[str],
+        namespaces: set[str] = frozenset(),
+        declared_names: set[str] = frozenset(),
+    ) -> Union[
+        ResponseFunctionToolCall,
+        ResponseCustomToolCall,
+        ResponseNamespacedFunctionToolCall,
+    ]:
         """A call against a ``custom`` tool reports its freeform payload rather
-        than the JSON arguments of the shim function tool."""
+        than the JSON arguments of the shim function tool; a call against a
+        flattened ``namespace`` member splits the qualified name back into
+        ``name`` plus ``namespace``."""
         call_id = f"call_{random_uuid()[:24]}"
         if name in custom_names:
             return ResponseCustomToolCall(
@@ -903,11 +929,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                 name=name,
                 input=decode_custom_tool_input(arguments),
             )
+        item_name, namespace = split_namespaced_call(name, namespaces, declared_names)
+        if namespace is not None:
+            return ResponseNamespacedFunctionToolCall(
+                arguments=arguments,
+                call_id=call_id,
+                type="function_call",
+                name=item_name,
+                namespace=namespace,
+                id=f"fc_{random_uuid()[:8]}",
+                status="completed",
+            )
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=call_id,
             type="function_call",
-            name=name,
+            name=item_name,
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
         )
@@ -1032,6 +1069,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         custom_names = custom_tool_names(request.tools)
+        namespaces = namespace_tool_names(request.tools)
+        declared_names = {
+            tool.name
+            for tool in request.tools or []
+            if tool.type in ("function", "custom") and tool.name
+        }
         tool_call_items: list[
             Union[ResponseFunctionToolCall, ResponseCustomToolCall]
         ] = []
@@ -1059,6 +1102,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 call_info.name,
                                 call_info.parameters or "",
                                 custom_names,
+                                namespaces,
+                                declared_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -1085,7 +1130,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                         tool_call_items.append(
                             self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
+                                tool["name"],
+                                arguments,
+                                custom_names,
+                                namespaces,
+                                declared_names,
                             )
                         )
                     content = ""
@@ -1115,6 +1164,8 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _make_response_output_items_with_harmony(
         self,
         context: HarmonyContext,
+        namespaces: Optional[set[str]] = None,
+        declared_names: Optional[set[str]] = None,
     ):
         output_items = []
         num_init_messages = (
@@ -1123,9 +1174,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             else context.num_init_messages
         )
         for msg in context.messages[num_init_messages:]:
-            output_items.extend(parse_output_message(msg))
+            output_items.extend(parse_output_message(msg, namespaces, declared_names))
         # Handle the generation stopped in the middle (if any).
-        last_items = parse_remaining_state(context.parser)
+        last_items = parse_remaining_state(context.parser, namespaces, declared_names)
         if last_items:
             output_items.extend(last_items)
         return output_items
@@ -1148,7 +1199,9 @@ class OpenAIServingResponses(OpenAIServingChat):
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
-        # harmony. A custom tool is shimmed into a single-string function tool.
+        # harmony. A custom tool is shimmed into a single-string function tool;
+        # a namespace tool's members flatten to ``{namespace}.{name}``
+        # functions.
         chat_tools = []
         for tool in request.tools:
             if tool.type == "function":
@@ -1156,6 +1209,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             elif tool.type == "custom" and tool.name:
                 description = custom_tool_description(tool.description, tool.format)
                 parameters = custom_tool_parameters()
+            elif tool.type == "namespace" and tool.name:
+                chat_tools.extend(namespace_members_to_chat_tools(tool))
+                continue
             else:
                 continue
             chat_tools.append(
@@ -1271,7 +1327,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
                 raw = "{}"
-            return cls._chat_tool_call_message(message, message.get("name"), raw)
+            name = message.get("name")
+            namespace = message.get("namespace")
+            if namespace and name:
+                # Re-qualify so the template sees the flattened name the
+                # model was shown at declaration time.
+                name = f"{namespace}.{name}"
+            return cls._chat_tool_call_message(message, name, raw)
         if msg_type == "custom_tool_call":
             # Replay through the same single-string shim the tool was offered as.
             return cls._chat_tool_call_message(
@@ -1626,6 +1688,12 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> AsyncGenerator[str, None]:
         created_time = created_time or int(time.time())
         sequence_number = 0
+        namespaces = namespace_tool_names(request.tools)
+        declared_names = {
+            tool.name
+            for tool in request.tools or []
+            if tool.type in ("function", "custom") and tool.name
+        }
         emitted_items = []
         active_item = None
         active_model = None
@@ -1804,11 +1872,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         async for ctx in result_generator:
             for message in ctx.messages[num_messages:]:
-                for item in parse_output_message(message):
+                for item in parse_output_message(message, namespaces, declared_names):
                     for event in _update_item(item, done=True):
                         yield event
             num_messages = len(ctx.messages)
-            for item in parse_remaining_state(ctx.parser):
+            for item in parse_remaining_state(ctx.parser, namespaces, declared_names):
                 for event in _update_item(item):
                     yield event
 
@@ -1963,6 +2031,12 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
+        namespaces = namespace_tool_names(request.tools)
+        declared_names = {
+            tool.name
+            for tool in request.tools or []
+            if tool.type in ("function", "custom") and tool.name
+        }
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
@@ -2194,6 +2268,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     name=state["name"] or "",
                     input=payload,
                 )
+                item_done_cls = openai_responses_types.ResponseOutputItemDoneEvent
                 events.append(
                     _send_event(
                         openai_responses_types.ResponseCustomToolCallInputDoneEvent(
@@ -2206,14 +2281,30 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             else:
-                completed_item = ResponseFunctionToolCall(
-                    arguments=arguments,
-                    call_id=state["call_id"],
-                    name=state["name"] or "",
-                    type="function_call",
-                    id=state["item_id"],
-                    status="completed",
+                item_name, namespace = split_namespaced_call(
+                    state["name"] or "", namespaces, declared_names
                 )
+                if namespace is not None:
+                    completed_item = ResponseNamespacedFunctionToolCall(
+                        arguments=arguments,
+                        call_id=state["call_id"],
+                        name=item_name,
+                        namespace=namespace,
+                        type="function_call",
+                        id=state["item_id"],
+                        status="completed",
+                    )
+                    item_done_cls = ResponseNamespacedOutputItemDoneEvent
+                else:
+                    completed_item = ResponseFunctionToolCall(
+                        arguments=arguments,
+                        call_id=state["call_id"],
+                        name=item_name,
+                        type="function_call",
+                        id=state["item_id"],
+                        status="completed",
+                    )
+                    item_done_cls = openai_responses_types.ResponseOutputItemDoneEvent
                 events.append(
                     _send_event(
                         openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
@@ -2222,13 +2313,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             item_id=state["item_id"],
                             output_index=state["output_index"],
                             arguments=arguments,
-                            name=state["name"] or "",
+                            name=item_name,
                         )
                     )
                 )
             events.append(
                 _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
+                    item_done_cls(
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=state["output_index"],
@@ -2418,17 +2509,40 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     name=state["name"],
                                     input="",
                                 )
-                            else:
-                                added_item = ResponseFunctionToolCall(
-                                    arguments="",
-                                    call_id=state["call_id"],
-                                    name=state["name"],
-                                    type="function_call",
-                                    id=state["item_id"],
-                                    status="in_progress",
+                                added_event_cls = (
+                                    openai_responses_types.ResponseOutputItemAddedEvent
                                 )
+                            else:
+                                item_name, namespace = split_namespaced_call(
+                                    state["name"] or "",
+                                    namespaces,
+                                    declared_names,
+                                )
+                                if namespace is not None:
+                                    added_item = ResponseNamespacedFunctionToolCall(
+                                        arguments="",
+                                        call_id=state["call_id"],
+                                        name=item_name,
+                                        namespace=namespace,
+                                        type="function_call",
+                                        id=state["item_id"],
+                                        status="in_progress",
+                                    )
+                                    added_event_cls = (
+                                        ResponseNamespacedOutputItemAddedEvent
+                                    )
+                                else:
+                                    added_item = ResponseFunctionToolCall(
+                                        arguments="",
+                                        call_id=state["call_id"],
+                                        name=item_name,
+                                        type="function_call",
+                                        id=state["item_id"],
+                                        status="in_progress",
+                                    )
+                                    added_event_cls = openai_responses_types.ResponseOutputItemAddedEvent
                             yield _send_event(
-                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                added_event_cls(
                                     type="response.output_item.added",
                                     sequence_number=-1,
                                     output_index=state["output_index"],

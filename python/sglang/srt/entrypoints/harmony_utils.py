@@ -5,7 +5,7 @@
 import datetime
 import logging
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Optional, Set, Union
 
 import orjson
 from openai.types.responses import (
@@ -46,11 +46,14 @@ from openai_harmony import (
 from sglang.srt.entrypoints.openai.protocol import (
     ReasoningEffortTier,
     ResponseInputOutputItem,
+    ResponseNamespacedFunctionToolCall,
     ResponseOutputMessage,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_reasoning_state,
     encode_custom_tool_input,
+    namespace_members_to_chat_tools,
+    split_namespaced_call,
 )
 from sglang.srt.utils import random_uuid
 
@@ -110,6 +113,7 @@ def get_developer_message(
         dev_msg_content = dev_msg_content.with_instructions(instructions)
     if tools is not None:
         function_tools = []
+        member_descriptions = []
         for tool in tools:
             if tool.type in (
                 "web_search",
@@ -120,6 +124,17 @@ def get_developer_message(
                 pass
             elif tool.type == "function":
                 function_tools.append(tool)
+            elif tool.type == "namespace" and tool.name:
+                # Members flatten to qualified functions, same as the chat
+                # path, but as harmony tool descriptions.
+                for member in namespace_members_to_chat_tools(tool):
+                    member_descriptions.append(
+                        ToolDescription.new(
+                            name=member.function.name,
+                            description=member.function.description or "",
+                            parameters=member.function.parameters,
+                        )
+                    )
             else:
                 # No harmony prompt template for the remaining built-ins;
                 # drop them so the request still runs.
@@ -127,15 +142,15 @@ def get_developer_message(
                     "harmony: ignoring unsupported response tool type %r",
                     tool.type,
                 )
-        if function_tools:
-            function_tool_descriptions = [
-                ToolDescription.new(
-                    name=tool.name,
-                    description=tool.description,
-                    parameters=tool.parameters,
-                )
-                for tool in function_tools
-            ]
+        function_tool_descriptions = [
+            ToolDescription.new(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+            )
+            for tool in function_tools
+        ] + member_descriptions
+        if function_tool_descriptions:
             dev_msg_content = dev_msg_content.with_function_tools(
                 function_tool_descriptions
             )
@@ -230,9 +245,14 @@ def parse_response_input(
         )
         if isinstance(arguments, dict):
             arguments = orjson.dumps(arguments).decode()
+        name = response_msg["name"]
+        namespace = response_msg.get("namespace")
+        if namespace and name:
+            # Re-qualify so the model sees the flattened name it was offered.
+            name = f"{namespace}.{name}"
         msg = Message.from_role_and_content(Role.ASSISTANT, arguments)
         msg = msg.with_channel("commentary")
-        msg = msg.with_recipient(f"functions.{response_msg['name']}")
+        msg = msg.with_recipient(f"functions.{name}")
         msg = msg.with_content_type("json")
     else:
         raise ValueError(f"Unknown input type: {response_msg['type']}")
@@ -286,7 +306,11 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
-def parse_output_message(message: Message):
+def parse_output_message(
+    message: Message,
+    namespaces: Optional[Set[str]] = None,
+    declared_names: Optional[Set[str]] = None,
+):
     if message.author.role != "assistant":
         # This is a message from a tool to the assistant (e.g., search result).
         # Don't include it in the final output for now. This aligns with
@@ -351,16 +375,32 @@ def parse_output_message(message: Message):
             output_items.append(reasoning_item)
     elif message.channel == "commentary" and message.recipient is not None:
         if message.recipient.startswith("functions."):
-            function_name = message.recipient.removeprefix("functions.")
+            # The recipient keeps the full dotted suffix; declared
+            # namespaces split it back onto the wire item's fields.
+            item_name, namespace = split_namespaced_call(
+                message.recipient.removeprefix("functions."),
+                namespaces or frozenset(),
+                declared_names or frozenset(),
+            )
             for content in message.content:
                 random_id = random_uuid()
-                response_item = ResponseFunctionToolCall(
-                    arguments=content.text,
-                    call_id=f"call_{random_id}",
-                    type="function_call",
-                    name=function_name,
-                    id=f"ft_{random_id}",
-                )
+                if namespace is None:
+                    response_item = ResponseFunctionToolCall(
+                        arguments=content.text,
+                        call_id=f"call_{random_id}",
+                        type="function_call",
+                        name=item_name,
+                        id=f"ft_{random_id}",
+                    )
+                else:
+                    response_item = ResponseNamespacedFunctionToolCall(
+                        arguments=content.text,
+                        call_id=f"call_{random_id}",
+                        type="function_call",
+                        name=item_name,
+                        namespace=namespace,
+                        id=f"ft_{random_id}",
+                    )
                 output_items.append(response_item)
         elif message.recipient.startswith("python") or message.recipient.startswith(
             "browser"
@@ -406,7 +446,11 @@ def parse_output_message(message: Message):
     return output_items
 
 
-def parse_remaining_state(parser: StreamableParser):
+def parse_remaining_state(
+    parser: StreamableParser,
+    namespaces: Optional[Set[str]] = None,
+    declared_names: Optional[Set[str]] = None,
+):
     if not parser.current_content:
         return []
     if parser.current_role != Role.ASSISTANT:
@@ -441,12 +485,29 @@ def parse_remaining_state(parser: StreamableParser):
         return [reasoning_item]
     elif current_recipient is not None and current_recipient.startswith("functions."):
         random_id = random_uuid()
+        item_name, namespace = split_namespaced_call(
+            current_recipient.removeprefix("functions."),
+            namespaces or frozenset(),
+            declared_names or frozenset(),
+        )
+        if namespace is None:
+            return [
+                ResponseFunctionToolCall(
+                    id=f"ft_{random_id}",
+                    call_id=f"call_{random_id}",
+                    type="function_call",
+                    name=item_name,
+                    arguments=parser.current_content,
+                    status="in_progress",
+                )
+            ]
         return [
-            ResponseFunctionToolCall(
+            ResponseNamespacedFunctionToolCall(
                 id=f"ft_{random_id}",
                 call_id=f"call_{random_id}",
                 type="function_call",
-                name=current_recipient.removeprefix("functions."),
+                name=item_name,
+                namespace=namespace,
                 arguments=parser.current_content,
                 status="in_progress",
             )
