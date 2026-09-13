@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
+    marlin_init_stream_workspaces,
     marlin_make_workspace,
     marlin_permute_bias,
     marlin_permute_scales,
@@ -178,6 +179,7 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     device = layer.weight.device
     layer.workspace = marlin_make_workspace(device)
+    marlin_init_stream_workspaces(layer)
 
     perm = torch.empty(0, dtype=torch.int, device=device)
     qweight = layer.weight.view(torch.int32).T.contiguous()
@@ -380,6 +382,7 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     device = w13.device
     layer.workspace = marlin_make_workspace(device, 4)
+    marlin_init_stream_workspaces(layer, max_blocks_per_sm=4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     def _pad_w13(x: torch.Tensor) -> torch.Tensor:
@@ -490,6 +493,7 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     device = w13.device
     layer.workspace = marlin_make_workspace(device, 4)
+    marlin_init_stream_workspaces(layer, max_blocks_per_sm=4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     if not layer.moe_runner_config.is_gated:

@@ -276,6 +276,52 @@ def marlin_make_workspace(
     )
 
 
+def marlin_stream_workspaces_enabled() -> bool:
+    """True when PDMux stream groups exist and workspaces must be split."""
+    try:
+        from sglang.srt.multiplex.pdmux_context import get_stream_groups
+
+        return len(get_stream_groups()) > 0
+    except Exception:  # noqa: BLE001 - feature probe must never break forward
+        return False
+
+
+def marlin_init_stream_workspaces(layer: torch.nn.Module, **make_kwargs) -> None:
+    """Opt a layer into per-executing-stream workspaces under PDMux.
+
+    No-op without PDMux: every launch stays serialized on one stream and the
+    original per-layer workspace remains correct.
+    """
+    if marlin_stream_workspaces_enabled():
+        layer.marlin_stream_workspaces = {}
+        if make_kwargs:
+            layer.marlin_workspace_make_kwargs = make_kwargs
+
+
+def get_marlin_workspace_for_forward(layer: torch.nn.Module) -> torch.Tensor:
+    """Return a Marlin workspace private to the executing CUDA stream.
+
+    Marlin kernels use the workspace for cross-CTA synchronization and assume
+    every launch touching one workspace is serialized on a single stream.
+    Under PD-Multiplexing the decode forward and the split-prefill slice of
+    the same layer run concurrently on two green-context streams, so sharing
+    one per-layer workspace lets both launches consume the same barrier
+    slots and a CTA can spin forever. Without PDMux this returns the
+    original per-layer workspace and nothing changes.
+    """
+    workspaces = getattr(layer, "marlin_stream_workspaces", None)
+    if workspaces is None:
+        return layer.workspace
+    stream = torch.cuda.current_stream()
+    key = (stream.device.index, stream.cuda_stream)
+    workspace = workspaces.get(key)
+    if workspace is None:
+        make_kwargs = getattr(layer, "marlin_workspace_make_kwargs", None) or {}
+        workspace = marlin_make_workspace(stream.device, **make_kwargs)
+        workspaces[key] = workspace
+    return workspace
+
+
 def marlin_is_k_full(act_order: bool, is_row_parallel: bool) -> bool:
     return (not act_order) or (act_order and not is_row_parallel)
 
