@@ -1749,6 +1749,49 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         return self._stream_one_response(obj=obj, state=state, request=request)
 
+    async def _is_request_disconnected(self, request: fastapi.Request) -> bool:
+        """Poll whether the client is still connected, tolerating cancellation
+        of the poll itself.
+
+        ``Request.is_disconnected()`` awaits the ASGI ``receive`` channel. If
+        the transport is torn down while that await is pending (the client
+        closed its socket, a proxy reset the connection, etc.), uvicorn/h11
+        cancels the pending receive, which surfaces here as
+        ``asyncio.CancelledError``. Since Python 3.8, ``CancelledError`` is a
+        ``BaseException``, not an ``Exception``, so it silently bypasses every
+        ``except Exception`` handler in the request-handling call stack. Left
+        uncaught, it propagates out of this task and is mistaken for a fatal
+        engine error upstream, which brings down the whole process for what
+        is really just one client disconnecting.
+
+        This poll only touches the HTTP/ASGI transport layer -- it never
+        reaches the scheduler process, the KV cache, or any CUDA state (those
+        live behind an IPC boundary) -- so it's safe to treat a cancellation
+        observed here as "the client disconnected" and let the normal
+        disconnect path run. The one case we must NOT swallow is our own task
+        being cancelled on purpose, e.g. during graceful server shutdown --
+        that has to keep propagating or shutdown can hang.
+        """
+        try:
+            return await request.is_disconnected()
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and hasattr(current_task, "cancelling"):
+                # Python 3.11+: Task.cancelling() tells us precisely whether
+                # *this* task has a cancellation request pending. If it does,
+                # this CancelledError is ours to honor, not the transport's.
+                if current_task.cancelling() > 0:
+                    raise
+            elif self.gracefully_exit:
+                # Python 3.10 has no Task.cancelling(); fall back to the
+                # engine's own shutdown flag as the next-best signal that
+                # this cancellation was intentional rather than transport-driven.
+                raise
+            # Otherwise, the cancellation came from the transport tearing
+            # down the connection itself -- treat it the same as a normal
+            # disconnected-client observation.
+            return True
+
     async def _stream_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1766,7 +1809,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._is_request_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
@@ -1854,7 +1897,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._is_request_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
