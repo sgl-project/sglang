@@ -5,13 +5,15 @@ use std::sync::Arc;
 use pyo3::PyErr;
 use pyo3::Python;
 use pyo3::exceptions::{PyTypeError, PyValueError};
-use tokio::sync::{Notify, mpsc::Receiver};
+use tokio::sync::{Notify, mpsc::Receiver, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
+use tonic_health::pb::health_server::HealthServer;
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
+use crate::health::StandardHealthService;
 use crate::proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
@@ -984,6 +986,8 @@ pub async fn run_grpc_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let (health_shutdown, health_stopping) = watch::channel(false);
+    let health_service = StandardHealthService::new(bridge.clone(), health_stopping);
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
@@ -998,8 +1002,11 @@ pub async fn run_grpc_server(
 
     tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(HealthServer::new(health_service))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
+            // Report NOT_SERVING before draining in-flight health checks.
+            let _ = health_shutdown.send(true);
             tracing::info!("gRPC server shutting down");
         })
         .await?;

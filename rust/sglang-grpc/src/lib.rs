@@ -1,4 +1,5 @@
 pub mod bridge;
+mod health;
 pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
@@ -27,10 +28,13 @@ struct GrpcServerHandle {
 #[pymethods]
 impl GrpcServerHandle {
     /// Gracefully shut down the gRPC server.
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, py: Python<'_>) {
         self.shutdown.notify_one();
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            // In-flight health checks may need the GIL before the server can exit.
+            py.detach(move || {
+                let _ = handle.join();
+            });
         }
     }
 
