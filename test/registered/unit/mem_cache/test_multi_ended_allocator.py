@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.schedule_policy import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -40,6 +41,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -558,6 +560,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         swa_layer_num=2,
         head_num=2,
         head_dim=4,
+        page_size=1,
     ):
         full_spec = MHASubPoolSpec(
             name="full",
@@ -584,6 +587,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         allocator = UnifiedSWATokenToKVPoolAllocator(
@@ -592,10 +596,174 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             device=_DEV,
             full_max_total_num_tokens=n_full_slots,
             swa_max_total_num_tokens=n_swa_slots,
+            page_size=page_size,
             need_sort=False,
             forward_stream=None,
         )
         return pool, allocator, kvcache
+
+    def test_reclaim_plan_matches_exhaustive_page_targets(self):
+        page_size = 4
+        _, allocator, _ = self._build(
+            n_full_slots=40, n_swa_slots=24, page_size=page_size
+        )
+        allocator.lazy_compaction = True
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.lazy_compaction = True
+            sub_pool.disagg_move_gate = lambda: False
+        live = allocator.alloc(16)
+        self.assertIsNotNone(live)
+        allocator.free(live[4:8])
+        allocator.free_swa(live[8:12])
+
+        for compacted in (False, True):
+            for sub_pool in (
+                allocator.full_attn_allocator,
+                allocator.swa_attn_allocator,
+            ):
+                sub_pool.disagg_move_gate = lambda: compacted
+            for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
+                max_full = min(12, full_evictable) // page_size
+                max_swa = min(8, swa_evictable) // page_size
+                for full_pages in range(9):
+                    for swa_pages in range(9):
+                        feasible = [
+                            (full * page_size, swa * page_size)
+                            for swa in range(max_swa + 1)
+                            for full in range(max_full + 1)
+                            if allocator._fits_page_demand(
+                                full_pages,
+                                swa_pages,
+                                full_reclaim_pages=full,
+                                swa_reclaim_pages=swa,
+                                compacted=compacted,
+                            )
+                        ]
+                        with self.subTest(
+                            compacted=compacted,
+                            evictable=(full_evictable, swa_evictable),
+                            pages=(full_pages, swa_pages),
+                        ):
+                            self.assertEqual(
+                                allocator.reclaim_plan(
+                                    full_pages * page_size,
+                                    swa_pages * page_size,
+                                    full_evictable_tokens=full_evictable,
+                                    swa_evictable_tokens=swa_evictable,
+                                ),
+                                feasible[0] if feasible else None,
+                            )
+
+    def test_restore_swa_without_allocating_more_full(self):
+        _, allocator, _ = self._build(page_size=4)
+        indices = allocator.alloc(8)
+        full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
+        allocator.free_swa(indices)
+
+        self.assertEqual(allocator.reclaim_plan(0, 8), (0, 0))
+        self.assertTrue(allocator.can_reserve(0, 8))
+        self.assertTrue(allocator.ensure_capacity(0, 8))
+        allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_kv_indices_for_transfer(indices), full_before
+            )
+        )
+        self.assertTrue(
+            bool((allocator.swa_attn_allocator.translate_kv_loc(indices) > 0).all())
+        )
+
+    def test_empty_pool_reservation_matches_packed_byte_boundary(self):
+        page_size = 4
+        _, allocator, _ = self._build(
+            n_full_slots=40,
+            n_swa_slots=24,
+            full_layer_num=4,
+            swa_layer_num=2,
+            page_size=page_size,
+        )
+        full_allocator = allocator.full_attn_allocator
+        swa_allocator = allocator.swa_attn_allocator
+        swa_pages = 2
+        full_pages = (
+            allocator._empty_shared_gap_bytes
+            - swa_pages * swa_allocator.entry_bytes_per_page
+        ) // full_allocator.entry_bytes_per_page
+        packed_bytes = (
+            full_pages * full_allocator.entry_bytes_per_page
+            + swa_pages * swa_allocator.entry_bytes_per_page
+        )
+
+        self.assertLessEqual(
+            full_pages + 1, full_allocator.num_pages - full_allocator.min_page_index
+        )
+        self.assertLessEqual(
+            swa_pages, swa_allocator.num_pages - swa_allocator.min_page_index
+        )
+        self.assertLessEqual(packed_bytes, allocator._empty_shared_gap_bytes)
+        self.assertGreater(
+            packed_bytes + full_allocator.entry_bytes_per_page,
+            allocator._empty_shared_gap_bytes,
+        )
+        self.assertTrue(
+            allocator.can_reserve(
+                full_pages * page_size,
+                swa_pages * page_size,
+                empty_pool=True,
+            )
+        )
+        self.assertFalse(
+            allocator.can_reserve(
+                full_pages * page_size + 1,
+                swa_pages * page_size,
+                empty_pool=True,
+            )
+        )
+
+        extend_tokens = 32
+        max_new_tokens = 0
+        reservation_full_tokens = extend_tokens + max_new_tokens + page_size
+        reservation_swa_tokens = estimate_swa_kv_tokens(
+            extend_tokens,
+            max_new_tokens,
+            sliding_window_size=16,
+            page_size=page_size,
+            allocation_limit=16,
+        )
+        reservation_swa_with_tail = estimate_swa_kv_tokens(
+            extend_tokens,
+            max_new_tokens,
+            sliding_window_size=16,
+            page_size=page_size,
+        )
+        reservation_bytes = (
+            reservation_full_tokens // page_size
+        ) * full_allocator.entry_bytes_per_page + (
+            reservation_swa_tokens // page_size
+        ) * swa_allocator.entry_bytes_per_page
+        reservation_bytes_with_tail = (
+            reservation_full_tokens // page_size
+        ) * full_allocator.entry_bytes_per_page + (
+            reservation_swa_with_tail // page_size
+        ) * swa_allocator.entry_bytes_per_page
+        self.assertLessEqual(reservation_bytes, allocator._empty_shared_gap_bytes)
+        self.assertGreater(
+            reservation_bytes_with_tail, allocator._empty_shared_gap_bytes
+        )
+        self.assertTrue(
+            allocator.can_reserve(
+                reservation_full_tokens,
+                reservation_swa_tokens,
+                empty_pool=True,
+            )
+        )
+        self.assertFalse(
+            allocator.can_reserve(
+                reservation_full_tokens,
+                reservation_swa_with_tail,
+                empty_pool=True,
+            )
+        )
 
     def _alloc(self, allocator, kvcache, n):
         """Allocate N virtual ids; stamp the data marker on both sub-pools."""
@@ -2354,6 +2522,29 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
         expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
         self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+
+    def test_swa_transfer_page_is_physical_not_kernel_scaled(self):
+        mult = 2 * self.SWA_L
+        a = self._build()
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+
+        physical_pages = a.swa_attn_allocator.virtual_to_physical[
+            v[:: self.PS] // self.PS
+        ]
+        physical_tokens = a.swa_attn_allocator.translate_kv_loc(v)
+        transfer_tokens = a.translate_swa_indices_for_transfer(v)
+        self.assertTrue(torch.equal(transfer_tokens, physical_tokens))
+        self.assertEqual(
+            kv_to_page_indices(transfer_tokens, self.PS).tolist(),
+            physical_pages.tolist(),
+        )
+
+        kernel_tokens = a.translate_loc_from_full_to_swa(v)
+        self.assertEqual(
+            kv_to_page_indices(kernel_tokens, self.PS).tolist(),
+            (physical_pages * mult).tolist(),
+        )
 
     def test_swa_kernel_tombstone_still_lands_on_sink(self):
         """The scaled stride must not break the tombstone clamp: a tombstoned

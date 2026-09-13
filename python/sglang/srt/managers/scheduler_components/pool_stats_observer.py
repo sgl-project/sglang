@@ -14,6 +14,7 @@ from typing import (
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
+    supports_swa_byte_budget,
 )
 
 if TYPE_CHECKING:
@@ -38,6 +39,8 @@ class PoolStats:
     is_hisparse: bool = False
 
     # For hybrid-swa pools
+    full_capacity: Optional[int] = None
+    swa_capacity: Optional[int] = None
     swa_num_used: Optional[int] = None
     swa_token_usage: Optional[float] = None
     swa_available_size: Optional[int] = None
@@ -288,30 +291,37 @@ class SchedulerPoolStatsObserver:
             mamba_evictable_size=mamba_evictable_size,
         )
 
-    def _get_swa_token_info(self) -> PoolStats:
-        # `*_num_used` is `static_cap - (available + evictable)`, so the
-        # available term must match the static cap's denomination: the conserve
-        # view, never the byte-coordinated one (see
-        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
+    def _swa_capacity_and_available(self) -> tuple[tuple[int, int], tuple[int, int]]:
         allocator = self.token_to_kv_pool_allocator
+        if supports_swa_byte_budget(allocator):
+            return (
+                (allocator.current_full_capacity, allocator.full_available_size()),
+                (allocator.current_swa_capacity, allocator.swa_available_size()),
+            )
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # The tri-pool reports static capacities paired with conserve views.
             full_available_size = allocator.conserve_full_available_size()
             swa_available_size = allocator.conserve_swa_available_size()
         else:
             full_available_size = allocator.full_available_size()
             swa_available_size = allocator.swa_available_size()
+        return (
+            (self.full_tokens_per_layer, full_available_size),
+            (self.swa_tokens_per_layer, swa_available_size),
+        )
+
+    def _get_swa_token_info(self) -> PoolStats:
+        (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
+            self._swa_capacity_and_available()
+        )
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix
         # prefixes still report swa_evictable; counting it drives usage negative.
         if is_swa_req_ring(self.token_to_kv_pool_allocator):
             swa_evictable_size = 0
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
+        swa_num_used = swa_capacity - (swa_available_size + swa_evictable_size)
         # FIXME(hisparse): host-backup transiently over-releases the device pool
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
@@ -319,16 +329,23 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
+        if not swa_capacity:
+            swa_num_used = 0
+            swa_available_size = 0
+            swa_token_usage = 0.0
+        else:
+            swa_token_usage = swa_num_used / swa_capacity
 
         return PoolStats(
             is_hybrid_swa=True,
+            full_capacity=full_capacity,
+            swa_capacity=swa_capacity,
             full_num_used=full_num_used,
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,

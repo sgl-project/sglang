@@ -413,6 +413,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_tail_len = MagicMock(return_value=8)
+        queue._prealloc_required_tokens = MagicMock(return_value=(8, 8))
         queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
         queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8)
         queue._match_prefix_and_lock = MagicMock(
@@ -477,7 +478,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
-        queue._swa_tail_len.assert_called_once_with(8)
+        queue._swa_tail_len.assert_called_with(8)
         queue._allocatable_token_budgets.assert_called_once()
 
     def test_hicache_restore_commit_hands_over_lock_with_receipt(self):

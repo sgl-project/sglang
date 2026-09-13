@@ -690,11 +690,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Published layer IDs give exact pairing; plain-MHA peers publish none
         # and keep positional slicing.
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        # Unified SWA publishes one page-envelope region even on an MHA backend.
+        is_single_region_swa = (
+            state_type == StateType.SWA
+            and len(src_data_ptrs) == 1
+            and len(dst_data_ptrs) == 1
+        )
         if (
             self.is_mla_backend
             or self.is_hybrid_mla_backend
             or force_flat
             or has_layer_ids
+            or is_single_region_swa
         ):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
@@ -957,6 +964,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            force_flat=get_memory().enable_unified_memory,
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,

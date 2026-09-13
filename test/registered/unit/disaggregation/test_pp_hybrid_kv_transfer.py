@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
@@ -14,6 +15,8 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.runtime_context import get_memory, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +73,7 @@ class TestTransferStartLayer(CustomTestCase):
 
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
+    get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -140,6 +144,50 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
     def test_f5_of_n12(self):
         ids = _full_attention_ids(num_layers=48, interval=4)
         self._run_case(model_full_ids=ids, stage_full_ids=ids[:5], start_offset=0)
+
+
+class TestSingleRegionSWATransfer(CustomTestCase):
+    def test_one_region_full_generates_transfer_block(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        manager.kv_args.kv_data_ptrs = [1000]
+        manager.kv_args.kv_item_lens = [64]
+        manager.kv_args.kv_layer_ids = []
+        manager._validate_envelope_kv_layout = (
+            MooncakeKVManager._validate_envelope_kv_layout.__get__(manager)
+        )
+        manager._send_kvcache_generic = MooncakeKVManager._send_kvcache_generic.__get__(
+            manager
+        )
+        with get_memory().override(enable_unified_memory=True):
+            rc = MooncakeKVManager.send_kvcache(
+                manager,
+                mooncake_session_id="session",
+                prefill_kv_indices=np.array([3, 4], dtype=np.int32),
+                dst_kv_ptrs=[2000],
+                dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                dst_kv_item_len=64,
+                executor=None,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(manager.blocks, [(1192, 2448, 128)])
+
+    def test_one_region_swa_generates_transfer_block(self):
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        rc = MooncakeKVManager._send_kvcache_generic(
+            manager,
+            mooncake_session_id="session",
+            src_data_ptrs=[1000],
+            dst_data_ptrs=[2000],
+            item_lens=[64],
+            prefill_data_indices=np.array([3, 4], dtype=np.int32),
+            dst_data_indices=np.array([7, 8], dtype=np.int32),
+            executor=None,
+            state_type=StateType.SWA,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(manager.blocks, [(1000 + 3 * 64, 2000 + 7 * 64, 2 * 64)])
 
 
 class TestGetMhaKvPtrsWithPp(CustomTestCase):

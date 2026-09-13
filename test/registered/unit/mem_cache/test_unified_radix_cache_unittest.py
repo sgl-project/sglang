@@ -4137,7 +4137,7 @@ class UnifiedRadixCacheSuite:
 
     def test_buffer_load_back_swa_window_charged_at_admission(self):
         """Admission contract: a request the SWA budget gate accepts must be
-        allocatable at batch time (_swa_reserved_tokens: "an admitted request
+        allocatable at batch time (estimate_swa_kv_tokens: "an admitted request
         cannot OOM"). Regression: buffer mode surfaced a staged prefetch as
         host_hit_length only, so the gate never charged the SWA window that
         consumption (init_load_back -> cc.load) allocates and the request
