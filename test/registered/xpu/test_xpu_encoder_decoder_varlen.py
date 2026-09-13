@@ -2,13 +2,12 @@
 
 The backend calls flash_attn_with_kvcache with a page_size=1 view; sgl-kernel-xpu
 PR #454 detects that and gathers + runs varlen inside the kernel. This runs on an
-actual XPU and guards what a mocked CPU test cannot: _forward_attn_flat_page_table
+actual XPU and guards what a mocked CPU test cannot: _forward_encoder_decoder_attn
 plus the real kernel produce correct attention for a scattered (non-page-aligned)
 token-slot layout, for both cross-attn (non-causal) and decoder self-attn (causal).
 """
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -85,30 +84,23 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             .to(self.dev)
         )
         q = torch.randn(num_rows, self.H, self.D, dtype=torch.bfloat16, device=self.dev)
-        layer = SimpleNamespace(
-            is_cross_attention=not causal,
-            tp_q_head_num=self.H,
-            tp_k_head_num=self.H,
-            tp_v_head_num=self.H,
-            head_dim=self.D,
-            scaling=0.5,
-            logit_cap=0.0,
-        )
+        scale, softcap = 0.5, 0.0
         key_cache = self.k_flat.view(-1, 1, self.H, self.D)
         value_cache = self.v_flat.view(-1, 1, self.H, self.D)
 
         # causal=True mirrors decoder self-attn, causal=False cross-attn; the
         # generic helper takes the (page_table, cache_seqlens, causal) that the
         # caller's _encoder_decoder_page_table dispatch would have selected.
-        got = self.backend._forward_attn_flat_page_table(
+        got = self.backend._forward_encoder_decoder_attn(
             q=q,
             key_cache=key_cache,
             value_cache=value_cache,
-            layer=layer,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=1,
+            scale=scale,
+            softcap=softcap,
             causal=causal,
         )
         torch.xpu.synchronize()
@@ -119,7 +111,7 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            scale=layer.scaling,
+            scale=scale,
             causal=causal,
         )
         self.assertEqual(tuple(got.shape), (num_rows, self.H, self.D))

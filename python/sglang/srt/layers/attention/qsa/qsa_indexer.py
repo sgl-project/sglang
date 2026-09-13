@@ -321,6 +321,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
+            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
