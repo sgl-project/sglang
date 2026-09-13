@@ -116,13 +116,16 @@ def transform_index_page_table_decode_kernel(
     tl.store(result_ptr + offset, -1, mask=~mask)
 
 
-@triton.jit
+# Expanded EAGLE page tables are contiguous, so their row stride changes with
+# the exact context length. Treating it as constexpr creates one cubin per
+# observed length and grows the loaded-module set in long-lived processes.
+@triton.jit(do_not_specialize=["page_table_stride_0"])
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,

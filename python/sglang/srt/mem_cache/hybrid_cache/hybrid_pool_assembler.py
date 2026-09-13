@@ -788,8 +788,11 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
     mtp_draft_device_pools = tuple(
-        pool.full_kv_pool for pool in params.mtp_draft_device_pools
+        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+        for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
@@ -915,7 +918,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
-        allocator_type=get_memory().hicache_storage_backend,
+        allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
     )
     entries = [
@@ -1297,7 +1300,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             _build_deepseek_v4_device_pool_group,
         )
 
-        return _build_deepseek_v4_device_pool_group(kvcache, page_size)
+        return _build_deepseek_v4_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1569,7 +1574,9 @@ class _DsaStrategy(StackStrategy):
             _build_dsa_device_pool_group,
         )
 
-        return _build_dsa_device_pool_group(kvcache, page_size)
+        return _build_dsa_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1893,7 +1900,7 @@ def build_minimax_sparse_hicache_stack(
             index_k_pool,
             kv_host_pool,
             get_memory().hicache_mem_layout,
-            allocator_type=get_memory().hicache_storage_backend,
+            allocator_type=_get_allocator_type(),
         )
         entries.append(
             build_pool_entry(

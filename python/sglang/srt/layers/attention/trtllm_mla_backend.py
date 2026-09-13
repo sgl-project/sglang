@@ -766,19 +766,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
-            out_cache_loc = forward_batch.out_cache_loc
-            n = out_cache_loc.shape[0]
-            dst = self.cuda_graph_out_cache_loc_kernel[:n]
-            dst.copy_(out_cache_loc)
-            # Replay-prep receives the RAW (unpadded) out_cache_loc
-            # (build_replay_fb_view), but the captured write kernel consumes the
-            # full captured tier of this buffer. Zero the tail so pad rows write
-            # to the sink (row 0) instead of stale kernel-facing locs left by
-            # earlier larger replays — a stale tail scatters pad-row garbage into
-            # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
-            # out_cache_loc slot.
-            self.cuda_graph_out_cache_loc_kernel[n:].zero_()
-            self._decode_kernel_loc = dst
+            # The captured kernel consumes the whole buffer, so the tail a
+            # shorter replay leaves must go to slot 0 rather than live pages.
+            self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
+                out=self.cuda_graph_out_cache_loc_kernel,
+                forward_batch=forward_batch,
+                width=self.cuda_graph_out_cache_loc_kernel.numel(),
+            )
         else:
             self._decode_kernel_loc = None
 

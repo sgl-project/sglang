@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -11,8 +12,16 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    get_fixed_sequence_metadata,
+    get_host_sequence_lengths,
+    get_request_skip_softmax_params,
+    run_skip_softmax,
 )
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
@@ -365,6 +374,7 @@ class FlashAttentionImpl(AttentionImpl):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -372,7 +382,25 @@ class FlashAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.is_cross_attention = is_cross_attention
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
         self.attention_metadata = FlashAttentionMetadata()
+
+    def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
+        params = get_request_skip_softmax_params()
+        if params is None or self.is_cross_attention:
+            return False, None
+        current_step = get_forward_context().current_timestep
+        if not isinstance(current_step, Integral):
+            raise RuntimeError(
+                "Skip Softmax requires the denoising loop to publish an integer "
+                f"step index, got {current_step!r}."
+            )
+        if current_step < params.start_step:
+            return True, None
+        return True, params.threshold_scale_factor
 
     def forward(
         self,
@@ -383,6 +411,38 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
+            if return_softmax_lse:
+                raise NotImplementedError(
+                    "Skip Softmax does not support the LSE output required by "
+                    "Ring Attention."
+                )
+            batch_size, query_length = query.shape[:2]
+            kv_length = key.shape[1]
+            metadata = get_fixed_sequence_metadata(
+                query.device,
+                batch_size,
+                query_length,
+                kv_length,
+            )
+            output = run_skip_softmax(
+                query.reshape(-1, query.shape[-2], query.shape[-1]),
+                key.reshape(-1, key.shape[-2], key.shape[-1]),
+                value.reshape(-1, value.shape[-2], value.shape[-1]),
+                seq_lens=metadata.seq_lens,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_kv=metadata.cu_seqlens_kv,
+                max_seqlen_q=query_length,
+                max_seqlen_kv=kv_length,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                threshold_scale_factor=skip_threshold,
+                q_seq_lens_cpu=metadata.q_seq_lens_cpu,
+                kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
+            )
+            return output.view(batch_size, query_length, *output.shape[1:])
+
         if attn_metadata is not None:
             if attn_metadata.max_seqlen_q is None:
                 attn_metadata.max_seqlen_q = query.shape[1]
@@ -457,7 +517,62 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
+            bounds = cu_seqlens_host
+            used = (
+                trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=bounds,
+                )
+                if self.packed_trailing_padding and bounds is not None
+                else None
+            )
+            if used is not None:
+                live_cu_seqlens = cu_seqlens[:2]
+                live_output = run_skip_softmax(
+                    query[:used],
+                    key[:used],
+                    value[:used],
+                    seq_lens=live_cu_seqlens[1:] - live_cu_seqlens[:-1],
+                    cu_seqlens_q=live_cu_seqlens,
+                    cu_seqlens_kv=live_cu_seqlens,
+                    max_seqlen_q=used,
+                    max_seqlen_kv=used,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    threshold_scale_factor=skip_threshold,
+                    q_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                    kv_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                )
+                output = live_output.new_zeros(
+                    query.shape[0], query.shape[1], value.shape[2]
+                )
+                output[:used] = live_output
+                return output
+
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            seq_lens_cpu = (
+                get_host_sequence_lengths(cu_seqlens_host)
+                if cu_seqlens_host is not None
+                else None
+            )
+            return run_skip_softmax(
+                query,
+                key,
+                value,
+                seq_lens=seq_lens,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                threshold_scale_factor=skip_threshold,
+                q_seq_lens_cpu=seq_lens_cpu,
+                kv_seq_lens_cpu=seq_lens_cpu,
+            )
         output = flash_attn_varlen_func(
             query,
             key,

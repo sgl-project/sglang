@@ -65,6 +65,7 @@ def test_pruned_adaln_lora_projection_preserves_affine_term():
         arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
         adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
         adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+        _adaln_precomputed=False,
     )
     prefix = "blocks.0.adaln_proj.linear."
     a = torch.tensor([[2.0, 3.0, 4.0]])
@@ -237,7 +238,9 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
+    block.attn.qkv_proj = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     block.mlp = torch.nn.Identity()
+    block.mlp.fc1 = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):

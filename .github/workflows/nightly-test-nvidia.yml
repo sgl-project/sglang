@@ -152,8 +152,6 @@ jobs:
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
       scheduled: true
-      # aarch64: the rust-ext cache key is x86_64-only, same reason base-c skips it.
-      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-h200:

@@ -188,6 +188,17 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             f"got {mova_num_experts!r}."
         )
     is_mova = mova_num_experts > 0
+    num_experts = getattr(config, "num_experts", 0)
+    if (
+        isinstance(num_experts, bool)
+        or not isinstance(num_experts, int)
+        or num_experts < 0
+    ):
+        raise ValueError(
+            "K2Horizon num_experts must be a non-negative integer, "
+            f"got {num_experts!r}."
+        )
+    has_moe_ffn = num_experts > 0
 
     if is_mova:
         if _get_xllm_source_router_gemm_partitions(config) is None:
@@ -247,14 +258,21 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             target_name="num_values_per_tok",
             value=0,
         )
-        for field in ("num_experts", "num_experts_per_tok", "num_shared_experts"):
-            value = getattr(config, field, 0)
-            if isinstance(value, bool) or not isinstance(value, int) or value != 0:
-                raise ValueError(f"Dense K2Horizon requires {field}=0, got {value!r}")
-            # Some dense exports omit the MoE-only fields. Downstream model
-            # construction reads them directly, so materialize the validated
-            # dense defaults instead of relying on getattr fallbacks forever.
-            setattr(config, field, 0)
+        if not has_moe_ffn:
+            for field in (
+                "num_experts",
+                "num_experts_per_tok",
+                "num_shared_experts",
+            ):
+                value = getattr(config, field, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                    raise ValueError(
+                        f"Dense K2Horizon requires {field}=0, got {value!r}"
+                    )
+                # Some dense exports omit the MoE-only fields. Downstream model
+                # construction reads them directly, so materialize the validated
+                # dense defaults instead of relying on getattr fallbacks forever.
+                setattr(config, field, 0)
         if getattr(config, "query_key_norm", False):
             raise ValueError(
                 "Dense K2Horizon native loading does not support query/key "
@@ -489,7 +507,7 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
                 "K2Horizon MoVA requires mlp_only_layers to be a contiguous "
                 f"prefix starting at zero, got {list(mlp_only_layers)}"
             )
-        if not is_mova and list(mlp_only_layers) != list(
+        if not has_moe_ffn and list(mlp_only_layers) != list(
             range(config.num_hidden_layers)
         ):
             raise ValueError(
@@ -501,7 +519,7 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             target_name="num_dense_layers",
             value=len(mlp_only_layers),
         )
-    elif not is_mova:
+    elif not has_moe_ffn:
         raise ValueError(
             "Dense K2Horizon native loading requires explicit mlp_only_layers"
         )
@@ -643,10 +661,10 @@ def _validate_mova_config(
                 "the released checkpoints persist float32 dtype metadata but "
                 "their weights and validated runtime contract are BF16."
             )
-        if quant_config is not None:
+        if quant_config is not None and quant_config.get_name() != "compressed_tensors":
             raise ValueError(
-                "Native xLLM/K2 Horizon serving does not support quantized "
-                "model weights"
+                "Native xLLM/K2 Horizon serving supports only "
+                "compressed-tensors quantized model weights"
             )
 
         runtime = get_exec()
@@ -1667,6 +1685,14 @@ class XllmModel(nn.Module):
 
 class XllmForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    # Quantized checkpoints store these projections separately. This mapping
+    # lets quantization configs resolve fused runtime modules and their ignore
+    # lists consistently.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,

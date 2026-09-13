@@ -103,6 +103,20 @@ class HunyuanDetector(BaseFormatDetector):
     def __init__(self, tokenizer=None):
         super().__init__()
 
+        # Hy4 dropped <tool_sep> from its vocab entirely; Hy3 carries it (bare
+        # or suffixed). Detect the dialect from the vocab, not from the
+        # resolved literal (which falls back to "<tool_sep>" for both).
+        self._has_tool_sep = True
+        if tokenizer is not None:
+            try:
+                self._has_tool_sep = any(
+                    re.fullmatch(r"<tool_sep(?::[^>]+)?>", tok)
+                    for tok in tokenizer.get_vocab()
+                    if isinstance(tok, str)
+                )
+            except Exception:
+                pass
+
         t = resolve_hunyuan_tokens(tokenizer)
         tool_calls = t["tool_calls"]
         tool_call = t["tool_call"]
@@ -129,7 +143,13 @@ class HunyuanDetector(BaseFormatDetector):
         self.tool_call_regex = re.compile(
             re.escape(tool_call)
             + r"(.*?)"
+            + r"(?:"
             + re.escape(tool_sep)
+            + r"|(?="
+            + re.escape(arg_key)
+            + r"|"
+            + re.escape(tc_end)
+            + r"))"
             + r"(.*?)"
             + re.escape(tc_end),
             re.DOTALL,
@@ -383,14 +403,22 @@ class HunyuanDetector(BaseFormatDetector):
                         self._in_tool_calls = False
                     break
 
-                sep_pos = self._buffer.find(self.tool_sep_token, tc_start)
-                if sep_pos == -1:
+                name_start = tc_start + len(self.tool_call_start_token)
+                boundaries = [
+                    (self._buffer.find(token, name_start), token)
+                    for token in (
+                        self.tool_sep_token,
+                        self.arg_key_start_token,
+                        self.tool_call_end_token,
+                    )
+                ]
+                boundaries = [(pos, token) for pos, token in boundaries if pos != -1]
+                if not boundaries:
                     self._buffer = self._buffer[tc_start:]
                     break
+                boundary_pos, boundary_token = min(boundaries, key=lambda item: item[0])
 
-                tool_name = self._buffer[
-                    tc_start + len(self.tool_call_start_token) : sep_pos
-                ].strip()
+                tool_name = self._buffer[name_start:boundary_pos].strip()
 
                 if (
                     tool_name not in self._tool_indices
@@ -413,7 +441,9 @@ class HunyuanDetector(BaseFormatDetector):
                     )
                 )
 
-                self._buffer = self._buffer[sep_pos + len(self.tool_sep_token) :]
+                if boundary_token == self.tool_sep_token:
+                    boundary_pos += len(boundary_token)
+                self._buffer = self._buffer[boundary_pos:]
 
             # Phase 2: stream argument JSON of the current tool.
             before_name = self._streaming_tool_name
@@ -534,6 +564,14 @@ class HunyuanDetector(BaseFormatDetector):
         return []
 
     def structure_info(self) -> _GetInfoFunc:
+        # Hy4 has no <tool_sep> and no separators between adjacent
+        # <tool_call> blocks, so the Hy3 begin/end literals never match.
+        if not self._has_tool_sep:
+            return lambda name: StructureInfo(
+                begin=f"{self.bot_token}{self.tool_call_start_token}{name}",
+                end=f"{self.tool_call_end_token}{self.eot_token}",
+                trigger=self.bot_token,
+            )
         return lambda name: StructureInfo(
             begin=f"{self.bot_token}\n{self.tool_call_start_token}{name}{self.tool_sep_token}",
             end=f"{self.tool_call_end_token}\n{self.eot_token}",
@@ -542,3 +580,9 @@ class HunyuanDetector(BaseFormatDetector):
 
     def supports_structural_tag(self) -> bool:
         return False
+
+    def parses_required_natively(self) -> bool:
+        # Hy3/Hy4 both emit their structural tool-call format natively; without
+        # a dialect grammar, a json_schema constraint would force plain JSON the
+        # model was not trained to produce here.
+        return True

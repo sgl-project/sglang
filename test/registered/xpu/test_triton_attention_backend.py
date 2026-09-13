@@ -13,7 +13,17 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_xpu_ci(est_time=600, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(
+    est_time=600,
+    suite="nightly-xpu-1-gpu",
+    nightly=True,
+    disabled=(
+        "XPU fused MoE has no fp8-w8a8 kernel: sgl_kernel/moe.py:505 asserts "
+        "use_fp8_w8a8 is False, so the fp8-MoE model "
+        "(DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = gaunernst/DeepSeek-V2-Lite-Chat-FP8) "
+        "crashes the server. Re-enable once an XPU fp8-w8a8 MoE kernel lands."
+    ),
+)
 
 
 def triton_attention_benchmark(extra_args=None, mem_fraction_static="0.84"):

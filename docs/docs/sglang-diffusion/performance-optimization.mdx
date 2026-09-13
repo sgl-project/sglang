@@ -147,6 +147,27 @@ These techniques can change the denoising path, numerical representation, or gen
 6. Profile if the bottleneck is unclear.
 7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
 
+## Per-model tuning starting points
+
+Warmup and breakable CUDA graph (BCG) solve different problems. `--warmup-mode request` runs a warmup copy derived from the first request to prime one-time compilation and caches; it does not remove recurring Python launches from each denoising step. BCG captures supported DiT segments and can reduce that recurring launch overhead for captured shapes. Use the table below as a first experiment, then keep a lever only when profiling confirms that it addresses the active bottleneck.
+
+| Observed bottleneck or constraint | Example models | First experiment | What to verify |
+| --- | --- | --- | --- |
+| The first execution of a shape pays substantial compilation or cache setup | ERNIE-Image-Turbo, GLM-Image, FastWan / TurboWan family, FLUX.2-klein-4B, LingBot-World, LongLive, Cosmos3, SANA, LongCat-Image-Edit-Turbo | Compare `--warmup-mode request` with `off` | Separate warmup time, first-real-request latency, and warmed steady-state latency. Request-based warmup is primarily a benchmark aid and still consumes time before the first real request completes. |
+| A supported fixed-shape pipeline shows recurring host-launch gaps between GPU kernels | GLM-Image, Z-Image-Turbo, Qwen-Image-2512, Ideogram-4, LongCat-Image, LTX-2 / LTX-2.3, SANA-1.5 1.6B, JoyEcho | Compare eager execution with `--enable-breakable-cuda-graph` | Confirm graph capture and replay in the server log, then compare steady-state latency and GPU memory. Pass additional production shapes through `--warmup-resolutions`; without it, BCG captures only the model's default warmup resolution. |
+| The model does not fit while both DiT stages are resident | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, LingBot-Video-MoE | Start with `--dit-layerwise-offload` | Verify peak GPU memory first, then measure the transfer overhead. Add warmup separately if first-run compilation is also material. |
+| Dynamic masks, metadata, or image conditions make graph replay ineffective | Qwen-Image-Edit family, FireRed-Image-Edit | Keep eager execution as the baseline | Profile before attempting BCG. Dynamic per-step host work can outweigh graph replay savings, and unsupported pipelines fall back to eager execution. |
+| Kernels or collectives already dominate a many-step workload | Qwen-Image, FLUX.1-dev, FLUX.2-dev, LTX-2, Wan2.1 14B, HunyuanVideo, MOVA | Warm the baseline, then profile before enabling another lever | A small host gap limits the benefit available from BCG. Prioritize kernels, attention, parallelism, or residency according to the trace. |
+| A one-shot or very few-step workload cannot amortize warmup | FastVideo-FastH3 (4-step) | Start with `--warmup-mode off` | Compare end-to-end latency including warmup. Use request warmup only when intentionally separating cold-start setup from the measured request. |
+
+The example assignments come from single-GPU NVIDIA B300/GB300 profiles and are directional rather than an exhaustive compatibility list. A model can match more than one row as resolution, frame count, step count, parallelism, or GPU type changes; the measured bottleneck takes precedence over the model name.
+
+BCG is enabled only for model and pipeline configurations accepted by the runtime support check. It captures the default warmup shape automatically. Use `--warmup-resolutions` for additional served resolutions; for video and variable prompt lengths, set `--warmup-num-frames` and `--bcg-text-buckets` to cover the intended workload. Requests that do not match a captured signature fall back to eager execution.
+
+Warmup and BCG do not intentionally trade output quality for speed, but that is not a guarantee of byte-identical output. Different execution paths can introduce numerical differences, and some pipelines customize the scheduler or schedule used by a synthetic warmup request. Before production rollout, compare output hashes when bitwise stability is required, otherwise run the project's quality acceptance check.
+
+Performance results are configuration-dependent. Record the exact checkpoint revision, GPU, precision, resolution, frame count, step count, parallelism, command line, and whether the measurement includes warmup. Re-profile with [Profiling](/docs/sglang-diffusion/profiling) on the target workload rather than transferring a percentage from another model or shape.
+
 ## Diagnostics
 
 [Profiling](/docs/sglang-diffusion/profiling) is not an optimization technique by itself. It belongs in the performance workflow because it tells you which stage, kernel, or denoising step is worth optimizing before you change multiple levers.
