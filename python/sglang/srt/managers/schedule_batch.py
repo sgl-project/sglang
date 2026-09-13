@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1128,14 +1129,14 @@ class Req(ReqDllmMixin):
         self.host_loaded_length = 0
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
-        # Storage prefetch retry state while queued
-        # (see Scheduler._retry_missed_storage_prefetches).
-        self.storage_prefetch_retry_pending = False
-        self.storage_prefetch_retry_wait_polls = 0
         self.storage_prefetch_retry_attempts = 0
+        self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
         # Receipt of the tree lock held on last_node (anchor, SWA boundary,
         # skipped components); every release replays it unchanged.
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
+        # Device/host prefix used to plan the latest L3 lookup. Admission uses
+        # it to detect newly exposed storage demand after queue-time eviction.
+        self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
         # Logical-page KV sharding: rotation base of the chain this request

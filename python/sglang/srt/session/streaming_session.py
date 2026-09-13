@@ -22,6 +22,8 @@ from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 
 
 logger = logging.getLogger(__name__)
@@ -563,6 +565,14 @@ class StreamingSession(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
+
+    @property
+    def buffer_pipeline(self) -> Optional[BufferModePipeline]:
+        return self.inner.buffer_pipeline
+
+    @property
+    def storage_prefetch_retries(self) -> Optional[StoragePrefetchRetries]:
+        return self.inner.storage_prefetch_retries
 
     def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
         return self.inner.pop_prefetch_loaded_span(req_id)

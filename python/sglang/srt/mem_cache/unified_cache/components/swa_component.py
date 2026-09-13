@@ -1007,28 +1007,23 @@ class SWAComponent(TreeComponent):
         prefetch_pages = prefetch_tokens // self.cache.page_size
         if prefetch_pages >= sw_pages:
             num_pages = sw_pages
-        elif prefetch_pages <= 0:
-            return PreparePrefetchResult()
-        elif (
-            self.tree_core.is_root(node_id) or self.tree_core.is_host_memory_buffer_only
-        ):
-            # Sub-window fetch: at root the sequence IS its window; mid-tree
-            # (buffer mode) the window head is the device prefix's own ring
-            # state, so only the suffix needs fetching.
+        elif prefetch_pages > 0 and self.tree_core.is_root(node_id):
+            # At root the sequence is shorter than the window, so its whole
+            # SWA is the window -- complete, not a partial fetch.
             num_pages = prefetch_pages
         else:
-            # Cache-mode graft: a mid-tree window head is not
-            # device-guaranteed, require a full window.
+            # Mid-tree short span: the window head would have to come from the
+            # device prefix, which the match validator does not promise.
             return PreparePrefetchResult()
-        num_tokens = num_pages * self.cache.page_size
-        host_indices = self.cache.host_pool_group.alloc(
-            num_tokens,
-            pool=PoolName.SWA,
-            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
-        )
+        return PreparePrefetchResult(staging_tokens=num_pages * self.cache.page_size)
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        assert self._swa_kv_pool_host is not None
+        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+            self.cache.evict_host(num_tokens, ComponentType.SWA)
+            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        return host_indices
 
     def build_hicache_transfers(
         self,
@@ -1039,6 +1034,7 @@ class SWAComponent(TreeComponent):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
@@ -1116,14 +1112,14 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
-            # Keys are unknowable at build time; placeholders carry the
-            # count, _sync_trailing_keys fills the real trailing hashes.
-            num_pages = host_indices.numel() // self.tree_core.page_size
+            # Staging is allocated once the hit is known; the placeholders carry
+            # the planned page count and _sync_trailing_keys fills the real hashes.
+            num_pages = staging_tokens // self.tree_core.page_size
+            if num_pages == 0:
+                return None
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=host_indices,
                     keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )

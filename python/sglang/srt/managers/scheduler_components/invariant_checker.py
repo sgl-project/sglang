@@ -280,7 +280,7 @@ class SchedulerInvariantChecker:
             batches.append(running_batch)
 
         full_uncached = 0
-        swa_uncached = 0
+        swa_uncached = self.tree_cache.swa_transient_size()
         counted: set[int] = set()
         reqs = [req for batch in batches for req in batch.reqs]
         chunked_req = self.get_chunked_req()

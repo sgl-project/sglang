@@ -1,6 +1,7 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
 import unittest
+from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -263,14 +264,21 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
 
-    def test_short_staged_swa_tail_resolves_device_covered_head(self):
+    def _short_swa_tail_pipeline(self, swa_page_size: int) -> BufferModePipeline:
+        """Pipeline holding one staged span [2, 8) whose 4-slot trailing SWA
+        window outruns the splice left by a device prefix of 6."""
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.cache_controller.mem_pool_host.entry_map = {
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(page_size=swa_page_size)
+            )
+        }
         pipeline.release_staged_hold = mock.Mock(return_value=True)
         pipeline.staged_prefetches = {
             "r": SimpleNamespace(
                 req_id="r",
-                key_tokens=list(range(8)),
+                key_tokens=array("q", range(8)),
                 extra_key=None,
                 cache_salt=None,
                 matched_len=2,
@@ -287,10 +295,39 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 operation_id=1,
             )
         }
+        return pipeline
 
-        self.assertEqual(pipeline.plan_staged_splice("r", device_prefix_len=6), (0, 0))
-        pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with("r", 4)
-        pipeline.release_staged_hold.assert_called_once_with("r", reason="shrunk")
+    def test_short_staged_swa_tail_keeps_complete_window(self):
+        """FULL-prefix growth trims only FULL; SWA keeps its complete window."""
+        pipeline = self._short_swa_tail_pipeline(swa_page_size=2)
+        pipeline._cache.tree_core.is_eagle = False
+        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
+        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
+            0, 6
+        )
+        req = SimpleNamespace(
+            rid="r",
+            prefix_indices=_indices(0, 0),
+            kv=SimpleNamespace(cache_protected_len=0),
+        )
+        self.assertTrue(pipeline.prepare_staged_prefetch(req))
+        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
+        pipeline.release_staged_hold.assert_not_called()
+
+        pipeline = self._short_swa_tail_pipeline(swa_page_size=4)
+        pipeline._cache.tree_core.is_eagle = False
+        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
+        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
+            0, 6
+        )
+        req = SimpleNamespace(
+            rid="r",
+            prefix_indices=_indices(0, 0),
+            kv=SimpleNamespace(cache_protected_len=0),
+        )
+        self.assertTrue(pipeline.prepare_staged_prefetch(req))
+        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
+        pipeline.release_staged_hold.assert_not_called()
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()

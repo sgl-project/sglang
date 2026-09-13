@@ -693,14 +693,15 @@ class MambaComponent(TreeComponent):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        host_indices = self.cache.host_pool_group.alloc(
-            1,
-            pool=PoolName.MAMBA,
-            reclaim=lambda size: self.cache.evict_host(size, ComponentType.MAMBA),
-        )
+        # One state slot per fetch, allocated once the hit is known.
+        return PreparePrefetchResult(staging_tokens=1)
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        host_indices = self._mamba_pool_host.alloc(num_tokens)
         if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+            self.cache.evict_host(num_tokens, ComponentType.MAMBA)
+            host_indices = self._mamba_pool_host.alloc(num_tokens)
+        return host_indices
 
     def build_hicache_transfers(
         self,
@@ -711,6 +712,7 @@ class MambaComponent(TreeComponent):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
@@ -770,11 +772,13 @@ class MambaComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
+            if staging_tokens == 0:
+                return None
+            # Staging is allocated once the hit is known; the placeholder key
+            # carries the single trailing page this pool loads.
             return [
                 PoolTransfer(
                     name=PoolName.MAMBA,
-                    host_indices=host_indices,
                     keys=["__placeholder__"],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
