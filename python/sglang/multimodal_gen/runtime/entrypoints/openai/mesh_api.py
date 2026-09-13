@@ -1,6 +1,8 @@
 import asyncio
 import os
 import time
+from collections.abc import Coroutine
+from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -39,6 +41,29 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/meshes", tags=["meshes"])
+_MESH_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+def _discard_mesh_job_task(job_id: str, task: asyncio.Task[None]) -> None:
+    if _MESH_JOB_TASKS.get(job_id) is task:
+        del _MESH_JOB_TASKS[job_id]
+
+
+def _start_mesh_job(job_id: str, job: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.create_task(job, name=f"mesh-job-{job_id}")
+    _MESH_JOB_TASKS[job_id] = task
+    task.add_done_callback(lambda completed: _discard_mesh_job_task(job_id, completed))
+    return task
+
+
+async def shutdown_mesh_jobs() -> None:
+    tasks = list(_MESH_JOB_TASKS.values())
+    _MESH_JOB_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def _normalize_format(fmt: Optional[str]) -> str:
@@ -219,7 +244,7 @@ async def create_mesh(
         sampling_params=sampling_params,
     )
 
-    asyncio.create_task(_dispatch_job_async(request_id, batch))
+    _start_mesh_job(request_id, _dispatch_job_async(request_id, batch))
     return MeshResponse(**job)
 
 
