@@ -3587,9 +3587,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             f"MXFP8 KV cache requires CUDA and store_cache-compatible rows, "
             f"got _is_cuda={_is_cuda}, {row_bytes=}, {v_row_bytes=}"
         )
-        assert (
-            self.mxfp8_sf_interleaved
-        ), "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        assert self.mxfp8_sf_interleaved, (
+            "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        )
         store_cache(
             cache_k.reshape(loc.shape[0], -1),
             cache_v.reshape(loc.shape[0], -1),

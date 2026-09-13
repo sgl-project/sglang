@@ -12,7 +12,7 @@ import torch
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 requires_sm100 = pytest.mark.skipif(
     not torch.cuda.is_available() or get_device_sm() < 100,
@@ -103,9 +103,9 @@ def test_fused_quant_store_path_skips_reserved_slot():
     _assert_slot0_zero(pool)
     kc, _ = pool.get_kv_buffer(0)
     valid = kc.view(-1, PS, NHKV, HD)[0, 5].float()
-    assert (
-        not torch.isnan(valid).any() and valid.abs().sum() > 0
-    ), "fused valid write lost"
+    assert not torch.isnan(valid).any() and valid.abs().sum() > 0, (
+        "fused valid write lost"
+    )
 
 
 @requires_sm100
