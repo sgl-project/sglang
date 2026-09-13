@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{HeaderMap, HeaderValue, Request};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
@@ -125,5 +125,65 @@ async fn forwards_whitelisted_headers_strips_others() {
         captured_host,
         Some(&"example.com".to_string()),
         "router must not forward the inbound Host header to upstream"
+    );
+}
+
+#[tokio::test]
+async fn forwards_upstream_response_headers() {
+    use bytes::Bytes;
+    use sgl_router::health::circuit_breaker::CircuitBreaker;
+
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("retry-after", HeaderValue::from_static("7"));
+    upstream_headers.insert(
+        "x-request-id",
+        HeaderValue::from_static("upstream-request-42"),
+    );
+    let worker = crate::common::mock_worker::MockWorker::start_with_response_headers(
+        vec!["data: {\"token\":1}\n\n"],
+        upstream_headers,
+    )
+    .await;
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+    let breaker = Arc::new(CircuitBreaker::new());
+    let request_headers = HeaderMap::new();
+
+    let buffered = proxy
+        .forward_json_to(
+            &worker.url,
+            &breaker,
+            "/v1/chat/completions",
+            &request_headers,
+            Bytes::from_static(br#"{"model":"tiny"}"#),
+        )
+        .await
+        .unwrap();
+    assert_response_headers(&buffered);
+
+    let streaming = proxy
+        .forward_streaming_to(
+            &worker.url,
+            &breaker,
+            "/v1/chat/completions",
+            &request_headers,
+            Bytes::from_static(br#"{"model":"tiny","stream":true}"#),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_response_headers(&streaming);
+}
+
+fn assert_response_headers(response: &axum::response::Response) {
+    assert_eq!(
+        response.headers().get("retry-after"),
+        Some(&HeaderValue::from_static("7")),
+        "retry guidance from the worker must reach the client",
+    );
+    assert_eq!(
+        response.headers().get("x-request-id"),
+        Some(&HeaderValue::from_static("upstream-request-42")),
+        "the worker request ID must reach the client for diagnostics",
     );
 }

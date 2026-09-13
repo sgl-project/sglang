@@ -7,10 +7,10 @@ pub mod sse;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
-use crate::server::header_utils::should_forward_request_header;
+use crate::server::header_utils::{copy_response_headers, should_forward_request_header};
 use anyhow::Context;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{header, HeaderMap, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::Arc;
@@ -119,6 +119,7 @@ impl Proxy {
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
+        let response_headers = copy_response_headers(resp.headers());
         // Defer breaker recording until after the body completes — a
         // worker that returns 2xx headers and then drops mid-body is
         // still failing the request, and crediting it as healthy lets
@@ -145,10 +146,10 @@ impl Proxy {
         }
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
-        out.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_static("application/json"),
-        );
+        *out.headers_mut() = response_headers;
+        out.headers_mut()
+            .entry(header::CONTENT_TYPE)
+            .or_insert(HeaderValue::from_static("application/json"));
         Ok(out)
     }
 
@@ -201,9 +202,10 @@ impl Proxy {
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
+        let response_headers = copy_response_headers(resp.headers());
         let upstream_ct = resp
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
@@ -247,8 +249,9 @@ impl Proxy {
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
+        *out.headers_mut() = response_headers;
         out.headers_mut().insert(
-            HeaderName::from_static("content-type"),
+            header::CONTENT_TYPE,
             HeaderValue::from_str(&content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
         );
