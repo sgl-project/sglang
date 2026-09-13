@@ -67,13 +67,30 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    NUM_STEPS: tl.constexpr = 0,
 ):
-    BLOCK_SIZE: tl.constexpr = 128
-    iters = tl.program_id(axis=0)
+    # Optional token-block parallelism (NUM_STEPS > 0): the first grid axis
+    # packs (draft step, token block) as ``step + NUM_STEPS * block``,
+    # spreading the per-request index copy below over many programs instead
+    # of one program crawling the whole context serially (which bottlenecks
+    # long-context spec decode, where this kernel runs every iteration).
+    # NUM_STEPS == 0 (default) is the historical one-program-per-step kernel:
+    # the same 128-wide copy loop, in the same order, with the token-block
+    # branches folded away at compile time.
+    BLOCK_SIZE: tl.constexpr = 128 if NUM_STEPS == 0 else 512
+    pid0 = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
     topk_id = tl.program_id(axis=2)
 
-    num_steps = tl.num_programs(axis=0)
+    if NUM_STEPS == 0:
+        iters = pid0
+        num_steps = tl.num_programs(axis=0)
+        blk = 0
+    else:
+        iters = pid0 % NUM_STEPS
+        blk = pid0 // NUM_STEPS
+        num_steps = NUM_STEPS
+        num_blk = tl.num_programs(axis=0) // NUM_STEPS
     num_seqs = tl.num_programs(axis=1)
     topk = tl.num_programs(axis=2)
 
@@ -81,56 +98,90 @@ def generate_draft_decode_kv_indices(
     kv_indptr += kv_indptr_stride * iters
     iters += 1
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
-    seq_len = tl.load(paged_kernel_lens + bid)
-    cum_seq_len = tl.sum(seq_lens)
+    if NUM_STEPS == 0:
+        load_offset = tl.arange(0, bs_upper)
+        seq_lens = tl.load(
+            paged_kernel_lens + load_offset, mask=load_offset < bid, other=0
+        )
+        seq_len = tl.load(paged_kernel_lens + bid)
+        cum_seq_len = tl.sum(seq_lens)
+    else:
+        seq_len = tl.load(paged_kernel_lens + bid)
+        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+        # Blocks with no copy work exit before the O(bs) prefix-sum below;
+        # block 0 always continues (it owns the extension and kv_indptr).
+        if blk >= num_loop and blk > 0:
+            return
+        load_offset = tl.arange(0, bs_upper)
+        seq_lens = tl.load(
+            paged_kernel_lens + load_offset, mask=load_offset < bid, other=0
+        )
+        cum_seq_len = tl.sum(seq_lens)
 
     # Update kv_indices
     kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
     kv_ptr = kv_indices + kv_offset
     token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
 
-    kv_offset = tl.arange(0, BLOCK_SIZE)
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = kv_offset < seq_len
-        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
-        tl.store(kv_ptr + kv_offset, data, mask=mask)
-        kv_offset += BLOCK_SIZE
-
-    extend_offset = tl.arange(0, iter_upper)
-    if page_size == 1 or topk == 1:
-        extend_data = tl.load(
-            token_pool_ptr + seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
-            mask=extend_offset < iters,
-        )
+    if NUM_STEPS == 0:
+        kv_offset = tl.arange(0, BLOCK_SIZE)
+        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+        for _ in range(num_loop):
+            mask = kv_offset < seq_len
+            data = tl.load(token_pool_ptr + kv_offset, mask=mask)
+            tl.store(kv_ptr + kv_offset, data, mask=mask)
+            kv_offset += BLOCK_SIZE
     else:
-        prefix_len = seq_len
-        last_page_len = prefix_len % page_size
-        num_new_pages_per_topk = (
-            last_page_len + num_steps + page_size - 1
-        ) // page_size
-        prefix_base = seq_len // page_size * page_size
-        start = (
-            prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
-        )
-        extend_data = tl.load(
-            token_pool_ptr + start + extend_offset,
+        for i in range(blk, num_loop, num_blk):
+            tok_off = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = tok_off < seq_len
+            data = tl.load(token_pool_ptr + tok_off, mask=mask)
+            tl.store(kv_ptr + tok_off, data, mask=mask)
+
+    # Extension entries and kv_indptr belong to token block 0 alone; other
+    # blocks neither compute nor store them.
+    if blk == 0:
+        extend_offset = tl.arange(0, iter_upper)
+        if page_size == 1 or topk == 1:
+            extend_data = tl.load(
+                token_pool_ptr
+                + seq_len
+                + topk_id * num_steps
+                + tl.arange(0, iter_upper),
+                mask=extend_offset < iters,
+            )
+        else:
+            prefix_len = seq_len
+            last_page_len = prefix_len % page_size
+            num_new_pages_per_topk = (
+                last_page_len + num_steps + page_size - 1
+            ) // page_size
+            prefix_base = seq_len // page_size * page_size
+            start = (
+                prefix_base
+                + topk_id * num_new_pages_per_topk * page_size
+                + last_page_len
+            )
+            extend_data = tl.load(
+                token_pool_ptr + start + extend_offset,
+                mask=extend_offset < iters,
+            )
+
+        tl.store(
+            kv_ptr + seq_len + extend_offset,
+            extend_data,
             mask=extend_offset < iters,
         )
 
-    tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
+        # Update kv_indptr
+        bs_offset = tl.arange(0, num_tokens_upper)
 
-    # Update kv_indptr
-    bs_offset = tl.arange(0, num_tokens_upper)
-
-    zid = bid * topk + topk_id
-    if zid == 0:
-        zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
-    base = tl.sum(positions)
-    tl.store(kv_indptr + zid, base + zid * iters)
+        zid = bid * topk + topk_id
+        if zid == 0:
+            zid = num_seqs * topk
+        pos_vals = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+        base = tl.sum(pos_vals)
+        tl.store(kv_indptr + zid, base + zid * iters)
 
 
 @triton.jit

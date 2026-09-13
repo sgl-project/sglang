@@ -34,7 +34,7 @@ class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
         "1",
         "--chunked-prefill-size",
         "-1",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--context-length",
         "4096",
         "--max-total-tokens",

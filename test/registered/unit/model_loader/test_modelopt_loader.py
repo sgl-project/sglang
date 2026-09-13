@@ -22,7 +22,12 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -41,6 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
+from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -716,6 +722,29 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_nemotron_h_omni_resolves_fused_qkv_from_split_layers(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    f"language_model.model.layers.7.mixer.{projection}": {
+                        "quant_algo": "FP8"
+                    }
+                    for projection in ("q_proj", "k_proj", "v_proj")
+                },
+                "packed_modules_mapping": (
+                    NemotronH_Omni_Reasoning_V3.packed_modules_mapping
+                ),
+            }
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "language_model.model.layers.7.mixer.qkv_proj"
+            ),
+            "FP8",
+        )
+
     def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {
@@ -1162,6 +1191,56 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
+        )
+
+    def test_mixed_precision_resolves_vl_language_model_keys(self):
+        # nvidia/Qwen3.8-Flash-Next-NVFP4 keys the text stack as
+        # `model.language_model.*` while Qwen4-Exp modules are `model.*`.
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.3.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                        "quant_algo": "FP8"
+                    },
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": "FP8_BLOCK_SCALES",
+                        "group_size": 128,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(quant_config.exclude_modules, [])
+        moe = FusedMoE.__new__(FusedMoE)
+        self.assertIsInstance(
+            quant_config.get_quant_method(moe, "mtp.layers.0.mlp.experts"),
+            Fp8MoEMethod,
+        )
+        self.assertEqual(
+            quant_config.get_quant_method(
+                moe, "mtp.layers.0.mlp.experts"
+            ).quant_config.weight_block_size,
+            [128, 128],
+        )
+        self.assertEqual(
+            quant_config.resolve_quant_algo("model.layers.3.mlp.experts"), "NVFP4"
+        )
+        self.assertEqual(
+            quant_config.resolve_quant_algo(
+                "model.layers.1.ple.ple_embedding.ngram_embedding"
+            ),
+            "FP8",
+        )
+        self.assertIsNone(
+            quant_config.resolve_quant_algo("model.layers.1.ple.key_proj")
+        )
+        self.assertIsNone(
+            quant_config.resolve_quant_algo("model.layers.3.mlp.shared_expert")
         )
 
 

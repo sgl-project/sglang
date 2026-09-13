@@ -9,7 +9,6 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
-    _attention_backend_dual_chunk,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
@@ -175,6 +174,11 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
+            # The record, via the input snapshot rather than the field: a
+            # hook may not read a field off the record (the guard in
+            # `test_resolution_reads_the_declarations.py`), and what this
+            # needs is the input anyway -- whether the operator asked for a
+            # memory fraction, not the value in effect.
             explicit_mem_fraction = (
                 getattr(server_args, "_raw_input", None) or {}
             ).get("mem_fraction_static") is not None
@@ -203,23 +207,6 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
-
-    # Dual chunk flash attention backend
-    run_post_process_pass(server_args, _attention_backend_dual_chunk)
-    if resolved_view(server_args).attention_backend == "dual_chunk_flash_attn":
-        logger.warning(
-            "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            enable_mixed_chunk=False,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            disable_radix_cache=True,
-        )
 
 
 def handle_linear_attn_backend(server_args: Any):
