@@ -112,6 +112,13 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
+try:
+    from sglang.kernels.ops.mamba.triton_ops import (
+        initialize_mamba_selective_state_update_backend,
+    )
+except ImportError:
+    initialize_mamba_selective_state_update_backend = None
+
 
 def start_profile(
     profile_activities,
@@ -906,6 +913,11 @@ def latency_test(
     initialize_moe_config()
     initialize_fp8_gemm_config()
     initialize_fp4_gemm_config()
+    # Mamba's selective_state_update dispatches through a process-global backend
+    # that only the Scheduler installs; without it every Mamba model dies in
+    # decode (including the decode CUDA-graph capture inside load_model).
+    if initialize_mamba_selective_state_update_backend is not None:
+        initialize_mamba_selective_state_update_backend(server_args)
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         parallel = get_parallel()
