@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -8,6 +9,10 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
+
+_is_xpu = is_xpu()
+
+XPU_RUN_TIMEOUT_S: float = 200.0
 
 
 def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
@@ -77,8 +82,16 @@ class TestChunkSizeDefault(ScriptedTestCase):
             f"single-token prompt should not chunk, got chunks_done={r.chunks_done}"
         )
 
+    @unittest.skipIf(_is_xpu, "Non-XPU runners only")
     def test_chunk_size_256_prompt_100x(self):
         self.server.execute_script(self._script_chunk_size_256_prompt_100x)
+
+    @unittest.skipUnless(_is_xpu, "XPU runner only")
+    def test_chunk_size_256_prompt_100x_xpu(self):
+        self.server.execute_script(
+            self._script_chunk_size_256_prompt_100x,
+            timeout_s=XPU_RUN_TIMEOUT_S,
+        )
 
     @staticmethod
     def _script_chunk_size_256_prompt_100x(t: ScriptedContext):

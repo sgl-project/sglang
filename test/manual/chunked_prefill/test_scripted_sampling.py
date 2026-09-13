@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
+from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -10,6 +11,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
+
+_is_xpu = is_xpu()
 
 
 class TestSamplingBasic(ScriptedTestCase):
@@ -51,6 +54,12 @@ class TestSamplingBasic(ScriptedTestCase):
             f"{len(r.req.output_ids)}"
         )
 
+    @unittest.skipIf(
+        _is_xpu,
+        "Too time-consuming on XPU: 1000 forced decode steps take ~20 min on a "
+        "low-end device. The ignore_eos length cap it guards is device-agnostic "
+        "and covered on XPU by test_ignore_eos_chunked.",
+    )
     def test_max_new_tokens_1000_long_chunked(self):
         self.server.execute_script(self._script_max_new_tokens_1000_long_chunked)
 

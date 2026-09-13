@@ -12,6 +12,19 @@ import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 
+_TRITON_DEVICE_TYPES = ("cuda", "xpu")
+
+
+def _require_triton_device(dst: torch.Tensor, src: torch.Tensor, fn_name: str) -> None:
+    """Both tensors must share one device with a Triton backend in this tree."""
+    if dst.device != src.device:
+        raise ValueError(
+            f"{fn_name}: dst and src must be on the same device. "
+            f"{dst.device=} {src.device=}"
+        )
+    if dst.device.type not in _TRITON_DEVICE_TYPES:
+        raise ValueError(f"{fn_name}: unsupported device {dst.device.type}.")
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -246,14 +259,7 @@ def fused_mamba_state_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if dst.device != src.device:
-        raise ValueError(
-            f"dst and src must be on the same device. {dst.device=} {src.device=}"
-        )
-    if not dst.is_cuda or not src.is_cuda:
-        raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
-        )
+    _require_triton_device(dst, src, "fused_mamba_state_scatter_with_mask")
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -410,11 +416,7 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
-        raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
-            f"tensors on the same device ({dst.device=}, {src.device=})."
-        )
+    _require_triton_device(dst, src, "fused_conv_window_scatter_with_mask")
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
     if dst.shape[0] != src.shape[0]:

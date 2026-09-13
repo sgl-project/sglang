@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from cuda.bindings import driver as cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    # CUDA-only; DwdpManager rejects non-CUDA before anything touches this.
+    cuda = None
 
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,

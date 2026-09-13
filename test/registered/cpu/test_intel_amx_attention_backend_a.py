@@ -19,11 +19,13 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
+    requires_intel_amx,
 )
 
 register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
 
 
+@requires_intel_amx()
 class TestIntelAMXAttnBackend(CustomTestCase):
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
@@ -72,6 +74,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
             kill_process_tree(process.pid)
 
 
+@requires_intel_amx()
 class TestDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
