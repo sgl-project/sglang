@@ -750,6 +750,33 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertFalse(special_token_ids & sampled_pool)
         self.assertTrue(sampled_pool)
 
+    def test_gen_mm_prompt_excludes_added_vocab_tokens(self):
+        # Media placeholders are not always registered as special tokens: MiniMax-M3
+        # keeps `]<]video[>[` in the added vocabulary only. Sampling one makes the
+        # server look for a video the request never carries, so it answers HTTP 400.
+        tokenizer = create_lightweight_tokenizer()
+        placeholders = ["]<]image[>[", "]<]video[>["]
+        tokenizer.add_tokens(placeholders)
+        placeholder_ids = set(tokenizer.convert_tokens_to_ids(placeholders))
+        # Precondition: these are exactly the tokens `all_special_ids` does not cover.
+        self.assertFalse(placeholder_ids & set(tokenizer.all_special_ids))
+        image_pad_id = tokenizer.convert_tokens_to_ids("]<]image[>[")
+        captured_population = {}
+
+        def fake_choices(population, k):
+            captured_population["tokens"] = population
+            return population[:k]
+
+        with patch(
+            "sglang.benchmark.datasets.common.random.choices",
+            side_effect=fake_choices,
+        ):
+            gen_mm_prompt(tokenizer, image_pad_id, token_num=8)
+
+        sampled_pool = set(captured_population["tokens"])
+        self.assertFalse(placeholder_ids & sampled_pool)
+        self.assertTrue(sampled_pool)
+
     def test_gen_mm_prompt_is_independent_of_vocab_order(self):
         class OrderedVocabTokenizer:
             all_special_ids = []
