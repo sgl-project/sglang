@@ -1,0 +1,5 @@
+# Keep this directory limited to the reviewed, hand-authored fixture.
+*
+!.gitignore
+!README.md
+!synthetic_trace.jsonl
