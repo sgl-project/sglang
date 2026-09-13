@@ -5,8 +5,9 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
+from sglang.srt.arg_groups.platform_hook import handle_cpu_backends, handle_xpu_backends
 from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,6 +44,30 @@ class TestServerArgsCPUBackend(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "attention_backend"), "intel_amx"
         )
+        self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
+
+
+class TestServerArgsXPUBackend(CustomTestCase):
+    def _make_server_args(self, sampling_backend=None):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.device = "xpu"
+        server_args.sampling_backend = sampling_backend
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._cuda_graph_config_locked = set()
+        return server_args
+
+    def test_xpu_defaults_to_xpu_sampling_backend(self):
+        server_args = self._make_server_args()
+
+        handle_xpu_backends(server_args)
+
+        self.assertEqual(resolution_result(server_args, "sampling_backend"), "xpu")
+
+    def test_xpu_keeps_explicit_sampling_backend(self):
+        server_args = self._make_server_args(sampling_backend="pytorch")
+
+        handle_xpu_backends(server_args)
+
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
 
