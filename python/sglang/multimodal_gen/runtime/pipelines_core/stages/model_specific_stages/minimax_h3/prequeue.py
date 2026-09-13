@@ -309,9 +309,17 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                     minimax_h3_resolve_reference_image_shape,
                 )
 
+                reference_resize_mode = getattr(
+                    batch.sampling_params,
+                    "reference_resize_mode",
+                    "diffusers",
+                )
                 resolved = minimax_h3_resolve_reference_image_shape(
                     width=width,
                     height=height,
+                    canvas_width=int(shape["width"]),
+                    canvas_height=int(shape["height"]),
+                    mode=reference_resize_mode,
                 )
             else:
                 continue
