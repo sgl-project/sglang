@@ -16,6 +16,8 @@ register_npu_ci(
 )
 
 # Prefill node environment variables for DSV4-Flash PD-Sep deployment.
+# Model-level envs are kept identical to the GPQA accuracy test
+# (test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py).
 DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -24,13 +26,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    # deepep
-    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
-    # war barrier
-    "SGLANG_ENABLE_WAR_BARRIER": "1",
-    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -42,14 +37,27 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # PD disagg
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "60",
-    # MTP
+    # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # DSPARK
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # deepep
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "60",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+    # PD disagg
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "60",
 }
 
 # Decode node environment variables for DSV4-Flash PD-Sep deployment.
+# Model-level envs are kept identical to the GPQA accuracy test
+# (test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py).
 DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -59,12 +67,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    # deepep
-    "HCCL_BUFFSIZE": "1200",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -76,9 +78,22 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # MTP
+    # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # DSPARK
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # deepep
+    "HCCL_BUFFSIZE": "1200",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
+    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "60",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
 }
 

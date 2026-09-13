@@ -118,13 +118,14 @@ def run_evalscope(
     timeout=60000,
     stream=True,
     eval_type="openai_api",
+    ignore_errors=False,
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_path = "./evalscope_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    api_url = f"http://{host}:{port}/v1/chat/completions"
+    api_url = f"http://{host}:{port}/v1"
 
     if generation_config is None:
         generation_config = {"max_tokens": 512}
@@ -145,6 +146,24 @@ def run_evalscope(
         config_dict["dataset_args"] = dataset_args
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
+    if ignore_errors:
+        config_dict["ignore_errors"] = True
+
+    cli_cmd = (
+        f"evalscope eval --model {model} --api-url {api_url} "
+        f"--eval-type {eval_type} --datasets {' '.join(datasets)} "
+        f"--eval-batch-size {eval_batch_size} --limit {limit} "
+        f"--timeout {timeout} --stream {stream} "
+        f"--work-dir {result_path} "
+        f"--generation-config '{json.dumps(generation_config, ensure_ascii=False)}'"
+    )
+    if dataset_args:
+        cli_cmd += f" --dataset-args '{json.dumps(dataset_args, ensure_ascii=False)}'"
+    if dataset_dir:
+        cli_cmd += f" --dataset-dir {dataset_dir}"
+    if ignore_errors:
+        cli_cmd += " --ignore-errors"
+    logger.info(f"Equivalent evalscope CLI command:\n{cli_cmd}")
 
     config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
     config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
@@ -310,6 +329,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
@@ -494,6 +514,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -523,6 +544,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
@@ -580,7 +602,10 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            max_retries = get_max_retries(self.datasets)
+            max_retries = (
+                getattr(self, "accuracy_max_retries", None)
+                or get_max_retries(self.datasets)
+            )
             best_metrics = None
             for attempt in range(max_retries):
                 metrics = run_evalscope(
@@ -596,6 +621,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -625,6 +651,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     accuracy = 0.1
@@ -713,6 +740,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)

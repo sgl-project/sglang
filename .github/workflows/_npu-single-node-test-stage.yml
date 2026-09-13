@@ -345,6 +345,7 @@ jobs:
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+          source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh || true
           set -u
 
           # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
