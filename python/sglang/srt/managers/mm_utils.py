@@ -736,7 +736,14 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
+            needs_private_copy = (
+                forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_eagle()
+                and forward_batch.input_embeds is None
+            )
+            forward_batch.mm_input_embeds = (
+                input_embeds.clone() if needs_private_copy else input_embeds
+            )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
