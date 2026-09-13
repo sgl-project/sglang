@@ -87,6 +87,7 @@ class StorageBackendFactory:
         if backend_name in cls._registry:
             registry_entry = cls._registry[backend_name]
             backend_class = registry_entry["loader"]()
+            cls._validate_layer_sharding(backend_name, backend_class, storage_config)
             logger.info(
                 f"Creating storage backend '{backend_name}' "
                 f"({registry_entry['module_path']}.{registry_entry['class_name']})"
@@ -135,6 +136,7 @@ class StorageBackendFactory:
             backend_class = cls._load_backend_class(
                 module_path, class_name, backend_name
             )
+            cls._validate_layer_sharding(backend_name, backend_class, storage_config)
 
             logger.info(
                 f"Creating dynamic storage backend '{backend_name}' "
@@ -148,6 +150,20 @@ class StorageBackendFactory:
                 f"Failed to create dynamic storage backend '{backend_name}': {e}"
             )
             raise
+
+    @staticmethod
+    def _validate_layer_sharding(
+        backend_name: str,
+        backend_class: type[HiCacheStorage],
+        storage_config: HiCacheStorageConfig,
+    ) -> None:
+        if storage_config.layer_shard is not None and not getattr(
+            backend_class, "supports_layer_sharded_mla", False
+        ):
+            raise ValueError(
+                f"Storage backend '{backend_name}' does not support "
+                "layer-sharded cache pages"
+            )
 
     @classmethod
     def _create_builtin_backend(
