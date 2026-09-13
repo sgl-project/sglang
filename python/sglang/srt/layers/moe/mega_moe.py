@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_SHARED_SF_INDEX: dict = {}
 
 
 def _mega_moe_mma_type() -> str:
@@ -93,6 +94,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_shared_experts: int = 0,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -105,6 +107,7 @@ def _get_mega_moe_symm_buffer(
         hidden,
         intermediate_hidden,
         mma_type,
+        num_shared_experts,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -115,6 +118,7 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
+            num_shared_experts=num_shared_experts,
             mma_type=mma_type,
             activation="swiglu",
         )
@@ -254,6 +258,9 @@ def _run_mega_routed(
             num_tokens,
         )
 
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        topk_weights_in = topk_weights_in * moe.routed_scaling_factor
+
     mma_type = _mega_moe_mma_type()
     if mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
@@ -302,11 +309,7 @@ def _run_mega_routed(
             activation_clamp=swiglu_limit,
             fast_math=True,
         )
-    y = y[:num_tokens]
-
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        y.mul_(moe.routed_scaling_factor)
-    return y
+    return y[:num_tokens]
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
