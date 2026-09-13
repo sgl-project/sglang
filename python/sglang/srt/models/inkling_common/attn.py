@@ -734,7 +734,7 @@ class InklingAttention(nn.Module):
             activation=self.k_sconv.activation,
             use_residual=self.k_sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=self.k_sconv._conv_state(forward_batch).track_cache_indices,
             do_store=do_store,
             mxfp8_quant=do_mxfp8_store,
             sfk=sfk,

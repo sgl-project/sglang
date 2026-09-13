@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvAttnBackend,
+    InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -121,14 +122,20 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else mask,
         )
 
-    def scatter(self, batch, cache):
+    def scatter(self, backend, batch, cache):
         hidden = (
             torch.arange(3 * 64, device="cuda", dtype=torch.float32)
             .reshape(3, 64)
             .to(torch.bfloat16)
         )
         rows = torch.arange(3, device="cuda").repeat(batch.batch_size, 1)
-        ShortConvolution._prepare_extend_sconv_cache(None, batch, cache, hidden, rows)
+        ShortConvolution._prepare_extend_sconv_cache(
+            SimpleNamespace(_conv_state=lambda _: backend.sconv_metadata),
+            batch,
+            cache,
+            hidden,
+            rows,
+        )
         return hidden
 
     def test_prefill_checkpoint_after_real_compaction(self):
@@ -147,31 +154,33 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 backend._prepare_slot_indices(batch)
                 cache = pool.mamba_cache.conv[0][0]
                 before = cache.clone()
-                expected = self.scatter(batch, cache)
+                expected = self.scatter(backend, batch, cache)
                 torch.testing.assert_close(cache[physical[0]], expected, rtol=0, atol=0)
                 before[physical[0]] = expected
                 torch.testing.assert_close(cache, before, rtol=0, atol=0)
                 torch.testing.assert_close(ids, original, rtol=0, atol=0)
-                self.assertEqual(batch.mamba_track_indices.dtype, torch.int64)
+                self.assertEqual(
+                    backend.sconv_metadata.track_cache_indices.dtype, torch.int64
+                )
 
     def test_replay_refreshes_captured_destination_after_compaction(self):
         backend, allocator, pool, slots = self.make_backend(lazy=True)
         virtual = slots[-1:].clone()
         batch = self.batch(virtual, mode=ForwardMode.DECODE)
         backend.init_forward_metadata_out_graph(batch)
-        pointer = batch.mamba_track_indices.data_ptr()
+        pointer = backend.sconv_metadata.track_cache_indices.data_ptr()
         cache = pool.mamba_cache.conv[0][0]
-        self.scatter(batch, cache)  # compile before capture
+        self.scatter(backend, batch, cache)  # compile before capture
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            self.scatter(batch, cache)
+            self.scatter(backend, batch, cache)
         allocator.free(slots[:1].clone())
         allocator._flush(urgent=True)
         physical = backend._translate_mamba_indices(virtual)
         cache.zero_()
         fresh = self.batch(virtual, mode=ForwardMode.DECODE)
         backend.init_forward_metadata_out_graph(fresh)
-        self.assertEqual(fresh.mamba_track_indices.data_ptr(), pointer)
+        self.assertEqual(backend.sconv_metadata.track_cache_indices.data_ptr(), pointer)
         graph.replay()
         expected = (
             torch.arange(3 * 64, device="cuda", dtype=torch.float32)
@@ -192,6 +201,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         cache = pool.mamba_cache.conv[0][0]
         conv = SimpleNamespace(
             activation=None,
+            _conv_state=lambda _: backend.sconv_metadata,
             use_residual=True,
             _weight_2d=lambda: torch.ones(64, 4, dtype=torch.bfloat16, device="cuda"),
         )
@@ -247,7 +257,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     backend.init_forward_metadata_in_graph(batch)
                     self.assertEqual(translate.call_count, calls)
                 torch.testing.assert_close(
-                    batch.mamba_track_indices,
+                    backend.sconv_metadata.track_cache_indices,
                     backend._translate_mamba_indices(ids).to(torch.int64),
                 )
                 torch.testing.assert_close(ids, slots[-1:])
@@ -264,19 +274,27 @@ class TestInklingCheckpointIndices(CustomTestCase):
         self.assertFalse(ids.is_contiguous())
         batch = self.batch(ids)
         backend._prepare_slot_indices(batch)
-        pointer = batch.mamba_track_indices.data_ptr()
+        pointer = backend.sconv_metadata.track_cache_indices.data_ptr()
         physical = backend._translate_mamba_indices(selected).to(torch.int64)
-        torch.testing.assert_close(batch.mamba_track_indices, physical, rtol=0, atol=0)
+        torch.testing.assert_close(
+            backend.sconv_metadata.track_cache_indices, physical, rtol=0, atol=0
+        )
         cache = pool.mamba_cache.conv[0][0]
         expected = cache.clone()
         hidden = torch.arange(12 * 64, device="cuda").reshape(12, 64).to(torch.bfloat16)
         rows = torch.arange(12, device="cuda").reshape(4, 3)
-        ShortConvolution._prepare_extend_sconv_cache(None, batch, cache, hidden, rows)
+        ShortConvolution._prepare_extend_sconv_cache(
+            SimpleNamespace(_conv_state=lambda _: backend.sconv_metadata),
+            batch,
+            cache,
+            hidden,
+            rows,
+        )
         expected[physical] = hidden.reshape(4, 3, 64)
         torch.testing.assert_close(cache, expected, rtol=0, atol=0)
         smaller = self.batch(ids[:2])
         backend._prepare_slot_indices(smaller)
-        self.assertEqual(smaller.mamba_track_indices.data_ptr(), pointer)
+        self.assertEqual(backend.sconv_metadata.track_cache_indices.data_ptr(), pointer)
         torch.testing.assert_close(storage, original, rtol=0, atol=0)
 
     def test_decode_graph_refreshes_distinct_destinations_and_masks_padding(self):
@@ -290,12 +308,15 @@ class TestInklingCheckpointIndices(CustomTestCase):
         batch = self.batch(ids, mode=ForwardMode.DECODE, mask=track_mask)
         batch.req_pool_indices = torch.arange(1, 5, device="cuda")
         backend.init_forward_metadata_out_graph(batch)
-        pointer = batch.mamba_track_indices.data_ptr()
+        pointer = backend.sconv_metadata.track_cache_indices.data_ptr()
         cache = pool.mamba_cache.conv[0][0]
         hidden = torch.zeros(4, 64, dtype=torch.bfloat16, device="cuda")
         weight = torch.ones(64, 4, dtype=torch.bfloat16, device="cuda")
         conv = SimpleNamespace(
-            activation=None, use_residual=True, _weight_2d=lambda: weight
+            activation=None,
+            use_residual=True,
+            _weight_2d=lambda: weight,
+            _conv_state=lambda _: backend.sconv_metadata,
         )
 
         def decode():
@@ -330,7 +351,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 fresh.req_pool_indices = torch.arange(1, 5, device="cuda")
                 fresh.req_pool_indices[live:] = 0
                 backend.init_forward_metadata_out_graph(fresh)
-                self.assertEqual(fresh.mamba_track_indices.data_ptr(), pointer)
+                self.assertEqual(
+                    backend.sconv_metadata.track_cache_indices.data_ptr(), pointer
+                )
                 physical = backend._translate_mamba_indices(ids).to(torch.int64)
                 active = backend._cache_indices.clone().to(torch.int64)
                 cache.fill_(-7)
@@ -405,6 +428,166 @@ class TestInklingCheckpointIndices(CustomTestCase):
             backend._cache_indices,
             backend._translate_mamba_indices(slots[1:2]).to(torch.int32),
         )
+
+    def test_draft_eager_preplan_and_repeated_steps_preserve_virtual_source(self):
+        from sglang.srt.speculative import eagle_worker_common as common
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        for static in (False, True):
+            for graph_available in (False, True):
+                with self.subTest(static=static, graph_available=graph_available):
+                    steps = []
+                    for step in range(2):
+                        backend, allocator, pool, slots = self.make_backend(
+                            static=static, slot_count=12, draft_token_num=4
+                        )
+                        backend.mamba_cache_chunk_size = 4
+                        backend.req_to_token_pool.req_index_to_mamba_index_mapping.fill_(
+                            slots[3]
+                        )
+                        if not static:
+                            allocator.free(slots[step : step + 1].clone())
+                        wrapper = InklingShortConvHybridAttnBackend.__new__(
+                            InklingShortConvHybridAttnBackend
+                        )
+                        wrapper.full_attn_backend = Mock()
+                        wrapper.short_conv_backend = backend
+                        wrapper.attn_backend_list = [wrapper.full_attn_backend, backend]
+                        steps.append((wrapper, backend, pool))
+                    ids = slots[-1:].clone()
+                    original = ids.clone()
+                    batch = self.batch(ids, mode=ForwardMode.DRAFT_EXTEND_V2)
+                    batch.seq_lens = torch.tensor([2], device="cuda")
+                    batch.extend_seq_lens = torch.tensor([4], device="cuda")
+                    batch.extend_prefix_lens = None
+                    batch.extend_num_tokens = 4
+                    batch.spec_info = EagleDraftExtendInput(
+                        num_accept_tokens=torch.tensor([3], device="cuda")
+                    )
+                    batch.mark_forward_metadata_ready = Mock()
+                    schedule_batch = SimpleNamespace(
+                        seq_lens=batch.seq_lens,
+                        seq_lens_cpu=None,
+                        forward_mode=batch.forward_mode,
+                        model_config=SimpleNamespace(vocab_size=32),
+                    )
+                    runner = SimpleNamespace(
+                        spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+                        attn_backend=steps[0][0],
+                    )
+                    graph_runner = (
+                        SimpleNamespace(can_run_graph=lambda _: False)
+                        if graph_available
+                        else None
+                    )
+                    with (
+                        patch.object(
+                            common.ForwardBatch, "init_new", return_value=batch
+                        ),
+                        patch.object(common, "maybe_detect_oob"),
+                        patch.object(common, "is_npu", return_value=False),
+                    ):
+                        planned = common.prepare_for_draft_extend(
+                            batch.spec_info,
+                            schedule_batch,
+                            torch.zeros(4, dtype=torch.int64, device="cuda"),
+                            4,
+                            runner,
+                            graph_runner,
+                            return_hidden_states_before_norm=False,
+                        )
+                    self.assertIs(planned, batch)
+                    destinations = []
+                    # Inspect the real pre-plan, then repeat step 0 and enter step 1.
+                    for index in (0, 0, 1):
+                        wrapper, backend, pool = steps[index]
+                        if destinations:
+                            wrapper.init_forward_metadata(batch)
+                        self.assertIs(batch.mamba_track_indices, ids)
+                        torch.testing.assert_close(ids, original, rtol=0, atol=0)
+                        physical = backend._translate_mamba_indices(ids).long()
+                        torch.testing.assert_close(
+                            backend.sconv_metadata.track_cache_indices,
+                            physical,
+                            rtol=0,
+                            atol=0,
+                        )
+                        destinations.append(physical.clone())
+                        cache = pool.mamba_cache.conv[0][0]
+                        cache.fill_(-7)
+                        hidden = torch.arange(4, device="cuda")[:, None].expand(4, 64)
+                        hidden = hidden.to(torch.bfloat16)
+                        active = backend._cache_indices.long()
+                        joined = torch.cat([cache[active[0]], hidden])
+                        expected = cache.clone()
+                        expected[physical[0]] = joined[1:4]
+                        expected[active[0]] = joined[3:6]
+                        with patch(
+                            "sglang.srt.models.inkling_common.sconv.get_exec",
+                            return_value=SimpleNamespace(
+                                mamba=SimpleNamespace(
+                                    enable_mamba_extra_buffer=True,
+                                    mamba_track_interval=4,
+                                )
+                            ),
+                        ):
+                            ShortConvolution._update_sconv_cache_for_draft_extend(
+                                SimpleNamespace(
+                                    _conv_state=lambda _: backend.sconv_metadata
+                                ),
+                                batch,
+                                cache,
+                                backend._cache_indices,
+                                hidden,
+                            )
+                        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+                    if not static:
+                        self.assertFalse(torch.equal(destinations[0], destinations[-1]))
+
+    def test_static_draft_staging_keeps_checkpoint_metadata(self):
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        backend, _, _, slots = self.make_backend(static=True, draft_token_num=4)
+        wrapper = InklingShortConvHybridAttnBackend.__new__(
+            InklingShortConvHybridAttnBackend
+        )
+        wrapper.short_conv_backend = backend
+        wrapper.full_attn_backend = Mock(supports_draft_extend_metadata_staging=True)
+        batch = self.batch(slots[-1:].clone(), mode=ForwardMode.DRAFT_EXTEND_V2)
+        batch.seq_lens = torch.tensor([6], device="cuda")
+        batch.extend_seq_lens = torch.tensor([4], device="cuda")
+        batch.extend_prefix_lens = None
+        batch.extend_num_tokens = 4
+        batch.spec_info = EagleDraftExtendInput(
+            num_accept_tokens=torch.tensor([3], device="cuda")
+        )
+        wrapper.init_forward_metadata_out_graph(batch, in_capture=True)
+        wrapper.init_forward_metadata_in_graph(batch)
+        self.assertIs(
+            backend.sconv_metadata.track_cache_indices, batch.mamba_track_indices
+        )
+
+    def test_prefill_capture_reinitializes_inert_checkpoint_metadata(self):
+        backend, _, pool, _ = self.make_backend()
+        backend.mamba_cache_chunk_size = 4
+        batch = self.batch(torch.zeros(1, dtype=torch.int64, device="cuda"))
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.seq_lens = torch.tensor([4], device="cuda")
+        batch.extend_seq_lens = torch.tensor([4], device="cuda")
+        batch.extend_prefix_lens = None
+        batch.extend_num_tokens = 4
+        batch.spec_info = None
+        cache = pool.mamba_cache.conv[0][0]
+        expected = cache.clone()
+        for _ in range(2):
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+            torch.testing.assert_close(
+                backend.sconv_metadata.track_cache_indices,
+                torch.zeros(1, dtype=torch.int64, device="cuda"),
+            )
+            self.scatter(backend, batch, cache)
+            torch.testing.assert_close(cache, expected, rtol=0, atol=0)
 
     def test_draft_runners_capture_and_replay_checkpoint_destinations(self):
         for multilayer in (False, True):
@@ -508,7 +691,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             if not captured:
                 captured.append(batch)
             ShortConvolution._update_sconv_cache_for_draft_extend(
-                None, batch, cache, backend._cache_indices, buffers.hidden_states
+                SimpleNamespace(_conv_state=lambda _: backend.sconv_metadata),
+                batch,
+                cache,
+                backend._cache_indices,
+                buffers.hidden_states,
             )
             return output
 
@@ -545,7 +732,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 capture_graph(None, run_once)
             else:
                 runner.capture_one_shape(4, None)
-            pointer = captured[0].mamba_track_indices.data_ptr() if tracking else None
+            pointer = (
+                backend.sconv_metadata.track_cache_indices.data_ptr()
+                if tracking
+                else None
+            )
             self.assertIsNone(backend.sconv_metadata.track_conv_indices)
             for live in (4, 2, 1, 3, 4):
                 if live == 2 and not static:
@@ -625,7 +816,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         buffers.mamba_track_indices, expected_ids, rtol=0, atol=0
                     )
                     self.assertEqual(
-                        captured[0].mamba_track_indices.data_ptr(), pointer
+                        backend.sconv_metadata.track_cache_indices.data_ptr(), pointer
                     )
                 else:
                     self.assertIsNone(captured[0].mamba_track_indices)
