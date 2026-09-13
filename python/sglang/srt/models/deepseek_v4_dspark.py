@@ -70,9 +70,8 @@ from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
-_is_ppu = is_ppu()
-
 _PAD_NUM_HEADS = 64
+_is_ppu = is_ppu()
 
 # DSpark confidence is a per-token score that must stay in [0, 1].
 _CONFIDENCE = Invariant(
@@ -274,7 +273,9 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        # On PPU q is not padded: the backend slices the full attn_sink per TP
+        # rank to n_local_heads, so q must keep its local head count.
+        if not _is_ppu and self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -1203,6 +1204,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        if _is_ppu:
+            if self.quant_config and self.quant_config.get_name() == "fp8":
+                if self.quant_config.is_fp4_experts and "mlp.experts" in mapped_rest:
+                    mapped_rest = mapped_rest.replace(
+                        ".weight_scale_inv", ".weight_scale"
+                    )
+            else:
+                mapped_rest = mapped_rest.replace(".weight_scale_inv", ".weight_scale")
         return f"stages.{stage_id}.{mapped_rest}"
 
     def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
