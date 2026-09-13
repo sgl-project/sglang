@@ -3936,6 +3936,11 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        if self.chunked_req is not None:
+            # Chunk fairness: return the budget left by the waiting queue to
+            # the capped chunked request (no-op when it was not capped).
+            self.chunked_req = adder.regrow_chunked_req(self.chunked_req)
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:

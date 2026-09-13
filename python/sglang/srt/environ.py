@@ -590,6 +590,13 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Chunked-prefill fairness: fraction of the chunk budget that a continuing
+    # chunked request leaves to the requests still waiting in the same prefill
+    # iteration (0 disables). With long prompts prefilled in many chunks, this
+    # lets short extends (turn restarts over a cached prefix) ride along instead
+    # of waiting for the whole prompt; waiting requests that would themselves
+    # need chunking are deferred until the current chunked request finishes.
+    SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE = EnvFloat(0.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

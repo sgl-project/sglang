@@ -646,6 +646,10 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.chunk_fairness_reserve = min(
+            max(envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.get(), 0.0), 0.9
+        )
+        self._fair_capped_req: Optional[Req] = None
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1076,6 +1080,7 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            _rem_tokens = self._fair_chunk_tokens(req, _rem_tokens)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1109,6 +1114,65 @@ class PrefillAdder:
         )
 
         # Return if chunked prefill not finished
+        return req if truncated else None
+
+    def _fair_chunk_tokens(self, req: Req, rem_tokens: int) -> int:
+        """Cap a continuing chunked request's chunk so waiting requests can
+        share this prefill iteration (SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE).
+
+        No-op when the knob is off, nothing is waiting, or the remaining
+        prompt already fits in the capped chunk.
+        """
+        if (
+            self.chunk_fairness_reserve <= 0
+            or self.waiting_queue_len <= 0
+            or self.rem_chunk_tokens is None
+        ):
+            return rem_tokens
+        cap = self.rem_chunk_tokens - int(
+            self.rem_chunk_tokens * self.chunk_fairness_reserve
+        )
+        cap = max(cap // self.page_size * self.page_size, self.page_size)
+        remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        if remaining <= cap or rem_tokens <= cap:
+            return rem_tokens
+        self._fair_capped_req = req
+        return cap
+
+    def regrow_chunked_req(self, req: Req) -> Optional[Req]:
+        """Hand the chunk budget that waiting requests did not use back to the
+        chunked request capped by `_fair_chunk_tokens`, so fairness never idles
+        prefill capacity. Call once after the waiting queue has been scanned.
+
+        Returns the request if it is still truncated after regrowing, else None
+        (same contract as `add_chunked_req`).
+        """
+        if req is None or req is not self._fair_capped_req:
+            return req
+        self._fair_capped_req = None
+        if self.rem_chunk_tokens is None or self.rem_chunk_tokens <= 0:
+            return req
+        extra = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        if self.is_hybrid_swa and not self._swa_req_ring:
+            extra = min(extra, int(self.rem_swa_tokens) - self.page_size)
+        extra = extra // self.page_size * self.page_size
+        remaining = len(req.full_untruncated_fill_ids) - req.extend_range.end
+        if extra <= 0 or remaining <= 0:
+            return req
+        extra = min(extra, remaining)
+        truncated = remaining > extra
+        req.set_extend_range(req.extend_range.start, req.extend_range.end + extra)
+        self._update_prefill_budget(
+            0,
+            extra,
+            (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if not truncated
+                else 0
+            ),
+            req.retracted_stain,
+            is_chunked_continuation=True,
+        )
         return req if truncated else None
 
     @contextmanager
@@ -1449,6 +1513,13 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
+                if has_chunked_req and self.chunk_fairness_reserve > 0:
+                    # Under chunk fairness the continuing chunked request left
+                    # part of the budget for waiting requests; only whole
+                    # extends may take it (the scheduler tracks one chunked
+                    # request at a time). Skip this one, keep scanning.
+                    return AddReqResult.CONTINUE
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
