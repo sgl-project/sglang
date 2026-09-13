@@ -13,23 +13,21 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+)
+from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +39,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -220,7 +218,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = get_alloc_memory_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -638,7 +636,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = get_alloc_memory_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [

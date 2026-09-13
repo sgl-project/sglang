@@ -29,13 +29,27 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pf,
+    transfer_kv_all_layer_lf_ph,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    transfer_kv_per_layer_pf_lf,
+    transfer_kv_per_layer_ph_lf,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -45,21 +59,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
@@ -187,7 +186,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -802,7 +801,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         self.k_buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -1130,7 +1129,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         # shared stride is a bug. Such callers will fail loudly with
         # AttributeError rather than silently use the K stride for V copies.
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         k_buffer = alloc_func(
             k_dims,
             dtype=self.dtype,

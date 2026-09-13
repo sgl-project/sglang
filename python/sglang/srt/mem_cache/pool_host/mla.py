@@ -20,13 +20,22 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -45,16 +54,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-    )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
@@ -299,7 +298,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if num_indexer_layers is None:
                 num_indexer_layers = self.layer_num
             indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
-            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            alloc_func = get_alloc_memory_func(self.device_pool.device)
             if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
                 # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
                 # mirror the packed width so the 2D memcpy row width matches.
@@ -333,6 +332,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
+
             self.k_buffer = alloc_func(
                 (*base_dims, k_width),
                 dtype=self.dtype,
@@ -376,7 +376,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
