@@ -288,6 +288,16 @@ _PRECARVE_SMALL_RESERVE_BYTES = 32 << 20
 _PRECARVE_GRANULARITY = 2 << 20
 
 
+def graph_pool_borrow_can_fit(nbytes: int) -> bool:
+    """Whether one free run fits the payload plus allocator padding and reserve."""
+    if nbytes <= 0:
+        return False
+    required = (
+        nbytes + _PRECARVE_GRANULARITY - 1
+    ) // _PRECARVE_GRANULARITY * _PRECARVE_GRANULARITY + _PRECARVE_SMALL_RESERVE_BYTES
+    return graph_pool_borrow_largest_run() >= required
+
+
 def _precarve_run_segments(runs: list[tuple[int, int]]) -> None:
     """Seed coalescible segments on the stream that will allocate borrows."""
     for _, run_bytes in runs:
