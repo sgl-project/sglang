@@ -461,6 +461,7 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    apply_step: Callable[..., None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
@@ -472,6 +473,8 @@ def minimax_h3_denoise_loop(
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
     independently testable with a plain callable.
+    ``apply_step`` optionally wraps the in-loop Euler pair so the caller can
+    record ``x_t`` (via ``step_latents``) before the video update.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
@@ -592,26 +595,43 @@ def minimax_h3_denoise_loop(
                 mv_audio_t = v_audio[audio_target_slice].float()
 
                 video_target = video_rows[video_target_slice]
-                _minimax_h3_update_target_rows_(
-                    video_target,
-                    mv_video_t,
-                    sigma_t=video_sigma_t[step],
-                    sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
-                )
-
                 audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
-                    mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
-                )
+
+                def update_video() -> None:
+                    _minimax_h3_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma_t=video_sigma_t[step],
+                        sigma_curr=s_v,
+                        sigma_ratio=video_sigma_ratios[step],
+                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        denoised_scratch=video_denoised_scratch,
+                    )
+
+                def update_audio() -> None:
+                    _minimax_h3_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_curr=s_a,
+                        sigma_ratio=audio_sigma_ratios[step],
+                        one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
+
+                if apply_step is None:
+                    update_video()
+                    update_audio()
+                else:
+                    apply_step(
+                        step,
+                        video_target,
+                        mv_video_t,
+                        audio_target,
+                        mv_audio_t,
+                        update_video,
+                        update_audio,
+                    )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
