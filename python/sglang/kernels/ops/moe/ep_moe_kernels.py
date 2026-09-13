@@ -1296,8 +1296,7 @@ def ep_scatter_from_psum(
         BLOCK_E=BLOCK_E,
     )
 
-    # BF16 scatter carries no scales; feed the kernel a live pointer it never
-    # dereferences instead of a null one.
+    # The BF16 specialization never dereferences these scale pointers.
     recv_x_scale_arg = recv_x_scale if is_fp8 else recv_x
     output_tensor_scale_arg = output_tensor_scale if is_fp8 else output_tensor
 
@@ -1323,8 +1322,7 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
-        # DeepEP v2 dispatch already rebases recv_topk to local expert ids
-        # (-1 elsewhere), so this kernel has nothing left to subtract.
+        # DeepEP v2 already rebases recv_topk to local expert IDs.
         0,
         num_experts,
         topk_num=recv_topk.shape[1],
