@@ -564,7 +564,9 @@ class DFlashDraftModel(nn.Module):
 
     The checkpoint provides:
       - transformer weights for `layers.*`
-      - `fc.weight`, `hidden_norm.weight` for projecting target context features
+      - `fc` weights (dense `fc.weight`, or pack-quantized `fc.weight_packed` /
+        `fc.weight_scale` / `fc.weight_shape`) and `hidden_norm.weight` for
+        projecting target context features
       - `norm.weight` for final normalization
     """
 
@@ -638,19 +640,20 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.is_nemotron_35_draft:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
-            self.fc = ReplicatedLinear(
-                self.num_context_features * hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=fc_prefix,
-            )
-        else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
-            )
+        # fc is replicated across TP ranks: its input (the concatenated target
+        # context features) and output (the draft hidden state) are both full
+        # tensors. Use a quantization-aware linear so pack-quantized checkpoints
+        # (e.g. compressed-tensors W4A16, which stores fc.weight_packed /
+        # fc.weight_scale / fc.weight_shape) are loadable; a plain nn.Linear only
+        # exposes fc.weight and silently drops those keys.
+        fc_prefix = f"{prefix}.fc" if prefix else "fc"
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=fc_prefix,
+        )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -708,9 +711,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -720,9 +721,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected = self.fc(target_hidden)[0]
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -827,24 +826,19 @@ class DFlashDraftModel(nn.Module):
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
-                    if self.is_nemotron_35_draft:
-                        expected_shape = (
-                            int(self.config.hidden_size),
-                            int(self.num_context_features * self.config.hidden_size),
-                        )
-                        loaded_shape = _logical_linear_weight_shape(
-                            param,
-                            loaded_weight,
-                            output_features=expected_shape[0],
-                        )
-                        shape_matches = loaded_shape == expected_shape or (
-                            getattr(param, "pack_factor", None) is None
-                            and tuple(loaded_weight.shape) == tuple(param.shape)
-                        )
-                    else:
-                        expected_shape = tuple(param.shape)
-                        loaded_shape = tuple(loaded_weight.shape)
-                        shape_matches = loaded_shape == expected_shape
+                    expected_shape = (
+                        int(self.config.hidden_size),
+                        int(self.num_context_features * self.config.hidden_size),
+                    )
+                    loaded_shape = _logical_linear_weight_shape(
+                        param,
+                        loaded_weight,
+                        output_features=expected_shape[0],
+                    )
+                    shape_matches = loaded_shape == expected_shape or (
+                        getattr(param, "pack_factor", None) is None
+                        and tuple(loaded_weight.shape) == tuple(param.shape)
+                    )
                     if not shape_matches:
                         raise ValueError(
                             "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
@@ -958,9 +952,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -972,16 +964,14 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         num_slices = int(self.num_context_features)
         slice_size = int(target_hidden.shape[-1]) // num_slices
         slices = target_hidden.view(target_hidden.shape[0], num_slices, slice_size)
-        compute_dtype = self.fc.weight.dtype
+        compute_dtype = self.fc.params_dtype
         if slices.dtype != compute_dtype:
             slices = slices.to(compute_dtype)
         normed = torch.empty_like(slices)
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected = self.fc(fused)[0]
         return self.hidden_norm(projected)
 
 
