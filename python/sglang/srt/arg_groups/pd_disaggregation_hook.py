@@ -147,6 +147,39 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
 
+        # Reject features whose role-specific state is not rebuilt on a flip.
+        if cfg.enable_pd_role_switch:
+            view = resolved_view(server_args)
+            unsupported = []
+            if view.enable_dp_attention:
+                unsupported.append("DP attention (--enable-dp-attention)")
+            if view.ep_size > 1:
+                unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
+            if view.moe_a2a_backend != "none":
+                unsupported.append(
+                    f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
+                )
+            if view.pp_size > 1:
+                unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
+            if view.dp_size > 1:
+                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if view.dcp_size > 1:
+                unsupported.append(
+                    f"decode context parallelism (--dcp-size {view.dcp_size})"
+                )
+            if view.speculative_algorithm is not None:
+                unsupported.append(
+                    "speculative decoding "
+                    f"(--speculative-algorithm {view.speculative_algorithm})"
+                )
+            if unsupported:
+                raise ValueError(
+                    "--enable-pd-role-switch does not rebuild role-specific "
+                    "state for the following features: "
+                    + ", ".join(unsupported)
+                    + ". Remove these options or drop --enable-pd-role-switch."
+                )
+
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     """Rust-server prefill serves the KV bootstrap registry on the api listener
