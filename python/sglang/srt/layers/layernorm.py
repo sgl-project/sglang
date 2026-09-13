@@ -487,6 +487,16 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def _torch_compile_forward(self, num_tokens: int):
+        # torch_npu exposes RMSNorm as an operator boundary that Dynamo can
+        # retain.  The generic compile-safe fallback is a float32 reference
+        # implementation; switching to it changes the NPU execution contract
+        # and has corrupted Qwen3-ASR decode output before any compiler backend
+        # is involved.
+        if _is_npu:
+            return None
+        return super()._torch_compile_forward(num_tokens)
+
     def forward_cuda(
         self,
         x: torch.Tensor,

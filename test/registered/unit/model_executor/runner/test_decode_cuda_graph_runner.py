@@ -25,6 +25,7 @@ server is constructed.
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,6 +41,67 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
+
+
+def test_compile_safe_model_context_restores_fused_ops_and_ca_comm():
+    from sglang.srt.compilation import torch_compile_decoration
+
+    model = object()
+    original_ca_comm = object()
+    tp_group = SimpleNamespace(ca_comm=original_ca_comm)
+    with mock.patch.object(torch_compile_decoration, "_to_torch") as toggle:
+        with torch_compile_decoration.prepare_model_for_torch_compile(
+            model, num_tokens=4, tp_group=tp_group
+        ):
+            tp_group.ca_comm = object()
+            toggle.assert_called_once_with(model, reverse=False, num_tokens=4)
+
+    assert toggle.call_args_list == [
+        mock.call(model, reverse=False, num_tokens=4),
+        mock.call(model, reverse=True, num_tokens=4),
+    ]
+    assert tp_group.ca_comm is original_ca_comm
+
+
+def test_npu_patch_model_uses_compile_safe_model_context():
+    from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner
+
+    events = []
+
+    @contextmanager
+    def fake_prepare(model, num_tokens, tp_group):
+        events.append(("enter", model, num_tokens, tp_group))
+        try:
+            yield
+        finally:
+            events.append(("exit", model, num_tokens, tp_group))
+
+    model = SimpleNamespace(forward=lambda *args, **kwargs: None)
+    tp_group = SimpleNamespace(ca_comm=object())
+    compiled = object()
+    with (
+        mock.patch.object(
+            npu_graph_runner, "prepare_model_for_torch_compile", fake_prepare
+        ),
+        mock.patch.object(
+            npu_graph_runner, "get_compiler_backend", return_value="npugraph_ex"
+        ),
+        mock.patch.object(
+            npu_graph_runner.torch, "compile", return_value=compiled
+        ) as compile_mock,
+    ):
+        with npu_graph_runner.patch_model_npu(
+            model, True, num_tokens=8, tp_group=tp_group
+        ) as forward:
+            assert forward is compiled
+            assert [event[0] for event in events] == ["enter"]
+
+    assert [event[0] for event in events] == ["enter", "exit"]
+    assert compile_mock.call_args.kwargs == {
+        "fullgraph": True,
+        "dynamic": False,
+        "backend": "npugraph_ex",
+    }
 
 
 def _make_fake_self(capture_bs):
