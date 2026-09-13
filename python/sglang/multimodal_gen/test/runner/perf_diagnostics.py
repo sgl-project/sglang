@@ -152,6 +152,7 @@ class AttemptDiagnostics:
         self.directory = None
         self.events = None
         self.thread = None
+        self.process_thread = None
         self.stop = threading.Event()
         self.pending_line = ""
         root = os.environ.get(_ROOT_ENV)
@@ -210,6 +211,10 @@ class AttemptDiagnostics:
 
     def start(self, pid: int):
         if self.directory:
+            self.process_thread = threading.Thread(
+                target=self._sample_processes, args=(pid,), daemon=True
+            )
+            self.process_thread.start()
             self.thread = threading.Thread(
                 target=self._sample, args=(pid,), daemon=True
             )
@@ -238,6 +243,33 @@ class AttemptDiagnostics:
             print(f"[diagnostics] boundary write failed: {type(exc).__name__}")
             self.events.close()
             self.events = None
+
+    def _sample_processes(self, pid):
+        # keep worker evidence flowing while NVML is blocked in the driver
+        try:
+            with (self.directory / "processes.jsonl").open("a") as stream:
+                parent = psutil.Process(pid)
+                while not self.stop.is_set():
+                    started = time.monotonic()
+                    started_wall_time_ns = time.time_ns()
+                    rows = []
+                    for process in [parent, *parent.children(recursive=True)]:
+                        try:
+                            rows.append(_process_sample(process))
+                        except (psutil.Error, OSError) as exc:
+                            rows.append(
+                                {"pid": process.pid, "error": type(exc).__name__}
+                            )
+                    _write_event(
+                        stream,
+                        "processes",
+                        processes=rows,
+                        sample_started_wall_time_ns=started_wall_time_ns,
+                        sample_seconds=time.monotonic() - started,
+                    )
+                    self.stop.wait(1)
+        except (OSError, psutil.Error) as exc:
+            print(f"[diagnostics] process sampling stopped: {type(exc).__name__}")
 
     def _sample(self, pid):
         initialized = False
@@ -325,6 +357,8 @@ class AttemptDiagnostics:
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.process_thread:
+            self.process_thread.join(timeout=5)
         if self.events:
             try:
                 _write_event(
@@ -332,6 +366,10 @@ class AttemptDiagnostics:
                     "attempt_end",
                     returncode=returncode,
                     sampler_stopped=self.thread is None or not self.thread.is_alive(),
+                    process_sampler_stopped=(
+                        self.process_thread is None
+                        or not self.process_thread.is_alive()
+                    ),
                 )
             except OSError as exc:
                 print(f"[diagnostics] final write failed: {type(exc).__name__}")

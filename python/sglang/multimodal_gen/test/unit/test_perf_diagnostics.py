@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import psutil
@@ -24,6 +26,48 @@ def test_disabled(monkeypatch, tmp_path):
     diagnostics.finish(1)
     assert diagnostics.directory is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_process_sampling_continues_while_nvml_blocks(monkeypatch, tmp_path):
+    monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_init():
+        entered.set()
+        assert release.wait(10)
+        raise perf_diagnostics.pynvml.NVMLError_NotSupported()
+
+    monkeypatch.setattr(perf_diagnostics.pynvml, "nvmlInit", blocked_init)
+    diagnostics = perf_diagnostics.AttemptDiagnostics(1)
+    try:
+        diagnostics.start(os.getpid())
+        assert entered.wait(5)
+        path = diagnostics.directory / "processes.jsonl"
+        deadline = time.monotonic() + 5
+        samples = []
+        while time.monotonic() < deadline:
+            if path.exists():
+                # another thread may currently be writing the last record
+                lines = path.read_text().splitlines(keepends=True)
+                samples = [json.loads(line) for line in lines if line.endswith("\n")]
+            if len(samples) >= 2:
+                break
+            time.sleep(0.05)
+        assert len(samples) >= 2
+        assert not release.is_set()
+        assert all(
+            any(p["pid"] == os.getpid() and "kernel" in p for p in s["processes"])
+            for s in samples
+        )
+    finally:
+        release.set()
+        diagnostics.finish(0)
+    assert not diagnostics.thread.is_alive()
+    assert not diagnostics.process_thread.is_alive()
+    assert _events(diagnostics.directory / "events.jsonl")[-1][
+        "process_sampler_stopped"
+    ]
 
 
 def test_fragmented_boundaries_do_not_save_arbitrary_logs(monkeypatch, tmp_path):
