@@ -17,3 +17,7 @@ export ENVS2="$ENVS2 SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=mat
 # Launch example (coordinator GPUs 0-3):
 #   source /scratch/run/best_lossy_config.sh; TAG=v9_lossy GPUS=0,1,2,3 PORT=30000 SPEC_ATTN=decode \
 #     EXTRA2="--max-running-requests 48 $EXTRA2" ENVS2="NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1 $ENVS2" bash /scratch/run/launch_v2.sh
+
+# Track L: chunked-prefill fairness (waiting short extends share the chunk budget with a long in-flight prefill);
+# c=24 900 s windows: TTFT p90 4.50->3.96 s, p99 12.7->10.3 s, throughput within noise; gsm8k-500 0.870 on the real-acceptance cfg.
+export ENVS2="$ENVS2 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5"

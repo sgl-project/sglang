@@ -19,3 +19,7 @@ export STEPS=3 DRAFT=4 MEMFRAC=0.85
 export ENVS2="$ENVS2 ROCM_QUICK_REDUCE_QUANTIZATION=INT4"
 export ENVS2="$ENVS2 SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1"
 # SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1 (Track H): aiter CK paged batch-prefill for >=2048-row extends over long prefixes; fresh 197K prefill 6.2 -> 5.8 s; gsm8k-500 0.864.
+
+# Track L: chunked-prefill fairness (waiting short extends share the chunk budget with a long in-flight prefill);
+# c=24 900 s windows: TTFT p90 4.50->3.96 s, p99 12.7->10.3 s, throughput within noise; gsm8k-500 0.870 on the real-acceptance cfg.
+export ENVS2="$ENVS2 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5"
