@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):

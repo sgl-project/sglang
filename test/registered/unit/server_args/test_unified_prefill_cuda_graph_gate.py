@@ -20,8 +20,7 @@ captured store would silently write wrong slots.
 
 The old gate only rejected `TC_PIECEWISE`, but the generic prefill default is
 `BREAKABLE` -- so the DEFAULT unified invocation was broken; it only ever
-worked when `--disable-piecewise-cuda-graph` (a deprecated alias for
-`--cuda-graph-backend-prefill=disabled`) happened to be passed.
+worked when `--cuda-graph-backend-prefill=disabled` happened to be passed.
 
 Pinned: the default is auto-disabled with a warning (unified boots out of the
 box), an EXPLICIT prefill backend still raises (never silently override a
@@ -33,6 +32,8 @@ user's stated intent), and decode capture is untouched either way.
 import unittest
 from types import SimpleNamespace
 
+import msgspec
+
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
@@ -43,7 +44,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 def _run_handler(*, prefill_backend, explicit):
     """Run just `handle_unified_memory_pool` over a minimal stand-in."""
-    sa = ServerArgs.__new__(ServerArgs)
+    sa = ServerArgs(model_path="dummy")
     cg = SimpleNamespace(
         prefill=SimpleNamespace(backend=prefill_backend),
         decode=SimpleNamespace(backend=Backend.FULL),
@@ -55,11 +56,12 @@ def _run_handler(*, prefill_backend, explicit):
         "speculative_eagle_topk": None,
         "enable_hierarchical_cache": False,
         "enable_lmcache": False,
+        "enable_two_batch_overlap": False,
         "dcp_size": 1,
         "cuda_graph_config": cg,
         "cuda_graph_backend_prefill": prefill_backend if explicit else None,
     }.items():
-        object.__setattr__(sa, name, value)
+        msgspec.Struct.__setattr__(sa, name, value)
     handle_unified_memory_pool(sa)
     return cg
 

@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -593,7 +594,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "npu_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -866,6 +875,24 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+                to_device_no_sync,
+            )
+
+            if ascendc_io_enabled():
+                # The fused acc_offload kv_exchange kernel reads the token
+                # indices directly on the device; keeping them there avoids
+                # the D2H sync that would serialize the layer-group pipeline.
+                # (The legacy memcpy2d exchange op still wants CPU indices and
+                # converts them itself.)
+                # Upload through pinned memory: host_indices comes from the
+                # radix-tree match as a pageable CPU tensor, and a pageable
+                # .to(device) completes with a stream synchronize that drains
+                # all compute queued on the current (default) stream.
+                if host_indices.device != self.device:
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
@@ -1171,7 +1198,7 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
-        page_hashes = self.get_hash_str(
+        page_hashes = get_storage_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
         operation.all_hash_values = page_hashes

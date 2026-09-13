@@ -88,7 +88,7 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
+    scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
@@ -149,8 +149,13 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + bias[None, :]
     elif SCORING_FUNC == 1:
-        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large.
-        sp = tl.where(scores > 20.0, scores, tl.log(1.0 + tl.exp(scores)))
+        # sqrt(softplus(x)). log(1.0 + exp(x)) rounds to 0 below -16.64 and overflows
+        # above 88.7; Triton has no log1p, so recover it from log via z*log(u)/(u-1).
+        z = tl.exp(-tl.abs(scores))
+        u = 1.0 + z
+        exact = u == 1.0
+        log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
+        sp = tl.maximum(scores, 0.0) + log1p_z
         activated = tl.sqrt(sp)
         biased = activated + bias[None, :]
     else:

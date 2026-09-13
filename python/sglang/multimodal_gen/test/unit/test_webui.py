@@ -44,6 +44,9 @@ def test_h3_webui_tasks_follow_loaded_partition():
     assert minimax_h3_tasks_for_server(
         SimpleNamespace(model_variant="ref2va", model_subfolder=None)
     ) == ("ref2va",)
+    assert minimax_h3_tasks_for_server(
+        SimpleNamespace(model_variant="hybrid", model_subfolder=None)
+    ) == ("t2va", "fl2va", "ref2va")
 
 
 def test_h3_t2va_uses_native_contract_without_generic_cfg_fields():
