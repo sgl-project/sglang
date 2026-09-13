@@ -7,6 +7,11 @@ from contextlib import nullcontext
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+try:
+    from torch.nn.attention.varlen import varlen_attn as torch_varlen_attn
+except ImportError:
+    torch_varlen_attn = None
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -118,7 +123,46 @@ class SDPAImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del max_seqlen
+        if (
+            type(self) is SDPAImpl
+            and torch_varlen_attn is not None
+            and not torch.compiler.is_compiling()
+            and not torch.is_grad_enabled()
+            and query.is_cuda
+            and torch.version.hip is None
+            and query.ndim == 3
+            and query.shape == key.shape == value.shape
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and query.dtype == key.dtype == value.dtype
+            and query.device == key.device == value.device == cu_seqlens.device
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and query.numel() > 0
+            and query.shape[-1] <= 256
+            and query.shape[-1] % 8 == 0
+            and cu_seqlens.dtype == torch.int32
+            and cu_seqlens.ndim == 1
+            and cu_seqlens.is_contiguous()
+            and cu_seqlens.numel() > 2
+            and max_seqlen > 0
+            and self.dropout == 0.0
+            and not self.allow_cudnn_sdp
+            and torch.backends.cuda.flash_sdp_enabled()
+            and not torch.backends.cuda.cudnn_sdp_enabled()
+            and torch.cuda.get_device_capability(query.device)[0] == 9
+        ):
+            # Keep the existing Flash SDPA arithmetic while consuming all
+            # packed windows in one call, including ragged and empty windows.
+            return torch_varlen_attn(
+                query,
+                key,
+                value,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                scale=self.softmax_scale,
+                window_size=(-1, 0) if self.causal else (-1, -1),
+            )
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
