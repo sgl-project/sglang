@@ -10,6 +10,38 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSparkPDMux(unittest.TestCase):
+    def test_scheduler_pp_proxy_argument_is_accepted_for_decode(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._forward_decode = Mock(return_value="decoded")
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: False),
+            is_extend_in_batch=False,
+        )
+        proxy = object()
+
+        result = worker.forward_batch_generation(batch, pp_proxy_tensors=proxy)
+
+        self.assertEqual(result, "decoded")
+        worker._forward_decode.assert_called_once_with(batch, None, None)
+
+    def test_scheduler_pp_proxy_argument_reaches_target_prefill(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._verify_planner = SimpleNamespace(note_non_decode_step=Mock())
+        worker._observers = SimpleNamespace(note_prefill_step=Mock())
+        worker._forward_prefill = Mock(return_value="prefilled")
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+            is_extend_in_batch=True,
+        )
+        proxy = object()
+
+        result = worker.forward_batch_generation(batch, pp_proxy_tensors=proxy)
+
+        self.assertEqual(result, "prefilled")
+        worker._forward_prefill.assert_called_once_with(
+            batch, None, pp_proxy_tensors=proxy
+        )
+
     def test_layer_split_rejects_target_without_aux_capture_support(self):
         target_worker = SimpleNamespace(
             device="cuda",
