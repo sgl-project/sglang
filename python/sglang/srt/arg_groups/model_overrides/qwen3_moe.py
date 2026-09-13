@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import get_quantization_config
 
@@ -56,9 +57,20 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
         )
         if has_w4a16_moe_layers:
             # trtllm-gen only has the W4A4 NVFP4 MoE path.
-            if cfg.moe_runner_backend not in ("auto", "marlin"):
+            # CuTe DSL v2 also supports W4A16 with BF16 activations when opted in.
+            use_cutedsl_w4a16 = (
+                cfg.moe_runner_backend == "flashinfer_cutedsl"
+                and cfg.moe_a2a_backend in ("none", "flashinfer")
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
+            if (
+                cfg.moe_runner_backend not in ("auto", "marlin")
+                and not use_cutedsl_w4a16
+            ):
                 raise ValueError(
-                    "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+                    "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
+                    "or flashinfer_cutedsl with --moe-a2a-backend=none/flashinfer "
+                    "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
                 )
             if cfg.moe_runner_backend == "auto":
                 overrides["moe_runner_backend"] = "marlin"

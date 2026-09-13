@@ -3113,6 +3113,57 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "marlin"},
             )
 
+    def test_qwen3_moe_family_w4a16_explicit_runner(self):
+        """Keep opted-in CuTe DSL v2 W4A16 accepted and auto routed to Marlin."""
+        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
+            _qwen3_moe_family_overrides,
+        )
+
+        hf_config = SimpleNamespace(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            quantization_config={
+                "quant_method": "modelopt_mixed",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "W4A16_NVFP4"
+                    }
+                },
+            },
+        )
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}),
+            ("marlin", "none", False, {}),
+            ("marlin", "none", True, {}),
+            ("flashinfer_cutedsl", "none", True, {}),
+            ("flashinfer_cutedsl", "flashinfer", True, {}),
+            ("flashinfer_cutedsl", "none", False, None),
+            ("flashinfer_cutedsl", "flashinfer", False, None),
+            ("flashinfer_cutedsl", "deepep", True, None),
+            ("flashinfer_cutlass", "none", True, None),
+            ("flashinfer_trtllm", "none", True, None),
+        ]
+        for runner, a2a, w4a16_enabled, expected in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16=w4a16_enabled),
+                override_platform(is_sm100=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                args = SimpleNamespace(
+                    quantization=None,
+                    _quantization_explicitly_unset=False,
+                    moe_a2a_backend=a2a,
+                    moe_runner_backend=runner,
+                )
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "W4A16_NVFP4"):
+                        _qwen3_moe_family_overrides(args, hf_config)
+                else:
+                    self.assertEqual(
+                        _qwen3_moe_family_overrides(args, hf_config),
+                        {"quantization": "modelopt_mixed", **expected},
+                    )
+
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
 
