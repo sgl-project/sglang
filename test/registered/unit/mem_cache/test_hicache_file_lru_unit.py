@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import errno
 import os
 import shutil
 import tempfile
@@ -179,6 +180,59 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         # No tracking happens.
         self.assertEqual(len(b._evictor._lru), 0)
         self.assertEqual(b._evictor._total_bytes, 0)
+
+
+class TestReadErrors(HiCacheFileLRUTestBase):
+    def test_short_read_returns_miss(self):
+        for enable_metadata_cache in (False, True):
+            for size in (0, 7):
+                with self.subTest(metadata=enable_metadata_cache, size=size):
+                    b = self.make_backend(enable_metadata_cache=enable_metadata_cache)
+                    self.assertTrue(b.set("key", _t(8, fill=1)))
+                    with open(b._get_component_path("key"), "r+b") as f:
+                        f.truncate(size)
+
+                    self.assertIsNone(b.get("key", _t(8)))
+                    if b.metadata_cache is not None:
+                        self.assertFalse(
+                            b.metadata_cache.contains(b._get_suffixed_key("key"))
+                        )
+
+    def test_os_error_returns_miss_and_later_read_succeeds(self):
+        b = self.make_backend(enable_metadata_cache=True)
+        value = _t(8, fill=3)
+        self.assertTrue(b.set("key", value))
+        for error in (errno.EIO, errno.EACCES):
+            with self.subTest(errno=error):
+                self.assertTrue(b.metadata_cache.contains(b._get_suffixed_key("key")))
+                with mock.patch(
+                    "builtins.open", side_effect=OSError(error, "read failed")
+                ):
+                    self.assertIsNone(b.get("key", _t(8)))
+                self.assertFalse(b.metadata_cache.contains(b._get_suffixed_key("key")))
+                # A transient read error must not delete a valid cached page.
+                self.assertTrue(torch.equal(b.get("key", _t(8)), value))
+
+    def test_batch_get_continues_after_short_read(self):
+        b = self.make_backend(enable_metadata_cache=False)
+        keys = ["first", "short", "last"]
+        for key in keys:
+            self.assertTrue(b.set(key, _t(8, fill=5)))
+        with open(b._get_component_path("short"), "r+b") as f:
+            f.truncate(7)
+
+        results = b.batch_get(keys, [_t(8) for _ in keys])
+        self.assertEqual(len(results), 3)
+        self.assertTrue(torch.equal(results[0], _t(8, fill=5)))
+        self.assertIsNone(results[1])
+        self.assertTrue(torch.equal(results[2], _t(8, fill=5)))
+
+    def test_non_io_error_propagates(self):
+        b = self.make_backend(enable_metadata_cache=False)
+        self.assertTrue(b.set("key", _t(8)))
+        with mock.patch("builtins.open", side_effect=ValueError("unexpected error")):
+            with self.assertRaisesRegex(ValueError, "unexpected error"):
+                b.get("key", _t(8))
 
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
