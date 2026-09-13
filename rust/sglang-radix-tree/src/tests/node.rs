@@ -5,7 +5,7 @@ use tch::Tensor;
 
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
-use crate::node::TreeCoreRuntimeError;
+use crate::node::{NodeAccessError, TreeCoreRuntimeError};
 
 static COUNTED_KEY_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1264,7 +1264,7 @@ fn alloc_stamps_self_id_and_a_fresh_access_tick() -> Result<(), TreeCoreRuntimeE
     )?;
     assert_eq!(arena.node(a).id, 1);
     assert_eq!(arena.node(b).id, 2);
-    assert_eq!(arena.resolve(arena.node(a).id), a);
+    assert_eq!(arena.resolve(arena.node(a).id).expect("live test node"), a);
     // Construction stamps strictly increasing ticks: root, then a, then b;
     // both stamps share the node's single construction tick.
     let root_tick = arena.node(root).last_access_counter;
@@ -1711,11 +1711,13 @@ fn failed_alloc_child_mints_no_id_and_keeps_the_freelist() -> Result<(), TreeCor
 }
 
 #[test]
-#[should_panic(expected = "is not allocated")]
-fn resolve_panics_on_a_never_minted_handle() {
+fn resolve_returns_err_for_a_never_minted_handle() {
     let arena = arena();
     arena.root();
-    arena.resolve(1_000_000);
+    assert!(matches!(
+        arena.resolve(1_000_000),
+        Err(NodeAccessError { node_id: 1_000_000 })
+    ));
 }
 
 #[test]
@@ -1815,7 +1817,7 @@ fn id_map_stays_consistent_across_free_and_realloc() -> Result<(), TreeCoreRunti
     )?;
     let b_id = arena.node(b).id;
     arena.free_leaf(b)?;
-    assert!(arena.try_resolve(b_id).is_none());
+    assert!(arena.resolve(b_id).is_err());
     // The freed slot is recycled with a fresh handle; the old one stays dead.
     let c = arena.alloc_child(
         root,
@@ -1825,10 +1827,13 @@ fn id_map_stays_consistent_across_free_and_realloc() -> Result<(), TreeCoreRunti
     )?;
     assert_eq!(c, b);
     assert_ne!(arena.node(c).id, b_id);
-    assert!(arena.try_resolve(b_id).is_none());
+    assert!(arena.resolve(b_id).is_err());
     // Every live slot resolves back from its own handle.
     for idx in arena.live_ids().collect::<Vec<_>>() {
-        assert_eq!(arena.resolve(arena.node(idx).id), idx);
+        assert_eq!(
+            arena.resolve(arena.node(idx).id).expect("live test node"),
+            idx
+        );
     }
     let _ = a;
     Ok(())

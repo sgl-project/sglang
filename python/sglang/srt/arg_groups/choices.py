@@ -78,6 +78,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific

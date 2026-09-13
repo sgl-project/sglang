@@ -7,6 +7,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
     unified_radix_tree_server_env,
@@ -49,6 +50,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
+@unittest.skipIf(is_in_amd_ci(), "Rust TreeCore is not packaged in AMD CI")
 class TestRustUnifiedFullRadixCache(TestUnifiedFullRadixCache):
     tree_core_backend = "rust"
 

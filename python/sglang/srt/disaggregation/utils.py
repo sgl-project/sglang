@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -70,6 +70,10 @@ def poll_and_all_reduce_pp(
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    # QSA models reuse the same flag for their draft-side index sharing but
+    # carry no DSA seed metadata over PD.
+    if not is_deepseek_dsa(hf_config):
         return 0
     return get_dsa_mtp_topk_width(hf_config)
 
@@ -1466,7 +1470,10 @@ def setup_state_kv_args(
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
-                kv_args.total_kv_layers = total_kv_layers
+                kv_args.hidden_kv_layers = total_kv_layers
+                kv_args.draft_kv_layers = (
+                    draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                )
             else:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens

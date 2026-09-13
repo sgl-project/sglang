@@ -91,6 +91,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
+
+    handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
@@ -174,6 +177,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
+        apply_glm5_chunked_prefill_default,
+        apply_glm5_prefill_cuda_graph_policy,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
@@ -187,6 +192,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_dwdp(server_args)
 
     handle_cuda_graph_config(server_args)
+    # Requires the parsed backend and explicit-input locks, and must precede
+    # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
+    apply_glm5_chunked_prefill_default(server_args)
 
     # Handle device-specific backends.
     from sglang.srt.arg_groups.platform_hook import (
@@ -231,6 +239,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    # After the model overrides: Qwen4-Exp declares the PLE offload default there.
+    handle_offload_compatibility(server_args)
 
     # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)
@@ -256,6 +266,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_mamba_backend(server_args)
     handle_int8_mamba_checkpoint(server_args)
     handle_linear_attn_backend(server_args)
+    apply_glm5_prefill_cuda_graph_policy(server_args)
     handle_kv4_compatibility(server_args)
     handle_mxfp8_kv_cache_compatibility(server_args)
     run_post_process_pass(server_args, _page_size_default)

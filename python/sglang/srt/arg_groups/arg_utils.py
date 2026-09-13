@@ -39,7 +39,6 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import functools
 import types
@@ -55,20 +54,6 @@ from typing import (
 )
 
 A = Annotated
-
-
-class _NoFallback:
-    """Sentinel for ``Arg.fallback``: this field declares none.
-
-    ``None`` cannot serve, because ``None`` is what a field *holds* when the
-    operator did not type it -- the state a fallback answers for.
-    """
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "<no fallback>"
-
-
-NO_FALLBACK = _NoFallback()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,11 +81,13 @@ class Arg:
     # What the field means when nobody said anything -- the bottom of the read
     # chain: override, decision, input, then this. Not the dataclass default,
     # which stays `None` because that is how the record spells "not typed".
+    # `None` here means the field declares no fallback, which is the same
+    # answer the read chain gives without one.
     #
     # Only a value fixed for the life of the configuration belongs here. One
     # that depends on the machine, on another field, or on anything impure is a
     # decision, and decisions stay in a hook where their order is visible.
-    fallback: Any = NO_FALLBACK
+    fallback: Any = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,7 +219,20 @@ def fallbacks_of(cls) -> dict:
     out = {}
     for field in dataclasses.fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
-        if arg is not None and arg.fallback is not NO_FALLBACK:
+        if arg is not None and arg.fallback is not None:
+            # Two things `with_fallback` relies on and cannot check itself,
+            # asserted where a new declaration passes through. This function is
+            # cached, so a mutable fallback would hand one shared object to
+            # every reader; and a field whose dataclass default is not `None`
+            # can never reach the fallback, which makes the declaration dead.
+            assert not isinstance(arg.fallback, (list, dict, set)), (
+                f"{cls.__name__}.{field.name}: a mutable fallback would be "
+                "shared by every reader -- use a scalar"
+            )
+            assert field.default is None, (
+                f"{cls.__name__}.{field.name}: declares a fallback but defaults "
+                f"to {field.default!r}, so the fallback is unreachable"
+            )
             out[field.name] = arg.fallback
     return out
 
@@ -246,17 +246,12 @@ def with_fallback(cls, name: str, value: Any) -> Any:
     on `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
     would make that branch dead. `test_declared_fallbacks.py` pins both halves.
 
-    A container fallback is copied, for the reason a dataclass spells this
-    `default_factory`.
+    A mutable fallback would need copying per read, for the reason a dataclass
+    spells this `default_factory`. Every declared one is a scalar.
     """
     if value is not None:
         return value
-    fallback = fallbacks_of(cls).get(name, NO_FALLBACK)
-    if fallback is NO_FALLBACK:
-        return value
-    if isinstance(fallback, (list, dict, set)):
-        return copy.deepcopy(fallback)
-    return fallback
+    return fallbacks_of(cls).get(name, value)
 
 
 # ---------------------------------------------------------------------------

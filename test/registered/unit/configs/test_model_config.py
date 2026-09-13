@@ -7,7 +7,9 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    resolve_spec_hidden_size,
 )
+from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,6 +70,27 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
+
+    def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
+        """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
+        so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses first."""
+        hidden_size, hc_mult = 2560, 4
+        self.assertEqual(Qwen4ExpTextConfig(hc_count=hc_mult).hc_mult, hc_mult)
+        for arch in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLMMTP"):
+            hf_config = SimpleNamespace(architectures=[arch])
+            self.assertEqual(
+                resolve_spec_hidden_size(
+                    hf_config=hf_config, hidden_size=hidden_size, hc_mult=hc_mult
+                ),
+                (hidden_size * hc_mult, hidden_size * hc_mult),
+            )
+        hy_v4 = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        self.assertEqual(
+            resolve_spec_hidden_size(
+                hf_config=hy_v4, hidden_size=hidden_size, hc_mult=hc_mult
+            ),
+            (hidden_size, None),
+        )
 
 
 if __name__ == "__main__":

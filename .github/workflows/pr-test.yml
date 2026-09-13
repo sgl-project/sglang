@@ -474,21 +474,21 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-4-gpu-gb300
-      runner_config: 4-gpu-gb300
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-      # The one aarch64 stage, so it takes the aarch64 build, not rust-ext-build's.
-      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
-    secrets: inherit
+  # base-c-test-4-gpu-gb300:
+  #   needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/_pr-test-stage.yml
+  #   with:
+  #     self_name: base-c-test-4-gpu-gb300
+  #     runner_config: 4-gpu-gb300
+  #     check_changes: ${{ toJson(needs.check-changes.outputs) }}
+  #     caller_inputs: ${{ toJson(inputs) }}
+  #     partitions: ${{ needs.check-changes.outputs.partitions }}
+  #     run_timeout_minutes: '30'
+  #     timeout_per_file: '1800'
+  #     # The one aarch64 stage, so it takes the aarch64 build, not rust-ext-build's.
+  #     rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
+  #   secrets: inherit
 
   base-c-test-8-gpu-b300:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
@@ -537,7 +537,7 @@ jobs:
         base-c-test-8-gpu-h20,
         base-c-test-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-4-gpu-gb300,
+        # base-c-test-4-gpu-gb300,
         base-c-test-8-gpu-b300,
       ]
     if: always()

@@ -33,6 +33,8 @@ dependencies = [
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
+  "memfabric-hybrid==1.1.4",
+  "memfabric-zbal==1.1.2",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -66,8 +68,6 @@ dependencies = [
   "uvloop",
   "xxhash",
   "xgrammar==0.2.1",
-  "memfabric-hybrid==1.1.4",
-  "memfabric-zbal==1.2.0",
 ]
 
 [project.optional-dependencies]

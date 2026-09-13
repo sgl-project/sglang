@@ -175,6 +175,11 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
+            # The record, via the input snapshot rather than the field: a
+            # hook may not read a field off the record (the guard in
+            # `test_resolution_reads_the_declarations.py`), and what this
+            # needs is the input anyway -- whether the operator asked for a
+            # memory fraction, not the value in effect.
             explicit_mem_fraction = (
                 getattr(server_args, "_raw_input", None) or {}
             ).get("mem_fraction_static") is not None

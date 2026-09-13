@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -246,7 +247,11 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        draft_kv_pool = (
+            self.draft_token_to_kv_pool
+            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            else None
+        )
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -481,6 +486,9 @@ class PrefillBootstrapQueue:
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
+                    req.arrival_processed_tokens = (
+                        self.scheduler.processed_tokens_counter
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -491,6 +499,7 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+                req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -1452,4 +1461,5 @@ class SchedulerDisaggregationPrefillMixin:
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
             self.waiting_queue.insert(0, req)
