@@ -71,13 +71,14 @@ def gate(
     )
 
 
-def fp8(ignored=(), block=(128, 128), name="fp8", mxfp8=False):
+def fp8(ignored=(), block=(128, 128), name="fp8", mxfp8=False, fp4_experts=False):
     return SimpleNamespace(
         get_name=lambda: name,
         weight_block_size=list(block),
         ignored_layers=list(ignored),
         packed_modules_mapping={},
         use_mxfp8=mxfp8,
+        is_fp4_experts=fp4_experts,
     )
 
 
@@ -107,6 +108,7 @@ def test_supported_paths(kwargs):
         {"deepep": True},
         {"quant": fp8(name="awq")},
         {"quant": fp8(block=(1, 32), mxfp8=True)},
+        {"quant": fp8(fp4_experts=True)},
         {"quant": fp8(["model.layers.1.mlp.shared_experts"])},
         {"quant": fp8(["model.layers.1.mlp.shared_experts.gate_proj"])},
         {"quant": fp8(["model.layers.1.mlp.experts.0.gate_proj"])},

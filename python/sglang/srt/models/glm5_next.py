@@ -1235,6 +1235,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 quant_config.get_name() != "fp8"
                 or getattr(quant_config, "weight_block_size", None) != [128, 128]
                 or getattr(quant_config, "use_mxfp8", False)
+                or getattr(quant_config, "is_fp4_experts", False)
             ):
                 return "The gfx942 path supports BF16 or 128x128 block FP8 only."
             if quant_config is not None and any(
