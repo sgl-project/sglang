@@ -12,6 +12,7 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 PROCESSOR_MAPPING = {}
+PROCESSOR_IMPORT_FAILURES: dict[str, str] = {}
 
 
 def import_processors(package_name: str, overwrite: bool = False):
@@ -21,8 +22,10 @@ def import_processors(package_name: str, overwrite: bool = False):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+                PROCESSOR_IMPORT_FAILURES[name] = f"{type(e).__name__}: {e}"
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
+            PROCESSOR_IMPORT_FAILURES.pop(name, None)
             all_members = inspect.getmembers(module, inspect.isclass)
             classes = [
                 member
@@ -82,8 +85,19 @@ def get_mm_processor(
 ) -> BaseMultimodalProcessor:
     processor_cls = get_mm_processor_cls(hf_config, model_config)
     if processor_cls is None:
+        import_failure_details = ""
+        if PROCESSOR_IMPORT_FAILURES:
+            failures = "\n".join(
+                f"- {name}: {failure}"
+                for name, failure in sorted(PROCESSOR_IMPORT_FAILURES.items())
+            )
+            import_failure_details = (
+                f"\nProcessor modules that failed to import:\n{failures}"
+            )
         raise ValueError(
             f"No processor registered for architecture: {hf_config.architectures}.\n"
-            f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+            f"Registered architectures: "
+            f"{[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+            f"{import_failure_details}"
         )
     return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)
