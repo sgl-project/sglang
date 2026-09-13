@@ -41,27 +41,7 @@ def set_mla_kv_buffer_module(nope_bytes: int, rope_bytes: int, use_pdl: bool) ->
 
 @cache_once
 def can_use_set_mla_kv_buffer(nope_bytes: int, rope_bytes: int) -> bool:
-    """Whether the TMA path can be used for these row byte widths.
-
-    TMA bulk store requires ``(nope_bytes + rope_bytes)`` to be a multiple of
-    16; both halves individually must also be a multiple of 4 (the warp-coop
-    smem load lower bound).
-    """
-    if nope_bytes % 4 != 0 or rope_bytes % 4 != 0:
-        logger.warning(
-            "Unsupported nope_bytes=%d rope_bytes=%d for JIT set_mla_kv_buffer:"
-            " both must be multiples of 4",
-            nope_bytes,
-            rope_bytes,
-        )
-        return False
-    if (nope_bytes + rope_bytes) % 16 != 0:
-        logger.warning(
-            "Unsupported nope_bytes=%d rope_bytes=%d for JIT set_mla_kv_buffer:"
-            " (nope_bytes + rope_bytes) must be a multiple of 16 for TMA bulk store",
-            nope_bytes,
-            rope_bytes,
-        )
+    if (rope_bytes + nope_bytes) % 16 != 0:
         return False
     try:
         set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())

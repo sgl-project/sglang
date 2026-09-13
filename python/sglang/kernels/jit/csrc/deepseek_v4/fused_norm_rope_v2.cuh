@@ -178,7 +178,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
 #ifndef USE_ROCM
-        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(warp::kFullMask, data[i], mask, kWarpThreads);
 #else
         const float other = __shfl_xor(data[i], mask, kWarpThreads);
 #endif
@@ -334,7 +334,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
 #ifndef USE_ROCM
-        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(warp::kFullMask, data[i], mask, kWarpThreads);
 #else
         const float other = __shfl_xor(data[i], mask, kWarpThreads);
 #endif

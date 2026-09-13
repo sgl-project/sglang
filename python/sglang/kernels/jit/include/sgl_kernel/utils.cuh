@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -22,6 +23,8 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <type_traits>
 #ifndef USE_ROCM
 #include <cuda_bf16.h>
@@ -108,6 +111,7 @@ namespace device {
 
 /// \brief Macro: forced-inline device function qualifier.
 #define SGL_DEVICE __forceinline__ __device__
+#define SGL_DEVICE_HOST __forceinline__ __device__ __host__
 
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
@@ -133,13 +137,42 @@ static_assert(
 inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
 
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
-inline constexpr auto kWarpThreads = 32u;
-/// \brief Full warp active mask (all 32 lanes).
+inline constexpr uint32_t kWarpThreads = 32u;
+/// \brief Most implementations prefer this name; keep the alias for them.
+inline constexpr uint32_t kWarpSize = kWarpThreads;
+
+/**
+ * \brief This thread's index within its logical `kNumThreads` group.
+ *
+ * \tparam kNumThreads Group width; a power of two, at most 32 on CUDA and at
+ * most 64 (the wave) on HIP -- so `64` is a HIP-only instantiation.
+ *
+ * \note Equals the true in-warp lane only when `blockDim.x` is a multiple of
+ * `kNumThreads`; every caller in this tree satisfies that.
+ * \note On CUDA prefer this over `threadIdx.x % kNumThreads` when the value
+ * feeds an address: `%laneid` is one register read that folds straight into
+ * `IMAD.WIDE`, while the modulo makes ptxas re-derive the mask at every address
+ * scale. Worth 8 instructions in a two-tile warp copy, measured on sm_100a.
+ * That only holds at full width -- a narrower group needs the mask anyway and
+ * ties with the modulo.
+ */
+template <uint32_t kNumThreads = kWarpThreads>
+SGL_DEVICE uint32_t get_lane_id() {
 #ifndef USE_ROCM
-inline constexpr auto kFullMask = 0xffffffffu;
+  static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
+  uint32_t lane_id;
+  asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+  if constexpr (kNumThreads != 32) lane_id %= kNumThreads;
+  return lane_id;
 #else
-inline constexpr auto kFullMask = 0xffffffffffffffffULL;
+  static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
+  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask as
+  // a `v_mbcnt_lo`/`v_mbcnt_hi` pair, and the group mask is still needed on top.
+  // Masking `threadIdx.x` -- already live in v0 -- is 2 instructions cheaper and
+  // yields the same value (measured on gfx950, hipcc 7.0).
+  return threadIdx.x % kNumThreads;
 #endif
+}
 
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
@@ -147,6 +180,14 @@ inline constexpr auto kFullMask = 0xffffffffffffffffULL;
  * On Hopper (sm_90+), inserts a `griddepcontrol.wait` instruction to
  * synchronize with a preceding kernel in the same stream. On older
  * architectures or ROCm this is a no-op.
+ *
+ *\note This is the only thing that orders us against the producer. Per the PTX
+ * ISA, `.wait` makes the executing thread wait until every prerequisite grid in
+ * flight has COMPLETED and all of its memory operations are performed and made
+ * visible to this grid -- so it is what a `PDLTriggerSecondary` upstream does
+ * NOT give us. It acts per thread, so every thread that reads producer data has
+ * to execute it; put it ahead of the first such load. Stores into our own output
+ * buffers depend on nothing upstream and may be issued before it.
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
@@ -162,6 +203,22 @@ SGL_DEVICE void PDLWaitPrimary() {
  *
  * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
  * instruction. On older architectures or ROCm this is a no-op.
+ *
+ * \note Scheduling only: this carries no memory ordering of its own. The
+ * dependent becomes eligible to launch once every CTA in this grid has issued
+ * the instruction or has exited, and it may then start before our writes are
+ * visible -- making them visible is the job of `PDLWaitPrimary` on the dependent
+ * side, which is why the programming guide requires the dependent to call it.
+ *
+ * Granularity is the CTA: the PTX ISA states that repeated invocations by
+ * threads of the same CTA have no side effect past the first, so one thread
+ * would do; we call it from all of them because it is free and needs no
+ * predication. Leaving it out altogether is safe and merely late, since the
+ * trigger is implied once every CTA exits (SASS code `PREEXIT`)
+ *
+ * Placing it early therefore costs nothing and only buys the dependent a head
+ * start on the work that does not depend on us. Even that is opportunistic:
+ * concurrent execution is never guaranteed, so nothing may rely on it.
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
@@ -227,6 +284,41 @@ SGL_DEVICE void enable_smem_spilling() {
 #if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
   asm(".pragma \"enable_smem_spilling\";");
 #endif
+}
+
+template <typename T, std::size_t N>
+struct DeviceArray {
+ public:
+  SGL_DEVICE constexpr static std::size_t size() {
+    return N;
+  }
+  SGL_DEVICE constexpr auto operator[](std::size_t idx) -> T& {
+    return m_data[idx];
+  }
+  SGL_DEVICE constexpr auto operator[](std::size_t idx) const -> const T& {
+    return m_data[idx];
+  }
+  SGL_DEVICE constexpr auto data() const -> const T* {
+    return m_data;
+  }
+  SGL_DEVICE constexpr auto data() -> T* {
+    return m_data;
+  }
+
+ private:
+  T m_data[N];
+};
+
+/**
+ * Adapted from
+ * https://github.com/deepseek-ai/DeepGEMM/blob/559d79fb6994a58b8a15b4b93bf13ccc16edf247/deep_gemm/include/deep_gemm/common/utils.cuh
+ */
+SGL_DEVICE_HOST constexpr uint32_t get_tmem_cols(uint32_t num_cols) {
+  if (num_cols <= 32) return 32;
+  if (num_cols <= 64) return 64;
+  if (num_cols <= 128) return 128;
+  if (num_cols <= 256) return 256;
+  return 512;
 }
 
 }  // namespace device
