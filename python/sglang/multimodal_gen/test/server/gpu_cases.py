@@ -405,6 +405,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "sana_wm_ti2v",
         DiffusionServerArgs(
             model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+            extras=["--warmup-resolutions 384x640"],
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,

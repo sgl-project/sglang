@@ -28,10 +28,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
     LongLive2T2VConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -62,7 +64,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
-from sglang.multimodal_gen.test.server.gpu_cases import TWO_GPU_CASES
+from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES, TWO_GPU_CASES
 from sglang.multimodal_gen.test.server.testcase_configs import _get_extra_arg_value
 
 
@@ -671,6 +673,39 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         )
 
         self.assertEqual(num_frames, 57)
+
+    def test_sana_ci_warmup_matches_formal_shape(self):
+        case = next(case for case in ONE_GPU_CASES if case.id == "sana_wm_ti2v")
+        resolution = _get_extra_arg_value(
+            case.server_args.extras, "--warmup-resolutions"
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SanaWMPipelineConfig(),
+            pipeline_class_name=None,
+            model_path=case.server_args.model_path,
+            model_id=None,
+            backend="sglang",
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+            warmup_sampling_params=None,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+        )
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=SanaWMSamplingParams()
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=[resolution],
+                warmup_input_path="synthetic-warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual(resolution, case.sampling_params.output_size)
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual((reqs[0].width, reqs[0].height), (384, 640))
+        self.assertEqual(reqs[0].num_frames, case.sampling_params.num_frames)
 
     def test_ltx25_ci_warmup_matches_formal_decoder_and_shape(self):
         case = next(
