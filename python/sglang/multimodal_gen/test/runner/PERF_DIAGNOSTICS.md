@@ -88,9 +88,10 @@ Sources are PR Test Base runs [34750203901](https://github.com/sgl-project/sglan
 Only saved valid loading measurements are used; this does not claim those runs
 passed all other checks. No E2E reference or tolerance is raised. Cross-run
 stability is a conservative selection criterion, not proof of an optimal load
-time. Cases with insufficient samples or greater variation remain uncalibrated
-and continue to fail the missing-loading-baseline check; B200 and 5090 references
-are not inferred from H100 or development H200 measurements.
+time. The first batches left variable cases uncalibrated; the best-observed
+references below now give those cases a loading guard without claiming stable
+runtime. B200 and 5090 references are not inferred from H100 or development H200
+measurements.
 
 The six RTX 5090 loading references use the same selection rule, from runs
 [34753876622](https://github.com/sgl-project/sglang/actions/runs/34753876622),
@@ -147,3 +148,27 @@ and no existing performance reference or tolerance is increased.
 36793.38 ms and 31600.49 ms, respectively, with maximum/minimum ratios of
 1.1745 and 1.1256. The realtime case uses the same process-start-to-ready
 loading boundary, excluding warmup; its request E2E reference is unchanged.
+
+### Best-observed references for variable cases
+
+The remaining 16 H100 and five B200 cases use the fastest valid startup in
+the saved reports from runs 34755864886, 34764411082, 34766506722,
+34770008768, and 34771349145, where available. Each value is rounded to two
+decimals. H100 cases have three to five distinct startups; B200 cases have
+two. These are initial measured references, not claims of stability or proof
+that every historical run passed. Requiring all noisy samples to converge
+before establishing a guard would leave these cases without a quantified limit.
+
+No existing reference or tolerance is increased. Samples above the resulting
+limit still fail, and their infrastructure/code diagnosis remains separate.
+In particular, LTX HQ retains the observed 116.531 s startup as its reference,
+not the later 187-208 s startups. Downloads in H200 development measurements
+are not used to establish either GPU pool's loading references.
+
+| Source run | GPU | Cases supplying the minimum |
+| --- | --- | --- |
+| 34755864886 | H100 | `fast_hunyuan_video`, `joy_echo_t2v_2gpu`, `wan2_1_i2v_14b_480P_2gpu`, `wan2_1_t2v_14b_2gpu`, `wan2_2_t2v_a14b_2gpu` |
+| 34764411082 | H100 | `lingbot_video_moe_t2v`, `ltx_2_3_hq_pipeline`, `qwen_image_t2i_2_gpus_extra_high`, `wan22_modelopt_fp8_t2v` |
+| 34766506722 | H100 | `ltx_2_3_two_stage_ti2v_2gpus`, `ltx_2_5_diffusion_decoder_2gpus`, `ltx_2_two_stage_t2v`, `minimax_h3_ref2va_video_audio_2gpu_h100`, `sana_wm_ti2v`, `wan2_1_i2v_14b_lora_2gpu`, `wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu` |
+| 34755864886 | B200 | `flux1_modelopt_nvfp4_t2i`, `flux2_modelopt_nvfp4_t2i` |
+| 34764411082 | B200 | `ideogram4_nvfp4_t2i`, `qwen_image_2512_modelopt_nvfp4_t2i`, `wan22_modelopt_nvfp4_t2v` |

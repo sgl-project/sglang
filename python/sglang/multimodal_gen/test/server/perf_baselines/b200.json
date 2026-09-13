@@ -40,6 +40,7 @@
     },
     "scenarios": {
         "flux1_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 38841.5,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 16.55,
@@ -68,6 +69,7 @@
             "estimated_full_test_time_s": 71.2
         },
         "flux2_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 71333.99,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 330.43,
@@ -97,6 +99,7 @@
             "estimated_full_test_time_s": 592.3
         },
         "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 46619.98,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 221.4,
@@ -163,6 +166,7 @@
             "estimated_full_test_time_s": 120.0
         },
         "wan22_modelopt_nvfp4_t2v": {
+            "expected_load_ms": 79653.94,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 316.23,
@@ -191,6 +195,7 @@
             "estimated_full_test_time_s": 181.8
         },
         "ideogram4_nvfp4_t2i": {
+            "expected_load_ms": 33439.28,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "Ideogram4TextEncodingStage": 129.35,

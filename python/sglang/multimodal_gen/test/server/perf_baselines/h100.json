@@ -40,6 +40,7 @@
     },
     "scenarios": {
         "sana_wm_ti2v": {
+            "expected_load_ms": 32625.62,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 7239.81,
@@ -205,6 +206,7 @@
             "estimated_full_test_time_s": 65.6
         },
         "qwen_image_t2i_2_gpus_extra_high": {
+            "expected_load_ms": 46120.38,
             "notes": "H100 CI run 34695613376, job 103558583416, head 5ae9847fc7092a7c75a275556d672f7507a1f933; request 1 after server warmup. E2E also agrees with runs 34693958419 and 34687251777. Existing tolerances are unchanged.",
             "stages_ms": {
                 "InputValidationStage": 0.04,
@@ -286,6 +288,7 @@
             "estimated_full_test_time_s": 75.4
         },
         "joy_echo_t2v_2gpu": {
+            "expected_load_ms": 46333.83,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 2469.07,
@@ -1386,6 +1389,7 @@
             "estimated_full_test_time_s": 124.7
         },
         "ltx_2_two_stage_t2v": {
+            "expected_load_ms": 47470.86,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 403.5,
@@ -1683,6 +1687,7 @@
             "estimated_full_test_time_s": 125.2
         },
         "fast_hunyuan_video": {
+            "expected_load_ms": 32322.52,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 252.98,
@@ -1773,6 +1778,7 @@
             "estimated_full_test_time_s": 168.7
         },
         "wan2_1_i2v_14b_480P_2gpu": {
+            "expected_load_ms": 46402.22,
             "stages_ms": {
                 "InputValidationStage": 7.88,
                 "LatentPreparationStage": 0.1,
@@ -1919,6 +1925,7 @@
             "estimated_full_test_time_s": 182.2
         },
         "wan2_2_t2v_a14b_2gpu": {
+            "expected_load_ms": 61832.44,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 314.11,
@@ -1980,6 +1987,7 @@
             "estimated_full_test_time_s": 188.0
         },
         "wan2_1_t2v_14b_2gpu": {
+            "expected_load_ms": 45201.26,
             "stages_ms": {
                 "TextEncodingStage": 325.79,
                 "DecodingStage": 637.43,
@@ -2182,6 +2190,7 @@
             "estimated_full_test_time_s": 129.6
         },
         "wan2_1_i2v_14b_lora_2gpu": {
+            "expected_load_ms": 66554.82,
             "stages_ms": {
                 "InputValidationStage": 12.06,
                 "TextEncodingStage": 325.79,
@@ -2891,6 +2900,7 @@
             "estimated_full_test_time_s": 186.0
         },
         "ltx_2_5_diffusion_decoder_2gpus": {
+            "expected_load_ms": 28133.24,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 634.13,
@@ -2924,6 +2934,7 @@
             "estimated_full_test_time_s": 545.1
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
+            "expected_load_ms": 50003.37,
             "stages_ms": {
                 "InputValidationStage": 3.21,
                 "TextEncodingStage": 411.15,
@@ -3027,6 +3038,7 @@
             "estimated_full_test_time_s": 149.4
         },
         "lingbot_video_moe_t2v": {
+            "expected_load_ms": 22654.46,
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "LingBotVideoTextEncodingStage": 89.03,
@@ -3081,6 +3093,7 @@
             "estimated_full_test_time_s": 126.0
         },
         "ltx_2_3_hq_pipeline": {
+            "expected_load_ms": 116530.53,
             "stages_ms": {
                 "InputValidationStage": 4.63,
                 "TextEncodingStage": 401.75,
@@ -3236,6 +3249,7 @@
             "estimated_full_test_time_s": 186.4
         },
         "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
+            "expected_load_ms": 34366.19,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 1077.99,
@@ -3244,6 +3258,7 @@
             "estimated_full_test_time_s": 52.2
         },
         "minimax_h3_ref2va_video_audio_2gpu_h100": {
+            "expected_load_ms": 68100.42,
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "MiniMaxH3PartitionAdmissionStage": 0.04,
@@ -3368,6 +3383,7 @@
             "estimated_full_test_time_s": 498.1
         },
         "wan22_modelopt_fp8_t2v": {
+            "expected_load_ms": 63380.1,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 7908.23,
