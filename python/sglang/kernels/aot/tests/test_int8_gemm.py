@@ -3,7 +3,11 @@ import sys
 import pytest
 import torch
 from sgl_kernel import int8_scaled_mm
-from utils import is_sm10x
+
+
+def _int8_unsupported() -> bool:
+    cap = torch.cuda.get_device_capability()
+    return not ((7, 5) <= cap <= (9, 0) or (12, 0) <= cap <= (12, 1))
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -34,8 +38,8 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
 
 @pytest.mark.skipif(
-    is_sm10x(),
-    reason="int8_scaled_mm is only supported on sm90 and lower",
+    _int8_unsupported(),
+    reason="int8_scaled_mm supports SM75-SM90 and SM120-SM121",
 )
 @pytest.mark.parametrize("M", [1, 16, 32, 64, 128, 512, 1024, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096, 8192, 16384])
