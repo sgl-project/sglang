@@ -44,6 +44,7 @@ from typing import (
     cast,
 )
 
+import msgspec
 import torch
 import uvloop
 import zmq
@@ -266,7 +267,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
             # shows here even when the caller did not pass it.
-            object.__setattr__(
+            msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
                 "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",

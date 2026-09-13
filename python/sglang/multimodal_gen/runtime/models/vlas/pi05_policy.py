@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     VLADenoiseGraphSignature,
@@ -62,7 +63,6 @@ from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
     effective_token_length,
     select_prompt_token_bucket,
 )
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
