@@ -8,7 +8,7 @@ Positions and state-ring indices describe the per-request decode schedule.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Final, Optional, Union
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 if TYPE_CHECKING:
@@ -26,10 +27,21 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_c2_module(head_dim: int, rope_dim: int = 64, page_size: int = 128) -> Module:
-    # rope_dim / page_size only shape the store half; the norm-only wrapper is
-    # unaffected by them and just takes the defaults.
-    args = make_cpp_args(head_dim, rope_dim, page_size, is_arch_support_pdl())
+def _jit_c2_module(
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+) -> Module:
+    # rope_dim / page_size / layout only shape the store half; the norm-only
+    # entry point ignores them.
+    args = make_cpp_args(
+        head_dim,
+        rope_dim,
+        page_size,
+        layout.cpp_name,
+        is_arch_support_pdl(),
+    )
     return load_jit(
         make_name("c2"),
         *args,
@@ -37,7 +49,6 @@ def _jit_c2_module(head_dim: int, rope_dim: int = 64, page_size: int = 128) -> M
         cuda_wrappers=[
             ("decode", f"FlashC2DecodeKernel<{args}>::run_decode"),
             ("decode_fusion", f"FlashC2DecodeKernel<{args}>::run_decode_fusion"),
-            ("verify_fusion", f"FlashC2DecodeKernel<{args}>::run_verify_fusion"),
         ],
     )
 
@@ -91,7 +102,8 @@ def c2_decode_norm(
     if out is None:
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
-    _jit_c2_module(head_dim).decode(
+    # Norm only: the store half's arguments are irrelevant, fixed to share a build.
+    _jit_c2_module(head_dim, 64, 128, KVLayout.V4).decode(
         kv_input,
         kv_state,
         out,
@@ -105,7 +117,7 @@ def c2_decode_norm(
     return out
 
 
-def c2_decode_norm_rope_store(
+def c2_decode_or_verify_norm_rope_store(
     kv_input: torch.Tensor,
     kv_state: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -118,6 +130,8 @@ def c2_decode_norm_rope_store(
     *,
     page_size: int,
     ring_size: int,
+    draft_len: int = 1,
+    layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``c2_decode_norm`` plus the whole main-KV write, in the same launch.
@@ -131,13 +145,18 @@ def c2_decode_norm_rope_store(
                       stands for, so there is no gather launch.
     :param k_cache: the compressed KV pool buffer for this layer.
     :param page_size: slots per page of that pool (``page_size // ratio``).
+    :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
+                   ``V41``) store the fp4 fake-quantized value; ``V41_FP4``
+                   stores the e2m1 codes themselves, rounding once.
     """
     num_tokens, fused_dim = kv_input.shape
     head_dim = fused_dim // 2
     if out is None:
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
-    _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size).decode_fusion(
+    layout = KVLayout.parse(layout)
+    module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module.decode_fusion(
         kv_input,
         kv_state,
         out,
@@ -145,65 +164,16 @@ def c2_decode_norm_rope_store(
         positions,
         req,
         raw_out_loc,
-        float(eps),
+        eps,
         freqs_cis,
         k_cache,
-        int(ring_size),
+        ring_size,
+        draft_len,
     )
     return out
 
 
-def c2_verify_norm_rope_store(
-    kv_input: torch.Tensor,
-    kv_state: torch.Tensor,
-    norm_weight: torch.Tensor,
-    positions: torch.Tensor,
-    req: torch.Tensor,
-    raw_out_loc: torch.Tensor,
-    eps: float,
-    freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
-    *,
-    page_size: int,
-    ring_size: int,
-    draft_len: int,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """``c2_decode_norm_rope_store`` for a target-verify block.
+# DO NOT try to modify the alias
 
-    A block is ``draft_len`` rows of one request at consecutive positions, laid
-    out request-major, so every row but the first pairs with the row before it
-    in ``kv_input`` rather than through the ring. Reading the in-block partner
-    from the input is what makes that safe: the row that publishes it into the
-    ring belongs to the same launch, with nothing ordering the two. The block's
-    first row does read the ring, at the slot before the block's own, which the
-    launch cannot reach while ``ring_size > draft_len`` -- a precondition the
-    kernel checks and ``get_compress_state_ring_size`` satisfies by
-    construction.
-
-    Nothing else changes, the pair state included: replaying a block one
-    position at a time through ``c2_decode_norm_rope_store`` gives the same
-    latents, the same ring and the same cache bytes.
-
-    :param draft_len: rows per request, ``speculative_num_draft_tokens``.
-    """
-    num_tokens, fused_dim = kv_input.shape
-    head_dim = fused_dim // 2
-    if out is None:
-        out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
-
-    _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size).verify_fusion(
-        kv_input,
-        kv_state,
-        out,
-        norm_weight,
-        positions,
-        req,
-        raw_out_loc,
-        float(eps),
-        freqs_cis,
-        k_cache,
-        int(ring_size),
-        int(draft_len),
-    )
-    return out
+c2_decode_norm_rope_store: Final = c2_decode_or_verify_norm_rope_store
+c2_verify_norm_rope_store: Final = c2_decode_or_verify_norm_rope_store

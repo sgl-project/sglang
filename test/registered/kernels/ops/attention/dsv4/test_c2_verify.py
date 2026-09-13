@@ -5,10 +5,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.c2 import (
-    c2_decode_norm_rope_store,
-    c2_verify_norm_rope_store,
-)
+from sglang.kernels.ops.attention.dsv4.c2 import c2_decode_or_verify_norm_rope_store
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import RMSNorm
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -108,7 +105,7 @@ def _decode_replay(
     out = torch.zeros(n, dim, device="cuda", dtype=torch.bfloat16)
     for j in range(draft_len):
         idx = rows[:, j]
-        out[idx] = c2_decode_norm_rope_store(
+        out[idx] = c2_decode_or_verify_norm_rope_store(
             kv_input[idx].contiguous(),
             kv_state,
             norm.weight.data,
@@ -130,7 +127,7 @@ def _run_verify(kv_input, kv_state, norm, positions, req, raw_out_loc, **kw):
     zeroed so rows the kernel skips compare equal to the replay's."""
     n, dim = positions.shape[0], kv_input.shape[1] // 2
     freqs_cis, cache = kw["freqs_cis"], kw["cache"]
-    got = c2_verify_norm_rope_store(
+    got = c2_decode_or_verify_norm_rope_store(
         kv_input,
         kv_state,
         norm.weight.data,
@@ -288,7 +285,7 @@ def test_rejected_prefix_then_next_verify(start, dtype):
         _run_verify(inputs, state, norm, pos, req, loc, cache=cache, **kw)
         for j in range(accepted):
             idx = rows[:, j]
-            c2_decode_norm_rope_store(
+            c2_decode_or_verify_norm_rope_store(
                 inputs[idx],
                 reference,
                 norm.weight.data,
