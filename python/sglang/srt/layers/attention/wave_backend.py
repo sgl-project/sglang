@@ -113,7 +113,11 @@ class WaveAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        # Use start_layer instead of 0 to handle pipeline parallelism.
+        # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+        self.v_head_dim = self.token_to_kv_pool.get_value_buffer(
+            self.token_to_kv_pool.start_layer
+        ).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
 

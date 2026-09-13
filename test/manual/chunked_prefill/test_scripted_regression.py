@@ -7,23 +7,12 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_released,
     run_until,
     run_until_all_finished,
     run_until_finished,
     warmup_radix,
 )
-
-
-def _drain_until_released(t, *handles):
-    for _ in range(12):
-        if all(
-            h.kv_pages == 0
-            and h.lock_refs == 0
-            and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
 
 
 class TestRegressionBasic(ScriptedTestCase):
@@ -34,17 +23,31 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_waiting_releases_all(t: ScriptedContext):
+        baseline = t.engine_stats()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
-        assert r.kv_pages == 0
-        assert r.req.kv.req_pool_idx is None
-        assert r.lock_refs == 0
-        assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        # kv_pages and lock_refs both read 0 once the req leaves the batch, so only
+        # the pool deltas can tell a release from a leak.
+        final = t.engine_stats()
+        assert final["req_pool_free"] == baseline["req_pool_free"], (
+            f"abort must return the req row; free {baseline['req_pool_free']} -> "
+            f"{final['req_pool_free']}"
+        )
+        assert final["kv_pool_free"] == baseline["kv_pool_free"], (
+            f"abort must return the KV; free {baseline['kv_pool_free']} -> "
+            f"{final['kv_pool_free']}"
+        )
+        req = r.req
+        if req is not None:
+            assert r.kv_pages == 0
+            assert req.kv.req_pool_idx is None
+            assert r.lock_refs == 0
+            assert not r.is_chunking
+            assert req.inflight_middle_chunks == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -237,6 +240,7 @@ class TestRegressionBasic(ScriptedTestCase):
     @staticmethod
     def _script_abort_chunked_resume_releases_all_resources(t: ScriptedContext):
         baseline_refs = sum(t.get_all_node_lock_refs().values())
+        baseline = t.engine_stats()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -245,19 +249,33 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
-        assert r.req.kv.req_pool_idx is None, (
-            f"96d4749094: abort must release row; got row_idx={r.req.kv.req_pool_idx!r}"
+        # kv_pages and lock_refs both read 0 once the req leaves the batch, so only
+        # the pool deltas can tell a release from a leak.
+        final = t.engine_stats()
+        assert final["req_pool_free"] == baseline["req_pool_free"], (
+            f"96d4749094: abort must return the req row; free "
+            f"{baseline['req_pool_free']} -> {final['req_pool_free']}"
         )
-        assert r.kv_pages == 0, (
-            f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+        assert final["kv_pool_free"] == baseline["kv_pool_free"], (
+            f"96d4749094: abort must return the KV; free "
+            f"{baseline['kv_pool_free']} -> {final['kv_pool_free']}"
         )
-        assert r.lock_refs == 0, (
-            f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
-        )
-        assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        req = r.req
+        if req is not None:
+            assert req.kv.req_pool_idx is None, (
+                f"96d4749094: abort must release row; "
+                f"got row_idx={req.kv.req_pool_idx!r}"
+            )
+            assert r.kv_pages == 0, (
+                f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+            )
+            assert r.lock_refs == 0, (
+                f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+            )
+            assert not r.is_chunking
+            assert req.inflight_middle_chunks == 0
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
 
     def test_pause_retract_releases_waiting_chunked_resume(self):
@@ -348,7 +366,7 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.finished
 
 

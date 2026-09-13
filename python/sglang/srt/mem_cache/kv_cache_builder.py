@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_context,
+    get_device,
     get_disagg,
     get_memory,
     get_parallel,
@@ -172,6 +173,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
+            # No XPU sgl_kernel.kvcacheio build, so a host pool cannot transfer.
+            and get_device().device != "xpu"
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
