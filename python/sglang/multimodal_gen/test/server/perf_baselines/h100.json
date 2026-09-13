@@ -283,7 +283,7 @@
         "joy_echo_t2v_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2469.07,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 62.8
