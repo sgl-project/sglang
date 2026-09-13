@@ -1,8 +1,8 @@
 # SGLang renderer
 
 The renderer runs as a separate service. It owns text preprocessing, token decoding,
-and OpenAI chat/completion responses. The native Rust server accepts token IDs;
-the renderer submits them through the engine's `/generate` endpoint.
+and OpenAI chat/completion responses. It submits token IDs through the native
+Rust server's existing `/generate` endpoint.
 
 The renderer targets the existing `/generate` contract on SGLang main and must
 work with an unmodified Rust server. It accepts both cumulative and incremental
@@ -11,15 +11,14 @@ request fields or server behavior changes are deferred to separate PRs.
 
 ## Build and run
 
-From the repository root, build the standalone executable separately from the
-Python package. The Python environment must already have the native Rust server
-extension built from SGLang main or this checkout.
+From the repository root, build the standalone renderer. Rendering and
+tokenization work without an engine; generation requires a running SGLang engine.
 
 ```sh
 cargo build --manifest-path rust/Cargo.toml -p sglang-renderer --release --features http --locked
 ```
 
-Start the engine in one terminal, using its normal Python launcher.
+Start the engine in one terminal.
 
 ```sh
 SGLANG_RUST_SERVER=1 python -m sglang.launch_server \
@@ -27,10 +26,7 @@ SGLANG_RUST_SERVER=1 python -m sglang.launch_server \
   --host 127.0.0.1 --port 30001 --skip-server-warmup
 ```
 
-The command skips Python's text-based warmup so it also works with token-ID-only
-engine builds. Warm the service through the renderer's OpenAI endpoints. Keep
-scheduler tokenizer initialization enabled for stop and minimum-token handling.
-The engine's `/health_generate` uses a token-ID probe.
+Keep engine tokenization enabled for stop conditions and minimum-token handling.
 
 Start the renderer in another terminal. Match the engine's model revision,
 tokenizer, context limit, and sampling defaults. Set tool and reasoning parsers
@@ -57,12 +53,13 @@ rust/target/release/sglang-renderer meta-llama/Llama-3.1-8B-Instruct \
 ```
 
 The CLI defaults to sampling parameters from the model's generation config.
-`--sampling-defaults openai` matches the Python server's default policy. Use
+`--sampling-defaults openai` matches SGLang's OpenAI API defaults. Use
 `--help` for template, parser, and limit options. A custom Cargo target directory
 or compilation target changes the executable path shown above.
 
-The GPU OpenAI parity suite is manual until the renderer has its own CI binary
-provisioning. With the Rust server extension and renderer executable built, run:
+The GPU OpenAI parity suite is currently manual. On a supported GPU host with
+the model and an SGLang build that supports `SGLANG_RUST_SERVER=1`, build the
+renderer and run:
 
 ```sh
 SGLANG_RENDERER_BIN=rust/target/release/sglang-renderer \
@@ -90,12 +87,10 @@ docker run --rm -p 30000:30000 \
 ```
 
 For inference, add `--engine-url` with a URL reachable from the container.
-The image runs as UID/GID `65532:65532`; bind-mounted caches must be writable by
-that user. `HF_TOKEN` is passed from the host for gated models.
 
 ## Current scope
 
 OpenAI serving supports text chat and completions. Multimodal OpenAI inputs,
-`/responses`, and `/messages` are deferred. Automatic Python co-launch and wheel
-installation of the renderer are also deferred; manage both processes explicitly.
+`/responses`, and `/messages` are deferred. Automatic engine launch and packaged
+renderer installation are also deferred; manage both processes explicitly.
 The renderer does not implement API-key authentication or TLS.
