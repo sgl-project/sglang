@@ -197,7 +197,6 @@ def test_opt_in_does_not_fall_back_on_an_unsupported_gpu(model_path, monkeypatch
         {"enable_two_batch_overlap": True},
         {"enable_single_batch_overlap": True},
         {"enable_pdmux": True},
-        {"enable_eplb": True},
         {"elastic_ep_backend": "nixl"},
         {"enable_elastic_expert_backup": True},
         {"speculative_algorithm": "EAGLE"},

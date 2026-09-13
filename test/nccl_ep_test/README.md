@@ -73,6 +73,35 @@ stream handoffs and recapture. Cleanup injects a controlled host failure after a
 completed transaction. Native/GPU/peer faults require a fresh process; `timeout`
 bounds failures that block a peer. A capability skip exits 77 and is never PASS.
 
+## Fixed-topology EPLB
+
+The local EPLB tests exercise the production updater, FP8 Triton compute,
+received-count recording and Graph reuse without native EP. A separate CPU test
+moves weights and scales between two Gloo processes, including redundant slots
+and updates in layer chunks:
+
+```bash
+PYTHONPATH=python:test python -m pytest -q \
+  test/registered/unit/layers/moe/test_nccl_ep_eplb.py \
+  test/registered/unit/eplb/test_nccl_ep_weight_relocation.py
+```
+
+On the pinned two-GPU environment above, validate native LL dispatch/combine,
+CUDA weight transfer and Graph reuse after relocation:
+
+```bash
+timeout 15m torchrun --standalone --nproc-per-node=2 \
+  --module nccl_ep_test.eplb_pair \
+  --replays 100 --generations 2 --report-dir "$NCCL_EP_REPORT_DIR/eplb"
+```
+
+This gate uses four logical experts, six physical slots, two layers and two
+decode buckets. It alternates routing layouts and active/idle senders, verifies
+weight/scale bytes after migration, compares real expert outputs to independent
+unpadded Triton experts, and checks handle reuse and resource closure. Eager
+interleaving uses true zero-length inputs. The native gate requires two SM90+
+GPUs; local tests alone do not certify native communication.
+
 ## Matched measurement and profiling
 
 Run measurement after correctness passes. Keep JIT/debug logging and profiling

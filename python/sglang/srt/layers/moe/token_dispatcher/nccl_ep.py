@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
@@ -581,6 +582,9 @@ class NcclEpDispatcher(BaseDispatcher):
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
 
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            expert_counters
+        )
         hs_fp8, hs_scale = self._quantize_fp8(recv_tokens, expert_counters)
 
         expected_m = (

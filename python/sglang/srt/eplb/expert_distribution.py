@@ -315,7 +315,7 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
 
-        if server_args.moe_a2a_backend == "mori":
+        if server_args.moe_a2a_backend in ("mori", "nccl_ep"):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":

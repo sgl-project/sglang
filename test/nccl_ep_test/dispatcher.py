@@ -23,7 +23,7 @@ from .oracle import (
 )
 
 
-def initialize(capacity, *, graph_enabled=False):
+def initialize(capacity, *, graph_enabled=False, weight_transfer=False):
     rank, local_rank = require_pair(ep=True)
     bindings = binding_check()
     bindings["jit"] = prepare_jit()
@@ -44,7 +44,14 @@ def initialize(capacity, *, graph_enabled=False):
     flags.a2a_backend = MoeA2ABackend.NCCL_EP
     flags.nccl_ep_mode = NcclEpMode.LOW_LATENCY
     flags.nccl_ep_num_max_dispatch_tokens_per_rank = capacity
-    dist.init_process_group("gloo", timeout=timedelta(seconds=120))
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl" if weight_transfer else "gloo",
+        timeout=timedelta(seconds=120),
+    )
+    if weight_transfer:
+        # Materialize the CUDA process group collectively before EPLB uses
+        # batched P2P with potentially only a subset of the ranks involved.
+        dist.all_reduce(torch.zeros(1, device=f"cuda:{local_rank}"))
     comm = PyNcclCommunicator(
         group=dist.group.WORLD, device=local_rank, library_path=bindings["nccl_path"]
     )

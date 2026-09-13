@@ -87,9 +87,23 @@ disaggregation skips this prefill requirement. SBO/TBO are unsupported for every
 NCCL EP compute backend, including eager execution.
 
 Prefill Graphs, piecewise or breakable decode Graphs,
-speculative decoding, TBO/SBO, PDMux, EPLB, elastic EP, multiple nodes, Torch
+speculative decoding, TBO/SBO, PDMux, elastic EP, multiple nodes, Torch
 compile and memory saver are outside this initial scope. Unsupported opt-in
 configurations raise an error during setup.
+
+## Fixed-topology expert load balancing
+
+You can enable EPLB with `--enable-eplb` when using more than one EP rank.
+NCCL EP uses the received expert counts for statistical recording, including
+work received by a rank with no local input tokens. The existing EPLB options
+control rebalance frequency, redundant expert slots and updates in layer chunks.
+
+Rebalancing keeps EP membership and the number of physical expert slots fixed.
+Weights, quantization scales and routing maps update in place between forward
+passes. Decode Graphs keep their existing handles and captured allocations;
+subsequent replays read the updated mapping and weights. You must restart the
+model to change EP membership or allocation shapes. Elastic EP recovery and
+growth remain unsupported with NCCL EP EPLB.
 
 ## Resource ownership
 

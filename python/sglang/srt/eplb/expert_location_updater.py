@@ -13,6 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import einops
@@ -53,25 +54,35 @@ class ExpertLocationUpdater:
         Returns a map of layer_id to expert_ids that are missing due to rank
         failures during fault conditions when elastic EP is enabled.
         """
-        if self._first_execution:
-            self._first_execution = False
-            torch.get_device_module().empty_cache()
-
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
 
-        missing_logical_experts_by_layers = _update_expert_weights(
-            routed_experts_weights_of_layer=routed_experts_weights_of_layer,
-            old_expert_location_metadata=old_expert_location_metadata,
-            new_expert_location_metadata=new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-            nnodes=nnodes,
-            rank=rank,
-        )
-        old_expert_location_metadata.update(
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-        )
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        session = nullcontext()
+        if get_moe_a2a_backend().is_nccl_ep():
+            from sglang.srt.eplb.nccl_ep import expert_update_session
+
+            session = expert_update_session(
+                old_expert_location_metadata, new_expert_location_metadata
+            )
+        with session:
+            if self._first_execution:
+                self._first_execution = False
+                torch.get_device_module().empty_cache()
+
+            missing_logical_experts_by_layers = _update_expert_weights(
+                routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+                old_expert_location_metadata=old_expert_location_metadata,
+                new_expert_location_metadata=new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+                nnodes=nnodes,
+                rank=rank,
+            )
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
 
         return missing_logical_experts_by_layers
 

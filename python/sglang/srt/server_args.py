@@ -4033,7 +4033,6 @@ class ServerArgs:
                 "enable_two_batch_overlap",
                 "enable_single_batch_overlap",
                 "enable_pdmux",
-                "enable_eplb",
                 "elastic_ep_backend",
                 "enable_elastic_expert_backup",
                 "speculative_algorithm",
@@ -6470,12 +6469,18 @@ class ServerArgs:
         if a2a_backend == "nccl_ep":
             if self.enable_single_batch_overlap or self.enable_two_batch_overlap:
                 raise ValueError("NCCL EP LL does not support single/two batch overlap")
+            if self.enable_eplb and (
+                self.elastic_ep_backend is not None
+                or self.enable_elastic_expert_backup
+                or self.elastic_ep_initial_size is not None
+                or self.ep_join_mode is not None
+            ):
+                raise ValueError("NCCL EP EPLB requires fixed EP membership")
             self._handle_nccl_ep_token_budget()
             if resolved_view(self).moe_runner_backend == "triton":
                 unsupported = [
                     name
                     for name in (
-                        "enable_eplb",
                         "enforce_shared_experts_fusion",
                         "enable_lora",
                     )
