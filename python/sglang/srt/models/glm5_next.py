@@ -1082,7 +1082,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         orig_to_new_substr={
             "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        # The vision tower ships a pre-fused ``qkv``; the runtime module is
+        # ``qkv_proj``. Quantization configs name layers by module, so the
+        # rename load_weights already does for tensors is needed here too.
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
 
     packed_modules_mapping = {
@@ -1241,9 +1245,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         if self.num_fused_shared_experts == 0:
             return
-        assert self.num_fused_shared_experts == 1, (
-            f"Only 1 fused shared expert is supported for {type(self).__name__}"
-        )
+        assert (
+            self.num_fused_shared_experts == 1
+        ), f"Only 1 fused shared expert is supported for {type(self).__name__}"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
@@ -1422,6 +1426,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            # Quark serializes block-FP8 scales as ``.weight_scale`` while the
+            # FP8 linear method registers them as ``.weight_scale_inv``.
+            if name.endswith(".weight_scale"):
+                candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1485,6 +1499,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1513,6 +1528,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1564,6 +1580,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1574,6 +1591,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 
