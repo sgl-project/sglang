@@ -1053,7 +1053,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                dst_kv_item_lens
+                dst_kv_item_lens,
+                peer_info.dst_dcp_size,
             )
             return
 
@@ -1315,15 +1316,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 packed_src = self._pack_dcp_rank_once(
                                     pack_buffer,
                                     dst_info,
-                                    plan.src_token_indices,
+                                    plan.target_src_token_indices,
                                     packed_source_by_dcp_rank,
                                 )
-                                kv_xfer_handle = self.send_kvcache_dcp(
-                                    req.agent_name,
-                                    dst_info,
-                                    plan,
-                                    notif,
-                                    packed_src,
+                                handles.extend(
+                                    self.send_kvcache_dcp(
+                                        req.agent_name,
+                                        dst_info,
+                                        plan,
+                                        notif,
+                                        packed_src,
+                                    )
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1571,6 +1574,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_item_lens: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1632,17 +1638,41 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend or force_flat:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                # The source item length is used as the destination stride, so
+                # the paired entries must have identical layouts.
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            raise RuntimeError(
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -1663,6 +1693,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+
+        if not layers_params:
+            return None
 
         src_addrs = []
         src_lens = []
@@ -1772,12 +1805,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        num_target = len(self.kv_args.kv_data_ptrs) - self.kv_args.num_draft_entries
         rank_stride = pack_buffer.get_size() // dst_info.dst_dcp_size
         packed_source_by_dcp_rank[rank] = try_pack_dcp_src(
             pack_buffer=pack_buffer,
-            kv_data_ptrs=self.kv_args.kv_data_ptrs,
+            kv_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
             src_token_indices=src_token_indices,
-            token_item_lens=token_item_lens[: len(self.kv_args.kv_data_ptrs)],
+            token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
@@ -1794,35 +1828,73 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError("Missing NIXL source KV memory kind")
         if dst_info.dst_homogeneous_mem_kind is None:
             raise RuntimeError("Missing NIXL destination KV memory kind")
-        if plan.src_token_indices.size == 0:
-            self.agent.send_notif(peer_name, notif.encode("ascii"))
-            return None
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        num_draft = self.kv_args.num_draft_entries
+        num_target = len(self.kv_args.kv_data_ptrs) - num_draft
         dst_kv_ptrs = [
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
-        src_kv_ptrs = self.kv_args.kv_data_ptrs
-        src_token_indices = plan.src_token_indices
-        if packed_src is not None:
-            src_kv_ptrs, src_token_indices = packed_src
-            token_item_lens = token_item_lens[: len(src_kv_ptrs)]
 
-        return self._send_kvcache_generic(
-            peer_name=peer_name,
-            src_data_ptrs=src_kv_ptrs,
-            dst_data_ptrs=dst_kv_ptrs,
-            item_lens=token_item_lens,
-            prefill_data_indices=src_token_indices,
-            dst_data_indices=plan.dst_token_indices,
-            dst_gpu_id=dst_info.gpu_id,
-            notif=notif,
-            src_mem_kind=self.src_mem_kind,
-            dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
-            force_flat=True,
-            bypass_prepped=True,
-        )
+        parts = []
+        if plan.target_src_token_indices.size:
+            src_kv_ptrs = self.kv_args.kv_data_ptrs[:num_target]
+            src_token_indices = plan.target_src_token_indices
+            if packed_src is not None:
+                src_kv_ptrs, src_token_indices = packed_src
+            parts.append(
+                (
+                    src_kv_ptrs,
+                    dst_kv_ptrs[:num_target],
+                    token_item_lens[:num_target],
+                    src_token_indices,
+                    plan.target_dst_token_indices,
+                )
+            )
+        if num_draft > 0 and plan.draft_src_token_indices.size:
+            parts.append(
+                (
+                    self.kv_args.kv_data_ptrs[num_target:],
+                    dst_kv_ptrs[num_target:],
+                    token_item_lens[num_target:],
+                    plan.draft_src_token_indices,
+                    plan.draft_dst_token_indices,
+                )
+            )
+
+        if not parts:
+            self.agent.send_notif(peer_name, notif.encode("ascii"))
+            return []
+
+        handles = []
+        for part_idx, (
+            src_ptrs,
+            part_dst_ptrs,
+            part_item_lens,
+            src_indices,
+            dst_indices,
+        ) in enumerate(parts):
+            part_notif = (
+                notif if len(parts) == 1 else f"{notif}_part_{part_idx}_{len(parts)}"
+            )
+            handles.append(
+                self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=part_dst_ptrs,
+                    item_lens=part_item_lens,
+                    prefill_data_indices=src_indices,
+                    dst_data_indices=dst_indices,
+                    dst_gpu_id=dst_info.gpu_id,
+                    notif=part_notif,
+                    src_mem_kind=self.src_mem_kind,
+                    dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+                    force_flat=True,
+                    bypass_prepped=True,
+                )
+            )
+        return handles
 
     def send_kvcache_mixed(
         self,
@@ -2465,6 +2537,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
+                    if 0 in src_dims:
+                        raise RuntimeError(
+                            "Replicated Mamba PD state transfer currently requires "
+                            "matching prefill/decode attention TP sizes"
+                        )
                     h = self._send_mamba_state_slice(
                         peer_name,
                         src_indices,
@@ -2529,6 +2606,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.QSA_PENDING,
+                StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
@@ -2557,6 +2636,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
