@@ -11,9 +11,9 @@ graph launch.
 
 Correctness contract:
 
-- The caller only routes here when the replay is padding-free
-  (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
-  Python-visible branch inside the backends is constant per key.
+- Callers keep Python-visible backend branches constant per key. Qualified
+  DSA draft replay uses padded static buffers; other callers require no padding.
+  TBO / pdmux / LoRA are off.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.

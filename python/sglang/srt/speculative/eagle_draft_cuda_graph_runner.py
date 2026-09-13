@@ -699,14 +699,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         metadata_view = SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
-        if (
-            self._metadata_glue is not None
-            and not self._metadata_glue.disabled
-            and raw_bs == bs
-        ):
+        if self._metadata_glue is not None and not self._metadata_glue.disabled:
             # Unpadded ForwardBatch inputs can change address between replays.
             metadata_view.seq_lens = buffers.seq_lens[:bs]
             metadata_view.req_pool_indices = buffers.req_pool_indices[:bs]
+            metadata_view.out_cache_loc = buffers.out_cache_loc[
+                : num_tokens * self.speculative_num_steps
+            ]
             self._metadata_glue.run(self.draft_attn_backend, metadata_view, bs)
         else:
             self.draft_attn_backend.init_forward_metadata_out_graph(metadata_view)
