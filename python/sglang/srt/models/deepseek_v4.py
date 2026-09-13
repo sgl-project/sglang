@@ -1158,6 +1158,36 @@ class MQALayer(MqaAttentionBase):
             inverse=inverse,
         )
 
+    def accepts_mxfp8_swizzled_input(self) -> bool:
+        """Whether the first projection consumes a 128x4 MXFP8 activation tuple."""
+        cached = getattr(self, "_accepts_mxfp8_swizzled_input", None)
+        if cached is not None:
+            return cached
+        if self.fuse_wqa_wkv:
+            linears = [getattr(self, "wqkv_a", None)]
+        else:
+            # Both projections read the same activation on this path.
+            linears = [getattr(self, "wq_a", None), getattr(self, "wkv", None)]
+
+        def _takes_swizzled(linear) -> bool:
+            method = getattr(linear, "quant_method", None)
+            return bool(
+                linear is not None
+                and getattr(method, "mxfp8_dense_backend", None)
+                in (
+                    Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
+                    Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS,
+                )
+                and (
+                    getattr(method, "use_mxfp8", False)
+                    or getattr(linear, "block_fp8_mxfp8_ready", False)
+                )
+            )
+
+        ok = all(_takes_swizzled(linear) for linear in linears)
+        self._accepts_mxfp8_swizzled_input = ok
+        return ok
+
     def _compute_q_a(
         self,
         x: torch.Tensor,
@@ -2737,10 +2767,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         apply_pre: Optional[torch.Tensor],
         norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
+        quantized: Optional[list] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
         apply_pre (None selects copy 0), then RMS-normalized.
-        Returns (y, pre, post, comb)."""
+        Returns (y, pre, post, comb).
+
+        ``quantized`` (a list) opts into the fused MXFP8 epilogue: the collapsed,
+        normalized row is also emitted as a ``Mxfp8SwizzledInput`` appended to it,
+        so the consuming projection skips its own quantization launch."""
+        quantize = quantized is not None
         from sglang.kernels.ops.layernorm.mhc import (
             hc_combine,
             hc_mix_stats,
@@ -2767,6 +2803,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
+                if quantize:
+                    from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
+                        hc_combine_norm_mxfp8,
+                    )
+
+                    y, y_q, y_sf = hc_combine_norm_mxfp8(
+                        x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                    )
+                    quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
+                    return y
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
                 return hc_combine_norm(
@@ -2869,6 +2915,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
+        attn_quantized: Optional[list] = (
+            [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
+        )
         x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
             hidden_states,
             self.hc_attn_fn,
@@ -2877,10 +2926,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             apply_pre=prev_pre,
             norm=self.input_layernorm,
             stats_stream=stats_stream,
+            quantized=attn_quantized,
         )
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
-                x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+                x=x,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=attn_quantized[0] if attn_quantized else None,
             )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
