@@ -11,6 +11,7 @@ import torch
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _get_k3_dense_weight,
+    _should_fuse_kda_projections,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +42,7 @@ def _make_owner(with_stream: bool):
 
     owner = SimpleNamespace(
         use_full_rank_gate=True,
+        _qkvg_w=qkvg_w,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
@@ -58,11 +60,69 @@ def _run(owner, x):
     return [t.clone() for t in out]
 
 
+class TestKimiK3ProjectionFusionPolicy(unittest.TestCase):
+    def test_full_rank_gate_supports_dp_attention(self):
+        self.assertTrue(
+            _should_fuse_kda_projections(
+                use_full_rank_gate=True,
+                quant_config=object(),
+                tp_size=16,
+                attn_tp_size=1,
+            )
+        )
+
+    def test_low_rank_layout_still_requires_matching_tp(self):
+        self.assertTrue(
+            _should_fuse_kda_projections(
+                use_full_rank_gate=False,
+                quant_config=None,
+                tp_size=16,
+                attn_tp_size=16,
+            )
+        )
+        self.assertFalse(
+            _should_fuse_kda_projections(
+                use_full_rank_gate=False,
+                quant_config=None,
+                tp_size=16,
+                attn_tp_size=1,
+            )
+        )
+
+
 class TestKimiK3BfaOverlap(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+
+    def test_fused_projections_match_unfused_math(self):
+        owner = _make_owner(with_stream=False)
+        qkv_w, gate_w = torch.split(owner._qkvg_w, owner.split_sizes)
+        fa_w = owner._bfa_w[: owner._bfa_fa_size]
+        beta_w = owner._bfa_w[
+            owner._bfa_fa_size : owner._bfa_fa_size + owner._bfa_b_size
+        ]
+
+        for num_tokens in (1, 32):
+            with self.subTest(num_tokens=num_tokens):
+                x = torch.randn(num_tokens, _H, device="cuda", dtype=torch.bfloat16)
+                fused = _run(owner, x)
+                fa = torch.nn.functional.linear(x, fa_w)
+                unfused = (
+                    torch.nn.functional.linear(x, qkv_w),
+                    torch.nn.functional.linear(x, beta_w),
+                    torch.nn.functional.linear(fa, owner._bfa_f_b_w),
+                    torch.nn.functional.linear(x, gate_w),
+                )
+                for got, ref, name in zip(
+                    fused, unfused, ("qkv", "beta", "forget_gate", "gate")
+                ):
+                    # The merged and standalone BF16 GEMMs may select different
+                    # accumulation schedules; allow roughly one output ULP.
+                    torch.testing.assert_close(
+                        got, ref, rtol=1e-2, atol=2e-2, msg=lambda msg: f"{name}: {msg}"
+                    )
 
     def test_capture_replay_matches_serial(self):
         torch.manual_seed(0)
