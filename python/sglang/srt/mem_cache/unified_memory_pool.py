@@ -639,11 +639,13 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             self.page_size * self.kernel_page_blocks
         ) + indices % self.page_size
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Translate physical host-pool ids for the page-major parent path."""
         return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
