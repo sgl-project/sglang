@@ -628,6 +628,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                if draft_probs is not None:
+                    # draft_probs is the one graph output read after the target
+                    # forward rather than by it, and it points into the graph's
+                    # private memory pool. The pool recycles that block in the
+                    # meantime -- in practice the DSA top-k mask lands there and
+                    # eagle_sample sees -inf. Copy out at the boundary.
+                    draft_probs = draft_probs.clone()
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -767,6 +774,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
+                        forward_batch.sampling_info.top_ks,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1117,6 +1125,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
+                batch.sampling_info.top_ks,
             )
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

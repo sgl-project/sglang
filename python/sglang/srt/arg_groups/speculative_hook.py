@@ -24,6 +24,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_auto_enable_hip_rejection_sampling(
+    *,
+    is_hip: bool,
+    use_rejection_sampling: bool,
+    algorithm: Optional[str],
+    token_map: Optional[str],
+    eagle_topk: int,
+    accept_threshold_single: float,
+    accept_threshold_acc: float,
+    enable_deterministic_inference: bool,
+) -> bool:
+    """Whether HIP may default ``speculative_use_rejection_sampling`` on.
+
+    Rejection sampling still cannot consume a reduced / hot draft vocab
+    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
+    would crash configs that previously ran greedy on HIP, including EAGLE3
+    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
+    EAGLE3 and any EAGLE run that already has a token map.
+    """
+    return (
+        is_hip
+        and not use_rejection_sampling
+        and algorithm == "EAGLE"
+        and token_map is None
+        and eagle_topk == 1
+        and accept_threshold_single == 1.0
+        and accept_threshold_acc == 1.0
+        and not enable_deterministic_inference
+    )
+
+
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.device != "cpu" or cfg.disable_overlap_schedule:
@@ -813,7 +844,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
-
     cfg = resolving_view(server_args)
 
     if (
@@ -920,7 +950,34 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if cfg.speculative_use_rejection_sampling:
+    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
+    # otherwise fall back to greedy (argmax) and silently ignore temperature and
+    # top_p. Default rejection sampling on -- it routes verify through the Triton
+    # chain sampler -- for configs that support it. See
+    # _should_auto_enable_hip_rejection_sampling for the cases we must not flip.
+    if _should_auto_enable_hip_rejection_sampling(
+        is_hip=get_platform().is_hip,
+        use_rejection_sampling=cfg.speculative_use_rejection_sampling,
+        algorithm=cfg.speculative_algorithm,
+        token_map=cfg.speculative_token_map,
+        eagle_topk=cfg.speculative_eagle_topk,
+        accept_threshold_single=cfg.speculative_accept_threshold_single,
+        accept_threshold_acc=cfg.speculative_accept_threshold_acc,
+        enable_deterministic_inference=cfg.enable_deterministic_inference,
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
+            "enabling speculative_use_rejection_sampling by default."
+        )
+
+    # resolved_view, not cfg: the block above may have just decided this field,
+    # and declare_resolution writes to the stash rather than the dataclass.
+    if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
         # the rejection-sampling kernel consumes; everything else (STANDALONE,

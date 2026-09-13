@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -213,6 +214,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
+            # Real per-request top_k, for the same reason temperatures are
+            # carried: the draft proposal cannot tell a greedy request from a
+            # T=1 one by temperature alone, because SamplingParams rewrites
+            # temperature 0 to temperature=1.0 with top_k=1.
+            # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
+            # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
+            # greedy, for the padded rows and for a run that never copies in.
+            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -417,7 +426,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             is_any_greedy=False,
@@ -624,6 +633,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
