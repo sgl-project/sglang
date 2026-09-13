@@ -1778,6 +1778,11 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            # Hoisted HiCache wait; see KVCache.hoist_layer_transfer_wait. Runs
+            # on the forward stream before any graph replay, and is a plain
+            # return unless a load is actually in flight.
+            self.token_to_kv_pool.wait_all_layer_transfers()
+
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

@@ -93,6 +93,10 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe.dsv4_tc_compact import (
+    compact_moe_enabled,
+    dsv4_tc_compact_moe_with_output,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -127,6 +131,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
@@ -2329,7 +2334,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        # When CP decode attention TP is off (the default) maybe_use_decode_attn_tp
+        # degrades to a bare `yield`, so skipping it is equivalent -- but it keeps
+        # self_attn out of a _GeneratorContextManager, inside which Dynamo refuses to
+        # graph break and tc_piecewise prefill fails to compile.
+        if get_cp_decode_attn_tp_ctx().is_enabled:
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                hidden_states = self.self_attn(
+                    x=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=x_quant,
+                )
+        else:
             hidden_states = self.self_attn(
                 x=hidden_states,
                 positions=positions,
@@ -2414,6 +2431,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if compact_moe_enabled() and is_in_tc_piecewise_cuda_graph():
+            output_local = torch.empty_like(hidden_states)
+            assert forward_batch.moe_real_num_tokens_gpu is not None
+            dsv4_tc_compact_moe_with_output(
+                hidden_states,
+                input_ids,
+                forward_batch.moe_real_num_tokens_gpu,
+                output_local,
+                self.layer_id,
+            )
+            return output_local
+
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -3082,7 +3111,11 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if compact_moe_enabled() and is_in_tc_piecewise_cuda_graph():
+            # Hash-routed layers gather the matching compact IDs in the split
+            # bridge, together with the real hidden rows.
+            input_ids_global = None
+        elif get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,

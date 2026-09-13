@@ -148,7 +148,7 @@ class SWAKVPool(BaseSWAKVPool):
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         # Wait happens at this wrapper. Inner pools must not wait again.
-        self.layer_transfer_counter = layer_transfer_counter
+        super().register_layer_transfer_counter(layer_transfer_counter)
         self.full_kv_pool.register_layer_transfer_counter(None)
         self.swa_kv_pool.register_layer_transfer_counter(None)
 

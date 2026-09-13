@@ -101,6 +101,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -135,10 +138,12 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
+    require_mlp_sync,
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
@@ -315,22 +320,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
-        # Hidden-state capture mode cases:
-        # - Breakable EAGLE draft: LAST.
-        # - EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
-        # - Otherwise: NULL.
+        # EAGLE prefill asks for FULL on the target (it feeds the draft) and
+        # LAST on the draft, regardless of the prefill backend: a graph captured
+        # below the requested mode is rejected on every replay.
         is_eagle = model_runner.spec_algorithm.is_eagle()
-        is_breakable_eagle_draft = (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and is_eagle
-            and model_runner.is_draft_worker
-        )
-        if is_breakable_eagle_draft:
+        if is_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif (is_eagle and not model_runner.is_draft_worker) or (
-            model_runner.spec_algorithm.is_dflash_family()
-        ):
+        elif is_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = self.return_hidden_states_mode
@@ -394,6 +390,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.dp_moe_layers = getattr(self.model_runner, "dp_moe_layers", None)
+        self._compact_moe_counts_gpu = (
+            torch.zeros(
+                get_parallel().attn_dp_size, dtype=torch.int64, device=self.device
+            )
+            if self.dp_moe_layers is not None
+            else None
+        )
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         self.dp_size = get_parallel().dp_size
@@ -417,6 +421,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        if self.prefill_backend_name == Backend.TC_PIECEWISE:
+            # Must happen before the compile pass below traces the model: the
+            # per-layer HiCache waits have to be gone from the graph, not just
+            # inert at replay time.
+            model_runner.token_to_kv_pool.hoist_layer_transfer_wait()
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -532,12 +541,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=model_runner.dtype,
                 )
 
-        # Some attention backends (e.g. DSV4) opt into a captured-metadata
-        # contract under BCG: capture-time builds a per-bucket metadata
-        # object the backend then refreshes in place at replay. We honor
-        # the contract only when the backend is Breakable; FullCG and
-        # TC_PIECEWISE use the eager init_forward_metadata path.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        # Some attention backends (e.g. DSV4) opt into a captured-metadata contract:
+        # capture builds one metadata object per bucket, the backend refreshes it in
+        # place at replay. TC_PIECEWISE needs it too -- rebuilding metadata per batch
+        # moves the shapes Dynamo guards on, and the recompiled entry holds no CUDA
+        # graph, so prefill silently runs eager.
+        _wants_captured_metadata = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) or (
+            isinstance(self.backend, TcPiecewiseCudaGraphBackend)
+            and not get_bool_env_var("SGLANG_PIECEWISE_NO_CAPTURED_METADATA")
+        )
+        if _wants_captured_metadata:
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
@@ -697,6 +712,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens=num_tokens,
                 raw_num_tokens=raw_num_tokens,
                 full_graph=self._is_full_backend,
+                dp_moe_layers=self.dp_moe_layers,
             ),
         ):
             yield
@@ -727,7 +743,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
         )
-        set_is_extend_in_batch(False)
+        # Prefill graphs only serve EXTEND batches, so True is the semantically
+        # correct value -- but only prepare_mlp_sync_batch actually writes this
+        # flag at serving time, and it runs only when require_mlp_sync(). Without
+        # it the global keeps the False default, so capturing under an
+        # unconditional True makes Dynamo's guard disagree with every real prefill
+        # under plain TP and invalidates all captured shapes on first replay.
+        # Mirror what serving will do instead of asserting what it ought to be.
+        set_is_extend_in_batch(require_mlp_sync())
 
         with self._prefill_forward_context(forward_batch):
             pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
@@ -811,7 +834,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             fb.dp_padding_mode.is_max_len(),
             fb.global_num_tokens_cpu,
         )
-        set_is_extend_in_batch(False)
+        # See _run_forward.
+        set_is_extend_in_batch(require_mlp_sync())
 
         with (
             forward_context(
@@ -1313,20 +1337,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
+        # The dummy batch never returns logprobs, so its logprob token count is
+        # one per request -- the same invariant the scheduler asserts in
+        # _dp_gather_info. Reusing num_tokens here makes the logits-side DP
+        # gather read num_tokens rows out of a pruned_states that only has bs,
+        # which walks off the end of the buffer.
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_for_logprob_cpu = [bs] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [bs]
         else:
             global_num_tokens_cpu = None
+            global_num_tokens_for_logprob_cpu = None
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
-            num_tokens_tensor = torch.tensor(
+            global_num_tokens_gpu = torch.tensor(
                 global_num_tokens_cpu, dtype=torch.int32, device=self.device
             )
-            global_num_tokens_gpu = num_tokens_tensor
-            global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob_cpu, dtype=torch.int32, device=self.device
+            )
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
@@ -1374,6 +1407,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+                global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
                 global_num_tokens_cpu=global_num_tokens_cpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -1400,6 +1434,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if self._compact_moe_counts_gpu is not None:
+                self._compact_moe_counts_gpu.fill_(num_tokens)
+                forward_batch.moe_real_num_tokens_cpu = [num_tokens] * self.dp_size
+                forward_batch.moe_real_num_tokens_gpu = self._compact_moe_counts_gpu
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1643,6 +1681,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=self.static_draft_hidden_states[:static_num_tokens],
             )
 
+        if self._compact_moe_counts_gpu is not None:
+            if (
+                forward_batch.moe_real_num_tokens_cpu is None
+                or forward_batch.moe_real_num_tokens_gpu is None
+            ):
+                raise RuntimeError("Compact MoE graph replay is missing real DP counts")
+            self._compact_moe_counts_gpu.copy_(forward_batch.moe_real_num_tokens_gpu)
+
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
             batch_size=bs,
@@ -1684,6 +1730,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
+            moe_real_num_tokens_cpu=forward_batch.moe_real_num_tokens_cpu,
+            moe_real_num_tokens_gpu=self._compact_moe_counts_gpu,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=padded_spec_info,

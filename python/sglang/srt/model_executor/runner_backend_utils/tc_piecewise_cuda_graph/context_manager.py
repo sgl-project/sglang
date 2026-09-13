@@ -73,6 +73,7 @@ class TcPiecewiseForwardContext:
     quant_config: Any = None
     moe_layers: Optional[List[Any]] = field(default=None)
     moe_fusions: Optional[List[Any]] = field(default=None)
+    dp_moe_layers: Optional[List[Any]] = field(default=None)
     dsa_indexers: Optional[List[Any]] = field(default=None)
     num_tokens: Optional[int] = None
     raw_num_tokens: Optional[int] = None
@@ -102,6 +103,7 @@ def set_tc_piecewise_forward_context(
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
     full_graph: bool = False,
+    dp_moe_layers: Optional[List[Any]] = None,
 ):
     global _tc_piecewise_forward_context
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
@@ -111,6 +113,7 @@ def set_tc_piecewise_forward_context(
         quant_config=quant_config,
         moe_layers=moe_layers,
         moe_fusions=moe_fusions,
+        dp_moe_layers=dp_moe_layers,
         dsa_indexers=dsa_indexers,
         num_tokens=num_tokens,
         raw_num_tokens=raw_num_tokens,

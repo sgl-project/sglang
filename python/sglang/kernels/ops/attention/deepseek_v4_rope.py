@@ -281,7 +281,9 @@ def apply_rotary_emb_triton(
             n_heads = 1
         freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
         if positions is not None:
-            assert positions.shape == (batch_size,)
+            # Scalar compare: the tuple form goes through Dynamo's cmp_eq polyfill,
+            # which needs a concrete bool and so specializes the token dimension.
+            assert positions.shape[0] == batch_size
         else:
             assert freqs_real.shape[0] == batch_size
         BLOCK_M = 32

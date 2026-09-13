@@ -600,6 +600,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # Unpadded token counts for the DSv4 compact MoE split. The ordinary DP
+    # counts below are overwritten by MAX_LEN attention-graph padding.
+    moe_real_num_tokens_cpu: Optional[List[int]] = None
+    moe_real_num_tokens_gpu: Optional[torch.Tensor] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1372,6 +1376,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+        from sglang.srt.layers.moe.dsv4_tc_compact import compact_moe_enabled
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -1385,6 +1390,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+
+        if compact_moe_enabled() and self.is_extend_in_batch:
+            self.moe_real_num_tokens_cpu = list(global_num_tokens)
+            # attn_tp_size is one in this mode, so the existing device counts
+            # already match these values. Keep storage independent of the
+            # padded-count copy performed at the end of this method.
+            self.moe_real_num_tokens_gpu = self.global_num_tokens_gpu.clone()
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1407,15 +1419,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        # `> 0`: when require_mlp_tp_gather() is false global_num_tokens holds only
+        # this rank's count, so an idle rank would take MAX_LEN with a maximum of 0
+        # and get rewritten into a 0-token EXTEND batch, whose extend_seq_lens of
+        # [0] indexes an empty hidden_states at -1.
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        prefill_graph_bucket = None
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
-            and max(global_num_tokens) <= max(prefill_cg.bs)
+            and 0 < max(global_num_tokens) <= max(prefill_cg.bs)
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+            # Pad straight to the capture bucket. The graph runner pads to it
+            # again on the way in, and that second padding never reaches the DP
+            # buffer lengths derived here. Replay-only backends never notice;
+            # tc_piecewise runs the model code and reads the stale local length
+            # against bucket-sized positions.
+            prefill_graph_bucket = min(
+                bs for bs in prefill_cg.bs if bs >= max(global_num_tokens)
+            )
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1423,7 +1448,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # all_gather_into_tensor to gather hidden states, where transferred
             # tokens should be padded to the same length. We will also use
             # reduce-scatter instead of all-reduce after MLP.
-            max_num_tokens = max(global_num_tokens)
+            max_num_tokens = (
+                prefill_graph_bucket
+                if prefill_graph_bucket is not None
+                else max(global_num_tokens)
+            )
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
         else:

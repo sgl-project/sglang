@@ -18,6 +18,9 @@ from sglang.srt.compilation.compile_phase import (
     is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
@@ -89,6 +92,9 @@ class CUDAPiecewiseBackend:
         self.compiled_graph_for_general_shape = compiled_graph_for_general_shape  # noqa
 
         self.sym_shape_indices = sym_shape_indices
+        # A static piece may capture only the first observed runner bucket.
+        # Other contexts retain the original eager behavior for this piece.
+        self._static_context_bucket: Optional[int] = None
 
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
@@ -110,20 +116,48 @@ class CUDAPiecewiseBackend:
             # save the hash of the inductor graph for the next run
             self.sglang_backend.compiler_manager.save_to_file()
 
+    def _runtime_shape_key(self, args) -> Optional[int]:
+        if self.sym_shape_indices:
+            # Preserve the existing behavior for already working symbolic pieces.
+            return args[self.sym_shape_indices[0]]
+
+        # A first trace can be fully static. The enclosing prefill runner still
+        # knows its padded local token bucket. Read that host-side context only
+        # here, after Dynamo; do not generalize persistent KV tensors to obtain
+        # an arbitrary SymInt that need not be the token count.
+        context = get_tc_piecewise_forward_context()
+        if context is None:
+            return None
+        num_tokens = context.num_tokens
+        if num_tokens is None:
+            # Capture/warmup currently leaves context.num_tokens unset.
+            batch = context.forward_batch
+            input_ids = getattr(batch, "input_ids", None)
+            if input_ids is None:
+                return None
+            num_tokens = input_ids.shape[0]
+        if type(num_tokens) is not int or num_tokens <= 0:
+            return None
+        if (
+            self._static_context_bucket is not None
+            and num_tokens != self._static_context_bucket
+        ):
+            return None
+        return num_tokens
+
     def __call__(self, *args) -> Any:
         if not self.first_run_finished:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
 
-        if len(self.sym_shape_indices) == 0:
-            return self.compiled_graph_for_general_shape(*args)
-
-        runtime_shape = args[self.sym_shape_indices[0]]
+        runtime_shape = self._runtime_shape_key(args)
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
             return self.compiled_graph_for_general_shape(*args)
 
+        if not self.sym_shape_indices and self._static_context_bucket is None:
+            self._static_context_bucket = runtime_shape
         entry = self.concrete_size_entries[runtime_shape]
 
         if entry.runnable is None:

@@ -821,7 +821,24 @@ def _dp_gather_via_all_gatherv(
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
+@torch._dynamo.assume_constant_result
+def _record_compiled_prefill_dp_gather() -> None:
+    # Record this on the host during tracing. Repeated traces set the same
+    # latch; DpFlags.__setattr__ stays outside the graph and the result is None.
+    get_flags().dp.prefill_graph_has_dp_gather = True
+
+
 def _note_dp_gather_in_prefill_graph() -> None:
+    if torch.compiler.is_compiling():
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
+        if is_in_tc_piecewise_cuda_graph():
+            _record_compiled_prefill_dp_gather()
+        # The capture flag changes between precompile/capture/replay. Reading
+        # it here would guard the trace on the phase and discard captured graphs.
+        return
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
         dp.prefill_graph_has_dp_gather = True
