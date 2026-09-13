@@ -86,6 +86,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
         new_parent.copy_device_lock_ref(FULL, child);
+        new_parent.set_lock_ref_(FullComponent::HOST, child.host_lock_ref(FULL));
+        // The boundary marks the older edge of the host-lock segment. A split
+        // inserts the prefix at that edge, so move the boundary with it.
+        new_parent.full_host_uuid = child.full_host_uuid.take();
         if child.has_device_value(FULL) {
             Node::redistribute_child_device_value(new_parent, child, FULL, split_len);
         }
@@ -279,12 +283,20 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     ) -> IncLockRefResult {
         // Only the last host node needs to be protected.
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
             // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
+            if !tree_core.arena.node(node_id).has_host_value(FULL) && !tree_core.is_write_back {
                 return result;
             }
-            node.inc_host_lock_ref(FULL);
+            let boundary_uuid = match tree_core.arena.node(node_id).full_host_uuid {
+                Some(uuid) => uuid,
+                None => {
+                    let uuid = tree_core.next_component_uuid_();
+                    tree_core.arena.node_mut(node_id).full_host_uuid = Some(uuid);
+                    uuid
+                }
+            };
+            result.full_uuid_for_host_lock = Some(boundary_uuid);
+            tree_core.arena.node_mut(node_id).inc_host_lock_ref(FULL);
             tree_core.update_evictable_leaf_sets_(node_id);
             return result;
         }
@@ -336,20 +348,41 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        _params: &DecLockRefParams,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
-            if node.host_lock_ref(FULL) == 0 {
+            let Some(boundary_uuid) = params.full_uuid_for_host_lock else {
                 return;
+            };
+            let mut cur = node_id;
+            loop {
+                let node = tree_core.arena.node(cur);
+                if !node.has_host_value(FULL) && !tree_core.is_write_back {
+                    return;
+                }
+                assert!(
+                    node.host_lock_ref(FULL) > 0,
+                    "Full host segment release hit host_lock_ref=0 on node {cur}"
+                );
+                let at_boundary = node.full_host_uuid == Some(boundary_uuid);
+                let parent = if at_boundary {
+                    None
+                } else {
+                    Some(node.try_parent().unwrap_or_else(|| {
+                        panic!(
+                            "Full host lock boundary {boundary_uuid} is not an ancestor of receipt anchor {:?}",
+                            params.node_id
+                        )
+                    }))
+                };
+                tree_core.arena.node_mut(cur).dec_host_lock_ref(FULL);
+                tree_core.update_evictable_leaf_sets_(cur);
+                if at_boundary {
+                    break;
+                }
+                cur = parent.unwrap();
             }
-            // Mirror of `acquire`. write_back uses a pure counter.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
-                return;
-            }
-            node.dec_host_lock_ref(FULL);
-            tree_core.update_evictable_leaf_sets_(node_id);
             return;
         }
 

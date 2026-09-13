@@ -140,7 +140,7 @@ impl SwaComponent {
         match Self::swa_uuid(tree_core.arena.node(node_id), host) {
             Some(uuid) => uuid,
             None => {
-                let minted = tree_core.next_swa_uuid_();
+                let minted = tree_core.next_component_uuid_();
                 let node = tree_core.arena.node_mut(node_id);
                 if host {
                     node.swa_host_uuid = Some(minted);
