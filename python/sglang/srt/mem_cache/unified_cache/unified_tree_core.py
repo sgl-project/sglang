@@ -522,6 +522,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def refresh_lru_to_root(self, node_id: NodeId) -> bool:
+        """Re-age a cached path as if it had just been matched.
+
+        This is the refresh half of ``_match_post_processor``: aux components
+        move to MRU, and Full's ``last_access_time`` is rewritten from a
+        decreasing counter so every ancestor sorts older than its child. Both
+        the device and the host eviction heaps order Full by
+        ``last_access_time``, so one walk protects the path on both tiers.
+
+        Returns False when the node is no longer in the arena, i.e. its KV was
+        already reclaimed and there is nothing left to keep alive.
+        """
+        node = self._node_arena.get(node_id)
+        if node is None:
+            return False
+
+        for comp in self.components:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue  # Full uses last_access_time, not LRU
+            comp.refresh_lru(LRURefreshPhase.MATCH_END, node, self.root_node)
+
+        cur_time = get_and_increase_time_counter()
+        while node:
+            node.last_access_time = cur_time
+            cur_time -= 0.00001
+            node = node.parent
+        return True
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
@@ -2223,6 +2251,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             return empty_kv, {}
         return kv_xfer, comp_xfers
+
+    def split_full_load_back_spec(self, kv_xfer: PoolTransfer) -> list[PoolTransfer]:
+        """One Full transfer per source node, in the chain's root-first order.
+
+        A node only counts as a reclaimable host duplicate once its KV is on
+        device (``_is_settled_full_host_duplicate``), so every node of a chain
+        that has not been loaded yet is a sole host copy. Loading the chain as
+        one transfer therefore demands a device eviction sized for the whole
+        chain at the moment none of it can fund the write-back that eviction
+        cascades into, and the host pressure falls through to a destructive
+        ``_evict_host_leaf``. Loaded root-first one at a time, each node becomes
+        a duplicate at its own ack and pays for the next node's write-back.
+        """
+        transfers: list[PoolTransfer] = []
+        for nid in kv_xfer.nodes_to_load or ():
+            host_value = (
+                self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].host_value
+            )
+            assert host_value is not None
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.KV,
+                    host_indices=host_value,
+                    nodes_to_load=[nid],
+                )
+            )
+        return transfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId

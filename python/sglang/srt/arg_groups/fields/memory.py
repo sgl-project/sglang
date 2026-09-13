@@ -89,6 +89,13 @@ class Memory(msgspec.Struct):
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
     ] = False
+    allow_subagent_keepalive: A[
+        bool,
+        "Refresh a parent session's UnifiedRadixCache LRU whenever one of its "
+        "subagents issues a request. Requests carry session_id / "
+        "parent_session_id; the parent's KV is kept hot while it is blocked on "
+        "the subagent it spawned.",
+    ] = False
     radix_cache_backend: A[
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",
@@ -127,6 +134,15 @@ class Memory(msgspec.Struct):
             choices=["direct", "kernel", "kernel_ascend"],
         ),
     ] = "kernel"
+    hicache_serialize_load_back: A[
+        bool,
+        "Load a prefix back from host one radix node at a time, completing each "
+        "node's H2D before evicting for the next, instead of submitting the "
+        "whole batch's chains together after admission closes. Under write_back "
+        "this bounds how much device memory one eviction has to clear, and lets "
+        "each loaded node be reclaimed as a host duplicate to fund the next one, "
+        "rather than forcing the write-back cascade to destroy sole host copies.",
+    ] = False
     hicache_mem_layout: A[
         str,
         Arg(
