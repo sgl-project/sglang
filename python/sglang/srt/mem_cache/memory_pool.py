@@ -629,7 +629,7 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                num_slots = size + 1
+                num_slots = (spec_state_size + 1) if enable_linear_replayssm_spec else (size + 1)
                 # Ring dtype. DECODE ring (--enable-linear-replayssm): records
                 # follow the SSM dtype -- its flush folds `d` directly into the
                 # state. SPEC-verify ring (--enable-linear-replayssm-spec): d/k feed
@@ -752,74 +752,83 @@ class MambaPool:
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
-                # On CUDA (Triton conv kernel + Triton scatter) we use a
-                # *deduplicated sliding-window* layout: consecutive draft tokens'
-                # (K-1)-wide windows overlap by (K-2), so instead of D separate
-                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
-                # (layer, slot) and expose an overlapping `as_strided` view of
-                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
-                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
-                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
-                # with no numerical change: both the conv kernel write (idempotent
-                # overlapping stores) and `fused_conv_window_scatter_with_mask`
-                # consume the view through its strides.
-                #
-                # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
-                # `conv_window_dedup_enabled` for the full rationale. The
-                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
-                # so the dense fallback reads correctly through the same code path.
-                dedup_conv_window = (
-                    not cache_params.shape.disable_conv_window_dedup
-                    and conv_window_dedup_enabled(
-                        _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
-                    )
-                )
-                self._intermediate_conv_window_phys = []
-                if dedup_conv_window:
-                    win_len = cache_params.shape.conv_kernel - 1
-                    self.conv_window_axis = self._detect_conv_window_axis(
-                        conv_state_shape, win_len
-                    )
+                # ReplaySSM spec-fold skips this allocation: the NPU commit path
+                # uses conv_state_rollback directly on persistent conv_states and
+                # never reads intermediate_conv_window. Skipping it avoids a
+                # 0.18GB allocation that the configurator doesn't charge to the
+                # mamba budget (would over-allocate KV cache → memory corruption).
+                if enable_linear_replayssm_spec:
                     intermediate_conv_window_cache = []
-                    for conv_shape in conv_state_shape:
-                        phys, view = self._allocate_deduplicated_conv_window(
-                            conv_shape=conv_shape,
-                            num_mamba_layers=num_mamba_layers,
-                            spec_state_size=spec_state_size,
-                            speculative_num_draft_tokens=speculative_num_draft_tokens,
-                            conv_dtype=conv_dtype,
-                        )
-                        self._intermediate_conv_window_phys.append(phys)
-                        intermediate_conv_window_cache.append(view)
+                    self._intermediate_conv_window_phys = []
                 else:
-                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
-                    # [dim, K-1] window per draft token.
-                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
-                    dense_conv_shapes = [
-                        (
-                            (conv_shape[1], conv_shape[0])
-                            if _is_npu and cache_params.is_kda
-                            else conv_shape
+                    # On CUDA (Triton conv kernel + Triton scatter) we use a
+                    # *deduplicated sliding-window* layout: consecutive draft tokens'
+                    # (K-1)-wide windows overlap by (K-2), so instead of D separate
+                    # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
+                    # (layer, slot) and expose an overlapping `as_strided` view of
+                    # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
+                    # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
+                    # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
+                    # with no numerical change: both the conv kernel write (idempotent
+                    # overlapping stores) and `fused_conv_window_scatter_with_mask`
+                    # consume the view through its strides.
+                    #
+                    # Dedup the sliding-window conv-intermediate only when it is safe:
+                    # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
+                    # verify (topk > 1) keep the dense layout -- see
+                    # `conv_window_dedup_enabled` for the full rationale. The
+                    # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
+                    # so the dense fallback reads correctly through the same code path.
+                    dedup_conv_window = (
+                        not cache_params.shape.disable_conv_window_dedup
+                        and conv_window_dedup_enabled(
+                            _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                         )
-                        for conv_shape in conv_state_shape
-                    ]
-                    intermediate_conv_window_cache = [
-                        torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                speculative_num_draft_tokens,
-                                conv_shape[0],
-                                conv_shape[1],
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
+                    )
+                    self._intermediate_conv_window_phys = []
+                    if dedup_conv_window:
+                        win_len = cache_params.shape.conv_kernel - 1
+                        self.conv_window_axis = self._detect_conv_window_axis(
+                            conv_state_shape, win_len
                         )
-                        for conv_shape in dense_conv_shapes
-                    ]
-                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                        intermediate_conv_window_cache = []
+                        for conv_shape in conv_state_shape:
+                            phys, view = self._allocate_deduplicated_conv_window(
+                                conv_shape=conv_shape,
+                                num_mamba_layers=num_mamba_layers,
+                                spec_state_size=spec_state_size,
+                                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                                conv_dtype=conv_dtype,
+                            )
+                            self._intermediate_conv_window_phys.append(phys)
+                            intermediate_conv_window_cache.append(view)
+                    else:
+                        # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                        # [dim, K-1] window per draft token.
+                        # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                        dense_conv_shapes = [
+                            (
+                                (conv_shape[1], conv_shape[0])
+                                if _is_npu and cache_params.is_kda
+                                else conv_shape
+                            )
+                            for conv_shape in conv_state_shape
+                        ]
+                        intermediate_conv_window_cache = [
+                            torch.zeros(
+                                size=(
+                                    num_mamba_layers,
+                                    spec_state_size + 1,
+                                    speculative_num_draft_tokens,
+                                    conv_shape[0],
+                                    conv_shape[1],
+                                ),
+                                dtype=conv_dtype,
+                                device="cuda",
+                            )
+                            for conv_shape in dense_conv_shapes
+                        ]
+                        self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,

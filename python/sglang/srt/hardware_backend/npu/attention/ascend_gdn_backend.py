@@ -6,6 +6,9 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_npu,
 )
 
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -190,6 +193,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
+                if mamba_cache_params.intermediate_conv_window
+                else None
             )
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
@@ -253,6 +258,89 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
+            # ReplaySSM fold-every-commit (mirrors the CUDA GDN backend's
+            # _replayssm_fold_target_verify): the Triton verify kernel stores
+            # each draft step's raw (v, pre-norm k, g, beta) into the per-slot
+            # ring and leaves ssm_states untouched; the commit
+            # (update_mamba_state_after_mtp_verify ->
+            # commit_gdn_replayssm_fold_all_layers) replays the accepted
+            # prefix into `temporal`. The NPU recurrent op below folds the
+            # whole draft window into ssm_states and never writes the ring,
+            # so it must not run under the flag.
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            use_replayssm_fold = (
+                mamba_cache_params.replayssm_rawv is not None
+                and getattr(mamba_pool, "replayssm_spec_fold", False)
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
+            )
+            if use_replayssm_fold:
+                assert retrieve_parent_token is None, (
+                    "ReplaySSM fold-every-commit supports a linear draft "
+                    "chain only (topk <= 1); EAGLE tree verify must use the "
+                    "recurrent verify."
+                )
+                num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim
+                # Dense verify layout: every request contributes exactly
+                # draft_token_num tokens. Derive the batch size from the
+                # (eager-mode truncatable) token count so padded tail
+                # requests are not fed to the kernel.
+                batch_size = mixed_qkv.shape[0] // draft_token_num
+                q, k, v = mixed_qkv.split(
+                    [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+                )
+                q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+                k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+                v = v.unflatten(-1, (-1, head_v_dim)).unsqueeze(0)
+                dense_cu_seqlens = torch.arange(
+                    0,
+                    (batch_size + 1) * draft_token_num,
+                    draft_token_num,
+                    device=mixed_qkv.device,
+                    dtype=torch.int32,
+                )
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=layer.A_log,
+                    a=a,
+                    dt_bias=layer.dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices[:batch_size],
+                    cu_seqlens=dense_cu_seqlens,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=False,
+                    disable_state_update=True,
+                    cache_ring=True,
+                    replayssm_rawv=mamba_cache_params.replayssm_rawv,
+                    replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                    replayssm_g=mamba_cache_params.replayssm_g,
+                    replayssm_beta=mamba_cache_params.replayssm_beta,
+                    num_warps=4,
+                )
+                # [1, T, HV, V] -> [T, HV, V]; re-pad the eager-mode
+                # non-padded truncation exactly like the recurrent path.
+                core_attn_out = core_attn_out.reshape(
+                    -1, num_value_heads, head_v_dim
+                )
+                if (
+                    not self.graph_mode
+                    and core_attn_out.shape[0] < num_token_padding
+                ):
+                    core_attn_out = torch.cat(
+                        [
+                            core_attn_out,
+                            core_attn_out.new_zeros(
+                                num_token_padding - core_attn_out.shape[0],
+                                *core_attn_out.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return core_attn_out
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
             )

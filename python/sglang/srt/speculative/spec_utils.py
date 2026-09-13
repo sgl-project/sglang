@@ -875,10 +875,14 @@ def commit_mamba_states_after_verify(
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.
+    # On NPU the fold + conv rollback is handled by the backend's own
+    # update_mamba_state_after_mtp_verify (NPU-native conv_state_rollback),
+    # so skip the early return and fall through.
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and not _is_npu
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -961,10 +965,14 @@ def commit_mamba_states_after_verify(
     # state. The draft window's raw inputs were written to the ring during verify
     # by the KDA backend. Gate on the fold flag + is_kda (the cursor tensors are
     # never allocated under fold, so they cannot serve as the signal).
+    # On NPU the fold + conv rollback is handled by the backend's own
+    # update_mamba_state_after_mtp_verify (NPU-native conv_state_rollback),
+    # so skip the early return and fall through.
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and getattr(mamba_pool, "replayssm_is_kda", False)
+        and not _is_npu
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return

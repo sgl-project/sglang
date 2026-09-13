@@ -37,6 +37,159 @@ import triton.language as tl
 
 
 @triton.jit
+def _kda_replayssm_fold_kernel_v2(
+    h0_ptr,
+    rawv_ptr,
+    rawk_ptr,
+    gk_ptr,
+    beta_ptr,
+    state_indices_ptr,
+    accept_lens_ptr,
+    track_indices_ptr,
+    steps_to_track_ptr,
+    stride_state_layer,
+    stride_state_slot,
+    stride_state_hv,
+    stride_state_v,
+    stride_state_k,
+    stride_rawv_layer,
+    stride_rawv_slot,
+    stride_rawk_layer,
+    stride_rawk_slot,
+    stride_gk_layer,
+    stride_gk_slot,
+    stride_beta_layer,
+    stride_beta_slot,
+    num_layers,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    state_idx = tl.load(state_indices_ptr + pid).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    n_commit = tl.load(accept_lens_ptr + pid).to(tl.int32)
+    if n_commit <= 0:
+        return
+
+    if HAS_TRACK:
+        track_idx = tl.load(track_indices_ptr + pid).to(tl.int64)
+        track_step_val = tl.load(steps_to_track_ptr + pid).to(tl.int32)
+    else:
+        track_idx = NULL_BLOCK_ID
+        track_step_val = -1
+
+    k_offsets = tl.arange(0, BLOCK_K)
+    k_mask = k_offsets < K
+
+    for l in range(num_layers):
+        l64 = tl.cast(l, tl.int64)
+        h0_l = h0_ptr + l64 * stride_state_layer
+        rawv_l = rawv_ptr + l64 * stride_rawv_layer
+        rawk_l = rawk_ptr + l64 * stride_rawk_layer
+        gk_l = gk_ptr + l64 * stride_gk_layer
+        beta_l = beta_ptr + l64 * stride_beta_layer
+
+        for hv in range(HV):
+            hv64 = tl.cast(hv, tl.int64)
+            h = hv // (HV // H)
+
+            for v_start in range(0, V, BLOCK_V):
+                v_offsets = v_start + tl.arange(0, BLOCK_V)
+                v_mask = v_offsets < V
+                mask_state = v_mask[:, None] & k_mask[None, :]
+
+                p_h0 = (
+                    h0_l
+                    + state_idx * stride_state_slot
+                    + hv64 * stride_state_hv
+                    + v_offsets[:, None] * stride_state_v
+                    + k_offsets[None, :] * stride_state_k
+                )
+                state = tl.load(
+                    p_h0, mask=mask_state, other=0.0
+                ).to(tl.float32)
+
+                for t in range(n_commit):
+                    t64 = tl.cast(t, tl.int64)
+
+                    b_k = tl.load(
+                        rawk_l
+                        + pid * stride_rawk_slot
+                        + h * MAX_CACHE_LEN * K
+                        + t64 * K
+                        + k_offsets,
+                        mask=k_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    b_v = tl.load(
+                        rawv_l
+                        + pid * stride_rawv_slot
+                        + hv * MAX_CACHE_LEN * V
+                        + t64 * V
+                        + v_offsets,
+                        mask=v_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    b_gk = tl.load(
+                        gk_l
+                        + pid * stride_gk_slot
+                        + hv * MAX_CACHE_LEN * K
+                        + t64 * K
+                        + k_offsets,
+                        mask=k_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    b_beta = tl.load(
+                        beta_l
+                        + pid * stride_beta_slot
+                        + hv * MAX_CACHE_LEN
+                        + t64,
+                    ).to(tl.float32)
+
+                    if USE_QK_L2NORM_IN_KERNEL:
+                        b_k = b_k / (
+                            tl.sqrt(tl.sum(b_k * b_k)) + 1e-6
+                        )
+                    state *= tl.exp(b_gk[None, :])
+                    b_v -= tl.sum(state * b_k[None, :], axis=1)
+                    b_v *= b_beta
+                    state += b_v[:, None] * b_k[None, :]
+
+                    if HAS_TRACK:
+                        if (t == track_step_val) and (
+                            track_idx > NULL_BLOCK_ID
+                        ):
+                            p_track = (
+                                h0_l
+                                + track_idx * stride_state_slot
+                                + hv64 * stride_state_hv
+                                + v_offsets[:, None] * stride_state_v
+                                + k_offsets[None, :] * stride_state_k
+                            )
+                            tl.store(
+                                p_track,
+                                state.to(h0_ptr.dtype.element_ty),
+                                mask=mask_state,
+                            )
+
+                tl.store(
+                    p_h0,
+                    state.to(h0_ptr.dtype.element_ty),
+                    mask=mask_state,
+                )
+
+
+@triton.jit
 def kda_replayssm_exact_fold_kernel(
     h0,  # [num_slots, HV, V, K] fp32 checkpoint (folded in place)
     rawv_cache,  # [num_slots, HV, L, V]  raw v
@@ -126,7 +279,7 @@ def kda_replayssm_exact_fold_kernel(
         phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + i_n * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -134,7 +287,7 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_v = tl.load(
             rawv_cache
-            + state_idx * stride_rawv_slot
+            + i_n * stride_rawv_slot
             + (i_hv * MAX_CACHE_LEN + phys) * V
             + o_v,
             mask=mask_v,
@@ -142,14 +295,14 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_gk = tl.load(
             gk_cache
-            + state_idx * stride_gk_slot
+            + i_n * stride_gk_slot
             + (i_hv * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            beta_cache + i_n * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
         # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
@@ -250,7 +403,7 @@ def commit_kda_replayssm_spec(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         num_warps=1,
-        num_stages=3,
+        num_stages=4,
     )
 
 
@@ -329,7 +482,78 @@ def commit_kda_replayssm_spec_all_layers(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         num_warps=1,
-        num_stages=3,
+        num_stages=4,
+    )
+
+
+def commit_kda_replayssm_spec_all_layers_v2(
+    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
+    rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
+    rawk_cache: torch.Tensor,  # [num_layers, num_slots, H,  L, K]
+    gk_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, K] fp32
+    beta_cache: torch.Tensor,  # [num_layers, num_slots, HV, L]    fp32
+    ssm_state_indices: torch.Tensor,  # [B] int   (shared across layers)
+    accept_lens: torch.Tensor,  # [B] int
+    max_cache_len: int,
+    num_k_heads: int,
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    null_block_id: int = 0,
+) -> None:
+    """Fold every layer's accepted window in a single launch (v2).
+
+    Follows the move_cache_dynamic_last_kernel_h_block_kda pattern: 1-D grid
+    (one program per request), layers/heads/v-tiles looped inside.  This
+    amortises per-request index loads and reduces program-dispatch overhead
+    versus the 3-D grid of the original kernel.
+    """
+    num_layers, num_slots, HV, V, K = checkpoint_state.shape
+    B = ssm_state_indices.shape[0]
+    BK = triton.next_power_of_2(K)
+    BV = min(64, triton.next_power_of_2(V))
+    grid = (B,)
+    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if has_track:
+        track_idx_t = mamba_track_indices
+        steps_t = mamba_steps_to_track
+    else:
+        track_idx_t = ssm_state_indices
+        steps_t = accept_lens
+    _kda_replayssm_fold_kernel_v2[grid](
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        gk_cache,
+        beta_cache,
+        ssm_state_indices,
+        accept_lens,
+        track_idx_t,
+        steps_t,
+        checkpoint_state.stride(0),
+        checkpoint_state.stride(1),
+        checkpoint_state.stride(2),
+        checkpoint_state.stride(3),
+        checkpoint_state.stride(4),
+        rawv_cache.stride(0),
+        rawv_cache.stride(1),
+        rawk_cache.stride(0),
+        rawk_cache.stride(1),
+        gk_cache.stride(0),
+        gk_cache.stride(1),
+        beta_cache.stride(0),
+        beta_cache.stride(1),
+        num_layers,
+        H=num_k_heads,
+        HV=HV,
+        K=K,
+        V=V,
+        MAX_CACHE_LEN=max_cache_len,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        NULL_BLOCK_ID=null_block_id,
+        HAS_TRACK=has_track,
+        BLOCK_V=BV,
+        BLOCK_K=BK,
     )
 
 
@@ -357,7 +581,7 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
+    commit_kda_replayssm_spec_all_layers_v2(
         checkpoint_state=spec_state.temporal,
         rawv_cache=spec_state.replayssm_rawv,
         rawk_cache=spec_state.replayssm_rawk,

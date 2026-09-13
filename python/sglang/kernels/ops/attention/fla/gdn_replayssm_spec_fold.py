@@ -99,7 +99,7 @@ def gdn_replayssm_exact_fold_kernel(
         phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + i_n * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -107,17 +107,17 @@ def gdn_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_v = tl.load(
             rawv_cache
-            + state_idx * stride_rawv_slot
+            + i_n * stride_rawv_slot
             + (i_hv * MAX_CACHE_LEN + phys) * V
             + o_v,
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
         b_g = tl.load(
-            g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+            g_cache + i_n * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            beta_cache + i_n * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:

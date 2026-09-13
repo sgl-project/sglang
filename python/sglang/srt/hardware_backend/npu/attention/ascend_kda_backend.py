@@ -27,6 +27,12 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 # from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 # from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+    fused_recurrent_linear_replayssm_decode,
+)
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
@@ -223,23 +229,68 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 ),
             )
         else:
-            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
-            q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
-            k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
-            v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
-            core_attn_out = self.kernel_dispatcher.decode(
-                q=q,
-                k=k,
-                v=v,
-                a=a,
-                b=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                lower_bound=layer.lower_bound,
+            replayssm_d = layer_cache.replayssm_d
+            replayssm_k = layer_cache.replayssm_k
+            replayssm_g = layer_cache.replayssm_g
+            replayssm_write_pos = getattr(
+                self.forward_metadata, "replayssm_write_pos", None
             )
+            replayssm_force_flush = getattr(
+                self.forward_metadata, "replayssm_force_flush", None
+            )
+            if (
+                replayssm_d is not None
+                and replayssm_k is not None
+                and replayssm_g is not None
+                and replayssm_write_pos is not None
+            ):
+                if layer.lower_bound is not None:
+                    raise NotImplementedError(
+                        "KDA safe gate (lower_bound) is not implemented in the "
+                        "ReplaySSM decode kernel; disable --enable-linear-replayssm."
+                    )
+                B = qkv.shape[0]
+                K = ssm_states.shape[-1]
+                out = qkv.new_empty(B, 1, layer.num_v_heads, layer.head_v_dim)
+                fused_recurrent_linear_replayssm_decode(
+                    mixed_qkv=qkv,
+                    a=a.reshape(B, layer.num_v_heads, K).contiguous(),
+                    b=b.reshape(B, layer.num_v_heads).contiguous(),
+                    A_log=layer.A_log.reshape(-1),
+                    dt_bias=layer.dt_bias.reshape(layer.num_v_heads, K).contiguous(),
+                    scale=layer.head_k_dim**-0.5,
+                    initial_state=ssm_states,
+                    d_cache=replayssm_d,
+                    k_cache=replayssm_k,
+                    g_cache=replayssm_g,
+                    out=out,
+                    ssm_state_indices=cache_indices,
+                    write_pos=replayssm_write_pos,
+                    force_flush=replayssm_force_flush,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                )
+                core_attn_out = out.transpose(0, 1)
+            else:
+                q, k, v = qkv.split(
+                    [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+                )
+                q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+                k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+                v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+                core_attn_out = self.kernel_dispatcher.decode(
+                    q=q,
+                    k=k,
+                    v=v,
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    lower_bound=layer.lower_bound,
+                )
 
         self._track_mamba_state_decode(
             forward_batch,
@@ -367,17 +418,28 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fixed-width DSpark verify with Ascend-native state snapshots."""
+        """Run fixed-width DSpark verify with Ascend-native state snapshots.
+
+        When ReplaySSM spec-verify is enabled (replayssm_spec_fold), the per-draft
+        full-state snapshots are replaced by a ring-writing Triton verify kernel
+        (fused_sigmoid_gating_delta_rule_update with cache_ring=True). The commit
+        fold replays the accepted prefix into the fp32 checkpoint.
+        """
         metadata = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = metadata.query_start_loc
         cache_indices = metadata.mamba_cache_indices
 
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        replayssm_spec_fold = getattr(mamba_pool, "replayssm_spec_fold", False)
+
         intermediate_state = cache.intermediate_ssm
-        if intermediate_state is None:
+        if intermediate_state is None and not replayssm_spec_fold:
             raise RuntimeError(
-                "Ascend KDA target verify requires speculative Mamba scratch."
+                "Ascend KDA target verify requires speculative Mamba scratch "
+                "(or --enable-linear-replayssm-spec)."
             )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
@@ -436,6 +498,47 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        if replayssm_spec_fold:
+            dense_cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * draft_token_num,
+                draft_token_num,
+                device=q.device,
+                dtype=torch.int32,
+            )
+            out = fused_sigmoid_gating_delta_rule_update(
+                A_log=layer.A_log,
+                a=dense_a,
+                dt_bias=layer.dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=dense_b,
+                initial_state_source=cache.temporal,
+                initial_state_indices=cache_indices[:batch_size],
+                cu_seqlens=dense_cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                lower_bound=layer.lower_bound,
+                disable_state_update=True,
+                cache_ring=True,
+                replayssm_rawv=cache.replayssm_rawv,
+                replayssm_rawk=cache.replayssm_rawk,
+                replayssm_g=cache.replayssm_g,
+                replayssm_beta=cache.replayssm_beta,
+                num_warps=4,
+            )
+            out = out[0] if isinstance(out, tuple) else out
+            if dense_token_indices is None:
+                return out
+            padded_out = out.new_zeros(
+                1, num_dense_tokens + 1, *out.shape[2:]
+            )
+            padded_out[:, :num_dense_tokens] = out
+            return padded_out[:, dense_token_indices]
 
         # Activate the forget gate and beta in FP32 before entering the
         # recurrent kernel to match the checkpoint's verify contract.
@@ -544,9 +647,13 @@ class AscendKDAHybridLinearAttnBackend:
                     self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
                 )
 
+                mamba_pool = self.linear_attn_backend.req_to_token_pool.mamba_pool
+                replayssm_spec_fold = getattr(
+                    mamba_pool, "replayssm_spec_fold", False
+                )
+
                 conv_states = mamba_caches.conv[0]
                 ssm_states = mamba_caches.temporal
-                intermediate_state_cache = mamba_caches.intermediate_ssm
                 dst_indices_tensor = state_indices_tensor.to(torch.int32)
                 src_indices_tensor = torch.arange(
                     dst_indices_tensor.shape[0],
@@ -554,6 +661,62 @@ class AscendKDAHybridLinearAttnBackend:
                     dtype=torch.int32,
                 )
                 last_steps = last_correct_step_indices.to(torch.int32)
+
+                if replayssm_spec_fold:
+                    from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+                        commit_kda_replayssm_spec_all_layers,
+                    )
+
+                    L = mamba_caches.replayssm_rawv.shape[-2]
+                    num_k_heads = mamba_caches.replayssm_rawk.shape[2]
+                    accept_lens = (last_steps + 1).to(torch.int32)
+
+                    track_idx = (
+                        mamba_track_indices.to(torch.int32)
+                        if mamba_track_indices is not None
+                        else None
+                    )
+                    track_steps = (
+                        mamba_steps_to_track.to(torch.int32)
+                        if mamba_steps_to_track is not None
+                        else None
+                    )
+
+                    commit_kda_replayssm_spec_all_layers(
+                        checkpoint_state=ssm_states,
+                        rawv_cache=mamba_caches.replayssm_rawv,
+                        rawk_cache=mamba_caches.replayssm_rawk,
+                        gk_cache=mamba_caches.replayssm_g,
+                        beta_cache=mamba_caches.replayssm_beta,
+                        ssm_state_indices=dst_indices_tensor,
+                        accept_lens=accept_lens,
+                        max_cache_len=L,
+                        num_k_heads=num_k_heads,
+                        mamba_track_indices=track_idx,
+                        mamba_steps_to_track=track_steps,
+                    )
+
+                    draft_token_num = L
+                    if dst_indices_tensor.numel() > 0:
+                        conv_state_rollback(
+                            conv_states,
+                            dst_indices_tensor,
+                            last_steps,
+                            draft_token_num,
+                        )
+                    if (
+                        mamba_track_indices is not None
+                        and mamba_track_indices.numel() > 0
+                    ):
+                        conv_state_rollback(
+                            conv_states,
+                            mamba_track_indices.to(torch.int32),
+                            mamba_steps_to_track.to(torch.int32),
+                            draft_token_num,
+                        )
+                    return
+
+                intermediate_state_cache = mamba_caches.intermediate_ssm
 
                 move_intermediate_cache_kda(
                     ssm_states,

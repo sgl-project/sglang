@@ -8,6 +8,374 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
 @triton.jit(do_not_specialize=["T"])
+def _gate_and_ring_write_kernel(
+    A_log,
+    a,
+    dt_bias,
+    b,
+    g_buffer,
+    beta_buffer,
+    softplus_beta,
+    softplus_threshold,
+    lower_bound,
+    cu_seqlens,
+    stride_a,
+    stride_b,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+):
+    i_nh = tl.program_id(0)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        T_seq = eos - bos
+    else:
+        bos = i_n * T
+        T_seq = T
+
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+
+    p_b = b + bos * stride_b + i_hv
+    p_A_log = A_log + i_hv
+    if IS_KDA:
+        p_a = a + bos * stride_a + i_hv * K + o_k
+        p_dt_bias = dt_bias + i_hv * K + o_k
+    else:
+        p_a = a + bos * stride_a + i_hv
+        p_dt_bias = dt_bias + i_hv
+
+    for step_idx in range(0, T_seq):
+        b_A_log = tl.load(p_A_log).to(tl.float32)
+        if IS_KDA:
+            b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
+            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+        else:
+            b_a = tl.load(p_a).to(tl.float32)
+            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+        x = b_a + b_dt_bias
+        if USE_LOWER_BOUND:
+            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            beta_x = softplus_beta * x
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
+
+        b_b = tl.load(p_b).to(tl.float32)
+        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+        if IS_KDA:
+            tl.store(
+                g_buffer + (bos + step_idx) * HV * K + i_hv * K + o_k,
+                b_g,
+                mask=mask_k,
+            )
+        else:
+            tl.store(g_buffer + (bos + step_idx) * HV + i_hv, b_g)
+        tl.store(beta_buffer + (bos + step_idx) * HV + i_hv, b_beta)
+
+        p_b += stride_b
+        p_a += stride_a
+
+
+@triton.jit(do_not_specialize=["T"])
+def _recurrent_delta_rule_preactivated_kernel(
+    q,
+    k,
+    v,
+    o,
+    g_preact,
+    beta_preact,
+    h0_source,
+    h0_indices,
+    stride_h0_source,
+    cu_seqlens,
+    scale,
+    T,
+    stride_q,
+    stride_k,
+    stride_v,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_KDA: tl.constexpr,
+):
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        all_tokens = T
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        all_tokens = B * T
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_q = q + bos * stride_q + i_h * K + o_k
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_o = o + ((i_k * all_tokens + bos) * HV + i_hv) * V + o_v
+
+    if IS_KDA:
+        p_g = g_preact + bos * HV * K + i_hv * K + o_k
+    else:
+        p_g = g_preact + bos * HV + i_hv
+    p_beta = beta_preact + bos * HV + i_hv
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_v[:, None] & mask_k[None, :]
+
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
+        if idx >= 0:
+            p_h0 = (
+                h0_source
+                + idx * stride_h0_source
+                + i_hv * K * V
+                + o_v[:, None] * K
+                + o_k[None, :]
+            )
+            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    for _ in range(0, T):
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+        b_q = b_q * scale
+
+        if IS_KDA:
+            b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
+            b_h *= tl.exp(b_g[None, :])
+        else:
+            b_g = tl.load(p_g).to(tl.float32)
+            b_h *= tl.exp(b_g)
+
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
+        b_beta = tl.load(p_beta).to(tl.float32)
+        b_v *= b_beta
+        b_h += b_v[:, None] * b_k[None, :]
+        b_o = tl.sum(b_h * b_q[None, :], 1)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        p_q += stride_q
+        p_k += stride_k
+        p_v += stride_v
+        p_o += HV * V
+        if IS_KDA:
+            p_g += HV * K
+        else:
+            p_g += HV
+        p_beta += HV
+
+
+@triton.jit
+def _replayssm_verify_recurrent_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    g_preact_ptr,
+    beta_preact_ptr,
+    initial_state_ptr,
+    initial_indices_ptr,
+    replayssm_rawv,
+    replayssm_rawk,
+    replayssm_g,
+    replayssm_beta,
+    stride_initial_0,
+    scale,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    STEPS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    CACHE_RING: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_hv = tl.program_id(1)
+    pid_v = tl.program_id(2)
+
+    offset_k = tl.arange(0, BK)
+    offset_v = pid_v * BV + tl.arange(0, BV)
+    mask_k = offset_k < K
+    mask_v = offset_v < V
+    mask_state = mask_v[:, None] & mask_k[None, :]
+
+    k_head = pid_hv // (HV // H)
+
+    state = tl.zeros([BV, BK], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        initial_idx = tl.load(initial_indices_ptr + pid_batch).to(tl.int64)
+        if initial_idx >= 0:
+            p_h0 = (
+                initial_state_ptr
+                + initial_idx * stride_initial_0
+                + pid_hv * V * K
+                + offset_v[:, None] * K
+                + offset_k[None, :]
+            )
+            state = tl.load(p_h0, mask=mask_state, other=0.0).to(tl.float32)
+
+    for step in tl.static_range(0, STEPS):
+        token = pid_batch * STEPS + step
+
+        k_raw = tl.load(
+            k_ptr + token * stride_k + k_head * K + offset_k,
+            mask=mask_k,
+            other=0.0,
+        )
+        v_raw = tl.load(
+            v_ptr + token * stride_v + pid_hv * V + offset_v,
+            mask=mask_v,
+            other=0.0,
+        )
+
+        if CACHE_RING:
+            if step < MAX_CACHE_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + pid_batch * stride_rawv_slot
+                    + pid_hv * MAX_CACHE_LEN * V
+                    + step * V
+                    + offset_v,
+                    v_raw.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if pid_v == 0:
+                    tl.store(
+                        replayssm_rawk
+                        + pid_batch * stride_rawk_slot
+                        + k_head * MAX_CACHE_LEN * K
+                        + step * K
+                        + offset_k,
+                        k_raw.to(replayssm_rawk.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                    if IS_KDA:
+                        tl.store(
+                            replayssm_g
+                            + pid_batch * stride_g_slot
+                            + pid_hv * MAX_CACHE_LEN * K
+                            + step * K
+                            + offset_k,
+                            tl.load(
+                                g_preact_ptr
+                                + (token * HV + pid_hv) * K
+                                + offset_k,
+                                mask=mask_k,
+                                other=0.0,
+                            ),
+                            mask=mask_k,
+                        )
+                    else:
+                        tl.store(
+                            replayssm_g
+                            + pid_batch * stride_g_slot
+                            + pid_hv * MAX_CACHE_LEN
+                            + step,
+                            tl.load(
+                                g_preact_ptr + token * HV + pid_hv
+                            ),
+                        )
+                    tl.store(
+                        replayssm_beta
+                        + pid_batch * stride_beta_slot
+                        + pid_hv * MAX_CACHE_LEN
+                        + step,
+                        tl.load(
+                            beta_preact_ptr + token * HV + pid_hv
+                        ),
+                    )
+
+        q = tl.load(
+            q_ptr + token * stride_q + k_head * K + offset_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        k = k_raw.to(tl.float32)
+        value = v_raw.to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            q = q / (tl.sqrt(tl.sum(q * q, axis=0)) + 1e-6)
+            k = k / (tl.sqrt(tl.sum(k * k, axis=0)) + 1e-6)
+        q *= scale
+
+        if IS_KDA:
+            gate = tl.load(
+                g_preact_ptr + (token * HV + pid_hv) * K + offset_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            state *= tl.exp(gate[None, :])
+        else:
+            gate = tl.load(
+                g_preact_ptr + token * HV + pid_hv
+            ).to(tl.float32)
+            state *= tl.exp(gate)
+
+        value -= tl.sum(state * k[None, :], axis=1)
+        beta = tl.load(beta_preact_ptr + token * HV + pid_hv).to(tl.float32)
+        value *= beta
+        state += value[:, None] * k[None, :]
+        output = tl.sum(state * q[None, :], axis=1)
+
+        tl.store(
+            out_ptr + (token * HV + pid_hv) * V + offset_v,
+            output,
+            mask=mask_v,
+        )
+
+
+@triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,
@@ -220,8 +588,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # ring; the overflow steps are past the committable prefix, so drop them
         # (writing them would smash the next slot's ring).
         if CACHE_RING:
-            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
-            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+            ring_slot = i_n
+            if step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -372,6 +740,7 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    num_warps: int = 1,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -400,7 +769,6 @@ def fused_sigmoid_gating_delta_rule_update(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -452,73 +820,162 @@ def fused_sigmoid_gating_delta_rule_update(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
-    # already launches dependents. Bit-exact (scheduling only) — benefits both
-    # KDA and GDN recurrent paths.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    if cache_ring:
+        # Split path (NPU-optimized): gate computation is fully parallel
+        # (no ring writes — just g/beta → temp buffers); ring writes are
+        # folded into the recurrent kernel's compute-heavy loop where they
+        # are hidden by the VEC pipeline.
+        total_tokens = B * T
 
-    fused_sigmoid_gating_delta_rule_update_kernel[grid](
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        lower_bound=lower_bound if lower_bound is not None else 0.0,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        o=o,
-        h0_source=initial_state_source,
-        h0_indices=initial_state_indices,
-        # Envelope-strided state pools (page-major / unified memory) have a
-        # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
-        stride_h0_source=(
-            initial_state_source.stride(0) if initial_state_source is not None else 0
-        ),
-        cu_seqlens=cu_seqlens,
-        intermediate_states_buffer=intermediate_states_buffer,
-        intermediate_state_indices=intermediate_state_indices,
-        cache_steps=cache_stride_steps,
-        retrieve_parent_token_ptr=retrieve_parent_token,
-        stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
-        stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
-        scale=scale,
-        T=T,
-        stride_a=stride_a,
-        stride_q=stride_q,
-        stride_k=stride_k,
-        stride_v=stride_v,
-        stride_b=stride_b,
-        NP2_T=NP2_T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        USE_INITIAL_STATE=initial_state_source is not None,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_VARLEN=cu_seqlens is not None,
-        IS_KDA=is_kda,
-        USE_LOWER_BOUND=lower_bound is not None,
-        DISABLE_STATE_UPDATE=disable_state_update,
-        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
-        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
-        replayssm_rawv=replayssm_rawv,
-        replayssm_rawk=replayssm_rawk,
-        replayssm_g=replayssm_g,
-        replayssm_beta=replayssm_beta,
-        stride_rawv_slot=stride_rawv_slot,
-        stride_rawk_slot=stride_rawk_slot,
-        stride_g_slot=stride_g_slot,
-        stride_beta_slot=stride_beta_slot,
-        MAX_CACHE_LEN=max_cache_len,
-        CACHE_RING=cache_ring,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **pdl_kwargs,
-    )
+        if is_kda:
+            g_buffer = torch.empty(
+                total_tokens, HV * K, dtype=torch.float32, device=q.device
+            )
+        else:
+            g_buffer = torch.empty(
+                total_tokens, HV, dtype=torch.float32, device=q.device
+            )
+        beta_buffer = torch.empty(
+            total_tokens, HV, dtype=torch.float32, device=q.device
+        )
+
+        grid_gate = (N * HV,)
+        _gate_and_ring_write_kernel[grid_gate](
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            g_buffer=g_buffer,
+            beta_buffer=beta_buffer,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+            cu_seqlens=cu_seqlens,
+            stride_a=stride_a,
+            stride_b=stride_b,
+            T=T,
+            B=B,
+            H=H,
+            HV=HV,
+            K=K,
+            BK=BK,
+            IS_VARLEN=cu_seqlens is not None,
+            IS_KDA=is_kda,
+            USE_LOWER_BOUND=lower_bound is not None,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        STEPS = T // N
+        BV_RECURRENT = min(triton.next_power_of_2(V), 64)
+        grid_recurrent = (N, HV, triton.cdiv(V, BV_RECURRENT))
+        _replayssm_verify_recurrent_kernel[grid_recurrent](
+            q,
+            k,
+            v,
+            o,
+            g_buffer,
+            beta_buffer,
+            initial_state_source if initial_state_source is not None else q,
+            initial_state_indices if initial_state_indices is not None else q,
+            replayssm_rawv if replayssm_rawv is not None else q,
+            replayssm_rawk if replayssm_rawk is not None else q,
+            replayssm_g if replayssm_g is not None else q,
+            replayssm_beta if replayssm_beta is not None else q,
+            initial_state_source.stride(0) if initial_state_source is not None else 0,
+            scale,
+            stride_q,
+            stride_k,
+            stride_v,
+            stride_rawv_slot,
+            stride_rawk_slot,
+            stride_g_slot,
+            stride_beta_slot,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            STEPS=STEPS,
+            BK=BK,
+            BV=BV_RECURRENT,
+            MAX_CACHE_LEN=max_cache_len,
+            CACHE_RING=True,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            IS_KDA=is_kda,
+            USE_INITIAL_STATE=initial_state_source is not None,
+            num_warps=1,
+            num_stages=3,
+        )
+    else:
+        # PDL (sm90+): chain this kernel behind its producer conv1d_update,
+        # which already launches dependents. Bit-exact (scheduling only) —
+        # benefits both KDA and GDN recurrent paths.
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
+
+        fused_sigmoid_gating_delta_rule_update_kernel[grid](
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            o=o,
+            h0_source=initial_state_source,
+            h0_indices=initial_state_indices,
+            stride_h0_source=(
+                initial_state_source.stride(0)
+                if initial_state_source is not None
+                else 0
+            ),
+            cu_seqlens=cu_seqlens,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_stride_steps,
+            retrieve_parent_token_ptr=retrieve_parent_token,
+            stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
+            stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+            scale=scale,
+            T=T,
+            stride_a=stride_a,
+            stride_q=stride_q,
+            stride_k=stride_k,
+            stride_v=stride_v,
+            stride_b=stride_b,
+            NP2_T=NP2_T,
+            B=B,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=BV,
+            USE_INITIAL_STATE=initial_state_source is not None,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            IS_VARLEN=cu_seqlens is not None,
+            IS_KDA=is_kda,
+            USE_LOWER_BOUND=lower_bound is not None,
+            DISABLE_STATE_UPDATE=disable_state_update,
+            CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+            HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
+            stride_rawv_slot=stride_rawv_slot,
+            stride_rawk_slot=stride_rawk_slot,
+            stride_g_slot=stride_g_slot,
+            stride_beta_slot=stride_beta_slot,
+            MAX_CACHE_LEN=max_cache_len,
+            CACHE_RING=cache_ring,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **pdl_kwargs,
+        )
     o = o.squeeze(0)
     return o

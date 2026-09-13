@@ -2110,8 +2110,8 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        # The ring is allocated per slot but is not part of mamba_cache_per_req;
-        # the solve must charge it too or num_slots is over-provisioned.
+        # The ring is allocated at (spec_state_size + 1) slots (not per mamba slot),
+        # so it is a FIXED cost charged once, not per-slot in the solve.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
@@ -2214,11 +2214,21 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                per_slot = per_req + replayssm_ring_per_req
+                # Ring is a fixed cost at (spec_state_size + 1) slots, not
+                # per-slot, because the ring is indexed by verify batch
+                # position (0..spec_state_size), not mamba slot ID.
+                if replayssm_active:
+                    spec_ss = (
+                        get_schedule().max_running_requests // self.ps.attn_dp_size
+                    )
+                    ring_fixed = replayssm_ring_per_req * (spec_ss + 1)
+                else:
+                    ring_fixed = 0
+                per_slot = per_req
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_slot) // per_slot
+                        (mamba_budget_bytes - per_slot - ring_fixed) // per_slot
                     ),
                 )
 
@@ -2239,13 +2249,16 @@ class KVCacheConfigurator:
             )
 
         # +1: the pool's padding slot is allocated alongside the request slots.
-        # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
-        # the ring is not allocated).
+        # ReplaySSM ring is a fixed cost at (spec_state_size + 1) slots, not
+        # per mamba slot (ring is indexed by verify batch position).
+        if replayssm_active:
+            spec_ss = get_schedule().max_running_requests // self.ps.attn_dp_size
+            ring_total = replayssm_ring_per_req * (spec_ss + 1)
+        else:
+            ring_total = 0
         mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1)
-            * (stage_per_req + replayssm_ring_per_req)
-            / (1 << 30)
-        )
+            (get_schedule().max_mamba_cache_size + 1) * stage_per_req + ring_total
+        ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
 
