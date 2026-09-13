@@ -196,7 +196,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4PagedHostPool(
                         pool_name="test",
@@ -229,7 +229,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4StateHostPool(
                         pool_name="test",

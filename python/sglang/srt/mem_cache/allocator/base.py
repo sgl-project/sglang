@@ -76,10 +76,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         evict_from_tree_cache(tree_cache, num_tokens)
 
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
         """Whether the next decode step's ``num_tokens`` allocation fits after
         evicting reclaimable cache. The retract loop converges on this same
-        check, so a shortfall here retracts instead of failing in alloc."""
+        check, so a shortfall here retracts instead of failing in alloc.
+        ``requests`` and ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
