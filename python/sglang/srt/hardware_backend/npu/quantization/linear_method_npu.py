@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -256,22 +256,33 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
+        if isinstance(x, tuple):
+            # MLAProlog supplies a [tokens, hidden] quantized query norm.
+            qx, input_scale = x
+            input_shape = qx.shape
+            if input_scale.dtype == torch.uint8:
+                input_scale = input_scale.view(_get_float8_e8m0fnu_dtype())
+            input_scale = input_scale.reshape(
+                qx.shape[0], qx.shape[1] // (2 * MXFP8_BLOCK_SIZE), 2
+            ).contiguous()
             original_dtype = torch.bfloat16
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
 
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
+            # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
+            # Dynamic MXFP8 activation quantisation
+            qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back

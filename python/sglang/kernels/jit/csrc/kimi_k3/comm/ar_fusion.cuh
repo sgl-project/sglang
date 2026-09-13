@@ -78,7 +78,7 @@ struct FusionParams {
   // deferred finalize path); `input` is then output-only ([T, kNormDim])
   const uint8_t* fin_gemm2;    // [P, kNormDim] bf16, permuted rows
   const uint8_t* fin_idx;      // [T * kFinTopK] int32, -1 = dropped slot
-  const uint8_t* fin_weights;  // [T, kFinTopK] bf16
+  const uint8_t* fin_weights;  // [T, kFinTopK] bf16 or fp32
 };
 
 // The *_norm variants view the input as rows of the K3 latent width (3584
@@ -161,13 +161,16 @@ constexpr uint32_t kFinTopK = 16;
 // One 16B vector of the deferred MoE finalize (latent width fixed to kNormDim):
 //   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
 // All 16 gathers issue before the FMA chain; threads of the same token
-// broadcast-load the same routing rows.
+// broadcast-load the same routing rows. `W` is the routing-weight dtype
+// (bf16 or fp32; see finalize_push_norm).
+template <typename W>
 SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& params, uint32_t vid) {
   using namespace device;
+  static_assert(std::is_same_v<W, bf16_t> || std::is_same_v<W, fp32_t>, "unsupported routing-weight dtype");
   constexpr uint32_t kIdxVecSize = kMaxVecBytes / sizeof(int32_t);
-  constexpr uint32_t kWVecSize = kMaxVecBytes / sizeof(bf16_t);
+  constexpr uint32_t kWVecSize = kMaxVecBytes / sizeof(W);
   constexpr uint32_t kIdxVecs = kFinTopK / kIdxVecSize;  // 2 on SM100+
-  constexpr uint32_t kWVecs = kFinTopK / kWVecSize;      // 1 on SM100+
+  constexpr uint32_t kWVecs = kFinTopK / kWVecSize;      // 1 (bf16) / 2 (fp32) on SM100+
 
   const uint32_t token = vid / kNormRowVecs;
   const uint32_t hvec = vid % kNormRowVecs;
@@ -177,7 +180,7 @@ SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& p
   for (uint32_t j = 0; j < kIdxVecs; ++j) {
     idx[j].load(params.fin_idx, token * kIdxVecs + j);
   }
-  AlignedVector<bf16_t, kWVecSize> weight[kWVecs];
+  AlignedVector<W, kWVecSize> weight[kWVecs];
 #pragma unroll
   for (uint32_t j = 0; j < kWVecs; ++j) {
     weight[j].load(params.fin_weights, token * kWVecs + j);
@@ -197,7 +200,7 @@ SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& p
   for (uint32_t k = 0; k < kFinTopK; ++k) {
     const int32_t row = idx[k / kIdxVecSize][k % kIdxVecSize];
     if (row < 0) continue;
-    const bf16_t w_k = weight[k / kWVecSize][k % kWVecSize];
+    const W w_k = weight[k / kWVecSize][k % kWVecSize];
 #pragma unroll
     for (uint32_t i = 0; i < 8; ++i) {
       acc[i] = device::math::fma_f32_bf16(in[k][i], w_k, acc[i]);
@@ -234,15 +237,17 @@ SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::Align
   return sum_eq;
 }
 
-// kFinalize: stage 1 computes the deferred MoE finalize per vector instead of
-// reading a staged input tensor; `input` is then output-only. The host sets
-// num_norm_rows to the full row count (every reduced row is normed).
-template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL, bool kFinalize = false>
+// FinWeight != void selects the finalize variant: stage 1 computes the
+// deferred MoE finalize per vector (with FinWeight-typed routing weights)
+// instead of reading a staged input tensor; `input` is then output-only. The
+// host sets num_norm_rows to the full row count (every reduced row is normed).
+template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL, typename FinWeight = void>
 __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClusterSize, 1, 1)  //
     void all_reduce_push_norm_cluster_kernel(const __grid_constant__ FusionParams params) {
   namespace cg = cooperative_groups;
   using namespace device;
   using vec_t = AlignedVector<bf16x2_t, 4>;
+  constexpr bool kFinalize = !std::is_void_v<FinWeight>;
   constexpr uint32_t kBlockSize = kNormRowVecs / kClusterSize;
   constexpr uint32_t kNumWarps = kBlockSize / kWarpThreads;
 
@@ -289,7 +294,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec;
     if constexpr (kFinalize) {
-      vec = finalize_vec(params, vid);
+      vec = finalize_vec<FinWeight>(params, vid);
     } else {
       ptx::ld_global_16B(vec, params.input, vid);
     }
@@ -796,7 +801,9 @@ struct AllReduceFusionKernel {
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(gemm2_out);
-    TensorMatcher({T, K}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(expert_weights);
+    // trtllm-gen returns the routing weights at the dtype the routing form
+    // carries -- fp32 for unpacked, bf16 for packed -- consumed as given
+    TensorMatcher({T, K}).with_dtype<fp32_t, bf16_t>().with_device<kDLCUDA>(device).verify(expert_weights);
     TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
     CHECK_HOST(K.unwrap() == kFinTopK) << "finalize_push_norm is specialized for top_k = " << kFinTopK;
 
@@ -805,13 +812,18 @@ struct AllReduceFusionKernel {
     params.fin_gemm2 = static_cast<const uint8_t*>(gemm2_out.data_ptr());
     params.fin_idx = static_cast<const uint8_t*>(permuted_idx.data_ptr());
     params.fin_weights = static_cast<const uint8_t*>(expert_weights.data_ptr());
+    // stage 1 reads the routing row with one aligned vector load per kMaxVecBytes
+    CHECK_HOST(reinterpret_cast<uintptr_t>(params.fin_weights) % device::kMaxVecBytes == 0)
+        << "expert_weights must be " << device::kMaxVecBytes << "B aligned";
 
     constexpr uint32_t kMaxClusters = 96;
     const auto num_row_clusters = std::max<uint32_t>(std::min(num_tokens, kMaxClusters), 1);
     CHECK_HOST(num_row_clusters < push.num_blocks);
+    const auto kernel = is_type<fp32_t>(expert_weights.dtype())
+                            ? all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, fp32_t>
+                            : all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, bf16_t>;
     host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, out.device())
-        .enable_pdl(kUsePDL)(
-            all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, /*kFinalize=*/true>, params);
+        .enable_pdl(kUsePDL)(kernel, params);
   }
 
   /// Low-SM NVLS pull (+ optional residual): in-place reduce-scatter +

@@ -832,7 +832,15 @@ class TestDonorLifecycle(CustomTestCase):
             "donor must be handed to the provider before any pool frees",
         )
         donor_node = cache._node_registry[captured["donor_last_node_id"]]
-        self.assertEqual(list(donor_node.key.token_ids), [90, 91, 92])
+        # The exact cache splits a finished request's leaf at the prompt
+        # boundary so eviction can drop output KV alone; the donor stays
+        # addressable through its tree path, which is what the resolver walks.
+        path_tokens: list = []
+        node = donor_node
+        while node is not None and node is not cache.root_node:
+            path_tokens = list(node.key.token_ids) + path_tokens
+            node = node.parent
+        self.assertEqual(path_tokens, [90, 91, 92])
 
 
 class TestNodeRegistry(CustomTestCase):
