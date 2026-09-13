@@ -50,8 +50,14 @@ runs:
           // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
           // Lint check above still runs.
           let labels = [];
-          if (context.payload.pull_request?.labels) {
-            labels = context.payload.pull_request.labels.map(l => l.name);
+          if (context.payload.pull_request?.number) {
+            // reruns retain the original event payload, including stale labels
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            labels = pr.labels.map(l => l.name);
           } else {
             const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
               owner: context.repo.owner,
