@@ -545,9 +545,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--swa-sizing-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How to size the hybrid SWA pool. `auto` selects `ratio` when you explicitly set `--swa-full-tokens-ratio`; otherwise it selects a supported request-based budget or falls back to `ratio`. Generic paged request sizing requires full-attention layers, `--disable-radix-cache`, positive `--max-running-requests` per attention-DP worker, and positive `--chunked-prefill-size`. DSV4 paged SWA supports `ratio`; DSV4 unified ring supports `request`. An explicit unsupported policy raises an error.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>ratio</code>, <code>request</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--swa-full-tokens-ratio`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SWA tokens per full-attention token, independent of layer counts; valid range is (0, 1]. For example, 0.5 reserves 50 SWA tokens for every 100 full tokens. Explicitly setting this selects ratio sizing, including when you specify the default value. It cannot be combined with `--swa-sizing-policy=request` or the DSV4 unified ring layout. Leave it unset to allow automatic request sizing.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Model default, otherwise `0.8`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
         <tr>

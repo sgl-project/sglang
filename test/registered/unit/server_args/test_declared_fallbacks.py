@@ -28,6 +28,7 @@ would make `if cfg.swa_full_tokens_ratio is None` in `model_overrides/inkling.py
 never fire, and the family's 0.1 would be silently replaced by the generic 0.8.
 """
 
+import argparse
 import unittest
 
 from sglang.srt.arg_groups.overrides import (
@@ -108,6 +109,62 @@ class TestAPassDecidingStillSeesUnset(CustomTestCase):
         if cfg.swa_full_tokens_ratio is None:  # the family's exact shape
             declared["swa_full_tokens_ratio"] = 0.1
         self.assertEqual(declared, {"swa_full_tokens_ratio": 0.1})
+
+
+class TestSWASizingPolicy(CustomTestCase):
+    def test_cli_preserves_auto_and_explicit_ratio_intent(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for flags, expected in (
+            ([], "auto"),
+            (["--swa-sizing-policy", "request"], "request"),
+            (["--swa-sizing-policy", "ratio"], "ratio"),
+            (["--swa-full-tokens-ratio", "0.8"], "ratio"),
+        ):
+            with self.subTest(flags=flags):
+                parsed = parser.parse_args(["--model-path", "dummy", *flags])
+                server_args = ServerArgs.from_cli_args(parsed)
+                server_args.resolve_once()
+                self.assertEqual(
+                    resolution_result(server_args, "swa_sizing_policy"), expected
+                )
+
+    def test_model_ratio_default_does_not_select_ratio_policy(self):
+        server_args = _resolved()
+        declare_resolution(server_args, "a_model_family", swa_full_tokens_ratio=0.1)
+        self.assertEqual(resolution_result(server_args, "swa_sizing_policy"), "auto")
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.1)
+
+    def test_explicit_ratio_selects_ratio_even_when_equal_to_a_default(self):
+        for ratio in (0.1, 0.8, 0.5):
+            with self.subTest(ratio=ratio):
+                server_args = _resolved(swa_full_tokens_ratio=ratio)
+                self.assertEqual(server_args.swa_sizing_policy, "auto")
+                self.assertEqual(
+                    resolution_result(server_args, "swa_sizing_policy"), "ratio"
+                )
+
+    def test_explicit_policy_uses_default_ratio_without_losing_intent(self):
+        for policy in ("ratio", "request"):
+            with self.subTest(policy=policy):
+                server_args = _resolved(swa_sizing_policy=policy)
+                self.assertEqual(
+                    resolution_result(server_args, "swa_sizing_policy"), policy
+                )
+                self.assertIsNone(server_args.swa_full_tokens_ratio)
+
+    def test_conflicting_or_invalid_inputs_fail_before_dummy_short_circuit(self):
+        cases = (
+            {"swa_sizing_policy": "request", "swa_full_tokens_ratio": 0.8},
+            {"swa_sizing_policy": "cap"},
+            {"swa_full_tokens_ratio": 0},
+            {"swa_full_tokens_ratio": -0.1},
+            {"swa_full_tokens_ratio": 1.1},
+            {"swa_full_tokens_ratio": float("nan")},
+        )
+        for fields in cases:
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                _resolved(**fields)
 
 
 if __name__ == "__main__":
