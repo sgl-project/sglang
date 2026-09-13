@@ -80,7 +80,7 @@ impl PrefixCachePolicy {
                 depths
                     .iter()
                     .filter(|(kw, _)| kw.url == w.url)
-                    .map(|(_, &d)| d)
+                    .map(|(_, d)| d.blocks)
                     .max()
                     .map_or(NO_HOLDING, |d| d as f32 / total)
             })

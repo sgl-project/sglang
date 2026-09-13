@@ -27,6 +27,7 @@ use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Tokens produced at ingress for routing and optional engine forwarding.
@@ -42,6 +43,37 @@ pub struct RequestTokens {
 pub struct ExternalPrefixSignal {
     pub outcome: sgl_kv_indexer::PrefixOutcome,
     pub query_blocks: usize,
+    /// Locality facts only the in-process tree can answer. `None` on the
+    /// out-of-process indexer path, whose wire contract carries neither the
+    /// storage tier nor reverse-index presence — so the metrics that need
+    /// them report `unknown` instead of guessing.
+    pub tree_view: Option<TreePrefixView>,
+}
+
+/// Observability side-channel from [`prefix_provider::RadixTreePrefixProvider`],
+/// carried alongside the routing answer so the decision site does not have to
+/// go back to the tree for the tier of a prefix the provider has already
+/// walked.
+///
+/// Nothing in routing reads this: the tiers rank ownership for reporting only,
+/// and selection still treats any tier as ownership.
+pub struct TreePrefixView {
+    /// Cheapest tier each matching worker holds ITS OWN matched prefix on, in
+    /// [`kv_events::Tiers::SLOTS`] vocabulary, keyed by the worker address
+    /// `PrefixMatch::address` routes on. A worker absent from
+    /// `PrefixOutcome::Matched` is absent here too. Falls out of the same
+    /// descent that produced the match.
+    pub owner_tiers: HashMap<String, &'static str>,
+    /// Whether the request's FIRST queried block hash is carried anywhere in
+    /// the tree, reachable or not. Splits a zero-overlap selection into an
+    /// engine-side publish gap (`false`) and a router-side linkage fault
+    /// (`true`) — see [`kv_events::HashTree::contains_hash`].
+    ///
+    /// `None` unless the walk matched nobody, which is the only case worth
+    /// attributing. It is a SECOND read of the tree under its own lock, so it
+    /// is not atomic with `owner_tiers` and is not taken on the hit path at
+    /// all — on a match there is nothing here to explain.
+    pub block0_in_tree: Option<bool>,
 }
 
 /// Tokenizes a request for routing. Chat-encoder tokens are engine-equivalent;
@@ -879,6 +911,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -922,6 +955,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -971,6 +1005,7 @@ mod tests {
                 best_prefix_blocks: workers.len() as u32,
             },
             query_blocks: 64,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1027,6 +1062,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 4,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1078,6 +1114,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 8,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1117,6 +1154,7 @@ mod tests {
                 best_prefix_blocks: 3,
             },
             query_blocks: 8,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1148,6 +1186,7 @@ mod tests {
                 best_prefix_blocks: 2,
             },
             query_blocks: 4_125,
+            tree_view: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)
