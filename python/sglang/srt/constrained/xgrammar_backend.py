@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -26,6 +27,7 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
+    apply_token_bitmask_inplace,
     bitmask_dtype,
     get_bitmask_shape,
 )
@@ -56,6 +58,26 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+
+@lru_cache(maxsize=None)
+def _warn_fallback_once(device_type: str) -> None:
+    logger.warning(
+        "No fused token-bitmask kernel is registered for device '%s'; guided "
+        "decoding falls back to xgrammar's device-agnostic kernel. Results are "
+        "correct, but slower than the fused CUDA/NPU path.",
+        device_type,
+    )
+
+
+def _apply_vocab_mask_fallback(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    """Apply the packed bitmask on devices that have no fused kernel.
+
+    xgrammar's own dispatcher picks a pure-torch implementation, so this works
+    on any PyTorch backend (cpu, tpu, ...) instead of hard-failing.
+    """
+    _warn_fallback_once(logits.device.type)
+    apply_token_bitmask_inplace(logits, vocab_mask)
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -139,7 +161,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
             apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+            _apply_vocab_mask_fallback(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -261,7 +283,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+            _apply_vocab_mask_fallback(logits, vocab_mask)
 
     @staticmethod
     def set_token_filter(
