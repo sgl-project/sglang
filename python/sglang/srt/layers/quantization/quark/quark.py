@@ -816,6 +816,14 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
+            if layer_name.startswith("model."):
+                layer_name_alias = "model.language_model." + layer_name.removeprefix(
+                    "model."
+                )
+                for name_pattern in layer_quant_config:
+                    if fnmatch.fnmatch(layer_name_alias, name_pattern):
+                        return layer_quant_config[name_pattern]
+
             layer_type = type(module).__name__
             layer_type_quant_config = cast(
                 dict[str, Any], self.quant_config.get("layer_type_quant_config")

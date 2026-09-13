@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
 )
 from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark.schemes import (
     quark_w4a4_mxfp4_moe as quark_moe,
 )
@@ -40,6 +41,34 @@ class _CapturingRunner:
 
 
 class TestGLM53FlashQuarkMoE(CustomTestCase):
+    def test_flash_layer_config_matches_runtime_prefix_without_language_model(self):
+        config = object.__new__(QuarkConfig)
+        fp8_config = {"weight": {"dtype": "fp8"}}
+        global_mxfp4_config = {"weight": {"dtype": "fp4"}}
+        config.quant_config = {
+            "layer_quant_config": {
+                "model.language_model.layers.0.mlp.down_proj": fp8_config,
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": global_mxfp4_config,
+        }
+        config.packed_modules_mapping = {}
+
+        matched = config._find_matched_config(
+            "model.layers.0.mlp.down_proj", SimpleNamespace()
+        )
+
+        self.assertIs(matched, fp8_config)
+
+        direct_config = {"weight": {"dtype": "bf16"}}
+        config.quant_config["layer_quant_config"]["model.layers.0.mlp.down_proj"] = (
+            direct_config
+        )
+        matched = config._find_matched_config(
+            "model.layers.0.mlp.down_proj", SimpleNamespace()
+        )
+        self.assertIs(matched, direct_config)
+
     def test_block_fp8_forwards_separated_layout_and_clamp(self):
         method = object.__new__(Fp8MoEMethod)
         method.block_quant = True
