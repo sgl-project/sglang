@@ -165,15 +165,21 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
+        update_errors: list[Exception] = []
 
         def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+            try:
+                self._device_module.set_device(self._device_id)
+                graph.update(cpu_update_input=cpu_update_input)
+            except Exception as e:
+                update_errors.append(e)
 
         thread = threading.Thread(target=_update)
         thread.start()
         graph.replay()
         thread.join()
+        if update_errors:
+            raise update_errors[0]
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
