@@ -1,6 +1,6 @@
 ---
 title: Hy3
-description: "Deploy Tencent Hy3 with SGLang — verified launch commands and tuning for the BF16 Mixture-of-Experts model with hybrid thinking, native tool calling, 256K context, and MTP speculative decoding."
+description: "Deploy Tencent Hy3 with SGLang on NVIDIA GPUs and Ascend A3, with launch commands, local model weights, hybrid thinking, tool calling, and evaluation instructions."
 ---
 
 ## Deployment
@@ -9,11 +9,11 @@ description: "Deploy Tencent Hy3 with SGLang — verified launch commands and tu
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install). The tabs below cover NVIDIA installation and Ascend A3 setup for the **Python / Docker** toggle in the command panel.
 
 <Tabs>
 
-<Tab title="Python (pip / uv)">
+<Tab title="NVIDIA Python (pip / uv)">
 
 ```bash
 pip install -U uv
@@ -31,18 +31,42 @@ Run the **Python** output of the command panel below in that environment.
 
 </Tab>
 
-<Tab title="Docker">
+<Tab title="NVIDIA Docker">
 
 ```bash Command
 # The image bundles the HYV3 model code and the suffix-aware `hunyuan` parser.
 docker pull lmsysorg/sglang:dev
 ```
 
-For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator below produces.
+For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator below produces.
 
 <Note>
 The `dev` image bundles the HYV3 model code, the suffix-aware `hunyuan` reasoning/tool-call parsers, and the MTP draft-module runtime. The same parsers serve both the preview (suffix-less) and the shipping (suffixed) Hy3 tokenizer — no per-model hard-coding.
 </Note>
+
+</Tab>
+
+<Tab title="Ascend A3">
+
+Use a Linux Atlas 800I A3 server with an installed Ascend driver and firmware. Follow the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for the CANN, TorchNPU, and SGLang component versions.
+
+For Docker, pull the image used by the Ascend Hy3 deployment tutorial:
+
+```bash
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+```
+
+The **Docker** command below exposes all 16 logical devices, mounts the driver and local model directory, uses host networking and shared memory, and initializes the CANN and Ascend Transformer Boost environments. Check that the host provides at least 64 GiB of shared memory for the 16-device deployment.
+
+For the **Python** command, open a shell in the same official image and initialize the runtime:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+npu-smi info
+```
+
+Adjust the installation paths to your environment. Confirm that all 16 logical devices are available before starting the server.
 
 </Tab>
 
@@ -67,10 +91,22 @@ import { benchmarks } from "/src/snippets/configs/tencent/hy3-benchmarks.jsx";
     <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from the <a href="#install">Install SGLang</a> panel above.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
-    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
-    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>MODEL_PATH</code>, <code>DATASET_PATH</code>, <code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) used by the deployment, playground, cURL, and benchmark commands. <code>DATASET_PATH</code> supplies the ShareGPT file for performance evaluation. Values persist in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — shows whether the <code>(hw, variant, quant, strategy, nodes)</code> combination has completed verification on real hardware.</li>
   </ul>
 </div>
+
+### Ascend setup
+
+The A3 recipe runs prefill and decode in the same serving deployment on one Atlas 800I A3 server. Its 8 physical cards expose 16 logical devices, each with 64 GB of device memory. The recipe uses BF16 weights and tensor parallelism across all 16 devices (`--tp-size 16`). See the [Ascend Hy3 deployment reference](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3) for the hardware layout and runtime settings.
+
+1. Download the complete [Hy3 BF16 model](https://www.modelscope.cn/models/Tencent-Hunyuan/Hy3), including the weight shards, configuration, and tokenizer files, into one local directory. Reserve space for the approximately 597.60 GB model and at least 30 GB for the container image.
+2. Select **A3**, **BF16**, **Balanced**, and **Single Node** in the deployment panel.
+3. Open **Env** and set `MODEL_PATH` to the absolute model directory, for example `/models/Hy3`. The Docker command mounts this directory read-only at the same path inside the container. Every tensor-parallel worker loads its assigned weights from that directory.
+4. Choose **Python** or **Docker**, copy the generated command, and run it in the prepared environment. The API model name is `tencent/Hy3`, set by `--served-model-name`.
+5. Wait for the server to report that it is ready, then use **cURL** in the panel to send the example request. Expect an HTTP 200 response whose `choices[0].message.content` identifies Paris as the capital of France.
+
+The A3 recipe uses the Ascend attention backend, tensor parallelism across 16 devices, and multi-token prediction with two speculative steps and three draft tokens. See [Benchmark](#4-benchmark) for the tested environment and results.
 
 ## Playground
 
@@ -140,18 +176,24 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**Hardware requirements (BF16, ~590GB weights):**
+**Hardware requirements (BF16, approximately 597.60 GB weights):**
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
     <tr style={{borderBottom: "2px solid #0052d9"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GPU</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>VRAM</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Device memory</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>TP</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Notes</th>
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>64 GB per logical device</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 physical cards, 16 logical devices, single node</td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>141GB</td>
@@ -183,8 +225,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **MTP (Multi-Token Prediction, EAGLE).**
 
-- `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
-- `balanced`: MTP disabled — keep the prefill batch moderate so chunked-prefill stays efficient.
+- NVIDIA `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
+- NVIDIA `balanced`: MTP disabled — keep the prefill batch moderate so chunked-prefill stays efficient.
+- Ascend A3 `balanced`: steps=2, draft-tokens=3, top-k=1.
 
 **`reasoning_effort` vs `thinking`.** The Hy3 chat template is driven by `reasoning_effort` (`high` / `low` / `no_think`), NOT by the `thinking` flag that some other families use. The default is `no_think` (instant). To opt into thinking, pass `reasoning_effort="high"` on the request (the OpenAI-standard field; sglang forwards it to the template). `reasoning_effort: max` is rejected by sglang — use `high`. For eval, sgl-eval's `--thinking` flag translates to `reasoning_effort="high"` for Hy3, so the benchmark commands below use it as-is.
 
@@ -264,6 +307,45 @@ print("Content:", response.choices[0].message.content)
 ```text Output
 Content: Relativity is Einstein's theory that space, time, mass, and gravity are interconnected and relative, not fixed, fundamentally changing our understanding of the universe.
 ```
+
+</Accordion>
+
+<Accordion title="Ascend A3: thinking mode">
+
+Use the A3 deployment above and set `chat_template_kwargs.reasoning_effort` to `high`. The `auto` reasoning parser returns reasoning in `reasoning_content` and the final answer in `content`.
+
+```bash
+pip install requests
+```
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "tencent/Hy3",
+        "messages": [{
+            "role": "user",
+            "content": "Choose two distinct integers uniformly at random from 1 to 100. What is the probability that their product is divisible by 6? Show the derivation and give the answer as a reduced fraction.",
+        }],
+        "temperature": 0,
+        "max_tokens": 16384,
+        "chat_template_kwargs": {"reasoning_effort": "high"},
+    },
+    timeout=600,
+)
+response.raise_for_status()
+message = response.json()["choices"][0]["message"]
+print(message["reasoning_content"])
+print(message["content"])
+```
+
+The probability is:
+
+$$
+\frac{2042}{4950}=\frac{1021}{2475}.
+$$
 
 </Accordion>
 
@@ -367,3 +449,101 @@ Tool[0] get_weather({"city": "Beijing", "unit": "fahrenheit"})
 ```
 
 </Accordion>
+
+
+## 4. Benchmark
+
+### Ascend A3
+
+The following results use the A3 BF16, Balanced, Single Node recipe.
+
+| Component | Version or configuration |
+| --- | --- |
+| Hardware | 1 Atlas 800I A3, 16 logical NPUs, 96 CPU cores, 1,024 GiB RAM |
+| Model | Hy3 BF16, tensor parallelism 16, EAGLE |
+| Image | `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16` |
+| SGLang | `0.5.17.dev386+gc5bd3d7dc` (`c5bd3d7dce`), bundled source |
+| CANN / PyTorch / TorchNPU | 9.0.0 / 2.10.0+cpu / 2.10.0 |
+| sgl-kernel-npu / Transformers | 2026.6.1 / 5.12.1 |
+| Ascend driver (`npu-smi`) | 25.5.2 |
+| Reasoning mode | `no_think` |
+
+#### GSM8K accuracy
+
+Use EvalScope 1.11.1 to evaluate all 1,319 test questions with one fixed training example, temperature 0, and seed 42. Set the API host and port to your server.
+
+```bash
+pip install evalscope==1.11.1
+evalscope eval \
+  --model tencent/Hy3 \
+  --api-url http://127.0.0.1:30000/v1 \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets gsm8k \
+  --dataset-args '{"gsm8k":{"few_shot_num":1,"few_shot_random":false}}' \
+  --generation-config '{"temperature":0,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \
+  --eval-batch-size 16 --seed 42 --timeout 600
+```
+
+| Test questions | Correct answers | Accuracy |
+| ---: | ---: | ---: |
+| 1,319 | 1,274 | 96.59% |
+
+#### ShareGPT performance
+
+Use the [ShareGPT conversation dataset](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered). The run uses 128 requests, concurrency 16, four warmup requests, seed 42, and temperature 0. Output lengths come from the dataset responses, with `ignore_eos=true`.
+
+On your Linux evaluation machine, create a separate CPU client container. Set `MODEL_PATH` to the local Hy3 model directory and `DATASET_PATH` to the local ShareGPT JSON file. The container mounts these at the same paths and saves results in `hy3-benchmark` under your current directory.
+
+```bash
+MODEL_PATH=/models/Hy3
+DATASET_PATH=/datasets/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json
+mkdir -p hy3-benchmark
+
+docker run --rm -it --network host \
+  -e SGLANG_USE_CPU_ENGINE=1 \
+  -e MODEL_PATH="$MODEL_PATH" -e DATASET_PATH="$DATASET_PATH" \
+  -v "$MODEL_PATH:$MODEL_PATH:ro" \
+  -v "$DATASET_PATH:$DATASET_PATH:ro" \
+  -v "$PWD/hy3-benchmark:/results" -w /results \
+  --entrypoint bash \
+  quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+```
+
+Prepare the CPU dependencies inside this client container:
+
+```bash
+python3 -m pip uninstall -y torch-npu triton-ascend
+python3 -m pip install --force-reinstall --no-deps triton==3.5.0
+```
+
+Run the benchmark in the client container. Set `--host` and `--port` to your server; `--served-model-name` matches the deployment command.
+
+```bash
+export SGLANG_USE_CPU_ENGINE=1
+
+python3 -m sglang.benchmark.serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 --port 30000 \
+  --model "$MODEL_PATH" --served-model-name tencent/Hy3 \
+  --tokenizer "$MODEL_PATH" \
+  --dataset-name sharegpt --dataset-path "$DATASET_PATH" \
+  --num-prompts 128 --max-concurrency 16 \
+  --seed 42 --warmup-requests 4 --flush-cache \
+  --extra-request-body '{"chat_template_kwargs":{"reasoning_effort":"no_think"}}' \
+  --output-file hy3-a3-sharegpt.jsonl
+```
+
+| Measurement | Result |
+| --- | ---: |
+| Successful / failed requests | 128 / 0 |
+| Measured duration | 149.87 s |
+| Input / output tokens | 43,318 / 29,644 |
+| Output throughput | 197.80 tokens/s |
+| Input + output throughput | 486.83 tokens/s |
+| Request throughput | 0.8541 requests/s |
+| Time to first token, median / P99 | 638.46 / 6,902.88 ms |
+| Time per output token, median / P99 | 59.67 / 188.72 ms |
+| End-to-end latency, median / P99 | 12,080.34 / 64,488.16 ms |
+
+The panel's throughput per logical NPU is the total input-plus-output throughput divided by 16. See [Ascend accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) and [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) for evaluation tool details.
