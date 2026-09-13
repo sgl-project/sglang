@@ -29,7 +29,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.schedule_policy import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -41,6 +40,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,

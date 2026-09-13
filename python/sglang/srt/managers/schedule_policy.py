@@ -48,13 +48,10 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import (
-    PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
-    is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
-    supports_swa_byte_budget,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -78,37 +75,6 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
-
-
-def estimate_swa_kv_tokens(
-    extend_input_len: int,
-    max_new_tokens: int,
-    *,
-    sliding_window_size: Optional[int],
-    page_size: int,
-    allocation_limit: Optional[int] = None,
-    host_hit_length: int = 0,
-) -> int:
-    """Peak SWA reservation for one prefill/decode request."""
-    if sliding_window_size is None or sliding_window_size <= 0:
-        reserved = extend_input_len + max_new_tokens + page_size
-    else:
-        allocated = (
-            extend_input_len
-            if allocation_limit is None
-            else min(extend_input_len, allocation_limit)
-        )
-        allocated_tail = max(allocated - sliding_window_size, 0)
-        # A full window would double-charge short cached-prefix resumes;
-        # including extend keeps the reservation above the prefill allocation.
-        reserved = (
-            allocated_tail
-            + min(extend_input_len + max_new_tokens, sliding_window_size)
-            + page_size
-        )
-    if host_hit_length > 0:
-        reserved += -(-host_hit_length // page_size) * page_size
-    return reserved
 
 
 # Threshold for in-batch prefix cache.
@@ -591,8 +557,6 @@ class PrefillAdder:
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        # Per-request SWA ring: one fixed slot per request, not a token budget.
-        self._swa_req_ring = is_swa_req_ring(token_to_kv_pool_allocator)
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -604,8 +568,9 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
-        self.rem_total_token_offset = num_mixed_decode_tokens
-        self.cur_rem_token_offset = num_mixed_decode_tokens
+        self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
+            tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
 
         self.req_states = None
         self.can_run_list = []
@@ -621,7 +586,7 @@ class PrefillAdder:
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
-            self.rem_total_token_offset += sum(
+            self.memory_budget.total_offset += sum(
                 [
                     self._get_running_request_total_token_offset(r)
                     for r in running_batch.reqs
@@ -634,16 +599,7 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator,
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
-        self.is_all_swa = isinstance(
-            self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
-        )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
-        self.is_unified_swa = supports_swa_byte_budget(self.token_to_kv_pool_allocator)
-
-        self.rem_swa_token_offset = (
-            num_mixed_decode_tokens if self.is_unified_swa else 0
-        )
-
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
         # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
@@ -730,95 +686,11 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-        return available_and_evictable - self.rem_total_token_offset
-
-    @property
-    def rem_swa_tokens(self):
-        allocator = self.token_to_kv_pool_allocator
-        if self._swa_req_ring:
-            # swa_available_size() already reports ring capacity; tree
-            # swa_evictable is in linear token units and frees no ring space.
-            return allocator.swa_available_size() - self.rem_swa_token_offset
-        return (
-            allocator.swa_available_size()
-            + self.tree_cache.swa_evictable_size()
-            - self.rem_swa_token_offset
-        )
+        return self.memory_budget.remaining_total
 
     @property
     def cur_rem_tokens(self):
-        if self.is_all_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        elif self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-
-        return available_and_evictable - self.cur_rem_token_offset
-
-    def _swa_budget_for_req(
-        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
-    ) -> int:
-        """SWA pool budget per request. Only valid when is_hybrid_swa is True.
-
-        With chunked prefill + overlap scheduler, the peak SWA occupancy is:
-          chunk N (running, not yet in tree) + sliding window (locked in tree)
-          + chunk N+1 (new allocation)
-        Since chunk N and locked tokens are already excluded from
-        swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation plus decode headroom:
-
-          budget = max(alloc - window, 0) + min(extend + max_new_tokens, window) + page
-
-        where alloc = min(extend, rem_chunk); the min() cap keeps the two terms
-        from double-counting extend, so budget <= extend + max_new_tokens + page.
-        """
-        allocator = self.token_to_kv_pool_allocator
-        if self._swa_req_ring:
-            # One ring slot per request, in the same unit as swa_available_size.
-            return allocator.swa_ring_cost_tokens
-        return estimate_swa_kv_tokens(
-            extend_input_len,
-            max_new_tokens,
-            sliding_window_size=self.tree_cache.sliding_window_size,
-            page_size=self.page_size,
-            allocation_limit=self.rem_chunk_tokens,
-            host_hit_length=swa_host_hit_length,
-        )
+        return self.memory_budget.remaining_current
 
     def _swa_new_tokens(self, req: Req) -> int:
         """Tokens a request may still decode, for SWA headroom sizing. Mirrors
@@ -830,150 +702,17 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
 
-    def _unified_swa_reservation_fits(
-        self,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        empty_pool: bool = False,
-    ) -> bool:
-        allocator = self.token_to_kv_pool_allocator
-        if empty_pool:
-            full_evictable_tokens = 0
-            swa_evictable_tokens = 0
-        else:
-            full_tokens += self.rem_total_token_offset
-            swa_tokens += self.rem_swa_token_offset
-            full_evictable_tokens = self.tree_cache.full_evictable_size()
-            swa_evictable_tokens = self.tree_cache.swa_evictable_size()
-        return allocator.can_reserve(
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable_tokens,
-            swa_evictable_tokens=swa_evictable_tokens,
-            empty_pool=empty_pool,
-            require_token_slack=empty_pool,
-        )
-
-    def _unified_swa_chunk_cap(
-        self,
-        max_new_tokens: int,
-        swa_host_hit_length: int = 0,
-        *,
-        max_chunk_tokens: int,
-    ) -> int:
-        """Largest page-aligned chunk that fits the joint FULL/SWA byte budget."""
-        cap = max_chunk_tokens // self.page_size * self.page_size
-        lo, hi = 0, cap // self.page_size
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            chunk_tokens = mid * self.page_size
-            full_tokens = self.ceil_paged_tokens(chunk_tokens) + self.page_size
-            swa_tokens = self._swa_budget_for_req(
-                chunk_tokens, max_new_tokens, swa_host_hit_length
-            )
-            if self._unified_swa_reservation_fits(full_tokens, swa_tokens):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo * self.page_size
-
-    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
-        """Largest chunk fitting the fixed SWA partition after decode headroom."""
-        # Only the sliding window stays locked across chunks, so the next
-        # chunk can reuse the transient space outside its decode headroom.
-        cap = int(self.rem_swa_tokens) - estimate_swa_kv_tokens(
-            0,
-            max_new_tokens,
-            sliding_window_size=self.tree_cache.sliding_window_size,
-            page_size=self.page_size,
-            host_hit_length=swa_host_hit_length,
-        )
-        return max(0, cap // self.page_size * self.page_size)
-
-    def _swa_req_never_fits(
-        self,
-        extend_input_len: int,
-        max_new_tokens: int,
-        swa_host_hit_length: int = 0,
-    ) -> bool:
-        """True when a request's SWA budget exceeds the *entire* SWA pool, so it
-        can never be admitted whole no matter how far the pool drains.
-
-        This is the head-of-line livelock the _swa_chunk_cap escape hatch exists
-        for; the hatch must fire only in this case. A request that merely
-        exceeds *current* rem_swa (transient pressure) would fit once running
-        decodes free their windows, so it must wait — admitting it into the
-        decode headroom collapses the SWA evictable cushion and forces running
-        requests to retract (observed as a severe retraction/re-prefill storm on
-        hybrid-SWA models at high concurrency)."""
-        swa_tokens = self._swa_budget_for_req(
-            extend_input_len, max_new_tokens, swa_host_hit_length
-        )
-        if self._swa_req_ring:
-            return swa_tokens > self.token_to_kv_pool_allocator.size_swa
-        return swa_tokens >= self.token_to_kv_pool_allocator.size_swa
-
-    def _check_swa_admission(
-        self,
-        req: Req,
-        *,
-        extend_input_len: int,
-        total_tokens: int,
-    ) -> tuple[bool, Optional[int]]:
-        if not self.is_unified_swa:
-            extend_input_len = self.ceil_paged_tokens(extend_input_len)
-        max_new_tokens = self._swa_new_tokens(req)
-        swa_needed = self._swa_budget_for_req(
-            extend_input_len,
-            max_new_tokens,
-            swa_host_hit_length=req.swa_host_hit_length,
-        )
-        swa_cap = 0
-        # Only permanent shortfalls may shrink a chunk; transient pressure waits.
-        if self.is_unified_swa:
-            fits = self._unified_swa_reservation_fits(total_tokens, swa_needed)
-            if not fits:
-                full_input_tokens = len(req.full_untruncated_fill_ids)
-                if not self._unified_swa_reservation_fits(
-                    full_input_tokens + max_new_tokens + self.page_size,
-                    self._swa_budget_for_req(full_input_tokens, max_new_tokens),
-                    empty_pool=True,
-                ):
-                    swa_cap = self._unified_swa_chunk_cap(
-                        0,
-                        req.swa_host_hit_length,
-                        max_chunk_tokens=min(
-                            self.rem_chunk_tokens or 0, max(0, extend_input_len - 1)
-                        ),
-                    )
-        else:
-            # Ring-slot capacity is exact; the fixed token partition keeps slack.
-            fits = (
-                swa_needed <= self.rem_swa_tokens
-                if self._swa_req_ring
-                else swa_needed < self.rem_swa_tokens
-            )
-            if not fits and self._swa_req_never_fits(
-                extend_input_len, max_new_tokens, req.swa_host_hit_length
-            ):
-                swa_cap = self._swa_chunk_cap(max_new_tokens, req.swa_host_hit_length)
-        if fits:
-            return True, self.rem_chunk_tokens
-        if self.rem_chunk_tokens is None or swa_cap <= 0:
-            return False, None
-        return True, min(self.rem_chunk_tokens, swa_cap)
-
     def _check_prefill_budget(
         self, req: Req, *, extend_input_len: int, total_tokens: int
     ) -> tuple[bool, Optional[int]]:
-        if not self.is_unified_swa and total_tokens >= self.rem_total_tokens:
-            return False, None
-        if self.is_hybrid_swa:
-            return self._check_swa_admission(
-                req, extend_input_len=extend_input_len, total_tokens=total_tokens
-            )
-        return True, self.rem_chunk_tokens
+        return self.memory_budget.check_prefill(
+            extend_input_len=extend_input_len,
+            total_tokens=total_tokens,
+            max_new_tokens=self._swa_new_tokens(req),
+            input_tokens=len(req.full_untruncated_fill_ids),
+            swa_host_hit_length=req.swa_host_hit_length,
+            chunk_limit=self.rem_chunk_tokens,
+        )
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
@@ -994,12 +733,7 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
-        if self.is_unified_swa:
-            no_token = not self._unified_swa_reservation_fits(0, 0)
-        else:
-            no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
-            if not no_token and self.is_hybrid_swa:
-                no_token = self.rem_swa_tokens <= 0
+        no_token = not self.memory_budget.has_capacity()
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
@@ -1032,31 +766,18 @@ class PrefillAdder:
         raw_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
-        # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
-        # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
-        # immediately (counts against `cur_rem`) and held for the request lifetime
-        # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
-        self.rem_total_token_offset += (
-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
-        )
-        self.cur_rem_token_offset += (
-            extend_input_len + page_overhead + mamba_gap_reserve
+        self.memory_budget.reserve(
+            extend_input_len,
+            max_new_tokens,
+            extra_tokens=mamba_gap_reserve,
+            chunk_limit=self.rem_chunk_tokens,
+            is_chunked_continuation=is_chunked_continuation,
         )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
             self.rem_mamba_slots -= 1
         self.rem_input_tokens -= extend_input_len
-
-        if self.is_hybrid_swa:
-            # The ring slot is reserved once at first admission; charging it
-            # again on a continuation would double-count and over-throttle.
-            if not (self._swa_req_ring and is_chunked_continuation):
-                self.rem_swa_token_offset += self._swa_budget_for_req(
-                    extend_input_len, max_new_tokens
-                )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -1182,44 +903,15 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def _unified_swa_chunk_limit(
-        self, req: Req, extend_input_len: int, max_chunk_tokens: int
-    ) -> Optional[int]:
-        candidate_tokens = min(extend_input_len, max_chunk_tokens)
-        candidate_finishes = candidate_tokens >= extend_input_len
-        max_new_tokens = self._swa_new_tokens(req) if candidate_finishes else 0
-        if self._unified_swa_reservation_fits(
-            self.ceil_paged_tokens(candidate_tokens) + max_new_tokens + self.page_size,
-            self._swa_budget_for_req(candidate_tokens, max_new_tokens),
-        ):
-            return max_chunk_tokens
-        max_partial = (
-            max(0, candidate_tokens - 1) if candidate_finishes else candidate_tokens
-        )
-        joint_cap = self._unified_swa_chunk_cap(0, max_chunk_tokens=max_partial)
-        if joint_cap <= 0:
-            return None
-        return min(max_chunk_tokens, joint_cap)
-
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            if self.is_unified_swa:
-                _rem_tokens = self.rem_chunk_tokens
-            else:
-                _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-                if self.is_hybrid_swa and not self._swa_req_ring:
-                    # alloc_extend needs one extra page; ring mode counts slots.
-                    _rem_tokens = min(
-                        _rem_tokens, int(self.rem_swa_tokens) - self.page_size
-                    )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
-            if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
-                    return req
-                _rem_tokens = self.rem_chunk_tokens
+            _rem_tokens = self.memory_budget.available_chunk_tokens(
+                self.rem_chunk_tokens
+            )
+            if _rem_tokens is None:
+                return req
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1235,12 +927,13 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        if self.is_unified_swa:
-            _rem_tokens = self._unified_swa_chunk_limit(
-                req, cand_extend_input_len, _rem_tokens
-            )
-            if _rem_tokens is None:
-                return req
+        _rem_tokens = self.memory_budget.fit_chunk(
+            extend_input_len=cand_extend_input_len,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=_rem_tokens,
+        )
+        if _rem_tokens is None:
+            return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1285,18 +978,12 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
-        if self.is_hybrid_swa:
-            max_new_tokens = self._swa_new_tokens(req)
-            swa_needed = self._swa_budget_for_req(cand_extend_input_len, max_new_tokens)
-        if self.is_unified_swa:
-            fits = self._unified_swa_reservation_fits(
-                paged_input + max_new_tokens + self.page_size,
-                swa_needed,
-            )
-        else:
-            fits = paged_input <= min(self.cur_rem_tokens, self.rem_total_tokens) and (
-                not self.is_hybrid_swa or swa_needed <= self.rem_swa_tokens
-            )
+        fits = self.memory_budget.can_allocate_prefill(
+            paged_input=paged_input,
+            extend_input_len=cand_extend_input_len,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=self.rem_chunk_tokens,
+        )
         if not fits:
             return AddReqResult.NO_TOKEN
 
@@ -1666,7 +1353,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
-                self.rem_total_token_offset -= (
+                self.memory_budget.total_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1

@@ -69,12 +69,44 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # The scheduler calls these unconditionally, with no allocator-type branches
     # on its side; byte-accounted composites override the token-count defaults.
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        return PrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        """Clip generation to the empty-pool budget; None means prompt cannot fit.
+
+        token_capacity is the scheduler's configured capacity, including its
+        distributed token scaling. Shared pools use their physical byte layout.
+        """
+        paged_input = -(-input_tokens // self.page_size) * self.page_size
+        return max(
+            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
+        )
+
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         """Evict unlocked prefix-cache entries until this allocator can serve
         ``num_tokens`` or nothing evictable remains."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        evict_from_tree_cache(tree_cache, num_tokens)
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        shortfall = num_tokens - self.available_size()
+        if shortfall > 0:
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(
         self,
