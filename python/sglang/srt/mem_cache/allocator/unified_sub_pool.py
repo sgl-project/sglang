@@ -320,9 +320,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A non-owner
         # consumes the owner's ids, so the two counts are unrelated.
+        assert virtual_num_pages is None or not is_id_owner, (
+            "only a non-owner allocator may use another pool's virtual-id space"
+        )
         self.num_virtual_ids = (
             self.num_pages if virtual_num_pages is None else virtual_num_pages
         )
+        assert self.num_virtual_ids > 0, "virtual page count must be positive"
         # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
         self.virtual_to_physical = torch.full(
             (self.num_virtual_ids + 1,),
@@ -529,6 +533,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
             f"min_page_index={self.min_page_index}, "
             f"num_pages={self.num_pages}, "
+            f"num_virtual_ids={self.num_virtual_ids}, "
             f"watermark_physical={self.watermark_physical}, "
             f"allocated_pages={self._allocated_pages()}"
         )

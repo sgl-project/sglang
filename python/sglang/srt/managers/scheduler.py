@@ -212,6 +212,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    estimate_swa_kv_tokens,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -279,6 +280,9 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    supports_swa_byte_budget,
+)
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -2519,27 +2523,67 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget:
-        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
-        req.sampling_params.max_new_tokens = max(
+        # Keep this bound consistent with PrefillAdder's admission budget.
+        max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
+            ),
+        )
+        if supports_swa_byte_budget(self.token_to_kv_pool_allocator):
+            max_new_tokens = self._clip_unified_swa_max_new_tokens(req, max_new_tokens)
+        else:
+            # Non-unified pools keep their fixed token partition.
+            paged_input_len = -(-input_len // self.page_size) * self.page_size
+            max_new_tokens = min(
+                max_new_tokens,
                 self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,
-            ),
-        )
+            )
+
+        req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
+
+    def _clip_unified_swa_max_new_tokens(self, req: Req, max_new_tokens: int) -> int:
+        input_len = len(req.origin_input_ids)
+
+        def fits_shared_pool(candidate: int) -> bool:
+            swa_tokens = estimate_swa_kv_tokens(
+                input_len,
+                candidate,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.page_size,
+                allocation_limit=self.chunked_prefill_size,
+            )
+            return self.token_to_kv_pool_allocator.can_reserve(
+                input_len + candidate + self.page_size,
+                swa_tokens,
+                empty_pool=True,
+                require_token_slack=True,
+            )
+
+        if not fits_shared_pool(0):
+            req.set_finish_with_abort(
+                "Request prompt exceeds the unified FULL/SWA KV byte budget: "
+                f"input_len={input_len}."
+            )
+            return 0
+        if fits_shared_pool(max_new_tokens):
+            return max_new_tokens
+        lo, hi = 0, max_new_tokens
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits_shared_pool(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def _process_and_broadcast_mm_inputs(
         self,

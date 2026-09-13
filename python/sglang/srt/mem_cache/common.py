@@ -161,12 +161,17 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            supports_swa_byte_budget,
+        )
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+        if supports_swa_byte_budget(allocator):
+            allocator.evict_to_free_tokens(tree_cache, num_tokens)
+            return
+
+        full_num_tokens = max(0, num_tokens - allocator.full_available_size())
+        swa_num_tokens = max(0, num_tokens - allocator.swa_available_size())
+        if full_num_tokens or swa_num_tokens:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
