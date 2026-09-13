@@ -500,6 +500,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_indexer_topk",
     "enable_encoder_swa_bounded_replay",
     "enable_decoder_swa_bounded_replay",
+    "sampling_mask_max_tokens",
     "disable_outlines_disk_cache",
     "enable_mis",
     "weight_cache_mode",

@@ -132,14 +132,14 @@ class TorchCandidateIndexer:
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             metadata.deep_gemm_metadata,
-            metadata.max_c4_seq_len,
+            metadata.max_compressed_seq_len,
         )
         logits, mask = two_level_decode_logits(
             logits,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             is_candidate_source=True,
             uses_candidates=False,
             topk_blocks=self.topk_blocks,
@@ -160,20 +160,20 @@ class TorchCandidateIndexer:
         page table with ``-1`` past the valid count (and as positions into
         ``raw_indices`` when given)."""
         metadata = inputs.metadata
-        page_size = metadata.c4_page_size
+        page_size = metadata.compressed_page_size
         assert isinstance(candidate_metadata, CandidateMasks)
         logits = fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             metadata.deep_gemm_metadata,
-            metadata.max_c4_seq_len,
+            metadata.max_compressed_seq_len,
         )
         logits, _ = two_level_decode_logits(
             logits,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             is_candidate_source=False,
             uses_candidates=True,
             topk_blocks=self.topk_blocks,

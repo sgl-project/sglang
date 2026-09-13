@@ -196,15 +196,15 @@ class DeepGemmCandidateIndexer:
         the same logits and DeepGEMM's schedule for it; the backend stores the
         table on the forward metadata."""
         metadata = inputs.metadata
-        seq_lens = metadata.c4_seq_lens.reshape(-1)
+        seq_lens = metadata.compressed_seq_lens.reshape(-1)
         logits = fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             metadata.deep_gemm_metadata,
-            metadata.max_c4_seq_len,
+            metadata.max_compressed_seq_len,
         )
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -222,7 +222,7 @@ class DeepGemmCandidateIndexer:
             seq_lens,
             metadata.page_table,
             page_indices,
-            metadata.c4_page_size,
+            metadata.compressed_page_size,
             metadata.topk_metadata,
             out_raw_indices=raw_indices,
         )
@@ -235,13 +235,13 @@ class DeepGemmCandidateIndexer:
                 blocks,
                 seq_lens,
                 metadata.page_table,
-                metadata.c4_page_size,
+                metadata.compressed_page_size,
             )
             schedule = build_sparse_indexer_schedule(
                 blocks,
                 seq_lens,
                 metadata.page_table,
-                metadata.c4_page_size,
+                metadata.compressed_page_size,
                 inputs.q_fp4.dtype,
                 inputs.request_ids,
             )

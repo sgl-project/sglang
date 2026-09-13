@@ -1131,6 +1131,15 @@ class Req(ReqDllmMixin):
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Logical-page KV sharding: rotation base of the chain this request
+        # extends (owner of position-page P is (base + P) % shard_size).
+        # Refreshed at every sharded alloc — read through last_node, or drawn
+        # least-full for a new chain — and consumed by the radix insert to
+        # stamp new tree nodes. Allocation itself must NOT read it back when
+        # a tree node is available (the cache_unfinished_req dedup rebind
+        # would make it stale); the only allocation-time reader is the
+        # ChunkCache fallback, which has no tree nodes and no rebind.
+        self.kv_rotation_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1821,6 +1830,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False

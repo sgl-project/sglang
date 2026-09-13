@@ -269,7 +269,7 @@ class CompressorBackendMixin:
         kv_layout = KVLayout.V4
         kv_scale_cache = None
         if compressor.is_in_indexer:
-            page_size = token_to_kv_pool.get_index_k_page_size()
+            page_size = token_to_kv_pool.get_index_k_page_size(compressor.ratio)
             if use_hip_fp4:
                 kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
                 kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)

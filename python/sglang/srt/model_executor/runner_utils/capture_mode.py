@@ -37,9 +37,8 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
-# Capture-time indexer variant for DSA and V4.1; None records the full path.
-# V4.1 variants can bypass scoring or candidate filtering for short histories.
-_capture_dsa_variant: Optional[str] = None
+# Attention execution variant active through metadata preparation and capture.
+_capture_attention_variant: Optional[str] = None
 
 
 def get_is_capture_mode() -> bool:
@@ -69,21 +68,21 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
     _capture_lora_variant = variant
 
 
-def get_capture_dsa_variant() -> Optional[str]:
-    """Return the indexer or candidate-filter variant being captured, or None."""
-    return _capture_dsa_variant
+def get_capture_attention_variant() -> Optional[str]:
+    return _capture_attention_variant
 
 
 def skip_low_ratio_indexer(compress_ratio: int) -> bool:
-    """Whether this captured variant selects every position for this ratio."""
-    return _capture_dsa_variant == "candidate_all" or (
-        _capture_dsa_variant == "candidate_c2_all" and compress_ratio == 2
+    """Whether the captured DeepSeek-V4.1 candidate variant selects every
+    position for this ratio (decode_cuda_graph_runner's candidate graphs)."""
+    return _capture_attention_variant == "candidate_all" or (
+        _capture_attention_variant == "candidate_c2_all" and compress_ratio == 2
     )
 
 
-def _set_capture_dsa_variant(variant: Optional[str]) -> None:
-    global _capture_dsa_variant
-    _capture_dsa_variant = variant
+def _set_capture_attention_variant(variant: Optional[str]) -> None:
+    global _capture_attention_variant
+    _capture_attention_variant = variant
 
 
 @contextmanager

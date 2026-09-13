@@ -239,10 +239,10 @@ def _every_request_fits() -> bool:
     candidate block budget (decode_cuda_graph_runner): the plain top-k is the
     whole selection, and the candidate layers behave like any index source."""
     from sglang.srt.model_executor.runner_utils.capture_mode import (
-        get_capture_dsa_variant,
+        get_capture_attention_variant,
     )
 
-    return get_capture_dsa_variant() in (
+    return get_capture_attention_variant() in (
         "candidate_all",
         "candidate_c2_all",
         "candidate_unfiltered",
@@ -1295,8 +1295,9 @@ class DeepseekV4AttnBackend(
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
         return PagedIndexerMetadata(
             page_size=self.page_size,
+            compressed_page_size=index_page_size or self.page_size // compress_ratio,
             page_table=page_table,
-            c4_seq_lens=c_seq_lens,
+            compressed_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
@@ -1305,7 +1306,6 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
-            index_page_size=index_page_size,
         )
 
     def init_forward_metadata_decode(
@@ -1486,12 +1486,12 @@ class DeepseekV4AttnBackend(
         row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
         return PagedIndexerMetadata(
             page_size=self.page_size,
+            compressed_page_size=index_page_size,
             page_table=page_table,
-            c4_seq_lens=c_seq_lens,
+            compressed_seq_lens=c_seq_lens,
             use_topk_v2=False,
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
-            index_page_size=index_page_size,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
         )
 
@@ -2435,8 +2435,6 @@ class DeepseekV4AttnBackend(
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
-        # ``swa_window_size`` on the pool is its storage page size, not the
-        # model's SWA window, so pass both explicitly.
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),
@@ -2446,7 +2444,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
-            swa_page_size=self.token_to_kv_pool.swa_window_size,
+            swa_page_size=self.token_to_kv_pool.swa_page_size,
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
@@ -3298,7 +3296,7 @@ class DeepseekV4AttnBackend(
         )
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         assert indexer.n_local_heads == indexer.n_heads
-        width = metadata.max_c4_seq_len
+        width = metadata.max_compressed_seq_len
         if indexer.uses_candidates or indexer.is_candidate_source:
             # Every reachable block is a candidate inside the window, so the
             # two-level selection collapses to the plain top-k below.
@@ -3314,10 +3312,10 @@ class DeepseekV4AttnBackend(
 
         k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
         assert k_cache.dim() == 2
-        page_size = metadata.c4_page_size
+        page_size = metadata.compressed_page_size
         k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
-        lens = metadata.c4_seq_lens
+        lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
@@ -3404,7 +3402,7 @@ class DeepseekV4AttnBackend(
         k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
         assert k_cache.dim() == 2
         # Index pool page (64 slots); metadata.page_table is expanded to match.
-        page_size = metadata.c4_page_size
+        page_size = metadata.compressed_page_size
         k_cache = k_cache.view(
             k_cache.shape[0], page_size, 1, 68
         )  # fp4: 64 payload + 4 scale
@@ -3437,10 +3435,10 @@ class DeepseekV4AttnBackend(
             (q_fp4, q_sf),
             k_cache,
             weights,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             metadata.deep_gemm_metadata,
-            metadata.max_c4_seq_len,
+            metadata.max_compressed_seq_len,
         )
         # TODO(dark): add bf16 topk
         fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
@@ -3477,7 +3475,7 @@ class DeepseekV4AttnBackend(
         assert metadata is not None
         # V4 reserves the replay bound in metadata; visibility stays on device.
         # A capture-time length read would both synchronize and truncate replay.
-        lmax = min(metadata.max_c4_seq_len, self.req_to_token.shape[1] // ratio)
+        lmax = min(metadata.max_compressed_seq_len, self.req_to_token.shape[1] // ratio)
         if lmax == 0:
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
@@ -3697,13 +3695,13 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
+            swa_page_size = token_to_kv_pool.swa_page_size
             assert swa_k_cache.ndim == 2
             # The kernel detects each cache's format from the last dim of this
             # view: 584 (V4), 528 (V4.1 fp8) or 288 (V4.1 fp4, extra cache only).
             k_cache_total_dim = token_to_kv_pool.get_swa_key_bytes_per_token()
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
+            swa_k_cache = swa_k_cache[:, : swa_page_size * k_cache_total_dim].view(
+                swa_k_cache.shape[0], swa_page_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:

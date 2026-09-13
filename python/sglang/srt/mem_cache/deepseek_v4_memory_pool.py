@@ -693,6 +693,13 @@ class DeepSeekV4IndexerPool(KVCache):
         return (vals * scales).to(torch.bfloat16)
 
 
+class _CompressedPoolConfig(NamedTuple):
+    kv_size: int
+    state_size: int
+    state_dtype: torch.dtype
+    indexer_size: Optional[int] = None
+
+
 class DeepSeekV4LayerItem(NamedTuple):
     compress_ratio: Literal[0, 1, 2, 4, 128]
     # Layer index inside compress_kv_pool. Ratios 1/2 share a pool layer across the
@@ -828,13 +835,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.max_num_reqs = max_num_reqs
-        # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
-        # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
-        # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
+        # PD preallocation can exceed max_num_reqs;
+        # the SWA ring must cover every addressable req_pool_idx.
         self.num_req_slots = (
             num_req_slots if num_req_slots is not None else max_num_reqs + 1
         )
-        self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -858,21 +863,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # so the caller-supplied, SWA-scaled size does not apply here.
             c4_state_pool_size = self.num_req_slots * c4_ring_size
         # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
-        self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
-            # Request-scoped online C128 state is indexed by req_pool_idx.
-            # PD decode can allocate pre-transfer slots beyond
-            # max_num_reqs, so size to the actual req_to_token row count.
+            # Request-scoped C128 state must also cover PD preallocation slots.
             c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
         else:
             # Offline C128 keeps a per-request raw state ring.
             c128_state_pool_size = max(
                 c128_state_pool_size, self.num_req_slots * c128_ring_size
             )
-        self.c128_state_pool_size = c128_state_pool_size
-        self.c4_state_dtype = c4_state_dtype
-        self.c128_state_dtype = c128_state_dtype
+        self.compressed_pool_configs = {
+            4: _CompressedPoolConfig(
+                kv_size=c4_size,
+                state_size=c4_state_pool_size,
+                state_dtype=c4_state_dtype,
+                indexer_size=c4_logical_size,
+            ),
+            128: _CompressedPoolConfig(
+                kv_size=c128_size,
+                state_size=c128_state_pool_size,
+                state_dtype=c128_state_dtype,
+            ),
+        }
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_state_num_req_slots = c128_state_pool_size
@@ -899,15 +911,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.sliding_window = sliding_window
 
         self.swa_size = swa_size
-        self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
-        self.scale_pad = 1
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
         stage_layer_num = len(stage_ratios)
+        kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
@@ -978,7 +989,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
-            kv_pool_cls: type = DeepSeekV4SingleKVPool
             if self.uniform_fp8:
                 assert dtype == torch.float8_e4m3fn, (
                     "--dsv4-attn-backend trtllm requires "
@@ -1003,23 +1013,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             "request_window" if self.request_window is not None else "paged",
             self.needs_paged_swa_allocator,
         )
+        self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
         self.sources_by_ratio = self._collect_sources_by_ratio()
         self._init_compressed_pools(
-            c4_size=c4_size,
-            c128_size=c128_size,
-            full_size=full_size,
+            stage_ratios=stage_ratios,
             page_size=page_size,
             dtype=dtype,
             device=device,
             enable_memory_saver=enable_memory_saver,
             enable_hisparse=enable_hisparse,
+            kv_pool_cls=kv_pool_cls,
         )
-        # HiSparse, the HiCache pool assemblers and the NPU pool read the compressed
-        # pools by these names; everything in this file goes through the registries.
-        self.c4_kv_pool = self.kv_pools.get(4)
-        self.c128_kv_pool = self.kv_pools.get(128)
-        self.c4_indexer_kv_pool = self.index_pools.get(4)
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
@@ -1050,65 +1055,53 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self._unified_kv:
-            # Unified buffer per layer: [swa_pages + padded_compress_rows, head_dim].
-            # Compressed region [swa_pages:] is page-contiguous (row swa_pages +
-            # loc//ratio), so reuse the page-block PD transfer by offsetting the ptr
-            # past the SWA ring and setting item_len = one page of rows. The SWA ring
-            # ships separately as StateType.SWA_RING. Order [c4, c4_indexer, c128]
-            # mirrors the non-unified kv_data layout (keeps PP ptr-slicing valid).
-            stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-            swa_pages = self.unified_kv_pool.swa_pages
+        def append_page_buffer(buf: torch.Tensor) -> None:
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
 
-            def _append_compressed_entry(local_layer_id: int, ratio: int) -> None:
-                buf = self.unified_kv_pool.kv_buffer[local_layer_id]
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                row_bytes = buf[0].nbytes
-                rows_per_page = self.page_size // ratio
-                compress_rows = buf.shape[0] - swa_pages
-                data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                data_lens.append(compress_rows * row_bytes)
-                item_lens.append(rows_per_page * row_bytes)
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
+        # Keep each indexer immediately after the KV buffers of the same ratio.
+        for ratio, kv_pool in self.kv_pools.items():
+            if self._unified_kv:
+                # Unified buffers store token rows after the SWA ring. Transfer
+                # compressed pages from the offset; SWA ships as StateType.SWA_RING.
+                swa_pages = self.unified_kv_pool.swa_pages
+                for local_layer_id, layer_ratio in enumerate(stage_ratios):
+                    if layer_ratio != ratio:
+                        continue
+                    buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                    row_bytes = buf[0].nbytes
+                    rows_per_page = self.page_size // ratio
+                    compress_rows = buf.shape[0] - swa_pages
+                    data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
+                    data_lens.append(compress_rows * row_bytes)
+                    item_lens.append(rows_per_page * row_bytes)
+            elif kv_pool is not None:
+                for buf in kv_pool.kv_buffer:
+                    append_page_buffer(buf)
 
-            c4_locals = [i for i, r in enumerate(stage_ratios) if r == 4]
-            c128_locals = [i for i, r in enumerate(stage_ratios) if r == 128]
-
-            for i in c4_locals:
-                _append_compressed_entry(i, 4)
-            for buf in self.c4_indexer_kv_pool.contiguous_page_row_buffers():
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
-            for i in c128_locals:
-                _append_compressed_entry(i, 128)
-
-            return data_ptrs, data_lens, item_lens
-
-        # Fixed ratio order, so the receiver's PP ptr-slicing stays valid. The
-        # transfer addresses every buffer by FULL page id, so one item is one
-        # FULL page: a KV pool row already is one, while an index pool row is one
-        # of its own pages (DSV41_INDEX_PAGE_SIZE slots for the low ratios), so
-        # there a FULL page is the run of adjacent index pages that hold its
-        # page_size // ratio slots.
-        for ratio in (4, 128, 1, 2):
-            if ratio not in self.kv_pools:
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is None:
                 continue
-            for buf in self.kv_pools[ratio].kv_buffer:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
-            index_pool = self.index_pools.get(ratio)
-            if index_pool is None:
-                continue
-            slots_per_full_page = self.page_size // ratio
-            assert slots_per_full_page % index_pool.page_size == 0, (
-                f"ratio-{ratio} index pages of {index_pool.page_size} slots do not "
-                f"tile a FULL page of {slots_per_full_page} slots"
-            )
-            index_pages_per_full_page = slots_per_full_page // index_pool.page_size
-            for buf in index_pool.contiguous_page_row_buffers():
+            # The transfer addresses every buffer by FULL page id. A c4 index page
+            # already is one FULL page; the ratio-1/2 index pools page at
+            # DSV41_INDEX_PAGE_SIZE slots, so there one item is the run of adjacent
+            # index pages that hold a FULL page's page_size // ratio slots.
+            index_pages_per_full_page = 1
+            if ratio in (1, 2):
+                slots_per_full_page = self.page_size // ratio
+                assert slots_per_full_page % indexer_pool.page_size == 0, (
+                    f"ratio-{ratio} index pages of {indexer_pool.page_size} slots do not "
+                    f"tile a FULL page of {slots_per_full_page} slots"
+                )
+                index_pages_per_full_page = (
+                    slots_per_full_page // indexer_pool.page_size
+                )
+            for buf in indexer_pool.contiguous_page_row_buffers():
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -1117,8 +1110,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
-        per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
+        # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
+        # its indices address individual ring rows.
         # TODO(billishyahao): validate PP layer-slicing for SWA_RING.
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -1135,12 +1128,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
-        """
-        In unified_kv, swa/c4/c128 share one buffer with one slot per row. But the
-        HiCache host pool transfers a whole page per indexed row, so we reshape the
-        compressed region into the layout it expects: skip the SWA segment, reshape to
-        one row per page, then cast to uint8.
-        """
+        # HiCache expects byte rows containing whole pages;
+        # the unified pool stores individual token rows after its SWA region.
         assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
 
@@ -1201,7 +1190,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
-    def get_c128_state_buf_infos(
+    def get_request_state_buf_infos(
         self,
     ) -> Tuple[List[int], List[int], List[int]]:
         """The request-scoped state component, named after its first member: the
@@ -1222,6 +1211,107 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             else:
                 item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
+
+    def _init_compressed_pools(
+        self,
+        *,
+        stage_ratios: Sequence[int],
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        enable_hisparse: bool,
+        kv_pool_cls: type,
+    ) -> None:
+        """One FlashMLA-layout KV pool per compress ratio present in this stage, plus
+        the packed indexer-K pool every ratio but 128 carries: slot = full-pool token
+        loc // ratio, page = page_size // ratio rows, so the pages line up with the
+        full pool's. Ratios 4 / 128 are sized by compressed_pool_configs; the
+        DeepSeek-V4.1 ratio-1/2 pools follow their kv_source layers
+        (sources_by_ratio) and the full pool size."""
+        configs = self.compressed_pool_configs
+        layer_counts = {ratio: stage_ratios.count(ratio) for ratio in configs}
+        # Keep empty pools and allocation order for PP stages without a given ratio.
+        self.kv_pools: dict[int, Optional[DeepSeekV4SingleKVPool]] = {
+            ratio: None for ratio in configs
+        }
+        # Ratio-1/2 kv_source layers of this stage (DeepSeek-V4.1), when the pool
+        # was built with them; the PD wire order stays C4, C128, then low ratios.
+        low_ratio_sources = {
+            ratio: sources
+            for ratio, sources in getattr(self, "sources_by_ratio", {}).items()
+            if ratio in (1, 2)
+        }
+        if low_ratio_sources:
+            assert self.full_size is not None, (
+                "low compress ratios need the full pool size"
+            )
+            assert not self._unified_kv, "unified_kv has no low compress ratio layout"
+
+        if not self._unified_kv:
+            for ratio, config in configs.items():
+                pool_cls = kv_pool_cls
+                if ratio == 4 and enable_hisparse:
+                    assert not self.uniform_fp8, (
+                        "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                    )
+                    pool_cls = HiSparseC4DevicePool
+                self.kv_pools[ratio] = self._make_kv_pool(
+                    size=config.kv_size,
+                    page_size=page_size // ratio,
+                    dtype=dtype,
+                    layer_num=layer_counts[ratio],
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                    global_page_size=page_size,
+                    cls=pool_cls,
+                    kv_layout=self.compressed_kv_layout(ratio),
+                )
+            for ratio, sources in low_ratio_sources.items():
+                self.kv_pools[ratio] = self._make_kv_pool(
+                    size=self.full_size // ratio,
+                    page_size=page_size // ratio,
+                    dtype=dtype,
+                    layer_num=len(sources),
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                    global_page_size=page_size,
+                    cls=kv_pool_cls,
+                    kv_layout=self.compressed_kv_layout(ratio),
+                )
+
+        self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
+            ratio: self._make_indexer_pool(
+                config.indexer_size,
+                page_size // ratio,
+                dtype,
+                self.indexer_head_dim,
+                layer_counts[ratio],
+                device,
+                enable_memory_saver,
+            )
+            for ratio, config in configs.items()
+            if config.indexer_size is not None
+        }
+        for ratio, sources in low_ratio_sources.items():
+            # Slots remain loc // ratio, with DSV41_INDEX_PAGE_SIZE packed-buffer pages.
+            # Reserved FULL page 0 extends real slots past full_size; one index padding
+            # page is too small to cover that gap.
+            self.index_pools[ratio] = self._make_indexer_pool(
+                (self.full_size + page_size) // ratio,
+                DSV41_INDEX_PAGE_SIZE,
+                dtype,
+                self.indexer_head_dim,
+                len(sources),
+                device,
+                enable_memory_saver,
+                force_fp4=True,
+            )
+
+        # HiCache and hardware backends still access the per-ratio attributes.
+        self.c4_kv_pool = self.kv_pools[4]
+        self.c128_kv_pool = self.kv_pools[128]
+        self.c4_indexer_kv_pool = self.index_pools[4]
 
     def _make_kv_pool(
         self,
@@ -1304,21 +1394,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
         )
 
-    def _state_pool_size(self, ratio: int) -> int:
-        return self.c4_state_pool_size if ratio == 4 else self.c128_state_pool_size
-
-    def _make_attn_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+    def _make_compress_state_pool(
+        self, ratio: int, *, head_dim: int, enable_memory_saver: bool
     ) -> CompressStatePool:
-        """Build the per-layer attention compress-state pool for ``ratio``
-        (4 or 128). Overridden by :class:`DSV4NPUTokenToKVPool` to swap the
-        ring-buffered pool for the NPU paged one."""
+        """Build attention or indexer state; hardware backends override this factory."""
+        config = self.compressed_pool_configs[ratio]
         return CompressStatePool(
-            size=self._state_pool_size(ratio),
+            size=config.state_size,
             ring_size=self.get_ring_size(ratio),
             overlap=ratio == 4,
-            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+            head_dim=head_dim,
+            dtype=config.state_dtype,
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
@@ -1327,22 +1413,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             online_mtp_max_draft_tokens=(
                 self.online_mtp_max_draft_tokens if ratio == 128 else 0
             ),
-        )
-
-    def _make_indexer_state_pool(
-        self, ratio: int, enable_memory_saver: bool
-    ) -> CompressStatePool:
-        """Build the per-layer indexer compress-state pool (c4 only)."""
-        return CompressStatePool(
-            size=self._state_pool_size(ratio),
-            ring_size=self.get_ring_size(ratio),
-            overlap=ratio == 4,
-            head_dim=self.indexer_head_dim,
-            device=self.device,
-            dtype=self.c4_state_dtype,
-            enable_memory_saver=enable_memory_saver,
-            ratio=ratio,
-            swa_page_size=self.swa_page_size,
         )
 
     def _make_pair_state_pool(self, enable_memory_saver: bool) -> CompressStatePool:
@@ -1368,7 +1438,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
             None
         ] * total_L
-        pair_sources = self.sources_by_ratio.get(2, [])
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
@@ -1378,19 +1447,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 2:
                 # Only a kv_source layer compresses; the ratio-2 layers after it
                 # read its latents and so need no pending-pair state of their own.
-                if idx in pair_sources:
+                if idx in self.sources_by_ratio.get(2, []):
                     self.compress_state_pools[idx] = self._make_pair_state_pool(
                         enable_memory_saver
                     )
                 continue
 
-            self.compress_state_pools[idx] = self._make_attn_state_pool(
-                ratio, enable_memory_saver
+            self.compress_state_pools[idx] = self._make_compress_state_pool(
+                ratio,
+                head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                enable_memory_saver=enable_memory_saver,
             )
 
-            if ratio == 4:
-                self.indexer_compress_state_pools[idx] = self._make_indexer_state_pool(
-                    ratio, enable_memory_saver
+            if ratio in self.index_pools:
+                self.indexer_compress_state_pools[idx] = self._make_compress_state_pool(
+                    ratio,
+                    head_dim=self.indexer_head_dim,
+                    enable_memory_saver=enable_memory_saver,
                 )
 
     def _collect_sources_by_ratio(self) -> dict[int, List[int]]:
@@ -1425,105 +1498,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert sources, f"layer {layer_id} (ratio {ratio}) has no kv_source layer"
         return max(sources)
 
-    def _init_compressed_pools(
-        self,
-        *,
-        c4_size: int,
-        c128_size: int,
-        full_size: Optional[int],
-        page_size: int,
-        dtype: torch.dtype,
-        device: str,
-        enable_memory_saver: bool,
-        enable_hisparse: bool,
-    ) -> None:
-        """One FlashMLA-layout KV pool per compress ratio present in this stage, plus
-        the packed indexer-K pool every ratio but 128 carries: slot = full-pool token
-        loc // ratio, page = page_size // ratio rows, so the pages line up with the
-        full pool's."""
-        self.kv_pools: dict[int, DeepSeekV4SingleKVPool] = {}
-        self.index_pools: dict[int, DeepSeekV4IndexerPool] = {}
-        if any(ratio in (1, 2) for ratio in self.sources_by_ratio):
-            assert full_size is not None, "low compress ratios need the full pool size"
-            assert not self._unified_kv, "unified_kv has no low compress ratio layout"
-
-        kv_pool_size = {4: c4_size, 128: c128_size}
-        # Uniform 512-dim e4m3 layout for the trtllm attention backend.
-        kv_pool_cls: type = DeepSeekV4SingleKVPool
-        if self.uniform_fp8:
-            assert not enable_hisparse, (
-                "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
-            )
-            kv_pool_cls = DeepSeekV4UniformFP8KVPool
-        if not self._unified_kv:
-            for ratio, sources in self.sources_by_ratio.items():
-                self.kv_pools[ratio] = self._make_kv_pool(
-                    size=(
-                        kv_pool_size[ratio]
-                        if ratio in kv_pool_size
-                        else full_size // ratio
-                    ),
-                    page_size=page_size // ratio,
-                    dtype=dtype,
-                    layer_num=len(sources),
-                    device=device,
-                    enable_memory_saver=enable_memory_saver,
-                    global_page_size=page_size,
-                    cls=(
-                        HiSparseC4DevicePool
-                        if ratio == 4 and enable_hisparse
-                        else kv_pool_cls
-                    ),
-                    kv_layout=self.compressed_kv_layout(ratio),
-                )
-
-        for ratio, sources in self.sources_by_ratio.items():
-            if ratio == 128:
-                continue
-            if ratio == 4:
-                self.index_pools[ratio] = self._make_indexer_pool(
-                    self.c4_logical_size,
-                    page_size // 4,
-                    dtype,
-                    self.indexer_head_dim,
-                    len(sources),
-                    device,
-                    enable_memory_saver,
-                )
-                continue
-            # Slots remain loc // ratio, with DSV41_INDEX_PAGE_SIZE packed-buffer pages.
-            # Reserved FULL page 0 extends real slots past full_size; one index padding
-            # page is too small to cover that gap.
-            self.index_pools[ratio] = self._make_indexer_pool(
-                (full_size + page_size) // ratio,
-                DSV41_INDEX_PAGE_SIZE,
-                dtype,
-                self.indexer_head_dim,
-                len(sources),
-                device,
-                enable_memory_saver,
-                force_fp4=True,
-            )
-
     def _init_compressed_layer_mapping(self):
-        full_cnt = 0
+        layer_counts = {0: 0, **{ratio: 0 for ratio in self.kv_pools}}
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
-            if ratio == 0:
-                self.layer_mapping[idx] = DeepSeekV4LayerItem(
-                    compress_ratio=0,
-                    compress_layer_id=full_cnt,
-                )
-                full_cnt += 1
-                continue
-
-            sources = self.sources_by_ratio[ratio]
+            if ratio not in layer_counts:
+                raise ValueError(f"Unsupported compression ratio: {ratio}")
+            if ratio in (1, 2):
+                # Ratios 1/2 share a pool layer across the kv_source layer that
+                # writes it and the layers that read it.
+                sources = self.sources_by_ratio[ratio]
+                compress_layer_id = sources.index(self.source_layer_of(idx))
+            else:
+                compress_layer_id = layer_counts[ratio]
+                layer_counts[ratio] += 1
             self.layer_mapping[idx] = DeepSeekV4LayerItem(
                 compress_ratio=ratio,
-                compress_layer_id=sources.index(self.source_layer_of(idx)),
+                compress_layer_id=compress_layer_id,
                 compress_kv_pool=self.kv_pools.get(ratio),
             )
 
@@ -1608,9 +1602,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         accept_lens: torch.Tensor,
         num_draft_tokens: int,
     ) -> None:
-        """Clear offline C128 ring slots written for rejected speculative tokens.
-        C4 needs no counterpart: its draft states are overwritten in position order
-        before any read; a C128 compression boundary can read a stale draft slot."""
+        # C128 compression can read rejected draft slots at a boundary;
+        # C4 overwrites its draft slots before reading them.
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
@@ -1726,7 +1719,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def _indexer_pool(self, compress_ratio: int) -> DeepSeekV4IndexerPool:
         pool = self.index_pools.get(compress_ratio)
-        assert pool is not None, f"no indexer pool for {compress_ratio = }"
+        assert pool is not None, (
+            f"No indexer pool for compression ratio {compress_ratio}"
+        )
         return pool
 
     def get_low_ratio_index_k_dequant(
