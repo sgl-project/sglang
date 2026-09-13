@@ -973,7 +973,7 @@ class PrefillAdder:
                 "device_capacity"
                 if req.needs_host_load_back()
                 and req.host_loaded_length < req.host_hit_length
-                else "shrunk"
+                else "cache_admission_shortfall"
             )
         self.tree_cache.finish_storage_prefetch_admission(
             req.rid,

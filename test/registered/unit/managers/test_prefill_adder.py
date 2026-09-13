@@ -156,6 +156,24 @@ class TestPrefillAdder(CustomTestCase):
             "storage-hit", fulfilled_tokens=0, reason="device_capacity"
         )
 
+        self.mock_tree_cache.finish_storage_prefetch_admission.reset_mock()
+        req.host_hit_length = 4
+        req.host_loaded_length = 4
+        req.storage_hit_length = 8
+        req.storage_hit_start = 4
+        req.materialized_host_hit_len.return_value = 4
+        req.fulfilled_storage_hit_len.return_value = 4
+        req.needs_host_load_back.return_value = True
+        adder._account_prefill_cache_admission(req, prefix_len=8)
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            "storage-hit",
+            fulfilled_tokens=4,
+            reason="cache_admission_shortfall",
+        )
+        self.assertEqual(adder.log_device_hit_tokens, 8)
+        self.assertEqual(adder.log_host_hit_tokens, 0)
+        self.assertEqual(adder.log_storage_hit_tokens, 12)
+
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())
         req = self.create_mock_req(
