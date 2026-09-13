@@ -39,11 +39,14 @@ from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
-    ResponseOutputMessage,
+)
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseTextConfig,
 )
+from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
@@ -713,6 +716,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    phase: Optional[Literal["commentary", "final_answer"]] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
@@ -1581,6 +1585,9 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    # Input format of a ``custom`` tool: {"type": "text"} or
+    # {"type": "grammar", "syntax": ..., "definition": ...}.
+    format: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_function_tool(self) -> ResponseTool:
@@ -1589,7 +1596,17 @@ class ResponseTool(BaseModel):
         return self
 
 
+class ResponseInputMessageParam(EasyInputMessageParam, total=False):
+    phase: Optional[Literal["commentary", "final_answer"]]
+
+
+class ResponseOutputMessage(OpenAIResponseOutputMessage):
+    phase: Optional[Literal["commentary", "final_answer"]] = None
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputMessageParam,
+    ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
@@ -1782,20 +1799,24 @@ class ResponsesRequest(BaseModel):
     def is_include_output_logprobs(self) -> bool:
         return bool(self.include and "message.output_text.logprobs" in self.include)
 
+    def is_include_encrypted_reasoning(self) -> bool:
+        return bool(self.include and "reasoning.encrypted_content" in self.include)
+
     def has_json_schema_constraint(self) -> bool:
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
         """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` survives, the rest (web_search,
-        mcp, ...) can't be forced through the tool-call parser."""
+        object forms only a named ``function`` / ``custom`` tool survives, the
+        rest (web_search, mcp, ...) can't be forced through the tool-call
+        parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
         )
-        if tool_choice.get("type") == "function" and name:
+        if tool_choice.get("type") in ("function", "custom") and name:
             return {"type": "function", "name": name}
         return "auto"
 
@@ -1897,7 +1918,12 @@ class ResponsesResponse(BaseModel):
     model: str
 
     output: List[
-        Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+        Union[
+            ResponseOutputMessage,
+            ResponseOutputItem,
+            ResponseReasoningItem,
+            ResponseFunctionToolCall,
+        ]
     ] = Field(default_factory=list)
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
@@ -1957,7 +1983,12 @@ class ResponsesResponse(BaseModel):
         model_name: str,
         created_time: int,
         output: List[
-            Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+            Union[
+                ResponseOutputMessage,
+                ResponseOutputItem,
+                ResponseReasoningItem,
+                ResponseFunctionToolCall,
+            ]
         ],
         status: str,
         usage: Optional[UsageInfo],
@@ -1983,7 +2014,7 @@ class ResponsesResponse(BaseModel):
                 try:
                     if isinstance(it, ResponseOutputText):
                         continue
-                    elif isinstance(it, ResponseOutputMessage):
+                    elif isinstance(it, OpenAIResponseOutputMessage):
                         if not it.content:
                             continue
                         for c in it.content:
@@ -2083,7 +2114,11 @@ class ResponseReasoningTextContent(BaseModel):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+    ResponseInputMessageParam,
+    ResponseOutputMessage,
+    ResponseInputItemParam,
+    "ResponseReasoningItem",
+    ResponseFunctionToolCall,
 ]
 
 

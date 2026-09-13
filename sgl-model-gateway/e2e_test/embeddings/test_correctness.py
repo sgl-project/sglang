@@ -252,7 +252,11 @@ class TestEmbeddingCorrectness:
         and HuggingFace implementations within tolerance.
         """
         backend, model_path, client, gateway = setup_backend
-        tolerance = 0.05
+        # Scores are cosine * 100, fp16 GPU kernels vs a CPU
+        # sentence-transformers reference: allow 2.5e-3 cosine of
+        # cross-implementation drift (~2x the level observed from kernel
+        # changes); a wrong pooling or missing normalization is >1e-2.
+        tolerance = 0.25
 
         # Format query with instruction (for e5-mistral)
         query = f"Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: {RELEVANCE_TEST_DATA['sample_query']}"
@@ -275,6 +279,10 @@ class TestEmbeddingCorrectness:
 
         assert np.allclose(scores_gateway, scores_hf, atol=tolerance), (
             f"Scores differ beyond tolerance:\nGateway: {scores_gateway}\nHF: {scores_hf}"
+        )
+        # The looser tolerance must not let a reshuffled ranking through.
+        assert (np.argsort(scores_gateway) == np.argsort(scores_hf)).all(), (
+            f"Relevance ranking differs:\nGateway: {scores_gateway}\nHF: {scores_hf}"
         )
 
         logger.info("Relevance scores comparison passed")
