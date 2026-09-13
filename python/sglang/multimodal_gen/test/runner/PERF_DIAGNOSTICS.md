@@ -131,3 +131,13 @@ Their maximum/minimum ratios in this window range from 1.006 to 1.250
 these references do not claim stability across the entire history. Each value
 is the minimum in the stated window, rounded to two decimals. Existing loading
 references, E2E references, and tolerances are unchanged.
+
+Four additional single-H100 references follow the same minimum-of-three rule.
+`flux_2_image_t2i_upscaling_4x` uses runs 34764411082, 34766506722, and
+[34770008768](https://github.com/sgl-project/sglang/actions/runs/34770008768).
+`flux_2_t2i_customized_vae_path`, `flux_2_ti2i_multi_image_cache_dit`, and
+`zimage_image_t2i` use runs 34766506722, 34770008768, and
+[34771349145](https://github.com/sgl-project/sglang/actions/runs/34771349145).
+Their maximum/minimum ratios range from 1.090 to 1.224. These are initial
+loading references only; earlier variable runs remain diagnostic evidence,
+and no existing performance reference or tolerance is increased.

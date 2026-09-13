@@ -679,6 +679,7 @@
             "estimated_full_test_time_s": 168.9
         },
         "flux_2_ti2i_multi_image_cache_dit": {
+            "expected_load_ms": 54569.41,
             "stages_ms": {
                 "ImageVAEEncodingStage": 156.01,
                 "DenoisingStage": 23101.61,
@@ -821,6 +822,7 @@
             "estimated_full_test_time_s": 44.9
         },
         "zimage_image_t2i": {
+            "expected_load_ms": 28221.57,
             "stages_ms": {
                 "DecodingStage": 6.23,
                 "InputValidationStage": 0.03,
@@ -2558,6 +2560,7 @@
             "estimated_full_test_time_s": 129.3
         },
         "flux_2_image_t2i_upscaling_4x": {
+            "expected_load_ms": 52489.37,
             "stages_ms": {
                 "TextEncodingStage": 373.42,
                 "DenoisingStage": 21888.49,
@@ -3213,6 +3216,7 @@
             "estimated_full_test_time_s": 65.0
         },
         "flux_2_t2i_customized_vae_path": {
+            "expected_load_ms": 52103.72,
             "stages_ms": {},
             "denoise_step_ms": {},
             "expected_e2e_ms": 23073.55,
