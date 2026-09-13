@@ -481,12 +481,46 @@ def action_generation_response(
         )
 
     action_shape = data[0]["action"]["shape"]
+    input_batch_size = len(data)
 
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
         default_num_inference_steps = Cosmos3SamplingParams().num_inference_steps
     else:
         default_num_inference_steps = pipeline_config.default_num_inference_steps
+
+    # candidate_spec.return_candidates (see #35331 /
+    # runtime.pipelines_core.candidates) surfaces the raw pre-reduction
+    # trajectories alongside the served (reduced) result in data[0] above;
+    # candidate_spec only ever applies to a single-input request (see
+    # _build_candidate_spec in entrypoints/action/cosmos3.py), so data has
+    # exactly one entry to append after here. Candidate 0 here is a raw
+    # trajectory in its own right, distinct from the reduced data[0] entry,
+    # so numbering starts at 1 to avoid implying it *is* the served action.
+    raw_candidates = output.get("candidates")
+    if raw_candidates is not None:
+        for i, candidate_actions in enumerate(raw_candidates):
+            candidate_array = np.asarray(candidate_actions)
+            candidate_values = (
+                candidate_array if preserve_numpy else candidate_array.tolist()
+            )
+            candidate_action = {
+                "type": "continuous",
+                "dtype": "float32",
+                "shape": list(candidate_array.shape),
+                "values": candidate_values,
+            }
+            for name in ("action_mode", "domain_id", "raw_action_dim"):
+                if output.get(name) is not None:
+                    candidate_action[name] = output[name]
+            data.append(
+                {
+                    "index": 0,
+                    "input_index": 0,
+                    "candidate_index": i + 1,
+                    "action": candidate_action,
+                }
+            )
 
     response = {
         "id": output.get("request_id") or f"act_{uuid.uuid4().hex}",
@@ -495,7 +529,7 @@ def action_generation_response(
         "model": server_args.served_model_name,
         "data": data,
         "usage": {
-            "batch_size": len(data),
+            "batch_size": input_batch_size,
             "action_horizon": action_shape[0] if action_shape else 0,
             "action_dim": action_shape[1] if len(action_shape) > 1 else 0,
             "denoise_steps": output.get("parameters", {}).get(
@@ -511,6 +545,8 @@ def action_generation_response(
         response["cache"] = output["cache"]
     if "parallel" in output:
         response["parallel"] = output["parallel"]
+    if "candidate_metrics" in output:
+        response["candidate_metrics"] = output["candidate_metrics"]
     return response
 
 

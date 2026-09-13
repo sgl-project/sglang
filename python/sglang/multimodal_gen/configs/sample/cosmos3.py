@@ -476,6 +476,27 @@ class Cosmos3SamplingParams(SamplingParams):
             self.output_file_name = None
             self.output_compression = 0
 
+        # Candidate-trajectory fan-out (#35331): the denoiser only ever
+        # produces as many physical action trajectories as
+        # batch.preprocessed_image has items, so a single-image request with
+        # candidate_spec set must fan its image/prompt out to
+        # candidate_spec.count identical copies here -- the one chokepoint
+        # every entry point (the action HTTP endpoint and
+        # DiffGenerator.generate_action alike) runs through -- or the
+        # decode-stage reducer never receives more than one candidate to
+        # reduce. Guarded by isinstance so this stays a no-op if some caller
+        # already fanned image_path out itself.
+        if (
+            action_output
+            and self.candidate_spec is not None
+            and self.image_path is not None
+            and not isinstance(self.image_path, (list, tuple))
+        ):
+            count = self.candidate_spec.count
+            self.image_path = [self.image_path] * count
+            if isinstance(self.prompt, str):
+                self.prompt = [self.prompt] * count
+
     def _validate(self) -> None:
         super()._validate()
         paths = self._resolve_control_paths()
