@@ -446,6 +446,29 @@ pub struct AffinityConfig {
     pub cache_candidate_ratio: f64,
     pub cache_candidate_max_workers: usize,
     pub cache_switch_margin_tokens: u64,
+    /// Queue gate (`--worker-queue-limit`): a worker whose engine reports at
+    /// least this many *waiting* requests cannot win a selection on cache
+    /// affinity — the request goes to another worker holding the same
+    /// prefix, or failing that to the least-loaded worker that is not
+    /// queueing. `None` disables the gate.
+    ///
+    /// Gating on the queue rather than on total depth is what makes this
+    /// targeted: `num_waiting_reqs` IS the question the request cares about
+    /// — will I sit behind other work before my prefill starts — whereas
+    /// depth only proxies it, and proxies it badly (an engine can queue at
+    /// 7-8 running on long-prompt traffic, far below its running cap, so a
+    /// depth threshold either fires on healthy busy workers or misses the
+    /// workers actually making requests wait).
+    ///
+    /// The gate reads the engine-published load sample and fails OPEN on a
+    /// worker with no fresh sample: the router-side in-flight counter cannot
+    /// separate a running request from a waiting one, so there is no honest
+    /// substitute to compare the limit against.
+    ///
+    /// Note the firing point scales with `dp_size`: the sample sums `waiting`
+    /// across a worker's DP ranks while a request lands on one of them, so
+    /// scale the limit with `--dp-size` on DP-attention deployments.
+    pub worker_queue_limit: Option<u64>,
 }
 
 impl Default for AffinityConfig {
@@ -468,6 +491,7 @@ impl Default for AffinityConfig {
             cache_candidate_ratio: 0.05,
             cache_candidate_max_workers: 32,
             cache_switch_margin_tokens: 1_024,
+            worker_queue_limit: None,
         }
     }
 }

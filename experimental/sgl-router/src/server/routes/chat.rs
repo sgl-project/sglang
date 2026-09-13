@@ -4,8 +4,8 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
-    CandidateDomain, CandidateRange, DecisionReason,
+    queue_gate_admits, resolve_cache_candidates, resolve_decode, resolve_prefill,
+    resolve_prefill_admitted, CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
 use crate::policies::decode::{
@@ -20,8 +20,8 @@ use crate::policies::{
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    WorkerModeLabel,
+    CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -32,6 +32,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 /// Observability header carrying the final decode-pool URL for a
@@ -57,6 +58,12 @@ const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 /// workers — not absolute accuracy — so the estimate is fit for
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// The queue-gate blind warn is sampled: it fires on a per-request path, and
+/// the condition (gate configured, zero fresh engine load samples fleet-wide)
+/// is steady-state, so 1-in-64 is plenty to surface it without log flooding.
+const QUEUE_GATE_BLIND_LOG_SAMPLE: u64 = 64;
+static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Return the low-cardinality reason for the final Prefill decision.
 fn prefill_policy_reason(
@@ -367,8 +374,25 @@ pub async fn chat_completions(
     let use_global_affinity_probe = ctx.bucket_selector.is_enabled()
         && policy.is_bucket_affinity_policy()
         && session_affinity_mode != SessionAffinityMode::Bucket;
+    // The queue gate (`--worker-queue-limit`) applies to the cache-aware
+    // candidate resolution and, beneath it, to primary/backup admission and
+    // the min-load range fallback. It does NOT reach the
+    // `CapacityFallbackPowerOfTwo` last resort: by the time that fires no
+    // worker in the domain is capacity-admitted, so there is no unqueued
+    // destination left to prefer.
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.worker_queue_limit);
     let worker = {
         let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
+        // Set when the queue gate emptied the cache candidate set: how many
+        // candidates it rejected, the deepest prefix among them, and whether
+        // every worker in the fleet is queueing (the saturation signal the
+        // `cache_hit_all_queued` decision label keys on).
+        let queue_gate_fallback: Cell<Option<(u64, u32, bool)>> = Cell::new(None);
         let select_prefill_in_domain = |domain: &CandidateDomain,
                                         affinity_lookup_enabled: bool,
                                         affinity_assignment_enabled: bool,
@@ -405,13 +429,20 @@ pub async fn chat_completions(
                     .as_ref()
                     .expect("shared prefill admission requires a load snapshot");
                 let decision = if allow_capacity_fallback {
-                    resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
+                    resolve_prefill(
+                        &candidate_range,
+                        &proposal,
+                        request_input_tokens,
+                        snapshot,
+                        worker_queue_limit,
+                    )
                 } else {
                     resolve_prefill_admitted(
                         &candidate_range,
                         &proposal,
                         request_input_tokens,
                         snapshot,
+                        worker_queue_limit,
                     )
                 };
                 let Some(decision) = decision else {
@@ -483,6 +514,30 @@ pub async fn chat_completions(
             .then(|| {
                 let snapshot = load_snapshot.as_ref()?;
                 let global_range = CandidateRange::global(&workers);
+                // The queue gate reads the engine-published load sample and
+                // fails open per worker. When NO worker has a fresh sample the
+                // gate is inert fleet-wide and nothing would say so:
+                // `cache_worker_queued` sitting at 0 is indistinguishable from
+                // a healthy fleet. Warn (sampled) — a fleet that never
+                // advertised a load port must not silently disable the gate.
+                if worker_queue_limit.is_some()
+                    && !workers.is_empty()
+                    && workers
+                        .iter()
+                        .all(|worker| snapshot.fresh_load_for_url(&worker.url).is_none())
+                    && QUEUE_GATE_BLIND_LOG_COUNTER
+                        .fetch_add(1, AtomicOrdering::Relaxed)
+                        .is_multiple_of(QUEUE_GATE_BLIND_LOG_SAMPLE)
+                {
+                    tracing::warn!(
+                        model = %model_str,
+                        worker_queue_limit,
+                        workers = workers.len(),
+                        "--worker-queue-limit is set but no worker has a fresh engine load \
+                         sample, so the queue gate is inert. Check that engines advertise a \
+                         load port and publish LoadStat",
+                    );
+                }
                 let cache_ctx =
                     SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
                         .with_session_id(session_id)
@@ -515,6 +570,22 @@ pub async fn chat_completions(
                 ctx.metrics
                     .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
                 let Some(decision) = cache_decision.decision else {
+                    if cache_decision.queue_gate_rejected_candidates > 0 {
+                        // Saturation is keyed on the fleet, not on where the
+                        // fallback lands: every worker with a fresh sample at
+                        // or over the limit means no unqueued destination
+                        // exists. A worker with no fresh sample breaks the
+                        // claim — its queue is unknown, not provably full.
+                        let fleet_all_queued = !workers.is_empty()
+                            && workers.iter().all(|worker| {
+                                !queue_gate_admits(snapshot, worker, worker_queue_limit)
+                            });
+                        queue_gate_fallback.set(Some((
+                            cache_decision.queue_gate_rejected_candidates,
+                            cache_decision.queue_gate_best_rejected_blocks,
+                            fleet_all_queued,
+                        )));
+                    }
                     selection_failure_reason
                         .set(PolicySelectionFailureReason::CacheCandidatesExhausted);
                     return None;
@@ -539,6 +610,8 @@ pub async fn chat_completions(
                 );
                 ctx.metrics
                     .record_policy_decision("cache_aware", "cache_candidate");
+                ctx.metrics
+                    .record_cache_aware_decision(&model_str, CacheAwareDecision::CacheHit);
                 Some(decision.selected)
             })
             .flatten();
@@ -578,7 +651,8 @@ pub async fn chat_completions(
             })
             // Rebuild the backup inside the primary's own Bucket.
             .and_then(|domain| select_prefill_in_domain(&domain, true, false, false));
-        cache_winner
+        let cache_winner_hit = cache_winner.is_some();
+        let selected = cache_winner
             .or_else(|| {
                 // Materialize normal domains only when Cache-Aware has no winner.
                 let prefill_domains = ctx
@@ -602,7 +676,38 @@ pub async fn chat_completions(
             })
             .ok_or_else(|| {
                 policy_selection_failed(&ctx, &model_str, selection_failure_reason.get())
-            })?
+            })?;
+        if ctx.config.model.policy == PolicyKind::CacheAware && !cache_winner_hit {
+            match queue_gate_fallback.get() {
+                Some((_rejected, _blocks, true)) => {
+                    // Every worker is queueing: locality could not be bought
+                    // at any price, so the fallback's routing is equivalent
+                    // to a hit — but booked under the saturation label, or a
+                    // fully saturated fleet would read as a healthy one.
+                    ctx.metrics.record_cache_aware_decision(
+                        &model_str,
+                        CacheAwareDecision::CacheHitAllQueued,
+                    );
+                }
+                Some((_rejected, blocks, false)) => {
+                    // A real diversion: an unqueued destination existed and
+                    // the gate gave up `blocks` of matched prefix to reach
+                    // it. The histogram is the evidence for whether the gate
+                    // is trading large cached prefixes for short waits.
+                    ctx.metrics
+                        .observe_diverted_overlap_blocks(&model_str, u64::from(blocks));
+                    ctx.metrics.record_cache_aware_decision(
+                        &model_str,
+                        CacheAwareDecision::CacheWorkerQueued,
+                    );
+                }
+                None => {
+                    ctx.metrics
+                        .record_cache_aware_decision(&model_str, CacheAwareDecision::CacheMiss);
+                }
+            }
+        }
+        selected
     };
 
     // Decode selection starts after Final P.

@@ -55,10 +55,17 @@ impl CacheAwarePolicy {
             if entry.matched_prefix_blocks == 0 || !seen.insert(worker.id.clone()) {
                 continue;
             }
+            // Cap here for the same reason `estimate_matched_prefix_tokens`
+            // caps: the block count is indexer-supplied and a query cannot
+            // match more blocks than it asked about. An uncapped value would
+            // reach the diverted-overlap histogram raw.
+            let matched_prefix_blocks = entry
+                .matched_prefix_blocks
+                .min(u32::try_from(signal.query_blocks).unwrap_or(u32::MAX));
             let matched_prefix_tokens = estimate_matched_prefix_tokens(
                 input_tokens,
                 signal.query_blocks,
-                entry.matched_prefix_blocks,
+                matched_prefix_blocks,
             );
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
                 continue;
@@ -67,6 +74,7 @@ impl CacheAwarePolicy {
                 worker: Arc::clone(worker),
                 matched_prefix_tokens,
                 uncached_tokens: input_tokens.saturating_sub(matched_prefix_tokens),
+                matched_prefix_blocks,
                 candidate_range_id: ctx.candidate_range_id().to_string(),
                 max_pending_prefill_tokens: None,
             });
@@ -106,6 +114,7 @@ impl CacheAwarePolicy {
             pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
             pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
             pressure_rel_threshold: self.config.pressure_rel_threshold,
+            worker_queue_limit: self.config.worker_queue_limit,
         })
     }
 
