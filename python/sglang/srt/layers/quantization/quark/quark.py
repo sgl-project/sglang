@@ -397,7 +397,21 @@ class QuarkConfig(QuantizationConfig):
             return None
 
         if isinstance(layer, LinearBase):
-            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            layer_quant_config = self._find_matched_config(prefix, layer)
+            weight_config = cast(dict[str, Any], layer_quant_config.get("weight") or {})
+            input_config = cast(
+                dict[str, Any], layer_quant_config.get("input_tensors") or {}
+            )
+            if self._is_block_fp8_w8a8(weight_config, input_config):
+                return Fp8LinearMethod(
+                    quant_config=Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=weight_config["block_size"],
+                        packed_modules_mapping=self.packed_modules_mapping,
+                    )
+                )
+            scheme = self._get_scheme_from_config(layer_quant_config)
             layer.scheme = scheme
             self._online_quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
@@ -708,6 +722,22 @@ class QuarkConfig(QuantizationConfig):
         # Confirm activation scheme is supported.
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
+
+    @staticmethod
+    def _is_block_fp8_w8a8(
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+        return (
+            weight_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and not weight_quant.get("is_dynamic")
+            and weight_quant.get("qscheme") == "per_block"
+            and weight_quant.get("block_size") is not None
+            and input_quant.get("is_dynamic")
+        )
 
     def _is_mx_fp4(
         self,

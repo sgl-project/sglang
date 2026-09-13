@@ -43,7 +43,20 @@ class _CapturingRunner:
 class TestGLM53FlashQuarkMoE(CustomTestCase):
     def test_flash_layer_config_matches_runtime_prefix_without_language_model(self):
         config = object.__new__(QuarkConfig)
-        fp8_config = {"weight": {"dtype": "fp8"}}
+        fp8_config = {
+            "weight": {
+                "dtype": "fp8_e4m3",
+                "is_dynamic": False,
+                "qscheme": "per_block",
+                "block_size": [128, 128],
+            },
+            "input_tensors": {
+                "dtype": "fp8_e4m3",
+                "is_dynamic": True,
+                "qscheme": "per_group",
+                "group_size": 128,
+            },
+        }
         global_mxfp4_config = {"weight": {"dtype": "fp4"}}
         config.quant_config = {
             "layer_quant_config": {
@@ -59,6 +72,9 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
         )
 
         self.assertIs(matched, fp8_config)
+        self.assertTrue(
+            config._is_block_fp8_w8a8(fp8_config["weight"], fp8_config["input_tensors"])
+        )
 
         direct_config = {"weight": {"dtype": "bf16"}}
         config.quant_config["layer_quant_config"]["model.layers.0.mlp.down_proj"] = (
