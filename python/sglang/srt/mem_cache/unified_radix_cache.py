@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1323,7 +1324,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
         anchor_entry = self.host_pool_group.anchor_entry
-        if self.cache_controller._uses_shared_host_layout(anchor_entry.host_pool):
+        if uses_shared_host_layout(anchor_entry.host_pool):
             allocation = self.cache_controller.allocate_shared_host_transfers(
                 device_indices, extra_transfers or None
             )
