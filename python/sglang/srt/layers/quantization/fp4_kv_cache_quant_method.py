@@ -751,6 +751,166 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
         return fp4_size + scale_size + dq_size
 
 
+class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
+    """OCP MXFP4 block-32 E2M1 + E8M0 with a BF16 PLAIN read path."""
+
+    name = "mxfp4"
+    SCALE_BLOCK_SIZE = 32
+
+    def __init__(
+        self,
+        num_layers: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        self.head_dim: Optional[int] = None
+
+    def scale_buffer_view_dtype(self) -> Optional[torch.dtype]:
+        return torch.float8_e8m0fnu
+
+    def create_buffers(
+        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
+    ) -> dict:
+        if head_dim <= 0:
+            raise ValueError(f"MXFP4 head_dim must be positive, got {head_dim}")
+        self.head_dim = head_dim
+        packed_dim = (head_dim + 1) // 2
+        scale_blocks = (head_dim + self.SCALE_BLOCK_SIZE - 1) // self.SCALE_BLOCK_SIZE
+        store_dtype = self.kv_storage_dtype()
+        k_buffer = [
+            torch.zeros((size, head_num, packed_dim), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        v_buffer = [
+            torch.zeros((size, head_num, packed_dim), dtype=store_dtype, device=device)
+            for _ in range(layer_num)
+        ]
+        k_scale_buffer = [
+            torch.zeros(
+                (size, head_num, scale_blocks), dtype=store_dtype, device=device
+            )
+            for _ in range(layer_num)
+        ]
+        v_scale_buffer = [
+            torch.zeros(
+                (size, head_num, scale_blocks), dtype=store_dtype, device=device
+            )
+            for _ in range(layer_num)
+        ]
+        return {
+            "k_buffer": k_buffer,
+            "v_buffer": v_buffer,
+            "k_scale_buffer": k_scale_buffer,
+            "v_scale_buffer": v_scale_buffer,
+            "dq_k_buffer": None,
+            "dq_v_buffer": None,
+            "store_dtype": store_dtype,
+        }
+
+    def quantize_and_store(
+        self,
+        k_buffer,
+        v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+    ) -> None:
+        from sglang.kernels.ops.quantization.mxfp4_quant import (
+            mxfp4_fused_store_supported,
+            quant_store_kv_mxfp4,
+        )
+
+        if mxfp4_fused_store_supported(cache_k, cache_v, loc):
+            # Fused write path: one triton kernel does block amax -> E8M0
+            # scale -> E2M1 saturating RNE pack -> scatter of data + scale,
+            # preserving the reserved-slot-0 contract inside the kernel. No
+            # host sync, CUDA-graph safe. Bit-exact with the eager codec for
+            # bf16/fp16 inputs (see mxfp4_quant module docstring).
+            quant_store_kv_mxfp4(
+                cache_k,
+                cache_v,
+                loc,
+                k_buffer,
+                v_buffer,
+                k_scale_buffer,
+                v_scale_buffer,
+            )
+            return
+
+        # Eager OCP codec fallback (CPU tests, fp32/exotic dtypes,
+        # non-contiguous K/V). This remains the bit-exact reference.
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        cache_k_fp4, cache_k_sf = MXFP4KVQuantizeUtil.batched_quantize(cache_k)
+        cache_v_fp4, cache_v_sf = MXFP4KVQuantizeUtil.batched_quantize(cache_v)
+
+        # Slot 0 is the reserved CUDA-graph padding slot. Quantized writes bypass
+        # _store_kv_layer(), so preserve its reserved_skip_index=0 contract here.
+        valid = (loc != 0).view(-1, 1, 1)
+        k_buffer[loc] = torch.where(valid, cache_k_fp4, k_buffer[loc])
+        v_buffer[loc] = torch.where(valid, cache_v_fp4, v_buffer[loc])
+        k_scale_buffer[loc] = torch.where(valid, cache_k_sf, k_scale_buffer[loc])
+        v_scale_buffer[loc] = torch.where(valid, cache_v_sf, v_scale_buffer[loc])
+
+    def dequantize_kv_tensor(
+        self,
+        fp4_tensor: Tensor,
+        scales: Tensor,
+        layer_id: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        if self.head_dim is None:
+            raise RuntimeError("MXFP4 buffers must be created before dequantization.")
+        target_dtype = dtype or self.plain_attention_kv_dtype() or torch.bfloat16
+        return MXFP4KVQuantizeUtil.batched_dequantize(
+            fp4_tensor,
+            scales,
+            logical_dim=self.head_dim,
+            dtype=target_dtype,
+        )
+
+    def dequantize_prev_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+    ) -> tuple[Tensor, Tensor]:
+        return (
+            self.dequantize_kv_tensor(k_fp4, k_scales, layer_id),
+            self.dequantize_kv_tensor(v_fp4, v_scales, layer_id),
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        packed_size = head_num * ((head_dim + 1) // 2) * num_layers * 2 * kv_size
+        scale_size = (
+            head_num
+            * ((head_dim + self.SCALE_BLOCK_SIZE - 1) // self.SCALE_BLOCK_SIZE)
+            * num_layers
+            * 2
+            * kv_size
+        )
+        # PLAIN materializes one layer's K and V as BF16 simultaneously. Reserve
+        # that transient footprint during capacity sizing even though it is not a
+        # persistent pool allocation.
+        plain_scratch_size = (
+            head_num
+            * head_dim
+            * 2
+            * torch.empty((), dtype=torch.bfloat16).element_size()
+            * kv_size
+        )
+        return packed_size + scale_size + plain_scratch_size
+
+
 # Registry: method name -> attention access rules.
 _PREFILL = KVCacheAttentionPhase.PREFILL
 _DECODE = KVCacheAttentionPhase.DECODE
@@ -760,6 +920,7 @@ _NATIVE_FP4_KIND = KVCacheAttentionAccessKind.NATIVE_FP4
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
 _NVFP4_SCALE = "nvfp4"
 _FP4_MX_SCALE = "fp4_mx_block16"
+_MXFP4_SCALE = "mxfp4"
 _FP8_E4M3 = torch.float8_e4m3fn
 _TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _BF16 = torch.bfloat16
@@ -770,6 +931,8 @@ _FP4_MX_MHA_BACKENDS = frozenset(
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
 _CPU_FP8_BACKENDS = frozenset({"intel_amx"})
+_MXFP4_FLASHINFER_BACKENDS = frozenset({"flashinfer"})
+_MXFP4_TRITON_DECODE_BACKENDS = frozenset({"triton"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -844,6 +1007,14 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
         _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
     ),
+    MXFP4KVCacheMethod.name: (
+        _plain(_PREFILL, _MXFP4_FLASHINFER_BACKENDS, _MXFP4_SCALE, _BF16),
+        _plain(_DECODE, _MXFP4_FLASHINFER_BACKENDS, _MXFP4_SCALE, _BF16),
+        # Native decode: the triton kernel in
+        # sglang/kernels/ops/attention/decode_attention_mxfp4_sm120.py reads the
+        # packed E2M1 data + E8M0 scales inline (no PLAIN materialization).
+        _native_fp4(_DECODE, _MXFP4_TRITON_DECODE_BACKENDS, _MXFP4_SCALE, _TORCH_FP4),
+    ),
 }
 
 
@@ -852,6 +1023,7 @@ KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
     "cpu_fp8_e4m3": CPUFP8KVCacheMethod,
     "nvfp4": NVFP4KVCacheMethod,
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
+    "mxfp4": MXFP4KVCacheMethod,
 }
 
 
@@ -865,7 +1037,8 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
         ):
             raise ValueError(
                 "FP4 KV cache storage dtype does not identify the recipe. "
-                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_mx_block16'."
+                "Pass an explicit --kv-cache-dtype value: 'nvfp4', "
+                "'fp4_mx_block16', or 'mxfp4'."
             )
         return None
 
@@ -873,12 +1046,6 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 is deprecated. "
             "Use --kv-cache-dtype=fp4_mx_block16."
-        )
-    if kv_cache_dtype == "mxfp4":
-        raise ValueError(
-            "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "
-            "semantics. Use --kv-cache-dtype=fp4_mx_block16 for the current "
-            "block-size-16 FP4 KV recipe."
         )
     if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
         return kv_cache_dtype

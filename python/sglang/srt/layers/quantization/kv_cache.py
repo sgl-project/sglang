@@ -11,6 +11,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.runtime_context import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,19 @@ class BaseKVCacheMethod(QuantizeMethodBase):
 
     def __init__(self, quant_config: QuantizationConfig):
         self.quant_config = quant_config
+
+    def _checkpoint_kv_scales_apply(self, kv_cache_dtype) -> bool:
+        """Whether --kv-cache-dtype is a per-tensor FP8 cache that consumes this
+        checkpoint's external k_scale/v_scale: fp8_e4m3/fp8_e5m2, or "auto" under an
+        FP8 KV scheme. bf16 and block-scaled formats (mxfp8/mxfp4/nvfp4/...) carry
+        their own/no scales; keys on the raw string, not the shared torch dtype.
+        """
+        if kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+            return True
+        if kv_cache_dtype == "auto":
+            algo = getattr(self.quant_config, "kv_cache_quant_algo", None)
+            return isinstance(algo, str) and algo.upper() == "FP8"
+        return False
 
     def create_weights(self, layer: torch.nn.Module):
         """
@@ -75,6 +89,14 @@ class BaseKVCacheMethod(QuantizeMethodBase):
 
         if not isinstance(k_scale, float) or not isinstance(v_scale, float):
             raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        # Apply the checkpoint's FP8-KV scales only when the runtime KV cache
+        # actually is that FP8 cache; otherwise fall back to unit scales so every
+        # backend reads an identity descale with no per-backend guard. Mirrors
+        # load_kv_cache_scales(), which only loads scales for fp8_e4m3.
+        if not self._checkpoint_kv_scales_apply(get_model().kv_cache_dtype):
+            k_scale = 1.0
+            v_scale = 1.0
 
         # These are used in the final Attention.forward()
         layer.k_scale.copy_(k_scale)

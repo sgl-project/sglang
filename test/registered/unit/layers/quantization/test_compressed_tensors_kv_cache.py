@@ -80,6 +80,37 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
             _config(dict(_FP8_TENSOR_KV_SCHEME, dynamic=True)).kv_cache_quant_algo
         )
 
+    def test_checkpoint_scales_gated_by_kv_cache_dtype(self):
+        """process_weights_after_loading applies the calibrated per-tensor
+        k_scale/v_scale only when --kv-cache-dtype is that FP8 cache: a bf16 or
+        block-scaled (mxfp4) cache carries its own or no scales, so the
+        checkpoint FP8 scales fall back to unit. One gate at load time replaces
+        any per-backend scale-validity guard."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.runtime_context import get_context
+
+        method = _config(_FP8_TENSOR_KV_SCHEME).get_quant_method(
+            _attn(), "model.layers.0.attn"
+        )
+        for kv_cache_dtype, exp_k, exp_v in (
+            ("fp8_e4m3", 0.5, 0.25),
+            ("mxfp4", 1.0, 1.0),
+            ("bfloat16", 1.0, 1.0),
+        ):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                # A layer whose calibrated per-tensor scales were loaded from
+                # the checkpoint (both k_scale and v_scale positive).
+                layer = SimpleNamespace(
+                    k_scale=torch.tensor(0.5), v_scale=torch.tensor(0.25)
+                )
+                with get_context().override_server_args(kv_cache_dtype=kv_cache_dtype):
+                    method.process_weights_after_loading(layer)
+                self.assertEqual(layer.k_scale_float, exp_k)
+                self.assertEqual(layer.v_scale_float, exp_v)
+
     def test_unsupported_scheme_degrades_to_none(self):
         """Unsupported declared schemes must skip the method, not fail
         the boot: such checkpoints serve with an unquantized-scale cache."""
