@@ -122,11 +122,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
-            from sglang.kernels.ops.attention.dsa_metadata import (
-                fused_dsa_decode_metadata,
-            )
-
+        if (
+            (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1
+        ) or self.experimental_kpool_metadata_fusion:
             cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
             cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
             page_indices = torch.empty(
@@ -146,7 +144,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 real_page_table = None
                 real_page_table_arg = page_indices
 
-            fused_dsa_decode_metadata(
+            self._fused_decode_metadata(
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
@@ -245,11 +243,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
-            from sglang.kernels.ops.attention.dsa_metadata import (
-                fused_dsa_target_verify_metadata,
-            )
-
+        if (
+            (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1
+        ) or self.experimental_kpool_metadata_fusion:
             cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
             cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
             page_indices = torch.empty(
@@ -282,7 +278,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 real_page_table = None
                 real_page_table_arg = page_indices
 
-            fused_dsa_target_verify_metadata(
+            self._fused_verify_metadata(
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,

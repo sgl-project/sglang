@@ -71,12 +71,9 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Extra key for caller-defined cache classification.
+        # Namespaces the tree and storage; omitted from KV events.
         self.extra_key = extra_key
-        # Cache salt is kept distinct so it cannot collide with extra_key.
-        # It namespaces the in-process radix tree and external KV events;
-        # external L3/remote storage keys remain token-only and are outside
-        # this contract.
+        # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
@@ -517,6 +514,31 @@ class RadixCache(BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            # A request that was never cached while unfinished can add its
+            # whole prompt and generated output as one leaf. Split that leaf at
+            # the prompt boundary so LRU eviction can discard output KV without
+            # also losing the reusable prompt KV. Reinserting a prefix only
+            # changes radix topology; it reuses the indices inserted above.
+            prompt_key = RadixKey(
+                token_ids[: len(req.origin_input_ids)],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if 0 < len(prompt_key) < key_len:
+                self.insert(
+                    InsertParams(
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        priority=priority + 1,
+                        # Topology-only re-insert: this request created these
+                        # nodes moments ago, so counting it as a hit is the
+                        # same self-referencing inflation `chunked` exists to
+                        # suppress. hit_count drives eviction order, so an
+                        # extra bump would silently promote every prompt node.
+                        chunked=True,
+                    )
+                )
             freed_end = result.prefix_len
         else:
             freed_end = key_len
