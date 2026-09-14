@@ -205,10 +205,7 @@ class NPUSwigluMxfp8Quant(BaseActivation):
     """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
 
     def __init__(self, limit: float):
-        from sgl_kernel_npu.activation.swiglu_mxfp8_quant import swiglu_quant
-
         self._limit = float(limit)
-        self._kernel = swiglu_quant
 
     def _apply_activation(
         self,
@@ -216,14 +213,21 @@ class NPUSwigluMxfp8Quant(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        return self._kernel(
-            hidden_states,
-            group_list=group_list,
-            group_list_type=group_list_type,
-            need_quant=True,
-            do_limit=True,
-            limit=self._limit,
+        # The op sums the group list as per-expert counts and has no cumulative layout;
+        # a cusum list passed through would silently process the wrong rows.
+        if group_list_type != 1:
+            raise ValueError(
+                "swiglu_group_quant takes a per-expert count group list, got "
+                f"group_list_type={group_list_type}"
+            )
+        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+            x=hidden_states,
+            group_index=group_list,
+            quant_mode=2,  # MX: one e8m0 scale per 32-element block
+            group_list_type=0,  # sglang numbers the count layout 1, the op numbers it 0
+            clamp_value=self._limit,
         )
+        return out, scale
 
 
 # =============================================================================
