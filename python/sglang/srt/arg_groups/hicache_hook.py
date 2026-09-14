@@ -94,11 +94,28 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    # handle_hicache runs before handle_speculative_decoding uppercases the
+    # algorithm and collapses the NEXTN alias onto EAGLE; normalize here.
+    spec_algo = (cfg.speculative_algorithm or "").upper()
+    if spec_algo not in ("", "DSPARK", "EAGLE", "NEXTN"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK or EAGLE/NEXTN "
+            "(packed MTP) speculative decoding; other draft-model host "
+            "pools have no DCP index translation."
+        )
+    if spec_algo in ("EAGLE", "NEXTN") and (
+        cfg.speculative_draft_model_path is not None
+        or not getattr(cfg.get_model_config().hf_config, "num_nextn_predict_layers", 0)
+    ):
+        # Only the packed NextN/MTP draft is DCP-safe: its single MLA layer
+        # is owner-striped by the shared write kernel and rides in the
+        # anchor host pool with the anchor's index translation (and its
+        # index-K in the logical-space DSA indexer pool). A separate EAGLE
+        # draft model gets a sidecar host pool without translation.
+        raise NotImplementedError(
+            "HiCache with --dcp-size > 1 supports EAGLE only as the packed "
+            "NextN/MTP draft (num_nextn_predict_layers > 0, no separate "
+            "--speculative-draft-model-path)."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(
