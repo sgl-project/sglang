@@ -34,7 +34,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -98,7 +98,37 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def is_dcp_dsa_extend_phase(forward_batch: ForwardBatch, use_dsa: bool) -> bool:
+    """WQ Hopper DCP: DSA plain EXTEND takes the same owner-filtered,
+    LSE-merged attention path as decode / target-verify.
+
+    The DSA backend never consumes the dense prefix gather
+    (``all_gather_kv_cache_for_mla_extend``; only ``flashinfer_mla_backend``
+    does), and ``flashmla_kv`` already treats each extend token as a decode
+    row with its own top-k slot set, so the decode machinery is exact here.
+    Mirrors ``dsa_backend._should_return_dsa_dcp_lse_flashmla_kv``. MIXED and
+    draft-extend modes are excluded (rejected at config time for DSA+DCP).
+    """
+    if not (use_dsa and get_parallel().dcp_enabled):
+        return False
+    return forward_batch.forward_mode == ForwardMode.EXTEND
+
+
+def is_dcp_lse_merge_phase(forward_batch: ForwardBatch, use_dsa: bool) -> bool:
+    """Every phase whose attention returns a DCP partial + LSE to merge."""
+    return is_dcp_mla_decode_phase(forward_batch) or is_dcp_dsa_extend_phase(
+        forward_batch, use_dsa
+    )
+
+
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    # The DSA backend publishes its LSE base per decode impl
+    # (``dcp_lse_base_on_e``; FlashMLA kernels are natural-log). Fall back to
+    # the backend-name table for the dense MLA backends.
+    backend_obj = get_attn_backend()
+    published = getattr(backend_obj, "dcp_lse_base_on_e", None)
+    if published is not None:
+        return bool(published)
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
@@ -312,7 +342,7 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and is_dcp_mla_decode_phase(forward_batch)
+            and is_dcp_lse_merge_phase(forward_batch, self.use_dsa)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -625,8 +655,10 @@ class DeepseekMLAForwardMixin:
         )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
+        # DSA (WQ Hopper DCP): plain EXTEND also takes the Q all-gather + LSE
+        # merge path; the DSA backend has no consumer for the dense KV gather.
         if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch):
+            if is_dcp_lse_merge_phase(forward_batch, self.use_dsa):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -719,7 +751,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch):
+            elif is_dcp_lse_merge_phase(forward_batch, self.use_dsa):
                 # set return_lse=True to correct attn_output
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
@@ -768,7 +800,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_lse_merge_phase(forward_batch, self.use_dsa):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
