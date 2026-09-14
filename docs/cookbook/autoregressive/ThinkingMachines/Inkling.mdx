@@ -35,7 +35,7 @@ There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the
 
 ```bash Command
 docker pull lmsysorg/sglang:dev-inkling-dspark      # CUDA 13
-docker pull lmsysorg/sglang:dev-cu12-inkling-dspark # CUDA 12
+docker pull lmsysorg/sglang:dev-cu12-inkling-dspark # CUDA 12 (final build; lane retired)
 docker pull lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark  # AMD MI350X / MI355X
 ```
 
@@ -306,4 +306,4 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-DSpark-Preview` — served unquantized alongside the NVFP4 target.
 
-DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).
+DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12 — a final build, since that lane is retired), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).

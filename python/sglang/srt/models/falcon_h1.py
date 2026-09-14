@@ -70,8 +70,7 @@ class FalconH1MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.layer_id = layer_id
@@ -96,7 +95,6 @@ class FalconH1MLP(nn.Module):
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: FalconH1Config,
@@ -275,16 +273,18 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm)
-            // self.tp_size : (2 * self.d_ssm + self.groups_time_state_size)
+            (2 * self.d_ssm) // self.tp_size : (
+                2 * self.d_ssm + self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[2]
         # C vector 2 * d_ssm + (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm + self.groups_time_state_size)
-            // self.tp_size : (2 * self.d_ssm + 2 * self.groups_time_state_size)
+            (2 * self.d_ssm + self.groups_time_state_size) // self.tp_size : (
+                2 * self.d_ssm + 2 * self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[3]
         # dt vector 2 * d_ssm + 2 * (n_group * d_state)
@@ -521,7 +521,6 @@ class FalconH1ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq" in name:
                 continue
 

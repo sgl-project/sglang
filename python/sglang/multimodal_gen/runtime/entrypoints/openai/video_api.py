@@ -133,6 +133,7 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "cfg_gate_step",
     "enable_cache_dit",
     "quality",
+    "skip_softmax_params",
 )
 
 
@@ -285,12 +286,14 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "max_sequence_length": request.max_sequence_length,
         "flow_shift": request.flow_shift,
         "enable_teacache": request.enable_teacache,
+        "use_diffusion_decoder": _extra_value(request, "use_diffusion_decoder"),
         "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
         "cache_dit_params": _extra_value(request, "cache_dit_params"),
         "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
         "attention_backend_override": _extra_value(
             request, "attention_backend_override"
         ),
+        "skip_softmax_params": _extra_value(request, "skip_softmax_params"),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -494,6 +497,7 @@ async def create_video(
     output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
     output_path: Optional[str] = Form(None),
+    perf_dump_path: Optional[str] = Form(None),
     extra_params: Optional[str] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
@@ -645,6 +649,7 @@ async def create_video(
             output_compression=form_value("output_compression", output_compression),
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
+            perf_dump_path=form_value("perf_dump_path", perf_dump_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
             **extra_request_fields,
         )

@@ -3,6 +3,9 @@
 
 import unittest
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    trailing_padding_used_len,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -10,6 +13,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 
 class TestMiniMaxH3PackedSequence(unittest.TestCase):
+    def test_trailing_padding_layout(self):
+        self.assertEqual(trailing_padding_used_len(64, 61, (0, 61, 64)), 61)
+        self.assertIsNone(trailing_padding_used_len(64, 31, (0, 32, 64)))
+        self.assertIsNone(trailing_padding_used_len(64, 61, (0, 61)))
+
     def test_t2va_structure(self):
         built = minimax_h3_packed_sequence(
             text_len=97,

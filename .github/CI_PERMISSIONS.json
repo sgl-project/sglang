@@ -278,7 +278,7 @@
     "Shunkangz": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
     "SimonCqk": {
@@ -900,6 +900,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "lucifer1004": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "maocheng23": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1189,6 +1195,12 @@
         "reason": "top contributor"
     },
     "sshleifer": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "stepinto": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
