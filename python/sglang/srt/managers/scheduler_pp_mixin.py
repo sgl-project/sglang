@@ -63,7 +63,7 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
-    # Rank-local event ownership, never part of the cross-rank tensor payload.
+    # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
 
 
