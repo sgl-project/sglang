@@ -50,7 +50,7 @@ class _FakeGraphCtx:
         return False
 
 
-def _make_backend(runner, *, use_symmetric_memory_graph_pool=False):
+def _make_backend(runner, *, use_symmetric_memory_graph_pool=False, prime=False):
     """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
     touch CUDA), wiring just the attributes ``capture_one`` reads."""
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
@@ -68,6 +68,7 @@ def _make_backend(runner, *, use_symmetric_memory_graph_pool=False):
     backend._device_module = runner.device_module
     backend._tp_group = runner.model_runner.tp_group
     backend._use_symmetric_memory_graph_pool = use_symmetric_memory_graph_pool
+    backend._prime_symmetric_memory_graph = prime
     return backend
 
 
@@ -114,7 +115,9 @@ class TestCaptureOneNoProfiling(CustomTestCase):
 
     def test_resets_state_after_disposable_prime(self):
         runner = _make_runner(enable_profile=False, profiler=None)
-        backend = _make_backend(runner, use_symmetric_memory_graph_pool=True)
+        backend = _make_backend(
+            runner, use_symmetric_memory_graph_pool=True, prime=True
+        )
         forward_fn = mock.Mock(return_value=object())
         post_warmup_hook = mock.Mock()
 

@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+    should_prime_symmetric_memory_graph,
     should_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
@@ -80,6 +81,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._use_symmetric_memory_graph_pool = (
             should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
+        )
+        self._prime_symmetric_memory_graph = should_prime_symmetric_memory_graph(
+            cuda_graph_runner
         )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
@@ -141,7 +145,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         prime_graph = None
         with defer_symmetric_memory_graph_registration(
             self._tp_group,
-            enabled=self._use_symmetric_memory_graph_pool,
+            enabled=self._prime_symmetric_memory_graph,
         ) as should_prime:
             if should_prime:
                 # Keep lazy/JIT work from the final warmup out of this extra capture.
@@ -159,8 +163,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 ):
                     captured_fn()
 
-        if should_prime and post_warmup_hook is not None:
-            post_warmup_hook()
+        if should_prime:
+            if post_warmup_hook is not None:
+                post_warmup_hook()
             self._device_module.synchronize()
             self._tp_group.barrier()
 

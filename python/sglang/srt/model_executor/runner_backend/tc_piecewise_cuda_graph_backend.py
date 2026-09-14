@@ -38,10 +38,12 @@ from sglang.srt.compilation.compile_phase import (
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+    set_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+    should_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
@@ -96,6 +98,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = model_runner.tp_group
+        self._use_symmetric_memory_graph_pool = (
+            should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._compile_config: CompilationConfig = self.build_compilation_config(
             model_runner.server_args
@@ -220,12 +225,18 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
+        set_use_dedicated_symmetric_memory_graph_pool(
+            self._use_symmetric_memory_graph_pool
+        )
+        set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
             with self.replay_session():
                 with set_pcg_capture_stream(stream):
                     yield
         finally:
+            set_graph_pool_id(None)
+            set_use_dedicated_symmetric_memory_graph_pool(False)
             self._capture_stream = None
 
     def capture_one(

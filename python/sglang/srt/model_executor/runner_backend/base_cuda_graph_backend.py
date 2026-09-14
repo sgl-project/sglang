@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
+)
+from sglang.srt.utils import is_cuda
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -31,8 +36,21 @@ if TYPE_CHECKING:
 def should_use_dedicated_symmetric_memory_graph_pool(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> bool:
+    return (
+        is_cuda()
+        and is_symmetric_memory_enabled()
+        and cuda_graph_runner.model_runner.tp_group.world_size > 1
+    )
+
+
+def should_prime_symmetric_memory_graph(
+    cuda_graph_runner: BaseCudaGraphRunner,
+) -> bool:
     # Ordinary graphs keep one capture because kernels may retain graph-scoped state.
-    return cuda_graph_runner.model_runner.spec_algorithm.is_speculative()
+    return (
+        should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
+        and cuda_graph_runner.model_runner.spec_algorithm.is_speculative()
+    )
 
 
 class BaseCudaGraphBackend(ABC):
