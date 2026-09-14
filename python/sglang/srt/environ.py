@@ -980,6 +980,11 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Opt in to the Marlin atomicAdd K-slice reduction for narrow outputs
+    # (n < 2048, k >= 2048). Faster for those shapes, but the summation order
+    # follows CTA scheduling, so results are not bitwise reproducible between
+    # runs. Ignored under --enable-deterministic-inference.
+    SGLANG_MARLIN_USE_ATOMIC_ADD = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
