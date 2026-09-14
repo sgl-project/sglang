@@ -22,7 +22,7 @@ features = ["python", "parallel"]
 # which renames the built artifact.
 name = "sglang_mm_core"
 # cdylib: the PyO3 module (`sglang.srt.rust_extensions._multimodal`).
-# rlib:   pure-Rust core linked by sglang-server's native MM path.
+# rlib:   pure-Rust core linked by sglang-server's Rust MM path.
 crate-type = ["cdylib", "rlib"]
 
 [features]

@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _full_attention_ids(*, num_layers: int, interval: int) -> list:
@@ -75,6 +75,7 @@ class _RecordingKVManager:
         self.is_mla_backend = False
         self.is_hybrid_mla_backend = False
         self.enable_custom_mem_pool = False
+        self.max_transfer_batch_indices = 0
         self.pp_size = pp_size
         self.kv_args = SimpleNamespace(prefill_start_layer=prefill_start_layer)
         self.blocks = []

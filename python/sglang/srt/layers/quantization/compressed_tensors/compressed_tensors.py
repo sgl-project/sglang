@@ -69,7 +69,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sm100_supported, is_xpu
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -838,7 +839,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
                     use_blackwell_triton = (
                         moe_backend.is_auto()
-                        and is_sm100_supported()
+                        and get_platform().is_sm100
                         and triton_supported
                     )
                     if moe_backend.is_triton() and not triton_supported:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -27,11 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import (
-    get_memory,
-    get_parallel,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     import torch
@@ -91,6 +87,44 @@ def _with_mtp_layer_mapping(
         transfer_layer_start + depth: target_device_layer_num + depth
         for depth in range(draft_layer_num)
     }
+
+
+class _DeepSeekV4LayerMappings(NamedTuple):
+    transfer_layer_num: int
+    full: dict[int, int]
+    swa: dict[int, int]
+    c4: dict[int, int]
+    c128: dict[int, int]
+    c4_state: dict[int, int]
+    c4_state_global_layers: list[int]
+
+
+def _resolve_deepseek_v4_layer_mappings(
+    kvcache: Any,
+) -> _DeepSeekV4LayerMappings:
+    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
+    full = {layer: layer for layer in range(transfer_layer_num)}
+    swa = {} if getattr(kvcache, "_unified_kv", False) else full.copy()
+
+    c4, c128, c4_state_global_layers = {}, {}, []
+    for local_layer, item in enumerate(
+        kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
+    ):
+        if item.compress_ratio == 4:
+            c4[local_layer] = item.compress_layer_id
+            c4_state_global_layers.append(kvcache.start_layer + local_layer)
+        elif item.compress_ratio == 128:
+            c128[local_layer] = item.compress_layer_id
+
+    return _DeepSeekV4LayerMappings(
+        transfer_layer_num=transfer_layer_num,
+        full=full,
+        swa=swa,
+        c4=c4,
+        c128=c128,
+        c4_state={layer: index for index, layer in enumerate(c4)},
+        c4_state_global_layers=c4_state_global_layers,
+    )
 
 
 def build_kv_host_pool(
@@ -403,7 +437,7 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
     device_full_pages = (device_full_size + page_size - 1) // page_size
@@ -418,7 +452,15 @@ def _deepseek_v4_num_host_pages(
     ratio = get_memory().hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
-    return full_host_pages, swa_host_pages
+
+    # NPU sizes the independent C128 host pool from its device page count.
+    # For example, host pages = device pages * hicache_ratio.
+    # GPU keeps the FULL page count because C128 is a KV-derived sidecar.
+    c128_host_pages = full_host_pages
+    c128_attn_allocator = getattr(allocator, "c128_attn_allocator", None)
+    if c128_attn_allocator is not None:
+        c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
+    return full_host_pages, swa_host_pages, c128_host_pages
 
 
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
@@ -432,6 +474,101 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+@dataclass(frozen=True)
+class _IndexerRegion:
+    """One page-contiguous indexer buffer group to mirror on the host."""
+
+    name: PoolName
+    device_buffers: list
+    item_bytes: int
+    slot_page_size: int
+    # FP4 page rows group their slots instead of laying tokens out flat, so the
+    # fused-row token-granular copy does not apply and transfers must be whole
+    # pages. The fused FP8 row has no such restriction.
+    page_aligned_only: bool
+
+
+def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
+    """
+    Resolve the indexer HiCache regions, hiding the FP8/FP4 split from the
+    stack builder. FP8 keeps key and scale fused in one buffer, while FP4
+    stores payload and scale separately, so it maps to two host pools.
+    """
+    import torch
+
+    pool = kvcache.c4_indexer_kv_pool
+    if getattr(pool, "has_npu_storage", False):
+        # NPU stores C4 int8 K and fp16 scale in separate PA_ND buffers.  Keep
+        # the FULL logical page geometry for HiCache indices. The transfer path
+        # derives the native C4 page geometry from these device buffers.
+        k_buffers = pool.index_k_buffer
+        scale_buffers = pool.index_scale_buffer
+        return [
+            _IndexerRegion(
+                name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+                device_buffers=k_buffers,
+                item_bytes=int(k_buffers[0][0].numel() * k_buffers[0].element_size()),
+                slot_page_size=page_size,
+                page_aligned_only=False,
+            ),
+            _IndexerRegion(
+                name=PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+                device_buffers=scale_buffers,
+                item_bytes=int(
+                    scale_buffers[0][0].numel() * scale_buffers[0].element_size()
+                ),
+                slot_page_size=page_size,
+                page_aligned_only=False,
+            ),
+        ]
+
+    fused = pool.index_k_with_scale_buffer
+    if fused is not None:
+        return [
+            _IndexerRegion(
+                name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+                device_buffers=fused,
+                item_bytes=fused[0].shape[1] * fused[0].element_size(),
+                slot_page_size=page_size,
+                page_aligned_only=False,
+            )
+        ]
+
+    payload_ref = pool.index_k_payload_buffer[0]
+    scale_ref = pool.index_k_scale_buffer[0]
+    # A page row covers ``page_slots`` C4 slots, i.e. one tree page of tokens
+    # after 4:1 compression.
+    page_slots = payload_ref.shape[3]
+    if scale_ref.shape[3] != page_slots:
+        raise ValueError(
+            "FP4 indexer payload and scale must agree on slots per page: "
+            f"payload={page_slots}, scale={scale_ref.shape[3]}"
+        )
+    if page_size % page_slots != 0:
+        raise ValueError(
+            f"Tree page size {page_size} must be a multiple of the FP4 indexer "
+            f"slots per page {page_slots}"
+        )
+    payload = [b.view(torch.uint8).flatten(1) for b in pool.index_k_payload_buffer]
+    scale = [b.view(torch.uint8).flatten(1) for b in pool.index_k_scale_buffer]
+    return [
+        _IndexerRegion(
+            name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+            device_buffers=payload,
+            item_bytes=payload[0].shape[1],
+            slot_page_size=page_size,
+            page_aligned_only=True,
+        ),
+        _IndexerRegion(
+            name=PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            device_buffers=scale,
+            item_bytes=scale[0].shape[1],
+            slot_page_size=page_size,
+            page_aligned_only=True,
+        ),
+    ]
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -440,14 +577,17 @@ def build_deepseek_v4_hicache_stack(
     storage_backend: Optional[str],
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    host_c128_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
-    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
-    full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+    layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
+    transfer_layer_num = layer_mappings.transfer_layer_num
+    full_layer_mapping = layer_mappings.full
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     mtp_swa_device_buffers = []
@@ -462,9 +602,7 @@ def build_deepseek_v4_hicache_stack(
                 f"got {len(kvcache.swa_kv_pool.kv_buffer)} buffers for "
                 f"{transfer_layer_num} local layers"
             )
-        swa_layer_mapping = {
-            layer_id: layer_id for layer_id in range(transfer_layer_num)
-        }
+        swa_layer_mapping = layer_mappings.swa
         # Keep every uncompressed draft SWA layer after the target SWA layers.
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         mtp_swa_device_buffers = [
@@ -479,25 +617,15 @@ def build_deepseek_v4_hicache_stack(
             draft_layer_num=len(mtp_swa_device_buffers),
         )
 
-    c4_layer_mapping = {}
-    c128_layer_mapping = {}
-    c4_state_local_layers = []
-    c4_state_global_layers = []
-    for local_layer_id, layer_item in enumerate(
-        kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
-    ):
-        global_layer_id = kvcache.start_layer + local_layer_id
-        if layer_item.compress_ratio == 4:
-            c4_layer_mapping[local_layer_id] = layer_item.compress_layer_id
-            c4_state_local_layers.append(local_layer_id)
-            c4_state_global_layers.append(global_layer_id)
-        elif layer_item.compress_ratio == 128:
-            c128_layer_mapping[local_layer_id] = layer_item.compress_layer_id
-
-    c4_state_mapping = {
-        layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
-    }
-    num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
+    c4_layer_mapping = layer_mappings.c4
+    c128_layer_mapping = layer_mappings.c128
+    c4_state_mapping = layer_mappings.c4_state
+    c4_state_global_layers = layer_mappings.c4_state_global_layers
+    (
+        num_host_pages,
+        swa_num_host_pages,
+        c128_num_host_pages,
+    ) = _deepseek_v4_num_host_pages(
         params=params,
         kvcache=kvcache,
         page_size=page_size,
@@ -549,6 +677,9 @@ def build_deepseek_v4_hicache_stack(
 
     if c4_layer_mapping:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
+        # C4 is KV-derived, so its HiCache indices stay in the FULL logical
+        # coordinate space. NPU transfer code derives the native C4 page size
+        # (for example 32 rather than 128) from the device-buffer shape.
         c4_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4),
             device_buffers=c4_device_buffers,
@@ -558,36 +689,34 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
         )
-        c4_indexer_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
-            device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            item_bytes=(
-                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
-                * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].element_size()
-            ),
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DEEPSEEK_V4_C4,
+                host_pool=c4_host_pool,
+                device_pool=kvcache.c4_kv_pool,
+                layer_mapping=c4_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+            )
         )
-        entries.extend(
-            [
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            entries.append(
                 build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    host_pool=c4_host_pool,
-                    device_pool=kvcache.c4_kv_pool,
-                    layer_mapping=c4_layer_mapping,
-                    transfer_layer_num=transfer_layer_num,
-                ),
-                build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C4_INDEXER,
-                    host_pool=c4_indexer_host_pool,
+                    name=region.name,
+                    host_pool=DeepSeekV4PagedHostPool(
+                        pool_name=str(region.name),
+                        device_buffers=region.device_buffers,
+                        item_bytes=region.item_bytes,
+                        num_host_pages=num_host_pages,
+                        slot_page_size=region.slot_page_size,
+                        layout=get_memory().hicache_mem_layout,
+                        allocator_type=_get_allocator_type(),
+                        page_aligned_only=region.page_aligned_only,
+                    ),
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
-                ),
-            ]
-        )
+                )
+            )
 
         if not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -635,12 +764,20 @@ def build_deepseek_v4_hicache_stack(
         c128_device_buffers, c128_item_bytes = _dsv4_compressed_region_buffers(
             kvcache, 128
         )
+        # NPU C128 host views use kernel_page_size, for example 16 instead of 128.
+        # GPU pools lack this attribute and fall back to the global page_size.
+        _c128_pool = getattr(kvcache, "c128_kv_pool", None)
+        c128_slot_page_size = getattr(_c128_pool, "kernel_page_size", page_size)
+        # NPU derives the independent C128 host budget from its device pool.
+        c128_attn_allocator = getattr(
+            params.token_to_kv_pool_allocator, "c128_attn_allocator", None
+        )
         c128_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128),
             device_buffers=c128_device_buffers,
             item_bytes=c128_item_bytes,
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
+            num_host_pages=c128_num_host_pages,
+            slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
         )
@@ -654,6 +791,20 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c128_kv_pool,
                     layer_mapping=c128_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    # NPU C128 uses bare allocator callbacks for independent indices.
+                    # FULL leaf eviction also frees each attached C128 host value.
+                    # GPU keeps its KV-derived sidecar callbacks unset.
+                    host_evict_fn=host_c128_evict_fn,
+                    device_alloc_fn=(
+                        c128_attn_allocator.alloc
+                        if c128_attn_allocator is not None
+                        else None
+                    ),
+                    device_free_fn=(
+                        c128_attn_allocator.free
+                        if c128_attn_allocator is not None
+                        else None
+                    ),
                 ),
             ]
         )
@@ -700,8 +851,11 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
     mtp_draft_device_pools = tuple(
-        pool.full_kv_pool for pool in params.mtp_draft_device_pools
+        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+        for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
@@ -827,7 +981,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
-        allocator_type=get_memory().hicache_storage_backend,
+        allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
     )
     entries = [
@@ -997,10 +1151,7 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import (
-        DSATokenToKVPool,
-        HybridLinearKVPool,
-    )
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -1144,6 +1295,7 @@ _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
     ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
     ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
     ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
+    ComponentType.C128: ("c128_kv_pool_host", "_c128_kv_pool_host"),
 }
 
 
@@ -1164,6 +1316,18 @@ class StackStrategy:
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
         raise NotImplementedError
 
+    def build_direct_linker_pool_group(
+        self,
+        *,
+        kvcache: Any,
+        params: CacheInitParams,
+        page_size: int,
+    ):
+        raise ValueError(
+            "The selected hybrid pool strategy does not support the direct "
+            f"external linker: {type(self).__name__}."
+        )
+
     def build(
         self,
         *,
@@ -1181,16 +1345,30 @@ class StackStrategy:
         raise NotImplementedError
 
 
+def _delegate_c128_host_evict(cache, n: int) -> int:
+    """Delegate C128 host pressure to FULL leaf eviction.
+
+    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
+    return cache.evict_host(n * 128, ComponentType.FULL)
+
+
 class _DeepSeekV4Strategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components in (
+            {ComponentType.FULL, ComponentType.SWA},
+            {ComponentType.FULL, ComponentType.SWA, ComponentType.C128},
         )
 
-        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components == {
-            ComponentType.FULL,
-            ComponentType.SWA,
-        }
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_deepseek_v4_device_pool_group,
+        )
+
+        return _build_deepseek_v4_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1206,6 +1384,7 @@ class _DeepSeekV4Strategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        layer_mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
             kvcache=kvcache,
@@ -1213,11 +1392,31 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            # NPU delegates C128 host pressure to FULL host-leaf eviction.
+            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            host_c128_evict_fn=(
+                (lambda n: _delegate_c128_host_evict(cache, n))
+                if ComponentType.C128 in cache.components
+                else None
+            ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            layer_mappings=layer_mappings,
         )
+        # NPU drives C128 as an independent tree component, so adding a KV-derived
+        # sidecar would duplicate transfers. Add that sidecar only on GPU.
+        _sidecar_srcs = [
+            (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
+        ]
+        if ComponentType.C128 not in cache.components:
+            _sidecar_srcs.append((PoolName.DEEPSEEK_V4_C128, PoolName.KV))
         sidecars = [
             SidecarPoolSpec(
                 pool_name=name,
@@ -1228,14 +1427,7 @@ class _DeepSeekV4Strategy(StackStrategy):
                     else PoolHitPolicy.ALL_PAGES
                 ),
             )
-            for name, src in (
-                (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
-                (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
-                (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
-                (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
-                (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
-                (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
-            )
+            for name, src in _sidecar_srcs
             if name in host_pool_group.entry_map
         ]
         component_host_pools = {
@@ -1244,6 +1436,13 @@ class _DeepSeekV4Strategy(StackStrategy):
         if PoolName.SWA in host_pool_group.entry_map:
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA
+            )
+        if (
+            ComponentType.C128 in cache.components
+            and PoolName.DEEPSEEK_V4_C128 in host_pool_group.entry_map
+        ):
+            component_host_pools[ComponentType.C128] = host_pool_group.get_pool(
+                PoolName.DEEPSEEK_V4_C128
             )
 
         return StackBuildResult(
@@ -1320,9 +1519,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
@@ -1376,9 +1573,7 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
@@ -1453,6 +1648,15 @@ class _DsaStrategy(StackStrategy):
         return isinstance(kvcache, DSATokenToKVPool) and components == {
             ComponentType.FULL
         }
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_dsa_device_pool_group,
+        )
+
+        return _build_dsa_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1566,9 +1770,7 @@ class _MiniMaxSparseStrategy(StackStrategy):
 
 class _PlainKvStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.memory_pool import (
             DSATokenToKVPool,
             HybridLinearKVPool,
@@ -1776,7 +1978,7 @@ def build_minimax_sparse_hicache_stack(
             index_k_pool,
             kv_host_pool,
             get_memory().hicache_mem_layout,
-            allocator_type=get_memory().hicache_storage_backend,
+            allocator_type=_get_allocator_type(),
         )
         entries.append(
             build_pool_entry(

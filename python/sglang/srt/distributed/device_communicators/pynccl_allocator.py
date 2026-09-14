@@ -299,9 +299,9 @@ class SymmetricMemoryContext:
         self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
 
     def __enter__(self):
-        assert (
-            self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        assert self.group_coordinator.pynccl_comm is not None, (
+            f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        )
 
         self.resume()
         return self
@@ -335,9 +335,9 @@ class SymmetricMemoryContext:
 
     def resume(self):
         if self.is_graph_capture:
-            assert (
-                _graph_pool_id is not None
-            ), "graph_pool_id is not set under graph capture"
+            assert _graph_pool_id is not None, (
+                "graph_pool_id is not set under graph capture"
+            )
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
                 torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
@@ -371,9 +371,9 @@ class SymmetricMemoryContext:
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
         result = _register_func(self._comm_ptr)
-        assert (
-            result == 0
-        ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        assert result == 0, (
+            f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        )
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):

@@ -23,6 +23,7 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -595,7 +596,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # its GPU transport proxy lazy until that assignment is known, avoiding a full
         # image copy to every rank. The scheduler only honors this marker once
         # the processor has already set the item's hash and pad value.
-        if self.keep_mm_features_on_device and self.server_args.mm_enable_dp_encoder:
+        if self.keep_mm_features_on_device and get_mm().mm_enable_dp_encoder:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True

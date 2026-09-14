@@ -109,7 +109,7 @@ elif hicache_mem_layout == "layer_first":
     for operation in operations:
         cache_controller.generic_page_backup(operation, batch_size=128)
 tok = time.monotonic()
-print(f"{tok-tik:.6f} s")
+print(f"{tok - tik:.6f} s")
 
 operations = [
     PrefetchOperation(
@@ -137,4 +137,4 @@ elif hicache_mem_layout == "layer_first":
     for operation in operations:
         cache_controller.generic_page_transfer(operation, batch_size=128)
 tok = time.monotonic()
-print(f"{tok-tik:.6f} s")
+print(f"{tok - tik:.6f} s")

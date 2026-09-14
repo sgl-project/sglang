@@ -399,7 +399,7 @@ class FlexKVRadixCache(RadixCache):
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
+            kv_committed_len = req.kv.kv_committed_len
         else:
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
@@ -409,7 +409,7 @@ class FlexKVRadixCache(RadixCache):
         if not token_ids:
             return
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         # Anchor on the new last_device_node so FlexKV's lock matches

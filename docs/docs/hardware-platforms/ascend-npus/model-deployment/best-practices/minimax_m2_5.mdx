@@ -105,7 +105,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 18 \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 32768 \
-    --cuda-graph-bs 2 4 6 8 10 12 14 16 18 24 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 24 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -212,7 +212,7 @@ python3 -m sglang.launch_server \
     --prefill-max-requests 10 \
     --chunked-prefill-size 67072 \
     --max-prefill-tokens 67000 \
-    --cuda-graph-bs 2 4 8 12 16 18 20 22 24 26 \
+    --cuda-graph-bs-decode 2 4 8 12 16 18 20 22 24 26 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -324,7 +324,7 @@ python3 -m sglang.launch_server \
     --prefill-max-requests 4 \
     --chunked-prefill-size 160000 \
     --max-prefill-tokens 80000 \
-    --cuda-graph-bs 2 4 6 8 \
+    --cuda-graph-bs-decode 2 4 6 8 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -437,7 +437,7 @@ python3 -m sglang.launch_server \
     --prefill-max-requests 3 \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 8192 \
-    --cuda-graph-bs 1 2 3 4 5 6 \
+    --cuda-graph-bs-decode 1 2 3 4 5 6 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -541,7 +541,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --chunked-prefill-size 196608 \
     --max-prefill-tokens 8192 \
-    --cuda-graph-bs 1 2 4 8 12 16 20 \
+    --cuda-graph-bs-decode 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
     --fuseep-mode 2 \
     --quantization modelslim \

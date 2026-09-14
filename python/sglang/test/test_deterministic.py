@@ -510,7 +510,7 @@ def test_deterministic(args):
 
         # If logprobs are enabled, compare them across different batch sizes
         if args.return_logprob:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print("Logprobs Comparison Across Batch Sizes")
             print("=" * 60)
 
@@ -536,7 +536,7 @@ def test_deterministic(args):
                     match, msg = compare_logprobs(ref_logprobs, resp_logprobs)
 
                     if not match:
-                        print(f"  ✗ Sample {j+1}: {msg}")
+                        print(f"  ✗ Sample {j + 1}: {msg}")
                         mismatches.append((j + 1, msg))
                         all_match = False
 
@@ -549,7 +549,7 @@ def test_deterministic(args):
                     )
                     logprob_results.append(0)
 
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             if all(r == 1 for r in logprob_results):
                 print("✓✓✓ Logprobs are identical across all batch sizes! ✓✓✓")
             else:
@@ -653,7 +653,7 @@ def test_deterministic(args):
         print(f"  Logprob:  {uncached_logprob:.10f}")
 
         # Step 6: Compare results
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Comparison 1: Decode (Request 1) vs Prefill with Cache (Request 2)")
         print("=" * 60)
 
@@ -679,7 +679,7 @@ def test_deterministic(args):
             print(f"  Logprob difference: {diff:.10e}")
         print(f"  Note: We expect these to be DIFFERENT (decode vs prefill kernels)")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(
             "Comparison 2: Cached Prefill (Request 2) vs Uncached Prefill (Request 3)"
         )
@@ -708,7 +708,7 @@ def test_deterministic(args):
             print(f"    Difference: {diff:.10e}")
         print(f"  Note: We expect these to be IDENTICAL (both prefill kernels)")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         if token_match and logprob_match:
             print("✓✓✓ TEST PASSED - Radix cache is consistent! ✓✓✓")
             return [1]
