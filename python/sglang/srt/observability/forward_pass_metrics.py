@@ -170,7 +170,7 @@ class _FpmPublisherThread:
         self._thread.start()
 
     def set_idle(self, idle: bool) -> None:
-        """A quiet publisher queue alone does not mean GPU execution is idle."""
+        """Set whether the scheduler permits idle heartbeats."""
         self._idle = idle
 
     def publish(self, metrics: ForwardPassMetrics) -> None:
