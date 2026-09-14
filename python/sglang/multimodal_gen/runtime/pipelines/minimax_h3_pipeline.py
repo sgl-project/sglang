@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -25,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_TASK_PARTITIONS,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -75,6 +79,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         subfolders = {
             "fl2va": "FL2VA",
             "ref2va": "Ref2VA",
+            "hybrid": "Ref2VA",
         }
         try:
             return subfolders[normalized]
@@ -88,6 +93,14 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         model_variant = self.server_args.model_variant
         if model_variant is not None:
             semantic_subfolder = self.model_subfolder_for_variant(model_variant)
+            if model_variant.strip().lower() == "hybrid" and not (
+                self.server_args.component_weights_paths.get("transformer")
+                or self.server_args.transformer_weights_path
+            ):
+                raise ValueError(
+                    "MiniMax H3 --model-variant hybrid requires explicit merged "
+                    "weights via --component-weights-paths.transformer"
+                )
             explicit_subfolder = self.server_args.model_subfolder
             if (
                 explicit_subfolder is not None
@@ -104,11 +117,19 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
         if (
             model_variant is not None
-            and self.release_metadata.partition != model_variant.strip().lower()
+            and self.release_metadata.partition != semantic_subfolder.lower()
         ):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
                 f"--model-variant {model_variant!r}"
+            )
+        if model_variant is not None and model_variant.strip().lower() == "hybrid":
+            # merged checkpoints share the native graph across all three tasks
+            # keep the base partition contract strict unless explicitly selected
+            self.release_metadata = replace(
+                self.release_metadata,
+                partition="hybrid",
+                tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
         return model_index
 

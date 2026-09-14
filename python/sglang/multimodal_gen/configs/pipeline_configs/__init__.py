@@ -65,6 +65,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+    SenseNovaU1PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -99,6 +102,7 @@ __all__ = [
     "PipelineConfig",
     "SanaPipelineConfig",
     "SanaVideoPipelineConfig",
+    "SenseNovaU1PipelineConfig",
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "Pi05PipelineConfig",

@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ScheduleBatch,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeReq:

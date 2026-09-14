@@ -58,6 +58,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -89,7 +90,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -105,6 +106,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -316,6 +318,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
@@ -866,6 +874,17 @@ def is_mnnvl_fabric_device() -> bool:
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
+
+
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
 
 
 @lru_cache(maxsize=1)
@@ -1812,6 +1831,7 @@ def smart_to_rgb(
     if not isinstance(image, Image.Image):
         return image
 
+    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
         width, height = image.size
@@ -1953,6 +1973,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 
@@ -2408,6 +2430,14 @@ def configure_logger(server_args, prefix: str = ""):
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
@@ -4106,7 +4136,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
+    logger.debug(
         f"Freezing GC in {context} process. "
         f"gen0: {g0_before}->{g0_after}, "
         f"gen1: {g1_before}->{g1_after}, "
