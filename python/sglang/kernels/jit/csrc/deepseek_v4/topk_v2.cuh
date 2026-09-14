@@ -661,9 +661,7 @@ struct TopKKernel {
       // correction that `bias` carries on this path. No caller needs both, so
       // reject the combination rather than emit indices that are short by up to
       // kVecSize - 1.
-      RuntimeCheck(
-          !raw_indices.has_value(),
-          "topk_transform_paged: row_starts is incompatible with raw_indices");
+      RuntimeCheck(!raw_indices.has_value(), "topk_transform_paged: row_starts is incompatible with raw_indices");
       // `mask_head` writes the residue columns back into `scores`, so rows that
       // overlap would let one row clobber its neighbour's tail. Only the packed
       // path writes, so the check stays here rather than covering every caller.
