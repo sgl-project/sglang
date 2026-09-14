@@ -140,3 +140,11 @@ def test_pp_comm_stream_avoids_schedule_forward_and_copy_streams():
     )
 
     assert stream.cuda_stream == 4
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
