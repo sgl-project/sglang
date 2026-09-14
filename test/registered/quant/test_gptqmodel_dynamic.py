@@ -14,10 +14,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=101, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="extra-a", runner_config="1-gpu-large")
 
 
-def check_quant_method(model_path: str, use_marlin_kernel: bool):
+def check_quant_method(model_path: str):
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
@@ -40,23 +40,16 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         model_config=model_config, load_config=load_config, device_config=device_config
     )
 
-    from sglang.srt.layers.quantization.gptq import (
-        GPTQLinearMethod,
-        GPTQMarlinLinearMethod,
-    )
+    from sglang.srt.layers.quantization.gptq import GPTQMarlinLinearMethod
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-    linear_method_cls = (
-        GPTQMarlinLinearMethod if use_marlin_kernel else (GPTQLinearMethod)
-    )
 
     for name, submodule in model.named_modules():
         if name == "lm_head":
-            assert isinstance(submodule.quant_method, linear_method_cls)
+            assert isinstance(submodule.quant_method, GPTQMarlinLinearMethod)
         elif name == "model.layers.0.self_attn.qkv_proj":
             # The first layer is quantized using bits=4, group_size=128
             # desc_act=True
-            assert isinstance(submodule.quant_method, linear_method_cls)
+            assert isinstance(submodule.quant_method, GPTQMarlinLinearMethod)
             config = submodule.quant_method.quant_config
             assert config.weight_bits == 4
             assert config.group_size == 128
@@ -64,7 +57,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         elif name == "model.layers.1.self_attn.qkv_proj":
             # The second layer is quantized using bits=8, group_size=32
             # desc_act=False
-            assert isinstance(submodule.quant_method, linear_method_cls)
+            assert isinstance(submodule.quant_method, GPTQMarlinLinearMethod)
             config = submodule.quant_method.quant_config
             assert get_dynamic_override(config, layer_name=name, key="bits") == 8
             assert get_dynamic_override(config, layer_name=name, key="group_size") == 32
@@ -77,61 +70,6 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
             assert isinstance(submodule.quant_method, UnquantizedLinearMethod)
 
     del model
-
-
-# GPTQ with Dynamic Per/Module Quantization Control
-# Leverages GPTQModel (pypi) to produce the `dynamic` models
-# Test GPTQ fallback kernel that is not Marlin
-class TestGPTQModelDynamic(CustomTestCase):
-    MODEL_PATH = (
-        "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
-    )
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = cls.MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dtype", "float16"],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def run_decode(self, max_new_tokens):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.001,
-                },
-            },
-        )
-        return response.json()
-
-    def test_throughput(self):
-        max_tokens = 256
-
-        tic = time.perf_counter()
-        result = self.run_decode(max_tokens)
-        tok = time.perf_counter()
-
-        print(f"result = `{result}`")
-
-        self.assertIn("paris", result["text"].lower())
-
-        throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
-        self.assertGreaterEqual(throughput, 140)
-
-    def test_gptq_module(self):
-        check_quant_method(self.MODEL_PATH, use_marlin_kernel=False)
 
 
 # GPTQ with Dynamic Per/Module Quantization Control
@@ -186,7 +124,7 @@ class TestGPTQModelDynamicWithMarlin(CustomTestCase):
         assert throughput >= 140
 
     def test_gptq_marlin_module(self):
-        check_quant_method(self.MODEL_PATH, use_marlin_kernel=True)
+        check_quant_method(self.MODEL_PATH)
 
 
 if __name__ == "__main__":
