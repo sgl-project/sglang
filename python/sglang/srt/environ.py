@@ -1343,6 +1343,11 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Decode JPEG inputs with nvJPEG on the GPU inside the tokenizer process.
+    # That opens a CUDA context (~600 MiB on Blackwell) in a process the
+    # scheduler's mem_fraction_static budget does not see. False decodes every
+    # image on the CPU instead.
+    SGLANG_MM_GPU_IMAGE_DECODE = EnvBool(True)
 
     # ===================================================================
     # Multimodal CUDA IPC transport

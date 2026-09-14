@@ -1873,7 +1873,11 @@ def is_jpeg_with_cuda(
     2. whether input is recognized as JPEG.
     3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
     """
-    if not is_cuda() or not gpu_image_decode:
+    if (
+        not is_cuda()
+        or not gpu_image_decode
+        or not envs.SGLANG_MM_GPU_IMAGE_DECODE.get()
+    ):
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
