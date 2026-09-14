@@ -68,34 +68,31 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
             logger.warning_once("from the caller %d", 1)
         self.assertEqual(captured.records[0].filename, "test_logging_utils.py")
 
-    def test_it_calls_warning_not_log(self):
-        """The level-specific method has to be the one that gets called.
+    def test_it_calls_warning_with_stacklevel_2(self):
+        """The exact call is the contract, not just the text that comes out.
 
-        Routing through `logger.log(WARNING, ...)` formats and filters the same,
-        so it looked equivalent -- but callers and tests patch `logger.warning`,
-        and test_diffusion_bcg_padding asserts on exactly that mock. CI found
-        this; the tests here did not, because they all read the emitted record
-        instead of watching which method produced it.
+        test_diffusion_bcg_padding asserts `warning.assert_called_once_with(msg,
+        stacklevel=2)`, so both the method and the stacklevel are observable.
+        Routing through `logger.log(WARNING, ...)` broke the first; putting a
+        helper between the wrapper and `logger.warning` broke the second, because
+        stacklevel counts frames and the entry point is bound one frame from the
+        caller. Every test I wrote before this one read the emitted record, which
+        cannot see either mistake.
         """
         from unittest import mock
 
-        from sglang.multimodal_gen.runtime.utils.logging_utils import (
-            _print_info_once,
-            _print_warning_once,
+        logger = init_logger("sglang.test.logonce.contract")
+        with mock.patch.object(logger, "warning") as warning:
+            logger.warning_once("cfg_parallel_size=%d > n_branches=%d", 2, 1)
+            logger.warning_once("cfg_parallel_size=%d > n_branches=%d", 2, 1)
+        warning.assert_called_once_with(
+            "cfg_parallel_size=2 > n_branches=1", stacklevel=2
         )
 
-        logger = mock.MagicMock()
-        _print_warning_once(logger, "cfg_parallel_size=%d > n_branches=%d", 2, 1)
-        logger.warning.assert_called_once()
-        self.assertIn(
-            "cfg_parallel_size=2 > n_branches=1", logger.warning.call_args[0][0]
-        )
-        logger.log.assert_not_called()
-
-        info_logger = mock.MagicMock()
-        _print_info_once(info_logger, "degree %d", 2)
-        info_logger.info.assert_called_once()
-        info_logger.log.assert_not_called()
+        info_logger = init_logger("sglang.test.logonce.contract.info")
+        with mock.patch.object(info_logger, "info") as info:
+            info_logger.info_once("degree %d", 2)
+        info.assert_called_once_with("degree 2", stacklevel=2)
 
     def test_cache_clear_is_still_on_the_helpers(self):
         """`.cache_clear()` is part of these helpers' surface, and is used.

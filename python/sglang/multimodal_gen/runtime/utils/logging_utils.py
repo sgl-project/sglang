@@ -100,41 +100,50 @@ class SortedHelpFormatter(argparse.HelpFormatter):
         super().add_arguments(actions)
 
 
-# These take %-style args the way ``logger.warning`` does. They used to take only
-# the message, so a caller that formatted lazily -- the way the standard contract
-# implies -- raised TypeError instead of logging, always on a branch too rare for
-# anyone to have seen it.
+# `logger.warning_once(msg, *args)` is bound as MethodType(_print_warning_once,
+# logger), so there is exactly ONE frame between the caller and logger.warning --
+# and stacklevel=2 is part of the observable contract, asserted literally by
+# test_diffusion_bcg_padding. Any helper in between pushes the record's filename
+# to this file and breaks that assertion, so the dedup cannot be an lru_cache on
+# a second function.
 #
-# Two details are load-bearing. Dedupe on the FORMATTED text, not on the
-# arguments: an lru_cache keyed on arguments keeps a strong reference to each one
-# for the life of the process, and callers here pass tensors. And keep exactly one
-# frame between the caller and ``logger.warning``, because stacklevel counts it --
-# an extra helper in the middle silently relabels every *_once call in the package
-# as coming from this file.
-@lru_cache
-def _emit_info_once(logger: Logger, text: str) -> None:
-    # Set the stacklevel to 3 to print the original caller's line info
-    logger.info(text, stacklevel=3)
+# It also cannot be an lru_cache on THIS function: keyed on the arguments it would
+# hold a strong reference to each one for the life of the process, and callers
+# here pass tensors. Hence a set of formatted text, which stores only strings.
+#
+# The args themselves are new: these helpers used to take the message alone, so a
+# caller that formatted lazily -- the way the standard contract implies -- raised
+# TypeError instead of logging, always on a branch too rare to have been seen.
+_logged_once: set[tuple[str, int, str]] = set()
 
 
-@lru_cache
-def _emit_warning_once(logger: Logger, text: str) -> None:
-    logger.warning(text, stacklevel=3)
+def _log_once_guard(logger: Logger, level: int, msg: str, *args: Any) -> str | None:
+    """The text to log, or None when this message has already been logged."""
+    text = msg % args if args else msg
+    key = (logger.name, level, text)
+    if key in _logged_once:
+        return None
+    _logged_once.add(key)
+    return text
 
 
 def _print_info_once(logger: Logger, msg: str, *args: Any) -> None:
-    _emit_info_once(logger, msg % args if args else msg)
+    text = _log_once_guard(logger, logging.INFO, msg, *args)
+    # Set the stacklevel to 2 to print the original caller's line info
+    if text is not None:
+        logger.info(text, stacklevel=2)
 
 
 def _print_warning_once(logger: Logger, msg: str, *args: Any) -> None:
-    _emit_warning_once(logger, msg % args if args else msg)
+    text = _log_once_guard(logger, logging.WARNING, msg, *args)
+    if text is not None:
+        logger.warning(text, stacklevel=2)
 
 
 # These were lru_cache objects, so `.cache_clear()` was part of their surface and
-# a test resets the dedup through it. Moving the cache one level down took that
-# away; keep it, pointing at the cache that now holds the state.
-_print_info_once.cache_clear = _emit_info_once.cache_clear
-_print_warning_once.cache_clear = _emit_warning_once.cache_clear
+# a test resets the dedup through it.
+_print_info_once.cache_clear = _logged_once.clear
+_print_warning_once.cache_clear = _logged_once.clear
 
 
 def get_is_main_process():
