@@ -472,16 +472,6 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         observed_steps = self._current_steps if num_steps is None else num_steps
         self._tracker.update(num_correct_drafts_per_req, observed_steps)
         self._batch_count += 1
-        logger.debug(
-            "[ThroughputAware] Verify feedback: batch_count=%d bs=%d "
-            "observed_steps=%d current_steps=%d warmed=%s cost_table_empty=%s",
-            self._batch_count,
-            batch_size,
-            observed_steps,
-            self._current_steps,
-            self._tracker.all_positions_warmed(self._current_steps),
-            self._cost_table.is_empty(),
-        )
 
     # ------------------------------------------------------------------
     # Decision logic
@@ -552,11 +542,4 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
                 f"[ThroughputAware] Step {direction}: {old_steps} → {best_steps}  "
                 f"(bs={batch_size}, batch_count={self._batch_count}, "
                 f"throughput={score_summary})",
-            )
-            logger.debug(
-                "[ThroughputAware] detail: pos_rates=%s  scores=%s",
-                format_position_rates(
-                    self._tracker, max(candidates) if candidates else 0
-                ),
-                format_score_rows(rows, best_steps),
             )
