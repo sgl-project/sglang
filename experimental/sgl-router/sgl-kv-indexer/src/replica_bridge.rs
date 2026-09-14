@@ -389,6 +389,7 @@ async fn run_stream(
     let overflow = Arc::new(AtomicBool::new(false));
     let failed = overflow.clone();
     let topic = stream.topic.clone();
+    let worker = stream.descriptor.worker_address.clone();
     let _reader = Task(tokio::spawn(async move {
         let bytes = Arc::new(Semaphore::new(BUFFER_BYTES));
         loop {
@@ -400,6 +401,9 @@ async fn run_stream(
                 continue;
             }
             failed.store(true, Ordering::Release);
+            // Report the loss where it occurs, even while the forwarding task
+            // is waiting for an unresponsive Indexer's RPC to time out.
+            warn!(%worker, "live buffer overflow or subscriber failure; snapshot required");
             break;
         }
     }));

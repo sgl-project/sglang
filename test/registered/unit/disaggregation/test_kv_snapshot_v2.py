@@ -114,6 +114,20 @@ class TestSnapshotV2(unittest.TestCase):
         rejected = self.request(self.replay, b"replay-v2", b"old-epoch", bytes(8))
         self.assertEqual(rejected[0][1], b"error")
 
+    def test_empty_components_revoke_only_the_reported_tier(self):
+        self.send(
+            self.store("GPU", ["full", "swa"]),
+            self.store("CPU_PINNED", ["full"]),
+            self.store("DISK", ["full"]),
+        )
+        self.send(self.store("GPU", []))
+        _, blocks = self.cut()
+        self.assertEqual(
+            {(b["tier"], b["component_mask"]) for b in blocks}, {(2, 1), (3, 1)}
+        )
+        self.send(self.store("CPU_PINNED", []), self.store("DISK", []))
+        self.assertEqual(self.cut()[1], [])
+
     def test_parent_links_and_legacy_snapshot_remain_usable(self):
         self.send(self.store("GPU", ["full"], [11, 12, 13]))
         _, blocks = self.cut()

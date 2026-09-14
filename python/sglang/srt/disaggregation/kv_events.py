@@ -768,14 +768,20 @@ class ZmqEventPublisher(EventPublisher):
                     )
                     if tier is not None:
                         key = (self._namespace, block_hash, tier)
-                        self._snapshot_blocks_v2[key] = KVSnapshotBlockV2(
-                            namespace=self._namespace,
-                            block_hash=block_hash,
-                            parent_block_hash=parent,
-                            block_size=event.block_size,
-                            tier=tier,
-                            component_mask=mask,
-                        )
+                        # Zero on the v2 wire denotes a legacy whole-block
+                        # report. An explicit empty component set instead
+                        # revokes this tier, as in the live Bridge decoder.
+                        if components is not None and mask == 0:
+                            self._snapshot_blocks_v2.pop(key, None)
+                        else:
+                            self._snapshot_blocks_v2[key] = KVSnapshotBlockV2(
+                                namespace=self._namespace,
+                                block_hash=block_hash,
+                                parent_block_hash=parent,
+                                block_size=event.block_size,
+                                tier=tier,
+                                component_mask=mask,
+                            )
                     parent = block_hash
             elif isinstance(event, BlockRemoved):
                 for block_hash in event.block_hashes:

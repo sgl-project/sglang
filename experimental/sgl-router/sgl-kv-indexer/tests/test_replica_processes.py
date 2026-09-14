@@ -26,6 +26,7 @@ import pytest
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
+    BlockStoredWithComponents,
     KVEventBatch,
     ZmqEventPublisher,
 )
@@ -57,8 +58,9 @@ def wait_for(fn, seconds=20):
 
 
 class Worker:
-    def __init__(self, worker_id):
+    def __init__(self, worker_id, cache_spec=None):
         self.worker_id = worker_id
+        self.cache_spec = cache_spec
         self.live, self.snapshot, self.replay = port(), port(), port()
         self.load = SimpleNamespace(
             num_running_reqs=0,
@@ -171,6 +173,7 @@ class Worker:
             worker_id=self.worker_id,
             model="model",
             page_size=4,
+            cache_spec=self.cache_spec,
         )
 
     def store(self, hashes):
@@ -359,6 +362,84 @@ def test_two_pairs_recover_restart_worker_and_scale_membership(tmp_path, pb):
             worker.close()
 
 
+def test_empty_components_match_after_live_updates_and_snapshot_recovery(tmp_path, pb):
+    workers = [
+        Worker(
+            "a",
+            cache_spec={
+                "version": 1,
+                "components": 1,
+                "swa_window_tokens": 0,
+                "full_tier_mask": 6,
+                "swa_tier_mask": 6,
+                "mamba_tier_mask": 6,
+            },
+        ),
+        Worker("b"),
+    ]
+    pair = None
+
+    def report(medium, components):
+        publisher = workers[0].publisher
+        publisher.publish(
+            KVEventBatch(
+                ts=time.time(),
+                events=[
+                    BlockStoredWithComponents(
+                        block_hashes=[11],
+                        parent_block_hash=None,
+                        token_ids=[1, 2, 3, 4],
+                        block_size=4,
+                        lora_id=None,
+                        medium=medium,
+                        component_types=components,
+                    )
+                ],
+            )
+        )
+        publisher._event_queue.join()
+        return publisher._next_seq - 1
+
+    def matched(expected, watermark):
+        response = query(pair, pb, workers)
+        return (
+            response.complete
+            and any(
+                c.stream.key.worker_id == "a" and c.watermark >= watermark
+                for c in response.coverage
+            )
+            and {m.worker_id: m.matched_prefix_blocks for m in response.matches}
+            == expected
+        )
+
+    try:
+        workers[1].store([11])
+        report("GPU", ["full"])
+        watermark = report("GPU", [])
+        pair = Pair(tmp_path, workers, pb, "components")
+        wait_for(lambda: matched({"b": 1}, watermark))
+
+        report("GPU", ["full"])
+        watermark = report("CPU_PINNED", ["full"])
+        wait_for(lambda: matched({"a": 1, "b": 1}, watermark))
+        watermark = report("GPU", [])
+        wait_for(lambda: matched({"a": 1, "b": 1}, watermark))
+        watermark = report("CPU_PINNED", [])
+        wait_for(lambda: matched({"b": 1}, watermark))
+
+        # Reconstructing the same cut must agree with the live result, without
+        # erasing the other Worker's copy of this shared hash.
+        pair.server.kill()
+        pair.server.wait(timeout=5)
+        pair.start_server()
+        wait_for(lambda: matched({"b": 1}, watermark))
+    finally:
+        if pair is not None:
+            pair.close()
+        for worker in workers:
+            worker.close()
+
+
 def http_json(url, data=None, timeout=5):
     request = Request(
         url,
@@ -416,27 +497,39 @@ def test_tail_loss_replay_slow_replica_overflow_and_worker_scale_out(tmp_path, p
         os.kill(paused.pid, signal.SIGSTOP)
         for _ in range(100):
             workers[0].store([11, 12, 13])
+        last_event = publisher._next_seq - 1
         wait_for(
             lambda: (
                 (r := query(pairs[1], pb, workers)).complete
+                and any(
+                    c.stream.key.worker_id == "a" and c.watermark >= last_event
+                    for c in r.coverage
+                )
                 and any(
                     m.worker_id == "a" and m.matched_prefix_blocks == 3
                     for m in r.matches
                 )
             )
         )
+        # Wait until the Bridge has observed overflow before unpausing. A
+        # matching prefix alone can come from the first event of the burst,
+        # before the queued RPC returns and revokes the old READY state.
+        wait_for(lambda: "overflow" in (tmp_path / "stability-0.log").read_text())
         os.kill(paused.pid, signal.SIGCONT)
         paused = None
         wait_for(
             lambda: (
                 (r := query(pairs[0], pb, workers)).complete
                 and any(
+                    c.stream.key.worker_id == "a" and c.watermark >= last_event
+                    for c in r.coverage
+                )
+                and any(
                     m.worker_id == "a" and m.matched_prefix_blocks == 3
                     for m in r.matches
                 )
             )
         )
-        assert "overflow" in (tmp_path / "stability-0.log").read_text()
 
         # Horizontal Worker expansion: each existing pair discovers a new stream
         # through its hot-reloaded desired Worker list and recovers preexisting KV.
