@@ -248,8 +248,11 @@ class TestDSV4TopKDispatch(CustomTestCase):
                 torch.empty((1, 1, 1)),
             )
         )
-        backend._get_nonpaged_indexer_plan = MagicMock(return_value=object())
-        backend._forward_nonpaged_indexer = MagicMock(return_value=logits)
+        backend._get_nonpaged_indexer_plan = MagicMock(
+            return_value=SimpleNamespace(query_rows=1, rows_per_chunk=None)
+        )
+        backend._gather_nonpaged_index_k = MagicMock(return_value=(object(), object()))
+        backend._nonpaged_mqa_logits = MagicMock(return_value=logits)
 
         indexer_capturer = MagicMock()
         with (
