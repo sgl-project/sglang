@@ -872,8 +872,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
         )
     else:
         pool.swa_kv_pool = SimpleNamespace(
-            page_size=256,
-            kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
+            page_size=256, kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
         )
     return pool
 
