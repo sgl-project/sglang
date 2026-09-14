@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -283,15 +283,21 @@ def get_otlp_span_exporter(endpoint):
 
 
 # Should be called by each tracked thread.
+#
+# Decoupled from tracing init (plan.md §5.2): the thread_info table is ALWAYS
+# populated (first-write-wins), even when tracing is disabled. Existing readers
+# -- __create_thread_context and the async exporter -- only run while tracing
+# is enabled, so their behavior is unchanged; the only new benefit is that
+# `get_thread_caller_info()` (caller_id/caller_role attribution forwarded to
+# Mooncake) stays readable regardless of the tracing switch. The exporter
+# callback is still gated on `opentelemetry_initialized` so disabled builds
+# never push thread info to the async trace exporter.
 def trace_set_thread_info(
     thread_label: str,
     tp_rank: Optional[int] = None,
     dp_rank: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ):
-    if not opentelemetry_initialized:
-        return
-
     pid = threading.get_native_id()
     if pid in threads_info:
         return
@@ -305,8 +311,36 @@ def trace_set_thread_info(
         pp_rank=pp_rank,
     )
 
-    if _on_thread_info_set is not None:
+    if opentelemetry_initialized and _on_thread_info_set is not None:
         _on_thread_info_set(threads_info[pid])
+
+
+def get_thread_caller_info() -> Optional[Tuple[str, str]]:
+    """Return the calling thread's ``(caller_id, caller_role)`` if it has
+    registered via ``trace_set_thread_info``; otherwise ``None``.
+
+    ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
+    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
+    thread-span name (``[TP x] [PP y] [DP z] (host:.. | pid:..)``) -- note
+    *without* the leading label, so it does not duplicate ``caller_role`` --
+    and is forwarded to Mooncake so per-RPC spans can be attributed to a
+    specific dummy-client / TP rank (plan.md §5.3). Read from
+    ``threads_info`` keyed by the native thread id, so it returns ``None`` on
+    threads that never registered (e.g. a fresh test thread), allowing callers
+    to omit the fields cleanly.
+    """
+    info = threads_info.get(threading.get_native_id())
+    if info is None:
+        return None
+    parts: List[str] = []
+    if info.tp_rank is not None:
+        parts.append(f"[TP {info.tp_rank}]")
+    if info.pp_rank is not None:
+        parts.append(f"[PP {info.pp_rank}]")
+    if info.dp_rank is not None:
+        parts.append(f"[DP {info.dp_rank}]")
+    parts.append(f"(host:{info.host_id[:8]} | pid:{info.pid})")
+    return " ".join(parts), info.thread_label
 
 
 class TraceReqContext:
@@ -822,6 +856,17 @@ class TraceReqContext:
         pass
 
     def __del__(self):
+        # Safety net for spans whose owner object is retired through an early
+        # exit / terminate / drain path that bypasses trace_req_finish (e.g. a
+        # HiCache prefetch op revoked for insufficient hits). Normal completion
+        # already set root_span=None, so this is a no-op there. Ending root_span
+        # here (in addition to abort()'s thread-span end) prevents unbounded
+        # span accumulation when owners are dropped without an explicit finish.
+        if self.tracing_enable and self.root_span:
+            try:
+                self.root_span.end()
+            except Exception:
+                pass
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})
 
 
