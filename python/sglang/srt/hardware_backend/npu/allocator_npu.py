@@ -42,8 +42,8 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if num_new_pages is None:
             num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
+                (seq_lens_cpu + self.roundup) // self.page_size
+                - (prefix_lens_cpu + self.roundup) // self.page_size
             ).sum()
             num_new_pages_item = num_new_pages_tensor.item()
         else:
