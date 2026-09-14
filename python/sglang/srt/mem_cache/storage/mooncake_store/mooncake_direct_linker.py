@@ -110,9 +110,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     ):
         self.page_size = params.page_size
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
-        self.page_wise_load_threshold = (
-            server_args.mooncake_page_wise_load_threshold
-        )
+        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
                 "--mooncake-page-wise-load-threshold must be positive, got "
@@ -181,9 +179,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             labels = {
                 "storage_backend": "mooncake_direct",
                 "tp_rank": tp_rank,
-                "dp_rank": _get_mooncake_storage_metrics_dp_rank(
-                    server_args, params
-                ),
+                "dp_rank": _get_mooncake_storage_metrics_dp_rank(server_args, params),
                 "pp_rank": params.pp_rank,
                 "pp_size": params.pp_size,
                 "attn_cp_rank": params.attn_cp_rank,
@@ -201,9 +197,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             "dfs_replica_num",
             (extra_config or {}).get("dfs_replica_num", 1),
         )
-        self.backup_metric_source = (
-            "dfs" if int(dfs_replica_num) > 0 else "local_disk"
-        )
+        self.backup_metric_source = "dfs" if int(dfs_replica_num) > 0 else "local_disk"
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -536,9 +530,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                                     {
                                         "key": key,
                                         "rid": (
-                                            rids[index]
-                                            if index < len(rids)
-                                            else None
+                                            rids[index] if index < len(rids) else None
                                         ),
                                         "transferred": actual,
                                         "expected": wanted,
@@ -563,9 +555,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for rid, _ in request_transfers:
-                self._finish_l4_metric(
-                    "prefetch", rid, request_success.get(rid, False)
-                )
+                self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
             for keys in started:
                 try:
                     self.storage.store.batch_get_session_end(keys)
@@ -658,9 +648,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         # Mooncake's range API is key-major and does not take a pool argument,
         # so differently suffixed physical-pool objects can share one call.
-        pool_counts = {
-            str(name): len(keys) for name, (keys, _) in batches.items()
-        }
+        pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
         unique_rids = sorted({rid for rid in all_rids if rid is not None})
         result = self.storage.store.batch_get_into_multi_buffer_ranges(
             all_keys, all_ptrs, all_sizes, all_offsets
@@ -685,8 +673,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     pool = all_pools[index] if index < len(all_pools) else None
                     if rid is None:
                         request_success = {
-                            request_rid: False
-                            for request_rid, _ in request_transfers
+                            request_rid: False for request_rid, _ in request_transfers
                         }
                     else:
                         request_success[rid] = False
@@ -700,8 +687,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         }
                     )
             logger.error(
-                "Mooncake page-wise aggregated range get failed: "
-                "failed_objects=%s",
+                "Mooncake page-wise aggregated range get failed: failed_objects=%s",
                 failed_objects,
             )
 

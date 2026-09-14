@@ -3997,9 +3997,7 @@ class Scheduler(
                         if res == AddReqResult.NO_TOKEN
                         else "head_of_line_admission_limit"
                     )
-                    self._mark_waiting_queue_reason(
-                        blocked_reason, queue_index + 1
-                    )
+                    self._mark_waiting_queue_reason(blocked_reason, queue_index + 1)
                 break
 
         if mamba_allocator is not None:
