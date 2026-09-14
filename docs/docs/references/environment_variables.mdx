@@ -1869,7 +1869,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_PAGED_PREFILL_ASM</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let gfx950 fp8 hd256 chunked prefill read the KV pool in place through AITER's paged-varlen ASM kernel, instead of gathering the prefix into a contiguous buffer first. Applies only at <code>--page-size 64</code> on the NHD pool; every other shape is unaffected either way. The gain grows with context and is flat to marginally negative at moderate ISL, so set it to <code>false</code> for workloads that are not long-context.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let gfx950 fp8 hd256 chunked prefill read the KV pool in place through AITER's paged-varlen ASM kernel, instead of gathering the prefix into a contiguous buffer first. The ASM kernel is compiled for a 4D LINEAR <code>[N, 64, H, D]</code> KV cache, so it serves <code>--page-size 64</code> on the NHD pool and nothing else; at any other page size this variable has no effect whichever way it is set. Where it does apply, the gain grows with context and is flat to marginally negative at moderate ISL, so set it to <code>false</code> for workloads that are not long-context.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
