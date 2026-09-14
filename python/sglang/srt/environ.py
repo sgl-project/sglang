@@ -548,6 +548,11 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
+    # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
+    # the NCCL ring. Only taken when the group's communicator has a multicast
+    # plane; off, or no such plane, keeps the NCCL all-gather.
+    SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
