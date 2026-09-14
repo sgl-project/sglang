@@ -1303,8 +1303,21 @@ class Qwen4ExpLayerExtensionMixin:
     ):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+
+        # Deferred combine: pass pending update to MLP mix for fused combine+norm
+        pending_update = self.attn_hyper_connection.combine_deferred(
+            hidden_states, residual
+        )
+
+        # MLP mix consumes the pending update, fusing combine+norm
+        if hasattr(self.mlp_hyper_connection, 'combine_norm'):
+            hidden_states = self.mlp_hyper_connection.combine_norm(pending_update)
+            residual = None  # Consumed by combine_norm
+        else:
+            # Fallback: materialize then mix
+            hidden_states = pending_update.materialize()
+            hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1370,7 +1383,9 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        # If residual is None, it was consumed by combine_norm in _prepare_qwen4_exp_mlp
+        if residual is not None:
+            hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
 

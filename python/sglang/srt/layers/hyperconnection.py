@@ -4,8 +4,37 @@ import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+
+
+@dataclass(frozen=True)
+class GatedResidualUpdate:
+    """Forward-local residual injection awaiting its consuming normalization.
+
+    All three tensors share a dtype and row layout. ``residual`` contains the
+    branch streams, ``block_output`` one sublayer output per row, and
+    ``inject_logits`` one gate per row and branch. Materialize before an
+    intervening operation that needs the updated, unnormalized streams.
+    The producing sublayer has already consumed ``residual``, so a consuming
+    mixer may preload it and its immutable norm weights before the PDL wait.
+    """
+
+    residual: torch.Tensor
+    block_output: torch.Tensor
+    inject_logits: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+
+        return hc_combine(
+            self.block_output,
+            self.residual,
+            self.inject_logits,
+            self.inject_logits.shape[-1],
+            self.block_output.shape[-1],
+        )
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -325,6 +354,74 @@ class GatedResidual(HyperConnectionBase):
             self.hidden_size,
         ).to(self.params_dtype)
         return updated_residuals
+
+    def combine_deferred(self, block_output: torch.Tensor, residuals) -> GatedResidualUpdate:
+        """Return a pending update instead of materializing the combine.
+
+        The caller is responsible for materializing the update at a boundary
+        (PLE, deepstack, row-gather, final all-gather) or passing it to a
+        consuming mixer that supports fused combine+norm.
+        """
+        hyper_input, hyper_input_normed = residuals
+        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        assert block_output.shape[-1] == self.hidden_size
+
+        # Compute inject logits without materializing the full combine
+        inject_logits = F.linear(hyper_input_normed, self.block_inject_weight.weight)
+
+        return GatedResidualUpdate(
+            residual=hyper_input,
+            block_output=block_output,
+            inject_logits=inject_logits,
+        )
+
+    def combine_norm(self, pending: GatedResidualUpdate) -> torch.Tensor:
+        """Fused combine + norm on a pending update.
+
+        Uses the gated_residual_combine_norm JIT kernel to compute both the
+        combined residual and its normalized form in a single pass.
+        """
+        assert pending.residual.shape[-1] == self.hc_count * self.hidden_size
+        assert pending.block_output.shape[-1] == self.hidden_size
+
+        if pending.block_output.shape[0] == 0:
+            return pending.residual.to(self.params_dtype)
+
+        # Determine group size for the norm
+        if self.config.hc_per_branch_norm:
+            group_size = self.hidden_size
+        else:
+            group_size = self.hc_count * self.hidden_size
+
+        # Check JIT compatibility
+        jit_ok = (
+            pending.residual.is_cuda
+            and pending.residual.dtype in (torch.bfloat16, torch.float16)
+            and group_size % 512 == 0
+            and self.hidden_size % group_size == 0
+        )
+
+        if jit_ok:
+            from sglang.kernels.ops.layernorm.gated_residual_combine_norm import (
+                gated_residual_combine_norm,
+            )
+
+            combined, normed = gated_residual_combine_norm(
+                pending.block_output,
+                pending.residual,
+                pending.inject_logits,
+                self.hc_norm.weight,
+                group_size,
+                self.config.rms_norm_eps,
+            )
+            return normed.to(self.params_dtype)
+
+        # Fallback: materialize then norm
+        combined = pending.materialize()
+        if self.config.hc_per_branch_norm:
+            return self.hc_norm(combined)
+        else:
+            return self.hc_norm(combined.unflatten(-1, (self.hc_count, self.hidden_size))).flatten(-2)
 
 
 HYPERCONNECTION_CLASS_DICT = {
