@@ -39,7 +39,7 @@ impl ResponseSink {
     }
 }
 
-#[allow(dead_code)] // the receiver half is created inline in api_server::submit.
+#[allow(dead_code)] // the receiver half is owned by frontend::FrontendCall.
 pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
 /// What the connection handler receives on the decode stream: a detok-decoded

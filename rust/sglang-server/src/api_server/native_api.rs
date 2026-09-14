@@ -3,14 +3,25 @@
 //! `data: {json}` … `[DONE]`, byte-compatible with Python
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
-//! tuples, cumulative vs incremental streams) lives here, as does
-//! generate-request submission (`submit`); the shared `AppState` lives in the
-//! parent `api_server` module.
+//! tuples, cumulative vs incremental streams) lives here; submission and
+//! request lifetime belong to the shared [`crate::frontend::FrontendHandle`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::app::AppState;
+use super::frame::{
+    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
+};
+use crate::frontend::{FrontendCall, FrontendError, HealthStatus};
+use crate::message::ids::Rid;
+use crate::message::request::{GenerateBody, GenerateRequest};
+use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::utils::{
+    environ,
+    response::{error_response, error_value},
+};
 use axum::{
     Json, Router,
     extract::State,
@@ -21,22 +32,6 @@ use axum::{
         sse::{Event, Sse},
     },
     routing::{get, post},
-};
-use tokio::sync::mpsc;
-
-use super::app::AppState;
-use super::frame::{
-    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
-};
-use super::guard::AbortGuard;
-use super::submit::submit;
-use crate::message::ids::Rid;
-use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
-use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::message::sampling::SamplingParams;
-use crate::utils::{
-    environ,
-    response::{error_response, error_value},
 };
 
 /// API-local timing for one request.
@@ -91,6 +86,22 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
     error_response(code, error_value(code.as_u16(), message), stream)
 }
 
+fn native_frontend_error(error: FrontendError, stream: bool) -> Response {
+    match error {
+        FrontendError::Unavailable => {
+            native_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string(), stream)
+        }
+        FrontendError::InvalidArgument(_) => {
+            native_error(StatusCode::BAD_REQUEST, &error.to_string(), stream)
+        }
+        _ => native_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            stream,
+        ),
+    }
+}
+
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
 /// router build (server startup) — changing them on a live process needs a
 /// restart. The deep-probe handler is built once with
@@ -114,16 +125,12 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.startup_readiness.is_ready() {
+    if state.frontend.is_ready() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
     }
 }
-
-/// Sentinel host that makes the KV connector no-op. Parity with
-/// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
-const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 if the response heartbeat advances within `timeout`
@@ -133,67 +140,24 @@ const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
-/// [`AppState::response_activity`] counter (not the probe's own rid) — so a busy
+/// frontend response-activity counter (not the probe's own rid) — so a busy
 /// server passes immediately and a backlog never false-503s (the analogue of
 /// Python's `last_receive_tstamp`).
 async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
 ) -> Response {
-    if !state.startup_readiness.is_ready() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-
-    let baseline = state
-        .response_activity
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    // Fire the probe (the heartbeat is the signal, not its own response). A busy
-    // scheduler skips it with no terminal frame, so its detok registration is
-    // cleaned up only by the `AbortGuard` below.
-    //
-    // On a PD node the scheduler 400-aborts room-less requests, so inject the
-    // same fake bootstrap pair Python uses (`FAKE_BOOTSTRAP_HOST` / room 0).
-    let pd = state.server_args.is_disaggregation();
-    let probe = GenerateRequest {
-        // The `HEALTH_CHECK_<uuid>` rid form
-        rid: Rid::new_health_check(),
-        input_ids: Some(vec![0]),
-        // One greedy token: the cheapest round-trip that still produces a frame.
-        sampling_params: SamplingParams {
-            max_new_tokens: Some(1),
-            temperature: 0.0,
-            ..Default::default()
-        },
-        stream: false,
-        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
-        bootstrap_room: pd.then_some(0),
-        ..Default::default()
-    };
-    let (rid, _keepalive) =
-        match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
-            // Hold the receiver so the probe's sink stays open until it completes.
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
-    // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
-    // frame, so without this abort it leaks one detok entry per call.
-    let _abort_guard = AbortGuard::new(state.senders.clone(), rid);
-
-    // Watch the heartbeat advance (timeout frozen at router build, default 20s).
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if state
-            .response_activity
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != baseline
-        {
-            return StatusCode::OK.into_response();
+    match state.frontend.probe_health(timeout).await {
+        Ok(HealthStatus::Healthy) => StatusCode::OK.into_response(),
+        Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        if tokio::time::Instant::now() >= deadline {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Err(FrontendError::Unavailable) => native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        ),
+        Err(error) => native_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string(), false),
     }
 }
 
@@ -230,7 +194,7 @@ async fn generate(
     }
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (mut payloads, is_batch) = match body.into_requests() {
+    let (payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
@@ -243,14 +207,8 @@ async fn generate(
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
     let timing = RequestTiming::new();
-    // Media I/O (URL downloads, file reads) happens here, on the API runtime
-    // — never on the MM worker pool (see `prefetch`).
-    if let Err(e) =
-        super::prefetch::prefetch_all(&mut payloads, &state.server_args.limit_mm_data_per_request)
-            .await
-    {
-        return native_error(StatusCode::BAD_REQUEST, &e, stream);
-    }
+    // Shared frontend admission performs media I/O (URL downloads, file reads)
+    // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
@@ -263,9 +221,6 @@ async fn generate(
     }
 }
 
-/// Answer an error raised *before* anything was submitted, in the shape the client
-/// asked for.
-///
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
 async fn generate_single(
@@ -276,15 +231,11 @@ async fn generate_single(
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
-    let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
-    {
-        Ok(v) => v,
-        Err(resp) => return resp,
+    let mut call = match state.frontend.generate(req).await {
+        Ok(call) => call,
+        Err(error) => return native_frontend_error(error, stream),
     };
-    // Abort on client disconnect: the guard fires when dropped before the request
-    // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
-    // `rid_str` is the response `meta_info.id`, reused for every frame.
-    let mut guard = AbortGuard::new(state.senders.clone(), rid_str.clone());
+    let rid = call.rid().clone();
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output;
 
@@ -292,29 +243,25 @@ async fn generate_single(
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx, timing)], guard, incremental, false)
+        let s = generation_event_stream(vec![(call, timing)], incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
-        // Unary: fold to the terminal, respond once. Disarm only on a real terminal
-        // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing(), timing).await;
-        if terminal {
-            guard.disarm(&rid_str);
-        }
+        // Unary: fold to the terminal and respond once. `FrontendCall` disarms
+        // itself on a terminal item; truncation leaves it armed for drop cleanup.
+        let (status, value) = drain_unary(&mut call, rid.client_facing(), timing).await;
         (status, Json(value)).into_response()
     }
 }
 
-/// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal);
-/// `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
+/// Fold a unary request to its terminal HTTP result. Shared by single + batch.
 async fn drain_unary(
-    rx: &mut mpsc::Receiver<ResponseItem>,
+    call: &mut FrontendCall,
     rid_str: &str,
     mut timing: RequestTiming,
-) -> (StatusCode, serde_json::Value, bool) {
+) -> (StatusCode, serde_json::Value) {
     let mut acc = OutputAccumulator::default();
-    while let Some(item) = rx.recv().await {
+    while let Some(item) = call.recv().await {
         match item {
             ResponseItem::Frame(out) => {
                 timing.observe_first_output();
@@ -333,18 +280,18 @@ async fn drain_unary(
                 {
                     let status =
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return (status, error_value(code, message), true);
+                    return (status, error_value(code, message));
                 }
                 let mut value = frame_value(&final_out, rid_str);
                 add_e2e_latency(&mut value, &timing);
-                return (StatusCode::OK, value, true);
+                return (StatusCode::OK, value);
             }
             ResponseItem::Error(e) => {
                 timing.finish();
                 let code = e.http_status();
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, error_value(code, &e.to_string()), true);
+                return (status, error_value(code, &e.to_string()));
             }
             ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
         }
@@ -354,7 +301,6 @@ async fn drain_unary(
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         error_value(500, "response truncated before completion"),
-        false,
     )
 }
 
@@ -362,8 +308,8 @@ async fn drain_unary(
 /// then either (unary) drain them concurrently into a request-ordered JSON array,
 /// or (streaming) multiplex their streams into one SSE response, each frame carrying
 /// its `index`.
-/// One [`AbortGuard`] covers the batch. A failed unary item is its own
-/// `{ "error": … }` entry; the batch response is 200.
+/// Each submitted call owns its own cancellation. A failed unary item is its
+/// own `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
@@ -373,88 +319,75 @@ async fn generate_batch(
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut receivers = Vec::with_capacity(requests.len());
-    for req in requests {
-        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
-            Ok((rid, rx)) => {
-                guard.arm(rid.clone());
-                receivers.push((rid, rx, timing.clone()));
-            }
-            Err(resp) => return resp,
-        }
-    }
+    let calls = match state.frontend.generate_batch(requests).await {
+        Ok(calls) => calls
+            .into_iter()
+            .map(|call| (call, timing.clone()))
+            .collect(),
+        Err(error) => return native_frontend_error(error, stream),
+    };
 
     if stream {
         // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
-        // `guard` moves into the stream so a disconnect aborts what's unfinished.
+        // Calls move into the stream so a disconnect aborts what's unfinished.
         use futures::StreamExt;
         let incremental = state.server_args.incremental_streaming_output;
-        let s = generation_event_stream(receivers, guard, incremental, true)
+        let s = generation_event_stream(calls, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
         // Unary: poll every item concurrently, as Python's gather does. `join_all`
         // preserves input order for the final JSON array, while each drain observes
         // its own terminal output promptly (important for per-item e2e_latency).
-        let drained = futures::future::join_all(receivers.into_iter().map(
-            |(rid_str, mut rx, request_timing)| async move {
-                let client_rid = rid_str.client_facing().to_owned();
-                let (_status, value, terminal) =
-                    drain_unary(&mut rx, &client_rid, request_timing).await;
-                (rid_str, value, terminal)
+        let drained = futures::future::join_all(calls.into_iter().map(
+            |(mut call, request_timing)| async move {
+                let client_rid = call.rid().client_facing().to_owned();
+                let (_status, value) = drain_unary(&mut call, &client_rid, request_timing).await;
+                value
             },
         ))
         .await;
-        let mut results = Vec::with_capacity(drained.len());
-        for (rid_str, value, terminal) in drained {
-            if terminal {
-                guard.disarm(&rid_str);
-            }
-            results.push(value);
-        }
-        (StatusCode::OK, Json(serde_json::Value::Array(results))).into_response()
+        (StatusCode::OK, Json(serde_json::Value::Array(drained))).into_response()
     }
 }
 
-/// Await the next item from `rx`, then drain whatever queued behind it (so the caller
-/// can coalesce a backlog, as Python's `state.out_list` does), handing the receiver
+/// Await the next item from `call`, then drain whatever queued behind it (so the caller
+/// can coalesce a backlog, as Python's `state.out_list` does), handing the call
 /// back for `FuturesUnordered` to re-poll. Empty result = channel closed.
 async fn recv_indexed(
     index: usize,
-    mut rx: mpsc::Receiver<ResponseItem>,
-) -> (usize, mpsc::Receiver<ResponseItem>, Vec<ResponseItem>) {
+    mut call: FrontendCall,
+) -> (usize, FrontendCall, Vec<ResponseItem>) {
     let mut items = Vec::new();
-    match rx.recv().await {
+    match call.recv().await {
         Some(item) => items.push(item),
-        None => return (index, rx, items), // closed
+        None => return (index, call, items), // closed
     }
-    while let Ok(item) = rx.try_recv() {
+    while let Ok(item) = call.try_recv() {
         items.push(item);
     }
-    (index, rx, items)
+    (index, call, items)
 }
 
-/// Multiplex `receivers` (one per request) into SSE `data` strings + a final `[DONE]`;
-/// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
-/// `guard` aborts unfinished on drop.
+/// Multiplex calls into SSE `data` strings + a final `[DONE]`; `with_index` tags
+/// each frame (batch only), `incremental` = delta vs cumulative. Each call
+/// aborts itself if the stream is dropped while it is unfinished.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
-    mut guard: AbortGuard,
+    calls: Vec<(FrontendCall, RequestTiming)>,
     incremental: bool,
     with_index: bool,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         use futures::StreamExt;
 
-        let n = receivers.len();
-        let rid_strs: Vec<Rid> = receivers
+        let n = calls.len();
+        let rid_strs: Vec<Rid> = calls
             .iter()
-            .map(|(rid, _, _)| rid.clone())
+            .map(|(call, _)| call.rid().clone())
             .collect();
-        let mut timings: Vec<RequestTiming> = receivers
+        let mut timings: Vec<RequestTiming> = calls
             .iter()
-            .map(|(_, _, timing)| timing.clone())
+            .map(|(_, timing)| timing.clone())
             .collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
@@ -465,11 +398,11 @@ fn generation_event_stream(
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
         let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, (_, rx, _)) in receivers.into_iter().enumerate() {
-            futs.push(recv_indexed(i, rx));
+        for (i, (call, _)) in calls.into_iter().enumerate() {
+            futs.push(recv_indexed(i, call));
         }
 
-        while let Some((i, rx, items)) = futs.next().await {
+        while let Some((i, call, items)) = futs.next().await {
             if items.is_empty() {
                 // Channel closed with no terminal → truncation for this item;
                 // leave its rid armed so the scheduler work is aborted.
@@ -510,7 +443,6 @@ fn generation_event_stream(
 
             if let Some(e) = failed {
                 yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
-                guard.disarm(&rid_strs[i]);
             } else if let Some(out) = terminal {
                 // A validation abort → an error object, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
@@ -525,12 +457,11 @@ fn generation_event_stream(
                         &timings[i],
                     ),
                 };
-                guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
                     yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
                 }
-                futs.push(recv_indexed(i, rx)); // keep this item flowing
+                futs.push(recv_indexed(i, call)); // keep this item flowing
             }
         }
         yield "[DONE]".to_string();
@@ -568,18 +499,29 @@ fn terminal_stream_frame_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::request::RequestKind;
     use crate::message::response::ChunkEvent;
-    use crate::tokenizer_manager::wiring::Senders;
+    use crate::tokenizer_manager::wiring::TmEvent;
     use crate::utils::error::Error;
+    use axum::body::Body;
+    use axum::http::Request;
     use futures::StreamExt;
     use std::time::Duration;
-    fn senders() -> Senders {
-        Senders {
-            tok_manager_tx: flume::unbounded().0,
-            abort_tx: flume::unbounded().0,
-            tokenizer_tx: flume::unbounded().0,
-            detokenizer_tx: vec![],
-        }
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    fn frontend(startup_ready: bool) -> crate::frontend::FrontendHandle {
+        crate::frontend::FrontendHandle::new(
+            flume::unbounded().0,
+            flume::unbounded().0,
+            crate::frontend::FrontendConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+            },
+        )
     }
 
     fn frame(rid: u64, text: &str) -> ResponseItem {
@@ -607,13 +549,17 @@ mod tests {
         serde_json::from_str(s).expect("frame is JSON")
     }
 
-    fn timed_receiver(
+    fn timed_call(rid: u64, rx: mpsc::Receiver<ResponseItem>) -> (FrontendCall, RequestTiming) {
+        timed_call_with_abort(rid, rx, flume::unbounded().0)
+    }
+
+    fn timed_call_with_abort(
         rid: u64,
         rx: mpsc::Receiver<ResponseItem>,
-    ) -> (Rid, mpsc::Receiver<ResponseItem>, RequestTiming) {
+        abort_tx: flume::Sender<crate::tokenizer_manager::wiring::AbortSource>,
+    ) -> (FrontendCall, RequestTiming) {
         (
-            Rid::from(rid.to_string()),
-            rx,
+            FrontendCall::from_test_generation_parts(Rid::from(rid.to_string()), rx, abort_tx),
             RequestTiming {
                 created_at: Instant::now() - Duration::from_millis(10),
                 time_to_first_token: None,
@@ -625,16 +571,105 @@ mod tests {
     #[tokio::test]
     async fn health_is_unavailable_before_startup_warmup_finishes() {
         let state = Arc::new(AppState {
-            senders: senders(),
-            response_buf: 8,
+            frontend: frontend(false),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             chat_formatter: None,
-            response_activity: Default::default(),
-            startup_readiness: Default::default(),
         });
 
         let response = health_generate(State(state), Duration::ZERO).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_closed_intake_preserves_native_503_body() {
+        let state = Arc::new(AppState {
+            // The helper deliberately retains no intake receiver, so this
+            // ready probe reaches the operational submission-failure path.
+            frontend: frontend(true),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+        });
+
+        let response = health_generate(State(state), Duration::ZERO).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["message"], "service unavailable");
+        assert_eq!(value["error"]["code"], 503);
+    }
+
+    #[tokio::test]
+    async fn unary_http_generate_round_trips_through_frontend_handle() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let frontend = crate::frontend::FrontendHandle::new(
+            intake_tx,
+            abort_tx,
+            crate::frontend::FrontendConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+            },
+        );
+        let state = Arc::new(AppState {
+            frontend,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+        });
+
+        let responder = tokio::spawn(async move {
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("HTTP generation must enter through frontend intake");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Generate(generate) = &request.kind else {
+                panic!("/generate must submit a generation request");
+            };
+            assert_eq!(generate.input_ids.as_deref(), Some([1, 2].as_slice()));
+            let rid = request.rid.clone();
+            request
+                .sink
+                .try_send(ResponseItem::Done(ChunkEvent {
+                    rid,
+                    text: "ok".into(),
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    finish_reason: serde_json::from_value(serde_json::json!({
+                        "type": "length",
+                        "length": 1
+                    }))
+                    .unwrap(),
+                    ..Default::default()
+                }))
+                .unwrap();
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rid":"client-rid","input_ids":[1,2],"sampling_params":{"max_new_tokens":1}}"#,
+            ))
+            .unwrap();
+        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["text"], "ok");
+        assert_eq!(value["meta_info"]["id"], "client-rid");
+        assert_eq!(value["meta_info"]["prompt_tokens"], 2);
+        assert_eq!(value["meta_info"]["completion_tokens"], 1);
+        assert!(abort_rx.try_recv().is_err());
     }
 
     #[test]
@@ -674,7 +709,7 @@ mod tests {
     /// terminal-output handling.
     #[tokio::test]
     async fn unary_terminal_meta_info_matches_python_semantics() {
-        let (tx, mut rx) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel(2);
         tx.send(ResponseItem::Done(ChunkEvent {
             rid: "internal-rid".into(),
             text: "ok".into(),
@@ -690,15 +725,19 @@ mod tests {
         }))
         .await
         .unwrap();
+        let mut call = FrontendCall::from_test_generation_parts(
+            "internal-rid".into(),
+            rx,
+            flume::unbounded().0,
+        );
 
         let timing = RequestTiming {
             created_at: Instant::now() - Duration::from_millis(20),
             time_to_first_token: None,
             e2e_latency: None,
         };
-        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", timing).await;
+        let (status, value) = drain_unary(&mut call, "client-rid", timing).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(terminal);
         assert_eq!(value["meta_info"]["id"], "client-rid");
         assert_eq!(value["meta_info"]["prompt_tokens"], 5);
         assert_eq!(value["meta_info"]["completion_tokens"], 2);
@@ -724,9 +763,8 @@ mod tests {
     async fn interleaves_indexes_and_accumulates() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let calls = vec![timed_call(10, rx0), timed_call(11, rx1)];
+        let stream = generation_event_stream(calls, false, true);
         futures::pin_mut!(stream);
 
         // Drive deterministically: exactly one channel has data before each poll.
@@ -757,15 +795,40 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn dropping_stream_aborts_only_unfinished_calls() {
+        use crate::tokenizer_manager::wiring::AbortSource;
+
+        let (tx0, rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let calls = vec![
+            timed_call_with_abort(10, rx0, abort_tx.clone()),
+            timed_call_with_abort(11, rx1, abort_tx),
+        ];
+        let mut stream = Box::pin(generation_event_stream(calls, false, true));
+
+        tx0.send(done(10, "done")).await.unwrap();
+        assert_eq!(parse(&stream.next().await.unwrap())["index"], 0);
+        tx1.send(frame(11, "live")).await.unwrap();
+        assert_eq!(parse(&stream.next().await.unwrap())["index"], 1);
+
+        drop(stream);
+        assert!(matches!(
+            abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "11"
+        ));
+        assert!(abort_rx.try_recv().is_err());
+    }
+
     /// A per-item error is surfaced with its `index` and doesn't end the batch;
     /// `[DONE]` still waits for the other item.
     #[tokio::test]
     async fn per_item_error_carries_index() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let calls = vec![timed_call(10, rx0), timed_call(11, rx1)];
+        let stream = generation_event_stream(calls, false, true);
         futures::pin_mut!(stream);
 
         tx0.send(ResponseItem::Error(Error::Validation("bad".into())))
@@ -787,9 +850,8 @@ mod tests {
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "Hello")).await.unwrap();
@@ -822,9 +884,8 @@ mod tests {
     #[tokio::test]
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, false, false);
         futures::pin_mut!(stream);
 
         tx.send(done(10, "hi")).await.unwrap();
@@ -843,9 +904,8 @@ mod tests {
     #[tokio::test]
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, false, false);
         futures::pin_mut!(stream);
 
         // Three chunks queued before the stream is ever polled (a client falling behind).
@@ -870,9 +930,8 @@ mod tests {
     #[tokio::test]
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, true, false);
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "a")).await.unwrap();

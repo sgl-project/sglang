@@ -13,7 +13,7 @@ use crate::message::request::MmWorkItem;
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
-/// on the fixed MM worker pool (see `api_server::prefetch`). `data:` and bare
+/// on the fixed MM worker pool (see `frontend::prefetch`). `data:` and bare
 /// base64 are pure CPU and stay on the worker. Lives next to [`image_source`]
 /// so the prefetch walk and the parse walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {

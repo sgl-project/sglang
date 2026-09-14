@@ -19,17 +19,15 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
-use super::super::guard::AbortGuard;
-use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
+use crate::frontend::{FrontendCall, FrontendError};
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -48,9 +46,8 @@ enum PromptSpec {
 pub(super) struct SubmittedChoice {
     pub(super) index: usize,
     pub(super) prompt_index: usize,
-    pub(super) rid: Rid,
     pub(super) echo: String,
-    pub(super) rx: mpsc::Receiver<ResponseItem>,
+    pub(super) call: FrontendCall,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -144,7 +141,6 @@ async fn completions(
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
@@ -183,16 +179,15 @@ async fn completions(
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
             };
-            let rx = match submit_generation(&state, native, stream, &mut guard).await {
-                Ok(rx) => rx,
+            let call = match submit_generation(&state, native, stream).await {
+                Ok(call) => call,
                 Err(response) => return response,
             };
             submitted.push(SubmittedChoice {
                 index,
                 prompt_index,
-                rid,
                 echo: prompt_echo.clone(),
-                rx,
+                call,
             });
         }
     }
@@ -210,7 +205,6 @@ async fn completions(
         let want_logprobs = request.logprobs.is_some();
         let s = completion_event_stream(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -224,7 +218,6 @@ async fn completions(
     } else {
         unary_completion(
             submitted,
-            guard,
             response_id,
             model,
             created,
@@ -236,32 +229,29 @@ async fn completions(
 }
 
 /// Decode a token-id prompt back to text for `echo=true`, via a
-/// `RequestKind::Detokenize` request through the regular submit path — the
+/// detokenize operation through the shared frontend handle — the
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
-    else {
-        // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
-        // error shape rather than forwarding the native-shaped response.
-        return Err(openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
-            false,
-        ));
-    };
-    match rx.recv().await {
-        Some(ResponseItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
+    match state.frontend.detokenize(token_ids).await {
+        Ok(payload) => String::from_utf8(payload.to_vec()).map_err(|_| {
             openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "detokenized prompt is not valid UTF-8",
                 false,
             )
         }),
-        Some(ResponseItem::Error(Error::Validation(message))) => {
+        // Same rule as `submit_generation`: build the refusal in the OpenAI
+        // error shape rather than forwarding the native-shaped response.
+        Err(FrontendError::Unavailable) => Err(openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        )),
+        Err(FrontendError::Pipeline(Error::Validation(message))) => {
             Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
-        Some(ResponseItem::Error(error)) => {
+        Err(FrontendError::Pipeline(error)) => {
             let status = StatusCode::from_u16(error.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err(openai_error(
@@ -270,9 +260,16 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
                 false,
             ))
         }
-        Some(_) | None => Err(openai_error(
+        Err(FrontendError::ResponseClosed | FrontendError::UnexpectedResponse(_)) => {
+            Err(openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to decode prompt for echo: reply channel closed",
+                false,
+            ))
+        }
+        Err(error @ FrontendError::InvalidArgument(_)) => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to decode prompt for echo: reply channel closed",
+            format!("failed to decode prompt for echo: {error}"),
             false,
         )),
     }
@@ -356,7 +353,6 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
 
 pub(super) async fn unary_completion(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -372,7 +368,7 @@ pub(super) async fn unary_completion(
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
-        let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
+        let output = match collect_output(choice.call).await {
             Ok(output) => output,
             Err((status, message)) => {
                 return openai_error(status, &message, false);
@@ -513,7 +509,6 @@ pub(super) fn completion_response_value(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -524,7 +519,6 @@ pub(super) fn completion_event_stream(
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
         let mut prompt_indexes = Vec::with_capacity(count);
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
@@ -534,10 +528,9 @@ pub(super) fn completion_event_stream(
 
         for choice in submitted {
             let index = choice.index;
-            rids.push(choice.rid);
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            streams.push(indexed_decode_stream(index, choice.rx));
+            streams.push(indexed_decode_stream(index, choice.call));
         }
         let mut events = futures::stream::select_all(streams);
 
@@ -548,12 +541,8 @@ pub(super) fn completion_event_stream(
             };
             let output = match item {
                 ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
+                ResponseItem::Done(output) => output,
                 ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
                     yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
                     continue;
                 }
@@ -732,12 +721,11 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, senders, submitted};
+    use super::super::test_utils::{chunk, submitted};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
         completion_prompt_specs, completion_response_value, unary_completion,
     };
-    use crate::api_server::guard::AbortGuard;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
@@ -828,7 +816,6 @@ mod tests {
 
         let response = unary_completion(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
             "cmpl-test".into(),
             "model".into(),
             1,
@@ -856,7 +843,6 @@ mod tests {
 
         let stream = completion_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
             "cmpl-test".into(),
             "model".into(),
             1,
