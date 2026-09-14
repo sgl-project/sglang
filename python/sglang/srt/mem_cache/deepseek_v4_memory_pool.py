@@ -21,9 +21,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_hip
-from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +67,15 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     return sliding_window + spec_extra
 
 
+def _num_dsv4_physical_kv_pages(
+    size: int, physical_page_size: int, logical_page_size: int
+) -> int:
+    """Include the allocator's reserved logical page in physical storage."""
+    if physical_page_size <= 0 or logical_page_size <= 0:
+        raise ValueError("DeepSeek-V4 KV page sizes must be positive")
+    return ceil_div(size + logical_page_size, physical_page_size)
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -81,6 +89,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        global_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -94,6 +103,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.global_page_size = global_page_size or page_size
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -110,7 +120,9 @@ class DeepSeekV4SingleKVPool(KVCache):
             ):
                 self.kv_buffer = [
                     self.create_buffer(
-                        num_pages=(self.size + self.page_size + 1) // self.page_size,
+                        num_pages=_num_dsv4_physical_kv_pages(
+                            self.size, self.page_size, self.global_page_size
+                        ),
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -256,6 +268,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        global_page_size: int | None = None,
     ):
         super().__init__(
             size,
@@ -268,6 +281,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            global_page_size,
         )
 
         self.data_ptrs = torch.tensor(
@@ -705,7 +719,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # allocator.
         self.swa_kv_page_size = (
             64
-            if is_sm120_supported() and envs.SGLANG_OPT_SM120_DIRECT_SWA_KV.get()
+            if get_platform().is_sm120 and envs.SGLANG_OPT_SM120_DIRECT_SWA_KV.get()
             else swa_page_size
         )
         assert swa_page_size % self.swa_kv_page_size == 0
@@ -1005,11 +1019,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cls: type = DeepSeekV4SingleKVPool,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
-        is the model-wide page_size (== ``page_size`` for the SWA pool, larger
-        for the per-ratio c4/c128 pools); the default CUDA pool ignores it.
+        is the model-wide logical page size. CUDA pools use it to reserve enough
+        physical rows for the allocator's dummy logical page.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
-        del global_page_size  # CUDA pools key only off their own page_size
         return cls(
             size,
             page_size,
@@ -1019,6 +1032,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            global_page_size=global_page_size,
         )
 
     def _make_indexer_pool(

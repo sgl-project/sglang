@@ -384,7 +384,7 @@ def handle_model_specific_adjustments(server_args: Any):
         if get_platform().is_sm120:
             # Keep FP8 wo_a opt-in on SM120. Recent DeepGEMM builds provide
             # dedicated SM120 kernels, while older installations do not; the
-            # API/capability validation in serving_hook handles explicit opt-in.
+            # Centralized DeepGEMM capability validation handles explicit opt-in.
             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             # The default top-k v2 path still requires unsupported resources.

@@ -1778,7 +1778,7 @@ class GroupCoordinator:
 
         The returned buffers remain alive through P2PWork. Callers must wait all
         works and run postprocess callbacks before consuming tensors on another
-        CUDA stream. This mirrors vLLM's lazy PP receive handle lifecycle.
+        CUDA stream.
         """
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None, [], []
@@ -2195,7 +2195,6 @@ get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
 _SELF_PP: Optional[GroupCoordinator] = None
-_PP_PROXY: Optional[GroupCoordinator] = None
 
 
 def get_self_pp_group() -> GroupCoordinator:
@@ -2206,11 +2205,6 @@ def get_self_pp_group() -> GroupCoordinator:
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
-
-
-def get_pp_proxy_group() -> GroupCoordinator:
-    assert _PP_PROXY is not None, "pipeline proxy group is not initialized"
-    return _PP_PROXY
 
 
 # kept for backward compatibility
@@ -2870,6 +2864,7 @@ def initialize_model_parallel(
             group_name="self_pp",
         )
 
+
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:
@@ -3092,11 +3087,6 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
-
-    global _PP_PROXY
-    if _PP_PROXY:
-        _PP_PROXY.destroy()
-    _PP_PROXY = None
 
     global _DCP
     if _DCP:

@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     _CompressedPoolConfig,
+    _num_dsv4_physical_kv_pages,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,6 +18,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_physical_kv_pages_cover_reserved_logical_page(self):
+        size = 8192
+        self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
+        self.assertEqual(_num_dsv4_physical_kv_pages(size, 64, 256), 132)
+        self.assertGreaterEqual(
+            _num_dsv4_physical_kv_pages(size, 64, 256) * 64,
+            size + 256,
+        )
+
     def test_pp_mapping_and_pd_buffer_order(self):
         for unified, stage_ratios in product(
             (False, True), ([4, 0, 128, 4], [128], [0])
