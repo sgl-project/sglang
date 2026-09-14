@@ -17,6 +17,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from array import array
 from collections import defaultdict
@@ -88,6 +89,10 @@ logger = logging.getLogger(__name__)
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
 # the TP consistency check can still all_reduce [digest, -digest] in int64.
 _RECLAIM_DIGEST_MASK = (1 << 42) - 1
+
+_SKIP_HOST_DUPLICATE_RECLAIM = (
+    os.environ.get("SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM", "0") == "1"
+)
 
 
 class StorageBackupSpec(NamedTuple):
@@ -1338,11 +1343,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if absent. Under
-        write_back, FULL pressure reclaims redundant Full host copies first."""
+        write_back, FULL pressure reclaims redundant Full host copies first
+        (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
+            if (
+                not _SKIP_HOST_DUPLICATE_RECLAIM
+                and self.is_write_back
+                and component_type == BASE_COMPONENT_TYPE
+            ):
                 self._reclaim_full_host_duplicates(
                     num_tokens,
                     result.tracker,

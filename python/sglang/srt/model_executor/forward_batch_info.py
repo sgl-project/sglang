@@ -514,6 +514,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # PD disaggregation per-layer hooks: ALL layerwise-enabled senders in the
+    # batch (one per request), published into ForwardContext so the model
+    # forward loop can drive layerwise KV transfer for every request, not
+    # just the first.  Empty on non-disaggregation workers.
+    disagg_kv_senders: List[object] = None  # type: ignore[assignment]
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -739,14 +744,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
+        pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=is_pin_memory_available(device)
+            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob,
             dtype=torch.int64,
-            pin_memory=is_pin_memory_available(device),
+            pin_memory=pin_memory,
         ).to(device, non_blocking=True)
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
@@ -850,6 +856,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            # PD disaggregation: collect ALL layerwise-enabled senders in the
+            # batch so the model forward loop dispatches every request's KV
+            # per layer, not just the first request's.
+            disagg_kv_senders=[
+                req.disagg_kv_sender
+                for req in batch.reqs
+                if getattr(req, "disagg_kv_sender", None) is not None
+                and getattr(req.disagg_kv_sender, "is_layerwise_enabled", False)
+            ]
+            if batch.reqs
+            else None,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -857,8 +874,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret._maybe_init_non_generation_fields(batch)
 
+        # Layerwise PD transfer: pre-compute the page indices so the model
+        # forward loop can dispatch each layer's KV the moment its attention
+        # completes.  Populated once here (before forward) since the
+        # req_to_token mapping is fixed after load_batch.
+        if ret.disagg_kv_senders:
+            _prepare_layerwise_indices(ret, batch, model_runner)
+
         device = model_runner.device
-        _pin = is_pin_memory_available(device)
+        pin_memory = is_pin_memory_available()
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -887,7 +911,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
             ret.num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, pin_memory=_pin
+                num_tokens, dtype=torch.int32, pin_memory=pin_memory
             ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -911,6 +935,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -926,7 +951,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                prefill_pin = _pin or (
+                prefill_pin = pin_memory or (
                         _is_npu and str(device).split(":", 1)[0] == "npu"
                 )
                 ret.extend_seq_lens = torch.tensor(
@@ -1442,8 +1467,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        pin_memory = is_pin_memory_available()
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=pin_memory
+        )
+        self.global_num_tokens_gpu.copy_(
+            global_num_tokens_pinned, non_blocking=pin_memory
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -1782,3 +1812,64 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def _prepare_layerwise_indices(ret: "ForwardBatch", batch, model_runner) -> None:
+    """Compute and cache the per-layer KV page indices on the sender so the
+    model forward loop can dispatch layerwise RDMA writes.
+
+    For each request in the batch that has a layerwise-enabled sender, the
+    source (prefill) page indices are read from ``req_to_token_pool`` and
+    translated to physical IDs; the destination page indices are read from
+    the sender's ``transfer_infos`` (populated during bootstrap).
+    """
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+
+    req_to_token_pool = model_runner.req_to_token_pool
+    allocator = model_runner.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+
+    for req in batch.reqs:
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is None or not getattr(sender, "is_layerwise_enabled", False):
+            continue
+        # Use the current chunk's extend_range, not the full request length.
+        # For chunked prefill, req_to_token only has valid KV indices within
+        # extend_range; reading beyond it yields uninitialized slots that
+        # would produce invalid RDMA addresses and hang the NPU.
+        extend_range = getattr(req, "extend_range", None)
+        if extend_range is not None:
+            start = extend_range.start
+            end = min(extend_range.end, len(req.origin_input_ids))
+        else:
+            start = getattr(req, "start_send_idx", 0)
+            end = len(req.origin_input_ids)
+        if end <= start:
+            continue
+        kv_indices = req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
+        kv_indices = allocator.translate_kv_indices_for_transfer(kv_indices)
+        prefill_page_indices = kv_to_page_indices(kv_indices, page_size)
+        # dst_kv_indices is positionally indexed in PAGE units across the
+        # WHOLE request (see CommonKVSender.send's index_slice and
+        # mooncake's req.dst_kv_indices[index_slice]).  For chunked prefill
+        # we must slice it to the current chunk's page range so src/dst
+        # lengths stay aligned for group_concurrent_contiguous.
+        page_offset = start // page_size
+        dst_page_indices = prefill_page_indices  # fallback (same length)
+        kv_mgr = getattr(sender, "kv_mgr", None)
+        room = getattr(sender, "bootstrap_room", None)
+        if kv_mgr is not None and room is not None:
+            transfer_infos = getattr(kv_mgr, "transfer_infos", {})
+            if room in transfer_infos:
+                for tinfo in transfer_infos[room].values():
+                    if not tinfo.is_dummy and tinfo.dst_kv_indices is not None:
+                        full_dst = tinfo.dst_kv_indices
+                        page_end = page_offset + len(prefill_page_indices)
+                        dst_page_indices = full_dst[page_offset:page_end]
+                        break
+        # Guard against any residual length mismatch (e.g. dst pre-alloc
+        # shorter than the chunk).  Mirrors the workaround in
+        # mooncake/conn.py send path.
+        if len(dst_page_indices) < len(prefill_page_indices):
+            prefill_page_indices = prefill_page_indices[: len(dst_page_indices)]
+        sender.set_layerwise_indices(prefill_page_indices, dst_page_indices)

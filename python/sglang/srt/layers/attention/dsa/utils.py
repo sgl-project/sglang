@@ -273,6 +273,12 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
+        # extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        # if extend_lens is not None:
+        #     cp_min = cp_size * 2
+        #     for L in extend_lens:
+        #         if int(L) < cp_min:
+        #             return False
     return cur_cp_seq_len != 0
 
 

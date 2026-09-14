@@ -1143,6 +1143,13 @@ class CommonKVSender(BaseKVSender):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
+    def send_state_only(self, state_indices: Optional[List] = None) -> None:
+        """Send only state/aux, skipping KV pages.  In layerwise mode the KV
+        was already dispatched per-layer; this forces is_last_chunk=True by
+        advancing curr_idx so the state/aux routes correctly."""
+        self.curr_idx = self.num_kv_indices
+        self.send(np.empty(0, dtype=np.int32), state_indices, num_kv_tokens=0)
+
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
         total_bytes += (

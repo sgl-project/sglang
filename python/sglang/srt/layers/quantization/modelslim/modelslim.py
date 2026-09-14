@@ -613,5 +613,6 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_scale_bias=getattr(layer, "w2_scale_bias", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),
             w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            layer_id=layer.layer_id,
         )
         return self.runner.run(dispatch_output, quant_info)

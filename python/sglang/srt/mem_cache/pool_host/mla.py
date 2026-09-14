@@ -56,7 +56,7 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-_ASCENDC_LAYER_GROUP_DEFAULT = 2
+_ASCENDC_LAYER_GROUP_DEFAULT = 1
 
 
 def _ascendc_layer_group_size() -> int:
@@ -215,12 +215,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
-            base_dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                1,
-            )
+            if os.environ.get("ENABLE_LAYER_FIRST", "0") == "1":
+                base_dims = (
+                    self.layer_num,
+                    self.page_num,
+                    self.page_size,
+                    1,
+                )
+            else:
+                base_dims = (
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    1,
+                )
             # Indexer buffers only exist for physical Indexer layers, which can
             # be a subset of all layers (e.g. GLM 5.2: 21 of 78).  The device
             # pool packs them as (num_indexer_layers, page, ...); mirror that
@@ -231,12 +239,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             if num_indexer_layers is None:
                 num_indexer_layers = self.layer_num
-            indexer_dims = (
-                self.page_num,
-                num_indexer_layers,
-                self.page_size,
-                1,
-            )
+            if os.environ.get("ENABLE_LAYER_FIRST", "0") == "1":
+                indexer_dims = (
+                    num_indexer_layers,
+                    self.page_num,
+                    self.page_size,
+                    1,
+                )
+            else:
+                indexer_dims = (
+                    self.page_num,
+                    num_indexer_layers,
+                    self.page_size,
+                    1,
+                )
             alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
             if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
                 # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
@@ -434,6 +450,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         The layer range arguments restrict the transfer to one layer group
         (layer-group pipelining); the defaults transfer everything.
 
+        When ENABLE_LAYER_FIRST=1, meta[6] is set to host_layout_mode=1 so
+        the kernel uses layer-outer/page-inner iteration with peek-ahead
+        merging of contiguous pages.  The caller must pre-sort the indices
+        by host slot (done once in the controller via GPU argsort).
+
         Requires the host pool to be hybm-backed (SGLANG_HICACHE_IO_ASCENDC
         implies SGLANG_HICACHE_HOST_MEM=hybm) since the kernel de-references
         host pointers directly.
@@ -455,19 +476,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices.record_stream(stream)
 
         def comp_meta(dev_t, host_t, lo, hi):
-            # dev_t: (layer, page, page_size, [1,] width) layer-first;
-            # host_t: (page, layer, page_size, [1,] width) page-first.
             itemsize = dev_t.dtype.itemsize
             width = 1
             for dim in dev_t.shape[2:]:
                 width *= dim
+
+            if os.environ.get("ENABLE_LAYER_FIRST", "0") == "1":
+                # host:
+                # [layer, page, page_size, 1, width]
+                host_page_stride = host_t.stride(1) * itemsize
+                host_layer_stride = host_t.stride(0) * itemsize
+            else:
+                # host:
+                # [page, layer, page_size, 1, width]
+                host_page_stride = host_t.stride(0) * itemsize
+                host_layer_stride = host_t.stride(1) * itemsize
+
             return (
                 dev_t.data_ptr(),
                 host_t.data_ptr(),
+
+                # device is always layer-first
                 dev_t.stride(0) * itemsize,
                 dev_t.stride(1) * itemsize,
-                host_t.stride(0) * itemsize,
-                host_t.stride(1) * itemsize,
+
+                host_page_stride,
+                host_layer_stride,
+
                 width * itemsize,
                 lo,
                 hi,
@@ -481,11 +516,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Both pools must share the layer index space (same limitation as the
         # legacy memcpy2d exchange op); catches e.g. MTP draft pools, whose
         # host rows live past the main pool's layers.
-        if k_hi > self.k_buffer.shape[1] or k_hi > device_pool.k_buffer.shape[0]:
+        enable_layer_first = os.environ.get("ENABLE_LAYER_FIRST", "0") == "1"
+
+        host_layer_num = (
+            self.k_buffer.shape[0]
+            if enable_layer_first
+            else self.k_buffer.shape[1]
+        )
+
+        device_layer_num = device_pool.k_buffer.shape[0]
+
+        if k_hi > host_layer_num or k_hi > device_layer_num:
             raise RuntimeError(
                 f"AscendC kv_exchange layer range [{k_lo}, {k_hi}) exceeds the "
-                f"pool layer space (device={device_pool.k_buffer.shape[0]}, "
-                f"host={self.k_buffer.shape[1]})"
+                f"pool layer space (device={device_layer_num}, "
+                f"host={host_layer_num})"
             )
 
         comps = [
@@ -499,9 +544,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_index_k = getattr(device_pool, "index_k_buffer", None)
         if self.index_k_buffer is not None and device_index_k is not None:
             if index_k_layer_num < 0:
-                ik_lo, ik_hi = 0, self.index_k_buffer.shape[1]
+                host_index_layer_num = (
+                    self.index_k_buffer.shape[0]
+                    if enable_layer_first
+                    else self.index_k_buffer.shape[1]
+                )
+                ik_lo, ik_hi = 0, host_index_layer_num
             else:
-                ik_lo, ik_hi = index_k_layer_start, index_k_layer_start + index_k_layer_num
+                ik_lo = index_k_layer_start
+                ik_hi = index_k_layer_start + index_k_layer_num
             if ik_hi > ik_lo:
                 comps.append(
                     comp_meta(device_index_k, self.index_k_buffer, ik_lo, ik_hi)
@@ -523,6 +574,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         num_pages = host_indices.numel() // self.page_size
         direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
+
+        host_layout_mode = 1 if enable_layer_first else 0
+
         vals = [
             len(comps),
             num_pages,
@@ -530,10 +584,38 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             direction_value,
             device_indices.data_ptr(),
             host_indices.data_ptr(),
+            host_layout_mode,
+            0,
         ]
         for comp in comps:
             vals.extend(comp)
         
+        def _rewrite_host_base_to_dva(vals):
+            _KV_EXCHANGE_META_HEADER = 8
+            _KV_EXCHANGE_META_STRIDE = 9
+            _KV_EXCHANGE_MAX_COMPONENTS = 4
+            _KV_EXCHANGE_HOST_BASE_OFFSET = 1
+
+            # D2H: copy meta to CPU so we can read/modify the int64 fields.
+            num_components = int(vals[0])
+            if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
+                raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
+            for c in range(num_components):
+                idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
+                host_base = int(vals[idx])
+                if host_base == 0:
+                    continue
+                # get_dva_impl = offload.get_dva
+                dva = offload.get_dva(host_base)
+                if dva == 0:
+                    raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
+                if dva != host_base:
+                    vals[idx] = dva
+
+            return vals
+
+        vals = _rewrite_host_base_to_dva(vals)
+
         pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
         meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
         meta.copy_(pinned_meta, non_blocking=True)
@@ -634,24 +716,39 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
                 if _is_npu and ascendc_io_enabled():
-                    # AscendC layer-group pipelining: at each group boundary
-                    # layer, launch one fused kv_exchange kernel covering the
-                    # group.  The per-layer complete(i) events recorded by the
-                    # caller then gate compute at group granularity, letting
-                    # later groups' DMA overlap the current group's compute.
-                    group = self._ascendc_layer_group(device_pool, device_layer_id)
-                    if group is not None:
-                        layer_start, layer_num, ik_start, ik_num = group
-                        self._transfer_ascendc_sparse_copy(
-                            device_pool,
-                            host_indices,
-                            device_indices,
-                            TransferDirection.H2D,
-                            layer_start=layer_start,
-                            layer_num=layer_num,
-                            index_k_layer_start=ik_start,
-                            index_k_layer_num=ik_num,
-                        )
+                    if os.environ.get("ENABLE_LAYER_FIRST", "0") == "1":
+                        group = self._ascendc_layer_group(device_pool, device_layer_id)
+                        if group is not None:
+                            layer_start, layer_num, ik_start, ik_num = group
+                            self._transfer_ascendc_sparse_copy(
+                                device_pool,
+                                host_indices,
+                                device_indices,
+                                TransferDirection.H2D,
+                                layer_start=layer_start,
+                                layer_num=layer_num,
+                                index_k_layer_start=ik_start,
+                                index_k_layer_num=ik_num,
+                            )
+                    else:
+                        # AscendC layer-group pipelining: at each group boundary
+                        # layer, launch one fused kv_exchange kernel covering the
+                        # group.  The per-layer complete(i) events recorded by the
+                        # caller then gate compute at group granularity, letting
+                        # later groups' DMA overlap the current group's compute.
+                        group = self._ascendc_layer_group(device_pool, device_layer_id)
+                        if group is not None:
+                            layer_start, layer_num, ik_start, ik_num = group
+                            self._transfer_ascendc_sparse_copy(
+                                device_pool,
+                                host_indices,
+                                device_indices,
+                                TransferDirection.H2D,
+                                layer_start=layer_start,
+                                layer_num=layer_num,
+                                index_k_layer_start=ik_start,
+                                index_k_layer_num=ik_num,
+                            )
                     return
                 # memcpy2d layer-group pipelining: at each group boundary
                 # layer, enqueue that group's 2D copies through the op's
@@ -761,7 +858,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return device_pool.data_ptrs, device_pool.kv_buffer
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
     ):
         if torch.distributed.get_rank() == 0:
             logger.debug(

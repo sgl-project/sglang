@@ -26,6 +26,11 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.disaggregation.layerwise_hooks import (
+    layerwise_finalize_send,
+    layerwise_save_kv_layer,
+    layerwise_start_send,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
@@ -1098,6 +1103,7 @@ class Glm4MoeModel(nn.Module):
                 normal_end_layer = normal_start_layer = 0
 
         aux_hidden_states = []
+        layerwise_start_send(normal_end_layer - normal_start_layer)
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
@@ -1109,6 +1115,8 @@ class Glm4MoeModel(nn.Module):
                     forward_batch,
                     residual,
                 )
+                layerwise_save_kv_layer(i)
+        layerwise_finalize_send()
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
