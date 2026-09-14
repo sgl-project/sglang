@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_SHARED_SF_INDEX: dict = {}
 
 
 def _mega_moe_mma_type() -> str:
@@ -93,6 +95,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_shared_experts: int = 0,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -105,6 +108,7 @@ def _get_mega_moe_symm_buffer(
         hidden,
         intermediate_hidden,
         mma_type,
+        num_shared_experts,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -115,11 +119,39 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
+            num_shared_experts=num_shared_experts,
             mma_type=mma_type,
             activation="swiglu",
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
+
+
+def _fill_mega_moe_shared_l1_acts_sf(buf: SymmBuffer, num_tokens: int) -> None:
+    import deep_gemm
+
+    block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    index = _MEGA_MOE_SHARED_SF_INDEX.get(block_m)
+    if index is None:
+        # The kernel reads shared L1 scales in BLOCK_M blocks padded to 128 rows,
+        # 4x32-transposed within each 128 rows (sm100_fp8_fp4_mega_moe.cuh).
+        token = torch.arange(buf.num_max_tokens_per_rank, device=buf.x_sf.device)
+        m = token % block_m
+        index = (
+            token // block_m * ceil_align(block_m, 128)
+            + m // 128 * 128
+            + m % 32 * 4
+            + m % 128 // 32
+        )
+        _MEGA_MOE_SHARED_SF_INDEX[block_m] = index
+    buf.shared_l1_acts_sf[index[:num_tokens]] = buf.x_sf[:num_tokens]
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
@@ -142,6 +174,18 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     return max_tokens_per_rank <= cap
 
 
+def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
+    # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
+    return (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
+        and getattr(moe.experts, "_mega_moe_weights_built", False)
+        and _device_sm != 90
+        and _mega_moe_mma_type() == "fp8xfp4"
+        and moe.shared_experts_is_fp8
+        and moe.shared_experts_weight_block_size == [128, 128]
+    )
+
+
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -149,6 +193,11 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+
+    if moe.mega_shared_l1_weights is not None:
+        return _run_mega_routed(
+            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+        )
 
     sbo_overlap_flag = (
         moe.alt_stream is not None
@@ -235,6 +284,9 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        num_shared_experts=(
+            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+        ),
     )
 
     if num_tokens > 0:
@@ -253,6 +305,9 @@ def _run_mega_routed(
             buf,
             num_tokens,
         )
+
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        topk_weights_in = topk_weights_in * moe.routed_scaling_factor
 
     mma_type = _mega_moe_mma_type()
     if mma_type == "mxf4xmxf4":
@@ -290,6 +345,8 @@ def _run_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
+    if moe.mega_shared_l1_weights is not None:
+        _fill_mega_moe_shared_l1_acts_sf(buf, num_tokens=y.shape[0])
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
@@ -297,16 +354,14 @@ def _run_mega_routed(
             moe.experts.mega_l1_weights,
             moe.experts.mega_l2_weights,
             buf,
+            shared_l1_weights=moe.mega_shared_l1_weights,
+            shared_l2_weights=moe.mega_shared_l2_weights,
             recipe=(1, 1, 32),
             activation="swiglu",
             activation_clamp=swiglu_limit,
             fast_math=True,
         )
-    y = y[:num_tokens]
-
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        y.mul_(moe.routed_scaling_factor)
-    return y
+    return y[:num_tokens]
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
@@ -406,3 +461,36 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True
+
+
+def build_mega_moe_shared_weights(
+    shared_experts,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    from deep_gemm import transform_weights_for_mega_moe
+
+    gate_up_proj, down_proj = shared_experts.gate_up_proj, shared_experts.down_proj
+    # L1 is copied interleaved (2*moe_intermediate*hidden FP8 bytes per layer);
+    # the original stays for the forward_normal fallback above the token cap.
+    return transform_weights_for_mega_moe(
+        (gate_up_proj.weight.data, _transform_mega_moe_shared_sf(gate_up_proj)),
+        (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
+    )
+
+
+def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
+    from deep_gemm import transform_sf_into_required_layout
+
+    from sglang.srt.layers.quantization.fp8_utils import inverse_transform_scale_ue8m0
+
+    n, k = linear.weight.shape
+    sf = linear.weight_scale_inv.data
+    if sf.dtype == torch.int32:
+        # Requantized for the DeepGEMM linear runner.
+        sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+    return transform_sf_into_required_layout(
+        sf.repeat_interleave(4, dim=-1),
+        mn=n,
+        k=k,
+        recipe=(128, 32),
+        disable_ue8m0_cast=False,
+    )

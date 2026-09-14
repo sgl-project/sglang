@@ -3559,6 +3559,20 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
 
+    def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.layers.moe.mega_moe import (
+            build_mega_moe_shared_weights,
+            should_fuse_mega_moe_shared_experts,
+        )
+
+        for module in self.modules():
+            if isinstance(
+                module, deepseek_v2.DeepseekV2MoE
+            ) and should_fuse_mega_moe_shared_experts(module):
+                module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
+                    build_mega_moe_shared_weights(module.shared_experts)
+                )
+
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
         name: str,

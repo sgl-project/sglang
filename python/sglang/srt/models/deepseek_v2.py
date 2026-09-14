@@ -696,6 +696,8 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
+        self.mega_shared_l1_weights = None
+        self.mega_shared_l2_weights = None
         # Shared experts: skip when fused into MoE kernel
         # (self.num_fused_shared_experts > 0) or when DeepEP/MegaMOE fusion is enabled.
         if (
