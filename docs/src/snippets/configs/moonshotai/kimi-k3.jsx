@@ -470,8 +470,8 @@ export const config = {
     gb200:  "lmsysorg/sglang:kimi-k3",
     // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
     // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
-    mi350x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
