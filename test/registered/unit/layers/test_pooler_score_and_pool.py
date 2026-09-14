@@ -16,7 +16,7 @@ from sglang.srt.layers.pooler import (
     PoolingType,
     score_and_pool,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -193,7 +193,9 @@ class TestDisableNormalizeEmbedding(CustomTestCase):
 
     ``Pooler.__init__`` reads the resolved flag from the ``model`` config bag,
     so these tests publish a context via ``override_server_args`` rather than
-    constructing the pooler against an unpublished context.
+    faking the accessor. Construction against an *unpublished* context stays
+    supported and keeps normalization — see
+    ``test_unpublished_context_keeps_normalization``.
     """
 
     def setUp(self):
@@ -234,6 +236,19 @@ class TestDisableNormalizeEmbedding(CustomTestCase):
             self.assertFalse(
                 Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
             )
+
+    def test_unpublished_context_keeps_normalization(self):
+        """Pooler stays constructible without a published server context.
+
+        Config bags fail closed before ``publish``, so reading the flag
+        unconditionally would make ``Pooler(normalize=True)`` raise in any
+        standalone/offline construction path. With no published model
+        namespace there is no override to honor, so normalization is kept.
+        """
+        self.addCleanup(reset_context)
+        reset_context()
+        pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.assertTrue(pooler.normalize)
 
 
 if __name__ == "__main__":

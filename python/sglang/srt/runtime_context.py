@@ -1069,6 +1069,20 @@ class RuntimeContext:
         self._overrides_log = []
         self._publish_role = None
 
+    def is_config_published(self, name: str) -> bool:
+        """Whether ``name``'s config bag has been projected.
+
+        For the rare reader that must tolerate an unpublished context (a layer
+        constructible offline, outside any published server context) and has a
+        well-defined pre-publish default. Regular reads must keep using
+        ``config_bag`` and fail closed. Deliberately does not run the role
+        namespace check: this answers "is it there", not "may I read it", so a
+        role violation still raises from the subsequent ``config_bag`` call
+        rather than being reported as unpublished.
+        """
+        bags = self._config_bags
+        return bool(bags) and name in bags
+
     def config_bag(self, name: str) -> _ConfigBag:
         """Return the top-level config namespace bag (``device`` / ``model`` /
         ``exec`` / ``schedule`` / ``memory`` / ``spec`` / ``lora`` / ``mm`` /
@@ -1372,6 +1386,15 @@ def get_forward() -> ForwardFlags:
 # directly, alongside the live topology they belong to.
 def get_device() -> _ConfigBag:
     return _CONTEXT.config_bag("device")
+
+
+def is_config_published(name: str) -> bool:
+    """Whether the ``name`` config namespace has been projected by ``publish``.
+
+    Only for readers that must stay constructible without a published context;
+    everything else reads the bag directly and fails closed.
+    """
+    return _CONTEXT.is_config_published(name)
 
 
 def get_model() -> _ConfigBag:

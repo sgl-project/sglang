@@ -12,7 +12,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, is_config_published
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -166,6 +166,20 @@ def score_and_pool(
     )
 
 
+def _disable_normalize_embedding() -> bool:
+    """Whether ``--disable-normalize-embedding`` is set.
+
+    ``Pooler`` is constructible outside a published server context (offline /
+    standalone model construction), while config bags fail closed until
+    ``publish`` has run. Absent a published model namespace there is no flag to
+    honor, so fall back to the default of keeping normalization. Production
+    model init runs after ``publish``, so serving always sees the real value.
+    """
+    if not is_config_published("model"):
+        return False
+    return get_model().disable_normalize_embedding
+
+
 class Pooler(nn.Module):
     """A layer that pools specific information from hidden states.
     This layer does the following:
@@ -180,7 +194,7 @@ class Pooler(nn.Module):
     def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
-        if normalize and get_model().disable_normalize_embedding:
+        if normalize and _disable_normalize_embedding():
             normalize = False
         self.normalize = normalize
 
