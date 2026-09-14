@@ -259,10 +259,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        # Attention backend
+        # Attention backend; for the model runner's primary backend the static
+        # metadata buffers were already allocated by ModelRunner.init_backends.
+        # For an *injected* backend (e.g. EAGLE V2's adaptive target backend,
+        # built via _get_attention_backend(init_new_workspace=True)) the hoisted
+        # init never touched this instance, so initialize it here.
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.attn_backend.init_static_metadata_buffers(self.max_bs, self.max_num_token)
+        if self.attn_backend is not model_runner.attn_backend:
+            self.attn_backend.init_static_metadata_buffers(
+                self.max_bs, self.max_num_token
+            )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -375,10 +382,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
-            for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_static_metadata_buffers(
-                    self.max_bs, self.max_num_token
-                )
+            # Static metadata buffers for every backend in the group were
+            # allocated by ModelRunner._init_static_metadata_buffers_from_eager
+            # before this runner was built.
 
     def _cache_loc_dtype(self):
         return torch.int64

@@ -358,6 +358,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
+        # NOTE: We deliberately do NOT call init_static_metadata_buffers on
+        # the freshly-built draft / draft-extend backends here. Each EAGLE
+        # cuda-graph runner (EAGLEDraftCudaGraphRunner / EAGLEDraftExtendCuda
+        # GraphRunner) calls init_static_metadata_buffers on its backend in
+        # its __init__, so a pre-init here would peak at 2× the static
+        # buffers (briefly two cuda_graph_kv_indices / custom_mask tensors
+        # alive before the attribute is overwritten). When cuda graphs are
+        # disabled, no graph runner is built and the eager draft path
+        # allocates per-iter tensors itself rather than reading these
+        # static buffers, so init_static_metadata_buffers is also unneeded.
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None

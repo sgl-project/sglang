@@ -97,8 +97,16 @@ class AttentionBackend(ABC):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
     def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
-        """Init the global shared states for cuda graph."""
-        raise NotImplementedError()
+        """Allocate the per-backend static metadata buffers used by both the
+        cuda-graph runners (bucket replays) and the EagerRunner (eager forward
+        + eager fallback at non-captured bs). Sized once at ``(max_bs,
+        max_num_tokens)`` and sliced per static shape by
+        ``init_forward_metadata_out_graph``.
+
+        Defaults to a no-op so backends that never bind static buffers (CPU /
+        XPU eager-only paths) inherit the right behavior. Backends that DO
+        need static buffers (every cuda-graph-capable backend) override.
+        """
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,

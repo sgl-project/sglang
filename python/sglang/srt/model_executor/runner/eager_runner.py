@@ -111,6 +111,7 @@ class EagerRunner(BaseRunner):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
+        self._eager_max_num_token = max_num_token
         self._eager_num_tokens_per_bs = num_tokens_per_bs
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
