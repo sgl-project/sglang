@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
@@ -41,14 +42,19 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
+    _copy_right_aligned_prefix_bnsd,
     _randn_with_seed,
     prepare_flash_kv_cache,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Attention,
+    Qwen3MLP,
     _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
+    npu_fia_enabled,
+    npu_fused_mlp_enabled,
+    npu_fused_norm_enabled,
     position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -332,6 +338,131 @@ def test_sensenova_u1_compacts_variable_length_kv_before_attention():
     )
     expected_long = _sdpa_attn_func(q[1:], k[1:], v[1:])
     torch.testing.assert_close(actual, torch.cat((expected_short, expected_long)))
+
+
+def test_sensenova_u1_sdpa_masks_padded_prefix_keys():
+    q = torch.tensor([[[[1.0, 0.0]]]])
+    k = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]]])
+    v = torch.tensor([[[[2.0, 0.0]], [[0.0, 4.0]], [[100.0, 100.0]]]])
+    key_mask = torch.tensor([[[[True, True, False]]]])
+
+    actual = _sdpa_attn_func(q, k, v, attention_mask=key_mask)
+    expected = _sdpa_attn_func(q, k[:, :2], v[:, :2])
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
+    source = torch.tensor(
+        [
+            [[[1], [2], [99], [99], [99]]],
+            [[[3], [4], [5], [6], [7]]],
+        ]
+    )
+    destination = torch.zeros(2, 1, 8, 1, dtype=source.dtype)
+
+    _copy_right_aligned_prefix_bnsd(destination, source, [2, 5])
+
+    assert destination[:, 0, :5, 0].tolist() == [
+        [0, 0, 0, 1, 2],
+        [3, 4, 5, 6, 7],
+    ]
+    assert destination[:, :, 5:].eq(0).all()
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off"])
+def test_sensenova_u1_npu_fia_can_be_disabled(monkeypatch, value):
+    monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FIA", value)
+    assert not npu_fia_enabled()
+
+
+def test_sensenova_u1_npu_fia_is_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_SENSENOVA_NPU_FIA", raising=False)
+    assert npu_fia_enabled()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "enabled"),
+    [
+        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
+        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "false", "off"])
+def test_sensenova_u1_npu_fused_ops_can_be_disabled(
+    monkeypatch, env_name, enabled, value
+):
+    monkeypatch.setenv(env_name, value)
+    assert not enabled()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "enabled"),
+    [
+        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
+        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
+    ],
+)
+def test_sensenova_u1_npu_fused_ops_are_enabled_by_default(
+    monkeypatch, env_name, enabled
+):
+    monkeypatch.delenv(env_name, raising=False)
+    assert enabled()
+
+
+@torch.no_grad()
+def test_sensenova_u1_fused_dense_mlp_matches_original(monkeypatch):
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="silu",
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(37)
+        mlp = Qwen3MLP(config).eval()
+        hidden_states = torch.randn(2, 5, config.hidden_size)
+        expected = mlp(hidden_states)
+
+    monkeypatch.setattr(mlp, "_use_npu_fused_mlp", lambda _x: True)
+    monkeypatch.setattr(
+        torch.ops,
+        "npu",
+        SimpleNamespace(
+            npu_swiglu=lambda x, dim=-1: (
+                F.silu(x.chunk(2, dim=dim)[0]) * x.chunk(2, dim=dim)[1]
+            )
+        ),
+        raising=False,
+    )
+    actual = mlp(hidden_states)
+
+    torch.testing.assert_close(actual, expected)
+    assert set(mlp.state_dict()) == {
+        "gate_proj.weight",
+        "up_proj.weight",
+        "down_proj.weight",
+    }
+    assert (
+        mlp.gate_proj.weight.untyped_storage().data_ptr()
+        == mlp.up_proj.weight.untyped_storage().data_ptr()
+    )
+
+
+def test_sensenova_u1_batched_gqa_matches_unpadded_singletons():
+    generator = torch.Generator().manual_seed(17)
+    q = torch.randn(2, 3, 4, 8, generator=generator)
+    k = torch.randn(2, 8, 2, 8, generator=generator)
+    v = torch.randn(2, 8, 2, 8, generator=generator)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    valid[0, 2:5] = False
+
+    actual = _sdpa_attn_func(q, k, v, attention_mask=valid[:, None, None, :])
+
+    for i in range(2):
+        expected = _sdpa_attn_func(
+            q[i : i + 1], k[i : i + 1, valid[i]], v[i : i + 1, valid[i]]
+        )
+        torch.testing.assert_close(actual[i : i + 1], expected)
 
 
 @torch.no_grad()

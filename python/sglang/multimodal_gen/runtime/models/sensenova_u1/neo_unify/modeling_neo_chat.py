@@ -21,7 +21,11 @@ from .modeling_fm_modules import (
     TimestepEmbedder,
 )
 from .modeling_neo_vit import NEOVisionModel
-from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
+from .modeling_qwen3 import (
+    Qwen3ForCausalLM,
+    create_block_causal_mask,
+    npu_fia_enabled,
+)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
@@ -37,6 +41,14 @@ def version_cmp(v1, v2, op="eq"):
     return op_func(version.parse(v1), version.parse(v2))
 
 
+def _copy_right_aligned_prefix_bnsd(destination, source, lengths):
+    prefix_width = source.shape[2]
+    for batch_index, length in enumerate(lengths):
+        destination[batch_index, :, prefix_width - length : prefix_width].copy_(
+            source[batch_index, :, :length]
+        )
+
+
 def prepare_flash_kv_cache(
     past_key_values,
     current_len: int,
@@ -44,8 +56,8 @@ def prepare_flash_kv_cache(
     prefix_lengths: Optional[torch.Tensor] = None,
 ):
     """
-    Convert prefix cache from [B, H, S, D] to [B, S, H, D] and preallocate
-    the full KV buffer for [prefix + current].
+    Preallocate the full KV buffer for [prefix + current]. CUDA/SDPA use
+    [B, S, H, D], while NPU FIA keeps the source [B, H, S, D] layout.
 
     This is done once before denoising loop.
     """
@@ -72,6 +84,8 @@ def prepare_flash_kv_cache(
             layer.flash_k_cache = None
             layer.flash_v_cache = None
             layer.flash_actual_seq_lengths_kv = None
+            layer.flash_kv_padding_size = None
+            layer.flash_cache_layout = None
             continue
 
         # original cache layout: [B, H, S, D]
@@ -84,23 +98,51 @@ def prepare_flash_kv_cache(
                 f"Prefix lengths must be between 0 and {prefix_len}, got {lengths}"
             )
 
-        past_k_flash = past_k.transpose(1, 2).contiguous()
-        past_v_flash = past_v.transpose(1, 2).contiguous()
-        k_cache = torch.empty(
-            (batch_size, total_len, past_k_flash.shape[2], past_k_flash.shape[3]),
-            device=past_k_flash.device,
-            dtype=past_k_flash.dtype,
+        use_npu_fia = (
+            past_k.device.type == "npu" and lengths is not None and npu_fia_enabled()
         )
-        v_cache = torch.empty(
-            (batch_size, total_len, past_v_flash.shape[2], past_v_flash.shape[3]),
-            device=past_v_flash.device,
-            dtype=past_v_flash.dtype,
-        )
-        k_cache[:, :prefix_len].copy_(past_k_flash)
-        v_cache[:, :prefix_len].copy_(past_v_flash)
-        layer.flash_actual_seq_lengths_kv = (
-            None if lengths is None else [length + current_len for length in lengths]
-        )
+        if use_npu_fia:
+            k_cache = torch.empty(
+                (batch_size, past_k.shape[1], total_len, past_k.shape[3]),
+                device=past_k.device,
+                dtype=past_k.dtype,
+            )
+            v_cache = torch.empty(
+                (batch_size, past_v.shape[1], total_len, past_v.shape[3]),
+                device=past_v.device,
+                dtype=past_v.dtype,
+            )
+            _copy_right_aligned_prefix_bnsd(k_cache, past_k, lengths)
+            _copy_right_aligned_prefix_bnsd(v_cache, past_v, lengths)
+            layer.flash_actual_seq_lengths_kv = [
+                length + current_len for length in lengths
+            ]
+            layer.flash_kv_padding_size = torch.zeros(
+                1, dtype=torch.int64, device=past_k.device
+            )
+            layer.flash_cache_layout = "BNSD"
+        else:
+            past_k_flash = past_k.transpose(1, 2).contiguous()
+            past_v_flash = past_v.transpose(1, 2).contiguous()
+            k_cache = torch.empty(
+                (batch_size, total_len, past_k_flash.shape[2], past_k_flash.shape[3]),
+                device=past_k_flash.device,
+                dtype=past_k_flash.dtype,
+            )
+            v_cache = torch.empty(
+                (batch_size, total_len, past_v_flash.shape[2], past_v_flash.shape[3]),
+                device=past_v_flash.device,
+                dtype=past_v_flash.dtype,
+            )
+            k_cache[:, :prefix_len].copy_(past_k_flash)
+            v_cache[:, :prefix_len].copy_(past_v_flash)
+            layer.flash_actual_seq_lengths_kv = (
+                None
+                if lengths is None or past_k.device.type == "npu"
+                else [length + current_len for length in lengths]
+            )
+            layer.flash_kv_padding_size = None
+            layer.flash_cache_layout = "BSND"
 
         layer.flash_prefix_len = prefix_len
         layer.flash_total_len = total_len
@@ -122,6 +164,10 @@ def clear_flash_kv_cache(past_key_values):
             delattr(layer, "flash_v_cache")
         if hasattr(layer, "flash_actual_seq_lengths_kv"):
             delattr(layer, "flash_actual_seq_lengths_kv")
+        if hasattr(layer, "flash_kv_padding_size"):
+            delattr(layer, "flash_kv_padding_size")
+        if hasattr(layer, "flash_cache_layout"):
+            delattr(layer, "flash_cache_layout")
 
 
 def optimized_scale(positive_flat, negative_flat):
@@ -2215,6 +2261,16 @@ class NEOChatModel(PreTrainedModel):
             timesteps = self._apply_time_schedule(
                 timesteps, token_h * token_w, timestep_shift
             )
+        denoise_embeddings = None
+        if device.type == "npu":
+            denoise_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
+            if self.add_noise_scale_embedding:
+                noise_level = timesteps.new_tensor(
+                    [noise_scale / self.noise_scale_max_value]
+                )
+                denoise_embeddings = denoise_embeddings + self.fm_modules[
+                    "noise_scale_embedder"
+                ](noise_level)
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -2232,18 +2288,20 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
-                batch_size, token_h * token_w, -1
-            )
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(
-                    t_expanded, noise_scale / self.noise_scale_max_value
-                )
-                noise_embeddings = self.fm_modules["noise_scale_embedder"](
-                    noise_scale_tensor
+            if denoise_embeddings is not None:
+                timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
+            else:
+                t_expanded = t.expand(batch_size * token_h * token_w)
+                timestep_embeddings = self.fm_modules["timestep_embedder"](
+                    t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                timestep_embeddings += noise_embeddings
+                if self.add_noise_scale_embedding:
+                    noise_scale_tensor = torch.full_like(
+                        t_expanded, noise_scale / self.noise_scale_max_value
+                    )
+                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
+                        noise_scale_tensor
+                    ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             out_cond = self._t2i_predict_v(
@@ -2415,7 +2473,7 @@ class NEOChatModel(PreTrainedModel):
             input_ids_condition,
             indexes_condition,
             attention_mask_condition_prefix,
-            _,
+            condition_key_valid_mask,
             condition_prefix_lengths,
         ) = self._build_t2i_text_inputs(tokenizer, query_condition)
         if query_uncondition is not None:
@@ -2568,6 +2626,19 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
+        if device.type == "npu" and batch_size > 1 and not npu_fia_enabled():
+            condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
+            image_key_valid_mask = torch.ones(
+                (batch_size, token_h * token_w),
+                dtype=torch.bool,
+                device=device,
+            )
+            denoise_key_valid_mask = torch.cat(
+                [condition_key_valid_mask, image_key_valid_mask], dim=1
+            )
+            attention_mask_condition["full_attention"] = denoise_key_valid_mask[
+                :, None, None, :
+            ]
         attention_mask_uncondition = {"full_attention": None}
 
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
@@ -2575,6 +2646,16 @@ class NEOChatModel(PreTrainedModel):
             timesteps = self._apply_time_schedule(
                 timesteps, token_h * token_w, timestep_shift
             )
+        denoise_embeddings = None
+        if device.type == "npu":
+            denoise_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
+            if self.add_noise_scale_embedding:
+                noise_level = timesteps.new_tensor(
+                    [noise_scale / self.noise_scale_max_value]
+                )
+                denoise_embeddings = denoise_embeddings + self.fm_modules[
+                    "noise_scale_embedder"
+                ](noise_level)
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -2589,18 +2670,20 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
-                batch_size, token_h * token_w, -1
-            )
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(
-                    t_expanded, noise_scale / self.noise_scale_max_value
-                )
-                noise_embeddings = self.fm_modules["noise_scale_embedder"](
-                    noise_scale_tensor
+            if denoise_embeddings is not None:
+                timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
+            else:
+                t_expanded = t.expand(batch_size * token_h * token_w)
+                timestep_embeddings = self.fm_modules["timestep_embedder"](
+                    t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                timestep_embeddings += noise_embeddings
+                if self.add_noise_scale_embedding:
+                    noise_scale_tensor = torch.full_like(
+                        t_expanded, noise_scale / self.noise_scale_max_value
+                    )
+                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
+                        noise_scale_tensor
+                    ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             v_pred_condition = self._t2i_predict_v(

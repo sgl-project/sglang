@@ -85,6 +85,9 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
+    SGLANG_SENSENOVA_NPU_FIA: bool = True
+    SGLANG_SENSENOVA_NPU_FUSED_NORM: bool = True
+    SGLANG_SENSENOVA_NPU_FUSED_MLP: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
@@ -391,6 +394,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES": _lazy_int(
         "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
+    ),
+    "SGLANG_SENSENOVA_NPU_FIA": _lazy_bool("SGLANG_SENSENOVA_NPU_FIA", "true"),
+    "SGLANG_SENSENOVA_NPU_FUSED_NORM": _lazy_bool(
+        "SGLANG_SENSENOVA_NPU_FUSED_NORM", "true"
+    ),
+    "SGLANG_SENSENOVA_NPU_FUSED_MLP": _lazy_bool(
+        "SGLANG_SENSENOVA_NPU_FUSED_MLP", "true"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
     # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.

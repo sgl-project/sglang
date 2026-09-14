@@ -97,6 +97,22 @@ in one batch must use the same resolution, inference steps, guidance settings,
 and output options. Requests with multiple outputs or `think_mode=true` are
 executed sequentially.
 
+### 5.2 Ascend NPU optimizations
+
+On Ascend NPU, SenseNova-U1 uses fused inference attention, RMSNorm, and
+SwiGLU MLP operators by default. The following environment variables disable
+individual paths for comparison or troubleshooting:
+
+```bash
+export SGLANG_SENSENOVA_NPU_FIA=0
+export SGLANG_SENSENOVA_NPU_FUSED_NORM=0
+export SGLANG_SENSENOVA_NPU_FUSED_MLP=0
+```
+
+Restart the server after changing a variable. Run one complete warmup request
+before benchmarking because the fused MLP packs its gate and up projection
+weights on first use.
+
 ## 6. Benchmark
 
 ### 6.1 Speedup benchmark
@@ -155,5 +171,22 @@ executed sequentially.
     Peak Memory Median (MB):                      34326.00
     ------------------------------------------------------------
     ```
+  </Tab>
+  <Tab title="Ascend 910C">
+
+    Environment: one Ascend 910C; workload: four concurrent 2048 x 2048
+    text-to-image requests, 50 denoising steps, CFG 4, BF16.
+
+    | Configuration | Duration (s) | Throughput (images/s) | Mean latency (s) | Peak reserved memory (MB) |
+    |---|---:|---:|---:|---:|
+    | B1, optimizations disabled | 234.28 | 0.01707 | 146.47 | 35698 |
+    | B2, optimizations disabled | 234.83 | 0.01703 | 176.06 | 37870 |
+    | B1, FIA + RMSNorm + MLP | 205.94 | 0.01942 | 128.80 | 35718 |
+    | B2, FIA + RMSNorm + MLP | 195.02 | 0.02051 | 146.33 | 37850 |
+
+    Optimized B1 improves throughput by 13.76% over unoptimized B1. Optimized
+    B2 improves throughput by 20.42% over unoptimized B2 and by 5.60% over
+    optimized B1.
+
   </Tab>
 </Tabs>
