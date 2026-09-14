@@ -203,9 +203,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-test-1-gpu-mi35x:
-    name: nightly-test-1-gpu-mi35x (rocm700, linux-mi35x-gpu-1)
+    name: nightly-test-1-gpu-mi35x (rocm700, linux-mi35x-gpu-1.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-mi35x,'))
-    runs-on: linux-mi35x-gpu-1
+    runs-on: linux-mi35x-gpu-1.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -274,9 +274,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-glm51-mxfp4:
-    name: nightly-2-gpu-mi35x-glm51-mxfp4 (rocm700, linux-mi35x-gpu-2)
+    name: nightly-2-gpu-mi35x-glm51-mxfp4 (rocm700, linux-mi35x-gpu-2.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4,'))
-    runs-on: linux-mi35x-gpu-2
+    runs-on: linux-mi35x-gpu-2.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -309,9 +309,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2:
-    name: nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 (rocm700, linux-mi35x-gpu-2)
+    name: nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 (rocm700, linux-mi35x-gpu-2.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2,'))
-    runs-on: linux-mi35x-gpu-2
+    runs-on: linux-mi35x-gpu-2.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -515,9 +515,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-8-gpu-mi35x:
-    name: nightly-accuracy-8-gpu-mi35x (rocm700, linux-mi35x-gpu-8)
+    name: nightly-accuracy-8-gpu-mi35x (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -600,9 +600,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok1-int4:
-    name: nightly-8-gpu-mi35x-grok1-int4 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-grok1-int4 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok1-int4,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -699,9 +699,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok2:
-    name: nightly-8-gpu-mi35x-grok2 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-grok2 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok2,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -927,9 +927,9 @@ jobs:
   # ==============================================================================
 
   nightly-accuracy-8-gpu-mi35x-deepseek-v32:
-    name: nightly-accuracy-8-gpu-mi35x-deepseek-v32 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-accuracy-8-gpu-mi35x-deepseek-v32 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-deepseek-v32,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -964,9 +964,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp:
-    name: nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp (rocm700, linux-mi35x-gpu-8)
+    name: nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1001,9 +1001,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-8-gpu-mi35x-deepseek-v32-basic:
-    name: nightly-perf-8-gpu-mi35x-deepseek-v32-basic (rocm700, linux-mi35x-gpu-8)
+    name: nightly-perf-8-gpu-mi35x-deepseek-v32-basic (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-mi35x-deepseek-v32-basic,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1038,9 +1038,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-8-gpu-mi35x-deepseek-v32-mtp:
-    name: nightly-perf-8-gpu-mi35x-deepseek-v32-mtp (rocm700, linux-mi35x-gpu-8)
+    name: nightly-perf-8-gpu-mi35x-deepseek-v32-mtp (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-mi35x-deepseek-v32-mtp,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1079,9 +1079,9 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4:
-    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1127,9 +1127,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4:
-    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1174,9 +1174,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8:
-    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1222,9 +1222,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion:
-    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1270,9 +1270,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-hicache:
-    name: nightly-8-gpu-mi35x-deepseek-r1-hicache (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-deepseek-r1-hicache (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-hicache,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1343,9 +1343,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-kimi-k26:
-    name: nightly-8-gpu-mi35x-kimi-k26 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-kimi-k26 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k26,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1418,9 +1418,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen3-235b-mxfp4:
-    name: nightly-8-gpu-mi35x-qwen3-235b-mxfp4 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-qwen3-235b-mxfp4 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen3-235b-mxfp4,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1507,9 +1507,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35:
-    name: nightly-8-gpu-mi35x-qwen35 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-qwen35 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1555,9 +1555,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35-triton-dcp:
-    name: nightly-8-gpu-mi35x-qwen35-triton-dcp (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-qwen35-triton-dcp (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-triton-dcp,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1640,9 +1640,9 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-glm51:
-    name: nightly-8-gpu-mi35x-glm51 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-glm51 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm51,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1690,9 +1690,9 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-glm5-mxfp4:
-    name: nightly-8-gpu-mi35x-glm5-mxfp4 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-8-gpu-mi35x-glm5-mxfp4 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1742,9 +1742,9 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m25:
-    name: nightly-4-gpu-mi35x-minimax-m25 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-4-gpu-mi35x-minimax-m25 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1782,9 +1782,9 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m3:
-    name: nightly-4-gpu-mi35x-minimax-m3 (rocm700, linux-mi35x-gpu-8)
+    name: nightly-4-gpu-mi35x-minimax-m3 (rocm700, linux-mi35x-gpu-8.test)
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

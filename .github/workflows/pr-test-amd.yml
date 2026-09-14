@@ -553,7 +553,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-1]
+        runner: [linux-mi35x-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1086,7 +1086,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8]
+        runner: [linux-mi35x-gpu-8.test]
         part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
@@ -1128,7 +1128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8.fabric]
+        runner: [linux-mi35x-gpu-8.fabric.test]
 
     runs-on: ${{matrix.runner}}
 

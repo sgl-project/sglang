@@ -231,13 +231,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-test-1-gpu-mi35x-rocm720:
-    name: ${{ format('nightly-test-1-gpu-mi35x ({0}, linux-mi35x-gpu-1)', matrix.rocm_version) }}
+    name: ${{ format('nightly-test-1-gpu-mi35x ({0}, linux-mi35x-gpu-1.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-mi35x-rocm720,'))
-    runs-on: linux-mi35x-gpu-1
+    runs-on: linux-mi35x-gpu-1.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -307,13 +307,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-glm51-mxfp4-rocm720:
-    name: ${{ format('nightly-2-gpu-mi35x-glm51-mxfp4 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
+    name: ${{ format('nightly-2-gpu-mi35x-glm51-mxfp4 ({0}, linux-mi35x-gpu-2.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-2
+    runs-on: linux-mi35x-gpu-2.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -347,13 +347,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720:
-    name: ${{ format('nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
+    name: ${{ format('nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 ({0}, linux-mi35x-gpu-2.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720,'))
-    runs-on: linux-mi35x-gpu-2
+    runs-on: linux-mi35x-gpu-2.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -595,13 +595,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-8-gpu-mi35x-rocm720:
-    name: ${{ format('nightly-accuracy-8-gpu-mi35x ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-accuracy-8-gpu-mi35x ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -704,13 +704,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok1-int4-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-grok1-int4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-grok1-int4 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok1-int4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -811,13 +811,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok2-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-grok2 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-grok2 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok2-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -978,13 +978,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-v32-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1032,13 +1032,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32-mtp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32-mtp ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1088,13 +1088,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1142,13 +1142,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1195,13 +1195,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1249,13 +1249,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1303,13 +1303,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-hicache ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-hicache ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1393,13 +1393,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-flash ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-flash ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1449,13 +1449,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1505,13 +1505,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-mtp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-mtp ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1561,13 +1561,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-dspark ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-dspark ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1654,13 +1654,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-kimi-k3-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-kimi-k3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-kimi-k3 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1774,13 +1774,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-qwen35 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-qwen35 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1828,13 +1828,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-qwen35-triton-dcp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-qwen35-triton-dcp ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1872,13 +1872,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-qwen38-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-qwen38-mxfp4 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1987,13 +1987,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-glm52-fp8-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-glm52-fp8 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-glm52-fp8 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp8-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -2048,13 +2048,13 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-glm5-mxfp4-rocm720:
-    name: ${{ format('nightly-8-gpu-mi35x-glm5-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-8-gpu-mi35x-glm5-mxfp4 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -2106,13 +2106,13 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m25-rocm720:
-    name: ${{ format('nightly-4-gpu-mi35x-minimax-m25 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-4-gpu-mi35x-minimax-m25 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -2150,13 +2150,13 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m3-rocm720:
-    name: ${{ format('nightly-4-gpu-mi35x-minimax-m3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('nightly-4-gpu-mi35x-minimax-m3 ({0}, linux-mi35x-gpu-8.test)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3-rocm720,'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
