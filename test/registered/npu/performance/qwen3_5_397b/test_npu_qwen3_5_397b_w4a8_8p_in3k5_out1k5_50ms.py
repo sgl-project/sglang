@@ -125,6 +125,7 @@ class TestNPUQwen3_5_397B_A17B_3K5_1K5_50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     output_token_throughput = 5415
     request_rate = float("inf")
+    # Disabled to work around DTS2026091033366; re-enable after the fix.
     # temperature = 0.6
     # top_p = 0.95
 
