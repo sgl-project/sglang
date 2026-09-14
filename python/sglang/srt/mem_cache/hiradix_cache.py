@@ -1625,9 +1625,12 @@ class HiRadixCache(RadixCache):
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
-        last_host_node, prefetch_key, _ = info
+        last_host_node, prefetch_key, operation = info
         last_host_node.release_host()
         cc = self.cache_controller
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        cc._finish_op_trace(operation)
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
         )
