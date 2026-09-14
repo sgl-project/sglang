@@ -24,6 +24,7 @@ def _set_dummy_server_args():
 
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
+    monkeypatch.setattr(hash_topk_module, "_is_xpu", False)
     monkeypatch.setattr(
         hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
