@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_index_translator import KVReadTables
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -48,11 +49,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-
-from sglang.kernels.ops.attention.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -673,8 +669,26 @@ class FlashAttentionBackend(AttentionBackend):
         m.cu_seqlens_q[1:].copy_(
             torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
         )
+        translating = self.kv_index_translator.is_translating
         max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
-        if max_seq_len_k > 0:
+        if translating:
+            # Unified pool: the block table is a TRANSLATED page table, built
+            # straight into these capture-stable buffers from the LIVE v2p, so
+            # a page relocated by compaction since capture is picked up. Same
+            # substitution the eager extend branch makes in its `_unified_read`
+            # fixup; `build_index_table` emits page-granular kernel-facing ids
+            # directly, so there is no `// page_size` to undo.
+            self.kv_index_translator.build_index_table(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                into=KVReadTables(
+                    full=m.page_table,
+                    sliding_window=(
+                        m.swa_page_table if self.use_sliding_window_kv_pool else None
+                    ),
+                ),
+            )
+        elif max_seq_len_k > 0:
             # Build the block table like the eager extend branch: take every
             # page_size-th token slot from req_to_token and divide by page_size.
             # Identity for page_size == 1 (strided is 0..max_seq_len_k-1, //1).
@@ -700,11 +714,21 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc.shape[0],
                 "full-CG prefill SWA write-location buffer",
             )
-            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            # Under the unified pool `out_cache_loc` was rebound to FULL-side
+            # KERNEL-FACING ids at ForwardBatch construction, so the full->swa
+            # map cannot be re-run on it -- those values index far past the swa
+            # v2p table (a device-side "index out of bounds" assert). Phase 2 of
+            # the write contract derives the swa loc from them instead.
+            swa_write_loc = (
+                self.kv_index_translator.sliding_window_write_loc_for(
+                    forward_batch.out_cache_loc
+                )
+                if translating
+                else self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
@@ -1254,7 +1278,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-    ):
+        # Returns (output, lse) with lse in [total_q, num_heads].
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        lse_out = None
+        # Bound in __init__ so a subclass can substitute a different FA4 build.
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+        flash_attn_varlen_func = self.flash_attn_varlen_func
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         cp_active = is_cp_active(forward_batch)
@@ -1534,7 +1564,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
@@ -1594,6 +1624,8 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+            elif return_lse:
+                o, lse_out, *_ = result
             else:
                 o = result
         else:
@@ -1794,7 +1826,12 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            assert lse_out is not None
+            # The varlen kernel emits LSE head-major [num_heads, total_q].
+            return o, lse_out.transpose(0, 1).contiguous()
+        return o
 
     def forward_decode(
         self,
@@ -1815,7 +1852,13 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-    ) -> torch.Tensor:
+        # Returns (output, lse) with lse in [total_q, num_heads].
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        lse_out = None
+        # Bound in __init__ so a subclass can substitute a different FA4 build.
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+        flash_attn_varlen_func = self.flash_attn_varlen_func
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if k is not None:
@@ -2016,7 +2059,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=(
                         self.decode_num_splits
                         if not is_swa_layer
@@ -2061,6 +2104,8 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
+                elif return_lse:
+                    o, lse_out, *_ = result
                 else:
                     o = result
         else:
@@ -2139,7 +2184,12 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if return_lse:
+            assert lse_out is not None
+            # The varlen kernel emits LSE head-major [num_heads, total_q].
+            return o, lse_out.transpose(0, 1).contiguous()
+        return o
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
