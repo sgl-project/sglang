@@ -162,8 +162,10 @@ class TinyMLAModelConfig:
         qk_rope_head_dim: int,
         hidden_size: int,
         context_len: int,
+        dtype: torch.dtype,
     ):
         self.attention_arch = AttentionArch.MLA
+        self.dtype = dtype
         self.context_len = context_len
         self.hidden_size = hidden_size
         self.num_attention_heads = num_heads
@@ -891,6 +893,7 @@ def build_mla_attention_fixture(
         qk_rope_head_dim=qk_rope_head_dim,
         hidden_size=hidden_size,
         context_len=max_context_len,
+        dtype=dtype,
     )
     runner = MockMLAModelRunner(
         case=case,

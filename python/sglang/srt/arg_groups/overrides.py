@@ -73,10 +73,7 @@ from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import (
-    get_context,
-    get_platform,
-)
+from sglang.srt.runtime_context import get_context, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
@@ -1252,14 +1249,24 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
+        or view.prefill_attention_backend == "trtllm_mla"
     ):
         if not get_platform().is_blackwell:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in [
+            "auto",
+            "bf16",
+            "bfloat16",
+            "fp8_e4m3",
+            "nvfp4",
+            "fp4_mx_block16",
+        ]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of "
+                "auto, bf16/bfloat16, fp8_e4m3, nvfp4, or fp4_mx_block16; "
+                f"got {view.kv_cache_dtype}."
             )
     if (
         view.attention_backend == "tokenspeed_mla"

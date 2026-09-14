@@ -120,6 +120,9 @@ jobs:
               - "python/pyproject.toml"
               - "test/registered/kernels/**"
               - "test/registered/kernel/diffusion/**"
+              - "test/registered/kernel/attention/test_mla_varlen_absorbed_gate.py"
+              - "test/registered/kernel/attention/test_trtllm_mla_piecewise.py"
+              - "test/registered/kernel/attention/test_trtllm_mla_breakable.py"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/!(*.md)"
