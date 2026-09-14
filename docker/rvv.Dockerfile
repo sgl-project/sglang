@@ -70,8 +70,8 @@ RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK after sgl-kernel 
 # 8. Install SGLang (GCC REQUIRED for XGrammar compatibility)
 WORKDIR /sgl-workspace/sglang/python
 RUN cp pyproject_cpu.toml pyproject.toml && \
-    # TODO: Remove this line when SpacemiT publishes a cp313 torchaudio wheel.
-    sed -i '/torchaudio/d' pyproject.toml
+    # TODO: Remove these filters when riscv64 wheels become available.
+    sed -i '/torchaudio/d; /torchcodec/d' pyproject.toml
 RUN unset CC CXX && \
     export CXXFLAGS="-Wno-error" && \
     export RISCV_OMP_LIB_PATH=/usr/lib/riscv64-linux-gnu/libomp.so.5 && \
