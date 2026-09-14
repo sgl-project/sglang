@@ -709,7 +709,6 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
         )
-        self._init_op_trace(operation, rid=request_id, role="Prefetch")
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1037,7 +1036,6 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
-        self._init_op_trace(operation, rid=operation.id, role="Backup")
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1276,6 +1274,9 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # Create the hicache "Backup" root span here (off the scheduler
+                # hot path), mirroring the base controller's storage-thread init.
+                self._init_op_trace(operation, rid=operation.id, role="Backup")
                 self._page_backup(operation)
                 self._finish_op_trace(operation)
                 self.ack_backup_queue.put(operation)
