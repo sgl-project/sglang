@@ -205,3 +205,13 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# Fix for https://github.com/sgl-project/sglang/issues/30781: the pinned
+# openai-protocol v1.0.0 is missing 8 of the 12 tool types accepted by the
+# Python `RESPONSE_TOOL_TYPES` literal (e.g. "custom"), causing
+# `/v1/responses` requests using those tool types to be rejected by the
+# router with a 400 even though the backend SGLang server accepts them.
+# See vendor/openai-protocol/README.md for details on why this is a local
+# vendor patch rather than a version bump.
+[patch.crates-io]
+openai-protocol = { path = "vendor/openai-protocol" }
