@@ -44,6 +44,10 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # ``None`` selects the full MX dynamic-quant defaults used by the
         # original DeepSeek-V4 path; the shared ModelSlim path keeps its
         # historical explicit ``dst_type`` behavior.
+        # TODO: Fuse DeepSeek-V4 W13 GMM + SwiGLU + MXFP8 requant with
+        # npu_grouped_matmul_swiglu_quant_v2 once it accepts swiglu_limit.
+        # V4 sets swiglu_limit=10.0; the current fused op implements only
+        # standard SwiGLU and would skip the required gate/up clamps.
         self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
         self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
         self.runner = None
