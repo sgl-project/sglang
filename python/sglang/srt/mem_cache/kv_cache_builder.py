@@ -159,7 +159,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             tp_worker.model_runner.model_config
         ) and (
             isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and (full_tokens_per_layer or 0) > 0)
+            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
         schedule = get_schedule()
         priority_preemption = (

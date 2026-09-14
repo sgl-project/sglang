@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
+    get_hybrid_layer_ids,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -276,6 +277,18 @@ class KVCacheConfigurator:
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
+        if (
+            get_exec().kernel.attention_backend == "ascend"
+            and self.is_hybrid_swa_compress
+            and not self.is_hybrid_swa
+        ):
+            (
+                self.model_config.swa_attention_layer_ids,
+                self.model_config.full_attention_layer_ids,
+            ) = get_hybrid_layer_ids(
+                self.model_config.hf_config.architectures,
+                self.model_config.hf_text_config,
+            )
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.is_hybrid_swa_mtp_draft = (
@@ -384,7 +397,7 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
-        if self.is_hybrid_swa or self.is_hybrid_swa_compress:
+        if self.is_hybrid_swa:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
@@ -1234,7 +1247,7 @@ class KVCacheConfigurator:
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
-            if self.is_hybrid_swa or self.is_hybrid_swa_compress:
+            if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1478,7 +1491,6 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.model_config.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
-            identity_swa_locations=not self.is_hybrid_swa,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1569,6 +1581,25 @@ class KVCacheConfigurator:
             NPUMHATokenToKVPool,
         )
 
+        layer_kv_shapes = None
+        if self.is_hybrid_swa_compress:
+            model = self.model_config
+            full_shape = (
+                model.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                model.head_dim,
+                model.v_head_dim,
+            )
+            swa_shape = (
+                model.get_swa_num_kv_heads(get_parallel().attn_tp_size),
+                model.swa_head_dim,
+                model.swa_v_head_dim,
+            )
+            layer_kv_shapes = [
+                swa_shape if i in model.swa_attention_layer_ids else full_shape
+                for i in range(self.layer_info.start_layer, self.layer_info.end_layer)
+            ]
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1578,6 +1609,7 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
+            layer_kv_shapes=layer_kv_shapes,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

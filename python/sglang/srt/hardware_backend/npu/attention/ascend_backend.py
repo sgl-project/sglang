@@ -2156,7 +2156,7 @@ class AscendAttnBackend(AttentionBackend):
 
             # Attention sinks and the sliding window are model semantics,
             # independent of whether hybrid KV memory allocation is enabled.
-            if self.use_sliding_window_kv_pool or sinks is not None:
+            if self.is_hybrid_swa or is_swa_layer or sinks is not None:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -2381,7 +2381,11 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or self.use_sliding_window_kv_pool:
+        if (
+            sinks is not None
+            or self.is_hybrid_swa
+            or layer.sliding_window_size != -1
+        ):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
