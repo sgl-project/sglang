@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-requests", type=int, default=4)
     parser.add_argument("--request-rate", type=float, default=float("inf"))
     parser.add_argument("--max-total-tokens", type=int, default=65536)
+    parser.add_argument("--max-prefill-tokens", type=int)
     args = parser.parse_args()
     for name in ("input_length", "output_length", "num_requests", "max_total_tokens"):
         if getattr(args, name) < 1:
@@ -67,18 +68,22 @@ def main() -> None:
     from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
     from sglang.srt.server_args import ServerArgs
 
-    runner = SGLangBenchmarkRunner(
-        server_args=ServerArgs(
-            model_path=str(model_path),
-            load_format="dummy",
-            device="cpu",
-            skip_tokenizer_init=True,
-            max_total_tokens=args.max_total_tokens,
-            chunked_prefill_size=-1,
-            page_size=256,
-            disable_radix_cache=True,
-        )
-    )
+    server_args = {
+        "model_path": str(model_path),
+        "load_format": "dummy",
+        "device": "cpu",
+        "skip_tokenizer_init": True,
+        "max_total_tokens": args.max_total_tokens,
+        "chunked_prefill_size": -1,
+        "page_size": 256,
+        "disable_radix_cache": True,
+    }
+    if args.max_prefill_tokens is not None:
+        if args.max_prefill_tokens < 1:
+            raise ValueError("--max-prefill-tokens must be positive")
+        server_args["max_prefill_tokens"] = args.max_prefill_tokens
+
+    runner = SGLangBenchmarkRunner(server_args=ServerArgs(**server_args))
     try:
         metrics = runner.benchmark(
             BenchmarkConfig(
