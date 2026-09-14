@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, List, Protocol, Tuple
 
 import torch
 
@@ -36,6 +36,24 @@ class MambaFullCacheDonor(Protocol):
     def prepare_mamba_allocation(self, target_size: int) -> None:
         """Expose layout-specific reclaim so Mamba capacity is queryable."""
         ...
+
+
+def pinned_int64_pair(
+    values: List[int], device: torch.device | str
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The (cpu, device) int64 pair the alloc_* APIs take.
+
+    ``torch.tensor(values, device=cuda)`` copies from pageable memory, which
+    aten runs as cudaMemcpyAsync plus cudaStreamSynchronize; on the scheduler
+    stream that parks the host until the in-flight forward drains. A pinned
+    source keeps the copy asynchronous and stream-ordered before the allocator
+    kernel that reads it.
+    """
+    if torch.device(device).type == "cpu":
+        host = torch.tensor(values, dtype=torch.int64)
+        return host, host
+    host = torch.tensor(values, dtype=torch.int64, pin_memory=True)
+    return host, host.to(device, non_blocking=True)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):

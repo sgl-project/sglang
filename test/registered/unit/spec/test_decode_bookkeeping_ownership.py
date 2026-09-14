@@ -91,19 +91,20 @@ _OWNER_SITES = {
         "SchedulerBatchResultProcessor.process_batch_result_prefill",
         "kv_committed_len",
     ): 1,
-    # disaggregation decode prealloc: kv_allocated_len is settled inside the
-    # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
+    # disaggregation decode prealloc: both lengths are settled on the host in
+    # _plan_prealloc before the batched device allocation; the NPU DSV4
+    # per-request path (alloc_for_decode_prealloc) restates kv_allocated_len.
     (
         "disaggregation/decode.py",
-        "DecodePreallocQueue._pre_alloc",
+        "DecodePreallocQueue._plan_prealloc",
         "kv_committed_len",
     ): 1,
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     (
         "disaggregation/decode.py",
-        "alloc_for_decode_prealloc_hisparse",
+        "DecodePreallocQueue._plan_prealloc",
         "kv_allocated_len",
     ): 1,
+    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     # Beam member rows alias the leader's decode region, so releasing them
     # rewinds the leader's watermarks to keep its own per-Req release from
     # freeing that region twice.
