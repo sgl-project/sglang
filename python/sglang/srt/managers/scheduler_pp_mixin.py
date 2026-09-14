@@ -57,7 +57,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
-    # Rank-local event ownership, never part of the cross-rank tensor payload.
+    # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
 
 

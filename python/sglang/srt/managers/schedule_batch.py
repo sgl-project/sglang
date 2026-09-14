@@ -2303,8 +2303,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
-    # Forward-pass metrics
-
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
