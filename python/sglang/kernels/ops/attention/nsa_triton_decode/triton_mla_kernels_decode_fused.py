@@ -2754,17 +2754,27 @@ class SplitKBufferPool:
     """
 
     _buffers = {}
-    _device = None
 
     @classmethod
     def get_buffers(
         cls, split_k: int, total_tokens: int, h_q: int, d_v: int, device: torch.device
     ):
-        """Get or create intermediate buffers for the given configuration."""
-        key = (split_k, total_tokens, h_q, d_v, device)
+        """Get or create intermediate buffers for the given configuration.
 
-        if key not in cls._buffers or cls._device != device:
-            cls._device = device
+        The partial-output / partial-LSE tensors are scratch the split-K kernel
+        writes across and the reduction reads back, so two launches that share
+        one slot cannot run at the same time without silently clobbering each
+        other. Under multi-stream overlap (SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
+        on ROCm) the decode graph can dispatch this attention on a side stream
+        concurrently with other work, so the pool is keyed by the launching
+        stream as well as the shape -- each stream gets its own slot, exactly as
+        the wvSplitKrc scratch pool does upstream (ROCm/vllm 4915af8). Single
+        stream is unchanged: one stream, one key, one buffer.
+        """
+        stream = torch.cuda.current_stream(device).cuda_stream
+        key = (split_k, total_tokens, h_q, d_v, device, stream)
+
+        if key not in cls._buffers:
             partial_output = torch.empty(
                 split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device
             )
