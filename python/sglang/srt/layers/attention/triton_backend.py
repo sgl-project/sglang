@@ -1599,21 +1599,21 @@ class TritonAttnBackend(AttentionBackend):
             or forward_batch.seq_lens_cpu is None
         ):
             return False
-        ext = forward_batch.extend_seq_lens_cpu
-        if not ext or max(ext) < self.aiter_long_prefix_min_rows:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if not extend_lens or max(extend_lens) < self.aiter_long_prefix_min_rows:
             return False
         return self._use_long_prefix_extend(forward_batch, kv_indices)
 
     def _is_small_constant_extend(
         self, forward_batch: ForwardBatch, kv_indices: torch.Tensor
     ) -> bool:
-        ext = forward_batch.extend_seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
         return (
             forward_batch.forward_mode == ForwardMode.EXTEND
-            and ext is not None
-            and len(ext) > 0
-            and ext[0] <= self.SMALL_EXTEND_MAX_TOKENS
-            and all(e == ext[0] for e in ext)
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and extend_lens[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(n == extend_lens[0] for n in extend_lens)
             and kv_indices is not None
             and kv_indices.numel() > 0
         )
