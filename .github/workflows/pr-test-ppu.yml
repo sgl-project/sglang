@@ -1,0 +1,135 @@
+name: PR Test (PPU)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: "Run the preflight even if the last commit touched no PPU path"
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # Give manual runs and runs with an explicit ref separate run_id-based groups.
+  # Other runs share a group per github.ref so newer runs cancel older ones.
+  # Reusable workflows inherit the caller's event; inputs.ref only indicates
+  # an explicit target override, not all reusable workflow calls.
+  group: pr-test-ppu-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # github.sha (not github.ref) so a runner that dequeues after main
+          # advances still validates the SHA that triggered the run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
+            echo "Run mode: ALL TESTS"
+          else
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          # PPU-specific paths only.
+          filters: |
+            ppu:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "scripts/ci/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/kernels/aot/csrc/ppu/**"
+
+      - name: Test PPU CI registry wiring
+        run: python3 -m unittest scripts/ci/ppu/test_ppu_registry.py
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.ppu == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  # ==================== PPU Runner Preflight ==================== #
+  # Validates the runner contract only; the SRT platform and AOT kernels land
+  # in later PRs and build their first real test on top of this job.
+  ppu-preflight:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.ppu == 'true'
+    runs-on: ppu-1-gpu-runner
+    timeout-minutes: 60
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Validate PPU runner contract
+        timeout-minutes: 10
+        run: python3 scripts/ci/ppu/check_ppu_environment.py
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    needs: [pr-gate, check-changes, ppu-preflight]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          for job in $(echo "$json_needs" | jq -r 'keys_unsorted[]'); do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+
+      - name: Require the preflight to have run when PPU is in scope
+        run: |
+          in_scope='${{ needs.check-changes.outputs.ppu }}'
+          preflight='${{ needs.ppu-preflight.result }}'
+          echo "PPU in scope: '$in_scope' / ppu-preflight: '$preflight'"
+
+          if [[ "$in_scope" == "true" && "$preflight" != "success" ]]; then
+            echo "PPU was in scope but ppu-preflight did not succeed."
+            exit 1
+          fi
+          echo "Preflight status is consistent with the requested scope."
