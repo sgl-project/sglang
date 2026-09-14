@@ -936,7 +936,7 @@ def test_sensenova_image_only_forward_preserves_outputs_and_prefix(device, image
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("needs_cfg", [False, True])
 @pytest.mark.parametrize("shift", [1.0, 3.0])
-@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5)])
+@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5), (0.7, 0.8)])
 def test_sensenova_cfg_schedule_preserves_scalar_decisions(
     device, needs_cfg, shift, interval
 ):
@@ -950,20 +950,18 @@ def test_sensenova_cfg_schedule_preserves_scalar_decisions(
     timesteps = NEOChatModel._apply_time_schedule(
         SimpleNamespace(), timesteps, 4, shift
     )
-    boundary = torch.tensor(0.5, device=device)
-    timesteps = torch.cat(
-        [
-            timesteps[:-1],
-            torch.stack(
-                [
-                    torch.nextafter(boundary, boundary.new_tensor(0.0)),
-                    boundary,
-                    torch.nextafter(boundary, boundary.new_tensor(1.0)),
-                ]
-            ),
-            timesteps[-1:],
+    # Probe each endpoint from both sides. The schedule has to compare in the
+    # tensor's own dtype, and only an endpoint that is not exactly representable
+    # tells that apart from a comparison done in Python floats.
+    probes = []
+    for endpoint in dict.fromkeys(interval):
+        edge = timesteps.new_tensor(endpoint)
+        probes += [
+            torch.nextafter(edge, edge.new_tensor(0.0)),
+            edge,
+            torch.nextafter(edge, edge.new_tensor(1.0)),
         ]
-    )
+    timesteps = torch.cat([timesteps[:-1], torch.stack(probes), timesteps[-1:]])
     expected = [
         bool(t >= interval[0] and t <= interval[1] and needs_cfg)
         for t in timesteps[:-1]
