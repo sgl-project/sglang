@@ -152,6 +152,13 @@ def build_image_block(n_llm_h: int, n_llm_w: int, start_pos: int):
 class DeepseekV4VLImageProcessor(BaseMultimodalProcessor):
     models = [DeepseekV4ForCausalLM]
 
+    @classmethod
+    def max_language_model_forward_overshoot(cls, hf_config):
+        # A prefill cut strictly inside one indivisible image block may move
+        # to its end. safe_resize guarantees the full block is no larger than
+        # vision_max_n_token, including alignment and sentinels.
+        return max(int(hf_config.vision_max_n_token) - 1, 0)
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         image_token_id = self._tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)

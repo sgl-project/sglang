@@ -222,6 +222,17 @@ class BaseMultimodalProcessor(ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+
+    @classmethod
+    def max_language_model_forward_overshoot(cls, hf_config):
+        """Maximum rows a scheduler may add past a nominal prefill cut.
+
+        Multimodal processors whose atomic spans can move the cut must declare
+        this. ``None`` means unknown, so MoE backends that need a finite shape
+        domain can fail closed instead of guessing from checkpoint fields.
+        """
+        return None
+
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
