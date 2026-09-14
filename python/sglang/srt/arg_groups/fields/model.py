@@ -332,7 +332,11 @@ class Model(msgspec.Struct):
     ] = 6789
     modelexpress_config: A[
         Optional[str],
-        'JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
+        'JSON config for ModelExpress weight loading and refit. P2P keys: "url", '
+        '"transport" ("nixl" or "transfer_engine"). Refit keys match Slime: '
+        '"model_name", "server_url", "initial_base_version_id", '
+        '"seed_checkpoint_path", "refit_checkpoint_dir", "s3_endpoint_url", '
+        '"s3_region_name", and client timeout/retry settings.',
     ] = None
     download_dir: A[
         Optional[str],

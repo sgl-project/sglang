@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     PullWeightsReqInput,
     PullWeightsReqOutput,
+    ModelExpressWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -44,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromModelExpressReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -227,6 +229,21 @@ class SchedulerWeightUpdaterManager:
             success = all(ok for ok, _ in results)
             message = "; ".join(msg for ok, msg in results if not ok) or message
         return PullWeightsReqOutput(success=success, message=message)
+
+    def update_weights_from_modelexpress(
+        self, recv_req: UpdateWeightsFromModelExpressReqInput
+    ):
+        if self.draft_worker is not None:
+            return ModelExpressWeightUpdateReqOutput(
+                success=False, message="ModelExpress does not support draft models"
+            )
+        success, message = self.tp_worker.update_weights_from_modelexpress(recv_req)
+        if success:
+            self.flush_cache_after_weight_update(recv_req)
+            self.record_weight_version_after_update(recv_req.weight_version)
+        else:
+            logger.error(message)
+        return ModelExpressWeightUpdateReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""

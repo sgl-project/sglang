@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     RegisterLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateWeightsFromModelExpressReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -140,6 +141,13 @@ class BaseTpWorker(ABC):
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
+        )
+
+    def update_weights_from_modelexpress(
+        self, recv_req: UpdateWeightsFromModelExpressReqInput
+    ):
+        return self.model_runner.weight_updater.update_weights_from_modelexpress(
+            recv_req.weight_version
         )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
