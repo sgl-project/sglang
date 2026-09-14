@@ -59,6 +59,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         backend.use_mla = branch == "mla"
         backend.kv_cache_is_vectorized_5d = branch == "vectorized"
         backend.use_triton_unified_attention = branch != "legacy"
+        backend.dcp_world_size = 1
         backend.kv_cache_dtype = kv_cache_dtype
         backend.input_dtype = torch.bfloat16
         backend.page_size = 1
