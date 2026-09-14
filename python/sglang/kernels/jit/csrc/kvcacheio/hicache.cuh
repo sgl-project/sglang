@@ -207,11 +207,16 @@ SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const __grid_constant__ Hicac
     const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
     const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
     const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
-    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    // Both loads are issued before either store: the compiler cannot prove
+    // dst_k and src_v disjoint, so it will not hoist the V load on its own.
+    std::decay_t<decltype(vec_k)> vec_v;
     if constexpr (!kIsMLA) {
       const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+      vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+    }
+    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    if constexpr (!kIsMLA) {
       const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-      const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
       store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
     }
   }
@@ -252,13 +257,18 @@ SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const __grid_constant__ Hicac
       const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
       const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
       const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
-      store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+      // Both loads are issued before either store: the compiler cannot prove
+      // dst_k and src_v disjoint, so it will not hoist the V load on its own.
+      std::decay_t<decltype(vec_k)> vec_v;
       if constexpr (!kIsMLA) {
         const auto v_cache_src = static_cast<const src_ptr_t*>(v_ptr_src)[layer];
-        const auto v_cache_dst = static_cast<const dst_ptr_t*>(v_ptr_dst)[layer];
         const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+        vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+      }
+      store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+      if constexpr (!kIsMLA) {
+        const auto v_cache_dst = static_cast<const dst_ptr_t*>(v_ptr_dst)[layer];
         const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-        const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
         store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
       }
     }

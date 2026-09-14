@@ -28,12 +28,15 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 These hold for every step below.
 
 - **`namespace sglang` is where JIT code lives.** Open it after the include block and close it at the end of the file, with the device kernels, traits and host wrapper inside. The shared `host::` / `device::` helpers are nested in it too, so they resolve unqualified. `load_jit` emits the `TVM_FFI_DLL_EXPORT_TYPED_FUNC` wrapper inside `namespace sglang` as well, so the `kernel_name` you pass from Python needs no `sglang::` prefix.
+- **Tuning policy belongs in Python; C++ gets the answer, not the decision.** For a hyperparameter — split factor, threads per item, block size, vector width, an algorithm variant — prefer (not required) making it a **template parameter** and letting the `@cache_once` module factory choose the value, over a runtime `if`/`switch` in the launcher that picks among pre-instantiated kernels. The kernel then compiles exactly one specialisation and asserts its own preconditions with `static_assert`, while the heuristic that produced the value sits in Python where it is readable, adjustable, and inspectable without recompiling CUDA. `store_cache`'s `num_threads` is the worked example: a `get_kernel(num_split)` ladder guarded by byte-alignment `if constexpr`s became one template argument plus a heuristic in `_jit_kvcache_module`. The exception is a knob that genuinely varies per call with the runtime shape — that has to stay a kernel argument.
 - **Check where the check is cheapest: `static_assert` > C++ host check > cached Python > per-call Python.** Anything fixed at compile time is a `static_assert`. Anything about the tensors is a `TensorMatcher` / `CHECK_HOST` in the C++ launcher, free next to a kernel launch. A check Python cannot delegate goes inside the `@cache_once` module factory, where it runs once per specialisation. What remains in the per-call entry point costs interpreter time on *every* forward, so it should be nothing but picking the module and allocating `out`.
 - **Fixed-width integer types.** Prefer `int32_t` / `int64_t` / `uint32_t` / `size_t` over `int`, `long`, or `long long`, so an index has the same width on both sides of the FFI boundary. Bare `int` is fine only where the width plainly cannot matter — an unrolled loop counter over a `constexpr` bound, a template `int` parameter. Shapes arrive as `int64_t` (`SymbolicSize::unwrap()`); narrowing to `uint32_t` for in-kernel indexing is a deliberate act, so write the `static_cast` explicitly and only where the range is known.
 - **Doxygen comments in C++.** Document exported entities with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`, the way `include/sgl_kernel/` does. `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
 - **ASCII only in C++ and CUDA sources.** Write `--`, `->`, `<=` instead of `—`, `→`, `≤`, including in comments. `grep -nP '[^\x00-\x7F]' <file>` before committing.
+- **`namespace details` is private.** Anything inside one is an implementation detail of its own header, free to change without notice. Do not name `details::` from another module, and never `using namespace details`. If you find yourself wanting something in there, that is the signal to promote it to a documented name instead.
 - **`const T* __restrict__` for read-only pointers.** This is what `csrc/` does throughout, and it lets the compiler emit non-coherent (`LDG`) loads.
-- **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit. Build once with `extra_cuda_cflags=["-Xptxas", "-v"]` to see the actual count, and prefer recomputing a value over letting it spill.
+- **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit; prefer recomputing a value over letting it spill. Run `SGLANG_JIT_LOG_RESOURCE_USAGE=1 SGLANG_JIT_FORCE_RECOMPILE=1` to log per-kernel registers, spills and shared memory at INFO. Both halves are load-bearing: a cache hit has no compiler output to report, and passing `-Xptxas -v` by hand does nothing on its own because the build captures compiler output and replays it only on failure.
+- **Alignment is a contract you enforce, not a property you hope for.** A vectorized copy derives its access width from the row *size* (`load_bytes` picks 16B for a 1024B row), but the address it lands on is `base + index * row_stride` — and a stride is not constrained by the size. `TensorMatcher` admits any stride unless you say otherwise, so a padded cache row silently produces `misaligned address`. Every kernel that vectorizes is highly recommended to end its validation with `.ensure_alignment(w)`, where `w` is the width the kernel actually uses.
 
 ---
 
@@ -62,7 +65,9 @@ These hold for every step below.
 
 - **Type aliases**: `fp16_t`, `bf16_t`, `fp32_t`, `fp8_e4m3_t`, `fp8_e5m2_t` and their packed variants `fp16x2_t`, `bf16x2_t`, `fp32x2_t`, etc.
 - **`SGL_DEVICE`** — Expands to `__forceinline__ __device__`. Use on all device functions.
-- **`device::kWarpThreads`** — Constant `32`.
+- **`SGL_DEVICE_HOST`** — `__forceinline__ __device__ __host__`. Use it when a `constexpr` helper must be callable from both the kernel and its launcher, so the two cannot drift.
+- **`device::kWarpThreads`** — Constant `32` (the codebase's *logical* warp width). `kWarpSize` is an alias. Note this is a group size, not the hardware wave: on gfx950 `warpSize` is 64, and `warp::kFullWidth` reflects that.
+- **`device::get_lane_id<kNumThreads = kWarpThreads>()`** — this thread's index within its logical group. **Prefer it over `threadIdx.x % kNumThreads` whenever the value feeds an address.** On CUDA the lane register is one read that folds into the address computation, whereas the modulo is a derived value the compiler re-materialises at *every* address scale — 8 instructions and 2 registers on a two-tile warp copy, measured on sm_100a. It picks the cheaper form per platform, so callers never need to care. Only equals the true in-warp lane when `blockDim.x` is a multiple of `kNumThreads`.
 - **`device::load_as<T>(ptr, offset)`** / **`device::store_as<T>(ptr, val, offset)`** — Type-safe loads/stores from `void*`.
 - **`device::pointer::offset(ptr, offsets...)`** — Pointer arithmetic on device.
 - **`host::LaunchKernel(grid, block, device_or_stream [, smem])`** — RAII kernel launcher that:
@@ -93,6 +98,7 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
   - `.with_dtype<T1, T2, ...>()` — allow a set of types
   - `.with_device<kDLCUDA>(device_sym)` — require CUDA and bind the checked device to a `SymbolicDevice`
   - `.with_strides({strides...})` — validate strides (omit to require contiguous)
+  - `.ensure_alignment(bytes)` — require the data pointer **and every stride except the innermost** to be a multiple of `bytes` (a power of two). Size-1 dimensions are skipped, since their strides are arbitrary. This is how a vectorized kernel states its precondition; see the alignment convention above.
   - `.verify(tensor_view)` — execute the check; throws `PanicError` with full context on failure; **chainable** (`verify(a).verify(b)` to check multiple tensors with the same shape)
 - **`host::is_type<T>(dtype)`** — whether a `DLDataType` denotes the C++ type `T` (e.g. `fp16_t`).
 
@@ -104,6 +110,7 @@ device.set_options<kDLCUDA>();
 TensorMatcher({N})  //
     .with_dtype<fp16_t>()
     .with_device<kDLCUDA>(device)
+    .ensure_alignment(16)  // e.g. for 128-bit vectorized load/store
     .verify(dst)
     .verify(src);  // same shape, dtype, device as dst
 const int64_t n = N.unwrap();
@@ -155,6 +162,7 @@ The counterpart to `tensor.h`: that one validates what came in, this one produce
   - `.store(ptr, offset)` — vectorized store to `ptr[offset]`
   - `.fill(value)` — fill all N elements with `value`
   - `operator[](i)` — element access
+- **`device::LoadStoreBytes`** — named widths to pass around instead of bare integers: `MAX_GMEM` (arch-dependent, 32 on Blackwell), `MAX_SMEM` (16), `MAX_PORTABLE` (16, safe on CUDA and HIP), `MIN_COALALESCED` (4), and `RAW_1B` .. `RAW_32B`.
 
 ### `tile.cuh` — `tile::Memory` (strided memory access pattern)
 
@@ -164,11 +172,21 @@ The counterpart to `tensor.h`: that one validates what came in, this one produce
 
 - `tile::Memory<T>` is fundamentally a **1D cooperative accessor** over a contiguous region.
 - **`device::tile::Memory<T>::cta(blockDim.x)`** — Creates a tile accessor where each thread handles `tid = threadIdx.x` with stride `tsize` (for `cta(blockDim.x)`, this is `blockDim.x`). Common for loops over a 1D array.
+- **`device::tile::Memory<T>::warp()`** — the 32-lane flavour, and what `warp::load_bytes` is built on. It takes its lane index from `get_lane_id()` rather than `threadIdx.x % 32`, for the addressing reason described under `utils.cuh`. Use `warp(int n)` for a narrower sub-group; that overload keeps the modulo, since a hardware lane index is the wrong grouping below 32.
+- **`device::tile::Memory<T>::thread()`** — single-thread accessor, no cooperation.
 - **`.load(ptr, offset)`** — loads `ptr[tid + offset * tsize]`
 - **`.store(ptr, val, offset)`** — stores to `ptr[tid + offset * tsize]`
 - **`.in_bound(n, offset)`** — boundary check
 
 For a **2D tile**, either flatten `(row, col)` into a linear tile index first, or compute the address manually with `ptr[row * stride + col]` using your thread/block coordinates.
+
+### `bits.h` — Compile-time bit helpers (`host::`)
+
+```cpp
+#include <sgl_kernel/bits.h>
+```
+
+`constexpr` wrappers over `<bit>`, usable in `static_assert` and in template arguments: `host::is_pow2(x)`, `log2_floor(x)`, `log2_ceil(x)` (both `-1` for `x == 0`), `round_up_pow2(x)`, `round_down_pow2(x)`. They live in `host::` but are constant-expression-only, so device-side `static_assert` can call them.
 
 ### `math.cuh` — Device math (`device::math::`)
 
@@ -185,8 +203,19 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/warp.cuh>
 ```
 
-- `device::warp::reduce<Op, kNumThreads, kInner>(value, active_mask)` — generic warp reduction via `__shfl_xor_sync`. `Op` is a `device::ReductionOp` (`SUM`/`MAX`/`MIN`); `kNumThreads` is a power-of-two group size (default 32 = full warp); `kInner=true` (default) reduces within each `kNumThreads`-sized group, `kInner=false` reduces across groups (lanes at the same offset in different groups).
-- `device::warp::reduce_sum/reduce_max/reduce_min<kNumThreads, kInner>(value)` — convenience wrappers over `reduce`. Work for any type with a `ReductionTrait`: floats, integers, and packed x2 types.
+**Vectorized row copy — reach for this before hand-rolling.** A warp cooperatively moving one contiguous row is the single most common shape in this tree, and it used to be re-implemented per kernel.
+
+- **`warp::load_bytes<kBytes, kPattern>(src)`** / **`warp::store_bytes<kBytes, kPattern>(dst, val)`** — the whole warp moves `kBytes` from/to one contiguous row. `kBytes` is arbitrary, down to 1; the helper picks the widest vector that divides it and handles the ragged tail. The returned value is opaque and encodes the width, so a load and its matching store **must use the same `<kBytes, kPattern>`**.
+- **`warp::LoadStorePattern`** — the `kPattern` values, and the sign carries the meaning. A **negative** one (`WARP_UNIFORM_16B` and friends: `_GMEM`, `_SMEM`, `_4B`/`_8B`/`_32B`) says *the whole warp splits this row*, so the width is derived from the per-lane share (`gcd(kBytes / 32, |kPattern|)`), falling back to `gcd(kBytes, 4)` when the row is too narrow to give every lane 4 bytes. A **positive** one (a bare `LoadStoreBytes` value) makes no warp-splitting assumption and just caps the per-thread vector at `gcd(kBytes, kPattern)`. `WARP_UNIFORM_16B` is the usual choice for a row copy.
+- **`LoadStorePattern::get_vec_bytes<kBytes, kPattern>()`** — the width actually chosen. `SGL_DEVICE_HOST`, so **the launcher must call this to feed `.ensure_alignment(...)`**. Pass it the same value the kernel passes `load_bytes` — for a split row that is the *per-warp share*, not the whole row; the full row can resolve to a different width and would under-constrain the strides.
+
+**Reductions.**
+
+- `warp::reduce<Op, kStart, kFinish>(value, active_mask)` — `Op` is a `device::ReductionOp` (`SUM`/`MAX`/`MIN`). `kStart` and `kFinish` bound a range of lane-index bits: `<N, 1>` reduces within contiguous groups of `N` lanes, `<kFullWidth, N>` reduces *across* groups at the same offset. The operation is **symmetric** — `<A, B>` and `<B, A>` reduce the same lane set.
+- `warp::reduce_sum/reduce_max/reduce_min<kStart, kFinish>(value)` — wrappers. Work for any type with a `ReductionTrait`: floats, integers, packed x2. This is more widely used in practice than generic `reduce`.
+- `warp::inclusive_reduce<Op, kWidth, kStart, kFinish>(val, lane_id, mask)` and `inclusive_sum` / `inclusive_max` / `inclusive_min` — segmented inclusive scan: every lane keeps its own running total, unlike `reduce`. Forward when `kStart < kFinish`, backward when `kStart > kFinish`. `lane_id` defaults to `get_lane_id<kWidth>()`, which is correct by construction — only pass it if you already have the **segment-relative** index (`threadIdx.x % kWidth`); a warp-relative one silently corrupts every segment past the first when `kWidth < 32`.
+- `warp::broadcast<kWidth>(value, src_lane)` — `src_lane` is **segment-relative**: each `kWidth` segment reads its own lane, not one warp-wide source.
+- `warp::get_lane_id`, `warp::elect_one_lane()` (one elected lane, for gating a single-thread TMA issue; CUDA-only), `warp::kFullMask` and `warp::kFullWidth` (32 on CUDA, 64 on HIP — note this differs from `kWarpThreads`).
 
 ### `cta.cuh` — CTA-level primitives
 
@@ -203,6 +232,11 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 ```
 
 - `device::atomic::max(float* addr, float value)` — float atomic max (handles negative values correctly via bit tricks).
+- **`device::atomic::Event`** — a cross-CTA arrive/wait counter in one 32-bit word. Producers call `arrive()`; consumers call `wait(num_producers)` (exactly one consumer) or `wait_multi<kConsumerBits>(num_producers, num_consumers, n)` (several). The last released consumer resets the word, so one `Event` is reusable across launches with no host re-zero. Preconditions, all of them load-bearing:
+  - the word must be **zeroed by the host** before first use, and must live in **global** memory — a shared or local `Event` is an illegal address;
+  - `arrive()` is a release and the waits are acquires, so a producer's writes before `arrive()` are visible after the wait;
+  - **generations must be explicitly ordered** — the word has no phase bit, so overlapping generation N+1 with a consumer still in generation N is undefined behaviour (a lagging consumer never exits);
+  - `wait()` and `wait_multi()` lay the word out incompatibly; mixing them on one `Event` is undefined behaviour.
 
 ### `runtime.cuh` — Occupancy and device info
 
@@ -211,8 +245,10 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 ```
 
 - `host::runtime::get_blocks_per_sm(kernel, block_dim)` — max active blocks per SM (occupancy)
-- `host::runtime::get_sm_count(device_id)` — number of SMs on the device
-- `host::runtime::get_cc_major(device_id)` — compute capability major version
+- `host::runtime::get_sm_count(device_id [, use_cache])` — number of SMs on the device. Memoized per device ordinal, so it is cheap enough to call on a launch path; pass `use_cache=false` to force a driver query.
+- `host::runtime::get_cc_major` / `get_cc_minor` / `get_sm_version` — compute capability, same caching.
+
+**Do not query the architecture at runtime.** The JIT compiles for the exact local GPU, so the arch is a *compile-time* fact: `SGL_CUDA_ARCH` is injected by `load_jit`, and `SGL_ARCH_HOPPER_OR_GREATER` / `SGL_ARCH_BLACKWELL_OR_GREATER` / `device::kMaxVecBytes` are derived from it. Reach for `get_cc_*` only for something the arch genuinely does not determine. SM *count* is the opposite case — it varies within an arch (B200 vs B300 vs a MIG slice), so it has to stay a runtime query.
 
 **Persistent kernel pattern** (cap blocks to SM count × occupancy):
 ```cpp
@@ -586,7 +622,7 @@ Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/j
   - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"` — pass an iterable of indices/keys to limit to the *read* args (writes don't need cloning).
   - `use_cuda_graph=False` for kernels that can't be captured.
   - `metrics=(0.5, "avg")` controls reported quantiles (the first metric becomes the table latency column).
-  - `disable_log_bandwidth` (defaults from `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
+  - `disable_log_bandwidth` (defaults from `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
 - **`utils.create_random(*shape)` / `utils.create_empty(*shape)`** — shorthand for `torch.randn` / `torch.empty` with `DEFAULT_DTYPE` (`bfloat16`) and `DEFAULT_DEVICE` (`"cuda"`). Override via the `dtype=` / `device=` kwargs.
 - **`utils.get_benchmark_range(full_range, ci_range)`** — returns the smaller `ci_range` under CI (`is_in_ci()`), the `full_range` locally. Still available for the `benchmark(...)` column axis (which has no `ci_vals`); for `parametrize` row axes prefer the built-in `ci_vals` argument.
 
@@ -640,7 +676,7 @@ if __name__ == "__main__":
 - The `line_arg` name passed to `benchmark` (`"impl"` here) must match a parameter on `benchmark(...)`; same for every `parametrize` name (`"size"`).
 - Stack `@parametrize` once per swept axis. The required `@marker.benchmark` is the **innermost** decorator (bottom of the stack, directly above the function) — `@parametrize` rows go above it.
 - Prefer `create_random` / `create_empty` from `utils.py` over open-coding `torch.randn(..., dtype=..., device=...)`.
-- The GB/s column appears by default (`memory_args="all"` + `memory_output="out"`). For memory-bound kernels it's the most informative number; scope `memory_args` / `memory_output` to the tensors actually touched if the defaults over- or under-count. For compute-bound kernels where bandwidth is misleading, set `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1` (or `disable_log_bandwidth=True`).
+- The GB/s column appears by default (`memory_args="all"` + `memory_output="out"`). For memory-bound kernels it's the most informative number; scope `memory_args` / `memory_output` to the tensors actually touched if the defaults over- or under-count. For compute-bound kernels where bandwidth is misleading, set `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH=1` (or `disable_log_bandwidth=True`).
 - For in-place kernels (which return `None`), pass the written tensors via `memory_output=(...)` since the `"out"` default would capture nothing.
 - Tune `graph_clone_args` / `graph_clone_kwargs` to all the arguments that might be read by the kernel. We can only skip cloning for write-only args. For in-place modified args, we still need to clone them to get accurate timing (reusing the same buffer keeps it L2-hot and skews results).
 - Call `benchmark.run()` (no `print_data=` kwarg — the marker framework prints directly).
@@ -665,7 +701,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/kernels/jit/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. `graph_clone_args` defaults to `"all"`; if you narrow it, it must still cover every *read* tensor — reusing a single buffer keeps it L2-hot and skews results. Keep *write* tensors in it too: they are what sets the rotation count, and a shared output buffer stays L2-hot the same way.
-- **Missing GB/s column**: the column is on by default; check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
+- **Missing GB/s column**: the column is on by default; check that `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
 
 ---
 
@@ -681,6 +717,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/kernels/jit/include/sgl_kernel/vec.cuh` — `AlignedVector`
 - `python/sglang/kernels/jit/include/sgl_kernel/tile.cuh` — `tile::Memory`
+- `python/sglang/kernels/jit/include/sgl_kernel/bits.h` — compile-time bit helpers
 - `python/sglang/kernels/jit/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`, `device::unpack`, `ReductionTrait`
 - `python/sglang/kernels/jit/include/sgl_kernel/math.cuh` — `device::math::`
 - `python/sglang/kernels/jit/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers

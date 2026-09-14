@@ -39,9 +39,6 @@ namespace device::topk {
 namespace cg = cooperative_groups;
 #endif
 
-/// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
-inline constexpr uint32_t kWarpSize = kWarpThreads;
-
 // ---------------------------------------------------------------------------
 // Shared-memory storage sized/aligned for several impl `Smem` types
 // ---------------------------------------------------------------------------
@@ -139,19 +136,6 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
     return to_finite_val(okey);
   };
   return 0.5f * (to_val(key) + to_val(key - 1));
-}
-
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-#ifndef USE_ROCM
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-#else
-    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
-#endif
-    if (lane_id >= offset) val += n;
-  }
-  return val;
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
@@ -383,7 +367,7 @@ struct TopKConfig {
       uint32_t warp_inc = 0;
       if (tx < kRadixSize) {
         hist_val = histogram[tx];
-        warp_inc = warp_inclusive_sum(lane_id, hist_val);
+        warp_inc = warp::inclusive_sum(hist_val, lane_id);
         if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
       }
       __syncthreads();
@@ -506,7 +490,7 @@ struct TopKRadixBase : TopKConfig {
 
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
-    const auto warp_inc = warp_inclusive_sum(lane_id, tmp_local_sum);
+    const auto warp_inc = warp::inclusive_sum(tmp_local_sum, lane_id);
     const auto warp_exc = warp_inc - tmp_local_sum;
     if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
 

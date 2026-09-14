@@ -2,7 +2,7 @@
 /// \brief Host-side CUDA runtime query helpers.
 ///
 /// Thin wrappers around CUDA occupancy and device-property APIs with
-/// automatic error checking via `RuntimeDeviceCheck`.
+/// automatic error checking via `CHECK_CUDA`.
 
 #pragma once
 
@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #ifndef USE_ROCM
 #include <cuda_runtime.h>
 #else
@@ -50,45 +51,87 @@ namespace sglang {
 
 namespace host::runtime {
 
+namespace details {
+
+template <typename T, T kDefault>
+struct DeviceCacheMap {
+ public:
+  // Generous bound on the device ordinals one process can see; a larger ordinal
+  // is not an error, it just falls through to the driver query uncached.
+  static constexpr uint32_t kNumStaticMaxDevice = 72;
+
+  constexpr DeviceCacheMap() {
+    for (uint32_t i = 0; i < kNumStaticMaxDevice; ++i) {
+      m_data[i] = kDefault;
+    }
+  }
+
+  template <typename Fn>
+  T get_cached(int32_t device_, bool use_cache, Fn&& fn) {
+    const auto device = static_cast<uint32_t>(device_);
+    if (use_cache && device < kNumStaticMaxDevice && m_data[device] != kDefault) {
+      return m_data[device];
+    }
+    const auto value = static_cast<T>(std::forward<Fn>(fn)(device_));
+    if (device < kNumStaticMaxDevice) {
+      m_data[device] = value;
+    }
+    return value;
+  }
+
+ private:
+  T m_data[kNumStaticMaxDevice];
+};
+
+}  // namespace details
+
 // Return the maximum number of active blocks per SM for the given kernel
 template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
   int num_blocks_per_sm = 0;
-  RuntimeDeviceCheck(
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
   return static_cast<uint32_t>(num_blocks_per_sm);
 }
 
 // Return the number of SMs for the given device
-inline auto get_sm_count(int device_id) -> uint32_t {
-  int sm_count;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
-  return static_cast<uint32_t>(sm_count);
+inline auto get_sm_count(int device_id, bool use_cache = true) -> uint32_t {
+  static details::DeviceCacheMap<uint32_t, 0> sm_count_cache;
+  return sm_count_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
+    int sm_count;
+    CHECK_CUDA(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
+    return sm_count;
+  });
 }
 
 // Return the Major compute capability for the given device
-inline auto get_cc_major(int device_id) -> int {
-  int cc_major;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
-  return cc_major;
+inline auto get_cc_major(int device_id, bool use_cache = true) -> int {
+  static details::DeviceCacheMap<int, -1> cc_major_cache;
+  return cc_major_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
+    int cc_major;
+    CHECK_CUDA(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
+    return cc_major;
+  });
 }
 
 // Return the Minor compute capability for the given device
-inline auto get_cc_minor(int device_id) -> int {
-  int cc_minor;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
-  return cc_minor;
+inline auto get_cc_minor(int device_id, bool use_cache = true) -> int {
+  static details::DeviceCacheMap<int, -1> cc_minor_cache;
+  return cc_minor_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
+    int cc_minor;
+    CHECK_CUDA(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+    return cc_minor;
+  });
 }
 
 // Return the SM version (major * 10 + minor) for the given device
-inline auto get_sm_version(int device_id) -> int {
-  return get_cc_major(device_id) * 10 + get_cc_minor(device_id);
+inline auto get_sm_version(int device_id, bool use_cache = true) -> int {
+  return get_cc_major(device_id, use_cache) * 10 + get_cc_minor(device_id, use_cache);
 }
 
 // Return the runtime version
 inline auto get_runtime_version() -> int {
   int runtime_version;
-  RuntimeDeviceCheck(cudaRuntimeGetVersion(&runtime_version));
+  CHECK_CUDA(cudaRuntimeGetVersion(&runtime_version));
   return runtime_version;
 }
 
@@ -96,7 +139,7 @@ inline auto get_runtime_version() -> int {
 template <typename T>
 inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int block_size) -> std::size_t {
   std::size_t smem_size;
-  RuntimeDeviceCheck(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
+  CHECK_CUDA(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
   return smem_size;
 }
 

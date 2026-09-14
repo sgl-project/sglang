@@ -39,16 +39,6 @@ struct alignas(16) CTAWork {
   bool valid;
 };
 
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
 template <bool kApplySwigluLimit, bool kPrecise = true, typename DType2>
 SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
   using namespace device;
@@ -93,7 +83,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
