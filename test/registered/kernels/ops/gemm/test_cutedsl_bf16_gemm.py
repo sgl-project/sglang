@@ -18,7 +18,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
-    _K3_TGV_WIN_SHAPES,
+    _K3_TGV_WIN_MAX_M,
     cutedsl_bf16_gemm,
     use_cutedsl_bf16_gemm,
 )
@@ -53,7 +53,7 @@ def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     torch.testing.assert_close(out, ref.bfloat16(), rtol=2e-2, atol=2.5)
 
 
-@pytest.mark.parametrize("n, k", sorted(_K3_TGV_WIN_SHAPES) + [(1024, 2048)])
+@pytest.mark.parametrize("n, k", sorted(_K3_TGV_WIN_MAX_M) + [(1024, 2048)])
 def test_empty_batch_not_tgv_eligible(n, k):
     """DP-attention idle groups run a 0-token dummy forward to keep the
     mlp-sync lockstep; every m == 0 shape must route to cuBLAS."""
