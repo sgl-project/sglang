@@ -1117,11 +1117,10 @@ class PrefillAdder:
         return req if truncated else None
 
     def _fair_chunk_tokens(self, req: Req, rem_tokens: int) -> int:
-        """Cap a continuing chunked request's chunk so waiting requests can
-        share this prefill iteration (SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE).
+        """Cap a continuing chunked request's chunk so waiting requests share the iteration.
 
-        No-op when the knob is off, nothing is waiting, or the remaining
-        prompt already fits in the capped chunk.
+        No-op when the reserve is off, nothing waits, or the remaining prompt
+        fits under the cap anyway.
         """
         if (
             self.chunk_fairness_reserve <= 0
@@ -1140,12 +1139,10 @@ class PrefillAdder:
         return cap
 
     def regrow_chunked_req(self, req: Req) -> Optional[Req]:
-        """Hand the chunk budget that waiting requests did not use back to the
-        chunked request capped by `_fair_chunk_tokens`, so fairness never idles
-        prefill capacity. Call once after the waiting queue has been scanned.
+        """Give the budget the waiting queue left unused back to the capped chunked request.
 
-        Returns the request if it is still truncated after regrowing, else None
-        (same contract as `add_chunked_req`).
+        Call once after the waiting queue is scanned; returns the request while
+        it is still truncated, else `None`, like `add_chunked_req`.
         """
         if req is None or req is not self._fair_capped_req:
             return req
@@ -1162,6 +1159,7 @@ class PrefillAdder:
         extra = min(extra, remaining)
         truncated = remaining > extra
         req.set_extend_range(req.extend_range.start, req.extend_range.end + extra)
+        # mamba_gap_reserve was already charged by add_chunked_req this iteration
         self._update_prefill_budget(
             0,
             extra,
@@ -1514,10 +1512,7 @@ class PrefillAdder:
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
                 if has_chunked_req and self.chunk_fairness_reserve > 0:
-                    # Under chunk fairness the continuing chunked request left
-                    # part of the budget for waiting requests; only whole
-                    # extends may take it (the scheduler tracks one chunked
-                    # request at a time). Skip this one, keep scanning.
+                    # only whole extends take the reserve: one chunked request is tracked at a time
                     return AddReqResult.CONTINUE
 
                 # Make sure at least one page is available

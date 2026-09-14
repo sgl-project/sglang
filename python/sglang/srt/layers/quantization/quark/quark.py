@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (  # noqa: E501
@@ -33,7 +34,6 @@ from sglang.srt.layers.quantization.quark.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_capability, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -377,10 +377,7 @@ class QuarkConfig(QuantizationConfig):
         self.exclude_layers = list(dict.fromkeys(expanded))
 
     def _online_fp8_for_excluded(self, prefix: str) -> bool:
-        """Excluded (bf16) linear layers can be quantized to FP8 at load
-        time (dynamic per-token activations, per-channel weights) instead of
-        running bf16 GEMMs. Module names listed in
-        SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES (router gate, lm_head, ...) stay bf16."""
+        """Whether the excluded layer at `prefix` is served as load-time FP8."""
         if not envs.SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED.get():
             return False
         skip = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())

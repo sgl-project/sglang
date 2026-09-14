@@ -5593,9 +5593,7 @@ class MiniMaxSparseKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_idx_k: torch.Tensor,
     ) -> bool:
-        """Precondition for the Triton scale+cast+scatter store: plain
-        token-major (NHD) main/index pools whose dtype differs from the input
-        (i.e. a cast is needed), no FP4 quant method, GPU."""
+        """Plain token-major main and index pools on a GPU, with a cast to do."""
         main = self.main_pool
         return (
             self.use_minimax_fused_kv_index_store
@@ -5655,9 +5653,7 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Quantizing pools (fp8 KV / fp8 index-K): one Triton launch does the
-        # scale + cast + scatter for all four caches instead of the 7-8
-        # elementwise/cast/scatter launches of the separate stores below.
+        # the pools need a cast, so one launch scales, casts and scatters all four caches
         if index_pool is not None and self._can_fuse_kv_index_store_quant(
             index_pool, cache_k, cache_idx_k
         ):
