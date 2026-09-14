@@ -496,8 +496,9 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                     if case.forward_mode.is_decode()
                     else fixture.backend.forward_extend
                 )
-                with torch.no_grad(), forward_context(
-                    ForwardContext(attn_backend=fixture.backend)
+                with (
+                    torch.no_grad(),
+                    forward_context(ForwardContext(attn_backend=fixture.backend)),
                 ):
                     fixture.backend.init_forward_metadata(fixture.forward_batch)
                     q, k, v = module.project_qkv(fixture.input_hidden)
