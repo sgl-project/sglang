@@ -268,6 +268,14 @@ It preserves arrival times and variable request shapes while flattening every
 request into an independent event. This is useful for scheduler-load diagnosis,
 but it is not canonical AgentX: response-driven turns, spawn/join dependencies,
 tool delays, session affinity, and prefix reuse are not modeled.
+Optional `hash_ids` plus `block_size` fields reconstruct deterministic shared
+token blocks for Radix Cache and HiCache diagnostics. Enable those tiers with
+`--enable-radix-cache` and `--enable-hierarchical-cache --hicache-ratio N`.
+
+InferCast currently rejects a reused non-zero prefix, so an InferCast cache-hit
+run is an expected negative test. Use a replay predictor only to isolate cache
+accounting and transfer behavior; its fallback latency is not model-performance
+evidence.
 
 ```bash
 python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py \
