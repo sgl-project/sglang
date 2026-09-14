@@ -77,9 +77,9 @@ class TestStep3p7Flash(CustomTestCase):
         # and scorer. Sharing this object guarantees identical samples.
         evaluator = MMMUVLMEval(num_examples=100, num_threads=64)
         self.assertEqual(len(evaluator.samples), 100)
-        # Use run_eval_once's shared generation-length default instead of
-        # imposing a Step3.7-specific 1024-token cap.
-        args = SimpleNamespace(model=self.model, temperature=0)
+        # Step3.7 is a reasoning model, so use the long generation budget
+        # adopted by the repository's other reasoning-model MMMU tests.
+        args = SimpleNamespace(model=self.model, max_tokens=65536, temperature=0)
         report_dir = Path(tempfile.mkdtemp(prefix="step3p7_mmmu_"))
         print(f"Step3.7 MMMU reports: {report_dir}")
         scores = {}
