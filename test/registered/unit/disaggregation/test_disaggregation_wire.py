@@ -857,6 +857,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
     pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256
+    pool.swa_page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
     pool.unified_swa_window = 128
@@ -871,6 +872,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
         )
     else:
         pool.swa_kv_pool = SimpleNamespace(
+            page_size=256,
             kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
         )
     return pool
