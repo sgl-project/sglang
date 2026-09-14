@@ -30,6 +30,10 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.dsv4.mhc import (
+    hc_boundary_fused,
+    mhc_post_combine_norm,
+)
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
     wo_a_bf16_small_batch,
@@ -2206,6 +2210,29 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+def _fuse_hc_boundary(config: DeepSeekV4Config) -> bool:
+    """One kernel closes a sublayer (post-mix, in place) and opens the next one
+    (combine with the earlier pre-mix + RMSNorm): Blackwell, HC = 4, hidden 5120."""
+    return (
+        config.hc_pre_from_prev_sublayer
+        and _is_cuda
+        and get_platform().is_blackwell
+        and config.hc_mult == 4
+        and config.hidden_size == 5120
+    )
+
+
+class PendingHCPost(NamedTuple):
+    """An mHC post-mix not applied yet: residual[i] = post[i] * x + sum_j comb[j, i] * residual[j].
+
+    The field order is the argument order of hc_post / mhc_post_combine_norm."""
+
+    x: torch.Tensor
+    residual: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2283,6 +2310,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+        self._should_fuse_hc_boundary = _fuse_hc_boundary(config)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(
@@ -2881,6 +2909,53 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
 
+    def _hc_boundary(
+        self,
+        pending: Optional[PendingHCPost],
+        hidden_states: torch.Tensor,
+        pre: Optional[torch.Tensor],
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: RMSNorm,
+        stats_stream: Optional[torch.cuda.Stream],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Close *pending* (the previous sublayer's post-mix; None before the first
+        sublayer) and open the next one. Returns (residual, y, pre, post, comb):
+        the current streams, the normalized sublayer input, and the coefficients
+        of the sublayer after it."""
+        if pending is None:
+            residual = hidden_states
+        elif self._should_fuse_hc_boundary:
+            residual = pending.residual  # rewritten in place
+            y, pre, post, comb = hc_boundary_fused(
+                *pending,
+                pre,
+                norm.weight,
+                norm.variance_epsilon,
+                hc_fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                hc_mult=self.hc_mult,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                stats_stream=stats_stream,
+            )
+            return residual, y, pre, post, comb
+        else:
+            residual = self.hc_post(*pending)
+        y, pre, post, comb = self._hc_mix_and_combine(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            apply_pre=pre,
+            norm=norm,
+            stats_stream=stats_stream,
+        )
+        return residual, y, pre, post, comb
+
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -2889,19 +2964,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         prev_pre: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pending: Optional[PendingHCPost],
+    ) -> Tuple[PendingHCPost, torch.Tensor]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
-        the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
+        the FFN consumes this attention's. *pending* is the previous layer's FFN
+        post-mix, not yet applied to `hidden_states`; this layer's own FFN
+        post-mix is handed back the same way. Returns (ffn_post_mix, ffn_pre)."""
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
-        residual = hidden_states
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+        residual, x, attn_pre, attn_post, attn_comb = self._hc_boundary(
+            pending,
             hidden_states,
+            prev_pre,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
+            self.input_layernorm,
+            stats_stream,
         )
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
@@ -2909,25 +2987,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
-
-        residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
-            hidden_states,
+        residual, x, ffn_pre, ffn_post, ffn_comb = self._hc_boundary(
+            PendingHCPost(x, residual, attn_post, attn_comb),
+            residual,
+            attn_pre,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
+            self.post_attention_layernorm,
+            stats_stream,
         )
         x = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
-        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
-        return hidden_states, ffn_pre
+        return PendingHCPost(x, residual, ffn_post, ffn_comb), ffn_pre
 
     def _run_moe_ffn_dp_sync(
         self,
@@ -3466,6 +3541,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
+        self._should_fuse_hc_boundary = _fuse_hc_boundary(config)
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
         if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
             (
@@ -3641,7 +3717,17 @@ class DeepseekV4Model(nn.Module):
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
         prev_pre = None
+        pending: Optional[PendingHCPost] = None  # the previous layer's FFN post-mix
         for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            if pending is not None and (
+                (tail is not None and i == self.late_layer_start)
+                or layer.engram is not None
+                or (capture_dspark and i in self.dspark_layers_to_capture)
+            ):
+                # These read the completed streams: apply the post-mix here.
+                hidden_states = layer.hc_post(*pending)
+                pending = None
             if tail is not None and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
@@ -3694,18 +3780,20 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
+                pending, prev_pre = layer.forward_hc_pre_from_prev(
                     positions=positions,
                     hidden_states=hidden_states,
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                     prev_pre=prev_pre,
+                    pending=pending,
                 )
+            hidden_states = pending.residual  # streams before the FFN post-mix
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-            return hidden_states, prev_pre, tail
-        return hidden_states, prev_pre, None
+            return pending, prev_pre, tail
+        return pending, prev_pre, None
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
@@ -3891,9 +3979,10 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
+        pending = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+            pending, last_pre, tail = self._forward_layers_hc_pre_from_prev(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -3950,19 +4039,31 @@ class DeepseekV4Model(nn.Module):
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
-        pre_hc_head = hidden_states.flatten(1)
-
-        if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
-
-            hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+        if pending is not None and self._should_fuse_hc_boundary:
+            # The last FFN post-mix, the head combine and the final norm in one
+            # kernel; the completed streams land in pending.residual.
+            hidden_states = mhc_post_combine_norm(
+                *pending, last_pre, self.norm.weight, self.norm.variance_epsilon
             )
+            pre_hc_head = pending.residual.flatten(1)
         else:
-            hidden_states = self.hc_head(
-                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-            )
-        hidden_states = self.norm(hidden_states)
+            if pending is not None:
+                hidden_states = self.layers[self.end_layer - 1].hc_post(*pending)
+            pre_hc_head = hidden_states.flatten(1)
+            if self.hc_pre_from_prev_sublayer:
+                from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+                hidden_states = hc_combine(
+                    pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                )
+            else:
+                hidden_states = self.hc_head(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                )
+            hidden_states = self.norm(hidden_states)
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
