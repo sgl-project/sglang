@@ -1,0 +1,188 @@
+{{- $modelPath := required "A valid model.path is required (e.g., --set model.path=meta-llama/Llama-3.1-8B-Instruct)" .Values.model.path -}}
+{{- $defaultModel := dict "enableMetrics" true "trustRemoteCode" false "tensorParallelSize" 1 "distInitPort" 5000 "nccl" (dict "debug" "INFO" "extraEnv" dict) -}}
+{{- $model := mustMerge (deepCopy (default dict .Values.model)) $defaultModel -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "sglang.fullname" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "sglang.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sglang.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "sglang.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "sglang.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "sglang.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- if .Values.runtimeClass }}
+      runtimeClassName: {{ .Values.runtimeClass }}
+      {{- end }}
+      containers:
+        - name: sglang
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: {{ include "sglang.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - {{ $modelPath | quote }}
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "30000"
+            {{- if $model.enableMetrics }}
+            - --enable-metrics
+            {{- end }}
+            {{- if $model.trustRemoteCode }}
+            - --trust-remote-code
+            {{- end }}
+            {{- if gt (int .Values.replicaCount) 1 }}
+            - --nnodes
+            - {{ .Values.replicaCount | quote }}
+            - --node-rank
+            - "$(POD_INDEX)"
+            - --dist-init-addr
+            - {{ include "sglang.fullname" . }}-0.{{ include "sglang.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ $model.distInitPort }}
+            {{- end }}
+            {{- if $model.tensorParallelSize }}
+            - --tensor-parallel-size
+            - {{ $model.tensorParallelSize | quote }}
+            {{- end }}
+            {{- if $model.pipelineParallelSize }}
+            - --pipeline-parallel-size
+            - {{ $model.pipelineParallelSize | quote }}
+            {{- end }}
+            {{- if $model.expertParallelSize }}
+            - --expert-parallel-size
+            - {{ $model.expertParallelSize | quote }}
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+            {{- if gt (int .Values.replicaCount) 1 }}
+            - name: dist-init
+              containerPort: {{ $model.distInitPort }}
+              protocol: TCP
+            {{- end }}
+          {{- $hasEnv := or .Values.persistence.enabled (gt (int .Values.replicaCount) 1) .Values.hfSecret.existingSecret .Values.hfSecret.externalSecret.secretStoreRef.name .Values.hfSecret.token .Values.extraEnv -}}
+          {{- if $hasEnv }}
+          env:
+            {{- if .Values.persistence.enabled }}
+            - name: HF_HOME
+              value: {{ .Values.persistence.mountPath | quote }}
+            {{- end }}
+            {{- if gt (int .Values.replicaCount) 1 }}
+            - name: POD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: NCCL_DEBUG
+              value: {{ $model.nccl.debug | quote }}
+            {{- range $key, $value := $model.nccl.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if or .Values.hfSecret.existingSecret .Values.hfSecret.externalSecret.secretStoreRef.name .Values.hfSecret.token }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sglang.hfSecretName" . }}
+                  key: {{ .Values.hfSecret.existingSecretKey }}
+            {{- end }}
+            {{- range .Values.extraEnv }}
+            - {{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.shm.enabled }}
+            - name: shm
+              mountPath: /dev/shm
+            {{- end }}
+            - name: hf-cache
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: localtime
+              mountPath: /etc/localtime
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- if .Values.shm.enabled }}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shm.sizeLimit }}
+        {{- end }}
+        - name: hf-cache
+          {{- if not .Values.persistence.enabled }}
+          emptyDir: {}
+          {{- else if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else if .Values.persistence.hostPath.enabled }}
+          hostPath:
+            path: {{ .Values.persistence.hostPath.path }}
+            type: DirectoryOrCreate
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "sglang.fullname" . }}-cache
+          {{- end }}
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+            type: File
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
