@@ -1,3 +1,112 @@
+# Reproducing the SGLang vs ATOM AgentX comparison (read this first)
+
+Everything below was run on one node with 8x AMD Instinct MI350X (gfx950, 288 GB), ROCm 7.2.4, using GPUs 0-3 for the measured TP4 server. ATOM's published numbers are from MI355X (same silicon, higher clocks), so expect a few percent in their favor from hardware alone.
+
+## Images and software
+
+| Component | What we ran | How to get it |
+|---|---|---|
+| SGLang container | ROCm 7.2.4, Ubuntu 24.04, Python 3.12, torch 2.11.0+rocm7.2, triton 3.7.0+amd; built from `docker/rocm.Dockerfile` with base `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0` (gfx950, ROCm 7.2.4 variant) | `docker build -f docker/rocm.Dockerfile --build-arg GPU_ARCH=gfx950 --build-arg ROCM_VERSION=7.2.4 ...` from the `M3-perf` checkout, or the matching `lmsysorg/sglang:*-rocm724-mi35x` image if one exists for this SGLang version |
+| SGLang code | `github.com/kevin-mii/sglang` branch `M3-perf` @ ef761c4658 (editable install of `python/`) | `git clone -b M3-perf https://github.com/kevin-mii/sglang /sgl-workspace/sglang && pip install -e /sgl-workspace/sglang/python` |
+| aiter | `github.com/ROCm/aiter` @ 4ad99832 (v0.1.21.dev0-48), editable at `/sgl-workspace/aiter`, on `PYTHONPATH` | `git clone https://github.com/ROCm/aiter /sgl-workspace/aiter && git -C /sgl-workspace/aiter checkout 4ad99832 && pip install -e /sgl-workspace/aiter` |
+| mori (EP a2a lib, imported by aiter/sglang) | `/sgl-workspace/mori` @ 879983bd, on `PYTHONPATH` | `git clone https://github.com/ROCm/mori /sgl-workspace/mori` |
+| aiter tuned kernel rows (required) | fp4 fused-MoE rows for the M3 shape and per-token FP8 GEMM rows for the M3 dense shapes | copy `benchmark/minimax_m3_mi355x/tuned_fmoe_m3_gfx950.csv` to `/tmp/aiter_configs/tuned_fmoe.csv` (or `export AITER_CONFIG_FMOE=<path>`), and point `AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE` at `<aiter>/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:benchmark/minimax_m3_mi355x/tuned_a8w8_bpreshuffle_m3_gfx950.csv` (already in `best_config.sh`; fix the paths for your checkout) |
+| ATOM container | `rocm/atom-dev:latest` (or `rocm/atom:latest`) with ATOM `github.com/ROCm/ATOM` @ 47a81f9 | `docker pull rocm/atom-dev:latest`; the recipe is `recipes/MiniMax-M3-Agentic-InferenceX.md` in that repo |
+| Benchmark client | SemiAnalysis AIPerf fork `github.com/SemiAnalysisAI/aiperf` @ b7b16cf851885567988a643282266bce74e34437 (reports version 0.12.0), in its own venv | `python3.12 -m venv /scratch/aiperf-sa-venv && git clone https://github.com/SemiAnalysisAI/aiperf /scratch/aiperf-sa && git -C /scratch/aiperf-sa checkout b7b16cf8 && /scratch/aiperf-sa-venv/bin/pip install -e /scratch/aiperf-sa`. Stock aiperf 0.12.0 rejects `--trace-idle-gap-cap-seconds`, which ATOM's recipe uses, so the fork is mandatory for a like-for-like run. |
+| Models | `amd/MiniMax-M3-MXFP4` (quark MXFP4 target, ~230 GB), `Inferact/MiniMax-M3-EAGLE3-GQA` (draft), dataset `semianalysis_cc_traces_weka_062126` (393 traces, pulled by aiperf) | `huggingface-cli download amd/MiniMax-M3-MXFP4 --local-dir /scratch/models/MiniMax-M3-MXFP4`; same for the draft into `/scratch/models/MiniMax-M3-EAGLE3-GQA` |
+
+## SGLang server, recommended real-acceptance config (what the 34,720 / 35,935 points ran)
+
+Wrapper form (paths as on the benchmark host; `launch.sh` reads `TP`, `GPUS`, `PORT`, `MODEL`, `REPO`):
+
+```bash
+cd /sgl-workspace/sglang
+source benchmark/minimax_m3_mi355x/best_config.sh
+TAG=sglang_real GPUS=0,1,2,3 PORT=30000 SPEC_ATTN=decode \
+  EXTRA2="--max-running-requests 48 $EXTRA2" \
+  ENVS2="NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1 $ENVS2" \
+  bash benchmark/minimax_m3_mi355x/launch_v2.sh      # log: /scratch/logs/server_sglang_real.log
+```
+
+Fully expanded, this is:
+
+```bash
+export HIP_VISIBLE_DEVICES=0,1,2,3 CUDA_VISIBLE_DEVICES=0,1,2,3 HF_HUB_OFFLINE=1 \
+  SGLANG_USE_AITER=1 SGLANG_M3_ALLOW_CUSTOM_AR=1 ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+  SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4 \
+  SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1 \
+  SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5 \
+  SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1 SGLANG_USE_AITER_FP8_PER_TOKEN=1 \
+  SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES=gate,lm_head SGLANG_FUSED_NORM_FP8_QUANT_MAX_M=16384 \
+  AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE=/sgl-workspace/aiter/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:/sgl-workspace/sglang/benchmark/minimax_m3_mi355x/tuned_a8w8_bpreshuffle_m3_gfx950.csv \
+  SGLANG_TIMEOUT_KEEP_ALIVE=3600 NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1
+python -m sglang.launch_server \
+  --model-path /scratch/models/MiniMax-M3-MXFP4 --served-model-name MiniMax-M3 \
+  --trust-remote-code --tp 4 --port 30000 --host 0.0.0.0 \
+  --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 8192 --mem-fraction-static 0.85 \
+  --reasoning-parser auto --tool-call-parser auto --enable-metrics --enable-cache-report \
+  --watchdog-timeout 3600 \
+  --speculative-algorithm EAGLE3 --speculative-draft-model-path /scratch/models/MiniMax-M3-EAGLE3-GQA \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --speculative-attention-mode decode \
+  --max-running-requests 48 --triton-attention-num-kv-splits 64 --cuda-graph-backend-prefill breakable
+```
+
+The quark MXFP4 checkpoint selects the aiter FlyDSL fp4 fused MoE automatically; the fp4 tuned rows must be present (see the table) or the MoE falls back to untuned kernels.
+
+## SGLang server, ATOM-parity performance-only config (what the 38,196 / 40,598 points ran)
+
+Same as above with `source benchmark/minimax_m3_mi355x/best_lossy_config.sh` instead of `best_config.sh`. It changes: `--speculative-num-steps 2 --speculative-num-draft-tokens 3`, `--mem-fraction-static 0.9`, and adds the envs `SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0`. This is the equivalent of ATOM's `--spec-decode-acceptance-rate 0.5933` with 3 draft tokens (forced mean acceptance length 1 + 0.5933 x 3 = 2.78, same floor/ceil schedule) plus fp4 MoE activations at decode. Outputs are not the model's; never evaluate accuracy on it.
+
+## ATOM server (their recipe, verbatim from `recipes/MiniMax-M3-Agentic-InferenceX.md` @ 47a81f9)
+
+```bash
+FP4_TARGET=/scratch/models/MiniMax-M3-MXFP4
+DRAFT=/scratch/models/MiniMax-M3-EAGLE3-GQA
+CONC=24    # one server launch per concurrency point; --max-num-seqs = 2 x CONC
+env NCCL_IB_DISABLE=1 RCCL_IB_DISABLE=1 AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
+  AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0 ATOM_FORCE_ATTN_TRITON=1 AITER_LOG_LEVEL=WARNING \
+  ATOM_GC_THRESHOLD=20000,50,50 HIP_VISIBLE_DEVICES=0,1,2,3 \
+python3 -u -m atom.entrypoints.openai_server \
+  --model "$FP4_TARGET" --served-model-name "$FP4_TARGET" \
+  --host 0.0.0.0 --port 8896 --server-port 8890 --tensor-parallel-size 4 --trust-remote-code \
+  --kv_cache_dtype fp8 --gpu-memory-utilization 0.9 --block-size 128 \
+  --max-num-batched-tokens 32768 --attn-prefill-chunk-size 16384 --max-num-seqs $((2 * CONC)) \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}' \
+  --enable-prefix-caching --method eagle3 --draft-model "$DRAFT" \
+  --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.5933
+```
+
+Drop `--spec-decode-acceptance-rate 0.5933` for a real-acceptance ATOM point (their recipe marks it performance-only). ATOM's `--served-model-name` is the model path, so the client's `--model` must match it (below).
+
+## Client: one AgentX point (identical for both servers)
+
+```bash
+source benchmark/minimax_m3_mi355x/atom_client_env.sh      # ATOM's AIPERF_* env + ATOM_CLIENT_FLAGS
+export AIPERF_SERVER_METRICS_URLS=http://localhost:$PORT/metrics   # SGLang: PORT=30000; ATOM: 8890
+/scratch/aiperf-sa-venv/bin/aiperf profile --scenario inferencex-agentx-mvp \
+  --url http://127.0.0.1:$PORT --endpoint /v1/chat/completions --endpoint-type chat --streaming \
+  --model MiniMax-M3 --tokenizer /scratch/models/MiniMax-M3-MXFP4 --tokenizer-trust-remote-code \
+  --apply-chat-template --public-dataset semianalysis_cc_traces_weka_062126 --num-dataset-entries 393 \
+  --concurrency 24 --benchmark-duration 3600 --random-seed 42 --use-server-token-count --ui simple \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 --trace-idle-gap-cap-seconds 300 \
+  --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800 --failed-request-threshold 0.10 \
+  --stats-interval 30 --slice-duration 1.0 \
+  --output-artifact-dir /scratch/results/aiperf_<tag>_c24
+```
+
+For ATOM use `--model "$FP4_TARGET"` (its served name). Wrapper equivalent: `TAG=<tag> CONC=24 DURATION=3600 PORT=<port> bash benchmark/minimax_m3_mi355x/run_sa_point.sh` (adds the per-port lock, `/metrics` snapshots every 60 s and a `summarize.py` one-liner). Run c=24 and c=32; each point is ~8 min warmup + 60 min + drain.
+
+## Reading the result
+
+- Score = AIPerf `total_token_throughput` (prompt tokens incl. cache hits + completion tokens, per second) / 4 GPUs; `python3 benchmark/minimax_m3_mi355x/summarize.py <artifact dir>` prints it as `total_tok/s` and `/GPU`.
+- AIPerf divides by the phase's active duration, which runs until the last cancelled in-flight request returns (300 s drain timeout). When a few long generations are still streaming at the cutoff the denominator becomes ~3930 s instead of ~3630 s (-8%). Report the AIPerf number, and also the 3600 s window rate from `profile_export.jsonl` (sum of `input_sequence_length + output_sequence_length` over profiling-phase records / 3600 / 4) so the two servers are compared on equal footing; check `logs/aiperf.log` for `cancelled=N ... elapsed=` to see which case you got.
+- Never run two servers plus two clients on the same host at once: it costs ~3%.
+- Quality gate for the real-acceptance server only: `python -m sglang.test.few_shot_gsm8k --host 127.0.0.1 --port 30000 --num-questions 1000 --num-shots 5 --parallel 48` (expect 0.85-0.87) and `python3 benchmark/minimax_m3_mi355x/needle.py http://127.0.0.1:30000 20000,200000`.
+
+---
+
 # MiniMax-M3 on 4x MI355X/MI350X: every optimization ported for ATOM parity
 
 SGLang `M3-perf` (`github.com/kevin-mii/sglang`), TP4, MXFP4 quark checkpoint, fp8 KV, EAGLE3 draft. Metric: AIPerf `inferencex-agentx-mvp` total token throughput per GPU, SemiAnalysis client, ATOM's flags, 3600 s.
