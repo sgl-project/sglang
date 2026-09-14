@@ -2636,9 +2636,12 @@ class NEOChatModel(PreTrainedModel):
             denoise_key_valid_mask = torch.cat(
                 [condition_key_valid_mask, image_key_valid_mask], dim=1
             )
-            attention_mask_condition["full_attention"] = denoise_key_valid_mask[
-                :, None, None, :
-            ]
+            # Ascend SDPA requires an explicit query dimension.
+            attention_mask_condition["full_attention"] = (
+                denoise_key_valid_mask[:, None, None, :]
+                .expand(-1, -1, token_h * token_w, -1)
+                .contiguous()
+            )
         attention_mask_uncondition = {"full_attention": None}
 
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)

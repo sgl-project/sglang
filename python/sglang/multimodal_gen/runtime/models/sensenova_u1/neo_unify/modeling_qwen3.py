@@ -948,7 +948,7 @@ class Qwen3Attention(nn.Module):
         key_padding_mask = (
             attention_mask is not None
             and attention_mask.ndim == 4
-            and attention_mask.shape[-2] == 1
+            and (attention_mask.shape[-2] == 1 or attention_mask.dtype == torch.bool)
         )
         if attention_mask is None or key_padding_mask:
             actual_seq_lengths_kv = None

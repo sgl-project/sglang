@@ -455,8 +455,9 @@ def test_sensenova_u1_batched_gqa_matches_unpadded_singletons():
     v = torch.randn(2, 8, 2, 8, generator=generator)
     valid = torch.ones(2, 8, dtype=torch.bool)
     valid[0, 2:5] = False
+    attention_mask = valid[:, None, None, :].expand(-1, -1, q.shape[1], -1)
 
-    actual = _sdpa_attn_func(q, k, v, attention_mask=valid[:, None, None, :])
+    actual = _sdpa_attn_func(q, k, v, attention_mask=attention_mask)
 
     for i in range(2):
         expected = _sdpa_attn_func(

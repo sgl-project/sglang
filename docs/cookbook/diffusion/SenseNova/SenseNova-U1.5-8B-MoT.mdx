@@ -177,12 +177,12 @@ weights on first use.
     Environment: one Ascend 910C; workload: four concurrent 2048 x 2048
     text-to-image requests, 50 denoising steps, CFG 4, BF16.
 
-    | Configuration | Duration (s) | Throughput (images/s) | Mean latency (s) | Peak reserved memory (MB) |
-    |---|---:|---:|---:|---:|
-    | B1, optimizations disabled | 234.28 | 0.01707 | 146.47 | 35698 |
-    | B2, optimizations disabled | 234.83 | 0.01703 | 176.06 | 37870 |
-    | B1, FIA + RMSNorm + MLP | 205.94 | 0.01942 | 128.80 | 35718 |
-    | B2, FIA + RMSNorm + MLP | 195.02 | 0.02051 | 146.33 | 37850 |
+    | Batch size | NPU operators | Duration (s) | Throughput (images/s) | Mean latency (s) | Peak reserved memory (MB) |
+    |---:|---|---:|---:|---:|---:|
+    | 1 | Disabled | 234.28 | 0.01707 | 146.47 | 35698 |
+    | 2 | Disabled | 234.83 | 0.01703 | 176.06 | 37870 |
+    | 1 | FIA + RMSNorm + SwiGLU | 205.94 | 0.01942 | 128.80 | 35718 |
+    | 2 | FIA + RMSNorm + SwiGLU | 195.02 | 0.02051 | 146.33 | 37850 |
 
     Optimized B1 improves throughput by 13.76% over unoptimized B1. Optimized
     B2 improves throughput by 20.42% over unoptimized B2 and by 5.60% over
