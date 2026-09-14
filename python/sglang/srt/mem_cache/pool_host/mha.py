@@ -156,6 +156,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
+    def get_hybrid_pool_buffer(self):
+        # Expose the K/V host tensors required for zero-copy I/O registration.
+        return [self.k_buffer, self.v_buffer]
+
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2
 

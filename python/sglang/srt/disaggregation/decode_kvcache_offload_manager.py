@@ -18,6 +18,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_kv_host_pool,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -57,6 +59,12 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kv_cache, HybridLinearKVPool):
+            # Hybrid model (e.g. K3 with MLA + KDA): offload only the full
+            # attention KV pool. Mamba/SSM state is ephemeral and does not
+            # require L3 offload on the decode side.
+            kv_cache = kv_cache.full_kv_pool
+
         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
             raise ValueError("Unsupported KV cache type for decode offload")
         self.decode_host_mem_pool = build_kv_host_pool(
@@ -247,6 +255,16 @@ class DecodeKVCacheOffloadManager:
         # Released only at request finish; a mid-decode free races with
         # concurrent admission over live slots.
         self.tree_cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
+
+        # Hybrid models (e.g. K3 with KDA) need manual mamba slot release
+        # here since the offload path skips release_kv_cache.  Must run
+        # before req_to_token_pool.free(req), which nulls req_pool_idx
+        # that free_mamba_cache indexes the ping-pong track buffer with.
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool) and (
+            not self.tree_cache.supports_mamba()
+        ):
+            if req.kv.mamba_pool_idx is not None:
+                self.req_to_token_pool.free_mamba_cache(req)
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
