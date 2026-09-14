@@ -4614,7 +4614,9 @@ class MLATokenToKVPool(KVCache):
         span = self._write_loc_dcp_span
         if span == 1:
             return indices
-        return indices[indices % span == get_parallel().attn_dcp_rank] // span
+        # A request's slots start page-aligned, so position i has residue i % span;
+        # the strided view selects this rank's slots without a mask/nonzero sync.
+        return indices[get_parallel().attn_dcp_rank :: span] // span
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         indices = self._dcp_owned_rows(indices)
