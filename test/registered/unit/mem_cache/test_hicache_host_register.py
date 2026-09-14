@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
     _CUDA_HOST_REGISTERED_RANGES_ATTR,
+    ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
     _cuda_host_unregister,
 )
