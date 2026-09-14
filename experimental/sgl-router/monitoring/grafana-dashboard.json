@@ -511,7 +511,7 @@
     {
       "type": "timeseries",
       "title": "Responses by HTTP status",
-      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel).",
+      "description": "Client-visible HTTP status codes. A 504 is any router-side give-up \u2014 the stale-request deadline or an upstream timeout \u2014 or a worker 504 forwarded unchanged; worker_requests_total{outcome} tells them apart.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
