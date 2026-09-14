@@ -1736,6 +1736,37 @@ class SetInternalStateReqOutput(BaseReq):
 
 
 @dataclass
+class ConfigureLoRARouterReqInput(BaseReq):
+    lora_pool: List[str]
+    switch_every_n_tokens: int = 0
+    seed: int = 0
+    mode: str = "token_interval"
+    lora_ids: Optional[List[str]] = None
+
+
+@dataclass
+class ConfigureLoRARouterReqOutput(BaseReq):
+    success: bool
+    message: str
+    mode: str = "token_interval"
+    lora_pool: Optional[List[str]] = None
+    switch_every_n_tokens: int = 0
+
+
+@dataclass
+class SwitchLoRAAdapterReqInput(BaseReq):
+    request_id: str
+    lora_name: str
+    lora_id: Optional[str] = None
+
+
+@dataclass
+class SwitchLoRAAdapterReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
