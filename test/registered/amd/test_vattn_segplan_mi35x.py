@@ -8,6 +8,7 @@ Guards, on a gfx950 device:
     each trigger a rebuild, cached output bit-identical to uncached.
 """
 
+import ctypes
 import math
 import unittest
 
@@ -141,6 +142,14 @@ class TestVattnSegPlan(CustomTestCase):
         self.assertTrue(sum(nseg) <= target or slack <= 0)
         exp_tn = [nseg[s] for s, ql in enumerate(qlens) for _ in range(ql)]
         self.assertEqual(tok_nseg.tolist(), exp_tn)
+
+    def test_hip_runtime_matches_torch(self):
+        # A second HIP runtime has separate stream state, even at the same version.
+        torch_hip = ctypes.CDLL(torch._C.__file__)
+        self.assertEqual(
+            ctypes.cast(self.V._hip_lib().hipModuleLaunchKernel, ctypes.c_void_p).value,
+            ctypes.cast(torch_hip.hipModuleLaunchKernel, ctypes.c_void_p).value,
+        )
 
     def test_planned_split_matches_reference(self):
         V = self.V
