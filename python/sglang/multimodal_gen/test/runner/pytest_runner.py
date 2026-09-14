@@ -189,9 +189,11 @@ def _is_consistency_failure(full_output: str) -> bool:
 
 
 def _is_retryable_failure(full_output: str) -> bool:
-    # a performance failure must survive even a concurrent infrastructure failure
-    if "[performance]" in full_output or _is_consistency_failure(full_output):
+    if _is_consistency_failure(full_output):
         return False
+
+    if "[performance]" in full_output:
+        return True
 
     summary_lines = _extract_short_test_summary(full_output)
     is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)

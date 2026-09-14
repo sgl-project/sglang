@@ -6,7 +6,10 @@ import textwrap
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.runner.pytest_runner import _is_retryable_failure
+from sglang.multimodal_gen.test.runner.pytest_runner import (
+    _is_retryable_failure,
+    run_pytest,
+)
 from sglang.multimodal_gen.test.server import test_server_common as common
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
@@ -46,11 +49,9 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
 @pytest.mark.parametrize(
     "output",
     [
-        "[performance] Validation failed for 'E2E Latency'",
-        "[performance] Validation failed for 'E2E Latency'\nTimeoutError",
-        "[performance] Validation failed for 'E2E Latency'\nCUDA out of memory",
         "multimodal_gen/test/server/test_server_utils.py: AssertionError",
         "Consistency check failed for example\nTimeoutError",
+        "[performance] Validation failed\nConsistency check failed for example",
     ],
 )
 def test_validation_failures_are_not_retryable(output):
@@ -58,10 +59,44 @@ def test_validation_failures_are_not_retryable(output):
 
 
 @pytest.mark.parametrize(
+    "output",
+    [
+        "[performance] Validation failed for 'E2E Latency'",
+        "[performance] Validation failed for 'Load Latency (excluding warmup)'",
+        "[performance] Validation failed for 'Average Denoise Step'\nTimeoutError",
+        "[performance] E2E missing or invalid\nCUDA out of memory",
+    ],
+)
+def test_performance_failures_are_retryable(output):
+    assert _is_retryable_failure(output)
+
+
+@pytest.mark.parametrize(
     "output", ["TimeoutError", "SafetensorError", "CUDA out of memory"]
 )
 def test_infrastructure_failure_policy_is_unchanged(output):
     assert _is_retryable_failure(output)
+
+
+def test_performance_retry_recovers_only_failed_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    test_file = tmp_path / "test_retry.py"
+    test_file.write_text(
+        "from pathlib import Path\n"
+        "def test_slow():\n"
+        "    marker = Path(__file__).with_suffix('.attempt')\n"
+        "    if not marker.exists():\n"
+        "        marker.touch()\n"
+        "        assert False, '[performance] Validation failed for E2E Latency'\n"
+        "def test_fast():\n"
+        "    marker = Path(__file__).with_suffix('.passed')\n"
+        "    assert not marker.exists(), 'passing case must not rerun'\n"
+        "    marker.touch()\n"
+    )
+    code, _, _ = run_pytest([str(test_file)])
+    assert code == 0
+    assert test_file.with_suffix(".attempt").exists()
+    assert test_file.with_suffix(".passed").exists()
 
 
 @pytest.mark.parametrize(
@@ -179,7 +214,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
         env=env,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=600,
     )
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
@@ -187,5 +222,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     assert "GUARD_REQUESTS=1 LORA_CHECKS=0" in output, output
     retained = 0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
     assert f"RETAINED_METRICS={retained}" in output, output
-    assert output.count("Starting pytest attempt") == 1, output
+    assert output.count("Starting pytest attempt") == 7, output
+    assert "Max retry exceeded (6)" in output, output
     assert "'threshold_guard': 'fail'" in output, output

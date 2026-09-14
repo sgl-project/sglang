@@ -67,9 +67,12 @@ requires valid E2E but skips baseline comparisons. Explicit GT generation skips
 validation.
 
 A performance failure stops the testcase's remaining repeated requests and
-subsequent checks. It also prevents pytest retries, even if another testcase
-has a retryable infrastructure failure. Standalone infrastructure failures
-retain their existing retry policy. Valid failed measurements are recorded
+subsequent checks for that attempt. Performance failures use the existing
+pytest retry budget (at most six retries), rerunning only failed items.
+Exhausting the budget still fails CI; missing metrics and exceeded thresholds
+are never treated as passing. Consistency failures remain non-retryable.
+Standalone infrastructure failures retain their existing retry policy.
+Valid failed measurements are recorded
 before threshold validation; realtime chunk and memory guards remain enabled
 according to their existing configuration.
 
