@@ -56,6 +56,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resolve_geometry,
     sde_step_generator,
 )
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    _lighter_valid_num_frames,
+)
 
 # ``transformer/config.json["cosmos_dreams"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
@@ -581,6 +584,18 @@ class TestCosmosDreamsSamplingParams(unittest.TestCase):
         self.assertIn("dit", deployment.keep_resident_components)
         # The launcher's auto-CFG heuristic reads the default params.
         self.assertEqual(CosmosDreamsSamplingParams().guidance_scale, 1.0)
+
+    def test_frame_rounding_never_yields_a_single_frame(self):
+        config = CosmosDreamsConfig()
+        self.assertEqual([config.adjust_num_frames(n) for n in (1, 2, 4)], [5, 5, 5])
+        self.assertEqual(
+            [config.adjust_num_frames(n) for n in (5, 9, 61, 83)], [5, 9, 61, 81]
+        )
+        # The server warmup's residency ladder halves frames through this contract.
+        server_args = SimpleNamespace(pipeline_config=config)
+        self.assertEqual(_lighter_valid_num_frames(server_args, 17), 9)
+        self.assertEqual(_lighter_valid_num_frames(server_args, 9), 5)
+        self.assertEqual(_lighter_valid_num_frames(server_args, 5), 5)
 
     def test_sequence_parallel_layouts_are_rejected_with_a_hint(self):
         # `--num-gpus 2` alone resolves to sp_degree=2 in the launcher.

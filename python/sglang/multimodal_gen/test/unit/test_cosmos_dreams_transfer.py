@@ -5,6 +5,8 @@ ids, and registry wiring."""
 
 import copy
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -41,6 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resize_center_crop_uint8,
     synthetic_control_frames,
     tokenize_transfer_prompt,
+)
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    _lighter_valid_num_frames,
 )
 
 # ``transformer/config.json["cosmos_dreams"]`` of Cosmos3-Nano-Sim-Transfer
@@ -378,6 +383,35 @@ class TestTransferRegistryAndConfig(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 CosmosDreamsConfig()._validate_checkpoint("/models/transfer")
+
+    def test_frame_rounding_follows_the_chunk_partition(self):
+        config = CosmosDreamsTransferConfig()
+        self.assertEqual(
+            [config.adjust_num_frames(n) for n in (1, 9, 17, 61, 65, 601)],
+            [17, 17, 17, 49, 65, 593],
+        )
+        for count in (17, 49, 65, 593):
+            self.assertEqual(
+                align_pixel_frames_to_chunks(
+                    count, temporal_compression_factor=4, chunk_size=4
+                ),
+                count,
+            )
+        # The warmup residency ladder cannot halve 17 frames: the next fixed
+        # point below would be a single frame, which this pipeline rejects.
+        server_args = SimpleNamespace(pipeline_config=config)
+        self.assertEqual(_lighter_valid_num_frames(server_args, 17), 17)
+        self.assertEqual(_lighter_valid_num_frames(server_args, 49), 17)
+
+    def test_transfer_takes_no_image_so_warmup_probes_can_be_rebuilt(self):
+        # The auto-residency probe rebuilds warmup params with dataclasses.replace,
+        # which re-runs validation; a TI2V task type made warmup attach an image.
+        self.assertFalse(CosmosDreamsTransferConfig().task_type.accepts_image_input())
+        params = CosmosDreamsTransferSamplingParams(num_frames=17)
+        self.assertEqual(replace(params, num_frames=9).num_frames, 9)
+        params.image_path = ["/tmp/warmup.png"]  # attribute write skips validation
+        with self.assertRaisesRegex(ValueError, "image_path is not supported"):
+            replace(params, num_frames=9)
 
 
 class TestTransferSamplingParams(unittest.TestCase):

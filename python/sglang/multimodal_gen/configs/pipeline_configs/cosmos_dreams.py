@@ -13,6 +13,7 @@ from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
+    CosmosDreamsManifest,
     load_cosmos_dreams_manifest,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
@@ -46,12 +47,25 @@ class CosmosDreamsConfig(Cosmos3Config):
     # height/width unset. The Sim-Bimanual checkpoint trained on the 480 tier only.
     canvas_tier: str = "480"
 
+    # Latent frame contract of the rollout, refreshed from the transformer
+    # manifest once the checkpoint is known; adjust_num_frames rounds to it.
+    chunk_size: int = 4
+    temporal_compression_factor: int = 4
+
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
         if self.model_path:
-            self._validate_checkpoint(self.model_path)
+            manifest = self._validate_checkpoint(self.model_path)
+            self.chunk_size = manifest.chunk_size
+            self.temporal_compression_factor = manifest.temporal_compression_factor
 
-    def _validate_checkpoint(self, model_path: str) -> None:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
+        # Latent frame 0 is the conditioning image, so the smallest video is one
+        # generated latent frame; Cosmos3 rounds 1..4 pixel frames to a T2I frame.
+        adjusted = super().adjust_num_frames(num_frames, log_adjustment=log_adjustment)
+        return max(adjusted, 1 + self.temporal_compression_factor)
+
+    def _validate_checkpoint(self, model_path: str) -> CosmosDreamsManifest:
         """Fail in the launcher before 30 GB of weights are loaded."""
         manifest = load_cosmos_dreams_manifest(_transformer_config(model_path))
         if manifest.conditioning_mode != self.conditioning_mode:
@@ -77,6 +91,7 @@ class CosmosDreamsConfig(Cosmos3Config):
                 f"fixed-step schedules: scheduler={self.distilled_sigmas}, "
                 f"transformer={list(manifest.t_list)}."
             )
+        return manifest
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # Distilled checkpoints run one conditional branch per step, so CFG
