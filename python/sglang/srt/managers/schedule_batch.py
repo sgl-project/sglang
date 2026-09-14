@@ -2016,6 +2016,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
+            "routed_dp_rank": self.disagg_prefill_dp_rank,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
