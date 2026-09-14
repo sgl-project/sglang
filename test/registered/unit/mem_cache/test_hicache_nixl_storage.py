@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
+import contextlib
 import os
 import shutil
 import socket
@@ -19,11 +20,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.test.test_utils import CustomTestCase
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
 STRESS_ENABLED = bool(os.environ.get("SGLANG_RUN_NIXL_STRESS"))
+# Mirrors _OS_PAGE_BYTES in hicache_nixl; kept local so a revert of that module
+# cannot turn a probe assertion into a collection error.
+_PAGE_BYTES = 4096
 
 
 class MockHybridPool:
@@ -33,8 +38,10 @@ class MockHybridPool:
         page_size: int = 1,
         component_bytes: int = 8,
         expose_zero_copy: bool = True,
+        stride_page_aligned: bool = True,
     ):
         self.page_size = page_size
+        self.stride_page_aligned = stride_page_aligned
         self.dtype = torch.uint8
         self.device = "cpu"
         self.pin_memory = False
@@ -73,7 +80,7 @@ class MockHybridPool:
         self.conv_buffer[0][index].copy_(data_page[split:])
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        return True
+        return self.stride_page_aligned
 
 
 class MockMemPoolHost:
@@ -94,9 +101,11 @@ class MockMemPoolHost:
         head_dim: int = 4,
         num_pages: int = 4,
         dtype: torch.dtype = torch.float32,
+        stride_page_aligned: bool = False,
     ):
         self.layout = "page_first" if is_zero_copy_mode else "layer_first"
         self.page_size = page_size
+        self.stride_page_aligned = stride_page_aligned
         self.layer_num = layer_num
         self.head_num = head_num
         self.head_dim = head_dim
@@ -161,9 +170,9 @@ class MockMemPoolHost:
         )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        # Test tensors are too small to satisfy 4 KiB stride alignment; the
-        # O_DIRECT path correctly falls back to copy mode in this case.
-        return False
+        # Defaults to False because test tensors are too small to satisfy 4 KiB
+        # stride alignment; the O_DIRECT path then falls back to copy mode.
+        return self.stride_page_aligned
 
 
 class MinioFixture:
@@ -264,8 +273,10 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        # Per-process directory: cleanup removes it, so a fixed path would let two
+        # concurrent test processes delete each other's files mid-test.
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -295,11 +306,6 @@ class TestNixlUnified(CustomTestCase):
             )
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def tearDown(self):
-        """Clean up test directories."""
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @staticmethod
     def _open_fds() -> int:
@@ -531,6 +537,99 @@ class TestNixlUnified(CustomTestCase):
             is_zero_copy_mode=False, hicache=self._make_obj_hicache()
         )
 
+    def _batch_set_v1_log(self, xfer_results: list) -> str:
+        mock_host = MockMemPoolHost(is_zero_copy_mode=False)
+        self.hicache.register_mem_pool_host(mock_host)
+        self.hicache._batch_xfer = lambda keys, key_strs, host_buffers, direction: list(
+            xfer_results
+        )
+
+        keys = [f"stats_k{i}" for i in range(len(xfer_results))]
+        host_indices = torch.arange(len(keys) * mock_host.page_size, dtype=torch.int64)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixl.hicache_nixl", level="DEBUG"
+        ) as logs:
+            results = self.hicache.batch_set_v1(keys, host_indices)
+
+        self.assertEqual(results, xfer_results)
+        return "\n".join(logs.output)
+
+    def test_failed_batch_set_v1_reports_bytes_as_requested_not_transferred(self):
+        """A batch that wrote nothing logged the requested size at a bandwidth the
+        device cannot reach, which hid a whole round of zero-byte tier-3 stores.
+        """
+        log = self._batch_set_v1_log([False, False])
+
+        self.assertIn("batch_set_v1 failed", log)
+        self.assertIn("requested", log)
+        self.assertNotIn("effective bandwidth", log)
+
+    def test_partial_batch_set_v1_reports_bytes_as_requested_not_transferred(self):
+        """A batch where only some entries moved is not a full-size success either;
+        the transferred byte count is unknown for the ones that failed.
+        """
+        log = self._batch_set_v1_log([True, False])
+
+        self.assertIn("batch_set_v1 partially transferred 1/2", log)
+        self.assertIn("requested", log)
+        self.assertNotIn("effective bandwidth", log)
+
+    def test_successful_batch_set_v1_still_reports_bandwidth(self):
+        """The outcome flag must not be inverted: successes keep their stats line."""
+        log = self._batch_set_v1_log([True, True])
+
+        self.assertIn("batch_set_v1 transferred", log)
+        self.assertIn("effective bandwidth", log)
+
+    def _failed_xfer_log(self, run) -> str:
+        self.hicache._batch_xfer = lambda keys, key_strs, host_buffers, direction: (
+            [False] * len(key_strs)
+        )
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixl.hicache_nixl", level="DEBUG"
+        ) as logs:
+            run()
+        return "\n".join(logs.output)
+
+    def test_every_stats_call_site_reports_a_failed_batch_as_requested(self):
+        """All four transfer paths share the stats helper, so a call site that keeps
+        passing an all-success outcome still reports a bandwidth the hardware never
+        produced -- which is what hid the zero-byte tier-3 stores.
+        """
+        mock_host = MockMemPoolHost(is_zero_copy_mode=False)
+        self.hicache.register_mem_pool_host(mock_host)
+        self.hicache.register_mem_host_pool_v2(MockHybridPool(), PoolName.MAMBA)
+
+        keys = ["stats_k0", "stats_k1"]
+        host_indices = torch.arange(len(keys) * mock_host.page_size, dtype=torch.int64)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=keys,
+                host_indices=torch.arange(len(keys), dtype=torch.int64),
+            )
+        ]
+        # The op names are interpolated the same way the stats line builds them, so
+        # the pool-name spelling cannot drift between the two.
+        ops = [
+            ("batch_get_v1", lambda: self.hicache.batch_get_v1(keys, host_indices)),
+            (
+                f"batch_get_v2[{PoolName.MAMBA}]",
+                lambda: self.hicache.batch_get_v2(transfers),
+            ),
+            (
+                f"batch_set_v2[{PoolName.MAMBA}]",
+                lambda: self.hicache.batch_set_v2(transfers),
+            ),
+        ]
+        for op_name, run in ops:
+            with self.subTest(op=op_name):
+                log = self._failed_xfer_log(run)
+
+                self.assertIn(f"{op_name} failed", log)
+                self.assertIn("requested", log)
+                self.assertNotIn("effective bandwidth", log)
+
     def test_batch_set_v1_skips_on_nonzero_mla_rank(self):
         """batch_set_v1 is a no-op on nonzero MLA backup ranks.
 
@@ -693,12 +792,21 @@ class TestNixlDirectIO(CustomTestCase):
     """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
 
     def setUp(self):
-        self.test_dir = "/tmp/test_nixl_direct_io"
-        os.makedirs(self.test_dir, exist_ok=True)
+        # Per-process directory: cleanup removes it, so a fixed path would let two
+        # concurrent test processes delete each other's files mid-test.
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_direct_io_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
-    def tearDown(self):
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
+    def _skip_unless_o_direct_opens(self) -> None:
+        # Raw syscall so it cannot pass by agreeing with the code under test. The
+        # directory follows TMPDIR, which need not be a filesystem with O_DIRECT.
+        path = os.path.join(self.test_dir, "fs_support_probe")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_DIRECT, 0o644)
+        except OSError as e:
+            self.skipTest(f"{self.test_dir} rejects O_DIRECT opens: {e}")
+        os.close(fd)
+        os.unlink(path)
 
     def test_open_file_sets_o_direct(self):
         """open_file sets O_DIRECT on the file descriptor when use_direct_io=True."""
@@ -706,6 +814,7 @@ class TestNixlDirectIO(CustomTestCase):
 
         from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
+        self._skip_unless_o_direct_opens()
         fm = NixlFileManager(self.test_dir, use_direct_io=True)
         test_file = os.path.join(self.test_dir, "test_odirect.bin")
         fd = fm.open_file(test_file, create=True)
@@ -728,8 +837,14 @@ class TestNixlDirectIO(CustomTestCase):
         finally:
             os.close(fd)
 
-    def _make_direct_io_hicache(self) -> HiCacheNixl:
-        """Return a HiCacheNixl configured for O_DIRECT (default) with the POSIX backend."""
+    def _make_direct_io_hicache(self, probe_error=None) -> HiCacheNixl:
+        # Stubbing the probe keeps registration outcomes independent of whether
+        # the test filesystem supports O_DIRECT.
+        hicache = self._make_direct_io_hicache_with_real_probe()
+        hicache.file_manager.direct_io_error = lambda addr, size: probe_error
+        return hicache
+
+    def _make_direct_io_hicache_with_real_probe(self) -> HiCacheNixl:
         storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=1,
@@ -753,6 +868,209 @@ class TestNixlDirectIO(CustomTestCase):
         """File-based backend + use_direct_io=True must set needs_page_alignment."""
         hicache = self._make_direct_io_hicache()
         self.assertTrue(hicache.needs_page_alignment)
+
+    def test_probe_keeps_page_alignment_and_o_direct_in_sync(self):
+        """needs_page_alignment gates the page-aligned transfer paths and
+        use_direct_io gates the open flags; a fallback that moves only one issues
+        aligned transfers against a buffered fd, or the reverse.
+        """
+        hicache = self._make_direct_io_hicache_with_real_probe()
+        hicache.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+
+        self.assertEqual(
+            hicache.needs_page_alignment, hicache.file_manager.use_direct_io
+        )
+        # The fallback flips use_direct_io on the manager the registry opens files
+        # through, so a copy of it would silently keep O_DIRECT on.
+        self.assertIs(hicache.registry.file_manager, hicache.file_manager)
+
+    @staticmethod
+    def _aligned_addr(buf: torch.Tensor) -> int:
+        # The probe receives the first page-aligned address inside the buffer, not
+        # the buffer's own start.
+        addr = buf.data_ptr()
+        return addr + (-addr) % _PAGE_BYTES
+
+    @staticmethod
+    def _recording_probe(error=None):
+        calls = []
+
+        def probe(addr, size):
+            calls.append((addr, size))
+            return error
+
+        return probe, calls
+
+    def test_odirect_unusable_host_pool_falls_back_to_buffered_io(self):
+        """A bounce buffer O_DIRECT cannot pin makes every tier-3 write leave a
+        zero-length file that a later existence query counts as cached.
+        """
+        hicache = self._make_direct_io_hicache()
+        probe, probed = self._recording_probe("Bad address (errno 14)")
+        hicache.file_manager.direct_io_error = probe
+        hicache.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+        self.assertEqual(len(probed), 1)
+        # An unaligned probe would fail on every filesystem, disabling O_DIRECT
+        # unconditionally.
+        addr, size = probed[0]
+        self.assertEqual(addr % _PAGE_BYTES, 0)
+        self.assertEqual(size % _PAGE_BYTES, 0)
+
+    def test_probe_that_raises_falls_back_to_buffered_io(self):
+        """A probe that cannot run at all must still fall back: buffered I/O is
+        always correct, while letting the error out aborts pool registration and
+        with it the whole server start.
+        """
+        hicache = self._make_direct_io_hicache()
+
+        def raising_probe(addr, size):
+            raise RuntimeError("probe could not open a scratch file")
+
+        hicache.file_manager.direct_io_error = raising_probe
+        hicache.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+
+    def test_odirect_usable_host_pool_keeps_direct_io(self):
+        """A successful probe must leave O_DIRECT and page alignment in place."""
+        hicache = self._make_direct_io_hicache()
+        hicache.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+
+        self.assertTrue(hicache.file_manager.use_direct_io)
+        self.assertTrue(hicache.needs_page_alignment)
+
+    def test_zero_copy_pool_probes_its_kv_buffer(self):
+        """A page-aligned zero-copy pool sources every transfer straight out of
+        kv_buffer, so that is the allocation O_DIRECT has to be able to pin.
+        """
+        hicache = self._make_direct_io_hicache()
+        probe, probed = self._recording_probe("Bad address (errno 14)")
+        hicache.file_manager.direct_io_error = probe
+        # num_pages grows kv_buffer past a page so the probe is reached instead of
+        # the too-small guard.
+        pool = MockMemPoolHost(
+            is_zero_copy_mode=True, num_pages=32, stride_page_aligned=True
+        )
+        hicache.register_mem_pool_host(pool)
+
+        self.assertEqual(probed, [(self._aligned_addr(pool.kv_buffer), _PAGE_BYTES)])
+        # Only the alignment requirement goes away; zero copy is still correct
+        # against a buffered fd.
+        self.assertTrue(hicache.is_zero_copy)
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+
+    def test_logical_anchor_pool_registers_under_direct_io(self):
+        """A LogicalHostPool is the V4 KV anchor and holds no KV tensor, so the
+        O_DIRECT probe has no pool buffer to read, yet it must still register
+        with tier-3 storage enabled.
+        """
+        hicache = self._make_direct_io_hicache()
+        hicache.register_mem_pool_host(LogicalHostPool(size=8, page_size=2))
+
+        self.assertTrue(hicache._logical_anchor)
+        self.assertFalse(hicache.is_zero_copy)
+        self.assertTrue(hicache.file_manager.use_direct_io)
+        # The anchor marker is what tier-3 writes read from, so it must be a full
+        # page while O_DIRECT is on.
+        self.assertEqual(hicache._bounce_page_bytes, _PAGE_BYTES)
+
+    def test_logical_anchor_pool_probes_its_marker_buffer(self):
+        """The marker buffers are the anchor pool's only transfer source, so they
+        are what the probe has to accept before O_DIRECT stays on.
+        """
+        hicache = self._make_direct_io_hicache(probe_error="Bad address (errno 14)")
+        hicache.register_mem_pool_host(LogicalHostPool(size=8, page_size=2))
+
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+
+    def test_hybrid_pool_probe_falls_back_to_buffered_io(self):
+        """Hybrid v2 pools own their own zero-copy buffers, so probing only the KV
+        pool left mamba/SWA state writing through an O_DIRECT fd it cannot pin.
+        """
+        hicache = self._make_direct_io_hicache()
+        probe, probed = self._recording_probe("Bad address (errno 14)")
+        hicache.file_manager.direct_io_error = probe
+        # A buffer smaller than two pages would trip the too-small guard instead,
+        # which reports a fallback without ever reaching the probe.
+        pool = MockHybridPool(component_bytes=_PAGE_BYTES)
+        hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        buf = pool.get_hybrid_pool_buffer()[0]
+        self.assertEqual(probed, [(self._aligned_addr(buf), _PAGE_BYTES)])
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+        # Buffered I/O has no alignment constraint, so the stride check that would
+        # otherwise force bounce buffers must not fire once O_DIRECT is off.
+        self.assertTrue(hicache._hybrid_pool_ctx[PoolName.MAMBA].is_zero_copy)
+
+    def test_unaligned_hybrid_pool_keeps_direct_io_with_bounce_buffers(self):
+        """An unaligned hybrid pool never sources a transfer from its own buffers,
+        so probing them before the alignment decision disabled O_DIRECT for every
+        other pool as well.
+        """
+        hicache = self._make_direct_io_hicache()
+        hicache.register_mem_host_pool_v2(
+            MockHybridPool(component_bytes=32, stride_page_aligned=False),
+            PoolName.MAMBA,
+        )
+
+        ctx = hicache._hybrid_pool_ctx[PoolName.MAMBA]
+        self.assertFalse(ctx.is_zero_copy)
+        # A bounce buffer below a page reports the same fallback from the too-small
+        # guard, so pin the size this case depends on instead of its geometry.
+        self.assertGreaterEqual(
+            ctx.bounce_set.numel() * ctx.bounce_set.element_size(), _PAGE_BYTES
+        )
+        self.assertTrue(hicache.file_manager.use_direct_io)
+        self.assertTrue(hicache.needs_page_alignment)
+
+    def test_probe_rejects_a_buffer_too_small_for_an_aligned_page(self):
+        """A buffer that cannot hold an aligned page cannot source an O_DIRECT
+        write either, so it must not be probed past its end.
+        """
+        hicache = self._make_direct_io_hicache()
+        probed = []
+        hicache.file_manager.direct_io_error = lambda addr, size: probed.append(addr)
+
+        hicache._fall_back_if_direct_io_unusable(torch.empty(8, dtype=torch.uint8))
+
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+        self.assertEqual(probed, [])
+
+    def _path_mode_write_spec(self, hicache: HiCacheNixl) -> str:
+        hicache.registry.path_mode = True
+        specs = []
+
+        @contextlib.contextmanager
+        def spy_registered(tuples, mem_type):
+            specs.extend(metainfo.split(":", 1)[0] for *_, metainfo in tuples)
+            yield None
+
+        hicache.registry._registered = spy_registered
+        with hicache.registry.storage([(0, 4096)], ["page-123"], "WRITE") as descs:
+            self.assertIsNone(descs)
+
+        self.assertEqual(len(specs), 1)
+        return specs[0]
+
+    def test_fallback_drops_the_direct_flag_from_the_path_mode_spec(self):
+        """Path mode hands O_DIRECT to NIXL as a "direct" token in the file spec
+        rather than an open flag, so the fallback has to reach that string too.
+        """
+        usable = self._make_direct_io_hicache()
+        usable.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+        self.assertEqual(self._path_mode_write_spec(usable), "rw,create,direct")
+
+        unusable = self._make_direct_io_hicache(probe_error="Bad address (errno 14)")
+        unusable.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=True))
+        self.assertEqual(self._path_mode_write_spec(unusable), "rw,create")
 
     def test_odirect_unaligned_pool_falls_back_to_copy(self):
         """O_DIRECT with non-aligned pool strides falls back to copy mode."""
