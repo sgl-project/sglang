@@ -372,6 +372,8 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_prefetch_retry_max_attempts",
     "enable_unified_cache_external_linker",
     "unified_cache_external_linker_backend",
+    "mooncake_page_wise_load_threshold",
+    "mooncake_enable_page_wise_load",
     "enable_hisparse",
     "hisparse_config",
     "enable_broadcast_mm_inputs_process",
