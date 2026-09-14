@@ -803,6 +803,50 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
     assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
 
 
+@pytest.mark.parametrize("prior_enabled", [False, True])
+@pytest.mark.parametrize("disable_reason", ["explicit", "cuda_graph", "partial_cfg"])
+def test_sensenova_u1_disabled_cache_ignores_params(
+    monkeypatch, prior_enabled, disable_reason
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=4.0,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+    )
+    server_args = SimpleNamespace()
+    if prior_enabled:
+        stage._maybe_enable_cache_dit(batch, server_args)
+
+    # A shared client config may retain knobs that SenseNova does not support.
+    batch.sampling_params.cache_dit_params = {"enable_taylorseer": False}
+    if disable_reason == "explicit":
+        batch.sampling_params.enable_cache_dit = False
+    elif disable_reason == "cuda_graph":
+        server_args.enable_breakable_cuda_graph = True
+    else:
+        batch.extra = {SENSENOVA_U1_REQUEST_EXTRA_KEY: {"cfg_interval": (0.2, 0.8)}}
+
+    stage._maybe_enable_cache_dit(batch, server_args)
+
+    assert len(calls["enable"]) == int(prior_enabled)
+    assert calls["disable"] == ([transformer] if prior_enabled else [])
+    assert calls["refresh"] == []
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_active_config is None
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
 def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
     mount_error = RuntimeError("cache-dit mount failed")
     calls = _install_sensenova_cache_dit_stub(monkeypatch, enable_error=mount_error)

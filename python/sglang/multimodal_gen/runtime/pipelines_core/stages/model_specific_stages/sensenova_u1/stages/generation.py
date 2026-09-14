@@ -168,10 +168,10 @@ class SenseNovaU1GenerationStage(PipelineStage):
             )
             requested = False
 
-        # Keep cache-dit an optional dependency for ordinary SenseNova
-        # requests.  Import it only when a prior request must be unmounted or
-        # the current one actually enables it.
-        if not requested and not self._cache_dit_enabled:
+        # Disabled requests ignore cache parameters regardless of the previous
+        # request. Unmount lazily to keep cache-dit an optional dependency.
+        if not requested:
+            self._unmount_cache_dit()
             return
 
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
@@ -200,19 +200,12 @@ class SenseNovaU1GenerationStage(PipelineStage):
             "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
         }
         effective_config.update(overrides)
-        desired_key = (
-            (cache_dit_overrides_key(effective_config), has_separate_cfg)
-            if requested
-            else None
-        )
+        desired_key = (cache_dit_overrides_key(effective_config), has_separate_cfg)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
 
         transformer = self._cache_dit_transformer
         steps = int(batch.num_inference_steps)
-        if not requested:
-            return
-
         if self._cache_dit_enabled:
             if self._cache_dit_active_config is None:
                 raise RuntimeError(
