@@ -209,6 +209,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Defaults for the subclasses that build their own state without calling
+    # super().__init__() (the speculative draft runners) while still
+    # inheriting methods that touch these two. capture() ->
+    # _capture_one_stream() reads decode_graph_widths before testing it, so
+    # draft-graph capture raises AttributeError without that default even when
+    # no widths are configured. _active_decode_graph_width is read by
+    # execute()'s replay log when SGLANG_LOG_DECODE_GRAPH_KEY is enabled;
+    # MultiLayerEagleDraftExtendCudaGraphRunner and its NPU subclass inherit
+    # that path rather than overriding it.
+    decode_graph_widths = None
+    _active_decode_graph_width = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -298,9 +310,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Optional: a backend may advertise narrower capture widths. Whether
         # the surrounding configuration can serve them is validated with the
         # server arguments, not here.
-        self.decode_graph_widths = getattr(
-            self.attn_backend, "decode_graph_widths", None
-        )
+        self.decode_graph_widths = self.attn_backend.decode_graph_widths
         self._active_decode_graph_width: Optional[int] = None
 
         # --- bucket sizes ---------------------------------------------

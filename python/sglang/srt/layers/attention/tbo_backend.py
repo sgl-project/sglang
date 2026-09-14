@@ -178,6 +178,21 @@ class TboAttnBackend(AttentionBackend):
         # normal lookup succeeds with None and __getattr__ below never runs.
         return self.primary.verify_mask
 
+    @property
+    def decode_graph_widths(self):
+        # Same reason as verify_mask above, with one difference: the base
+        # declares that one as a property, while this is a plain class
+        # attribute, so normal lookup succeeds with None and __getattr__ below
+        # never delegates. Without this override the decode graph width ladder
+        # silently switches off whenever TBO is enabled.
+        #
+        # Read-only on purpose: the ladder belongs to the primary, and nothing
+        # assigns it through the wrapper. This restores delegation only --
+        # set_decode_graph_width still reaches the primary via __getattr__, so
+        # the two per-child backends stay at the full context. Narrowing the
+        # children is out of scope here.
+        return self.primary.decode_graph_widths
+
     def __getattr__(self, name):
         # Delegate backend-specific attributes/methods not explicitly wrapped
         # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which
