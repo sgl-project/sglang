@@ -26,7 +26,7 @@ def make_layout():
         mla_compression_ratios=[0, 2, 1],
         kv_layer_ids=[1, 2],
         kv_item_lens=[512, 1024],
-        state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
+        state_types=[StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA],
         state_item_lens=[[512], [32768], [512]],
     )
     with get_context().override_server_args(
