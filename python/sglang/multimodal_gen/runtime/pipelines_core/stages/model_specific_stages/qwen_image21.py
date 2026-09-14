@@ -126,12 +126,12 @@ class QwenImage21EncodingStage(PipelineStage):
                     ).reshape(image.height, image.width, 3)
                     pixels = (
                         pixels.permute(2, 0, 1)[None, :, None].to(
-                            device=device, dtype=torch.bfloat16
+                            device=device, dtype=torch.float32
                         )
                         / 127.5
                         - 1
                     )
-                    latent = vae.encode(pixels).mode()
+                    latent = vae.encode(pixels.to(torch.bfloat16)).mode()
                     mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
                     std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
                     conditions.append(

@@ -19,6 +19,7 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     should_use_guidance: bool = False
     enable_autocast: bool = False
     vae_tiling: bool = False
+    vae_sp: bool = False
     vae_precision: str = "bf16"
     generator_device: str = "cpu"
     dit_config: QwenImage21DitConfig = field(default_factory=QwenImage21DitConfig)
