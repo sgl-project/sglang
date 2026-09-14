@@ -22,6 +22,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig
 
@@ -54,7 +55,14 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    make_layers,
+)
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
@@ -241,6 +249,7 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
     ) -> torch.Tensor:
         if (
             not _is_npu
@@ -257,6 +266,122 @@ class LlamaAttention(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and q.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize:
+            # 1. Save KV cache into SGLang memory pool for subsequent decode steps
+            try:
+                self.attn.save_kv_cache_only(k, v, forward_batch)
+            except Exception:
+                _ = self.attn(q, k, v, forward_batch, save_kv_cache=True)
+
+            # 2. Compute Single-Query Attention on terminal token(s)
+            num_groups = self.num_heads // self.num_kv_heads
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                # Optimized fast path for single sequence (B=1)
+                q_b = q[-1:].view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
+                k_b = k.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_b = v.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                try:
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b,
+                            k_b,
+                            v_b,
+                            is_causal=False,
+                            scale=self.scaling,
+                            enable_gqa=(num_groups > 1),
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+                except TypeError:
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                start_indices = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.long, device=q.device),
+                        last_token_indices[:-1] + 1,
+                    ]
+                )
+                outs = []
+                for start_idx, end_idx in zip(start_indices, last_token_indices + 1):
+                    q_b = (
+                        q[end_idx - 1 : end_idx]
+                        .view(1, 1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    k_b = (
+                        k[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_b = (
+                        v[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    try:
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b,
+                                k_b,
+                                v_b,
+                                is_causal=False,
+                                scale=self.scaling,
+                                enable_gqa=(num_groups > 1),
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    except TypeError:
+                        if num_groups > 1:
+                            k_b = k_b.repeat_interleave(num_groups, dim=1)
+                            v_b = v_b.repeat_interleave(num_groups, dim=1)
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    outs.append(out_b)
+                attn_output = torch.cat(outs, dim=0)
+
+            # 3. Output projection on terminal token(s) only
+            output, _ = self.o_proj(attn_output)
+            return output
 
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -343,8 +468,64 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        is_last_layer: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+        is_extend_mode = forward_batch.forward_mode.is_extend()
+        can_optimize_last_layer = (
+            is_last_layer
+            and is_extend_mode
+            and forward_batch.extend_seq_lens is not None
+            and hidden_states.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize_last_layer:
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(
+                    hidden_states, quant_linear=self.self_attn.qkv_proj
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, quant_linear=self.self_attn.qkv_proj
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                is_last_layer=True,
+            )
+
+            # Slice residual connection to terminal tokens to match hidden_states
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
+
+            # Fully Connected on terminal tokens only
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+            )
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
+
+        # Standard execution path
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(
@@ -437,15 +618,18 @@ class LlamaModel(nn.Module):
             deferred_norm = None
 
         aux_hidden_states = []
+        num_layers = self.config.num_hidden_layers
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
+            is_last_layer = i == num_layers - 1
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                is_last_layer=is_last_layer,
             )
 
         if not self.pp_group.is_last_rank:
@@ -456,7 +640,10 @@ class LlamaModel(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            if residual is not None:
+                hidden_states, _ = self.norm(hidden_states, residual)
+            else:
+                hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -611,20 +798,26 @@ class LlamaForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
         # decoder layer
+        num_layers = self.model.config.num_hidden_layers
         for i in range(start, end):
             layer = self.model.layers[i]
+            is_last_layer = i == num_layers - 1
             forward_batch.hidden_states, forward_batch.residual = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
                 forward_batch.residual,
+                is_last_layer=is_last_layer,
             )
 
-        if end == self.model.config.num_hidden_layers:
+        if end == num_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
+            if forward_batch.residual is not None:
+                hidden_states, _ = self.model.norm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            else:
+                hidden_states = self.model.norm(forward_batch.hidden_states)
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
