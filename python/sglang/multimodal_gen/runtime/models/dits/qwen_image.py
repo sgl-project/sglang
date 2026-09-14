@@ -1106,14 +1106,6 @@ class QwenImageCrossAttention(nn.Module):
             joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
             joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
 
-        # TODO pass rot matrices to the attention cls to avoid extra matmuls here.
-        if "q_rot" in cross_attention_kwargs and "k_rot" in cross_attention_kwargs:
-            q_rot = cross_attention_kwargs["q_rot"].to(device=joint_query.devce, dtype=joint_query.dtype)
-            k_rot = cross_attention_kwargs["k_rot"].to(device=joint_key.devce, dtype=joint_key.dtype)
-
-            joint_query = torch.matmul(joint_query, q_rot)
-            joint_key = torch.matmul(joint_key, k_rot)
-
         # Compute joint attention
         joint_hidden_states = self.attn(
             joint_query,
@@ -1302,33 +1294,6 @@ class QwenImageTransformerBlock(nn.Module):
         self.img_norm1 = LayerNormScaleShift(
             hidden_size=dim, eps=eps, elementwise_affine=False
         )
-
-        # TODO Need to create mxfp8 attention scheme and refactor the code below
-        quant_description = getattr(quant_config, "quant_description", {})
-        self.use_offline_qk_rotation = (
-            quant_description.get(f"{prefix}.q_rot") == "FLOAT"
-            and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
-        )
-        if self.use_offline_qk_rotation:
-            self.register_buffer(
-                "q_rot",
-                torch.empty(
-                    attention_head_dim,
-                    attention_head_dim,
-                    dtype=torch.bfloat16,
-                ),
-                persistent=True,
-            )
-            self.register_buffer(
-                "k_rot",
-                torch.empty(
-                    attention_head_dim,
-                    attention_head_dim,
-                    dtype=torch.bfloat16,
-                ),
-                persistent=True,
-            )
-            quant_config.use_offline_qk_rotation=True
 
         self.attn = QwenImageCrossAttention(
             dim=dim,
@@ -1913,9 +1878,6 @@ class QwenImageTransformerBlock(nn.Module):
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
-        if self.use_offline_qk_rotation:
-            joint_attention_kwargs["q_rot"] = self.q_rot
-            joint_attention_kwargs["k_rot"] = self.k_rot
         attn_output = self.attn(
             # Image stream (will be processed as "sample")
             hidden_states=img_modulated,

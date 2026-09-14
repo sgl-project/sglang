@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -16,7 +17,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen import envs
 
 logger = init_logger(__name__)
 
@@ -383,6 +383,7 @@ class AscendFAImpl(AttentionImpl):
         if (
             self._quant_scheme == "MXFP8"
             and not self.causal
+            and not self._is_cross_attention
             and query.shape == key.shape
             and key.shape == value.shape
             and query.shape[0] % 64 == 0
