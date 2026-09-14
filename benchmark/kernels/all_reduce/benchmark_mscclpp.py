@@ -20,8 +20,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -35,6 +33,8 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
     set_mscclpp_all_reduce,
 )
+from sglang.srt.runtime_context import publish
+from sglang.srt.server_args import ServerArgs
 
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
@@ -60,7 +60,7 @@ def _bench_graph_time(
     inp_randn,
     tp_group,
     warmup_loop=2,
-    graph_loop=100,
+    graph_loop=10,
     test_loop=10,
 ):
     with use_symmetric_memory(tp_group):

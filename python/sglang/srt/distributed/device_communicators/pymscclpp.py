@@ -3,8 +3,8 @@ import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, ClassVar, Optional, Union
 from itertools import product
+from typing import Any, Callable, ClassVar, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -98,9 +98,7 @@ class _AlgorithmConfig(ABC):
     def resolve_reduce_op(self, reduce_ops):
         return getattr(reduce_ops, self.reduce_op)
 
-    def adapt_to_topology(
-        self, world_size: int, nranks_per_ipc_domain: int
-    ):
+    def adapt_to_topology(self, world_size: int, nranks_per_ipc_domain: int):
         if self.parameter_adapter is None:
             return
         self.parameter_adapter(
@@ -262,9 +260,12 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
         threads_per_block: int,
         algorithm_kwargs: dict[str, Any],
     ) -> str:
-        variant_parts = [f"{key}_{value}" for key, value in sorted(algorithm_kwargs.items())]
+        variant_parts = [
+            f"{key}_{value}" for key, value in sorted(algorithm_kwargs.items())
+        ]
         variant = f"{'_'.join(variant_parts)}_" if variant_parts else ""
         return f"{self.name}_{ipc_domain_count}node_{variant}" f"{threads_per_block}TPB"
+
 
 @dataclass(kw_only=True)
 class _NativeAlgorithmConfig(_AlgorithmConfig):
@@ -438,18 +439,18 @@ def _create_algorithm_configs(language) -> tuple[_AlgorithmConfig, ...]:
     )
     dsl_configs = (
         _DslAlgorithmConfig(
-                name="allreduce_multi_nodes",
-                collective="allreduce",
-                world_sizes=_SUPPORTED_WORLD_SIZES,
-                ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
-                message_size_range=_MessageSizeRange(1 << 10, 1 << 20),
-                reduce_op="SUM",
-                algo_spec=default_spec,
-                threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-                algorithm_kwargs={
-                    "thread_block_group_size": _DEFAULT_THREAD_BLOCK_GROUP_SIZES
-                },
-                parameter_adapter=_adapt_dsl_message_size_range,
+            name="allreduce_multi_nodes",
+            collective="allreduce",
+            world_sizes=_SUPPORTED_WORLD_SIZES,
+            ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
+            message_size_range=_MessageSizeRange(1 << 10, 1 << 20),
+            reduce_op="SUM",
+            algo_spec=default_spec,
+            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            algorithm_kwargs={
+                "thread_block_group_size": _DEFAULT_THREAD_BLOCK_GROUP_SIZES
+            },
+            parameter_adapter=_adapt_dsl_message_size_range,
         ),
         _DslAlgorithmConfig(
             name="allgather_multi_nodes",
