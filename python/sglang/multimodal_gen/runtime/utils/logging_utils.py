@@ -129,7 +129,10 @@ def _log_once_guard(logger: Logger, level: int, msg: str, *args: Any) -> str | N
 
 def _print_info_once(logger: Logger, msg: str, *args: Any) -> None:
     text = _log_once_guard(logger, logging.INFO, msg, *args)
-    # Set the stacklevel to 2 to print the original caller's line info
+    # stacklevel=2 is asserted literally by test_diffusion_bcg_padding, so it is
+    # contract rather than a tuning knob. It does NOT reach the caller: init_logger
+    # also patches `warning` into a forwarder to `logger.log`, adding a frame, so
+    # the record names this module. That was true before these helpers too.
     if text is not None:
         logger.info(text, stacklevel=2)
 

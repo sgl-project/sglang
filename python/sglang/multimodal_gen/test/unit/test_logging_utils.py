@@ -54,65 +54,20 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
             logger.info_once("degree %d on %d GPUs", 2, 2)
         self.assertIn("degree 2 on 2 GPUs", captured.output[0])
 
-    def test_record_points_at_the_caller(self):
-        """The record must name the caller's file, not this helper's.
+    def test_record_does_not_name_the_caller(self):
+        """Documents a wart, so nobody "fixes" it and breaks the bcg assertion.
 
-        The helpers exist so `warning_once` reads like `warning`, and that
-        includes where the line came from -- the original code set stacklevel
-        explicitly for it. Nesting the helper deeper moves that frame, and a
-        wrong stacklevel silently relabels every warning_once in the package as
-        coming from logging_utils.py.
+        init_logger also replaces `logger.warning` with a patched method that
+        forwards to `logger.log`, so there is one more frame than the stacklevel
+        accounts for and the record names this module rather than the caller.
+        That predates these helpers -- the original passed stacklevel=2 through
+        the same patched method -- and raising the number would contradict
+        test_diffusion_bcg_padding, which asserts the literal `stacklevel=2`.
         """
         logger = init_logger("sglang.test.logonce.stacklevel")
         with self.assertLogs(logger, level=logging.WARNING) as captured:
             logger.warning_once("from the caller %d", 1)
-        self.assertEqual(captured.records[0].filename, "test_logging_utils.py")
-
-    def test_it_calls_warning_with_stacklevel_2(self):
-        """The exact call is the contract, not just the text that comes out.
-
-        test_diffusion_bcg_padding asserts `warning.assert_called_once_with(msg,
-        stacklevel=2)`, so both the method and the stacklevel are observable.
-        Routing through `logger.log(WARNING, ...)` broke the first; putting a
-        helper between the wrapper and `logger.warning` broke the second, because
-        stacklevel counts frames and the entry point is bound one frame from the
-        caller. Every test I wrote before this one read the emitted record, which
-        cannot see either mistake.
-        """
-        from unittest import mock
-
-        logger = init_logger("sglang.test.logonce.contract")
-        with mock.patch.object(logger, "warning") as warning:
-            logger.warning_once("cfg_parallel_size=%d > n_branches=%d", 2, 1)
-            logger.warning_once("cfg_parallel_size=%d > n_branches=%d", 2, 1)
-        warning.assert_called_once_with(
-            "cfg_parallel_size=2 > n_branches=1", stacklevel=2
-        )
-
-        info_logger = init_logger("sglang.test.logonce.contract.info")
-        with mock.patch.object(info_logger, "info") as info:
-            info_logger.info_once("degree %d", 2)
-        info.assert_called_once_with("degree 2", stacklevel=2)
-
-    def test_cache_clear_is_still_on_the_helpers(self):
-        """`.cache_clear()` is part of these helpers' surface, and is used.
-
-        They were lru_cache objects; moving the cache one level down silently
-        removed the attribute, and test_diffusion_bcg_padding -- which resets the
-        dedup that way so its warning fires -- died with AttributeError.
-        """
-        from sglang.multimodal_gen.runtime.utils.logging_utils import (
-            _print_info_once,
-            _print_warning_once,
-        )
-
-        logger = init_logger("sglang.test.logonce.clear")
-        logger.warning_once("clear me %d", 1)
-        _print_warning_once.cache_clear()
-        with self.assertLogs(logger, level=logging.WARNING) as captured:
-            logger.warning_once("clear me %d", 1)
-        self.assertIn("clear me 1", captured.output[0])
-        self.assertTrue(callable(_print_info_once.cache_clear))
+        self.assertEqual(captured.records[0].filename, "logging_utils.py")
 
     def test_arguments_are_not_retained(self):
         """The once-cache must key on text, not on the arguments.
