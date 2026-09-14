@@ -1383,9 +1383,12 @@ class SchedulerPPMixin:
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
-            # Paired send + recv via batch_isend_irecv
+            # Paired send + recv via batch_isend_irecv. Only the recv side
+            # is waited for here; the send works are returned and committed
+            # on the next iteration so the output transfers overlap with
+            # the next micro-batch's compute (as in the non-NPU async path).
             with torch.profiler.record_function("send_recv_res_dict"):
-                recv_dict = self.pp_group.send_recv_tensor_dict(
+                recv_dict, send_output_work = self.pp_group.send_recv_tensor_dict(
                     send_tensor_dict=send_dict,
                     send_all_gather_group=all_gather_group,
                     recv_all_gather_group=all_gather_group,
