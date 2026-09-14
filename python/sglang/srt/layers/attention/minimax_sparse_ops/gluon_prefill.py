@@ -9,7 +9,7 @@ context is gathered into persistent SHUFFLE 5D scratch pages:
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize`` (8 for bf16, 16 for an fp8 KV pool). Each request occupies a contiguous,
+with ``x = 16 // dtype.itemsize`` (8 for bf16, 16 for fp8). Each request occupies a contiguous,
 position-ordered page range rounded up to whole sparse blocks.
 """
 
@@ -40,15 +40,7 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# Hard cap on the gathered context span per forward (K and V buffers each),
-# SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB per buffer (default 2 GiB). The span
-# is the batch's total prefix + current-chunk length, so a prefill batch of many
-# long-prefix extends can exceed 2M tokens; the former fixed 512 MiB cap (32768
-# bf16 pages) made every such batch fall back to the Triton kernel for all
-# sparse layers. 2 GiB is 131072 pages (8.4M tokens) at bf16 and twice that for
-# an fp8 pool, above any KV pool this model is served with, while still
-# bounding the grow-only scratch; beyond it the entry point raises and the
-# caller falls back to the Triton kernel (which reads the pool in place).
+# scratch is grow-only, so the env cap bounds it; over the cap the caller falls back
 _LEGACY_SCRATCH_BYTES = 512 * 1024 * 1024
 _above_legacy_cap_count = 0
 
@@ -291,12 +283,7 @@ def _build_gluon_prefill_meta(
     )
     abs_pos = (prefix_lens[req_id] + (pos - cu_seqlens[req_id])).to(torch.int32)
 
-    # Page layout: each request's context span rounds up to whole sparse
-    # blocks so every emitted page id stays inside its own span. The per-request
-    # page counts are derived on the device from ``seq_lens`` (the host copy
-    # only sizes the buffers): a ``torch.tensor(list, device=...)`` here is a
-    # pageable H2D copy that blocks the CPU until the GPU drains its queue,
-    # which cost ~35 ms of lost run-ahead per extend forward.
+    # spans round up to whole sparse blocks so every page id stays inside its own span
     lens = seq_lens_cpu.tolist()
     total_pages = int(
         sum(
@@ -304,12 +291,13 @@ def _build_gluon_prefill_meta(
             for l in lens
         )
     )
+    # device-side counts: a torch.tensor(list, device=) here is a blocking H2D copy
     pages_per_req_dev = (
         (seq_lens.to(torch.int64) + (SPARSE_BLOCK_SIZE - 1)) // SPARSE_BLOCK_SIZE
     ) * PAGES_PER_BLOCK
-    page_start = (
-        torch.cumsum(pages_per_req_dev, dim=0) - pages_per_req_dev
-    ).to(torch.int32)
+    page_start = (torch.cumsum(pages_per_req_dev, dim=0) - pages_per_req_dev).to(
+        torch.int32
+    )
     page_req = torch.repeat_interleave(
         torch.arange(len(lens), dtype=torch.int32, device=device),
         pages_per_req_dev,
@@ -381,8 +369,7 @@ def _unit_or_none(scale) -> bool:
 
 
 def _aiter_fp8_dtype() -> Optional[torch.dtype]:
-    """The fp8 storage dtype AITER's Gluon kernel accepts on this arch
-    (float8_e4m3fn on gfx950, float8_e4m3fnuz on gfx942), or None."""
+    """The fp8 storage dtype AITER's Gluon kernel accepts on this arch, or None without aiter."""
     try:
         import aiter
 
@@ -391,13 +378,14 @@ def _aiter_fp8_dtype() -> Optional[torch.dtype]:
         return None
 
 
-def _kv_dtype_supported(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
+def _kv_dtype_supported(
+    q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> bool:
     if k_cache.dtype != v_cache.dtype:
         return False
     if k_cache.dtype == q.dtype:
         return True
-    # fp8 KV pool with a bf16/fp16 q: the kernel dequantizes K/V in-register
-    # with per-tensor key/value scales (kv_quant_mode 0).
+    # an fp8 pool with a bf16 q: the kernel dequantizes in-register with per-tensor scales
     return k_cache.dtype == _aiter_fp8_dtype()
 
 
@@ -451,9 +439,11 @@ def can_use_gluon_prefill(
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
-        # bf16 KV: the kernel takes no scales, so they must be unit. fp8 KV:
-        # per-tensor k/v scales are forwarded to the kernel.
-        and (k_cache.dtype != q.dtype or (_unit_or_none(k_scale) and _unit_or_none(v_scale)))
+        # a same-dtype pool takes no scales, so they must be unit; an fp8 pool forwards its own
+        and (
+            k_cache.dtype != q.dtype
+            or (_unit_or_none(k_scale) and _unit_or_none(v_scale))
+        )
     )
 
 

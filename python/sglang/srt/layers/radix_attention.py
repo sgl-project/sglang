@@ -192,11 +192,7 @@ class RadixAttention(nn.Module):
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim)
                 )
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
-                # Under a breakable prefill graph the sparse attention must be
-                # an eager break like the dense path: its metadata (cu_seqlens,
-                # page layout, top-k block tables) is per batch, so a captured
-                # copy would replay the capture batch's layout for every later
-                # batch.
+                # per-batch sparse metadata cannot be captured, so run as an eager break
                 sparse_attn_fn = (
                     breakable_unified_sparse_attention_with_output
                     if is_in_breakable_cuda_graph()
@@ -613,9 +609,7 @@ def unified_sparse_attention_with_output(
     )
 
 
-# Breakable prefill graph: the sparse attention runs eagerly between graph
-# segments (plain function, not the custom op) so per-batch metadata is
-# rebuilt at replay. Mirrors ``breakable_unified_attention_with_output``.
+# eager break on the plain impl, not the custom op: per-batch metadata is rebuilt at replay
 breakable_unified_sparse_attention_with_output = eager_on_graph(True)(
     _unified_sparse_attention_with_output_impl
 )

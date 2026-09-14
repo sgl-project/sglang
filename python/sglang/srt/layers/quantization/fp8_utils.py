@@ -2033,8 +2033,6 @@ def apply_fp8_linear(
                 and pre_quant[0].shape[0] == input_2d.shape[0]
                 and pre_quant[0].shape[-1] == input_2d.shape[-1]
             ):
-                # Per-token fp8 activation already produced by the fused
-                # add-RMSNorm kernel (``out._fp8_qinput``); skip the re-quant.
                 qinput, x_scale = pre_quant[0], pre_quant[1]
             else:
                 # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
