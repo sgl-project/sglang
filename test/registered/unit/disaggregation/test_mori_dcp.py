@@ -9,9 +9,7 @@ from unittest.mock import Mock
 
 import numpy as np
 
-from sglang.srt.disaggregation.prefill import (
-    SchedulerDisaggregationPrefillMixin,
-)
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -136,6 +134,13 @@ class TestMoriDCP(unittest.TestCase):
         self.assertEqual(kwargs["src_page_offset"], 2)
         self.assertEqual(kwargs["num_kv_tokens"], 13)
 
+        sender = object.__new__(mori_conn.MoriKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = 7
+        self.assertFalse(sender.supports_cached_prefix_early_send())
+        peer.requires_dcp_relayout = False
+        self.assertTrue(sender.supports_cached_prefix_early_send())
+
     def test_pp_local_kv_descriptors_map_by_global_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
         manager.kv_mem_descs = ["src-17", "src-23"]
@@ -155,7 +160,9 @@ class TestMoriDCP(unittest.TestCase):
         manager.dcp_rank = 0
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
-        manager.kv_args = SimpleNamespace(page_size=64, kv_item_lens=[4096])
+        manager.kv_args = SimpleNamespace(
+            page_size=64, kv_item_lens=[4096], num_draft_entries=0
+        )
         manager.decode_kv_args_table = {}
         manager.engine = Mock()
         info = mori_conn.KVArgsRegisterInfo(
@@ -216,7 +223,9 @@ class TestMoriDCP(unittest.TestCase):
             self.assertEqual(call.args[4], [[4]])
 
     def test_cached_prefix_early_send_skips_dcp_relayout(self):
-        sender = SimpleNamespace(requires_dcp_relayout=Mock(return_value=True))
+        sender = SimpleNamespace(
+            supports_cached_prefix_early_send=Mock(return_value=False)
+        )
         req = SimpleNamespace(pending_bootstrap=False, disagg_kv_sender=sender)
         scheduler = SimpleNamespace(enable_staging=False, send_kv_chunk=Mock())
 

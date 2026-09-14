@@ -800,8 +800,14 @@ class MoriKVManager(CommonKVManager):
             register_info.dst_dcp_size, register_info.dst_dcp_rank
         )
         if register_info.requires_dcp_relayout:
+            num_entries = len(self.kv_args.kv_item_lens)
+            num_draft = self.kv_args.num_draft_entries
+            # The wire format registers only the target page item length.
+            dst_item_lens = [register_info.dst_kv_item_len] * (
+                num_entries - num_draft
+            ) + [None] * num_draft
             register_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                [register_info.dst_kv_item_len] * len(self.kv_args.kv_item_lens)
+                dst_item_lens, register_info.dst_dcp_size
             )
         self.engine.register_remote_engine(register_info.engine_desc)
         self.decode_kv_args_table[engine_key] = register_info
@@ -1167,8 +1173,17 @@ class MoriKVManager(CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
-        grouped_plan = GroupedIndexPlan.from_indices(
-            plan.src_token_indices, plan.dst_token_indices
+        target_plan = GroupedIndexPlan.from_indices(
+            plan.target_src_token_indices, plan.target_dst_token_indices
+        )
+        num_draft = self.kv_args.num_draft_entries
+        num_target = len(self.kv_args.kv_item_lens) - num_draft
+        draft_plan = (
+            GroupedIndexPlan.from_indices(
+                plan.draft_src_token_indices, plan.draft_dst_token_indices
+            )
+            if num_draft
+            else None
         )
         token_item_lens = peer_info.dcp_token_item_lens
         if token_item_lens is None:
@@ -1195,12 +1210,15 @@ class MoriKVManager(CommonKVManager):
             )
 
         statuses: List[TransferStatus] = []
-        plan_cache: Dict[int, BatchTransferPlan] = {}
+        plan_cache: Dict[tuple[bool, int], BatchTransferPlan] = {}
         for entry_idx, (src_desc, dst_desc) in enumerate(desc_pairs):
             item_len = token_item_lens[entry_idx]
-            transfer_plan = plan_cache.setdefault(
-                item_len, grouped_plan.materialize(item_len)
-            )
+            is_draft = entry_idx >= num_target
+            cache_key = (is_draft, item_len)
+            if cache_key not in plan_cache:
+                grouped_plan = draft_plan if is_draft else target_plan
+                plan_cache[cache_key] = grouped_plan.materialize(item_len)
+            transfer_plan = plan_cache[cache_key]
             statuses.extend(
                 self._submit_batch_transfer_plan(src_desc, dst_desc, transfer_plan)
             )
@@ -1746,14 +1764,15 @@ class MoriKVSender(CommonKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self.init_time = time.time()
 
-    def requires_dcp_relayout(self) -> bool:
+    def supports_cached_prefix_early_send(self) -> bool:
+        # TODO: Support cached-prefix early send with DCP relayout.
         with self.kv_mgr.transfer_lock:
             infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
             for info in infos.values():
                 peer_info = self.kv_mgr.decode_kv_args_table.get(info.engine_key)
                 if peer_info is not None and peer_info.requires_dcp_relayout:
-                    return True
-        return False
+                    return False
+        return True
 
     def send(
         self,

@@ -165,6 +165,10 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def supports_cached_prefix_early_send(self) -> bool:
+        """Whether this request can send cached KV before the suffix forward."""
+        return True
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""
