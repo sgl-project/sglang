@@ -1,6 +1,7 @@
 """SM100 parity tests for SGLang's TRT-LLM-native NVFP4 KV layout."""
 
 import math
+import sys
 
 import pytest
 import torch
@@ -351,3 +352,7 @@ def test_nvfp4_native_scale_move_preserves_logical_rows():
                 page, head, sw_t, sw_s
             ]
     torch.testing.assert_close(got_v, expected_v, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
