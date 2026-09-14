@@ -85,6 +85,36 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int
     return selected_history_tokens + tail_tokens
 
 
+def dcp_localize_topk_slots(
+    slots: torch.Tensor, dcp_rank: int, dcp_size: int
+) -> torch.Tensor:
+    """Owner-filter a page_size=1 top-k slot table for decode context parallel.
+
+    Under DCP the allocator hands out VIRTUAL slots; virtual slot ``v`` lives on
+    rank ``v % dcp_size`` at physical row ``v // dcp_size`` of that rank's MLA
+    KV pool (``memory_pool.MLATokenToKVPool`` write masking and
+    ``kernels/ops/kvcache/mla_buffer.py`` use the same map). The DSA index-K
+    cache is replicated in the virtual space, so every rank computes the same
+    virtual top-k set; this turns it into the rank-local physical subset,
+    marking non-owned columns (and pre-existing ``-1`` padding) as ``-1``,
+    which the FlashMLA sparse kernel masks out. The partial outputs are then
+    combined exactly via the LSE merge (``layers/dcp/comm.py``).
+
+    Returns a new tensor; ``slots`` is left untouched because the virtual set is
+    reused by the following ``index_topk_freq - 1`` layers and by the draft
+    (``index_share_for_mtp_iteration``), whose replicated pool is addressed by
+    untranslated virtual locs.
+    """
+    if dcp_size <= 1:
+        return slots
+    owned = (slots >= 0) & ((slots % dcp_size) == dcp_rank)
+    return torch.where(
+        owned,
+        torch.div(slots, dcp_size, rounding_mode="floor"),
+        slots.new_full((), -1),
+    )
+
+
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (

@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
+    dcp_localize_topk_slots,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
@@ -101,6 +102,29 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _should_return_dsa_dcp_lse(*, forward_mode: ForwardMode, dcp_enabled: bool) -> bool:
+    return dcp_enabled and (forward_mode.is_decode() or forward_mode.is_target_verify())
+
+
+def _should_return_dsa_dcp_lse_flashmla_kv(
+    *, forward_mode: ForwardMode, dcp_enabled: bool
+) -> bool:
+    """DCP LSE-merge phases for the ``flashmla_kv`` DSA impl (WQ: Hopper DCP).
+
+    Unlike the dense-MLA DCP path, the DSA backend has no consumer for the
+    dense prefix gather (``all_gather_kv_cache_for_mla_extend``), and
+    ``flashmla_kv`` already treats every extend token as an independent
+    decode row with its own top-k slot set. So plain EXTEND joins decode and
+    target-verify on the owner-filtered, LSE-merged path. MIXED / draft-extend
+    modes are rejected at config time for DSA+DCP.
+    """
+    return dcp_enabled and (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode == ForwardMode.EXTEND
+    )
 
 
 def prepare_kv_for_attention(
@@ -365,6 +389,26 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+        # WQ Hopper DCP: the target's MLA KV is striped by owner (virtual slot
+        # v lives on rank v % dcp_size at physical v // dcp_size) while the
+        # index-K cache stays replicated in the virtual loc space. The fused
+        # top-k therefore yields VIRTUAL slots on every rank; the target
+        # attention must owner-filter them before the sparse kernel reads the
+        # local physical pool. The draft pool is replicated and addressed by
+        # untranslated virtual locs (kv_cache_configurator.loc_space_scale),
+        # so the draft never localizes.
+        _parallel = get_parallel()
+        self.dcp_localize_topk: bool = (
+            _parallel.dcp_enabled and not model_runner.is_draft_worker
+        )
+        self.dcp_rank: int = _parallel.attn_dcp_rank
+        self.dcp_size: int = _parallel.attn_dcp_size
+        # FlashMLA's ``flash_mla_with_kvcache`` returns a natural-log LSE; the
+        # DCP merge (``dcp_a2a_lse_reduce`` / ``cp_lse_ag_out_rs_mla``) reads
+        # this to pick its exp base. Only ``flashmla_kv`` is DCP-capable on
+        # SM90 fp8 KV in this fork (see server_args DSA+DCP validation).
+        self.dcp_lse_base_on_e: bool = self.dsa_decode_impl == "flashmla_kv"
 
         # Hoisted per-call imports of set_dsa_prefill_impl. Module-scope
         # imports would cycle through model_executor (which imports the
@@ -2122,6 +2166,10 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dcp_localize_topk:
+                page_table_1 = dcp_localize_topk_slots(
+                    page_table_1, self.dcp_rank, self.dcp_size
+                )
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2131,6 +2179,10 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=_should_return_dsa_dcp_lse_flashmla_kv(
+                    forward_mode=forward_batch.forward_mode,
+                    dcp_enabled=get_parallel().dcp_enabled,
+                ),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2298,6 +2350,10 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dcp_localize_topk:
+                page_table_1 = dcp_localize_topk_slots(
+                    page_table_1, self.dcp_rank, self.dcp_size
+                )
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2307,6 +2363,10 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=_should_return_dsa_dcp_lse_flashmla_kv(
+                    forward_mode=forward_batch.forward_mode,
+                    dcp_enabled=get_parallel().dcp_enabled,
+                ),
             )
         elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2839,6 +2899,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
@@ -2870,7 +2931,10 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
+        # FlashMLA returns (out, softmax_lse); softmax_lse is float32
+        # [rows, heads, seq_len_q] in natural log. It was discarded before
+        # the WQ DCP work; the DCP merge needs it (see dcp_lse_base_on_e).
+        o, lse = flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -2889,6 +2953,11 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
+        if return_lse:
+            # [rows, heads, 1] -> [rows, heads]: the [B, H] layout that
+            # dcp_a2a_lse_reduce / cp_lse_ag_out_rs_mla expect.
+            lse = lse[:, :num_q_heads, 0]
+            return o, lse
         return o
 
     def _forward_standard_mha(
