@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -440,6 +441,14 @@ class DSparkV4MarkovHead(nn.Module):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._vocab_gather = make_vocab_gather(
+            shard_group,
+            local_width=per_partition,
+            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        )
+        if shard_group.rank == 0:
+            cls_name = type(self._vocab_gather).__name__
+            logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -491,11 +500,7 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
-            assert self._shard_group is not None
-            full = self._shard_group.all_gather(step_local, dim=-1)
-        else:
-            full = step_local
+        full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
