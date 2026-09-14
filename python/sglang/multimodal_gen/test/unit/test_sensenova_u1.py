@@ -1039,8 +1039,9 @@ def test_sensenova_u1_rope_sharing_holds_when_a_norm_promotes_dtype(monkeypatch)
     embeds = torch.randn(1, 5, _HIDDEN_DIM, dtype=torch.bfloat16)
     indicators = torch.ones(1, 5, dtype=torch.bool)
 
-    shared, per_layer = _run_shared_and_per_layer(
-        monkeypatch, model, embeds, indicators, _AXIS_INDEXES
-    )
+    with torch.autocast(device_type=embeds.device.type, dtype=torch.bfloat16):
+        shared, per_layer = _run_shared_and_per_layer(
+            monkeypatch, model, embeds, indicators, _AXIS_INDEXES
+        )
 
     assert torch.equal(shared, per_layer)

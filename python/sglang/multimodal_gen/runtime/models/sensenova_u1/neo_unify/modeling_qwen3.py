@@ -1423,9 +1423,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # Positions are all the tables depend on, so one build covers the whole
-        # forward. `_resolve_rope_tables` rechecks the activation dtype against
-        # each layer and rebuilds if it moved.
+        # Precompute shared RoPE tables. Attention layers rebuild them if
+        # normalization changes the activation dtype.
         layers = self.layers[: self.config.num_hidden_layers]
         position_embeddings = None
         if layers:
