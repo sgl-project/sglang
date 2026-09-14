@@ -310,8 +310,8 @@ def run(
                     torch.cuda.synchronize()
                     dist.barrier()
                     if profile:
-                        if rank == 0:
-                            torch.cuda.cudart().cudaProfilerStart()
+                        # Every worker must enable its own CUPTI collection.
+                        torch.cuda.cudart().cudaProfilerStart()
                         dist.barrier()
                     measured = dict(cuda_step_ms=[], host_step_ms=[])
                     graph_passes = tbo_passes = 0
@@ -347,8 +347,7 @@ def run(
                             checkpoints[f"B{bucket}/round{rnd}/sample{sample}"] = cpu
                     if profile:
                         dist.barrier()
-                        if rank == 0:
-                            torch.cuda.cudart().cudaProfilerStop()
+                        torch.cuda.cudart().cudaProfilerStop()
                     report["records"].append(
                         dict(
                             bucket=bucket,

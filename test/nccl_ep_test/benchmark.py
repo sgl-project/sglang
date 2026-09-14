@@ -197,8 +197,9 @@ def benchmark_steps(
                             warmup_seconds = time.perf_counter() - warmup_started
                             coordinator.barrier()
                             if profile:
-                                if rank == 0:
-                                    torch.cuda.cudart().cudaProfilerStart()
+                                # CUPTI collection starts per process. Starting
+                                # only rank 0 can miss rank 1's first graph.
+                                torch.cuda.cudart().cudaProfilerStart()
                                 coordinator.barrier()
                             measured = {metric: [] for metric in METRICS}
                             for iteration, (start, end) in enumerate(events):
@@ -225,8 +226,7 @@ def benchmark_steps(
                                 )
                             if profile:
                                 coordinator.barrier()
-                                if rank == 0:
-                                    torch.cuda.cudart().cudaProfilerStop()
+                                torch.cuda.cudart().cudaProfilerStop()
                             for batch, output in zip(
                                 pairs[(samples - 1) % 2][0], actual
                             ):
