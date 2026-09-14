@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
+    marlin_init_stream_workspaces,
     marlin_make_workspace,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
@@ -122,6 +123,7 @@ def prepare_fp8_layer_for_marlin(
 
     # WORKSPACE
     layer.workspace = marlin_make_workspace(device)
+    marlin_init_stream_workspaces(layer)
 
     # WEIGHT
     # Repack weights to marlin format
