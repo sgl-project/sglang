@@ -1145,9 +1145,19 @@ class RuntimeContext:
         the top-level fields describe startup config. TokenizerManager separately
         overlays its per-instance model identity.
         """
+        from sglang.srt.arg_groups.arg_utils import redacted_value, secret_fields
+
         d = self.server_args.resolved_dict() if base is None else dict(base)
+        secrets = secret_fields(type(self.server_args))
         for _source, fields in self._overrides_log:
-            d.update(fields)
+            # The base is already redacted. Redact raw overlay values before
+            # merging, preserving counts in the base's credential markers.
+            for name, value in fields.items():
+                d[name] = (
+                    redacted_value(value)
+                    if name in secrets and value is not None
+                    else value
+                )
         return d
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
