@@ -635,11 +635,26 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             )
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
-    @override_platform(is_cuda=False)
-    def test_cuda_ipc_rejects_non_nvidia_platforms(self):
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_cuda_ipc_accepts_rocm(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
 
-        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
+
+            self.assertEqual(
+                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
+            )
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("Using CUDA IPC for multimodal features", "\n".join(logs.output))
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_cuda_ipc_rejects_non_cuda_alike_platforms(self):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA or AMD ROCm/HIP"):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
