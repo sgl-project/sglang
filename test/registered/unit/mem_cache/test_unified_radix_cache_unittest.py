@@ -1636,6 +1636,15 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
+            if self.cfg.enable_mamba_extra_buffer:
+                # The prompt-only key needs its own checkpoint, not the
+                # latest state that has already consumed thinking + answer.
+                req.kv.mamba_prev_track_seqlen = len(prompt_ids)
+                prompt_slot = req.kv.mamba_ping_pong_track_buffer[
+                    req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.kv.mamba_last_track_idx
+                    )
+                ].clone()
         req.reasoning_tokens = 1
 
         # cache_finished_req reads get_serving().strip_thinking_cache
@@ -1658,6 +1667,14 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
         )
         self.assertEqual(len(m.device_indices), prompt_aligned)
+        if self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer:
+            node = cache.resolve_node_handle(m.last_device_node)
+            self.assertTrue(
+                torch.equal(
+                    node.component_data[ComponentType.MAMBA].value.reshape(-1),
+                    prompt_slot.reshape(-1),
+                )
+            )
         # Only prompt-aligned pages remain owned by the tree.
         self.assertEqual(
             allocator.available_size(), avail_before + kv_len - prompt_aligned
@@ -7829,6 +7846,30 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                     )
                 else:
                     self.assertIsNone(req.kv.mamba_pool_idx)
+                cache.sanity_check()
+
+    def test_strip_thinking_without_prompt_checkpoint_donates_nothing(self):
+        for previous_len in (None, 12):
+            with self.subTest(previous_len=previous_len):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                req, tokens = self._build_req(allocator, pool, previous_len)
+                req.origin_input_ids = array("q", tokens[:8])
+                req.output_ids = array("q", tokens[8:])
+                req.reasoning_tokens = 1
+                req.last_node = cache.root_node_handle()
+                with get_serving().override(strip_thinking_cache=True):
+                    cache.cache_finished_req(
+                        req,
+                        is_insert=True,
+                        kv_len_to_handle=req.effective_kv_committed_len(),
+                    )
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(match.device_indices), 0)
+                self.assertIsNone(req.kv.mamba_pool_idx)
                 cache.sanity_check()
 
 
