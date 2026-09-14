@@ -1526,9 +1526,33 @@ class GroupCoordinator:
         return obj_list
 
     def all_gather_object(self, obj: Any) -> List[Any]:
+        """Gather one object per rank, returned in group-rank order.
+
+        Uses the message-queue broadcaster when available: unlike the gloo
+        path, neither side of that channel holds a wall-clock-bounded wait.
+        """
+        if self.world_size == 1:
+            return [obj]
+        if self.mq_broadcaster is not None:
+            return self.mq_broadcaster.all_gather_object(obj)
         objs = [None] * self.world_size
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
+
+    def barrier(self):
+        """Barrier across the group.
+
+        Uses the message-queue broadcaster when available: unlike the gloo
+        path, neither side of that channel holds a wall-clock-bounded wait,
+        so an engine suspended past any timeout still completes the barrier
+        on resume.
+        """
+        if self.world_size == 1:
+            return
+        if self.mq_broadcaster is not None:
+            self.mq_broadcaster.barrier()
+            return
+        torch.distributed.barrier(group=self.cpu_group)
 
     def send_object(
         self,

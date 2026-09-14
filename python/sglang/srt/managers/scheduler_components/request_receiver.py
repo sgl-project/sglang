@@ -14,7 +14,6 @@ from typing import (
 
 import torch
 import zmq
-from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
@@ -259,11 +258,11 @@ class SchedulerRequestReceiver:
         parallel = get_parallel()
         if parallel.enable_dp_attention:
             if self.ps.attn_tp_size > 1:
-                barrier(group=self.attn_tp_cpu_group)
+                self.attn_tp_group.barrier()
             if self.ps.attn_cp_size > 1:
-                barrier(group=self.attn_cp_cpu_group)
+                self.attn_cp_group.barrier()
         elif self.ps.tp_size > 1:
-            barrier(group=self.tp_cpu_group)
+            self.tp_group.barrier()
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -283,11 +282,15 @@ class SchedulerRequestReceiver:
         # 3. all ranks reject the same requests before entering model collectives
         if parallel.enable_dp_attention:
             if self.ps.attn_tp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+                failed = torch.stack(self.attn_tp_group.all_gather_object(failed)).amax(
+                    dim=0
+                )
             if self.ps.attn_cp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+                failed = torch.stack(self.attn_cp_group.all_gather_object(failed)).amax(
+                    dim=0
+                )
         elif self.ps.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+            failed = torch.stack(self.tp_group.all_gather_object(failed)).amax(dim=0)
 
         error = MMInputsProcessError(
             "Failed to materialize shared-memory multimodal features on a scheduler rank."

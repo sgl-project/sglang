@@ -17,7 +17,6 @@ from typing import (
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.schedule_batch import Req
 
 if is_npu():
@@ -227,16 +227,16 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
-def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+def _all_reduce_polls(polls: List[int], group: GroupCoordinator) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    gathered = group.all_gather_object(tensor)
+    return torch.stack(gathered).amin(dim=0).tolist()
 
 
 def poll_and_all_reduce(
     pollers,
-    gloo_group: dist.ProcessGroup,
+    sync_group: GroupCoordinator,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
 ):
@@ -246,27 +246,27 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(polls, gloo_group)
+    return _all_reduce_polls(polls, sync_group)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
-    attn_cp_cpu_group: dist.ProcessGroup,
-    attn_tp_cpu_group: dist.ProcessGroup,
+    attn_cp_group: GroupCoordinator,
+    attn_tp_group: GroupCoordinator,
 ):
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+    polls = poll_and_all_reduce(pollers, attn_tp_group)
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
-    return _all_reduce_polls(polls, attn_cp_cpu_group)
+    return _all_reduce_polls(polls, attn_cp_group)
 
 
 def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,
-    gloo_group: dist.ProcessGroup,
+    sync_group: GroupCoordinator,
     metadata_buffers: Optional[MetadataBuffers] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
@@ -295,7 +295,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    return _all_reduce_polls(raw_polls, sync_group)
 
 
 #########################
