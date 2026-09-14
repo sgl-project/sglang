@@ -1382,7 +1382,7 @@ the configurations with collected measurements:
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
-| RTX 5090 | 2× TP2 + layerwise offload | — |
+| RTX 5090 | 1× layerwise offload, measured on a physical desktop | 2× TP2 + layerwise offload |
 | RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
 
 ### GB300 single-host
@@ -1731,9 +1731,11 @@ Ulysses2 was the fastest; TP4 used the least memory:
 | FSDP + Ulysses4 | 13.36 s | 57.01 GB |
 | TP4 + Ulysses1 | 13.86 s | 49.80 GB |
 
-### RTX 5090 capacity run
+### RTX 5090 capacity run (two cards)
 
-The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
+The single-card recipe is a different one — see *RTX 5090 single card, physical
+desktop* below; the twenty resident layers here are half a layer per GPU under
+TP2 and do not transfer to one card. The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
 50-step, 1344×768, 5-second request completed in 559.67 seconds: 525.05
 seconds of denoising and 33.61 seconds of decoding, with a 26.3 GiB sampled
 peak per GPU.
@@ -1910,16 +1912,33 @@ Under that cap, Recipe A wins the whole request at every host size:
 Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
 figures are anchored at 480P — activations grow with the pixel count, so at
 768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
-decode still collides. And the host convention holds the weights in page
-cache; a physical 32 GB machine re-reads them from disk each step, so the
-page cache cannot hold the per-step weight sweep, so every step re-reads it
-from disk and the drive becomes the denoise clock: a real desktop 4090 with a
-990 Pro measured 38 s/step, reading 52.9 GB per step (faulted sequentially, so
-almost none of it shows in majflt — measure `read_bytes`, not major faults).
-Two things cut that read directly: resident DiT layers (~1 GB/step each — on a
-physically small host raise them as far as VRAM allows, the opposite of the
-capped-host guidance above), and more RAM (64 GB caches the sweep and returns
-to the quoted times). The
+decode still collides.
+
+One convention behind that table is the one a home machine does not share: the
+host sizes above are `psutil` patches on a 2 TB lab machine, so the kernel kept
+the whole checkpoint in page cache and nothing was read from disk. A physical
+host of that size re-reads the streamed weights every step, and what that costs
+is computable — `bytes per step = (50 - resident DiT layers - layers the host
+pin budget covered) x 1.23 GiB`. The courier overlaps that read with compute, so
+the drive stops being the denoise clock once its sequential rate exceeds those
+bytes divided by the card's step time. A 32 GB host covers roughly 13 layers,
+which puts a 24 GB card at ~38 GiB/step and a 12/16 GB card at ~46 GiB/step: a
+PCIe 4.0 NVMe (6–7 GiB/s) clears both, a PCIe 3.0 drive (~3.2 GiB/s) becomes the
+clock, and a SATA SSD is not usable for this model. Resident DiT layers remove
+1.23 GiB/step each, but only while the streamed set is larger than the pin
+budget — once the read fits under the step's compute time, more of them buy
+nothing and only cost VRAM.
+
+An earlier revision of this page recorded 38 s/step on a physical 4090 with a
+990 Pro, reading 52.9 GB per step — about 1.4 GB/s, and faulted sequentially, so
+almost none of it showed in `majflt` (measure `read_bytes`, not major faults).
+That rate was the old path, not the drive: the pinned-store pool rounded every
+block up to a power of two, so the pin budget over-committed and the machine had
+to run with pinning off, and the layers that stayed mapped faulted in 4 KiB at a
+time. Exact-size pinning and O_DIRECT reads through the courier removed both,
+and the physical 5090 run below shows the drive fully hidden behind compute. A
+4090 on a 32 GB host is derived to return to its compute wall (~8.5 s/step) on a
+PCIe 4.0 drive; that machine has not been re-measured. The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
 and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
 22 GiB cap so a desktop's own allocations fit; a headless card can raise it
@@ -1936,7 +1955,9 @@ Stage by stage under the cap: text encoding is even (both stream the same
 48 GB Qwen3VL), the denoise leads at 32–48 GB hosts and sits within
 run-to-run variance of ComfyUI at 64 GB (162 vs 159 s), and the decode leads
 everywhere. Two ComfyUI notes that still matter: `--fast-disk` measured no
-faster than its default here, and stacking
+faster than its default on this lab host — though on a physical 60 GB desktop
+its default is OOM-killed while loading (55.6 GB of anonymous memory) and
+`--fast-disk` is what makes it run at all — and stacking
 `--novram --cache-none --disable-pinned-memory` made things strictly worse
 (69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
 configuration on a small host.
@@ -1946,6 +1967,61 @@ The path ComfyUI ships for 12 GB cards uses
 i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
 against the unpruned 66.3 GB. Those are different weights, so it is not a
 like-for-like comparison with the recipes above.
+
+### RTX 5090 single card, physical desktop
+
+Every consumer figure above this point was measured with at least one axis
+simulated: a hard allocator cap standing in for VRAM, a `psutil` patch standing
+in for host RAM, and a lab machine whose page cache held the whole checkpoint.
+This run had none of that — an RTX 5090 (32 GB) in a Ryzen 9 9950X desktop with
+60 GB of RAM, an 8 GB swap file and a Samsung 9100 PRO on PCIe 5.0, on Ubuntu
+24.04. The workload matches the comparison above: FL2VA T2VA, 864×480, 124
+frames, 20 steps, cfg 1.0, euler_ancestral, sigma shift 12.0/3.0, same seeds and
+keyframes on both engines, unpruned bf16 weights on both sides.
+
+```bash 32 GB VRAM + 60 GB host, lossless
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-layerwise-resident-layers 14 \
+  --layerwise-resident-layers video_vae=36 \
+  --warmup-resolutions 864x480 --warmup-num-frames 124
+```
+
+| | text encoding | denoise step | decode | request |
+| --- | ---: | ---: | ---: | ---: |
+| sglang | **4.2 s** | 5.14–5.17 s | **6.4 s** | **112.2 / 112.1 s** |
+| ComfyUI `--fast-disk --cache-none` | 11.3 s | 5.17–5.30 s | 7.2 s | 145.9 / 145.6 / 140.9 s |
+
+Three things a capped run cannot settle:
+
+**The denoise is at the card's compute wall, not the drive's.** The two engines
+are within noise of each other per step, and prefetch depth 2 and cuDNN SDPA
+each measured as no change. The 51.3 GiB the DiT reads from the drive per
+request is fully overlapped — across a whole request the compute thread waited
+0.9 s for the courier.
+
+**Host RAM decides how much traffic there is to hide.** At 60 GB the pin budget
+covers 34 of the 50 DiT layers, so only about two layers per step come off the
+disk. The 46 GiB text encoder is never pinned — streamed layers take the budget
+first — and is read whole, once per request, at the drive's sequential rate:
+that is the 4.2 s stage, against 12.1–12.9 s when the same bytes go through the
+page cache.
+
+**Neither engine's default command survives this machine.** ComfyUI's is
+OOM-killed during load (55.6 GB of anonymous memory) and needs `--fast-disk`;
+sglang's was too, until pinned stores were allocated at their exact size instead
+of the allocator's next power of two. Even now the automatic placement keeps no
+resident DiT layers and streams the VAE on every decode, so the flags above are
+what reach the numbers in the table.
+
+Two caveats to carry into your own machine. The run finished with its 8 GB swap
+file full, because the pin budget takes 95% of the memory available after
+loading and there is no smaller setting yet — on a machine that is also your
+desktop, expect that pressure and give the card more resident layers, since a
+resident layer is one the host no longer has to pin. And these are 480P figures:
+at 768P drop the resident DiT layers first, then `video_vae` to 24.
 
 ### RTX 4090 24 GB single-GPU run
 
