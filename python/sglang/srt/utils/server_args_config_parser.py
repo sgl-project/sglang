@@ -23,7 +23,8 @@ class ConfigArgumentMerger:
         boolean_actions: List[str] = None,
     ):
         """Initialize with list of store_true action names."""
-        # NOTE: The current code does not support actions other than "store_true" and "store".
+        # NOTE: The current code does not support actions other than
+        # "store_true", "store", and ``BooleanOptionalAction``.
         if parser is not None:
             self.parser = parser
             self.store_true_actions = [
@@ -31,12 +32,18 @@ class ConfigArgumentMerger:
                 for action in parser._actions
                 if isinstance(action, argparse._StoreTrueAction)
             ]
+            self.boolean_optional_actions = {
+                action.dest: action
+                for action in parser._actions
+                if isinstance(action, argparse.BooleanOptionalAction)
+            }
             self.unsupported_actions = {
                 a.dest: a
                 for a in parser._actions
                 if a.option_strings
                 and not isinstance(a, argparse._StoreTrueAction)
                 and not isinstance(a, argparse._StoreAction)
+                and not isinstance(a, argparse.BooleanOptionalAction)
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
@@ -44,9 +51,11 @@ class ConfigArgumentMerger:
         elif boolean_actions is not None:
             # Legacy interface for compatibility
             self.store_true_actions = boolean_actions
+            self.boolean_optional_actions = {}
             self.unsupported_actions = {}
         else:
             self.store_true_actions = []
+            self.boolean_optional_actions = {}
             self.unsupported_actions = {}
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
@@ -173,6 +182,18 @@ class ConfigArgumentMerger:
         if key_norm in self.store_true_actions:
             if value:
                 args.append(f"--{key}")
+        elif key_norm in self.boolean_optional_actions:
+            action = self.boolean_optional_actions[key_norm]
+            option = next(
+                option
+                for option in action.option_strings
+                if (
+                    option.startswith("--") and not option.startswith("--no-")
+                    if value
+                    else option.startswith("--no-")
+                )
+            )
+            args.append(option)
         else:
             args.extend([f"--{key}", str(value).lower()])
 
