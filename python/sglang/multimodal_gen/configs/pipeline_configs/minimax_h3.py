@@ -64,6 +64,9 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    calibrate_auto_residency_with_explicit_warmup_resolutions: bool = True
+    # The video/audio sigma schedules include both interval endpoints.
+    minimum_inference_steps: int = 2
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )

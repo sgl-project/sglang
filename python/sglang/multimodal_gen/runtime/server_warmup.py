@@ -253,7 +253,11 @@ async def maybe_apply_auto_residency(
     # that overlap under it. Resident-only changes need one full-shape step for
     # memory safety; other changes retain the longer regression timing sample.
     try:
-        validation_options = {"step_limit": 1} if short_validation else {}
+        validation_options = (
+            {"step_limit": _short_validation_step_limit(server_args)}
+            if short_validation
+            else {}
+        )
         await run_async_client_warmup(
             server_args,
             forward,
@@ -323,6 +327,13 @@ def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
         format_warmup_req(lighter),
     )
     return lighter
+
+
+def _short_validation_step_limit(server_args: ServerArgs) -> int:
+    """Steps for the resident-only validation pass: one, unless the pipeline
+    needs more (MiniMax H3 rejects fewer than two)."""
+    config = getattr(server_args, "pipeline_config", None)
+    return max(1, int(getattr(config, "minimum_inference_steps", 1) or 1))
 
 
 def format_warmup_req(req_or_group: Any) -> str:

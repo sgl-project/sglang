@@ -204,6 +204,13 @@ class PipelineConfig:
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
     supports_auto_residency: bool = True
+    # Explicit warmup resolutions are often deliberately tiny or atypical.
+    # Only pipelines that define those resolutions as representative residency
+    # probes should let them drive the auto-residency planner.
+    calibrate_auto_residency_with_explicit_warmup_resolutions: bool = False
+    # Fewest denoising steps a request may ask for. Calibration probes that
+    # shorten a request (the resident-only validation pass) never go below it.
+    minimum_inference_steps: int = 1
     # Components that cannot fall back to a native Transformers/Diffusers
     # implementation because their pipeline requires SGLang-specific behavior.
     native_only_components: tuple[str, ...] = ()
