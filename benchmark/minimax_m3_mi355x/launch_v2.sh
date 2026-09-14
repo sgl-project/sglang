@@ -1,6 +1,5 @@
 #!/bin/bash
-# MXFP4 quark target + EAGLE3 GQA draft with custom all-reduce and Gluon fp8 prefill; knobs via EXTRA2/ENVS2
-# Usage: TAG=... [GPUS=0,1,2,3 PORT=30000] [STEPS=3 DRAFT=4] [EXTRA2="..."] [ENVS2="..."] bash launch_v2.sh
+# Usage: TAG=x [GPUS=0,1,2,3 PORT=30000] [STEPS=3 DRAFT=4] [EXTRA2=..] [ENVS2=..] bash launch_v2.sh
 : "${TAG:=v2_mxfp4_eagle3_qrint8}"
 : "${STEPS:=3}"; : "${DRAFT:=4}"
 : "${MEMFRAC:=0.85}"

@@ -1,5 +1,4 @@
-# PERFORMANCE-ONLY ATOM-parity config: forced acceptance commits unchecked draft tokens, so outputs are not the model's.
-# Never run an accuracy evaluation with this sourced; report its numbers as synthetic acceptance.
+# PERFORMANCE-ONLY: forced acceptance commits unchecked draft tokens; never evaluate accuracy on it
 source /scratch/run/best_config.sh
 # mean acceptance length 2.78 over 3 draft tokens is ATOM's --spec-decode-acceptance-rate 0.5933
 export STEPS=2 DRAFT=3

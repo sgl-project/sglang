@@ -75,7 +75,7 @@ def should_ignore_layer(
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
-            # a shard the exclude list never names is not in the checkpoint, so it cannot veto siblings
+            # a shard the exclude list never names is absent, so it cannot veto its siblings
             if (
                 not should_ignore_shard
                 and should_ignore_layer

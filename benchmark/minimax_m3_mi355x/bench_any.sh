@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: CONC=24 TAG=baseline [DURATION=3600 PORT=30000 AIPERF_BIN=... AIPERF_EXTRA=...] bash bench_any.sh
+# Usage: CONC=24 TAG=x [DURATION=3600 PORT=30000 AIPERF_BIN=... AIPERF_EXTRA=...] bash bench_any.sh
 : "${CONC:?}"; : "${TAG:?}"
 : "${DURATION:=3600}"
 : "${PORT:=30000}"
