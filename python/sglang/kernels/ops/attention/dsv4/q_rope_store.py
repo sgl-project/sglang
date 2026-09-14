@@ -4,11 +4,17 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 @triton.jit
-def _q_rope_store(X, Y, F, POS, SX: tl.constexpr, SY: tl.constexpr):
+def _q_rope_store(
+    X, Y, F, POS, SX: tl.constexpr, SY: tl.constexpr, USE_GDC: tl.constexpr = False
+):
     row, head = tl.program_id(0), tl.program_id(1)
     r = tl.arange(0, 512)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()  # X is the wq_b GEMM output; POS may be in-graph
     value = tl.load(X + row * SX + head * 512 + r).to(tl.float32)
     partner = tl.gather(value, r ^ 1, 0)
     position = tl.load(POS + row)
@@ -19,6 +25,8 @@ def _q_rope_store(X, Y, F, POS, SX: tl.constexpr, SY: tl.constexpr):
     odd = tl.fma(partner, sin, value * cos)
     rotated = tl.where((r & 1) == 0, even, odd)
     tl.store(Y + row * SY + head * 512 + r, tl.where(r >= 448, rotated, value))
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def q_rope_store(
@@ -35,6 +43,7 @@ def q_rope_store(
     assert freqs_cis.dtype == torch.complex64 and freqs_cis.is_contiguous()
     assert freqs_cis.shape[1] == 32 and positions.shape == (q.shape[0],)
     assert positions.dtype in (torch.int32, torch.int64) and positions.is_contiguous()
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _q_rope_store[(q.shape[0], q.shape[1])](
         q,
         output,
@@ -43,4 +52,5 @@ def q_rope_store(
         q.stride(0),
         output.stride(0),
         num_warps=4,
+        **pdl_kwargs,
     )
