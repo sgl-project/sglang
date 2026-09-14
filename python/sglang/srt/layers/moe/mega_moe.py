@@ -179,6 +179,35 @@ def forward_mega_moe(
     return y
 
 
+def _compute_mega_moe_router_logits(moe, hidden_states, forward_batch):
+    if compute_router_logits := getattr(moe, "_compute_router_logits", None):
+        return compute_router_logits(hidden_states)
+    return moe.gate(hidden_states, forward_batch=forward_batch)
+
+
+def _get_moe_intermediate_size(config) -> int:
+    if intermediate_size := getattr(config, "moe_intermediate_size", None):
+        return intermediate_size
+    return config.intermediate_size
+
+
+def _get_mega_moe_activation_params(config):
+    if getattr(config, "hidden_act", None) == "swigluoai":
+        return (
+            "swigluoai",
+            float(config.swiglu_alpha),
+            1.0,
+            float(config.swiglu_limit),
+        )
+    return "swiglu", 1.0, 0.0, getattr(config, "swiglu_limit", None)
+
+
+def _get_mega_moe_routed_scaling_factor(moe) -> float:
+    if moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        return 1.0
+    return float(moe.routed_scaling_factor)
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -193,7 +222,9 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        router_logits = _compute_mega_moe_router_logits(
+            moe, hidden_states, forward_batch
+        )
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
         topk_output = moe.topk(
             hidden_states,
@@ -217,7 +248,16 @@ def _run_mega_routed(
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
-    intermediate_size = moe.config.moe_intermediate_size
+    intermediate_size = _get_moe_intermediate_size(moe.config)
+    activation, activation_alpha, activation_up_bias, activation_clamp = (
+        _get_mega_moe_activation_params(moe.config)
+    )
+    routed_scaling_factor = _get_mega_moe_routed_scaling_factor(moe)
+    if activation == "swigluoai" and _device_sm != 90:
+        raise RuntimeError(
+            "MegaMoE OAI-SwiGLU is only supported on SM90; refusing to run "
+            "a backend that would change the model activation semantics."
+        )
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -252,6 +292,11 @@ def _run_mega_routed(
             topk_weights_in,
             buf,
             num_tokens,
+            routed_scaling_factor=routed_scaling_factor,
+            activation=activation,
+            activation_alpha=activation_alpha,
+            activation_up_bias=activation_up_bias,
+            activation_clamp=activation_clamp,
         )
 
     mma_type = _mega_moe_mma_type()

@@ -257,6 +257,163 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         torch.testing.assert_close(actual, expected)
 
+    def test_model_adapter_reads_minimax_moe_contract(self):
+        expected_logits = torch.tensor([[1.0, 2.0]])
+        moe = SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_act="swigluoai",
+                swiglu_alpha=1.702,
+                swiglu_limit=7.0,
+                intermediate_size=384,
+            ),
+            _compute_router_logits=MagicMock(return_value=expected_logits),
+            routed_scaling_factor=2.0,
+            experts=SimpleNamespace(
+                should_fuse_routed_scaling_factor_in_topk=True,
+            ),
+            topk=SimpleNamespace(
+                topk_config=SimpleNamespace(apply_routed_scaling_factor_on_output=True)
+            ),
+        )
+
+        actual_logits = mega_moe._compute_mega_moe_router_logits(
+            moe, torch.zeros(1, 3), forward_batch=object()
+        )
+
+        self.assertIs(actual_logits, expected_logits)
+        self.assertEqual(mega_moe._get_moe_intermediate_size(moe.config), 384)
+        self.assertEqual(
+            mega_moe._get_mega_moe_activation_params(moe.config),
+            ("swigluoai", 1.702, 1.0, 7.0),
+        )
+        self.assertEqual(mega_moe._get_mega_moe_routed_scaling_factor(moe), 1.0)
+
+    def test_deepseek_expert_scaling_contract_remains_authoritative(self):
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                should_fuse_routed_scaling_factor_in_topk=False,
+            ),
+            routed_scaling_factor=2.5,
+            topk=SimpleNamespace(
+                topk_config=SimpleNamespace(apply_routed_scaling_factor_on_output=True)
+            ),
+        )
+
+        self.assertEqual(mega_moe._get_mega_moe_routed_scaling_factor(moe), 2.5)
+
+    def test_non_sm90_rejects_parameterized_swiglu(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        buffer = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        moe = SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=4,
+                hidden_act="swigluoai",
+                swiglu_alpha=1.702,
+                swiglu_limit=7.0,
+                num_experts_per_tok=2,
+                intermediate_size=8,
+            ),
+            experts=SimpleNamespace(
+                num_experts=8,
+                mega_l1_weights=object(),
+                mega_l2_weights=object(),
+                should_fuse_routed_scaling_factor_in_topk=True,
+            ),
+            num_fused_shared_experts=0,
+            routed_scaling_factor=1.0,
+            topk=SimpleNamespace(
+                topk_config=SimpleNamespace(apply_routed_scaling_factor_on_output=True)
+            ),
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer),
+            patch.object(mega_moe, "mega_moe_pre_dispatch"),
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=SimpleNamespace(device_group=object()),
+            ),
+            self.assertRaisesRegex(RuntimeError, "only supported on SM90"),
+        ):
+            mega_moe._run_mega_routed(
+                moe,
+                torch.zeros((0, 4)),
+                forward_batch=None,
+                input_ids_global=None,
+                num_tokens=0,
+            )
+
+        deep_gemm.fp8_fp4_mega_moe.assert_not_called()
+
+    def test_sm90_forwards_parameterized_swiglu(self):
+        from sglang.srt.layers.moe import mega_moe_sm90
+
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm.fp8_mega_moe = MagicMock()
+        experts = SimpleNamespace(
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+        )
+        moe = SimpleNamespace(
+            config=SimpleNamespace(hidden_size=4),
+            experts=experts,
+        )
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+        )
+
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            mega_moe_sm90.run_sm90_mega_routed(
+                moe,
+                torch.zeros((1, 4)),
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                torch.tensor([[0.6, 0.4]]),
+                buffer,
+                num_tokens=1,
+                routed_scaling_factor=1.0,
+                activation="swigluoai",
+                activation_alpha=1.702,
+                activation_up_bias=1.0,
+                activation_clamp=7.0,
+            )
+
+        call = deep_gemm.fp8_mega_moe.call_args
+        self.assertEqual(call.kwargs["activation"], "swigluoai")
+        self.assertEqual(call.kwargs["activation_alpha"], 1.702)
+        self.assertEqual(call.kwargs["activation_up_bias"], 1.0)
+        self.assertEqual(call.kwargs["activation_clamp"], 7.0)
+
+    def test_minimax_megamoe_fails_closed(self):
+        from sglang.srt.models import minimax_m3
+
+        backend = SimpleNamespace(
+            is_megamoe=lambda: True,
+            is_deepep=lambda: False,
+        )
+        moe = object.__new__(minimax_m3.MiniMaxM3MoE)
+
+        with (
+            patch.object(minimax_m3, "get_moe_a2a_backend", return_value=backend),
+            patch.object(mega_moe, "should_use_mega_moe", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "refusing to fall back"),
+        ):
+            moe.forward(torch.zeros(1, 1), forward_batch=object())
+
 
 if __name__ == "__main__":
     unittest.main()
