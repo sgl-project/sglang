@@ -71,3 +71,25 @@ def test_render_report_md_and_json(tmp_path):
     assert by_rank[1]["cell_hash"] == "aaa"
     assert by_rank[None]["cell_hash"] == "bbb"
     assert by_rank[1]["output_throughput_per_card"] == 500.0  # tp=2
+
+
+def test_all_tables_have_matching_separator_counts(tmp_path):
+    """GFM drops a table whose separator cell count != header cell count."""
+    row = make_row("aaa", {"output_throughput": 1000.0, "p99_ttft_ms": 800.0}, rank=1)
+    render_report(
+        tmp_path,
+        "unit-cfg",
+        "unit-run-2",
+        [row],
+        [{"cell_id": "cell-aaa", "status": "done"}],
+        {},
+        {"p99_ttft_ms": 2000.0, "p99_tpot_ms": 100.0},
+    )
+    lines = (tmp_path / "report.md").read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("|") and set(line) <= set("|-: "):
+            header = lines[i - 1]
+            assert header.count("|") == line.count("|"), (
+                f"separator at line {i + 1} has {line.count('|') - 1} cells "
+                f"but header has {header.count('|') - 1}: {header!r}"
+            )

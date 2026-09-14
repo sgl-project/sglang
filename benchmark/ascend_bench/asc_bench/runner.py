@@ -179,6 +179,7 @@ class Runner:
         run_dir: Path,
         procs: ProcessCtl | None = None,
         hbm_probe: Callable[[], dict[int, int] | None] | None = None,
+        straggler_kill: Callable[[], None] | None = None,
         log: Callable[[str], None] = lambda msg: print(msg, flush=True),
     ) -> None:
         self.cfg = cfg
@@ -186,6 +187,7 @@ class Runner:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.procs = procs or RealProcs()
         self.hbm_probe = hbm_probe
+        self.straggler_kill = straggler_kill
         self.log = log
         self.cells_dir = self.run_dir / "cells"
         self.manifest = Manifest(self.run_dir / "manifest.jsonl")
@@ -290,6 +292,7 @@ class Runner:
             budget_mb=self.cfg.run.hbm_budget_mb,
             timeout_s=self.cfg.run.hbm_timeout_s,
             poll_s=self.cfg.run.hbm_poll_s,
+            extra_kill=self.straggler_kill,
             log=lambda msg: self.log(f"[{cell.cell_id}] {msg}"),
         )
         durations["hbm_gate_s"] = round(time.monotonic() - started, 1)
@@ -367,17 +370,15 @@ class Runner:
             self._record(cell, "healthy", durations=durations)
 
             accuracy: float | None = None
+            gsm8k_note: str | None = None
             if self.cfg.run.gsm8k is not None:
                 accuracy = self._run_gsm8k(cell, cdir, env)
                 if accuracy is None:
-                    return self._finish(
-                        cell,
-                        server,
-                        baseline,
-                        durations,
-                        "failed_bench",
-                        detail="gsm8k run failed or accuracy not parseable",
-                    )
+                    # The accuracy gate is advisory: its failure must not
+                    # discard an otherwise valid perf measurement (e.g. the
+                    # gsm8k dataset download failing on a NAT-ed host).
+                    gsm8k_note = "gsm8k gate failed (no accuracy); perf data kept"
+                    self.log(f"[{cell.cell_id}] {gsm8k_note}")
 
             self._record(cell, "benching", durations=durations)
             bench = None
@@ -418,6 +419,7 @@ class Runner:
                 "done",
                 metrics=metrics,
                 accuracy=accuracy,
+                detail=gsm8k_note,
             )
         except Exception as exc:  # noqa: BLE001 - never leave the node dirty
             self._kill_tree(server)

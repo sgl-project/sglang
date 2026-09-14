@@ -7,8 +7,9 @@ with a phantom OOM and pollutes the whole sweep.
 
 from __future__ import annotations
 
+import subprocess
 import time
-from typing import Callable
+from typing import Any, Callable, Iterable
 
 # probe() -> {device: used_mb} | None
 Probe = Callable[[], dict[int, int] | None]
@@ -64,3 +65,35 @@ def wait_hbm_freed(
             killed_stragglers = True
         sleep(poll_s)
     return False
+
+
+STRAGGLER_PATTERNS = (
+    "sglang::",  # engine workers: sglang::scheduler / detokenizer / ...
+    # server main; the char class keeps this pattern from matching any
+    # plain-text occurrence (the pkill self-match trap)
+    "sglang[.]launch_server",
+)
+
+
+def kill_stragglers(
+    patterns: Iterable[str] = STRAGGLER_PATTERNS,
+    *,
+    run: Callable[..., Any] = subprocess.run,
+    log: Callable[[str], None] = lambda _msg: None,
+) -> None:
+    """Best-effort SIGKILL sweep for engine processes that survived the
+    process-group kill (orphaned workers keep holding HBM).  Silently
+    no-ops where pkill is unavailable (e.g. Windows dev hosts).
+    """
+    for pattern in patterns:
+        try:
+            proc = run(
+                ["pkill", "-9", "-f", pattern],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            log(f"pkill -9 -f {pattern!r} killed straggler(s)")

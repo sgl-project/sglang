@@ -95,10 +95,13 @@ def aggregate_by_hash(
         if runs:
             keys = set().union(*(run.keys() for run in runs))
             for key in keys:
+                # non-finite values (e.g. request_rate: Infinity in the
+                # bench JSONL) crash statistics.stdev on py3.11 — skip them
                 values = [
-                    float(run[key])
+                    value
                     for run in runs
-                    if isinstance(run.get(key), (int, float))
+                    if isinstance((value := run.get(key)), (int, float))
+                    and math.isfinite(value := float(value))
                 ]
                 if not values:
                     continue

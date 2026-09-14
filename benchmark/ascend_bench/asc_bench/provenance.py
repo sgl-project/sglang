@@ -36,7 +36,15 @@ def _pkg_version(python: str, package: str) -> str | None:
     )
 
 
+GIT_SHA_ENV = "ASCEND_BENCH_GIT_SHA"
+
+
 def _git_sha() -> str | None:
+    """Short HEAD sha; honors ASCEND_BENCH_GIT_SHA for archive trees
+    (git archive drops .git, e.g. code shipped to a bench host as a tarball)."""
+    override = os.environ.get(GIT_SHA_ENV)
+    if override:
+        return override.strip() or None
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -51,18 +59,27 @@ def _git_sha() -> str | None:
 
 
 def _cann_version() -> str | None:
-    root = Path("/usr/local/Ascend/ascend-toolkit/latest")
-    for candidate in (
-        root / "version.cfg",
-        root / "aarch64-linux/ascend_toolkit_install.info",
-    ):
-        try:
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        match = re.search(r"version[=:=]\s*([\w.\-]+)", text)
-        if match:
-            return match.group(1)
+    """CANN version, tolerant of both toolkit layouts: the classic
+    ascend-toolkit/ tree and the official container image layout
+    (``/usr/local/Ascend/cann-<ver>/`` with no ascend-toolkit/ dir)."""
+    roots: list[Path] = []
+    home = os.environ.get("ASCEND_TOOLKIT_HOME")
+    if home:
+        roots.append(Path(home))
+    roots.append(Path("/usr/local/Ascend/ascend-toolkit/latest"))
+    roots.extend(sorted(Path("/usr/local/Ascend").glob("cann-*")))
+    for root in roots:
+        for candidate in (
+            root / "version.cfg",
+            root / "aarch64-linux/ascend_toolkit_install.info",
+        ):
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            match = re.search(r"version[=:]\s*([\w.\-]+)", text)
+            if match:
+                return match.group(1)
     return None
 
 

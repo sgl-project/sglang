@@ -75,3 +75,15 @@ def test_aggregate_groups_by_hash_and_computes_std():
     assert row.repeats == 2
     assert row.mean["output_throughput"] == 150.0
     assert abs(row.std["output_throughput"] - 70.71) < 0.01
+
+
+def test_non_finite_metrics_are_skipped():
+    """request_rate: Infinity in real bench JSONL must not crash stdev."""
+    per_cell = {
+        "a0": {"output_throughput": 100.0, "request_rate": float("inf")},
+        "a1": {"output_throughput": 200.0, "request_rate": float("inf")},
+    }
+    rows = aggregate_by_hash(per_cell, {"a0": "h", "a1": "h"}, {}, {})
+    row = rows["h"]
+    assert row.mean["output_throughput"] == 150.0
+    assert "request_rate" not in row.mean

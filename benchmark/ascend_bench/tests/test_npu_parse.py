@@ -6,8 +6,9 @@ FIXTURE = Path(__file__).parent / "fixtures" / "npu_smi_sample.txt"
 
 
 def test_fixture_parses_both_dies():
+    # real `npu-smi info` capture from the A3 bench host (idle, both dies)
     used = parse_hbm_used_mb(FIXTURE.read_text(encoding="utf-8"))
-    assert used == {0: 1024, 1: 512}
+    assert used == {0: 3108, 1: 2872}
 
 
 def test_hugepage_counters_are_ignored():

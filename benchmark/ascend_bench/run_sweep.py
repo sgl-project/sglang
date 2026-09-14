@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from asc_bench.cleanup import kill_stragglers
 from asc_bench.config import ConfigError, load_config
 from asc_bench.expand import expand_cells
 from asc_bench.npu import hbm_used_mb
@@ -84,7 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run_id: {run_id}  workdir: {run_dir}" + ("  (resume)" if resumed else ""))
 
     probe = None if args.skip_hbm_gate else hbm_used_mb
-    runner = Runner(cfg, run_dir, hbm_probe=probe, log=print)
+    runner = Runner(
+        cfg,
+        run_dir,
+        hbm_probe=probe,
+        straggler_kill=kill_stragglers if probe else None,
+        log=print,
+    )
     runner.manifest.header(
         {
             "run_id": run_id,

@@ -89,8 +89,12 @@ def render_compare_md(diffs: list[dict[str, Any]], metrics: list[str]) -> str:
             a = diff["a"].get(metric)
             b = diff["b"].get(metric)
             pct = diff["delta_pct"].get(metric)
+            a_txt = None if a is None else round(a, 2)
+            b_txt = None if b is None else round(b, 2)
             cells.append(
-                f"{a}→{b} ({pct:+.1f}%)" if pct is not None else f"{a}→{b} (-)"
+                f"{a_txt}→{b_txt} ({pct:+.1f}%)"
+                if pct is not None
+                else f"{a_txt}→{b_txt} (-)"
             )
         lines.append(
             f"| `{diff['cell_hash']}` | `{diff['cell_id_a']}` "

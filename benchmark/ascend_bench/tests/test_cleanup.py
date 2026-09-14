@@ -1,4 +1,4 @@
-from asc_bench.cleanup import wait_hbm_freed
+from asc_bench.cleanup import STRAGGLER_PATTERNS, kill_stragglers, wait_hbm_freed
 
 
 class Clock:
@@ -83,3 +83,24 @@ def test_no_probe_degrades_to_grace_wait():
     )
     assert ok is True
     assert clock.now == 10.0
+
+
+def test_kill_stragglers_invokes_pkill_per_pattern():
+    calls = []
+
+    class FakeResult:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return FakeResult()
+
+    kill_stragglers(run=fake_run)
+    assert calls == [["pkill", "-9", "-f", p] for p in STRAGGLER_PATTERNS]
+
+
+def test_kill_stragglers_ignores_missing_pkill():
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError("no pkill")
+
+    kill_stragglers(run=fake_run)  # must not raise

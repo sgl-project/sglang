@@ -48,6 +48,7 @@ class FakeProcs:
         if self.script.get("popen_raises"):
             raise RuntimeError("boom")
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.touch(exist_ok=True)  # real popen creates the log file
         if any(part == "sglang.launch_server" for part in cmd):
             proc = FakeProc(self.script.get("server_rc"))
         else:
@@ -75,12 +76,20 @@ class FakeProcs:
         return value
 
 
-def make_runner(tmp_path, script=None, probe=lambda: {0: 100}, cfg_text=CFG):
+def make_runner(
+    tmp_path, script=None, probe=lambda: {0: 100}, cfg_text=CFG, straggler_kill=None
+):
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(cfg_text, encoding="utf-8")
     cfg = load_config(cfg_path)
     cell = expand_cells(cfg)[0]
-    runner = Runner(cfg, tmp_path / "run", procs=FakeProcs(script), hbm_probe=probe)
+    runner = Runner(
+        cfg,
+        tmp_path / "run",
+        procs=FakeProcs(script),
+        hbm_probe=probe,
+        straggler_kill=straggler_kill,
+    )
     return runner, cell
 
 
@@ -146,3 +155,35 @@ def test_manifest_roundtrip(tmp_path):
     rows = Manifest.result_rows(runner.manifest.path)
     assert rows[-1]["status"] == "done"
     assert rows[-1]["cell_hash"] == cell.cell_hash
+
+
+def test_gsm8k_gate_failure_keeps_perf_result(tmp_path):
+    """The accuracy gate is advisory: a failed gsm8k run (e.g. dataset
+    download blocked on a NAT-ed host) must not discard valid perf data."""
+    cfg_text = CFG.replace(
+        "run:\n  repeats: 1", "run:\n  repeats: 1\n  gsm8k:\n    num_questions: 2"
+    )
+    runner, cell = make_runner(tmp_path, cfg_text=cfg_text)
+    status = runner.run_cell(cell)
+    assert status == "done"
+    final = json.loads(
+        runner.manifest.path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert final["status"] == "done"
+    assert final["gsm8k_accuracy"] is None
+    assert "gsm8k gate failed" in final["detail"]
+
+
+def test_hbm_gate_invokes_straggler_kill(tmp_path):
+    kills = []
+    calls = {"n": 0}
+
+    def probe():
+        calls["n"] += 1
+        return {0: 100} if calls["n"] == 1 else {0: 9000}
+
+    runner, cell = make_runner(
+        tmp_path, probe=probe, straggler_kill=lambda: kills.append(1)
+    )
+    assert runner.run_cell(cell) == "failed_hbm"
+    assert kills == [1]

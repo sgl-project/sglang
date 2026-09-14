@@ -92,7 +92,7 @@ def render_report(
         + " |"
     )
     lines.append(header)
-    lines.append("|" + "---|" * (3 + len(DISPLAY_METRICS)))
+    lines.append("|" + "---|" * (header.count("|") - 1))
     for row in rows:
         rank = str(row.rank) if row.rank is not None else "-"
         acc = _fmt(row.accuracy, 3) if row.accuracy is not None else "-"
