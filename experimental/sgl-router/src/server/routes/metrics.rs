@@ -49,7 +49,26 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             }
         })
         .collect();
-    let body = ctx.metrics.render_with_workers(&workers);
+    let mut body = ctx.metrics.render_with_workers(&workers);
+    if let Some(fleet) = &ctx.replica_fleet {
+        use std::sync::atomic::Ordering;
+        for (name, value) in [
+            (
+                "sgl_router_indexer_complete_queries_total",
+                fleet.successful_queries.load(Ordering::Relaxed),
+            ),
+            (
+                "sgl_router_indexer_fallback_queries_total",
+                fleet.fallback_queries.load(Ordering::Relaxed),
+            ),
+            (
+                "sgl_router_indexer_failed_attempts_total",
+                fleet.failed_attempts.load(Ordering::Relaxed),
+            ),
+        ] {
+            body.push_str(&format!("# TYPE {name} counter\n{name} {value}\n"));
+        }
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],

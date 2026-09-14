@@ -188,3 +188,122 @@ service KVIndexer {
 
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
 }
+
+// Recoverable replica protocol. Legacy unconditional writes are deliberately
+// separate: they cannot make a stream READY in this service.
+message StreamKey {
+  string namespace = 1;
+  string worker_id = 2;
+  uint32 dp_rank = 3;
+}
+
+message StreamDescriptor {
+  StreamKey key = 1;
+  string worker_address = 2;
+  string model = 3;
+  uint32 hash_schema_version = 4;
+  uint32 page_size = 5;
+  bool is_bigram = 6;
+  WorkerCacheSpec cache_spec = 7;
+}
+
+message SnapshotCut {
+  uint32 version = 1;
+  StreamDescriptor stream = 2;
+  string worker_epoch = 3;
+  uint64 barrier_seq = 4;
+  uint64 resume_seq = 5;
+  string barrier_id = 6;
+  uint64 record_count = 7;
+}
+
+message PlacementBlock {
+  sfixed64 block_hash = 1;
+  optional sfixed64 parent_block_hash = 2;
+  uint32 block_size = 3;
+  TierType tier = 4;
+  uint32 component_mask = 5;
+}
+
+message BeginSnapshotRequest {
+  SnapshotCut cut = 1;
+  // Empty only when acquiring an expired/unowned stream. Returned by Indexer,
+  // scoped to its process lifetime, and required for every subsequent mutation.
+  string session = 2;
+}
+
+message StreamSession {
+  StreamKey key = 1;
+  string session = 2;
+}
+
+message SnapshotChunkRequest {
+  StreamSession owner = 1;
+  uint64 offset = 2;
+  repeated PlacementBlock blocks = 3;
+}
+
+message LiveBatchRequest {
+  StreamSession owner = 1;
+  string worker_epoch = 2;
+  uint64 sequence = 3;
+  repeated ExternalKvAction actions = 4;
+}
+
+message ConfirmStreamRequest {
+  StreamSession owner = 1;
+  string worker_epoch = 2;
+  // Worker replay header's exclusive end, not a Bridge-generated heartbeat.
+  uint64 resume_seq = 3;
+  // Required on first commit: observed on the subscribed LIVE socket.
+  string barrier_id = 4;
+  uint64 barrier_seq = 5;
+}
+
+message StreamProgress {
+  string session = 1;
+  uint64 next_sequence = 2;
+  bool ready = 3;
+  bool needs_snapshot = 4;
+}
+
+message StreamCoverage {
+  StreamDescriptor stream = 1;
+  string worker_epoch = 2;
+  uint64 watermark = 3;
+  bool ready = 4;
+}
+
+message ReplicaPrefixRequest {
+  string namespace = 1;
+  string model = 2;
+  uint32 hash_schema_version = 3;
+  uint32 page_size = 4;
+  bool is_bigram = 5;
+  repeated sfixed64 hashes = 6 [packed = true];
+  repeated StreamKey eligible_streams = 7;
+  uint32 max_blocks = 8;
+}
+
+message ReplicaPrefixMatch {
+  string worker_address = 1;
+  uint32 matched_prefix_blocks = 2;
+  string worker_id = 3;
+  uint32 dp_rank = 4;
+}
+
+message ReplicaPrefixResponse {
+  repeated ReplicaPrefixMatch matches = 1;
+  repeated StreamCoverage coverage = 2;
+  bool complete = 3;
+}
+
+service KVReplica {
+  rpc BeginSnapshot(BeginSnapshotRequest) returns (StreamProgress);
+  rpc SnapshotChunk(SnapshotChunkRequest) returns (StreamProgress);
+  rpc ApplyLive(LiveBatchRequest) returns (StreamProgress);
+  rpc ConfirmStream(ConfirmStreamRequest) returns (StreamProgress);
+  rpc InvalidateStream(StreamSession) returns (StreamProgress);
+  rpc RemoveStream(StreamSession) returns (StreamProgress);
+  rpc MatchPrefix(ReplicaPrefixRequest) returns (ReplicaPrefixResponse);
+}

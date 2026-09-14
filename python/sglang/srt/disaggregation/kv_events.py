@@ -19,20 +19,21 @@ KV caching events
 
 import atexit
 import enum
+import json
 import logging
 import queue
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections import deque
-from itertools import count
+from dataclasses import dataclass
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import msgspec
 import zmq
-from pydantic import BaseModel
-
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -291,6 +292,13 @@ class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
     metadata: BlockStoredMetadata
 
 
+class BlockStoredWithComponents(BlockStored, tag="BlockStored", kw_only=True):
+    """Optional resident component snapshot, in the established trailing slot."""
+
+    component_types: list[str]
+    metadata: Optional[BlockStoredMetadata] = None
+
+
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
@@ -306,6 +314,112 @@ class KVEventBatch(EventBatch):
     # type and ignore the trailing metadata; adding both types would give
     # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+
+
+class KVSnapshotBlock(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+):
+    """One logical block edge in a placement snapshot.
+
+    ``block_hashes`` is intentionally compatible with ``BlockStored``. The
+    current provider emits one hash per record, while the wire shape leaves
+    room for a future provider to coalesce contiguous chains.
+    """
+
+    parent_block_hash: Optional[int]
+    block_hashes: list[int]
+
+
+class KVSnapshotHeader(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+):
+    """Metadata for one DP replica's atomic placement cut.
+
+    ``epoch`` identifies that replica publisher's lifecycle, not the lifetime
+    of the enclosing server instance.
+    """
+
+    version: int
+    epoch: str
+    replica_rank: int
+    resume_seq: int
+    barrier_seq: int
+    barrier_id: str
+    record_count: int
+
+
+class KVSnapshotBlockV2(msgspec.Struct, frozen=True):
+    namespace: str
+    block_hash: int
+    parent_block_hash: Optional[int]
+    block_size: int
+    tier: int
+    component_mask: int
+
+
+class KVSnapshotHeaderV2(msgspec.Struct, frozen=True):
+    version: int
+    namespace: str
+    model: str
+    worker_id: str
+    dp_rank: int
+    worker_epoch: str
+    hash_schema_version: int
+    page_size: int
+    is_bigram: bool
+    barrier_seq: int
+    resume_seq: int
+    barrier_id: str
+    record_count: int
+    cache_spec: Optional[dict[str, int]]
+
+
+@dataclass(frozen=True, slots=True)
+class _KVPlacementSnapshot:
+    header: Union[KVSnapshotHeader, KVSnapshotHeaderV2]
+    blocks: Union[list[KVSnapshotBlock], list[KVSnapshotBlockV2]]
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotCaptureRequest:
+    response: Queue
+    version: int = 1
+
+
+SNAPSHOT_PROTOCOL_VERSION = 1
+SNAPSHOT_REQUEST = b"snapshot-v1"
+SNAPSHOT_REQUEST_V2 = b"snapshot-v2"
+REPLAY_REQUEST_V2 = b"replay-v2"
+SNAPSHOT_HEADER = b"header"
+SNAPSHOT_CHUNK = b"chunk"
+SNAPSHOT_END = b"end"
+SNAPSHOT_ERROR = b"error"
+SNAPSHOT_CHUNK_RECORDS = 4096
+SNAPSHOT_CAPTURE_TIMEOUT = 5.0
+# Bound how long the sole snapshot service thread may wait for one client to
+# drain an outbound message. Without this, a client that stops reading can
+# fill the ROUTER socket's send queue and prevent every later request (and
+# clean shutdown) from making progress.
+SNAPSHOT_SEND_TIMEOUT_MS = 500
+
+_EPOCH_TOPIC_MARKER = b"\x00sgl-kv-epoch="
+_SNAPSHOT_BARRIER_MARKER = b"\x00sgl-kv-snapshot="
+
+
+def _live_topic(topic: bytes, epoch: str) -> bytes:
+    return topic + _EPOCH_TOPIC_MARKER + epoch.encode("utf-8")
+
+
+def _snapshot_barrier_topic(topic: bytes, epoch: str, barrier_id: str) -> bytes:
+    return (
+        _live_topic(topic, epoch)
+        + _SNAPSHOT_BARRIER_MARKER
+        + barrier_id.encode("utf-8")
+    )
 
 
 class EventPublisher(ABC):
@@ -359,6 +473,9 @@ class ZmqEventPublisher(EventPublisher):
         Optional ROUTER address for replay requests. When given, subscribers can
         request missed batches by sending the starting sequence number as an
         8-byte big-endian integer.
+    snapshot_endpoint:
+        Optional ROUTER address for chunked placement snapshots. One endpoint is
+        exposed per independently routable DP replica.
     buffer_steps:
         Number of past batches to keep for replay.
     hwm:
@@ -367,6 +484,11 @@ class ZmqEventPublisher(EventPublisher):
         Maximum number of events to buffer in memory.
     topic:
         Topic to publish events to.
+    epoch:
+        Replica-lifecycle token. Snapshot-enabled live events carry it in the
+        topic metadata. A fresh publisher-local UUID is generated by default,
+        so rebuilding one DP replica does not reuse the server-wide instance
+        identity shared by the other replicas.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -377,10 +499,19 @@ class ZmqEventPublisher(EventPublisher):
         attn_dp_rank: int,
         endpoint: str = "tcp://*:5557",
         replay_endpoint: Optional[str] = None,
+        snapshot_endpoint: Optional[str] = None,
         buffer_steps: int = 10_000,
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
         topic: str = "",
+        epoch: Optional[str] = None,
+        namespace: str = "default",
+        model: str = "",
+        worker_id: str = "",
+        hash_schema_version: int = 1,
+        page_size: int = 1,
+        is_bigram: bool = False,
+        cache_spec: Optional[dict[str, int]] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -395,12 +526,47 @@ class ZmqEventPublisher(EventPublisher):
         self._replay_endpoint = self.offset_endpoint_port(
             replay_endpoint, self._dp_rank
         )
+        self._snapshot_endpoint = self.offset_endpoint_port(
+            snapshot_endpoint, self._dp_rank
+        )
         self._hwm = hwm
         self._socket_setup()
 
         # Payload
-        self._seq_gen = count()
+        self._next_seq = 0
+        self._epoch = epoch or uuid.uuid4().hex
+        self._namespace = namespace
+        self._model = model
+        self._worker_id = worker_id
+        self._hash_schema_version = hash_schema_version
+        self._page_size = page_size
+        self._is_bigram = is_bigram
+        self._cache_spec = cache_spec
+        self.load_reporter = None
+        if worker_id and snapshot_endpoint:
+            from sglang.srt.disaggregation.load_reporter import LoadReporter
+
+            self.load_reporter = LoadReporter(
+                namespace, worker_id, self._dp_rank, self._epoch
+            )
         self._topic_bytes = topic.encode("utf-8")
+        # Preserve the exact legacy topic when snapshots are disabled. A
+        # snapshot-capable publisher appends backward-compatible metadata to
+        # the topic frame; SUB filters are prefix based, so existing consumers
+        # configured for ``topic`` continue to receive the same payloads.
+        self._live_topic_bytes = (
+            _live_topic(self._topic_bytes, self._epoch)
+            if self._snapshot_endpoint is not None
+            else self._topic_bytes
+        )
+        # The publisher thread is the sole writer. Keeping the logical
+        # placement mirror beside sequence assignment makes snapshot cuts
+        # exact without traversing the scheduler's radix tree concurrently.
+        self._snapshot_blocks: dict[int, KVSnapshotBlock] = {}
+        self._snapshot_blocks_v2: dict[tuple[str, int, int], KVSnapshotBlockV2] = {}
+        # At most one capture may wait behind the publisher thread. This keeps
+        # a stalled publisher from accumulating timed-out requests forever.
+        self._snapshot_requests: Queue[_SnapshotCaptureRequest] = Queue(maxsize=1)
 
         # Thread
         self._running = True
@@ -411,19 +577,56 @@ class ZmqEventPublisher(EventPublisher):
         )
         self._thread.start()
 
+        self._snapshot_thread: Optional[threading.Thread] = None
+        self._snapshot_started = threading.Event()
+        self._snapshot_start_error: Optional[BaseException] = None
+        if self._snapshot_endpoint is not None:
+            self._snapshot_thread = threading.Thread(
+                target=self._snapshot_server_thread,
+                daemon=True,
+                name="zmq-kv-snapshot",
+            )
+            self._snapshot_thread.start()
+            if not self._snapshot_started.wait(timeout=SNAPSHOT_CAPTURE_TIMEOUT):
+                self.shutdown()
+                raise RuntimeError(
+                    f"Timed out starting KV snapshot endpoint {self._snapshot_endpoint}"
+                )
+            if self._snapshot_start_error is not None:
+                startup_error = self._snapshot_start_error
+                self.shutdown()
+                raise RuntimeError(
+                    f"Failed to start KV snapshot endpoint {self._snapshot_endpoint}"
+                ) from startup_error
+
         atexit.register(self.shutdown)
 
     def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
+        for event in events.events:
+            components = getattr(event, "component_types", None)
+            if components is not None and any(
+                name.lower() not in ("full", "swa", "mamba") for name in components
+            ):
+                raise ValueError("Unknown KV component type")
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
+        if not self._running:
+            return
         self._running = False
-        self._event_queue.put_nowait(None)
+        if self.load_reporter is not None:
+            self.load_reporter.close()
+        try:
+            self._event_queue.put_nowait(None)
+        except queue.Full:
+            # The publisher loop also exits after draining a non-empty queue
+            # when `_running` is false, so a full queue needs no sentinel.
+            pass
 
         start = time.time()
         pending_items = True
@@ -441,6 +644,8 @@ class ZmqEventPublisher(EventPublisher):
 
         if self._thread.is_alive():
             self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
+        if self._snapshot_thread is not None and self._snapshot_thread.is_alive():
+            self._snapshot_thread.join(timeout=self.SHUTDOWN_TIMEOUT)
 
         # Clean up ZMQ resources
         try:
@@ -484,6 +689,9 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            # A slow replica must never indefinitely stall the publisher.
+            self._replay.setsockopt(zmq.SNDTIMEO, 0)
+            self._replay.setsockopt(zmq.SNDHWM, 64)
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
@@ -503,6 +711,12 @@ class ZmqEventPublisher(EventPublisher):
                 except Exception as e:
                     logger.exception("Error in replay: %s", e)
 
+            # Snapshot capture is kept on this thread so the copied placement
+            # view, its resume sequence, and the live barrier form one serial
+            # cut. The separate snapshot server thread handles encoding and
+            # chunked network transfer after this short in-memory copy.
+            self._service_snapshot_capture()
+
             # --- main queue (critical) ---------------------------------
             try:
                 event = self._event_queue.get(timeout=0.1)
@@ -511,26 +725,308 @@ class ZmqEventPublisher(EventPublisher):
             except queue.Empty:
                 continue
 
+            seq = self._next_seq
             try:
-                seq = next(self._seq_gen)
-
                 payload = self._pack.encode(event)
                 seq_bytes = seq.to_bytes(8, "big")
-                self._pub.send_multipart((self._topic_bytes, seq_bytes, payload))
 
+                # Keep the replay journal complete even when live publication
+                # fails. Once a sequence number is assigned and encoded, a
+                # consumer must be able to recover that batch from `_buffer`
+                # instead of being forced to fetch a full snapshot.
                 self._buffer.append((seq, payload))
-                self._event_queue.task_done()
+                self._pub.send_multipart((self._live_topic_bytes, seq_bytes, payload))
 
             except Exception as e:
                 # Publishing failed;  back-off a bit to avoid a tight error loop
                 logger.exception("Error in publisher thread: %s", e)
                 time.sleep(0.1)
+            finally:
+                # The cache mutation already happened before the event entered
+                # this queue. Advance the placement mirror even when PUB send
+                # fails. The advanced sequence exposes a live-stream gap;
+                # consumers can replay it from `_buffer` or fall back to a
+                # snapshot if the replay window has already expired.
+                self._apply_snapshot_events(event)
+                self._next_seq = seq + 1
+                self._event_queue.task_done()
+
+    def _apply_snapshot_events(self, batch: EventBatch) -> None:
+        for event in batch.events:
+            if isinstance(event, BlockStored):
+                parent = event.parent_block_hash
+                tier = self._placement_tier(event.medium)
+                components = getattr(event, "component_types", None)
+                mask = 0
+                if components is not None:
+                    for component in components:
+                        mask |= {"full": 1, "swa": 2, "mamba": 4}[component.lower()]
+                for block_hash in event.block_hashes:
+                    self._snapshot_blocks[block_hash] = KVSnapshotBlock(
+                        parent_block_hash=parent,
+                        block_hashes=[block_hash],
+                    )
+                    if tier is not None:
+                        key = (self._namespace, block_hash, tier)
+                        # Zero on the v2 wire denotes a legacy whole-block
+                        # report. An explicit empty component set instead
+                        # revokes this tier, as in the live Bridge decoder.
+                        if components is not None and mask == 0:
+                            self._snapshot_blocks_v2.pop(key, None)
+                        else:
+                            self._snapshot_blocks_v2[key] = KVSnapshotBlockV2(
+                                namespace=self._namespace,
+                                block_hash=block_hash,
+                                parent_block_hash=parent,
+                                block_size=event.block_size,
+                                tier=tier,
+                                component_mask=mask,
+                            )
+                    parent = block_hash
+            elif isinstance(event, BlockRemoved):
+                for block_hash in event.block_hashes:
+                    self._snapshot_blocks.pop(block_hash, None)
+                    self._snapshot_blocks_v2.pop(
+                        (
+                            self._namespace,
+                            block_hash,
+                            self._placement_tier(event.medium),
+                        ),
+                        None,
+                    )
+            elif isinstance(event, AllBlocksCleared):
+                self._snapshot_blocks.clear()
+                self._snapshot_blocks_v2.clear()
+
+    @staticmethod
+    def _placement_tier(medium: Optional[str]) -> Optional[int]:
+        return {"GPU": 1, "CPU_PINNED": 2, "DISK": 3}.get(medium)
+
+    def _service_snapshot_capture(self) -> None:
+        try:
+            request = self._snapshot_requests.get_nowait()
+        except queue.Empty:
+            return
+
+        try:
+            barrier_id = uuid.uuid4().hex
+            barrier_seq = self._next_seq
+            barrier = KVEventBatch(
+                ts=time.time(), events=[], attn_dp_rank=self._dp_rank
+            )
+            payload = self._pack.encode(barrier)
+            assert self._pub is not None
+            self._pub.send_multipart(
+                (
+                    _snapshot_barrier_topic(self._topic_bytes, self._epoch, barrier_id),
+                    barrier_seq.to_bytes(8, "big"),
+                    payload,
+                )
+            )
+            self._buffer.append((barrier_seq, payload))
+            self._next_seq = barrier_seq + 1
+            blocks = list(self._snapshot_blocks.values())
+            if request.version == 2:
+                blocks = list(self._snapshot_blocks_v2.values())
+                request.response.put(
+                    _KVPlacementSnapshot(
+                        header=KVSnapshotHeaderV2(
+                            version=2,
+                            namespace=self._namespace,
+                            model=self._model,
+                            worker_id=self._worker_id,
+                            dp_rank=self._dp_rank,
+                            worker_epoch=self._epoch,
+                            hash_schema_version=self._hash_schema_version,
+                            page_size=self._page_size,
+                            is_bigram=self._is_bigram,
+                            barrier_seq=barrier_seq,
+                            resume_seq=self._next_seq,
+                            barrier_id=barrier_id,
+                            record_count=len(blocks),
+                            cache_spec=self._cache_spec,
+                        ),
+                        blocks=blocks,
+                    )
+                )
+                return
+            request.response.put(
+                _KVPlacementSnapshot(
+                    header=KVSnapshotHeader(
+                        version=SNAPSHOT_PROTOCOL_VERSION,
+                        epoch=self._epoch,
+                        replica_rank=self._dp_rank,
+                        resume_seq=self._next_seq,
+                        barrier_seq=barrier_seq,
+                        barrier_id=barrier_id,
+                        record_count=len(blocks),
+                    ),
+                    blocks=blocks,
+                )
+            )
+        except BaseException as exc:
+            request.response.put(exc)
+        finally:
+            self._snapshot_requests.task_done()
+
+    def _snapshot_server_thread(self) -> None:
+        assert self._snapshot_endpoint is not None
+        sock: Optional[zmq.Socket] = None
+        try:
+            sock = self._ctx.socket(zmq.ROUTER)
+            sock.setsockopt(zmq.SNDTIMEO, SNAPSHOT_SEND_TIMEOUT_MS)
+            sock.bind(self._snapshot_endpoint)
+        except BaseException as exc:
+            self._snapshot_start_error = exc
+            self._snapshot_started.set()
+            return
+
+        self._snapshot_started.set()
+        encoder = msgspec.msgpack.Encoder()
+        try:
+            while self._running:
+                if not sock.poll(100):
+                    continue
+                frames = sock.recv_multipart()
+                if (
+                    len(frames) == 4
+                    and frames[1] == b""
+                    and frames[2] == b"start-reporting-v1"
+                ):
+                    try:
+                        if self.load_reporter is None:
+                            raise ValueError("load reporting requires worker_id")
+                        identity = self.load_reporter.register(**json.loads(frames[3]))
+                        sock.send_multipart(
+                            (frames[0], b"", b"registered", encoder.encode(identity))
+                        )
+                    except Exception as exc:
+                        self._send_snapshot_error(sock, frames[0], str(exc).encode())
+                    continue
+                if len(frames) != 3:
+                    logger.warning("Invalid snapshot request: %s", frames)
+                    continue
+                client_id, delimiter, command = frames
+                if delimiter or command not in (SNAPSHOT_REQUEST, SNAPSHOT_REQUEST_V2):
+                    self._send_snapshot_error(
+                        sock, client_id, b"unsupported snapshot request"
+                    )
+                    continue
+
+                response: Queue = Queue(maxsize=1)
+                try:
+                    self._snapshot_requests.put_nowait(
+                        _SnapshotCaptureRequest(
+                            response=response,
+                            version=2 if command == SNAPSHOT_REQUEST_V2 else 1,
+                        )
+                    )
+                except queue.Full:
+                    self._send_snapshot_error(
+                        sock, client_id, b"snapshot provider busy"
+                    )
+                    continue
+                try:
+                    snapshot = response.get(timeout=SNAPSHOT_CAPTURE_TIMEOUT)
+                except queue.Empty:
+                    self._send_snapshot_error(
+                        sock, client_id, b"snapshot capture timeout"
+                    )
+                    continue
+                if isinstance(snapshot, BaseException):
+                    logger.exception(
+                        "KV snapshot capture failed",
+                        exc_info=(
+                            type(snapshot),
+                            snapshot,
+                            snapshot.__traceback__,
+                        ),
+                    )
+                    self._send_snapshot_error(
+                        sock, client_id, b"snapshot capture failed"
+                    )
+                    continue
+
+                try:
+                    self._send_snapshot_response(sock, client_id, encoder, snapshot)
+                except zmq.Again:
+                    logger.warning(
+                        "Timed out sending KV snapshot to client %r after %d ms; "
+                        "aborting this response",
+                        client_id,
+                        SNAPSHOT_SEND_TIMEOUT_MS,
+                    )
+        finally:
+            sock.close(linger=0)
+
+    @staticmethod
+    def _send_snapshot_response(
+        sock: zmq.Socket,
+        client_id: bytes,
+        encoder: msgspec.msgpack.Encoder,
+        snapshot: _KVPlacementSnapshot,
+    ) -> None:
+        sock.send_multipart(
+            (
+                client_id,
+                b"",
+                SNAPSHOT_HEADER,
+                encoder.encode(snapshot.header),
+            )
+        )
+        for start in range(0, len(snapshot.blocks), SNAPSHOT_CHUNK_RECORDS):
+            sock.send_multipart(
+                (
+                    client_id,
+                    b"",
+                    SNAPSHOT_CHUNK,
+                    encoder.encode(
+                        snapshot.blocks[start : start + SNAPSHOT_CHUNK_RECORDS]
+                    ),
+                )
+            )
+        sock.send_multipart((client_id, b"", SNAPSHOT_END, b""))
+
+    @staticmethod
+    def _send_snapshot_error(
+        sock: zmq.Socket, client_id: bytes, message: bytes
+    ) -> None:
+        try:
+            sock.send_multipart((client_id, b"", SNAPSHOT_ERROR, message))
+        except zmq.Again:
+            logger.warning(
+                "Timed out sending KV snapshot error to client %r after %d ms; "
+                "dropping this response",
+                client_id,
+                SNAPSHOT_SEND_TIMEOUT_MS,
+            )
 
     def _service_replay(self) -> None:
         """If a replay request is waiting, send buffered batches."""
         assert self._replay is not None  # narrows type for mypy
 
         frame = self._replay.recv_multipart()
+        if len(frame) == 5 and frame[1] == b"" and frame[2] == REPLAY_REQUEST_V2:
+            client_id, _, _, expected_epoch, start_bytes = frame
+            if len(start_bytes) != 8 or expected_epoch != self._epoch.encode():
+                self._replay.send_multipart(
+                    (client_id, b"", b"error", b"epoch mismatch or invalid sequence")
+                )
+                return
+            start = int.from_bytes(start_bytes, "big")
+            # Capture the journal end on its sole writer thread. The header
+            # proves completeness even when the worker has become idle.
+            header = msgspec.msgpack.encode(
+                {"worker_epoch": self._epoch, "resume_seq": self._next_seq}
+            )
+            self._replay.send_multipart((client_id, b"", b"header", header))
+            for seq, payload in self._buffer:
+                if seq >= start:
+                    self._replay.send_multipart(
+                        (client_id, b"", seq.to_bytes(8, "big"), payload)
+                    )
+            self._replay.send_multipart((client_id, b"", b"end", b""))
+            return
         if len(frame) != 3:
             logger.warning("Invalid replay request: %s", frame)
             return
@@ -583,12 +1079,15 @@ class ZmqEventPublisher(EventPublisher):
         raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
 
 
-class KVEventsConfig(BaseModel):
-    """Configuration for KV event publishing."""
+class _LegacyEventPublisherConfig(BaseModel):
+    """Stable constructor contract for publishers using the legacy registry API.
 
-    publisher: str = "null"
-    """The publisher to use for publishing kv events. Can be "null", "zmq".
+    Do not add fields here. Publisher-specific capabilities belong in that
+    publisher's own config model so extending one implementation cannot break
+    constructors registered by another implementation.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     endpoint: str = "tcp://*:5557"
     """The zmq endpoint to use for publishing kv events.
@@ -617,35 +1116,155 @@ class KVEventsConfig(BaseModel):
     this topic to receive events.
     """
 
+
+class ZmqEventPublisherConfig(_LegacyEventPublisherConfig):
+    """Configuration owned by the built-in ZMQ event publisher."""
+
+    snapshot_endpoint: Optional[str] = None
+    """The ZMQ ROUTER endpoint used to stream placement snapshots.
+
+    Like ``endpoint`` and ``replay_endpoint``, the data-parallel replica rank
+    is added to the configured base port.
+    """
+
+    namespace: str = "default"
+    model: str = ""
+    worker_id: str = ""
+    hash_schema_version: int = 1
+    page_size: int = 1
+    is_bigram: bool = False
+    cache_spec: Optional[dict[str, int]] = None
+
+
+class NullEventPublisherConfig(BaseModel):
+    """The null publisher intentionally accepts no publisher options."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class KVEventsConfig(ZmqEventPublisherConfig):
+    """Backward-compatible model for the original built-in ZMQ CLI shape.
+
+    Publisher construction and server introspection now use the
+    publisher-specific models registered in :class:`EventPublisherFactory`;
+    this model remains for existing external imports of ``KVEventsConfig``.
+    """
+
+    publisher: str = "null"
+    """The publisher to use for publishing kv events. Can be "null", "zmq".
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
-        return KVEventsConfig.model_validate_json(cli_value)
+        return cls.model_validate_json(cli_value)
+
+
+class _EventPublisherSelection(BaseModel):
+    """Parse only the registry key while preserving publisher-owned fields."""
+
+    model_config = ConfigDict(extra="allow")
+
+    publisher: str = "null"
+
+
+@dataclass(frozen=True, slots=True)
+class _PublisherSpec:
+    config_model: type[BaseModel]
+    factory: Callable[[int, BaseModel], EventPublisher]
+
+
+def _create_null_event_publisher(
+    _attn_dp_rank: int, _config: BaseModel
+) -> EventPublisher:
+    return NullEventPublisher()
+
+
+def _create_zmq_event_publisher(attn_dp_rank: int, config: BaseModel) -> EventPublisher:
+    assert isinstance(config, ZmqEventPublisherConfig)
+    return ZmqEventPublisher(attn_dp_rank=attn_dp_rank, **config.model_dump())
 
 
 class EventPublisherFactory:
-    _registry: dict[str, Callable[..., EventPublisher]] = {
-        "null": NullEventPublisher,
-        "zmq": ZmqEventPublisher,
+    _registry: dict[str, _PublisherSpec] = {
+        "null": _PublisherSpec(
+            config_model=NullEventPublisherConfig,
+            factory=_create_null_event_publisher,
+        ),
+        "zmq": _PublisherSpec(
+            config_model=ZmqEventPublisherConfig,
+            factory=_create_zmq_event_publisher,
+        ),
     }
 
     @classmethod
     def register_publisher(cls, name: str, ctor: Callable[..., EventPublisher]) -> None:
+        """Register a publisher using the stable pre-snapshot kwargs contract.
+
+        New integrations should use :meth:`register_publisher_spec` to own and
+        validate their configuration schema. This method remains source
+        compatible with existing custom publishers.
+        """
         if name in cls._registry:
             raise KeyError(f"publisher '{name}' already registered")
-        cls._registry[name] = ctor
+
+        def legacy_factory(attn_dp_rank: int, config: BaseModel) -> EventPublisher:
+            return ctor(attn_dp_rank=attn_dp_rank, **config.model_dump())
+
+        cls._registry[name] = _PublisherSpec(
+            config_model=_LegacyEventPublisherConfig,
+            factory=legacy_factory,
+        )
+
+    @classmethod
+    def register_publisher_spec(
+        cls,
+        name: str,
+        config_model: type[BaseModel],
+        factory: Callable[[int, BaseModel], EventPublisher],
+    ) -> None:
+        """Register a publisher with an implementation-owned config model.
+
+        ``factory`` is called as ``factory(attn_dp_rank, validated_config)``.
+        The config model should normally reject extra fields so unsupported
+        capabilities fail during validation rather than being ignored.
+        """
+        if name in cls._registry:
+            raise KeyError(f"publisher '{name}' already registered")
+        cls._registry[name] = _PublisherSpec(
+            config_model=config_model,
+            factory=factory,
+        )
 
     @classmethod
     def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
-        """Create publisher from a config mapping."""
+        """Validate config against the selected publisher's schema and build it."""
         if not config:
             return NullEventPublisher()
-        config = KVEventsConfig.from_cli(config)
-        config_dict = config.model_dump()
 
-        kind = config_dict.pop("publisher", "null")
+        _kind, spec, publisher_config = cls._parse_config(config)
+        return spec.factory(attn_dp_rank, publisher_config)
+
+    @classmethod
+    def parse_config(cls, config: str) -> tuple[str, BaseModel]:
+        """Return the selected kind and its validated publisher-owned config."""
+        kind, _spec, publisher_config = cls._parse_config(config)
+        return kind, publisher_config
+
+    @classmethod
+    def _parse_config(cls, config: str) -> tuple[str, _PublisherSpec, BaseModel]:
+        selection = _EventPublisherSelection.model_validate_json(config)
+        kind = selection.publisher
         try:
-            constructor = cls._registry[kind]
+            spec = cls._registry[kind]
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
-        return constructor(attn_dp_rank=attn_dp_rank, **config_dict)
+        try:
+            publisher_config = spec.config_model.model_validate(
+                selection.model_extra or {}
+            )
+        except ValidationError as exc:
+            raise ValueError(
+                f"Invalid config for event publisher '{kind}': {exc}"
+            ) from exc
+        return kind, spec, publisher_config

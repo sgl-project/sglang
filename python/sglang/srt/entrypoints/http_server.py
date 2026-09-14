@@ -62,7 +62,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -841,6 +840,21 @@ async def server_info():
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
+
+
+@app.post("/v1/start_reporting")
+async def start_reporting(request: Request):
+    """Register or renew this Router's independent Worker load streams."""
+    from sglang.srt.disaggregation.load_reporter import register_worker_reporting
+
+    try:
+        return await register_worker_reporting(
+            _global_state.tokenizer_manager.server_args, await request.json()
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        return ORJSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        return ORJSONResponse(status_code=503, content={"error": str(exc)})
 
 
 @app.get("/get_load")

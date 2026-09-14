@@ -1,0 +1,31 @@
+syntax = "proto3";
+package kv_load.v1;
+
+message LoadSample {
+  string namespace = 1;
+  string worker_id = 2;
+  uint32 dp_rank = 3;
+  string worker_epoch = 4;
+  string registration_token = 5;
+  uint64 sequence = 6;
+  uint64 num_running_reqs = 7;
+  uint64 num_waiting_reqs = 8;
+  uint64 num_used_tokens = 9;
+  uint64 max_total_num_tokens = 10;
+  uint64 num_waiting_uncached_tokens = 11;
+  uint64 num_total_tokens = 12;
+  uint64 max_running_requests = 13;
+  uint64 total_prefill_uncached_tokens = 14;
+  uint64 total_prefill_busy_us = 15;
+  double generation_throughput = 16;
+  double cache_hit_rate = 17;
+  double utilization = 18;
+  uint64 num_prefill_reqs = 19;
+  uint64 num_decode_reqs = 20;
+  // Age at send time. Reporter never resends an old scheduler measurement.
+  uint64 sample_age_ms = 21;
+}
+message LoadReportAck {}
+service LoadMonitor {
+  rpc Report(stream LoadSample) returns (LoadReportAck);
+}

@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1211,6 +1210,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
+        self._record_component_state(node, StorageMedium.GPU)
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
@@ -1256,6 +1256,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=state.pending_actions,
             )
         state.phase = _InsertPhase.TAIL
+        self._record_component_state(state.target_node, StorageMedium.GPU)
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
         components = self.components
@@ -1401,6 +1402,51 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
         self.kv_events.record_store(node, medium=StorageMedium.GPU)
+
+        self._record_component_state(node, StorageMedium.GPU)
+
+    def _record_component_state(
+        self, node: UnifiedTreeNode, medium: StorageMedium
+    ) -> None:
+        """Emit a per-page REPLACE after auxiliary residency changes.
+
+        Mamba state belongs only to the node boundary; SWA may cover just a
+        trailing slice. Empty component sets revoke the tier's placement.
+        """
+        if (
+            not self.kv_events.enabled
+            or not self.kv_events.component_aware
+            or node is self.root_node
+            or len(self.component_types) == 1
+        ):
+            return
+        if any(
+            ct not in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+            for ct in self.component_types
+        ):
+            return  # Snapshot spec version fencing excludes unsupported schemas.
+        field = "value" if medium == StorageMedium.GPU else "host_value"
+        logical_len = len(node.key)
+
+        def components(start: int, end: int) -> list[str]:
+            result = []
+            for ct in self.component_types:
+                value = getattr(node.component_data[ct], field)
+                if value is None:
+                    continue
+                if ct == ComponentType.MAMBA:
+                    present = end == logical_len
+                elif ct == ComponentType.SWA:
+                    present = start >= logical_len - len(value)
+                else:
+                    present = end <= len(value)
+                if present:
+                    result.append(str(ct))
+            return result
+
+        self.kv_events.record_store(
+            node, medium=medium, component_types_for_page=components
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1926,6 +1972,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru = lru_lists[ct]
                 if lru.in_list(node):
                     lru.remove_node(node)
+        if EvictLayer.DEVICE in target:
+            self._record_component_state(node, StorageMedium.GPU)
+        if EvictLayer.HOST in target:
+            self._record_component_state(node, StorageMedium.CPU)
         return device_freed, host_freed
 
     def _iteratively_delete_tombstone_leaf(
@@ -2336,6 +2386,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         for nid in kv_xfer.nodes_to_load or ():
             self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
+            self._record_component_state(self.node_by_id(nid), StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2462,6 +2513,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._update_duplicate_tracking(node)
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
+            self._record_component_state(node, StorageMedium.CPU)
+
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
     ) -> None:
@@ -2481,6 +2534,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.component_protected_size_[component_type] += len(value)
         else:
             self.component_evictable_size_[component_type] += len(value)
+        self._record_component_state(node, StorageMedium.GPU)
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType

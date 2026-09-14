@@ -70,8 +70,8 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
+    /// Recoverable KV Indexer endpoints (comma separated), or @path to a
+    /// hot-reloaded JSON array. Each URL needs an explicit http:// scheme.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
     /// KV Indexer query timeout in milliseconds. Requires

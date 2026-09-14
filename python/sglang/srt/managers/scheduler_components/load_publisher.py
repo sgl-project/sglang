@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import zmq
-
 from sglang.srt.disaggregation.kv_events import (
     LOAD_TOPIC,
     KVEventsConfig,
@@ -135,10 +134,12 @@ class SchedulerLoadPublisher:
         ps: ParallelState,
         load_publish_endpoint: Optional[str] = None,
         publish_interval: int = LOAD_PUBLISH_INTERVAL,
+        reporter=None,
     ) -> None:
         # _socket is None == disabled: every early return below leaves it so,
         # and publish_load_stat then skips the snapshot entirely.
         self._socket: Optional[zmq.Socket] = None
+        self._reporter = reporter
         self._rank = 0
         self._seq = count()
         self._publish_counter = 0
@@ -216,7 +217,7 @@ class SchedulerLoadPublisher:
         Best-effort: never crashes the loop (routers fall back to their own
         counter).
         """
-        if self._socket is None:
+        if self._socket is None and self._reporter is None:
             return
 
         self._publish_counter += 1
@@ -230,6 +231,10 @@ class SchedulerLoadPublisher:
         now = time.monotonic()
         try:
             load = snapshot if snapshot is not None else load_provider()
+            if self._reporter is not None:
+                self._reporter.update(load)
+            if self._socket is None:
+                return
             counts = (
                 load.num_running_reqs,
                 load.num_waiting_reqs,
