@@ -89,6 +89,14 @@ class HybridAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
+    def _prepare_prefill_shared_reads(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SharedReadEnds:
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend._prepare_prefill_shared_reads(
+            forward_batch, num_qo_tokens=num_qo_tokens
+        )
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
