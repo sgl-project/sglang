@@ -29,7 +29,7 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HIDDEN = 7168
 DTYPE = torch.bfloat16

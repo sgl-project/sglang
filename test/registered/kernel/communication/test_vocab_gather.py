@@ -34,7 +34,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 LOCAL_WIDTH = 32320  # DeepSeek-V4.1's 129280-entry vocab over TP4
 SYMM_ROWS = 256
