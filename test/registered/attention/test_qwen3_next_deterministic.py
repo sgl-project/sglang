@@ -25,9 +25,12 @@ class TestFlashInferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(["--attention-backend", "flashinfer", "--tp", "4"])
-        return args
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "flashinfer",
+            "--tp",
+            "4",
+        ]
 
 
 class TestTritonDeterministic(TestDeterministicBase):
@@ -38,9 +41,12 @@ class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(["--attention-backend", "triton", "--tp", "4"])
-        return args
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "triton",
+            "--tp",
+            "4",
+        ]
 
 
 if __name__ == "__main__":
