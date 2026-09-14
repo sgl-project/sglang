@@ -33,7 +33,9 @@ use crate::{
     routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
     tokenizer::{
         cache::CachedTokenizer,
-        chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        chat_template::{
+            ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        },
         stop::StopSequenceDecoderBuilder,
         traits::Tokenizer,
         HuggingFaceTokenizer, StopSequenceDecoder,
@@ -707,6 +709,37 @@ pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> u
         .sum()
 }
 
+/// Return whether the request should start the reasoning parser in reasoning mode.
+///
+/// Templates with a thinking toggle can default to either enabled or disabled.
+/// An explicit user value takes precedence over that template default.
+pub(crate) fn should_mark_reasoning_started(
+    user_thinking: Option<bool>,
+    thinking_toggle: ThinkingToggle,
+) -> bool {
+    match thinking_toggle {
+        ThinkingToggle::None => false,
+        ThinkingToggle::DefaultOn => user_thinking != Some(false),
+        ThinkingToggle::DefaultOff => user_thinking == Some(true),
+    }
+}
+
+/// Read the thinking preference from the template keyword used by this tokenizer.
+///
+/// A keyword that the template does not recognize must not affect parser state.
+pub(crate) fn resolve_user_thinking(
+    kwargs: Option<&HashMap<String, Value>>,
+    thinking_key_name: Option<ThinkingKeyName>,
+) -> Option<bool> {
+    let key = match thinking_key_name {
+        Some(ThinkingKeyName::EnableThinking) => "enable_thinking",
+        Some(ThinkingKeyName::Thinking) => "thinking",
+        None => return None,
+    };
+
+    kwargs?.get(key).and_then(Value::as_bool)
+}
+
 /// Generate a tool call ID based on model format
 ///
 /// # Arguments
@@ -1043,6 +1076,8 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::json;
 
     use super::*;
@@ -1051,8 +1086,88 @@ mod tests {
             chat::{ChatMessage, MessageContent},
             common::{ContentPart, ImageUrl},
         },
-        tokenizer::chat_template::ChatTemplateContentFormat,
+        tokenizer::chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
     };
+
+    #[test]
+    fn test_reasoning_parser_start_follows_thinking_toggle() {
+        assert!(should_mark_reasoning_started(
+            None,
+            ThinkingToggle::DefaultOn
+        ));
+        assert!(!should_mark_reasoning_started(
+            Some(false),
+            ThinkingToggle::DefaultOn
+        ));
+        assert!(!should_mark_reasoning_started(
+            None,
+            ThinkingToggle::DefaultOff
+        ));
+        assert!(should_mark_reasoning_started(
+            Some(true),
+            ThinkingToggle::DefaultOff
+        ));
+        assert!(!should_mark_reasoning_started(None, ThinkingToggle::None));
+    }
+
+    #[test]
+    fn test_resolve_user_thinking_uses_template_key() {
+        let kwargs = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(true)),
+        ]);
+
+        assert_eq!(
+            resolve_user_thinking(Some(&kwargs), Some(ThinkingKeyName::EnableThinking)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&kwargs), Some(ThinkingKeyName::Thinking)),
+            Some(true)
+        );
+        assert_eq!(resolve_user_thinking(Some(&kwargs), None), None);
+    }
+
+    #[test]
+    fn test_qwen3_prefill_reasoning_is_parsed_non_streaming() {
+        use crate::reasoning_parser::{ParserFactory, ReasoningParser};
+
+        let factory = ParserFactory::new();
+        let mut parser = create_reasoning_parser(&factory, Some("qwen3"), "Qwen3.8-27B")
+            .expect("qwen3 parser should be registered");
+        parser.reset();
+        parser.mark_reasoning_started();
+
+        let result = parser
+            .detect_and_parse_reasoning("Compute 17 * 23. </think>\n\n391")
+            .unwrap();
+
+        assert_eq!(result.reasoning_text, "Compute 17 * 23. ");
+        assert_eq!(result.normal_text, "\n\n391");
+    }
+
+    #[test]
+    fn test_qwen3_prefill_reasoning_is_parsed_streaming() {
+        use crate::reasoning_parser::{ParserFactory, ReasoningParser};
+
+        let factory = ParserFactory::new();
+        let mut parser = create_reasoning_parser(&factory, Some("qwen3"), "Qwen3.8-27B")
+            .expect("qwen3 parser should be registered");
+        parser.mark_reasoning_started();
+        parser.mark_think_start_stripped();
+
+        let reasoning = parser
+            .parse_reasoning_streaming_incremental("Compute 17 * 23. ")
+            .unwrap();
+        assert_eq!(reasoning.reasoning_text, "Compute 17 * 23. ");
+        assert_eq!(reasoning.normal_text, "");
+
+        let answer = parser
+            .parse_reasoning_streaming_incremental("</think>\n\n391")
+            .unwrap();
+        assert_eq!(answer.reasoning_text, "");
+        assert_eq!(answer.normal_text, "\n\n391");
+    }
 
     #[test]
     fn test_transform_messages_string_format() {
