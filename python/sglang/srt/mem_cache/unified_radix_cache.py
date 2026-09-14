@@ -148,6 +148,15 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+def history_prefix(origin_input_ids, output_ids, length: int):
+    """First ``length`` tokens of ``origin_input_ids + output_ids`` with one copy;
+    concatenating the whole history and then slicing copied every token twice
+    per finished request."""
+    if length <= len(origin_input_ids):
+        return origin_input_ids[:length]
+    return origin_input_ids + output_ids[: length - len(origin_input_ids)]
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -946,7 +955,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = history_prefix(
+            req.origin_input_ids, req.output_ids, kv_len_to_handle
+        )
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :kv_len_to_handle
         ]
