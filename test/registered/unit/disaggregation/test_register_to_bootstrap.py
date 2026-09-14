@@ -328,6 +328,24 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertNotIn("[::]", url_used)
         self.assertIn("[::1]", url_used)
 
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_put_sends_authorization_bearer_when_token_is_configured(
+        self, mock_put, mock_time
+    ):
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        with envs.SGLANG_DISAGGREGATION_BOOTSTRAP_AUTH_TOKEN.override("pd-secret"):
+            mgr = self._make_manager()
+            mgr.bootstrap_auth_token = None
+            mgr.register_to_bootstrap()
+
+        headers = mock_put.call_args.kwargs.get("headers") or {}
+        self.assertEqual(headers.get("Authorization"), "Bearer pd-secret")
+
     def _make_manager(self, dist_init_addr=None):
         """Create a lightweight mock manager that has the attributes needed
         by register_to_bootstrap, without going through CommonKVManager.__init__
