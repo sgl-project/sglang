@@ -2628,6 +2628,10 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # EAGLE3: one-based completed-layer ids from the draft config's
+        # eagle_aux_hidden_state_layer_ids (e.g. [2, 46, 90]); capture taps the
+        # plain prefix stream (NOT the AttnRes aggregate) after those layers.
+        self.eagle3_layers_to_capture: Optional[tuple[int, ...]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
 
@@ -2752,6 +2756,7 @@ class KimiK3LinearModel(nn.Module):
             and envs.SGLANG_K3_SP_ATTN_RES.get()
             and self.pp_group.world_size == 1
             and self.dspark_layers_to_capture is None
+            and self.eagle3_layers_to_capture is None
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
@@ -2778,6 +2783,23 @@ class KimiK3LinearModel(nn.Module):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, residual, attn_res)
                 )
+            elif (
+                self.eagle3_layers_to_capture is not None
+                and (i + 1) in self.eagle3_layers_to_capture
+            ):
+                # EAGLE3: one-based completed-layer ids (draft-config
+                # convention); tap the plain prefix stream, not the AttnRes
+                # aggregate. On the attn-res path the layer already returns
+                # the full head (prefix folded by the MLP); the standard path
+                # still carries the delayed add. Clone: later layers write
+                # the carried stream in place.
+                if sp_sharded:
+                    hidden_states = _sp_all_gather_rows(hidden_states)
+                    sp_sharded = False
+                captured = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                aux_hidden_states.append(captured.clone())
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -2830,7 +2852,10 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.dspark_layers_to_capture is not None:
+        if (
+            self.dspark_layers_to_capture is not None
+            or self.eagle3_layers_to_capture is not None
+        ):
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -2897,6 +2922,9 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
             # Capture layers living on non-last PP ranks would be silently
@@ -2910,6 +2938,40 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        """Configure EAGLE3 aux hidden capture.
+
+        ``layer_ids`` follows the draft config's one-based completed-layer
+        convention (e.g. [2, 46, 90] for a 93-layer target), matching what the
+        checkpoint was trained against; the model taps the plain prefix stream
+        after those layers.
+        """
+        if self.pp_group.world_size > 1:
+            # Same constraint as DSPARK: capture layers living on non-last PP
+            # ranks would be silently skipped.
+            raise NotImplementedError("EAGLE3 aux hidden capture requires PP=1.")
+        if not self.pp_group.is_last_rank:
+            return
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        selected = list(layer_ids)
+        if selected != sorted(selected) or len(set(selected)) != len(selected):
+            raise ValueError(
+                "K3 EAGLE3 layer ids must be unique and sorted ascending, "
+                f"got {selected}."
+            )
+        invalid = [val for val in selected if not 1 <= val <= num_layers]
+        if invalid:
+            raise ValueError(
+                "K3 EAGLE3 layer ids are one-based completed-layer ids; got "
+                f"invalid ids {invalid} for {num_layers} layers."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.eagle3_layers_to_capture = tuple(selected)
 
     @torch.no_grad()
     def forward(
@@ -3359,6 +3421,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "EAGLE3 layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        if self.language_model is None:
+            raise AttributeError(
+                "get_embed_and_head() is not available in encoder-only mode"
+            )
+        return self.language_model.get_embed_and_head()
 
     def preprocess_mm_for_encoder(
         self,
