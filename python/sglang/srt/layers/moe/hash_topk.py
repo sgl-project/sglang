@@ -54,6 +54,14 @@ class HashTopK(nn.Module):
         self.waterfill_balancer = None
 
         if self.enable_waterfill:
+            # Routed-experts capture sizes its buffer by the model's fused
+            # shared-expert count, but under waterfill the ids captured here
+            # carry routed slots only, so the two widths disagree.
+            if get_exec().features.enable_return_routed_experts:
+                raise ValueError(
+                    "HashTopK cannot capture routed experts with waterfill enabled: "
+                    "disable --enable-waterfill or --enable-return-routed-experts."
+                )
             # Waterfill appends the shared expert after EPLB maps routed IDs.
             topk -= num_fused_shared_experts
             num_fused_shared_experts = 0
