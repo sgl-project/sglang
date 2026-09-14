@@ -1233,6 +1233,53 @@ class ServingChatTestCase(unittest.TestCase):
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
 
+    def test_parserless_template_thinking_reaches_xgrammar_tag(self):
+        """Without --reasoning-parser nothing else owns the reasoning prefix,
+        so the structural tag must admit it whenever the template turns
+        thinking on. The scheduler-side reasoning bookkeeping still needs a
+        parser, so require_reasoning stays off."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.tm.server_args.tool_call_parser = "qwen3_coder"
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = "qwen3_coder"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "add",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "required": ["a"],
+                },
+            },
+        }
+        cases = (
+            (None, "sequence"),
+            ({"enable_thinking": True}, "sequence"),
+            ({"enable_thinking": False}, "tags_with_separator"),
+        )
+        for chat_template_kwargs, expected_format in cases:
+            with self.subTest(chat_template_kwargs=chat_template_kwargs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    tools=[tool],
+                    tool_choice="required",
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                kind, tag = result.tool_call_constraint
+                self.assertEqual(kind, "structural_tag")
+                self.assertEqual(tag.model_dump()["format"]["type"], expected_format)
+                self.assertFalse(result.require_reasoning)
+
     def test_kimi_k3_constraint_failure_keeps_native_stop_format(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

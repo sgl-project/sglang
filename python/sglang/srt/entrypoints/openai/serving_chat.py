@@ -1230,7 +1230,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
-        xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
+        # Without a parser nothing else owns that prefix, so the tags
+        # must admit it whenever the chat template turns thinking on.
+        xgrammar_reasoning = (
+            self.reasoning_parser is None and self._template_enables_reasoning(request)
+        )
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -2769,6 +2773,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
                 mode,
             )
+            return False
+
+        return self._template_enables_reasoning(request)
+
+    def _template_enables_reasoning(self, request: ChatCompletionRequest) -> bool:
+        """Whether the chat template puts the model into a reasoning phase for
+        this request, judged from the template's toggle config alone."""
+        config = self.template_manager.reasoning_config
+        if config is None:
             return False
 
         if config.special_case == "always":
