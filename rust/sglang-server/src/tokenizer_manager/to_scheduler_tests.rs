@@ -97,7 +97,7 @@ fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
 /// further chunk can be delivered, and tell the scheduler to stop generating.
 ///
 /// Neither releases anything, and nothing needs them to. Release ordering used
-/// to be the delicate part here — `AbortGuard::drop` releasing a rid right
+/// to be the delicate part here — `FrontendCall::drop` releasing a rid right
 /// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
 /// the same rid could `Register` ahead of the stale abort and be torn down by
 /// it. `Rid::from_client` removes the premise: a retry carries a different

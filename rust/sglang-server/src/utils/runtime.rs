@@ -275,12 +275,25 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         });
     }
 
-    // --- API server (tokio, I/O bound) ---
+    // One transport-neutral entrance to the runtime. Each configured listener
+    // receives a clone; no listener owns or reconstructs scheduler wiring.
+    let frontend = crate::frontend::FrontendHandle::new(
+        senders.tok_manager_tx.clone(),
+        senders.abort_tx.clone(),
+        crate::frontend::FrontendConfig {
+            response_capacity: cfg.rust_server_args.stage_channel_cap,
+            response_activity: response_activity.clone(),
+            startup_ready: cfg.server_args.skip_server_warmup,
+            is_disaggregation: cfg.server_args.is_disaggregation(),
+            mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+        },
+    );
+
+    // --- HTTP adapter (tokio, I/O bound) ---
     {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
-        let senders = senders.clone();
-        let response_activity = response_activity.clone();
+        let frontend = frontend.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -307,11 +320,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::app::serve(
                     listener,
-                    senders,
-                    cfg.rust_server_args.stage_channel_cap,
+                    frontend,
                     cfg.server_args.clone(),
-                    // Response heartbeat watched by `/health_generate`.
-                    response_activity,
                     shutdown_rx,
                 ))
             })
