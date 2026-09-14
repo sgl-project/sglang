@@ -1,0 +1,95 @@
+name: Bytedance Build SGLang Kernel Artifact
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to build from"
+        required: true
+        type: string
+      python_version:
+        description: "Python version passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "3.10"
+      cuda_version:
+        description: "CUDA version passed to sgl-kernel/build.sh"
+        required: true
+        type: string
+      arch:
+        description: "Optional architecture override passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: "Uploaded artifact name"
+        required: true
+        type: string
+      runner:
+        description: "Runner label for the wheel build"
+        required: false
+        type: string
+        default: "x64-kernel-build-node"
+      build_jobs:
+        description: "BUILD_JOBS passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "64"
+      nvcc_threads:
+        description: "NVCC_THREADS passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "8"
+      use_ccache:
+        description: "USE_CCACHE passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "1"
+
+concurrency:
+  group: bytedance-sglang-kernel-${{ github.ref }}-${{ inputs.artifact_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Prune stale Docker data
+        run: |
+          # Do not run daemon-wide system/volume pruning on shared runners.
+          docker buildx prune --filter "until=72h" -f
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Build wheel
+        run: |
+          cd python/sglang/kernels/aot
+          chmod +x ./build.sh
+          if [ -n "${{ inputs.arch }}" ]; then
+            ./build.sh "${{ inputs.python_version }}" "${{ inputs.cuda_version }}" "${{ inputs.arch }}"
+          else
+            ./build.sh "${{ inputs.python_version }}" "${{ inputs.cuda_version }}"
+          fi
+        env:
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+          NVCC_THREADS: ${{ inputs.nvcc_threads }}
+          USE_CCACHE: ${{ inputs.use_ccache }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: python/sglang/kernels/aot/dist/*
+          if-no-files-found: error

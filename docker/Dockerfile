@@ -14,6 +14,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
@@ -171,6 +172,7 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL
 
 WORKDIR /sgl-workspace
 
@@ -182,6 +184,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
+COPY .ci-artifacts/sgl-kernel/ /tmp/local-sgl-kernel/
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
@@ -190,7 +193,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
+    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
+        WHEEL_COUNT="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl' | wc -l)" \
+        && [ "$WHEEL_COUNT" -eq 1 ] \
+        && LOCAL_WHEEL="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl')" \
+        && python3 -m pip install "$LOCAL_WHEEL" --force-reinstall --no-deps; \
+    elif [ "$CUDA_VERSION" = "12.6.3" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.9.2" ]; then \
@@ -705,16 +713,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -877,16 +893,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
