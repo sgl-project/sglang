@@ -198,25 +198,18 @@ class TritonAttnBackend(AttentionBackend):
         self.long_prefix_extend_min_tokens = (
             envs.SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS.get()
         )
-        self.aiter_long_prefix_extend_enabled = False
+        self.aiter_long_prefix_extend = None
         if _is_hip and envs.SGLANG_USE_AITER_EXTEND_LONG_PREFIX.get():
             from sglang.srt.layers.attention.aiter_extend_long_prefix import (
-                aiter_batch_prefill_available,
+                AiterLongPrefixExtend,
                 build_paged_kv_indices,
-                extend_attention_fwd_aiter_paged,
             )
 
-            if aiter_batch_prefill_available():
-                self.aiter_long_prefix_extend_enabled = True
-                self.aiter_long_prefix_min_rows = (
-                    envs.SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS.get()
-                )
-                self.build_paged_kv_indices = torch.compiler.disable(
-                    build_paged_kv_indices
-                )
-                self.extend_attention_fwd_aiter_paged = torch.compiler.disable(
-                    extend_attention_fwd_aiter_paged
-                )
+            self.aiter_long_prefix_extend = AiterLongPrefixExtend.try_create()
+            self.aiter_long_prefix_min_rows = (
+                envs.SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS.get()
+            )
+            self.build_paged_kv_indices = torch.compiler.disable(build_paged_kv_indices)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -1598,7 +1591,7 @@ class TritonAttnBackend(AttentionBackend):
         """Within the long-prefix route, should the batch take aiter's CK paged
         batch-prefill? True once its largest request extends by `aiter_long_prefix_min_rows`."""
         if (
-            not self.aiter_long_prefix_extend_enabled
+            self.aiter_long_prefix_extend is None
             or self.page_size != 1
             or forward_batch.out_cache_loc is None
             or forward_batch.extend_seq_lens is None
@@ -1865,7 +1858,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     bs,
                 )
-                self.extend_attention_fwd_aiter_paged(
+                self.aiter_long_prefix_extend.forward(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     k_buffer,

@@ -11,16 +11,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-try:
-    from sglang.srt.layers.attention.aiter_extend_long_prefix import (
-        aiter_batch_prefill_available,
-        build_paged_kv_indices,
-        extend_attention_fwd_aiter_paged,
-    )
+from sglang.srt.layers.attention.aiter_extend_long_prefix import (
+    AiterLongPrefixExtend,
+    build_paged_kv_indices,
+)
 
-    _AITER_OK = aiter_batch_prefill_available()
-except Exception:  # pragma: no cover - aiter missing
-    _AITER_OK = False
+_AITER = AiterLongPrefixExtend.try_create()
+_AITER_OK = _AITER is not None
 
 # observed on gfx950: aiter ~1e-3 (bf16 KV), 1e-3..1e-2 (fp8 KV); scaled fp8 Triton hits 5e-2
 ATOL = {torch.bfloat16: 5e-3, torch.float8_e4m3fn: 3e-2}
@@ -118,7 +115,7 @@ class TestExtendLongPrefixAiter(CustomTestCase):
             )
 
         o = torch.empty_like(q)
-        extend_attention_fwd_aiter_paged(
+        _AITER.forward(
             q,
             o,
             k_buffer,
