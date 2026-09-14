@@ -1,5 +1,6 @@
 """Unit tests for UnifiedRadixCache"""
 
+import atexit
 import json
 import shutil
 import sys
@@ -228,6 +229,13 @@ class _FakeFullComponent(TreeComponent):
 
     def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
         pass
+
+
+def _drop_hicache_atexit_pin(cache):
+    """init_hicache registers ``cache.shutdown`` with atexit, which pins the
+    fixture's device and host pools until process exit; hundreds of HiCache
+    fixtures in this suite would otherwise accumulate on the GPU."""
+    atexit.unregister(cache.shutdown)
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
@@ -1064,6 +1072,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         )
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
+        self.addCleanup(_drop_hicache_atexit_pin, cache)
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
@@ -5519,6 +5528,7 @@ class UnifiedRadixCacheSuite:
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
+        self.addCleanup(_drop_hicache_atexit_pin, cache)
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
@@ -9691,6 +9701,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
+        self.addCleanup(_drop_hicache_atexit_pin, cache)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
 
