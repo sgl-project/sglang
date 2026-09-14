@@ -644,6 +644,29 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(request.model_dump(), body)
         self.assertFalse(hasattr(request, "conversation_id"))
 
+    def test_parent_session_id_forwarded_to_internal_request(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "child turn"}],
+            parent_session_id="parent-session",
+        )
+        processed_messages = MessageProcessingResult(
+            prompt="child turn",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=None,
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            internal, _ = self.chat._convert_to_internal_request(request)
+
+        self.assertEqual(internal.parent_session_id, "parent-session")
+
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
             req = ChatCompletionRequest(

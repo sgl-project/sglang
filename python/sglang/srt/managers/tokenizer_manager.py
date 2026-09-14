@@ -1589,19 +1589,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
-    def _maybe_send_subagent_keepalive(self, obj: Any) -> None:
-        """Keep a parent session's prefix cache hot while its subagent runs.
-
-        The parent's KV lives on whichever attention-DP rank served its last
-        turn, which is not in general the rank this subagent request is routed
-        to, so this goes out as a control request: the DP controller hands
-        control requests to rank 0, whose scheduler broadcasts them over the
-        full TP group. Every rank then refreshes the session if it holds it and
-        ignores it otherwise.
-        """
-        if not get_memory().allow_subagent_keepalive:
+    def _maybe_send_subagent_keepalive(
+        self, obj: GenerateReqInput | EmbeddingReqInput
+    ) -> None:
+        if not get_memory().allow_subagent_keepalive or not isinstance(
+            obj, GenerateReqInput
+        ):
             return
-        parent_session_id = getattr(obj, "parent_session_id", None)
+        parent_session_id = obj.parent_session_id
         if not parent_session_id:
             return
         self._dispatch_to_scheduler(
