@@ -3710,6 +3710,7 @@ fn insert_host_publishes_a_host_store_event() {
             block_size: 2,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
