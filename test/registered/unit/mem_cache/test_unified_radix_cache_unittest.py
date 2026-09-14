@@ -9005,6 +9005,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation = mock.MagicMock()
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.storage_start = 16
         cache.ongoing_prefetch = {
             operation.request_id: (
                 7,
@@ -9022,6 +9023,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
         cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
@@ -9049,6 +9051,10 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+        # Dedup changes ownership, not the source of this request's cache hit.
+        self.assertEqual(cache.prefetch_loaded_tokens_by_reqid["req"], 8)
+        self.assertEqual(cache.prefetch_loaded_storage_start_by_reqid["req"], 16)
+        cache._resolve_storage_prefetch_tokens.assert_not_called()
 
 
 class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
