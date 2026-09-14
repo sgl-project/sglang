@@ -153,9 +153,69 @@ def _sdpa_attn_func(
 
 
 def _flash_or_sdpa(
-    q, k, v, dropout_p: float = 0.0, softmax_scale=None, causal: bool = False
+    q,
+    k,
+    v,
+    dropout_p: float = 0.0,
+    softmax_scale=None,
+    causal: bool = False,
+    actual_seq_lengths_kv: Optional[list[int]] = None,
 ):
     backend = effective_attn_backend()
+    if actual_seq_lengths_kv is not None:
+        batch_size, query_length = q.shape[:2]
+        padded_key_length = k.shape[1]
+        prefix_width = padded_key_length - query_length
+        if len(actual_seq_lengths_kv) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} KV lengths, got {len(actual_seq_lengths_kv)}"
+            )
+        if all(length == padded_key_length for length in actual_seq_lengths_kv):
+            return _flash_or_sdpa(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+        outputs = []
+        for batch_index, total_length in enumerate(actual_seq_lengths_kv):
+            prefix_length = total_length - query_length
+            if prefix_length < 0 or prefix_length > prefix_width:
+                raise ValueError(
+                    f"KV length {total_length} is incompatible with query length "
+                    f"{query_length} and padded key length {padded_key_length}"
+                )
+            if total_length == padded_key_length:
+                compact_k = k[batch_index : batch_index + 1]
+                compact_v = v[batch_index : batch_index + 1]
+            else:
+                compact_k = torch.cat(
+                    (
+                        k[batch_index : batch_index + 1, :prefix_length],
+                        k[batch_index : batch_index + 1, prefix_width:],
+                    ),
+                    dim=1,
+                )
+                compact_v = torch.cat(
+                    (
+                        v[batch_index : batch_index + 1, :prefix_length],
+                        v[batch_index : batch_index + 1, prefix_width:],
+                    ),
+                    dim=1,
+                )
+            outputs.append(
+                _flash_or_sdpa(
+                    q[batch_index : batch_index + 1],
+                    compact_k,
+                    compact_v,
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                )
+            )
+        return torch.cat(outputs, dim=0)
     # flash-attn ships CUDA kernels only. On XPU / CPU we transparently fall
     # back to SDPA even if the user asked for ``flash`` — the alternative
     # (crashing on first forward) is worse, and ``set_attn_backend('flash')``
@@ -165,25 +225,54 @@ def _flash_or_sdpa(
             q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal
         )
     return _sdpa_attn_func(
-        q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
     )
 
 
-def create_block_causal_mask(index: torch.Tensor):
-    """
-    index: (L)
-    return: (1, 1, L, L) block-wise causal attention mask
-    """
-    L = index.size(0)
-    idx_i = index.unsqueeze(1).expand(L, L)
-    idx_j = index.unsqueeze(0).expand(L, L)
+def position_ids_from_indexes(indexes: torch.Tensor, coordinate: int) -> torch.Tensor:
+    """Return one coordinate as ``[batch, sequence]`` position IDs."""
+    if indexes.ndim == 2:
+        return indexes[coordinate].unsqueeze(0)
+    if indexes.ndim == 3:
+        return indexes[:, coordinate]
+    raise ValueError(f"indexes must have 2 or 3 dimensions, got {indexes.ndim}")
 
-    arange = torch.arange(L, device=index.device)
-    mask = (idx_j == idx_i) | (arange.unsqueeze(0) <= arange.unsqueeze(1))
 
-    return torch.where(
-        mask[None, None, :, :] > 0, torch.tensor(0.0), torch.tensor(float("-inf"))
-    )
+def create_block_causal_mask(
+    index: torch.Tensor, key_valid_mask: Optional[torch.Tensor] = None
+):
+    """
+    index: (L) or (B, L)
+    key_valid_mask: optional (B, L), where True marks a real token
+    return: (B, 1, L, L) block-wise causal attention mask
+    """
+    if index.ndim == 1:
+        index = index.unsqueeze(0)
+    if index.ndim != 2:
+        raise ValueError(f"index must have 1 or 2 dimensions, got {index.ndim}")
+
+    batch_size, seq_len = index.shape
+    idx_i = index.unsqueeze(2)
+    idx_j = index.unsqueeze(1)
+
+    arange = torch.arange(seq_len, device=index.device)
+    mask = (idx_j == idx_i) | (arange.view(1, 1, -1) <= arange.view(1, -1, 1))
+    if key_valid_mask is not None:
+        if key_valid_mask.shape != (batch_size, seq_len):
+            raise ValueError(
+                "key_valid_mask must match the batched index shape; "
+                f"got {tuple(key_valid_mask.shape)} and {(batch_size, seq_len)}"
+            )
+        mask = mask & key_valid_mask.to(torch.bool).unsqueeze(1)
+
+    output = torch.zeros(mask.shape, dtype=torch.float32, device=index.device)
+    output.masked_fill_(~mask, float("-inf"))
+    return output.unsqueeze(1)
 
 
 def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
@@ -530,17 +619,23 @@ class Qwen3Attention(nn.Module):
 
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        cos_t, sin_t = self.rotary_emb(
+            hidden_states, position_ids_from_indexes(indexes, 0)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
 
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+        cos_h, sin_h = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 1)
+        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
 
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+        cos_w, sin_w = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 2)
+        )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -705,17 +800,23 @@ class Qwen3Attention(nn.Module):
         )  # [B,H,S,D]
 
         # RoPE
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        cos_t, sin_t = self.rotary_emb(
+            hidden_states, position_ids_from_indexes(indexes, 0)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
 
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+        cos_h, sin_h = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 1)
+        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
 
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+        cos_w, sin_w = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 2)
+        )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -737,7 +838,12 @@ class Qwen3Attention(nn.Module):
         #   fully bidirectional inside current block => causal=False
         # ------------------------------------------------------------------
         if attention_mask is None:
-            # Convert current q/k/v to flash layout [B, S, H, D]
+            actual_seq_lengths_kv = None
+            layer = (
+                past_key_values.layers[self.layer_idx]
+                if past_key_values is not None and not update_cache
+                else None
+            )
             q = query_states.transpose(1, 2).contiguous()
             k_cur = key_states.transpose(1, 2).contiguous()
             v_cur = value_states.transpose(1, 2).contiguous()
@@ -752,34 +858,26 @@ class Qwen3Attention(nn.Module):
                     k = key_states.transpose(1, 2).contiguous()
                     v = value_states.transpose(1, 2).contiguous()
                 else:
-                    # Optimized path:
-                    # use preallocated flash_k_cache / flash_v_cache
-                    layer = past_key_values.layers[self.layer_idx]
-
                     if (
-                        hasattr(layer, "flash_k_cache")
-                        and layer.flash_k_cache is not None
-                        and hasattr(layer, "flash_v_cache")
-                        and layer.flash_v_cache is not None
+                        getattr(layer, "flash_k_cache", None) is not None
+                        and getattr(layer, "flash_v_cache", None) is not None
                     ):
                         prefix_len = layer.flash_prefix_len
                         cur_len = k_cur.shape[1]
-
-                        # overwrite current segment in-place
                         layer.flash_k_cache[:, prefix_len : prefix_len + cur_len].copy_(
                             k_cur
                         )
                         layer.flash_v_cache[:, prefix_len : prefix_len + cur_len].copy_(
                             v_cur
                         )
-
                         k = layer.flash_k_cache[:, : prefix_len + cur_len]
                         v = layer.flash_v_cache[:, : prefix_len + cur_len]
+                        actual_seq_lengths_kv = getattr(
+                            layer, "flash_actual_seq_lengths_kv", None
+                        )
                     else:
-                        # fallback if user forgot to prepare flash cache
-                        layer = past_key_values.layers[self.layer_idx]
+                        # fallback if the cache was not prepared
                         past_k, past_v = layer.keys, layer.values
-
                         if past_k is not None:
                             past_k = past_k.transpose(1, 2).contiguous()
                             past_v = past_v.transpose(1, 2).contiguous()
@@ -806,6 +904,7 @@ class Qwen3Attention(nn.Module):
                 dropout_p=0.0 if not self.training else self.attention_dropout,
                 softmax_scale=self.scaling,
                 causal=False,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
             )  # [B, S_q, H_q, D]
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -982,17 +1081,23 @@ class Qwen3Attention(nn.Module):
             )
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        cos_t, sin_t = self.rotary_emb(
+            hidden_states, position_ids_from_indexes(indexes, 0)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
 
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+        cos_h, sin_h = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 1)
+        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
 
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+        cos_w, sin_w = self.rotary_emb_hw(
+            hidden_states, position_ids_from_indexes(indexes, 2)
+        )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -1375,11 +1480,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 )
             else:
                 causal_mask_mapping = {
-                    "full_attention": create_block_causal_mask(indexes[0]),
+                    "full_attention": create_block_causal_mask(
+                        position_ids_from_indexes(indexes, 0)
+                    ),
                 }
-                self.current_index = indexes[0].max()
+                self.current_index = position_ids_from_indexes(indexes, 0).max()
         else:
-            self.current_index = indexes[0].max()
+            self.current_index = position_ids_from_indexes(indexes, 0).max()
             # raise NotImplementedError('not isinstance(causal_mask_mapping := attention_mask, dict)')
 
             # The sliding window alternating layers are not always activated depending on the config

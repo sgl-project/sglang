@@ -78,11 +78,29 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
-## 5. Benchmark
+## 5. Advanced usage
 
-### 5.1 Speedup Benchmark
+### 5.1 Dynamic request batching
 
-#### 5.1.1 Single-run Profile
+Start the server with dynamic batching enabled:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000 \
+  --batching-max-size 2 \
+  --batching-delay-ms 100
+```
+
+Requests in one batch must use the same resolution, inference steps, guidance
+settings, and output options. Batched requests support one output per request
+and require `think_mode=false`.
+
+## 6. Benchmark
+
+### 6.1 Speedup benchmark
+
+#### 6.1.1 Single-run profile
 
 <Tabs>
   <Tab title="NVIDIA A800">

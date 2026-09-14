@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.cache_utils import DynamicCache
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
@@ -26,6 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOLLMConfig,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
 )
@@ -33,7 +38,16 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
     get_conv_template,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+    NEOChatModel,
     _randn_with_seed,
+    prepare_flash_kv_cache,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+    Qwen3Attention,
+    _flash_or_sdpa,
+    _sdpa_attn_func,
+    create_block_causal_mask,
+    position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -56,7 +70,7 @@ class _FakeSenseNovaModel:
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
-        return torch.tensor(
+        sample = torch.tensor(
             [
                 [
                     [[-1.0, 0.0], [0.5, 1.0]],
@@ -65,6 +79,17 @@ class _FakeSenseNovaModel:
                 ]
             ]
         )
+        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+
+
+class _FakeTokenizer:
+    pad_token_id = None
+    eos_token_id = 2
+
+    def __call__(self, text, return_tensors):
+        del return_tensors
+        token_count = len(text.split()) + 1
+        return {"input_ids": torch.arange(1, token_count + 1).unsqueeze(0)}
 
 
 class _RecordingTraceContext:
@@ -186,6 +211,189 @@ def test_sensenova_u1_randn_fallback_preserves_cpu_rng(monkeypatch):
 
     assert torch.equal(first, second)
     assert torch.equal(torch.get_rng_state(), rng_state)
+
+
+def test_sensenova_u1_randn_supports_per_sample_seeds():
+    actual = _randn_with_seed(
+        (2, 3, 4), device=torch.device("cpu"), dtype=torch.float32, seed=[7, 19]
+    )
+    expected = torch.cat(
+        [
+            _randn_with_seed(
+                (1, 3, 4),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                seed=seed,
+            )
+            for seed in (7, 19)
+        ]
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_sensenova_u1_builds_padded_batched_text_inputs():
+    model = SimpleNamespace(device=torch.device("cpu"))
+
+    input_ids, indexes, attention_mask, valid_mask, prefix_lengths = (
+        NEOChatModel._build_t2i_text_inputs(
+            model, _FakeTokenizer(), ["short", "a much longer prompt"]
+        )
+    )
+
+    assert input_ids.shape == (2, 5)
+    assert indexes.shape == (2, 3, 5)
+    assert prefix_lengths.tolist() == [2, 5]
+    assert valid_mask.tolist() == [
+        [True, True, False, False, False],
+        [True, True, True, True, True],
+    ]
+    mask = attention_mask["full_attention"]
+    assert mask.shape == (2, 1, 5, 5)
+    assert torch.isneginf(mask[0, :, :, 2:]).all()
+    assert torch.isfinite(mask[0, :, :, :2]).any()
+
+
+def test_sensenova_u1_position_indexes_support_batched_inputs():
+    indexes = torch.tensor(
+        [
+            [[0, 1], [0, 0], [0, 0]],
+            [[4, 4], [0, 1], [0, 0]],
+        ]
+    )
+
+    assert torch.equal(position_ids_from_indexes(indexes, 0), indexes[:, 0])
+    assert torch.equal(
+        position_ids_from_indexes(indexes[0], 1), indexes[0, 1].unsqueeze(0)
+    )
+
+
+def test_sensenova_u1_singleton_text_matches_valid_batched_tokens():
+    model = SimpleNamespace(device=torch.device("cpu"))
+    tokenizer = _FakeTokenizer()
+    batched = NEOChatModel._build_t2i_text_inputs(
+        model, tokenizer, ["short", "a much longer prompt"]
+    )
+    for i, prompt in enumerate(["short", "a much longer prompt"]):
+        single = NEOChatModel._build_t2i_text_inputs(model, tokenizer, prompt)
+        length = single[0].shape[1]
+        assert torch.equal(batched[0][i, :length], single[0][0])
+        assert torch.equal(batched[1][i, :, :length], single[1])
+        assert torch.equal(
+            batched[2]["full_attention"][i, :, :length, :length],
+            single[2]["full_attention"][0],
+        )
+
+
+def test_sensenova_u1_block_causal_mask_rejects_padded_keys():
+    indexes = torch.tensor([[0, 1, 2], [0, 1, 2]])
+    valid = torch.tensor([[True, True, False], [True, True, True]])
+
+    mask = create_block_causal_mask(indexes, valid)
+
+    assert mask.shape == (2, 1, 3, 3)
+    assert torch.isneginf(mask[0, :, :, 2]).all()
+    assert mask[1, 0, 2, 2] == 0
+
+
+def test_sensenova_u1_builds_per_sample_image_indexes():
+    indexes = NEOChatModel._build_t2i_image_indexes(
+        SimpleNamespace(),
+        token_h=2,
+        token_w=2,
+        text_len=torch.tensor([2, 5]),
+        device=torch.device("cpu"),
+    )
+
+    assert indexes.shape == (2, 3, 4)
+    assert indexes[:, 0].tolist() == [[2, 2, 2, 2], [5, 5, 5, 5]]
+    assert indexes[:, 1].tolist() == [[0, 0, 1, 1], [0, 0, 1, 1]]
+    assert indexes[:, 2].tolist() == [[0, 1, 0, 1], [0, 1, 0, 1]]
+
+
+def test_sensenova_u1_compacts_variable_length_kv_before_attention():
+    generator = torch.Generator().manual_seed(29)
+    q = torch.randn(2, 3, 4, 8, generator=generator)
+    k = torch.randn(2, 8, 2, 8, generator=generator)
+    v = torch.randn(2, 8, 2, 8, generator=generator)
+    actual = _flash_or_sdpa(
+        q,
+        k,
+        v,
+        actual_seq_lengths_kv=[5, 8],
+    )
+
+    expected_short = _sdpa_attn_func(
+        q[:1],
+        torch.cat((k[:1, :2], k[:1, 5:]), dim=1),
+        torch.cat((v[:1, :2], v[:1, 5:]), dim=1),
+    )
+    expected_long = _sdpa_attn_func(q[1:], k[1:], v[1:])
+    torch.testing.assert_close(actual, torch.cat((expected_short, expected_long)))
+
+
+@torch.no_grad()
+def test_sensenova_u1_prefix_and_denoise_attention_match_singletons():
+    config = NEOLLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+    )
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng():
+        torch.manual_seed(23)
+        attention = Qwen3Attention(config, layer_idx=0).eval()
+    generator = torch.Generator().manual_seed(31)
+    text = torch.randn(2, 5, 64, generator=generator)
+    image = torch.randn(2, 3, 64, generator=generator)
+    helper = SimpleNamespace(device=torch.device("cpu"))
+
+    def run(prefix, lengths, image_states):
+        batch_size, width, _ = prefix.shape
+        positions = torch.arange(width).expand(batch_size, -1)
+        indexes = torch.stack(
+            [positions, torch.zeros_like(positions), torch.zeros_like(positions)], dim=1
+        )
+        valid = positions < torch.tensor(lengths)[:, None]
+        cache = DynamicCache(config=config)
+        attention.forward_und(
+            prefix, indexes, create_block_causal_mask(positions, valid), cache
+        )
+        prefix_keys = cache.layers[0].keys.clone()
+        prepare_flash_kv_cache(
+            cache,
+            current_len=3,
+            batch_size=batch_size,
+            prefix_lengths=torch.tensor(lengths),
+        )
+        image_indexes = NEOChatModel._build_t2i_image_indexes(
+            helper, 1, 3, torch.tensor(lengths), torch.device("cpu")
+        )
+        outputs = []
+        for _ in range(2):
+            image_states, _ = attention.forward_gen(
+                image_states,
+                image_indexes,
+                None,
+                cache,
+                update_cache=False,
+            )
+            outputs.append(image_states)
+        torch.testing.assert_close(cache.layers[0].keys, prefix_keys)
+        return prefix_keys, outputs
+
+    keys, batched = run(text, [2, 5], image)
+    for i, length in enumerate([2, 5]):
+        single_keys, single = run(text[i : i + 1, :length], [length], image[i : i + 1])
+        torch.testing.assert_close(keys[i : i + 1, :, :length], single_keys)
+        for step in range(2):
+            torch.testing.assert_close(
+                batched[step][i : i + 1], single[step], atol=1e-5, rtol=1e-4
+            )
 
 
 def test_sensenova_u1_randn_fallback_preserves_device_rng(monkeypatch):
@@ -341,8 +549,86 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
 def test_sensenova_u1_scheduler_capabilities():
     config = SenseNovaU1PipelineConfig()
 
-    assert not config.supports_dynamic_batching()
+    assert config.supports_dynamic_batching()
     assert config.supports_sequential_multi_output_inference()
+
+
+def test_sensenova_u1_batch_cost_tracks_resolution_steps_and_cfg():
+    config = SenseNovaU1PipelineConfig()
+    batch = SimpleNamespace(
+        width=1024,
+        height=1024,
+        num_inference_steps=5,
+        guidance_scale=4.0,
+        num_outputs_per_prompt=1,
+    )
+
+    assert config.estimate_request_cost(batch) == 32 * 32 * 5 * 2
+
+
+def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake", num_outputs_per_prompt=2
+    )
+    request = SimpleNamespace(
+        is_warmup=False,
+        realtime_session_id=None,
+        session=None,
+        prompt=sampling.prompt,
+        image_path=None,
+        return_file_paths_only=False,
+        num_outputs_per_prompt=2,
+        sampling_params=sampling,
+    )
+
+    assert not scheduler._can_dynamic_batch(request, request)
+    assert (
+        scheduler._get_dynamic_batch_reject_reason(request, request)
+        == "sequential_multi_output"
+    )
+
+
+def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    requests = []
+    for i, (prompt, seed) in enumerate([("short", 7), ("a longer prompt", 19)]):
+        sampling = SenseNovaU1SamplingParams(prompt=prompt, seed=seed)
+        requests.append(
+            SimpleNamespace(
+                prompt=prompt,
+                seed=seed,
+                request_id=f"request-{i}",
+                sampling_params=sampling,
+                extra=sampling.build_request_extra(),
+                is_warmup=False,
+                realtime_session_id=None,
+                session=None,
+                image_path=None,
+                return_file_paths_only=False,
+                num_outputs_per_prompt=1,
+                profile=False,
+            )
+        )
+    merged = scheduler._try_merge_generation_reqs(requests)
+    assert merged.prompt == ["short", "a longer prompt"]
+    assert merged.extra["dynamic_batch_seeds"] == [7, 19]
+    assert requests[0].prompt == "short"
+    outputs = scheduler._split_batched_output(
+        OutputBatch(output=[torch.tensor([7]), torch.tensor([19])]), requests
+    )
+    assert [output.output[0].item() for output in outputs] == [7, 19]
+    assert (
+        scheduler._split_batched_output(
+            OutputBatch(output=[torch.tensor([7])]), requests
+        )
+        is None
+    )
+    requests[1].sampling_params.width = 1024
+    del requests[1]._dynamic_batch_sig
+    assert scheduler._try_merge_generation_reqs(requests) is None
 
 
 def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
@@ -624,6 +910,71 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+
+
+def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="first prompt",
+        width=1024,
+        height=1024,
+        guidance_scale=4.0,
+        num_inference_steps=5,
+        seed=7,
+    )
+    batch = SimpleNamespace(
+        prompt=["first prompt", "a longer second prompt"],
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra={
+            **sampling.build_request_extra(),
+            "dynamic_batch_seeds": [7, 19],
+        },
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert len(output.output) == 2
+    assert model.call_kwargs["prompt"] == [
+        "first prompt",
+        "a longer second prompt",
+    ]
+    assert model.call_kwargs["batch_size"] == 2
+    assert model.call_kwargs["seed"] == [7, 19]
+
+
+def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="first prompt",
+        width=1024,
+        height=1024,
+        think_mode=True,
+    )
+    batch = SimpleNamespace(
+        prompt=["first prompt", "second prompt"],
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra={
+            **sampling.build_request_extra(),
+            "dynamic_batch_seeds": [7, 19],
+        },
+        metrics=None,
+    )
+
+    with pytest.raises(ValueError, match="think_mode"):
+        SenseNovaU1GenerationStage(
+            model=_FakeSenseNovaModel(), tokenizer="tok"
+        ).forward(batch, server_args=SimpleNamespace())
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
