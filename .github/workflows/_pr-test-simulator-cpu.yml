@@ -97,3 +97,4 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_predictor_contract.py
           python3 -m pytest -q tools/sglang-simulator/test/test_infercast_predictor.py
           python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py --help
+          python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py --help
