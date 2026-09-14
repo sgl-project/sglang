@@ -1343,6 +1343,12 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Threads that split one request's image batch across CPU cores and write
+    # the processed patches straight into one preallocated tensor, instead of a
+    # single call that builds per-image arrays, a list of them and a
+    # concatenated copy. 0 keeps the stock single-call path. Applies to the PIL
+    # Qwen2-VL-family image processor; other inputs fall back to the stock path.
+    SGLANG_MM_IMAGE_PREPROCESS_THREADS = EnvInt(0)
 
     # ===================================================================
     # Multimodal CUDA IPC transport
