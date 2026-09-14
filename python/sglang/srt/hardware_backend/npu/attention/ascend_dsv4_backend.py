@@ -890,9 +890,9 @@ class C4IndexerAscendBackendMixin:
             q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
-        compress_layer_id = sum(
-            ratio == 4 for ratio in self._dsv4_compress_ratios[: c4_indexer.layer_id]
-        )
+        compress_layer_id = self.token_to_kv_pool.layer_mapping[
+            c4_indexer.layer_id
+        ].compress_layer_id
         maybe_capture_indexer_topk(compress_layer_id, topk_idxs)
 
 
