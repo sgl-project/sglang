@@ -46,6 +46,9 @@ def benchmark_steps(
     run_layer=None,
     verify=None,
     retain_eager_output=True,
+    modes=("eager", "graph"),
+    profile=False,
+    profile_bucket=None,
 ):
     """Shared real driver; local tests substitute only the EP library/fixtures."""
     from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
@@ -64,10 +67,17 @@ def benchmark_steps(
         or warmups < 2
         or rounds < 2
         or rounds % 2
-        or len(dispatchers) != 2
+        or not dispatchers
+        or not modes
+        or len(set(modes)) != len(modes)
+        or not set(modes) <= {"eager", "graph"}
+        or (
+            profile_bucket is not None
+            and (not profile or profile_bucket not in buckets)
+        )
     ):
         raise ValueError(
-            "Use two layers, positive buckets, >=2 samples/warmups, even rounds >=2"
+            "Use nonempty stages, positive buckets, >=2 samples/warmups, even rounds >=2"
         )
     capacity = max(buckets)
     run_layer = run_layer or forward_layer
@@ -80,7 +90,7 @@ def benchmark_steps(
             for step in (0, 1):
                 batches = [
                     fixture(bucket, case=case, step=step + layer, change="all")
-                    for layer in range(2)
+                    for layer in range(len(dispatchers))
                 ]
                 for batch in batches:
                     validate_capacity(batch, capacity)
@@ -162,10 +172,14 @@ def benchmark_steps(
                 for case in cases:
                     pairs = prepared[bucket, case]
                     for round_index in range(rounds):
+                        if profile and (
+                            bucket != (profile_bucket or buckets[0])
+                            or case != cases[0]
+                            or round_index != 0
+                        ):
+                            continue
                         order = (
-                            ("eager", "graph")
-                            if round_index % 2 == 0
-                            else ("graph", "eager")
+                            modes if round_index % 2 == 0 else tuple(reversed(modes))
                         )
                         for mode in order:
                             # Exact receive/combine checks of both data variants
@@ -182,16 +196,26 @@ def benchmark_steps(
                             stream.synchronize()
                             warmup_seconds = time.perf_counter() - warmup_started
                             coordinator.barrier()
+                            if profile:
+                                if rank == 0:
+                                    torch.cuda.cudart().cudaProfilerStart()
+                                coordinator.barrier()
                             measured = {metric: [] for metric in METRICS}
                             for iteration, (start, end) in enumerate(events):
                                 live = pairs[iteration % 2][1]
                                 host_started = time.perf_counter()
                                 start.record()
+                                if profile:
+                                    torch.cuda.nvtx.range_push(
+                                        f"nccl_ep_pipeline/rank={rank}/{mode}/step={iteration}"
+                                    )
                                 actual = step(mode, bucket, live)
                                 end.record()
                                 submitted = time.perf_counter()
                                 end.synchronize()
                                 completed = time.perf_counter()
+                                if profile:
+                                    torch.cuda.nvtx.range_pop()
                                 measured["cuda_step_ms"].append(start.elapsed_time(end))
                                 measured["host_submit_ms"].append(
                                     (submitted - host_started) * 1000
@@ -199,6 +223,10 @@ def benchmark_steps(
                                 measured["host_step_ms"].append(
                                     (completed - host_started) * 1000
                                 )
+                            if profile:
+                                coordinator.barrier()
+                                if rank == 0:
+                                    torch.cuda.cudart().cudaProfilerStop()
                             for batch, output in zip(
                                 pairs[(samples - 1) % 2][0], actual
                             ):
@@ -225,10 +253,13 @@ def benchmark_steps(
         "config": {
             "buckets": buckets,
             "cases": list(cases),
-            "layers": 2,
+            "layers": len(dispatchers),
             "samples_per_round": samples,
             "warmups_per_block": warmups,
             "rounds": rounds,
+            "modes": list(modes),
+            "profiled": profile,
+            "profile_bucket": profile_bucket,
             "seed": 32774,
             "hidden": 2048,
             "top_k": 2,

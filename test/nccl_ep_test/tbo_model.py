@@ -21,19 +21,28 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
 
-def _layer(model):
+def _layer(model, residual_scale=None, input_transform=None):
     def begin(state, hidden_states, forward_batch, tbo_subbatch_index, **kwargs):
         if hasattr(model.topk, "set_subbatch"):
             model.topk.set_subbatch(
                 tbo_subbatch_index, forward_batch.tbo_parent_token_range
             )
-        state.hidden_states_mlp_input = hidden_states
+        state.hidden_states_mlp_input = (
+            input_transform(hidden_states)
+            if input_transform is not None
+            else hidden_states
+        )
         state.forward_batch = forward_batch
         state.tbo_subbatch_index = tbo_subbatch_index
+        if residual_scale is not None:
+            state.layer_input = hidden_states
 
     def finish(state):
+        hidden_states = state.pop("hidden_states_mlp_output")
+        if residual_scale is not None:
+            hidden_states = state.pop("layer_input") + hidden_states * residual_scale
         result = dict(
-            hidden_states=state.pop("hidden_states_mlp_output"),
+            hidden_states=hidden_states,
             forward_batch=state.pop("forward_batch"),
             tbo_subbatch_index=state.pop("tbo_subbatch_index"),
             residual=None,
@@ -54,7 +63,16 @@ def _layer(model):
 
 
 def forward_tbo(
-    models, x, *, split=None, padded=None, counts=None, mode, children=None
+    models,
+    x,
+    *,
+    split=None,
+    padded=None,
+    counts=None,
+    mode,
+    children=None,
+    residual_scale=None,
+    input_transform=None,
 ):
     children = (
         children
@@ -83,7 +101,9 @@ def forward_tbo(
     )
     strategy = OperationsStrategy.concat(
         [
-            _compute_moe_deepseek_layer_operations_strategy_tbo(_layer(model), mode)
+            _compute_moe_deepseek_layer_operations_strategy_tbo(
+                _layer(model, residual_scale, input_transform), mode
+            )
             for model in models
         ]
     )

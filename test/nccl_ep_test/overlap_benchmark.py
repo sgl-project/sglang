@@ -1,12 +1,16 @@
-"""Matched two-layer MoE timing with real shared/Triton experts and native EP.
+"""Matched continuous MoE pipeline with shared/Triton experts and native EP.
 
 Run each configuration in a fresh torchrun process. Attention is an identity
 fixture; these measurements do not establish serving throughput or model quality.
+All layers execute in one TBO schedule, with one split/merge per forward.
+Pre-normalization and residuals keep synthetic activations bounded. Weights and routing
+are tied across layers; this is not a checkpoint or a full-model benchmark.
 No EP audit wrappers or EPLB weight migration run inside the timed steps.
 """
 
 import argparse
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,8 +37,19 @@ def fixture(bucket, **kwargs):
     return replace(batch, tokens=tuple(x / 64 for x in batch.tokens))
 
 
-def run(coordinator, *, sbo=False, tbo=False, fixture_fn=fixture, **options):
+def run(
+    coordinator,
+    *,
+    sbo=False,
+    tbo=False,
+    fixture_fn=fixture,
+    layers=4,
+    intermediate=1408,
+    residual_scale=0.125,
+    **options,
+):
     from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+    from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
         NcclEpBuffer,
         NcclEpDispatcher,
@@ -45,12 +60,24 @@ def run(coordinator, *, sbo=False, tbo=False, fixture_fn=fixture, **options):
     from sglang.srt.runtime_context import get_flags, get_resources
 
     rank = coordinator.rank
+    if (
+        layers < 2
+        or intermediate < 128
+        or intermediate % 128
+        or not math.isfinite(residual_scale)
+        or residual_scale <= 0
+    ):
+        raise ValueError(
+            "Use at least two layers and a positive block-128 intermediate"
+        )
     experts = coordinator.world_size * 2
     configure_compute(graph_enabled=True)
     placement = metadata(
-        [list(range(experts))] * 2, ep_size=coordinator.world_size, rank=rank
+        [list(range(experts))] * layers, ep_size=coordinator.world_size, rank=rank
     )
-    _, global_quant, config = make_compute_fixture(hidden=2048, experts=experts)
+    _, global_quant, config = make_compute_fixture(
+        hidden=2048, intermediate=intermediate, experts=experts
+    )
     config = replace(
         config, num_experts=experts, num_local_experts=2, routed_scaling_factor=1.0
     )
@@ -77,7 +104,9 @@ def run(coordinator, *, sbo=False, tbo=False, fixture_fn=fixture, **options):
     ), patch.object(get_resources(), "expert_location_metadata", placement), patch(
         "sglang.srt.layers.linear.get_tp_group", return_value=coordinator
     ):
-        shared = make_shared_mlp(hidden=2048)
+        shared = make_shared_mlp(hidden=2048, intermediate=intermediate)
+        norm = RMSNorm(2048, eps=1e-6).cuda().bfloat16().eval().requires_grad_(False)
+        norm.weight.data.fill_(1)
         dispatcher_type = MaybeTboDeepEPDispatcher if tbo else NcclEpDispatcher
         models = [
             make_moe(
@@ -92,42 +121,61 @@ def run(coordinator, *, sbo=False, tbo=False, fixture_fn=fixture, **options):
                 scale=1.0,
                 sbo=sbo,
             )
-            for layer in range(2)
+            for layer in range(layers)
         ]
 
-        def layer(model, x, ids, weights, rank):
-            model.topk.ids, model.topk.weights = ids, weights
+        def pipeline(models, x, ids, weights, rank):
+            for model in models:
+                model.topk.ids, model.topk.weights = ids, weights
+                model.topk.start = 0
             if tbo:
                 split = len(x) // 2
                 combined = forward_tbo(
-                    [model],
+                    models,
                     x,
                     split=split,
                     padded=(split, len(x) - split),
                     counts=(None, None),
                     mode=ForwardMode.DECODE,
+                    residual_scale=residual_scale,
+                    input_transform=norm,
                 )
             else:
-                combined = model.forward_deepep(
-                    x, SimpleNamespace(num_token_non_padded=None)
-                )
+                combined = x
+                for model in models:
+                    output = model.forward_deepep(
+                        norm(combined), SimpleNamespace(num_token_non_padded=None)
+                    )
+                    combined = combined + output * residual_scale
             return None, None, combined
 
         def verify(batch, rank, received, counters, combined):
-            wanted = expected_output(
-                batch, rank, global_quant, shared, 1.0, compute_backend="triton"
-            )
+            wanted = batch.tokens[rank].cpu().bfloat16()
+            for _ in range(layers):
+                inputs = list(batch.tokens)
+                # Match device normalization rounding before the independent
+                # unpadded expert oracle; CPU RMSNorm drift compounds over 26 layers.
+                inputs[rank] = norm(wanted.cuda()).cpu()
+                output = expected_output(
+                    replace(batch, tokens=tuple(inputs)),
+                    rank,
+                    global_quant,
+                    shared,
+                    1.0,
+                    compute_backend="triton",
+                ).bfloat16()
+                wanted = wanted + output * residual_scale
             torch.testing.assert_close(
-                combined.cpu().float(), wanted, rtol=0.02, atol=0.02
+                combined.cpu().float(), wanted.float(), rtol=0.02, atol=0.02
             )
 
         try:
             result = benchmark_steps(
                 rank,
                 coordinator,
-                models,
+                [models],
                 fixture=fixture_fn,
-                run_layer=layer,
+                run_layer=pipeline,
                 verify=verify,
                 retain_eager_output=False,
                 **options,
@@ -136,14 +184,20 @@ def run(coordinator, *, sbo=False, tbo=False, fixture_fn=fixture, **options):
             torch.cuda.synchronize()
             NcclEpBuffer.destroy()
     result.update(
-        implementation="nccl_ep_shared_triton_overlap",
+        implementation="nccl_ep_shared_triton_pipeline_v2",
         tolerance={"rtol": 0.02, "atol": 0.02},
-        measurement_scope="Two independent MoE layers with shared MLP, Triton routed GEMMs, GPU input/routing/weight copies and native EP. TBO uses identity attention stages. Excludes audit wrappers, oracle, warmup, capture, JIT, barriers and EPLB migration.",
+        measurement_scope="Continuous residual MoE pipeline, one input copy and one TBO split/merge per forward, shared MLP, Triton routed GEMMs and native EP. Identity attention; tied synthetic weights/routing. Excludes oracle, warmup, capture, JIT, barriers and EPLB migration.",
         output_ownership="Production model outputs; no receive snapshots or extra driver clones.",
     )
     result["config"].update(
         sbo=sbo,
         tbo=tbo,
+        layers=layers,
+        residual_scale=residual_scale,
+        pre_normalization="RMSNorm, eps=1e-6, unit weight",
+        continuous_pipeline=True,
+        weights_tied_across_layers=True,
+        ep_rounds_per_rank_per_forward=layers * (2 if tbo else 1),
         routed_scaling_factor=1.0,
         shared_experts=2,
         world_size=coordinator.world_size,
@@ -163,8 +217,9 @@ def summarize(reports):
         if (
             not report.get("passed")
             or not report.get("native_ep_tested")
+            or report.get("result", {}).get("config", {}).get("profiled", False)
             or report.get("result", {}).get("implementation")
-            != "nccl_ep_shared_triton_overlap"
+            != "nccl_ep_shared_triton_pipeline_v2"
         ):
             raise ValueError("Both native benchmark ranks must pass")
     if (
@@ -178,7 +233,7 @@ def summarize(reports):
         for b in config["buckets"]
         for c in config["cases"]
         for r in range(config["rounds"])
-        for m in ("eager", "graph")
+        for m in config.get("modes", ("eager", "graph"))
     }
     indexed = []
     for report in reports:
@@ -193,7 +248,7 @@ def summarize(reports):
     rows = []
     for bucket in config["buckets"]:
         for case in config["cases"]:
-            for mode in ("eager", "graph"):
+            for mode in config.get("modes", ("eager", "graph")):
                 metrics = {}
                 for metric in ("cuda_step_ms", "host_submit_ms", "host_step_ms"):
                     values = []
@@ -227,6 +282,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sbo", action="store_true")
     parser.add_argument("--tbo", action="store_true")
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--intermediate", type=int, default=1408)
+    parser.add_argument("--graph-only", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-bucket", type=int)
     parser.add_argument("--buckets", nargs="+", type=int, default=[8, 32])
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=20)
@@ -243,6 +303,10 @@ def main():
         return
     if args.report_dir is None:
         parser.error("--report-dir is required for measurement")
+    if args.profile:
+        from .performance_trace import annotate_replays
+
+        annotate_replays()
     if any(b < 2 or b > 1024 or b % 2 for b in args.buckets):
         parser.error("use even buckets in [2, 1024] for matched TBO comparisons")
     if args.samples < 2 or args.warmups < 2 or args.rounds < 2 or args.rounds % 2:
@@ -253,6 +317,11 @@ def main():
             coordinator,
             sbo=args.sbo,
             tbo=args.tbo,
+            layers=args.layers,
+            intermediate=args.intermediate,
+            modes=("graph",) if args.graph_only else ("eager", "graph"),
+            profile=args.profile,
+            profile_bucket=args.profile_bucket,
             buckets=args.buckets,
             samples=args.samples,
             warmups=args.warmups,

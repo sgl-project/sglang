@@ -207,11 +207,50 @@ independent expert GEMMs outside timing. The summary aligns rank samples before
 computing maximum-rank median/p95. Compare like buckets, cases and execution
 modes across configurations.
 
-This measures two independent MoE layers with fixed expert placement; it excludes
-attention computation, EPLB migration, JIT, warmup, capture, barriers and oracle
-checks. It uses no EP audit wrappers or receive snapshots. TBO includes its
-staged host execution with identity attention fixtures. It does not establish
-full-model TBO throughput. Keep profiling disabled for timing measurements.
+This now measures a continuous MoE pipeline (`--layers 4` by default), with one
+TBO split/merge for all layers. Each layer consumes the preceding output, with
+RMSNorm and scaled residuals to bound synthetic activations. Routed intermediate
+defaults to 1408; shared intermediate is 2816. Weights and routing are tied across
+layers, attention remains an identity fixture, and this is not a full model.
+The v2 report schema rejects the old independent-layer timing reports.
+
+For a complete performance matrix, the following commands use the selected
+Python environment; they do not connect to or provision a server:
+
+```bash
+export PYTHONPATH="$PWD/python:$PWD/test"
+export PERF_REPORTS=/tmp/nccl-ep-performance
+python -m nccl_ep_test.performance_suite plan --reports "$PERF_REPORTS"
+python -m nccl_ep_test.performance_suite pipeline --reports "$PERF_REPORTS"
+python -m nccl_ep_test.performance_suite model --reports "$PERF_REPORTS"
+python -m nccl_ep_test.performance_suite summary --reports "$PERF_REPORTS"
+python -m nccl_ep_test.performance_suite profile --reports "$PERF_REPORTS"
+```
+
+The default matrix compares serial/TBO in forward and reverse configuration
+order. `--configurations serial sbo tbo sbo-tbo` extends every phase consistently.
+Pipeline depths are 4/26 and per-rank buckets are 8/32/64. The full-model driver
+loads all 27 layers of the pinned DeepSeek-V2-Lite FP8 checkpoint via the upstream
+one-batch loader, including 26 MoE layers and real attention. Initial prefill is
+one token per request, within the LL budget. It then performs 32 warmup decode
+steps and measures 64 steps, for two rounds per bucket. KV histories are fixed
+by teacher-forced, rank-specific token IDs; sampling and HTTP are excluded.
+With attention DP=2, aggregate tokens per step are twice the per-rank bucket.
+
+Each timed step must actually use Graph and the requested TBO mode. Reports
+retain both ranks' raw CUDA-event and host latencies, median/p95, environment,
+source SHA, and endpoint logits. Summaries compare like checkpoints (rtol/atol
+0.02), reject stale/incomplete/profiled evidence and report maximum-rank latency.
+These tests do not establish generation quality. EPLB migration is disabled.
+
+The profile phase first validates the unprofiled matrix. It uses the same
+implementations and maximum capacities, selecting eight post-warmup Graph steps
+at the smallest/largest bucket. It exports `.nsys-rep`, SQLite and per-step kernel
+activity checks. Kernel overlap does not measure all networking progress between
+send and complete. Profiled timings never enter the performance comparison.
+Existing report directories are not overwritten. A failed run retains evidence;
+retry with a fresh report root. OOM waits 1–5 minutes before returning failure
+and does not clear other jobs' memory.
 
 ## Matched measurement and profiling
 
