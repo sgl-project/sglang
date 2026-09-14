@@ -5,7 +5,7 @@
 # Measured at ~195K-token contexts (closed-loop steady state, GPUs 4-7): N=24 1226 -> 1595 tok/s, N=16 1173 -> 1417 tok/s
 # vs the same code without ENVS2 (kernel fix + TOPK_FREQ=4 together; bs=24 step 37.5 -> 29.4 ms).
 # Needle (thinking off) coherent at 5K / 79K / 132K prompt tokens.
-export ENVS2="SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4 SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_TIMEOUT_KEEP_ALIVE=3600"
+export ENVS2="SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4 SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_TIMEOUT_KEEP_ALIVE=3600"
 # --triton-attention-num-kv-splits 64: needs 65958e1554 (the AMD hook used to pin 16); draft dense decode attention 2.9 -> 2.3 ms/step, steady N=24 @195K 1675 -> 1752 tok/s.
 # --speculative-draft-model-quantization unquant (bf16 draft) is what Track B measured; v2 default also works.
 # --cuda-graph-backend-prefill breakable: prefill/extend graph replay (needs e0da9ebec1: M3 sparse attention as an eager break).
