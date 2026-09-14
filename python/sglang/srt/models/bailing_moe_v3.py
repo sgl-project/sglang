@@ -432,6 +432,16 @@ class BailingMoEGate(nn.Module):
         return logits
 
 
+def _get_bailing_num_shared_experts(config: PretrainedConfig) -> int:
+    shared_intermediate_size = getattr(
+        config, "moe_shared_expert_intermediate_size", None
+    )
+    num_shared_experts = getattr(config, "num_shared_experts", 0) or 0
+    if shared_intermediate_size is None:
+        return num_shared_experts
+    return max(1, num_shared_experts) if shared_intermediate_size > 0 else 0
+
+
 class BailingMoE(nn.Module):
     @staticmethod
     def _get_swiglu_limit(limit_list, layer_num):
@@ -463,7 +473,7 @@ class BailingMoE(nn.Module):
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
-        self.num_shared_experts = getattr(config, "num_shared_experts", 0)
+        self.num_shared_experts = _get_bailing_num_shared_experts(config)
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
         self.multi_gate = is_bailing_multi_gate_enabled(config)
@@ -1477,7 +1487,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         quant_config,
         expected_architecture="BailingMoeV3ForCausalLM",
     ):
-        num_shared_experts = getattr(hf_config, "num_shared_experts", 0)
+        num_shared_experts = _get_bailing_num_shared_experts(hf_config)
         if num_shared_experts == 0:
             return None
         if not get_moe_a2a_backend().is_none():
@@ -1563,7 +1573,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.num_fused_shared_experts = (
             0
             if is_shared_experts_fusion_disabled()
-            else getattr(self.config, "num_shared_experts", 0)
+            else _get_bailing_num_shared_experts(self.config)
         )
         if self.num_fused_shared_experts == 0:
             return
