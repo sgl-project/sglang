@@ -3,11 +3,11 @@ title: "Structured Outputs"
 metatags:
     description: "SGLang structured outputs: JSON schema, regex, EBNF constraints. XGrammar, Outlines, Llguidance backends for guaranteed output format."
 ---
-You can specify a JSON schema, [regular expression](https://en.wikipedia.org/wiki/Regular_expression) or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request.
+You can specify a JSON schema, [regular expression](https://en.wikipedia.org/wiki/Regular_expression) or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request. With XGrammar, the existing `ebnf` parameter also accepts [Lark grammar](https://lark-parser.readthedocs.io/en/latest/grammar.html) syntax.
 
 SGLang supports three grammar backends:
 
-- [XGrammar](https://github.com/mlc-ai/xgrammar)(default): Supports JSON schema, regular expression, and EBNF constraints.
+- [XGrammar](https://github.com/mlc-ai/xgrammar)(default): Supports JSON schema, regular expression, EBNF, and Lark grammar syntax through the `ebnf` parameter.
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 - [Llguidance](https://github.com/guidance-ai/llguidance): Supports JSON schema, regular expression, and EBNF constraints.
 
