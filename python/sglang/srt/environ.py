@@ -1914,6 +1914,10 @@ def third_party_cache_defaults() -> Dict[str, str]:
         "TRITON_CACHE_DIR": os.path.join(base, "triton"),
         "TORCHINDUCTOR_CACHE_DIR": os.path.join(base, "inductor"),
         "CUDA_CACHE_PATH": os.path.join(base, "nv"),
+        # TileLang compiles the DeepSeek-V4 MHC prenorm kernels; left at its own
+        # default the burst is invisible to anyone warming, mounting or baking
+        # SGLANG_CACHE_DIR, and gets paid again on every cold container.
+        "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,

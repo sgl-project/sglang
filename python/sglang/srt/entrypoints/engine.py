@@ -1783,6 +1783,7 @@ def _log_legacy_kernel_cache_dirs():
             os.path.expanduser("~/.triton"),
             os.path.expanduser("~/.cache/flashinfer"),
             os.path.expanduser("~/.cache/deep_gemm"),
+            os.path.expanduser("~/.tilelang/cache"),
         )
         if os.path.isdir(d)
     ]
