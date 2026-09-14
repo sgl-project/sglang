@@ -2,7 +2,7 @@
 //
 //! Hugging Face tokenizer configs contain Jinja templates. SGLang also accepts
 //! legacy conversation JSON files and the names in Python's template registry.
-//! Legacy definitions are rendered by a native port of Python's
+//! Legacy definitions are rendered by a Rust implementation of Python's
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn json_legacy_template_is_rendered_natively() {
+    fn json_legacy_template_is_rendered() {
         let base = std::env::temp_dir().join(format!(
             "sglang-openai-template-base-{}-test.json",
             std::process::id()
