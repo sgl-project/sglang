@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -26,6 +26,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    compact_accept_to_front,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -413,49 +415,31 @@ def _finalize_accept_tree_path(
     *,
     token_to_kv_pool_allocator: Any,
     num_draft_tokens: int,
+    state_captures: Sequence[Optional[TopkCaptureOutput]],
 ) -> torch.Tensor:
-    """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
-    hidden_states -- to the contiguous front of each per-req block, which the
-    downstream chain-layout code (draft-extend select_index, committed-KV reads)
-    assumes. Returns compacted predict; mutates logits_output.hidden_states
-    (moved only when present)."""
+    """Tree drafting (topk > 1): move the accepted path -- KV slots, state
+    captures, predict, hidden_states -- to the contiguous front of each per-req
+    block, which the downstream chain-layout code (draft-extend select_index,
+    committed-KV reads) assumes. Returns compacted predict; mutates
+    logits_output.hidden_states (moved only when present)."""
     move_accept_tokens_to_target_kvcache(
-        batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
+        batch,
+        accept_index,
+        accept_lens - 1,
+        token_to_kv_pool_allocator,
+        state_captures=state_captures,
     )
-    predict = _compact_accept_to_front(
+    predict = compact_accept_to_front(
         predict, accept_index, bs, num_draft_tokens=num_draft_tokens
     )
     if logits_output.hidden_states is not None:
-        logits_output.hidden_states = _compact_accept_to_front(
+        logits_output.hidden_states = compact_accept_to_front(
             logits_output.hidden_states,
             accept_index,
             bs,
             num_draft_tokens=num_draft_tokens,
         )
     return predict
-
-
-def _compact_accept_to_front(
-    x: torch.Tensor,
-    accept_index: torch.Tensor,
-    bs: int,
-    *,
-    num_draft_tokens: int,
-) -> torch.Tensor:
-    """Gather the accepted tree path to the front of each per-req block.
-
-    ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
-    ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
-    Padded entries clamp to node 0 but land past accept_lens (never read);
-    trailing unaccepted slots stay and are freed as overshoot.
-    """
-    nd = num_draft_tokens
-    s1 = accept_index.shape[1]  # spec_steps + 1
-    safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
-    gathered = x[safe]
-    out = x.clone()
-    out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
-    return out
 
 
 def run_eagle_verify(
@@ -649,6 +633,10 @@ def run_eagle_verify(
             bs,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             num_draft_tokens=num_draft_tokens,
+            state_captures=(
+                forward_batch_output.routed_experts_output,
+                forward_batch_output.indexer_topk_output,
+            ),
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
