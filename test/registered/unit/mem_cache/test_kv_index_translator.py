@@ -633,6 +633,70 @@ class TestWriteLoc(CustomTestCase):
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
             self.assertTrue(torch.equal(virt, keep))
 
+    def test_capture_capacity_covers_dcp_widened_mamba_ids(self):
+        """A capturer must store the highest virtual IDs issued under DCP."""
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.runtime_context import get_parallel
+
+        for dcp_size in (1, 2, 4):
+            with (
+                self.subTest(dcp_size=dcp_size),
+                get_parallel().override(attn_dcp_size=dcp_size),
+            ):
+                pool = UnifiedKVPool(
+                    total_bytes=2048,
+                    sub_pool_specs=[
+                        MHASubPoolSpec(
+                            name="full",
+                            layer_num=1,
+                            head_num=1,
+                            head_dim=4,
+                            store_dtype=torch.float16,
+                            grow_direction="up",
+                        ),
+                        MambaSubPoolSpec(
+                            name="mamba",
+                            layer_num=1,
+                            conv_state_shapes=((2, 2),),
+                            conv_dtype=torch.float16,
+                            temporal_state_shape=(2, 2),
+                            temporal_dtype=torch.float16,
+                            grow_direction="down",
+                        ),
+                    ],
+                    device="cpu",
+                    enable_memory_saver=False,
+                    page_size=4,
+                )
+                allocator = UnifiedMambaTokenToKVPoolAllocator(
+                    unified_buffer=pool,
+                    kvcache=SimpleNamespace(full_kv_pool=None, mamba_pool=None),
+                    device="cpu",
+                    page_size=4,
+                )
+                virt = allocator.alloc(allocator.available_size())
+                self.assertIsNotNone(virt)
+                src = _make_source(allocator, virt[None, :], 4)
+                cap = object.__new__(BaseTopkCapturer)
+                cap.topk_size = 1
+                expected = torch.arange(len(virt), dtype=torch.int32).reshape(-1, 1, 1)
+                cap.device_cache = SimpleNamespace(buffer=expected)
+                cap.host_cache = SimpleNamespace(
+                    buffer=torch.zeros(
+                        src.capture_token_capacity(1), 1, 1, dtype=torch.int32
+                    )
+                )
+                fb = _FakeForwardBatch(out_cache_loc=virt)
+                fb.out_cache_loc_virtual = virt
+                cap.on_forward_end(fb, False, None, no_copy_to_cpu=False)
+                req_pool = SimpleNamespace(req_to_token=virt[None, :])
+                self.assertTrue(
+                    torch.equal(cap.get_topk(0, len(virt) + 1, req_pool), expected)
+                )
+
     def test_topk_capture_round_trips_request_token_ids(self):
         for ps in (1, 4, 64):
             for translating in (False, True):

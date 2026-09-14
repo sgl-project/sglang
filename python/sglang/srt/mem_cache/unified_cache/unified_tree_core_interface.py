@@ -154,6 +154,8 @@ class UnifiedTreeCoreInterface(ABC):
     is_write_back: bool
     has_swa_host_pool: bool
     swa_write_back_eviction_barrier_enabled: bool
+    # Whether the host tier stages one node per FIFO backup intent.
+    is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
@@ -186,6 +188,22 @@ class UnifiedTreeCoreInterface(ABC):
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
+
+    # Logical-page KV sharding: whether this core stamps and honors
+    # UnifiedTreeNode.rotation_base. A core that does not cannot serve a
+    # sharded allocator (it would never decline a cross-base graft), and
+    # UnifiedRadixCache.__init__ rejects that pairing at construction.
+    supports_rotation_base: bool = False
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain).
+
+        Concrete, not abstract: a core that does not track rotation bases
+        stays constructible, and its None means "sharding is off" -- never
+        "sharding is on but unknown", which the constructor gate rules out.
+        """
+        return None
 
     @abstractmethod
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
@@ -445,6 +463,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def enable_swa_write_back_eviction_barrier(self) -> None:
         """Preserve dirty SWA before cache-mode write-back eviction."""
+        ...
+
+    @abstractmethod
+    def set_host_memory_buffer_only(self) -> None:
+        """Mark the host tier as buffer-only: one node staged per backup intent."""
         ...
 
     @abstractmethod

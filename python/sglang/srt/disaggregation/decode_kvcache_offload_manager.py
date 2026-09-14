@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
@@ -208,7 +209,9 @@ class DecodeKVCacheOffloadManager:
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
+                req.origin_input_ids[:prefill_offloaded_len],
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
@@ -364,7 +367,12 @@ class DecodeKVCacheOffloadManager:
         pool_transfers=(),
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
+        page_hashes = self._compute_prefix_hash(
+            incremental_tokens,
+            prior_hash,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+        )
         for transfer in pool_transfers:
             page_count = transfer.device_indices.numel() // self.page_size
             transfer.keys = page_hashes[-page_count:]
@@ -382,9 +390,12 @@ class DecodeKVCacheOffloadManager:
         )
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(self, tokens, prior_hash=""):
+    def _compute_prefix_hash(
+        self, tokens, prior_hash="", extra_key=None, cache_salt=None
+    ):
+        """Match prefill storage hashes."""
         page_hashes = []
-        last_hash = prior_hash
+        last_hash = prior_hash or storage_namespace_seed(extra_key, cache_salt)
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)

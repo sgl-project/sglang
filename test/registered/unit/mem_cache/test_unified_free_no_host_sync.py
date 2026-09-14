@@ -65,7 +65,7 @@ _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "free"),
     (mea.MultiEndedAllocator, "free_physical"),
     (mea.MultiEndedAllocator, "_commit_move_batch"),
-    (unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator, "clear_full_to_swa_mapping"),
+    (unified_hybrid_swa.UnifiedSWAAllocatorBase, "clear_full_to_swa_mapping"),
     (mea.FloatMultiEndedAllocator, "free"),
     (mea.FloatMultiEndedAllocator, "make_room"),
     (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
@@ -329,6 +329,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
@@ -348,9 +349,13 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
-                self.assertIn("free_page_reps_group", inspect.getsource(cls))
+                alloc = object.__new__(cls)
+                alloc.free_group = None
+                alloc.free_group_begin()
+                self.assertEqual(alloc.free_page_reps_group, [])
 
 
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):

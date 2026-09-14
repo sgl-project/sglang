@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -30,7 +31,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
@@ -90,13 +91,27 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
-    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+    def _collect_unbacked_swa_nodes(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
+        """Nodes whose SWA data needs a host backup, deepest first.
+
+        Buffer mode stages one node per FIFO backup intent; cache mode backs
+        up every device-only node within one sliding window of ``node``.
+        """
         if not self.tree_core.has_swa_host_pool:
             return []
+        if self.tree_core.is_host_memory_buffer_only:
+            cd = node.component_data[self.component_type]
+            return [node] if cd.value is not None else []
+        return self._collect_unbacked_swa_nodes_in_window(node)
 
+    def _collect_unbacked_swa_nodes_in_window(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
         ct = self.component_type
         covered = 0
-        dirty: list[UnifiedTreeNode] = []
+        unbacked: list[UnifiedTreeNode] = []
         cur = node
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
@@ -110,12 +125,12 @@ class SWAComponent(TreeComponent):
                 break
             covered += len(value)
             if cd.value is not None and cd.host_value is None:
-                dirty.append(cur)
+                unbacked.append(cur)
             cur = cur.parent
-        return dirty
+        return unbacked
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return bool(self._dirty_backup_window(node))
+        return bool(self._collect_unbacked_swa_nodes(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -310,11 +325,9 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv never caches the SWA ring (per-request, not content-stable),
-        # so SWA bookkeeping must not gate the match here.
-        swa_device_only_hicache = (
-            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
-        )
+        # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
+        # must not gate prefix matching.
+        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -322,7 +335,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                if swa_req_ring and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)
@@ -610,9 +623,6 @@ class SWAComponent(TreeComponent):
             parent_swa_data = new_parent.component_data[self.component_type]
             child_swa_data = child.component_data[self.component_type]
             parent_swa_data.host_lock_ref = child_swa_data.host_lock_ref
-            host_uuid = child_swa_data.metadata.pop("host_uuid", None)
-            if host_uuid is not None:
-                parent_swa_data.metadata["host_uuid"] = host_uuid
 
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             # Host-locked halves stay out of the host LRU: in-flight IO
@@ -621,7 +631,10 @@ class SWAComponent(TreeComponent):
                 new_parent.component_data[self.component_type].value is None
                 and parent_swa_data.host_lock_ref == 0
             ):
-                host_lru.insert_mru(new_parent)
+                if host_lru.in_list(child):
+                    host_lru.insert_after(child, new_parent)
+                else:
+                    host_lru.insert_mru(new_parent)
             if (
                 child.component_data[self.component_type].value is None
                 and child_swa_data.host_lock_ref == 0
@@ -942,6 +955,11 @@ class SWAComponent(TreeComponent):
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
+        # A recurrent checkpoint must stay attached to its exact token prefix.
+        # Let MambaComponent select the insertion length for hybrid caches.
+        if self.cache.is_mamba_enabled:
+            return None
+
         branching_seqlen = req.swa_branching_seqlen
         if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
             return None
@@ -1014,8 +1032,7 @@ class SWAComponent(TreeComponent):
         elif prefetch_pages <= 0:
             return PreparePrefetchResult()
         elif (
-            self.tree_core.is_root(node_id)
-            or self.cache.host_memory_mode == "buffer_only"
+            self.tree_core.is_root(node_id) or self.tree_core.is_host_memory_buffer_only
         ):
             # Sub-window fetch: at root the sequence IS its window; mid-tree
             # (buffer mode) the window head is the device prefix's own ring
@@ -1055,35 +1072,32 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if self.cache.host_memory_mode == "buffer_only":
-                # Buffer mode stages one node/hash span per FIFO backup intent.
-                cd = node.component_data[ct]
-                dirty = [node] if cd.value is not None else []
-            else:
-                dirty = self._dirty_backup_window(node)
-            if not dirty:
+            unbacked_swa_nodes = self._collect_unbacked_swa_nodes(node)
+            if not unbacked_swa_nodes:
                 return None
-            dirty.reverse()
+            unbacked_swa_nodes.reverse()
             allocator = self._unified_allocator()
             if allocator is not None:
                 full_values = []
-                for dirty_node in dirty:
-                    full_value = dirty_node.component_data[BASE_COMPONENT_TYPE].value
+                for unbacked_node in unbacked_swa_nodes:
+                    full_value = unbacked_node.component_data[BASE_COMPONENT_TYPE].value
                     assert full_value is not None
-                    assert len(full_value) == len(dirty_node.component_data[ct].value)
+                    assert len(full_value) == len(
+                        unbacked_node.component_data[ct].value
+                    )
                     full_values.append(full_value)
                 device_indices = allocator.translate_swa_indices_for_transfer(
                     torch.cat(full_values)
                 )
             else:
                 device_indices = torch.cat(
-                    [n.component_data[ct].value for n in dirty]
+                    [n.component_data[ct].value for n in unbacked_swa_nodes]
                 ).to(torch.int64)
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     device_indices=device_indices,
-                    nodes_to_load=[n.id for n in dirty],
+                    nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
             ]
 

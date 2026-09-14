@@ -350,6 +350,24 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             pool.set_kv_buffer_prefix_valid()
 
+    def test_pd_registration_is_one_whole_envelope(self):
+        """PD registers ONE region -- the whole raw buffer -- with the page
+        envelope as the item, so the transfer engine addresses it as
+        `raw_ptr + physical_page * page_envelope_bytes`. Per-layer regions
+        would be wrong here: the per-layer views overlap inside the envelope
+        and index in kernel-facing ids, not token ids."""
+        kv, pool = _make_pool_and_kv(1)
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), 1)
+        self.assertEqual(len(lens), 1)
+        self.assertEqual(len(item_lens), 1)
+        self.assertEqual(ptrs[0], kv._raw.data_ptr())
+        self.assertEqual(lens[0], kv._raw.numel())
+        self.assertEqual(item_lens[0], pool._page_bytes)
+        # The whole addressable page range must fit the registered region, or
+        # the last page's write would run off the end of the RDMA mapping.
+        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
+
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE must not flip this pool's layout: HND indexes
         4-D while the per-layer views are 3-D, so the pinned label has to win."""
