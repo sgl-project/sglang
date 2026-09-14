@@ -16,7 +16,9 @@ server:
     --tp-size: 2
     --port: 30000
     --mem-fraction-static: 0.85
-    --max-total-tokens: 32768
+    # must cover max-concurrency x (input+output) or the scheduler retracts
+    # mid-run (KV pool full -> retract -> recompute), skewing high-conc cells
+    --max-total-tokens: 131072
   env:
     # Ascend-documented tuning knobs (see docs ascend-npus parameter_tuning)
     HCCL_BUFFSIZE: "1200"
@@ -24,9 +26,11 @@ server:
     # Ascend NPU graph capture: keep <= 10 batch sizes (507000 crash guard;
     # also enforced by config validation).  sglang 0.5.x splits capture
     # lists by phase; decode-phase sizes are what decode-heavy sweeps hit.
+    # The list must cover the workload's max --max-concurrency: batches above
+    # the largest captured size fall back to eager decode (~10x slower).
     --cuda-graph-bs-decode:
-      - [1, 2, 4, 8]
       - [1, 2, 4, 8, 16, 32]
+      - [1, 2, 4, 8, 16, 32, 64]
     --chunked-prefill-size: [4096, 8192]
 
 workload:

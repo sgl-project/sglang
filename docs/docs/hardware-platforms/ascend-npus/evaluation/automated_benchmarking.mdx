@@ -58,9 +58,12 @@ ranking.
 
 ## Dataset selection
 
-- `random` — synthetic fixed input/output lengths. No download needed on
-  the bench host, fully controlled ISL/OSL; the default for cookbook
-  sweeps.
+- `random` — synthetic fixed input/output lengths, fully controlled
+  ISL/OSL. `bench_serving` still loads a tokenizer (`get_tokenizer` before
+  dataset sampling), so on NAT-ed hosts point it at local weights and set
+  `HF_HUB_OFFLINE=1`.
+- `random-ids` — synthesizes token ids directly; the zero-network variant
+  we use on offline bench hosts (verified during the A3 bring-up).
 - `generated-shared-prefix` — grouped prompts sharing prefixes, for
   systems where radix/prefix caching matters.
 - `sharegpt` — real conversation lengths; pre-download the dataset and
