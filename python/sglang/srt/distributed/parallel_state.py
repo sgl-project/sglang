@@ -92,16 +92,34 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
-        return None
+    if group_name == "dcp":
+        # DCP exchanges decode queries and partial attention states, whose
+        # communication footprint is much smaller than the EP64 DeepEP remote
+        # window.  Allow it to use a group-local HCCL buffer instead of
+        # inheriting the global/DeepEP-sized window.  Leaving the variable
+        # unset preserves the upstream HCCL default behavior.
+        hccl_buffer_size_str = os.environ.get("DCP_HCCL_BUFFSIZE")
+        if hccl_buffer_size_str is None:
+            return None
+    else:
+        # Only create HCCL options for the default group or MoE-related groups.
+        if group_name is not None and "moe" not in group_name:
+            return None
+        hccl_buffer_size_str = (
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or "200"
+        )
 
     import torch_npu
 
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
-    )
+    hccl_buffer_size = int(hccl_buffer_size_str)
+    if hccl_buffer_size <= 0:
+        raise ValueError(
+            f"HCCL buffer size for group {group_name!r} must be positive, "
+            f"got {hccl_buffer_size}."
+        )
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     return options
 
