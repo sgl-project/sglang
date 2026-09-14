@@ -321,6 +321,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             input_top_logprobs=input_top_logprobs,
                             output_token_logprobs=output_token_logprobs,
                             output_top_logprobs=output_top_logprobs,
+                            tokenizer=self.tokenizer_manager.tokenizer,
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
@@ -591,6 +592,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     output_top_logprobs=ret_item["meta_info"].get(
                         "output_top_logprobs", []
                     ),
+                    tokenizer=self.tokenizer_manager.tokenizer,
                 )
 
             # Handle hidden states

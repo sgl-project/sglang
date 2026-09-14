@@ -14,17 +14,79 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# GPT-2 style byte-level BPE decoder table (char -> raw byte). Byte-level BPE
+# vocab tokens are stored as a printable-char mapping of the raw UTF-8 bytes
+# (see openai/gpt-2 bytes_to_unicode); converting a token id back to its raw
+# bytes must go through this table, NOT through `token.encode()` on the
+# detokenized display string (that loses fragmentary bytes as U+FFFD).
+_BYTE_DECODER: Dict[str, int] = {}
+
+
+def _build_byte_decoder() -> Dict[str, int]:
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord(chr(0xA1)), ord(chr(0xAC)) + 1))
+        + list(range(ord(chr(0xAE)), ord(chr(0xFF)) + 1))
+    )
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    cs = [chr(c) for c in cs]
+    return dict(zip(cs, bs))
+
+
+def token_id_to_bytes(tokenizer, token_id) -> Optional[List[int]]:
+    """Raw UTF-8 bytes for a byte-level-BPE token id.
+
+    Returns the token's original bytes via the GPT-2 byte decoder, or None when
+    the token is not byte-level representable (e.g. special ids / non byte BPE),
+    so callers can fall back to the detokenized display string.
+    """
+    global _BYTE_DECODER
+    if not _BYTE_DECODER:
+        _BYTE_DECODER = _build_byte_decoder()
+    try:
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+    except Exception:
+        return None
+    if piece is None:
+        return None
+    out = bytearray()
+    for ch in piece:
+        b = _BYTE_DECODER.get(ch)
+        if b is None:
+            return None
+        out.append(b)
+    if not out:
+        return None
+    return list(out)
+
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
     input_top_logprobs=None,
     output_top_logprobs=None,
+    tokenizer=None,
 ):
+    """Convert engine logprob triples to an OpenAI ``LogProbs`` object.
+
+    Each engine logprob item is a ``(logprob, token_id, token_text)`` triple.
+    ``token_text`` is a detokenized *display* string that loses fragmentary
+    byte-level tokens (a lone byte of a 4-byte char decodes to U+FFFD).  The
+    legacy completions surface has no per-token ``bytes`` field, so when
+    ``tokenizer`` is provided we render fragments losslessly as latin-1
+    (one char per raw byte), keeping the string channel reversible.
+    """
     ret_logprobs = LogProbs()
 
     def append_token_logprobs(token_logprobs):
-        for logprob, _, token_text in token_logprobs:
+        for logprob, token_id, token_text in token_logprobs:
+            token_text = _lossless_token_text(tokenizer, token_id, token_text)
             ret_logprobs.tokens.append(token_text)
             ret_logprobs.token_logprobs.append(logprob)
 
@@ -35,7 +97,10 @@ def to_openai_style_logprobs(
         for tokens in top_logprobs:
             if tokens is not None:
                 ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
+                    {
+                        _lossless_token_text(tokenizer, token_id, token_text): logprob
+                        for logprob, token_id, token_text in tokens
+                    }
                 )
             else:
                 ret_logprobs.top_logprobs.append(None)
@@ -50,6 +115,26 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+def _lossless_token_text(tokenizer, token_id, token_text):
+    """Return a lossless display string for one engine logprob triple.
+
+    Fragmentary byte-level tokens decode to U+FFFD in the display string.  When
+    we can recover the true raw bytes from the token id (byte-level BPE), render
+    them as latin-1 so every byte round-trips; otherwise keep the display text.
+    """
+    if token_text is not None and "\ufffd" not in token_text:
+        return token_text
+    if tokenizer is None or token_id is None:
+        return token_text if token_text is not None else ""
+    raw = token_id_to_bytes(tokenizer, token_id)
+    if raw is None:
+        return token_text if token_text is not None else ""
+    try:
+        return bytes(raw).decode("latin-1")
+    except Exception:
+        return token_text if token_text is not None else ""
 
 
 def process_hidden_states_from_ret(
