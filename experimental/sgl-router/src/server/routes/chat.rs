@@ -786,7 +786,7 @@ pub async fn chat_completions(
     // predicate always has a parsed body to inspect.
     let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
     {
-        (Some(t), Some(v)) if t.chat_rendered && input_ids_safe_to_forward(v) => {
+        (Some(t), Some(v)) if t.rendered_from_chat && input_ids_safe_to_forward(v) => {
             Some(t.ids.as_slice())
         }
         _ => None,
@@ -1377,7 +1377,7 @@ fn ingress_tokenize_offload_failed(
     if !chat_request {
         return false;
     }
-    !request_tokens.is_some_and(|t| t.chat_rendered)
+    !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -1773,11 +1773,11 @@ mod tests {
     /// A chat request on a chat-formatter model that yields engine-equivalent
     /// ids (encode succeeded) is NOT a failure — the offload worked.
     #[test]
-    fn offload_failed_false_when_tokens_chat_rendered() {
+    fn offload_failed_false_when_tokens_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            chat_rendered: true,
+            rendered_from_chat: true,
         };
         assert!(!ingress_tokenize_offload_failed(
             true,
@@ -1804,14 +1804,14 @@ mod tests {
     }
 
     /// Encode produced ids but NOT via the chat formatter (raw fallback,
-    /// `chat_rendered = false`) on a chat-formatter model + chat request →
+    /// `rendered_from_chat = false`) on a chat-formatter model + chat request →
     /// the chat-encode render/encode failed and fell through to the raw path.
     #[test]
-    fn offload_failed_true_when_tokens_not_chat_rendered() {
+    fn offload_failed_true_when_tokens_not_rendered_from_chat() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
-            chat_rendered: false,
+            rendered_from_chat: false,
         };
         assert!(ingress_tokenize_offload_failed(
             true,

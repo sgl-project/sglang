@@ -33,8 +33,9 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
-    pub chat_rendered: bool,
+    /// Whether the IDs came from rendered chat messages.
+    /// Forwarding also requires the request safety guard.
+    pub rendered_from_chat: bool,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -44,8 +45,7 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-formatter tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
+/// Tokenizes requests for routing, preferring chat rendering over raw text.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
@@ -56,7 +56,7 @@ pub fn request_tokens_for(
             if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
                 return Some(RequestTokens {
                     ids,
-                    chat_rendered: true,
+                    rendered_from_chat: true,
                 });
             }
         }
@@ -65,7 +65,7 @@ pub fn request_tokens_for(
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
-        chat_rendered: false,
+        rendered_from_chat: false,
     })
 }
 
