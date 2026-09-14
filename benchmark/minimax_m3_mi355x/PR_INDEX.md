@@ -22,9 +22,9 @@ Upstream base: `origin/main` 39e147443b. Open upstream PRs we stack on (all by z
 | `pr/triton-verify-shared-kv-long-context` | 744bd6e7b3 | 4 | Split-KV / grouped-head verify kernels for EAGLE draft extend and M3 dense layers; head_dim-128 long-context config (24x195K: 2.02 -> 0.38 ms/call); grouped-head decode via the shared-KV kernel (head_dim 128 only); small constant-length extends routed to the verify kernels (twin of the sparse-backend half in `pr/m3-eagle3-chain-verify`). | fixed after REQUEST CHANGES |
 | `pr/triton-extend-long-prefix` | 2b8206eb88 | 3 | Split-prefix extend attention for long cached prefixes (`SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX`, renamed from the benchmark-branch name); aiter CK paged batch-prefill for extends >= 2048 rows (`SGLANG_USE_AITER_EXTEND_LONG_PREFIX`); AMD hook keeps an explicit `--triton-attention-num-kv-splits`. 197K fresh prefill 6.2 -> 5.8 s. | fixed after minor changes |
 | `pr/spec-page-table-parallel-copies` | 77770da139 | 1 | Token-block-parallel page-table copies in the Triton draft backend and EAGLE metadata (419 -> 30 us and 101 -> 13 us per call at 24x200K). | APPROVE |
-| `pr/m3-fused-kv-index-store` | f9710a5e99 | 1 | Fused scale+cast+scatter store for fp8 main and index KV caches (7-8 launches per layer -> 1). | fixed after REQUEST CHANGES |
+| `pr/m3-fused-kv-index-store` | 69d5fc0336 | 1 | Fused scale+cast+scatter store for fp8 main and index KV caches (7-8 launches per layer -> 1). | fixed after REQUEST CHANGES |
 | `pr/m3-sparse-attention-eager-break-bcg` | 0dcf77d879 | 1 | M3 sparse attention runs as an eager break under `--cuda-graph-backend-prefill breakable` (was captured: garbage + faults on replay). Extend forward at 185K: 75 -> 29 ms (20 tok), 118 -> 38 ms (409 tok). | APPROVE |
-| `pr/scheduler-chunked-prefill-fairness` | 544fafd835 | 1 | `SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE`: waiting short extends ride along with an in-flight chunked prefill; TTFT p99 -19% at c=24, throughput neutral. Scheduler hunk is one delegate call. | APPROVE |
+| `pr/scheduler-chunked-prefill-fairness` | e7b5bcf258 | 1 | `SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE`: waiting short extends ride along with an in-flight chunked prefill; TTFT p99 -19% at c=24, throughput neutral. Scheduler hunk is one delegate call. | APPROVE |
 | `pr/quark-online-fp8-excluded-layers` | c1acbbadf1 | 1 | Opt-in load-time per-channel FP8 for quark-excluded bf16 linear layers (ATOM's PTPC-FP8 attention/dense); GSM8K-1000 0.863 vs 0.854 with tuned aiter rows (rows are an aiter-side contribution, referenced). | APPROVE |
 | `pr/router-gemv-128-rows` | 7dd47ba0b2 | 1 | `router_gemv` covers 65-128-row batches (EAGLE verify shapes); base PR 36557 is merged. | APPROVE |
 | `pr/openai-chat-log-rejected-stream` | f84fdb7826 | 1 | Log the validation error (with request id) when a streaming chat request is rejected before its first chunk. | APPROVE |
@@ -43,7 +43,7 @@ Not upstreamed (stay on `M3-perf`): `benchmark/minimax_m3_mi355x/` launch and AI
 
 See the section appended below once the end-to-end run on `integration/m3-all` completes.
 
-## Integration validation (done)
+## Integration validation (done twice)
 
 `integration/m3-all` @ 55141230a7 = origin/main 39e147443b + upstream PR heads 36546, 36549, 36559, 36560, 36574, 36575, 36576 + all 16 branches (3 additive merge conflicts, recorded in `/scratch/results/integration_notes.md`). Recommended real-acceptance config, TP4 on MI350X:
 
@@ -57,6 +57,8 @@ See the section appended below once the end-to-end run on `integration/m3-all` c
 | Fresh 197K prefill | 5.5-5.6 s | 5.6-5.9 s |
 
 All engaged kernel paths match the benchmarked server marker for marker. No regression attributable to any branch.
+
+Second pass on the final cleaned heads: `integration/m3-all-v2` (base origin/main d72e59508b + the same seven PR heads + all branches; 4 additive conflicts) — GSM8K-500 0.864, needles coherent, steady N=16 / 24 1,479 / 2,000 tok/s, 600 s closed loop stable with zero faults. It caught two crashes and both fixes are on the PR branches: the fused KV/index store gate read attributes the K-only index pool lacks (fixed in the functional commit of `pr/m3-fused-kv-index-store`), and the fairness skip must sit ahead of every chunking branch on current main (`pr/scheduler-chunked-prefill-fairness` e7b5bcf258; keep that `elif` order when rebasing).
 
 **Load-bearing dependency found during integration:** plain main (even with 36546/36574/36575/36576 and our quark fix) produces garbage for MiniMax-M3 MXFP4 on gfx950; adding **PR 36559** (MoE small-batch sorting with fused mxfp8 quant, which carries the gfx950 aiter small-sort / SwiGLU path) alone restores correct output. Every M3 MXFP4 branch therefore depends on 36559 landing (or its aiter-side fix); the PR descriptions state this. Also: main before #37254 cannot load the MXFP4 checkpoint at all without `pr/quark-packed-shard-exclude-fix`.
 
