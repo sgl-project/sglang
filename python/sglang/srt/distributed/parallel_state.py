@@ -870,6 +870,11 @@ class GroupCoordinator:
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             use_1stage_ar = _should_use_1stage_mxfp4_ar(input_)
+            # MXFP4 fused AR has only a 1-stage tier; past its envelope the
+            # 2-stage kernel rejects the shape and raises. Return None so the
+            # caller falls back instead of crashing (see _should_use_1stage_mxfp4_ar).
+            if not use_1stage_ar:
+                return None
 
         # TC-piecewise CUDA-graph capture guard (mirrors fused_allreduce_rmsnorm).
         if (

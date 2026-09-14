@@ -864,6 +864,38 @@ class LayerCommunicator:
                             use_attn_tp_group=False,
                             keep_bf16=self.fused_ar_quant_keep_bf16,
                         )
+                    elif (
+                        quant_result is None
+                        and _use_aiter
+                        and _is_gfx95_supported
+                        and ("mxfp4" in quant_format)
+                        and not _disable_fused_ar_mxfp4_quant
+                    ):
+                        # Fully-fused AR+RMSNorm+MXFP4 can't service this shape;
+                        # keep RMSNorm+quant fused and unfuse only the all-reduce
+                        # so the consumer still gets the (fp4, scale) tuple.
+                        norm_weight = getattr(
+                            self.input_layernorm,
+                            "gemma_weight",
+                            self.input_layernorm.weight,
+                        )
+                        reduced = tensor_model_parallel_all_reduce(hidden_states)
+                        quant_out = fused_rms_mxfp4_quant(
+                            reduced,
+                            norm_weight,
+                            self.input_layernorm.variance_epsilon,
+                            None,
+                            None,
+                            None,
+                            residual,
+                            output_unquantized_inp1=emit_bf16,
+                        )
+                        (fp4, scale), out1_bf16, _out2, residual = quant_out
+                        quant_result = (
+                            ((out1_bf16, fp4, scale), residual)
+                            if emit_bf16
+                            else ((fp4, scale), residual)
+                        )
                     if quant_result is not None:
                         hidden_states, residual = quant_result
                     else:
