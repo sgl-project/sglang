@@ -376,12 +376,12 @@ class QuarkConfig(QuantizationConfig):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
 
-    def _online_fp8_for_excluded(self, prefix: str) -> bool:
+    def _serves_excluded_as_online_fp8(self, prefix: str) -> bool:
         """Whether the excluded layer at `prefix` is served as load-time FP8."""
         if not envs.SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED.get():
             return False
-        skip = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())
-        return not (skip & set(prefix.split(".")))
+        kept_bf16 = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())
+        return not (kept_bf16 & set(prefix.split(".")))
 
     def _online_fp8_config(self) -> "Fp8Config":
         cfg = getattr(self, "_online_fp8_config_cache", None)
@@ -413,7 +413,7 @@ class QuarkConfig(QuantizationConfig):
                 # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
-                if self._online_fp8_for_excluded(prefix):
+                if self._serves_excluded_as_online_fp8(prefix):
                     return Fp8LinearMethod(quant_config=self._online_fp8_config())
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):

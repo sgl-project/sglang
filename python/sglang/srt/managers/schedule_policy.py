@@ -646,10 +646,10 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
-        self.chunk_fairness_reserve = min(
+        self.chunked_prefill_fairness_reserve = min(
             max(envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.get(), 0.0), 0.9
         )
-        self._fair_capped_req: Optional[Req] = None
+        self._capped_chunked_req: Optional[Req] = None
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1080,7 +1080,7 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
-            _rem_tokens = self._fair_chunk_tokens(req, _rem_tokens)
+            _rem_tokens = self._cap_chunk_for_waiters(req, _rem_tokens)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1116,37 +1116,37 @@ class PrefillAdder:
         # Return if chunked prefill not finished
         return req if truncated else None
 
-    def _fair_chunk_tokens(self, req: Req, rem_tokens: int) -> int:
+    def _cap_chunk_for_waiters(self, req: Req, rem_tokens: int) -> int:
         """Cap a continuing chunked request's chunk so waiting requests share the iteration.
 
         No-op when the reserve is off, nothing waits, or the remaining prompt
         fits under the cap anyway.
         """
         if (
-            self.chunk_fairness_reserve <= 0
+            self.chunked_prefill_fairness_reserve <= 0
             or self.waiting_queue_len <= 0
             or self.rem_chunk_tokens is None
         ):
             return rem_tokens
         cap = self.rem_chunk_tokens - int(
-            self.rem_chunk_tokens * self.chunk_fairness_reserve
+            self.rem_chunk_tokens * self.chunked_prefill_fairness_reserve
         )
         cap = max(cap // self.page_size * self.page_size, self.page_size)
         remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
         if remaining <= cap or rem_tokens <= cap:
             return rem_tokens
-        self._fair_capped_req = req
+        self._capped_chunked_req = req
         return cap
 
-    def regrow_chunked_req(self, req: Req) -> Optional[Req]:
+    def regrow_capped_chunked_req(self, req: Req) -> Optional[Req]:
         """Give the budget the waiting queue left unused back to the capped chunked request.
 
         Call once after the waiting queue is scanned; returns the request while
         it is still truncated, else `None`, like `add_chunked_req`.
         """
-        if req is None or req is not self._fair_capped_req:
+        if req is None or req is not self._capped_chunked_req:
             return req
-        self._fair_capped_req = None
+        self._capped_chunked_req = None
         if self.rem_chunk_tokens is None or self.rem_chunk_tokens <= 0:
             return req
         extra = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
@@ -1511,7 +1511,7 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
-                if has_chunked_req and self.chunk_fairness_reserve > 0:
+                if has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
                     # only whole extends take the reserve: one chunked request is tracked at a time
                     return AddReqResult.CONTINUE
 

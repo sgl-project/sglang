@@ -882,7 +882,7 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(adder.rem_chunk_tokens, 4096 - 1500)
 
             # Unused reserve goes back to the chunked request.
-            self.assertIs(adder.regrow_chunked_req(chunked), chunked)
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range, Range(8192, 8192 + 4096 + 2596))
             self.assertEqual(adder.rem_chunk_tokens, 0)
             self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
@@ -902,11 +902,11 @@ class TestPrefillAdder(CustomTestCase):
             chunked = self._fairness_req("chunked", prefix_len=8192, total_len=14192)
             self.assertIs(adder.add_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range.length, 4096)
-            self.assertIsNone(adder.regrow_chunked_req(chunked))
+            self.assertIsNone(adder.regrow_capped_chunked_req(chunked))
             self.assertEqual(chunked.extend_range.length, 6000)
             self.assertEqual(adder.rem_chunk_tokens, 8192 - 6000)
             # Second call is a no-op (the request is no longer marked capped).
-            self.assertIs(adder.regrow_chunked_req(chunked), chunked)
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range.length, 6000)
 
             # An uncapped chunked request (nothing waiting) is untouched.
@@ -918,7 +918,7 @@ class TestPrefillAdder(CustomTestCase):
             )
             chunked = self._fairness_req("chunked2", prefix_len=0, total_len=30000)
             self.assertIs(adder.add_chunked_req(chunked), chunked)
-            self.assertIs(adder.regrow_chunked_req(chunked), chunked)
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range.length, 8192)
 
     def test_chunk_fairness_off_or_idle_keeps_full_chunk(self):
