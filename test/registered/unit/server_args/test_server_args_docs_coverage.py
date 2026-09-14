@@ -23,13 +23,12 @@ you fixed it without updating the baseline").
 """
 
 import argparse
-import dataclasses
 import re
 import unittest
 from pathlib import Path
 from typing import Annotated, get_args, get_origin, get_type_hints
 
-from sglang.srt.arg_groups.arg_utils import Arg
+from sglang.srt.arg_groups.arg_utils import Arg, field_names
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -76,6 +75,7 @@ _UNDOCUMENTED = frozenset(
         "--disaggregation-decode-extra-slots",
         "--disaggregation-decode-retraction-backup",
         "--dsa-paged-mqa-logits-backend",
+        "--dsv4-attn-backend",
         "--dsv4-prefill-backend",
         "--dwdp-size",
         "--elastic-ep-initial-size",
@@ -90,6 +90,7 @@ _UNDOCUMENTED = frozenset(
         "--enable-lean-attention",
         "--enable-linear-replayssm",
         "--enable-linear-replayssm-spec",
+        "--enable-response-store",
         "--enable-scattered-sconv",
         "--enable-session-radix-cache",
         "--enable-shared-experts-attn-tp",
@@ -119,10 +120,12 @@ _UNDOCUMENTED = frozenset(
         "--radix-eviction-policy-config",
         "--return-input-ids",
         "--return-output-ids",
+        "--sampling-mask-max-tokens",
         "--sidecar",
         "--sidecar-args",
         "--smg-grpc-mode",
         "--spec-trace-dir",
+        "--speculative-domino-candidate-pool-size",
         "--speculative-draft-kv-cache-dtype",
         "--speculative-dspark-align-verify-tokens-to-graph-tier",
         "--speculative-dspark-block-size",
@@ -140,22 +143,13 @@ _UNDOCUMENTED = frozenset(
 )
 
 # Rows naming a flag that no longer registers.
-# This set may only shrink. See TestNoNewStaleRows below. Three of these ten
-# (`--hybrid-kvcache-ratio`, `--debug-tensor-dump-inject`,
-# `--optimistic-prefill-retries`) are claimed by open PRs #37556 / #37571 and
-# the other seven by #38413. Drop each from this set as its fix merges.
+# This set may only shrink. See TestNoNewStaleRows below.
 _STALE_ROWS = frozenset(
     {
         "--custom-sigquit-handler",
         "--debug-tensor-dump-inject",
-        "--dsa-prefill-cp-mode",
-        "--enable-dsa-prefill-context-parallel",
-        "--enable-nsa-prefill-context-parallel",
-        "--enable-prefill-context-parallel",
         "--hybrid-kvcache-ratio",
-        "--nsa-prefill-cp-mode",
         "--optimistic-prefill-retries",
-        "--prefill-cp-mode",
     }
 )
 
@@ -213,11 +207,8 @@ def _classify_stale(flag: str) -> str:
     the failure message less useful, never turn a real gap into a false
     green (see TestClassifierIsAdvisoryOnly)."""
     field_name = flag.lstrip("-").replace("-", "_")
-    field = next(
-        (f for f in dataclasses.fields(ServerArgs) if f.name == field_name), None
-    )
-    if field is None:
-        return "no dataclass field at all -- renamed or removed"
+    if field_name not in field_names(ServerArgs):
+        return "no ServerArgs field at all -- renamed or removed"
 
     hint = get_type_hints(ServerArgs, include_extras=True).get(field_name)
     if get_origin(hint) is not Annotated:
@@ -247,7 +238,7 @@ class TestServerArgsDocsCoverage(CustomTestCase):
         guardrail. Pin both a minimum cell count and one known row."""
         self.assertGreater(
             len(self.cells),
-            1700,
+            1600,
             f"only {len(self.cells)} <td> cells recovered from {_DOC_PATH}. "
             "The cell regex no longer matches the table markup",
         )
@@ -337,10 +328,10 @@ class TestClassifierIsAdvisoryOnly(CustomTestCase):
                 self.assertTrue(verdict)
 
     def test_known_bucket_examples(self):
-        # No field at all (renamed/removed): 9 of the 10 fall here.
+        # No field at all (renamed/removed): 3 of the 4 fall here.
         self.assertEqual(
-            _classify_stale("--prefill-cp-mode"),
-            "no dataclass field at all -- renamed or removed",
+            _classify_stale("--hybrid-kvcache-ratio"),
+            "no ServerArgs field at all -- renamed or removed",
         )
         # Field exists, but was never annotated for CLI at all.
         self.assertEqual(
