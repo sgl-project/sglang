@@ -1486,6 +1486,8 @@ class Envs:
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    # Use the optional DeepSelect SM90 kernel for candidate-block FP32 Top-K.
+    SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK = EnvBool(False)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

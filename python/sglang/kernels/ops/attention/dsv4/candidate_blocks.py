@@ -5,6 +5,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
+
+_DEEPSELECT_INPUT_ALIGNMENT_BYTES = 1024
 
 
 @triton.jit
@@ -20,7 +23,7 @@ def _candidate_scores_kernel(
     SCORES,
     WIDTH: tl.constexpr,
     STRIDE: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    SCORE_STRIDE: tl.constexpr,
     GROUP: tl.constexpr,
     GROUP_PAD: tl.constexpr,
     TILE: tl.constexpr,
@@ -39,7 +42,7 @@ def _candidate_scores_kernel(
     scores = tl.where(
         (length > 0) & (blocks == (length - 1) // GROUP), float("inf"), scores
     )
-    tl.store(SCORES + row * BLOCKS + blocks, scores, blocks < BLOCKS)
+    tl.store(SCORES + row * SCORE_STRIDE + blocks, scores, blocks < SCORE_STRIDE)
 
 
 @triton.jit
@@ -72,14 +75,20 @@ def _publish_candidate_mask_kernel(
     WIDTH: tl.constexpr,
     GROUP: tl.constexpr,
     TOPK: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
+    VALUE_STRIDE: tl.constexpr,
     TILE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     i = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    selected = tl.load(INDICES + row * TOPK + i // GROUP, i < TOPK * GROUP, 0)
-    score = tl.load(VALUES + row * TOPK + i // GROUP, i < TOPK * GROUP, -float("inf"))
+    selected = tl.load(INDICES + row * INDEX_STRIDE + i // GROUP, i < TOPK * GROUP, 0)
+    score = tl.load(
+        VALUES + row * VALUE_STRIDE + i // GROUP,
+        i < TOPK * GROUP,
+        -float("inf"),
+    )
     cols = selected * GROUP + i % GROUP
-    # torch.topk returns unique block indices: each output position has one writer.
+    # Top-K returns unique block indices: each output position has one writer.
     tl.store(
         KEEP + row * WIDTH + cols,
         score > -float("inf"),
@@ -95,11 +104,12 @@ def candidate_block_logits(
     block_size: int,
     published: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Keep torch.topk's block selection, including its tie behavior.
+    """Select candidate blocks and publish their token-level visibility mask.
 
     A source masks the unread tail while reducing each block. A consumer masks
     visibility and the published candidates in one pass, without copying the
-    capacity-sized logits before each masked_fill.
+    capacity-sized logits before each masked_fill. DeepSelect can choose a
+    different valid subset when finite block scores tie.
     """
     rows, width = logits.shape
     output = torch.empty((rows, width), dtype=torch.float32, device=logits.device)
@@ -118,33 +128,67 @@ def candidate_block_logits(
         return output, None
 
     blocks = triton.cdiv(width, block_size)
-    scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)
+    use_deepselect = envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.get()
+    deep_select = None
+    if use_deepselect:
+        if torch.cuda.get_device_capability(logits.device) != (9, 0):
+            raise RuntimeError(
+                "SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK only supports SM90"
+            )
+        try:
+            import deep_select
+        except ImportError as exc:
+            raise RuntimeError(
+                "SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK requires the "
+                "deep_select package"
+            ) from exc
+    score_alignment = _DEEPSELECT_INPUT_ALIGNMENT_BYTES // torch.float32.itemsize
+    score_stride = triton.cdiv(blocks, score_alignment) * score_alignment
+    scores = torch.empty(
+        (rows, score_stride if use_deepselect else blocks),
+        dtype=torch.float32,
+        device=logits.device,
+    )
     group_pad = triton.next_power_of_2(block_size)
     tile = max(1, 1024 // group_pad)
-    _candidate_scores_kernel[(rows, triton.cdiv(blocks, tile))](
+    _candidate_scores_kernel[
+        (rows, triton.cdiv(score_stride if use_deepselect else blocks, tile))
+    ](
         logits,
         seq_lens,
         output,
         scores,
         width,
         logits.stride(0),
-        blocks,
+        scores.stride(0),
         block_size,
         group_pad,
         tile,
     )
     # Publication only needs membership; sorting the selected pairs is unused.
-    top = scores.topk(min(topk_blocks, blocks), dim=-1, sorted=False)
+    selected = min(topk_blocks, blocks)
+    if use_deepselect:
+        top_values, top_indices = deep_select.topk(
+            scores,
+            selected,
+            indices_type=torch.int32,
+            return_value=True,
+        )
+    else:
+        top = scores.topk(selected, dim=-1, sorted=False)
+        top_values, top_indices = top.values, top.indices
     keep = torch.zeros((rows, width), dtype=torch.bool, device=logits.device)
     _publish_candidate_mask_kernel[
-        (rows, triton.cdiv(top.indices.shape[1] * block_size, 256))
+        (rows, triton.cdiv(top_indices.shape[1] * block_size, 256))
     ](
-        top.indices,
-        top.values,
+        top_indices,
+        top_values,
         keep,
         width,
         block_size,
-        top.indices.shape[1],
+        top_indices.shape[1],
+        top_indices.stride(0),
+        top_values.stride(0),
         256,
         num_warps=4,
     )

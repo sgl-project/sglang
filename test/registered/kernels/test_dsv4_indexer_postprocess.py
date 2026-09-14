@@ -7,6 +7,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_row_lens,
 )
 from sglang.kernels.ops.attention.dsv4.indexer_postprocess import filter_topk_pages
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -167,6 +168,33 @@ class TestIndexerPostprocess(CustomTestCase):
                 atol=0,
                 equal_nan=True,
             )
+
+    def test_deepselect_candidate_publication(self):
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("DeepSelect candidate Top-K requires SM90")
+        try:
+            import deep_select  # noqa: F401
+        except ImportError:
+            self.skipTest("optional deep_select package is not installed")
+
+        torch.manual_seed(913)
+        rows, width, group, topk = 6, 131079, 8, 513
+        x = torch.randn(rows, width + 11, device="cuda")[:, :width]
+        lengths = torch.tensor(
+            [0, 1, 17, width // 2, width - 3, width],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        with envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.override(False):
+            ref_logits, ref_keep = candidate_block_logits(
+                x, lengths, topk_blocks=topk, block_size=group, published=None
+            )
+        with envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.override(True):
+            got_logits, got_keep = candidate_block_logits(
+                x, lengths, topk_blocks=topk, block_size=group, published=None
+            )
+        torch.testing.assert_close(got_logits, ref_logits, rtol=0, atol=0)
+        torch.testing.assert_close(got_keep, ref_keep, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
