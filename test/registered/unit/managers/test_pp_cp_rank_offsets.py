@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -85,6 +85,8 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             enable_dp_attention_local_control_broadcast=True,
         )
 
+        receiver.tp_group.broadcast_object = MagicMock()
+
         with (
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
@@ -96,15 +98,11 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 "attn_cp_tp_broadcast_pyobj",
                 side_effect=lambda requests: requests,
             ),
-            patch(
-                "sglang.srt.managers.scheduler_components.request_receiver."
-                "broadcast_pyobj"
-            ) as broadcast,
         ):
             result = receiver._broadcast_reqs_across_ranks([control_req])
 
         self.assertEqual(result, [control_req])
-        broadcast.assert_not_called()
+        receiver.tp_group.broadcast_object.assert_not_called()
 
     def test_default_control_uses_full_tp_broadcast(self):
         ps = SimpleNamespace(
@@ -120,6 +118,8 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
         )
+
+        receiver.tp_group.broadcast_object = MagicMock(return_value=[control_req])
 
         with (
             patch(
@@ -138,21 +138,11 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 "attn_cp_tp_broadcast_pyobj",
                 side_effect=lambda requests: requests,
             ),
-            patch(
-                "sglang.srt.managers.scheduler_components.request_receiver."
-                "broadcast_pyobj",
-                side_effect=lambda requests, *_args, **_kwargs: requests,
-            ) as broadcast,
         ):
             result = receiver._broadcast_reqs_across_ranks([control_req])
 
         self.assertEqual(result, [control_req])
-        broadcast.assert_called_once_with(
-            [control_req],
-            receiver.tp_group.rank,
-            receiver.tp_cpu_group,
-            src=receiver.tp_group.ranks[0],
-        )
+        receiver.tp_group.broadcast_object.assert_called_once_with([control_req], src=0)
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
