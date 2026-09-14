@@ -1,8 +1,8 @@
 FROM ubuntu:26.04
 SHELL ["/bin/bash", "-c"]
 
-ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
-ARG VER_SGLANG=main
+ARG SGLANG_REPO=https://github.com/ZailiWang/sglang.git
+ARG VER_SGLANG=limit-container-cpu-mem
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
