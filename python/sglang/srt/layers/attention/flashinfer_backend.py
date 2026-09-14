@@ -188,6 +188,7 @@ def fast_prefill_plan(
     custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
     q_data_type: Union[str, torch.dtype] = "float16",
     kv_data_type: Optional[Union[str, torch.dtype]] = None,
     o_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -256,6 +257,7 @@ def fast_prefill_plan(
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
 
+    self._logits_soft_cap = logits_soft_cap or 0.0
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
         kv_data_type if kv_data_type is not None else q_data_type
@@ -1532,6 +1534,13 @@ class FlashInferIndicesUpdaterDecode:
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
+        # FlashInfer specializes the attention kernel during plan(), before forward().
+        self.logits_soft_cap = (
+            getattr(
+                model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
+            )
+            or 0.0
+        )
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -1769,6 +1778,7 @@ class FlashInferIndicesUpdaterDecode:
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
+                logits_soft_cap=self.logits_soft_cap,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=(
@@ -1788,6 +1798,7 @@ class FlashInferIndicesUpdaterDecode:
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
+                logits_soft_cap=self.logits_soft_cap,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=(
@@ -1813,6 +1824,13 @@ class FlashInferIndicesUpdaterPrefill:
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
+        # FlashInfer specializes the attention kernel during plan(), before forward().
+        self.logits_soft_cap = (
+            getattr(
+                model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
+            )
+            or 0.0
+        )
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -2201,6 +2219,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                logits_soft_cap=self.logits_soft_cap,
             )
 
         if use_sliding_window_kv_pool and not use_swa_source:
@@ -2283,6 +2302,7 @@ class FlashInferIndicesUpdaterPrefill:
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
+            logits_soft_cap=self.logits_soft_cap,
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
