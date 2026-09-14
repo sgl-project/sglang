@@ -268,8 +268,6 @@ MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
 MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
 # DeepGEMM pads the logits row stride to 1024 bytes, i.e. 256 fp32 columns.
 MQA_LOGITS_ROW_ALIGN_ELEMS = 256
-# Arbitrary; keeps a tiny budget from degrading into hundreds of launches.
-MQA_LOGITS_MIN_ROWS_PER_CHUNK = 128
 
 
 def mqa_logits_free_mem_fraction() -> float:
@@ -320,5 +318,5 @@ def mqa_logits_rows_per_chunk(
     """Query rows per chunk so one logits chunk fits the budget; None if all rows fit."""
     if num_rows * row_bytes <= budget_bytes:
         return None
-    rows = max(budget_bytes // max(row_bytes, 1), MQA_LOGITS_MIN_ROWS_PER_CHUNK)
+    rows = max(budget_bytes // max(row_bytes, 1), 1)
     return int(rows) if rows < num_rows else None

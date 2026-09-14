@@ -923,7 +923,8 @@ class C4IndexerBackendMixin:
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             # K is gathered once; each row chunk's logits are reduced to top-k
-            # and freed before the next chunk is scored.
+            # and dropped before the next chunk allocates, so only one chunk
+            # of logits is live at a time.
             kv = self._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
@@ -941,6 +942,7 @@ class C4IndexerBackendMixin:
                     rows=rows,
                 )
                 run_topk_transform(rows, logits)
+                del logits
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()

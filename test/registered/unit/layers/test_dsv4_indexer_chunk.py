@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
-    MQA_LOGITS_MIN_ROWS_PER_CHUNK,
     mqa_logits_budget_bytes,
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -57,19 +56,27 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
                 num_rows=64, row_bytes=row_bytes, budget_bytes=budget
             )
         )
-        # A budget below one row floors at the minimum chunk, not 1-row launches.
+        # A tight budget never yields a chunk larger than the budget, even when
+        # that means fewer rows than a full page of queries.
+        tight = 64 << 20
+        rows = mqa_logits_rows_per_chunk(
+            num_rows=4096, row_bytes=row_bytes, budget_bytes=tight
+        )
+        self.assertEqual(rows, tight // row_bytes)
+        self.assertLessEqual(rows * row_bytes, tight)
+        # Few query rows still chunk when they do not fit.
+        self.assertEqual(
+            mqa_logits_rows_per_chunk(
+                num_rows=100, row_bytes=row_bytes, budget_bytes=40 * row_bytes
+            ),
+            40,
+        )
+        # A budget below one row degrades to single-row chunks, never None.
         self.assertEqual(
             mqa_logits_rows_per_chunk(
                 num_rows=4096, row_bytes=row_bytes, budget_bytes=1
             ),
-            MQA_LOGITS_MIN_ROWS_PER_CHUNK,
-        )
-        self.assertIsNone(
-            mqa_logits_rows_per_chunk(
-                num_rows=MQA_LOGITS_MIN_ROWS_PER_CHUNK,
-                row_bytes=row_bytes,
-                budget_bytes=1,
-            )
+            1,
         )
 
     def test_plan_combines_sm120_cap_with_budget(self):
