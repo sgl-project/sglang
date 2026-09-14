@@ -68,6 +68,46 @@ def _derive_tree_links(
     return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
+def _linearize_chain(req_drafts, mask, bs, D):
+    """Collapse each request's draft tree into one root chain.
+
+    Even at bfs-breadth 1 the corpus fans out at the root (one chain per
+    anchor, trie.cpp:236-260) and zero-padding nodes are root children
+    (result.cpp:34-38).  GDN replayssm fold, QSA (no tree mask, pending ring
+    keyed by position % 4) and the int8 KV move all assume a chain: row j-1 is
+    row j's parent.  Keep the longest root chain (ties -> lowest node index,
+    i.e. BFS order), pad with token 0 chained after it; mask := tril.
+    Padding token 0 chained after the real drafts is lossless: greedy verify
+    accepts a node only if it equals the target argmax at its parent row.
+    Inputs/outputs are the flat int arrays of NgramCorpus.batch_get:
+    tokens (bs*D,), mask (bs*D*D,) with mask[b, i, j] = j is an ancestor of i.
+    """
+    toks = np.asarray(req_drafts).reshape(bs, D).copy()
+    tree = np.asarray(mask).reshape(bs, D, D)
+    order = np.arange(D)
+    below = order[None, :] < order[:, None]  # [i, j]: j < i
+    for b in range(bs):
+        ancestor = (tree[b] != 0) & below
+        parents = np.where(ancestor.any(-1), (ancestor * order).argmax(-1), -1)
+        parents[0] = -1
+        children = [np.flatnonzero(parents == i) for i in range(D)]
+
+        def longest(i):
+            best = [i]
+            for k in children[i]:  # ascending index: first wins ties
+                cand = [i] + longest(int(k))
+                if len(cand) > len(best):
+                    best = cand
+            return best
+
+        best = longest(0)
+        new = np.zeros(D, dtype=toks.dtype)
+        new[: len(best)] = toks[b, best]
+        toks[b] = new
+    tri = np.tril(np.ones((D, D), dtype=tree.dtype))
+    return toks.reshape(-1), np.broadcast_to(tri, (bs, D, D)).reshape(-1).copy()
+
+
 class NGRAMWorker(BaseSpecWorker):
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
@@ -94,6 +134,11 @@ class NGRAMWorker(BaseSpecWorker):
         self.tp_rank = ps.tp_rank
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
+        assert server_args.speculative_ngram_max_bfs_breadth == 1, (
+            "Qwen4-Exp (GDN replayssm fold + QSA + PLE) needs a chain draft: "
+            "--speculative-ngram-max-bfs-breadth 1 (it sets speculative_eagle_topk, "
+            f"the hybrid backend's chain switch); got {server_args.speculative_ngram_max_bfs_breadth}"
+        )
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
@@ -285,6 +330,7 @@ class NGRAMWorker(BaseSpecWorker):
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
+        req_drafts, mask = _linearize_chain(req_drafts, mask, bs, self.draft_token_num)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it

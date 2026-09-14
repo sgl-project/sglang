@@ -907,6 +907,26 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
+        # PLE n-gram history + PLE short-conv state live outside the GDN fold;
+        # roll them to the last accepted node like the generic path does
+        # (hybrid_linear_attn_backend.py _update_ple_state_after_mtp_verify).
+        # The generic path scatters with PHYSICAL slot ids
+        # (forward_metadata.mamba_cache_indices, translated track indices);
+        # get_mamba_indices returns VIRTUAL ids, so translate (identity for the
+        # static HybridReqToTokenPool, a lookup for the unified pool).  Without
+        # this call the early return above skips the PLE roll and the n-gram
+        # history freezes after the first verify step.
+        attn_backend = model_runner.attn_backend
+        if hasattr(attn_backend, "_update_ple_state_after_mtp_verify"):
+            _ple_track = batch.mamba_track_indices
+            if _ple_track is not None:
+                _ple_track = req_pool.translate_mamba_indices(_ple_track)
+            attn_backend._update_ple_state_after_mtp_verify(
+                req_pool.translate_mamba_indices(state_batch_indices),
+                last_correct_step_indices,
+                _ple_track,
+                mamba_steps_to_track,
+            )
         return
 
     if (
@@ -957,6 +977,19 @@ def commit_mamba_states_after_verify(
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
         # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
+        # PLE side states: the ring branch returns early as well, so the PLE
+        # roll of the generic path has to happen here too.  The track scatter is
+        # skipped like the conv one above (extra_buffer is forbidden with replayssm),
+        # so no track indices / steps are passed.  Physical slot ids (see the fold
+        # branch): translate the virtual get_mamba_indices() result.
+        attn_backend = model_runner.attn_backend
+        if hasattr(attn_backend, "_update_ple_state_after_mtp_verify"):
+            attn_backend._update_ple_state_after_mtp_verify(
+                req_pool.translate_mamba_indices(state_batch_indices),
+                last_correct_step_indices,
+                None,
+                None,
+            )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
