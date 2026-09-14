@@ -1108,6 +1108,12 @@ class Envs:
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    # SM120 DeepSeek-V4 decode under attention TP: 1 keeps the padded 64-head
+    # decode path instead of FlashInfer's kernel at the exact per-rank head
+    # width (the default when the installed build covers it, #36655). On 4x RTX
+    # PRO 6000 TP4 (16 local heads) the native kernel measured single-request
+    # decode TPOT +12.6% against the padded path, batch 4 / 8 and prefill flat.
+    SGLANG_SM120_DSV4_DECODE_PADDED = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
