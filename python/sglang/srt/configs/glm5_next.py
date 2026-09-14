@@ -3,7 +3,11 @@ from typing import List, Optional, Union
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
+from sglang.srt.configs.glm5_next_processing import Glm5NextProcessor
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
+)
 from sglang.srt.runtime_context import get_parallel
 
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
@@ -290,6 +294,7 @@ class Glm5NextVisionConfig(GlmOcrVisionConfig):
         self.swiglu_limit = swiglu_limit
 
 
+@register_customized_processor(Glm5NextProcessor)
 class Glm5NextConfig(PretrainedConfig):
     model_type = "glm5_next"
     sub_configs = {
