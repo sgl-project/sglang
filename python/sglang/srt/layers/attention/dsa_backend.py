@@ -3593,6 +3593,11 @@ class DeepseekSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
+                # WQ Hopper DCP: MHA one-shot materializes the prefix K/V
+                # straight from the pool, which is owner-striped under DCP;
+                # only the absorbed (top-k, owner-filtered, LSE-merged) path
+                # is DCP-correct. Short prefills stay on flashmla_kv rows.
+                and (not get_parallel().dcp_enabled)
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
