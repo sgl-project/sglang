@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 @pytest.fixture

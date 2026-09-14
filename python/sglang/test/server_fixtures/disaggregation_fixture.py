@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -92,11 +93,13 @@ class PDDisaggregationServerBase(CustomTestCase):
 
         # config transfer backend and rdma devices
         cls._mc_gid_index_set = False
+        cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
+            cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -225,10 +228,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+        if getattr(cls, "_ucx_net_devices_set", False):
+            os.environ.pop("UCX_NET_DEVICES", None)
+        # The LB holds no device state, and popen_with_error_check only stays
+        # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
+        if cls.process_lb:
+            try:
+                kill_process_tree(cls.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"Error killing process {cls.process_lb.pid}: {e}")
+        for process in [cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
@@ -370,7 +382,7 @@ def get_rdma_devices_args():
         if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
             warnings.warn(
                 f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group+3}"
+                f"{base_rdma_group}-{base_rdma_group + 3}"
             )
 
     # 3. Generate RDMA device names
@@ -492,4 +504,21 @@ def _maybe_set_roce_gid_index(ib_devices) -> bool:
         return False
     os.environ["MC_GID_INDEX"] = str(gid_index)
     logger.warning("RoCE fabric detected; set MC_GID_INDEX=%d for mooncake", gid_index)
+    return True
+
+
+def _maybe_set_ucx_net_devices(ib_devices) -> bool:
+    if not ib_devices or os.environ.get("UCX_NET_DEVICES"):
+        return False
+    if ib_devices.lstrip().startswith("{"):
+        # Per-GPU JSON mapping; UCX_NET_DEVICES cannot express it.
+        return False
+    devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
+    if not devices:
+        return False
+    net_devices = ",".join(f"{d}:1" for d in devices)
+    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
+    # device on the host, and that full-device init can stall inside the driver.
+    os.environ["UCX_NET_DEVICES"] = net_devices
+    logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

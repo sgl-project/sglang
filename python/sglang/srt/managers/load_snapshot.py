@@ -202,6 +202,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    num_prealloc_ready_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0

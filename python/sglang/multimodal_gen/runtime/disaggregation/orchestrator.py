@@ -650,7 +650,7 @@ class DiffusionServer:
                 )
             except ValueError:
                 pass
-            logger.info(
+            logger.debug(
                 "GLM distributed mode dispatched request with %d output(s) "
                 "to denoiser[%d]",
                 request.req.num_outputs_per_prompt,

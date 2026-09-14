@@ -11,6 +11,11 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -172,7 +177,7 @@ class SchedulerPoolStatsObserver:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
-                if req.kv.req_pool_idx is not None:
+                if req.kv.holds_kv:
                     idxs.add(req.kv.req_pool_idx)
         return idxs
 
@@ -284,10 +289,23 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        # `*_num_used` is `static_cap - (available + evictable)`, so the
+        # available term must match the static cap's denomination: the conserve
+        # view, never the byte-coordinated one (see
+        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            full_available_size = allocator.conserve_full_available_size()
+            swa_available_size = allocator.conserve_swa_available_size()
+        else:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
+        # Per-request SWA ring: released with the req slot, yet cached radix
+        # prefixes still report swa_evictable; counting it drives usage negative.
+        if is_swa_req_ring(self.token_to_kv_pool_allocator):
+            swa_evictable_size = 0
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )

@@ -12,7 +12,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
