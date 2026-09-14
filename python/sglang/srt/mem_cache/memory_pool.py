@@ -4609,17 +4609,12 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
-    def _dcp_owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
-        # req_to_token ids share the write-loc space: widened unless resolved.
-        span = self._write_loc_dcp_span
-        if span == 1:
-            return indices
-        # A request's slots start page-aligned, so position i has residue i % span;
-        # the strided view selects this rank's slots without a mask/nonzero sync.
-        return indices[get_parallel().attn_dcp_rank :: span] // span
-
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        indices = self._dcp_owned_rows(indices)
+        # req_to_token ids are widened unless resolved; a request's slots start
+        # page-aligned, so the strided view picks this rank's rows without a sync.
+        span = self._write_loc_dcp_span
+        if span > 1:
+            indices = indices[get_parallel().attn_dcp_rank :: span] // span
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4639,7 +4634,9 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        indices = self._dcp_owned_rows(indices)
+        span = self._write_loc_dcp_span
+        if span > 1:
+            indices = indices[get_parallel().attn_dcp_rank :: span] // span
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
