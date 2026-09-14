@@ -2644,8 +2644,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale=layer.w2_weight_scale_inv,
             )
             return self.runner.run(dispatch_output, quant_info)
-        if self.runner.runner_backend.is_cpu():
-            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
