@@ -155,7 +155,10 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    # A chunk cache inserts nothing here; cache_unfinished_req only records
+    # prefix_indices, which the next chunk of the same request needs in order to
+    # extend its existing pages instead of allocating the whole sequence again.
+    if getattr(req, "skip_radix_cache_insert", False) and tree_cache.is_tree_cache():
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
