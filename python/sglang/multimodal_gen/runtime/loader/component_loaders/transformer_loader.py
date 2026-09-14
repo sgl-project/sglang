@@ -155,6 +155,10 @@ def _server_args_for_transformer_component(
 class TransformerLoader(OnlineQuantizationComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
+    allow_global_attention_backend_fallback = False
+    supports_online_quantization_override = True
+    supports_fsdp_loading = True
+    supports_fsdp_inference = True
     component_names = [
         "transformer",
         "unconditional_transformer",

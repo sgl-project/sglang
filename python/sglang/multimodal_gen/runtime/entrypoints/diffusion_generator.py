@@ -40,7 +40,10 @@ from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
+    run_sync_startup_warmup,
+    should_apply_pre_warmup_auto_residency,
     should_run_explicit_client_warmup,
+    should_run_synthetic_server_warmup,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
@@ -191,6 +194,11 @@ class DiffGenerator:
         return processes
 
     def _run_client_warmup_if_needed(self) -> None:
+        if should_apply_pre_warmup_auto_residency(
+            self.server_args
+        ) or should_run_synthetic_server_warmup(self.server_args):
+            run_sync_startup_warmup(self.server_args, sync_scheduler_client.forward)
+            return
         if not should_run_explicit_client_warmup(self.server_args):
             return
 

@@ -5,6 +5,9 @@ import os
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
+    ComponentWeightSource,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -169,6 +172,24 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             )
             return
         self._load_refiner_modules(server_args)
+
+    def additional_component_weight_sources(
+        self, server_args: ServerArgs
+    ) -> list[ComponentWeightSource]:
+        if sana_wm_skip_refiner_enabled():
+            return []
+        target_element_size = default_sana_wm_refiner_dtype(server_args).itemsize
+        return [
+            ComponentWeightSource(
+                component_name=module_name,
+                component_model_path=self._resolve_refiner_component_path(
+                    server_args, module_name, subpath
+                ),
+                target_element_size=target_element_size,
+            )
+            for module_name, subpath in self._REFINER_SUB_MODULES
+            if module_name != "tokenizer_2"
+        ]
 
     def _resolve_refiner_paths(self, server_args: ServerArgs) -> tuple[str, str]:
         component_paths = getattr(server_args, "component_paths", {}) or {}

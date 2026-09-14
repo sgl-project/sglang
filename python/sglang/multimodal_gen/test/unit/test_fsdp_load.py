@@ -3,7 +3,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import patch, sentinel
 
 import torch
 from safetensors.torch import safe_open, save_file
@@ -468,3 +469,66 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
             self.assertEqual(
                 rank_local_checkpoint.tp_local_shape(sources, 1, 2), (8, 2)
             )
+
+
+class TestRankLocalDTensorConstruction(unittest.TestCase):
+    @staticmethod
+    def _template() -> SimpleNamespace:
+        return SimpleNamespace(
+            shape=torch.Size((6, 4)),
+            device_mesh=sentinel.mesh,
+            placements=(sentinel.shard,),
+            stride=lambda: (4, 1),
+        )
+
+    def test_full_checkpoint_fallback_slices_locally_without_collective(self):
+        full_tensor = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        with (
+            patch.object(
+                fsdp_load.dist_tensor._utils,
+                "compute_local_shape_and_global_offset",
+                return_value=((2, 4), (2, 0)),
+            ),
+            patch.object(fsdp_load.dist_tensor, "DTensor") as dtensor_cls,
+        ):
+            dtensor_cls.from_local.return_value = sentinel.dtensor
+            result = fsdp_load._local_dtensor_from_full_tensor(
+                full_tensor,
+                self._template(),
+            )
+
+        self.assertIs(result, sentinel.dtensor)
+        local_tensor = dtensor_cls.from_local.call_args.args[0]
+        torch.testing.assert_close(local_tensor, full_tensor[2:4])
+        self.assertEqual(local_tensor.untyped_storage().nbytes(), local_tensor.nbytes)
+        dtensor_cls.from_local.assert_called_once_with(
+            local_tensor,
+            sentinel.mesh,
+            (sentinel.shard,),
+            run_check=False,
+            shape=torch.Size((6, 4)),
+            stride=(4, 1),
+        )
+
+    def test_missing_parameter_initializes_only_local_storage(self):
+        with (
+            patch.object(
+                fsdp_load.dist_tensor._utils,
+                "compute_local_shape_and_global_offset",
+                return_value=((2, 4), (2, 0)),
+            ),
+            patch.object(fsdp_load.dist_tensor, "DTensor") as dtensor_cls,
+        ):
+            dtensor_cls.from_local.return_value = sentinel.dtensor
+            result = fsdp_load._initialize_local_dtensor(
+                self._template(),
+                fill_value=1,
+                device=torch.device("cpu"),
+                dtype=torch.bfloat16,
+            )
+
+        self.assertIs(result, sentinel.dtensor)
+        local_tensor = dtensor_cls.from_local.call_args.args[0]
+        self.assertEqual(tuple(local_tensor.shape), (2, 4))
+        self.assertEqual(local_tensor.dtype, torch.bfloat16)
+        torch.testing.assert_close(local_tensor, torch.ones_like(local_tensor))

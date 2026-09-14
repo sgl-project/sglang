@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
+    _forward_diffusers_video_only,
     _refiner_config_value,
     _streaming_diffusers_self_attention,
     _uses_diffusers_ltx2_refiner,
@@ -419,6 +420,33 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
                 ("text_encoder_2", "refiner/text_encoder"),
                 ("tokenizer_2", "refiner/text_encoder"),
             ),
+        )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline."
+        "sana_wm_skip_refiner_enabled",
+        return_value=False,
+    )
+    def test_refiner_weights_are_included_in_preload_inventory(self, _skip) -> None:
+        pipeline = object.__new__(SanaWMTwoStagePipeline)
+        pipeline.model_path = "/models/sana-wm"
+        sources = pipeline.additional_component_weight_sources(
+            SimpleNamespace(
+                component_paths={},
+                pipeline_config=SimpleNamespace(dit_precision="bf16"),
+            )
+        )
+
+        self.assertEqual(
+            [
+                (source.component_name, source.component_model_path)
+                for source in sources
+            ],
+            [
+                ("transformer_2", "/models/sana-wm/refiner/transformer"),
+                ("connectors", "/models/sana-wm/refiner/connectors"),
+                ("text_encoder_2", "/models/sana-wm/refiner/text_encoder"),
+            ],
         )
 
 
@@ -1255,6 +1283,63 @@ class TestSanaWMNativeDiTChunking(unittest.TestCase):
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
+    def test_manual_diffusers_forward_runs_layerwise_lifecycle(self) -> None:
+        class _Rope:
+            def prepare_video_coords(self, *args, **kwargs):
+                return None
+
+            def __call__(self, *args, **kwargs):
+                return None, None
+
+        class _TimeEmbed(torch.nn.Module):
+            def forward(self, timestep, *, batch_size, hidden_dtype):
+                embedded = torch.zeros(
+                    timestep.numel(), 4, dtype=hidden_dtype, device=timestep.device
+                )
+                return embedded, embedded
+
+        class LTX2VideoTransformer3DModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.rope = _Rope()
+                self.proj_in = torch.nn.Identity()
+                self.time_embed = _TimeEmbed()
+                self.caption_projection = torch.nn.Identity()
+                self.transformer_blocks = torch.nn.ModuleList(
+                    [torch.nn.Identity(), torch.nn.Identity()]
+                )
+                self.scale_shift_table = torch.nn.Parameter(torch.zeros(2, 4))
+                self.norm_out = torch.nn.Identity()
+                self.proj_out = torch.nn.Identity()
+
+        transformer = OfficialDiffusersLTX2RefinerModule(LTX2VideoTransformer3DModel())
+        manager = Mock()
+        manager.layers_attr_str = "module.transformer_blocks"
+        manager.enabled = True
+        transformer.layerwise_offload_managers = [manager]
+        hidden_states = torch.zeros(1, 2, 4)
+
+        with patch(
+            f"{_SANA_WM_REFINER_STAGE_MODULE}._forward_diffusers_video_block",
+            side_effect=lambda **kwargs: kwargs["hidden_states"],
+        ):
+            result = _forward_diffusers_video_only(
+                transformer,
+                hidden_states=hidden_states,
+                encoder_hidden_states=hidden_states,
+                timestep=torch.zeros(1, 2),
+                encoder_attention_mask=None,
+                num_frames=1,
+                height=1,
+                width=2,
+                fps=24.0,
+                n_context_tokens=1,
+            )
+
+        self.assertEqual(result.shape, hidden_states.shape)
+        manager.prepare_layer_for_forward.assert_has_calls([call(0), call(1)])
+        manager.finish_layer_forward.assert_has_calls([call(0), call(1)])
+
     def test_diffusers_refiner_detection_uses_official_class_name(self) -> None:
         class LTX2VideoTransformer3DModel(torch.nn.Module):
             pass

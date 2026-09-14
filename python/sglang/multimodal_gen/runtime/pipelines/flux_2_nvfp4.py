@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_checkpoint_files,
+)
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -40,6 +43,11 @@ def _resolve_nvfp4_transformer_weights_path(
     server_args: ServerArgs, model_path: str
 ) -> str:
     if server_args.transformer_weights_path is not None:
+        override_files = resolve_transformer_checkpoint_files(
+            server_args, model_path
+        ).safetensors
+        if len(override_files) == 1:
+            return override_files[0]
         return server_args.transformer_weights_path
 
     local_nvfp4_path = maybe_download_model(model_path)
