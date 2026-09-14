@@ -569,6 +569,93 @@ class TestTokenizerManagerLogprobs(CustomTestCase):
         self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
         self.assertEqual(meta_info["output_token_logprobs_length"], 1)
 
+    def test_output_top_logprobs_without_input_logprobs(self):
+        """Output-only logprobs with top_logprobs_num > 0.
+
+        The scheduler leaves ReqLogprob.input_top_logprobs_val at None when the
+        prefill pass did not compute input-side top logprobs, and the output
+        streamer appends that per-request None into the batch list. The nested
+        rows therefore arrive as [None]: len() > 0 passes, so extending the
+        state with the None element must not crash."""
+        state = _make_state(return_logprob=True, top_logprobs_num=2)
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            input_token_logprobs_idx=None,
+            output_token_logprobs_val=[[-0.25]],
+            output_token_logprobs_idx=[[42]],
+            input_top_logprobs_val=[None],
+            input_top_logprobs_idx=[None],
+            input_top_logprobs_val_flat=None,
+            input_top_logprobs_idx_flat=None,
+            input_top_logprobs_flat_null_prefix=None,
+            output_top_logprobs_val=[[[-0.75, -1.5]]],
+            output_top_logprobs_idx=[[[7, 9]]],
+            input_token_ids_logprobs_val=None,
+            input_token_ids_logprobs_idx=None,
+            output_token_ids_logprobs_val=None,
+            output_token_ids_logprobs_idx=None,
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+        )
+
+        self.assertEqual(meta_info["input_token_logprobs"], [])
+        self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
+        self.assertEqual(meta_info["input_top_logprobs"], [])
+        self.assertEqual(
+            meta_info["output_top_logprobs"],
+            [[(-0.75, 7, None), (-1.5, 9, None)]],
+        )
+
+    def test_token_ids_logprobs_without_input_logprobs(self):
+        """token_ids_logprob requests hit the ids block even without input
+        logprobs; the input-side ids rows arrive as [None] and must be skipped
+        while the output-side ids rows are kept."""
+        state = _make_state(
+            return_logprob=True, top_logprobs_num=0, token_ids_logprob=[7]
+        )
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            input_token_logprobs_idx=None,
+            output_token_logprobs_val=[[-0.25]],
+            output_token_logprobs_idx=[[42]],
+            input_top_logprobs_val=[],
+            input_top_logprobs_idx=[],
+            input_top_logprobs_val_flat=None,
+            input_top_logprobs_idx_flat=None,
+            input_top_logprobs_flat_null_prefix=None,
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+            input_token_ids_logprobs_val=[None],
+            input_token_ids_logprobs_idx=[None],
+            output_token_ids_logprobs_val=[[[-0.5]]],
+            output_token_ids_logprobs_idx=[[[7]]],
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=0,
+            token_ids_logprob=[7],
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+        )
+
+        self.assertEqual(meta_info["input_token_logprobs"], [])
+        self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
+        self.assertEqual(meta_info["input_token_ids_logprobs"], [])
+        self.assertEqual(meta_info["output_token_ids_logprobs"], [[(-0.5, 7, None)]])
+
 
 def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     """A two-request BatchTokenIDOutput with the required fields stubbed."""
