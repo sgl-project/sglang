@@ -20,7 +20,16 @@ _is_xpu = current_platform.is_xpu()
 
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
-elif _is_hip or _is_xpu:
+elif _is_hip:
+
+    def silu_and_mul(x, out):
+        # FLUX's GELU path does not need this optional native SwiGLU backend.
+        # Require it only when used; do not block importing unrelated models.
+        from sgl_kernel import silu_and_mul as native_silu_and_mul
+
+        return native_silu_and_mul(x, out)
+
+elif _is_xpu:
     from sgl_kernel import silu_and_mul
 
 

@@ -69,6 +69,7 @@ def _eager_modulate(x, scale, shift):
 
 @pytest.mark.parametrize("shape", MODULATE_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA-only backend")
 def test_modulate_scale_shift_matches_eager(shape, dtype):
     x = torch.randn(shape, device=DEVICE, dtype=dtype)
     scale = torch.randn((shape[0], shape[-1]), device=DEVICE, dtype=dtype)
@@ -78,6 +79,7 @@ def test_modulate_scale_shift_matches_eager(shape, dtype):
     )
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA-only backend")
 def test_modulate_scale_shift_accepts_adaln_chunk_views():
     # Production feeds strided ``emb.chunk(6)`` views, not fresh tensors.
     x = torch.randn((1, 4096, 3072), device=DEVICE, dtype=torch.bfloat16)
@@ -95,6 +97,17 @@ def test_modulate_scale_shift_guards_reject_fp32():
     assert not can_use_modulate_scale_shift_cuda(x, row, row)
     # The public wrapper still returns the eager result on a rejected input.
     assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm fallback regression")
+def test_rocm_modulation_uses_exact_eager_fallback():
+    x = torch.randn((2, 17, 3072), device=DEVICE, dtype=torch.bfloat16)
+    scale = torch.randn((2, 3072), device=DEVICE, dtype=x.dtype)
+    shift = torch.randn_like(scale)
+    assert not can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert torch.equal(
+        modulate_scale_shift(x, scale, shift), _eager_modulate(x, scale, shift)
+    )
 
 
 # Causal Wan and LingBot use per-frame 4D modulation with a per-token shift.

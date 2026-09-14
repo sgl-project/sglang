@@ -44,6 +44,7 @@ from sglang.kernels.ops.diffusion import (
     modulate_scale_shift,
     residual_gate_add,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -97,6 +98,8 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 _get_qkv_projections = get_qkv_projections
 
 _FLUX_LN_MOD = BitExactFusionGate("FLUX fused LN+modulate", per_signature=True)
+_DISABLE_ROCM_LN_MODULATE = envs.SGLANG_DIFFUSION_DISABLE_ROCM_LN_MODULATE
+_FLUX_ROCM_VARIANCE_FMA: dict[tuple, bool] = {}
 # Keep the pre-refactor direct set lookup in this launch-sensitive hot path.
 _FLUX_LN_MOD_SIGS = _FLUX_LN_MOD.verified_sigs
 assert _FLUX_LN_MOD_SIGS is not None
@@ -117,13 +120,30 @@ def _flux_fused_ln_modulate(
     verified ``torch.equal`` against the eager chain on first sight, and any
     mismatch disables the fast path permanently.
     """
-    if (
-        _FLUX_LN_MOD.disabled
-        or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale, shift)
-    ):
+    if _FLUX_LN_MOD.disabled or not is_plain_layer_norm(norm, x.shape[-1]):
+        return None
+    is_rocm = current_platform.is_rocm()
+    if not is_rocm:
+        can_use = can_use_fused_layernorm_modulate
+        kernel = fused_layernorm_modulate
+    else:
+        # Qualification is against eager aten, not Inductor's fused arithmetic.
+        # Even an eager-verified signature must not introduce this backend into
+        # a compiled model graph. Standalone kernel compile support is separate.
+        if _DISABLE_ROCM_LN_MODULATE or torch.compiler.is_compiling():
+            return None
+        from sglang.kernels.ops.diffusion import (
+            can_use_layernorm_modulate_rocm,
+            layernorm_modulate_rocm,
+        )
+
+        can_use = can_use_layernorm_modulate_rocm
+        kernel = layernorm_modulate_rocm
+    if not can_use(x, scale, shift):
         return None
     sig = (
+        x.device,
+        x.dtype,
         x.shape,
         x.stride(),
         scale.shape,
@@ -140,13 +160,28 @@ def _flux_fused_ln_modulate(
         # neither inside compile tracing nor CUDA graph capture.
         return None
     try:
-        out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+        if is_rocm:
+            variance_fma = _FLUX_ROCM_VARIANCE_FMA.get(sig, False)
+            out = kernel(x, scale, shift, norm.eps, variance_fma=variance_fma)
+        else:
+            out = kernel(x, scale, shift, norm.eps)
     except Exception as exc:
         _FLUX_LN_MOD.on_exception(exc, logger=logger)
         return None
     if verified:
         return out
     ref = modulate_scale_shift(norm(x), scale, shift)
+    if is_rocm:
+        if not torch.equal(out, ref):
+            # Compiler builds differ in online-variance contraction. Try the
+            # alternate once, outside compile/capture, without relaxing equality.
+            variance_fma = not variance_fma
+            try:
+                out = kernel(x, scale, shift, norm.eps, variance_fma=variance_fma)
+            except Exception as exc:
+                _FLUX_LN_MOD.on_exception(exc, logger=logger)
+                return None
+        _FLUX_ROCM_VARIANCE_FMA[sig] = variance_fma
     return _FLUX_LN_MOD.accept_or_fallback(
         out,
         ref,

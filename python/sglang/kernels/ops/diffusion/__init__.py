@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.layernorm_modulate_rocm",
+        KernelBackend.TRITON,
+        "norm.layernorm_modulate_rocm_triton:layernorm_modulate_rocm",
+        _HIP,
+        "ROCm BF16 LayerNorm + modulation, runtime exactness verification.",
+    ),
+    (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
         "norm.group_norm_silu:apply_group_norm_silu",
@@ -520,6 +527,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
     "group_norm_silu_4d": "norm.group_norm_silu_twopass_triton",
     "group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
+    "can_use_layernorm_modulate_rocm": "norm.layernorm_modulate_rocm_triton",
+    "layernorm_modulate_rocm": "norm.layernorm_modulate_rocm_triton",
     "can_use_fused_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "can_use_fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
