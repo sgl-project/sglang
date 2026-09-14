@@ -294,7 +294,8 @@ class TestServerInfoKvEventsField(CustomTestCase):
             model_path="dummy",
             kv_events_config=(
                 '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
-                '"snapshot_endpoint": "tcp://*:5757"}'
+                '"snapshot_endpoint": "tcp://*:5757", '
+                '"namespace": "test-ns", "worker_id": "worker-a"}'
             ),
             page_size=64,
             dp_size=2,
@@ -305,6 +306,12 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["snapshot_endpoint_host"], "*")
         self.assertEqual(info["kv_events"]["snapshot_endpoint_port_base"], 5757)
         self.assertEqual(info["kv_events"]["snapshot_protocol_version"], 1)
+        self.assertEqual(info["kv_events"]["snapshot_versions"], [1, 2])
+        self.assertEqual(info["kv_events"]["namespace"], "test-ns")
+        self.assertEqual(info["kv_events"]["worker_id"], "worker-a")
+        self.assertEqual(info["kv_events"]["model"], "dummy")
+        self.assertEqual(info["kv_events"]["hash_schema_version"], 1)
+        self.assertFalse(info["kv_events"]["is_bigram"])
 
     def test_invalid_snapshot_endpoint_does_not_hide_live_publisher(self):
         args = ServerArgs(
@@ -320,6 +327,7 @@ class TestServerInfoKvEventsField(CustomTestCase):
 
         self.assertIsNotNone(info["kv_events"])
         self.assertNotIn("snapshot_endpoint_host", info["kv_events"])
+        self.assertNotIn("snapshot_versions", info["kv_events"])
 
     # ----- disabled / unconfigured -------------------------------------
 

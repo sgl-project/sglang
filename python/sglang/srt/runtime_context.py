@@ -2211,16 +2211,6 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "topic": cfg.topic,
         "block_size": kv_event_block_size_of(resolved),
         "dp_size": resolved.dp_size,
-        "namespace": cfg.namespace,
-        "worker_id": cfg.worker_id,
-        "model": cfg.model
-        or getattr(resolved, "served_model_name", None)
-        or getattr(resolved, "model_path", ""),
-        "hash_schema_version": cfg.hash_schema_version,
-        "is_bigram": cfg.is_bigram
-        or str(getattr(resolved, "speculative_algorithm", "")).upper()
-        in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"),
-        "snapshot_versions": [1, 2],
     }
     resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
     if resolved_replay is not None:
@@ -2229,11 +2219,23 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     resolved_snapshot = parse_advertisable_tcp(cfg.snapshot_endpoint)
     if resolved_snapshot is not None:
         snapshot_host, snapshot_port = resolved_snapshot
+        # Advertise recovery capabilities only alongside a reachable snapshot
+        # endpoint; live-only publishers retain their legacy descriptor.
         descriptor.update(
             {
                 "snapshot_endpoint_host": snapshot_host,
                 "snapshot_endpoint_port_base": snapshot_port,
                 "snapshot_protocol_version": SNAPSHOT_PROTOCOL_VERSION,
+                "namespace": cfg.namespace,
+                "worker_id": cfg.worker_id,
+                "model": cfg.model
+                or getattr(resolved, "served_model_name", None)
+                or getattr(resolved, "model_path", ""),
+                "hash_schema_version": cfg.hash_schema_version,
+                "is_bigram": cfg.is_bigram
+                or str(getattr(resolved, "speculative_algorithm", "")).upper()
+                in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"),
+                "snapshot_versions": [1, 2],
             }
         )
     # Load range, from the same resolver SchedulerLoadPublisher binds
