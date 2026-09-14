@@ -353,6 +353,20 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kv_indices
         )
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Use this wrapper's capacity, which also includes the compressed pool.
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),

@@ -10,8 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
@@ -149,45 +148,11 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(
-    tree_cache: BasePrefixCache | None,
-    num_tokens: int,
-    swa_num_tokens: Optional[int] = None,
-):
-    if tree_cache is None:
-        return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            supports_swa_byte_budget,
+def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+    if tree_cache is not None and not tree_cache.is_chunk_cache():
+        tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+            tree_cache, num_tokens
         )
-
-        if supports_swa_byte_budget(allocator):
-            allocator.evict_to_free_tokens(
-                tree_cache, num_tokens, swa_num_tokens=required_swa
-            )
-            return
-
-        full_num_tokens = max(0, num_tokens - allocator.full_available_size())
-        swa_num_tokens = max(0, required_swa - allocator.swa_available_size())
-        if full_num_tokens or swa_num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
-        available_size = allocator.available_size()
-        if available_size < num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
-            )
 
 
 def retraction_backup(
