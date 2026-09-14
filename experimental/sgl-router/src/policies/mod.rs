@@ -33,7 +33,8 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
+    /// Whether the ids came from chat rendering (forwardable as engine
+    /// `input_ids` when the chat route's guard allows) rather than raw text.
     pub chat_rendered: bool,
 }
 
@@ -44,21 +45,21 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-formatter tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
+/// Tokenizes a request for routing. Chat-rendered tokens may also be forwarded
+/// to the engine (the chat route decides); raw prompt tokens are routing-only.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_formatter(&model_id.0) {
-        if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
-                return Some(RequestTokens {
-                    ids,
-                    chat_rendered: true,
-                });
-            }
+    if tokenizers.has_chat_formatter(&model_id.0)
+        && value.get("messages").is_some_and(|m| m.is_array())
+    {
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                chat_rendered: true,
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;

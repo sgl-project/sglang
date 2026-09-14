@@ -626,11 +626,10 @@ impl MetricsRegistry {
     /// Recorded ONLY when the `input_ids` offload should have fired but the
     /// chat formatter failed: a plain text chat request (one the forward guard
     /// would have forwarded) on a model with a chat formatter that did not
-    /// yield engine-equivalent ids. That request silently fell back to
-    /// engine-side tokenization. It stays at ~0 in healthy operation; requests
-    /// the guard withholds anyway (tools, multimodal, thinking) are not counted
-    /// even when their render fails. Pairs with the per-model WARN log in
-    /// `encode_chat`.
+    /// yield chat-rendered ids. That request silently fell back to engine-side
+    /// tokenization. It stays at ~0 in healthy operation; requests the guard
+    /// withholds anyway (tools, multimodal, thinking) are not counted even when
+    /// their render fails. Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
