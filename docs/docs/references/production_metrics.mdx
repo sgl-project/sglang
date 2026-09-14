@@ -126,6 +126,9 @@ sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177
 # HELP sglang:num_queue_reqs The number of requests in the waiting queue
 # TYPE sglang:num_queue_reqs gauge
 sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
+# HELP sglang:avg_request_queue_latency The average wait time in seconds of requests currently in the waiting queue.
+# TYPE sglang:avg_request_queue_latency gauge
+sglang:avg_request_queue_latency{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.2
 # HELP sglang:spec_num_steps Currently active speculative_num_steps.
 # TYPE sglang:spec_num_steps gauge
 sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
