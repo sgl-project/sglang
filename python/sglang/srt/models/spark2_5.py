@@ -2,6 +2,7 @@ import logging
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import get_pp_group
@@ -40,6 +41,15 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def _get_attention_sliding_window_size(config):
     return config.sliding_window - 1
+
+
+def _apply_gate_activation(gate: torch.Tensor, mode: str) -> torch.Tensor:
+    gate = gate.float()
+    if mode == "sigmoid":
+        return torch.sigmoid(gate)
+    if mode == "silu":
+        return F.silu(gate)
+    raise ValueError(f"Unsupported gate_attn_act_mode: {mode}")
 
 
 class Spark2_5MLP(nn.Module):
@@ -96,6 +106,7 @@ class Spark2_5Attention(nn.Module):
         layer_type: str = "sliding_attention",
         headwise_attn_output_gate: bool = True,
         prefix: str = "",
+        gate_attn_act_mode: str = "sigmoid",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -126,6 +137,9 @@ class Spark2_5Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.partial_rotary_factor = partial_rotary_factor
         self.headwise_attn_output_gate = headwise_attn_output_gate
+        if gate_attn_act_mode not in ("sigmoid", "silu"):
+            raise ValueError(f"Unsupported gate_attn_act_mode: {gate_attn_act_mode}")
+        self.gate_attn_act_mode = gate_attn_act_mode
 
         self.q_k_v_proj = QKVParallelLinear(
             hidden_size,
@@ -197,7 +211,7 @@ class Spark2_5Attention(nn.Module):
 
         if self.headwise_attn_output_gate:
             g, _ = self.g_proj(hidden_states)
-            g = torch.sigmoid(g.float()).to(attn_output.dtype)
+            g = _apply_gate_activation(g, self.gate_attn_act_mode).to(attn_output.dtype)
             gate_output = attn_output.view(
                 attn_output.shape[0],
                 self.num_heads,
@@ -249,6 +263,7 @@ class Spark2_5DecoderLayer(nn.Module):
             headwise_attn_output_gate=getattr(
                 config, "headwise_attn_output_gate", True
             ),
+            gate_attn_act_mode=getattr(config, "gate_attn_act_mode", "sigmoid"),
             prefix=add_prefix("self_attn", prefix),
         )
 
