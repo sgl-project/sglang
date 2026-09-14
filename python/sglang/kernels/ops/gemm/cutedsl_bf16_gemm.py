@@ -1334,24 +1334,28 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     return best
 
 
-# Kimi-K3 per-rank dense-GEMM shapes (TP8). They sit in this heuristic's
-# unmeasured region (hidden=7168 inputs fail k > 6144; o_proj-style k=1536
-# fails k < 2048), but TGV wins 1.04-2.43x on every one of them on GB300
-# (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
-# e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
-# small decode batches; larger m stays on the measured heuristic below.
-_K3_TGV_WIN_SHAPES = frozenset(
-    {
-        (6144, 7168),  # KDA fused qkvg
-        (6016, 7168),  # merged MoE front (gate_up | router | latent down)
-        (7168, 1536),  # KDA / MLA o_proj
-        (1536, 7168),  # MLA q_a / shared gate_up
-        (2304, 1536),  # MLA q_b
-        (3584, 7168),  # MoE latent down (unfused fallback)
-        (7168, 3584),  # MoE latent up
-        (7168, 768),  # shared down
-    }
-)
+# Kimi-K3 per-rank dense-GEMM shapes (TP8): (n, k) -> largest m routed to TGV.
+# They sit in the generic heuristic's unmeasured region (hidden=7168 inputs
+# fail k > 6144; o_proj-style k=1536 fails k < 2048), so the windows come from
+# a dedicated B300 sweep (cold L2 via in-graph 512MB memset, CUDA graph
+# replay, CUPTI kernel medians vs cuBLAS, m in {8..128}, two runs within
+# +/-0.06x). The k=7168 shapes win 1.02-1.44x through m<=64; at m=96/128 only
+# (1536,7168) still wins (1.20x/1.10x), (6144,7168)/(6016,7168) tie at 96 and
+# lose at 128 (0.93-0.94x), and (3584,7168) loses already at 96 (0.94x). The
+# k=1536/768 shapes only win at m<=8 and tie or lose beyond. kv_a (n=576)
+# loses (0.84x) and stays out. Above a window, m falls through to the generic
+# heuristic below.
+_K3_TGV_WIN_MAX_M = {
+    (6144, 7168): 64,  # KDA fused qkvg: 1.14-1.22x to 64, 1.03x at 96, 0.94x at 128
+    (6016, 7168): 64,  # merged MoE front: 1.14-1.20x to 64, 1.01x at 96, 0.93x at 128
+    (7168, 1536): 8,  # KDA / MLA o_proj: ties to 48, loses from 64 (0.91-0.99x)
+    # MLA q_a / shared gate_up: 1.09-1.44x to 64, 1.2x at 96, 1.1x at 128
+    (1536, 7168): 128,
+    (2304, 1536): 8,  # MLA q_b: 1.32-1.39x at m=8, ties beyond (1.06x at 96)
+    (3584, 7168): 64,  # MoE latent down: 1.02-1.25x to 64, 0.94x at 96
+    (7168, 3584): 8,  # MoE latent up: 1.01-1.05x everywhere (tie-ish)
+    (7168, 768): 8,  # shared down: ties, loses from 64 (0.90-0.98x)
+}
 
 
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
@@ -1365,7 +1369,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+    if m <= _K3_TGV_WIN_MAX_M.get((n, k), 0):
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
