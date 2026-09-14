@@ -1079,7 +1079,7 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return int(seq_lens.max().item())
 
-    def _forward_mla_decode_dcp(self, q, k_buffer, layer, k_descale):
+    def _forward_mla_decode_dcp(self, q, k_buffer, layer, k_descale, qlen_real=1):
         """Rank-local shard attention for all gathered q heads; the model
         combines the (out, lse) partials across DCP ranks. The gfx950 asm
         kernels with the round-robin CP causal map are persistent fp8 q,
@@ -1092,19 +1092,22 @@ class AiterAttnBackend(AttentionBackend):
 
         md = self.forward_metadata
         qlen = self.dcp_decode_qlen
-        bs = q.shape[0]
+        assert 1 <= qlen_real <= qlen
+        bs = q.shape[0] // qlen_real
         q3 = q.contiguous()
         q_scale_buf = torch.empty((1,), dtype=torch.float32, device=q.device)
         q_fp8, q_scale = per_tensor_quant_mla_fp8(q3, q_scale_buf)
         num_head = layer.tp_q_head_num
+        q_fp8 = q_fp8.view(bs, qlen_real, num_head, layer.qk_head_dim)
         chunk = 32 if num_head % 32 == 0 else 16
         kv_flat = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
         outs, lses = [], []
+        r0 = qlen - qlen_real
         for h0 in range(0, num_head, chunk):
             q4 = torch.zeros(
                 (bs, qlen, chunk, layer.qk_head_dim), dtype=q_fp8.dtype, device=q.device
             )
-            q4[:, qlen - 1] = q_fp8[:, h0 : h0 + chunk]
+            q4[:, r0:] = q_fp8[:, :, h0 : h0 + chunk]
             q4 = q4.view(bs * qlen, chunk, layer.qk_head_dim)
             o = torch.empty(
                 (bs * qlen, chunk, layer.v_head_dim),
@@ -1143,8 +1146,12 @@ class AiterAttnBackend(AttentionBackend):
                 cp_world_size=self.dcp_size,
                 cp_rank=self.dcp_rank,
             )
-            outs.append(o.view(bs, qlen, chunk, layer.v_head_dim)[:, qlen - 1])
-            lses.append(lse.view(bs, qlen, chunk)[:, qlen - 1])
+            outs.append(
+                o.view(bs, qlen, chunk, layer.v_head_dim)[:, r0:].reshape(
+                    bs * qlen_real, chunk, layer.v_head_dim
+                )
+            )
+            lses.append(lse.view(bs, qlen, chunk)[:, r0:].reshape(bs * qlen_real, chunk))
         return torch.cat(outs, dim=1), torch.cat(lses, dim=1)
 
     def _forward_mla_decode(
@@ -1406,7 +1413,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention and self.dcp_size > 1:
+                if not self.use_triton_unified_attention and self.dcp_size > 1 and self.use_mla:
                     kv_indptr, kv_indices, _ = self._dcp_decode_kv_metadata(
                         forward_batch.req_pool_indices, forward_batch.seq_lens, bs
                     )
@@ -1634,27 +1641,43 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=device,
                 )
-                kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-                kv_indices = self._get_kv_indices_scratch(
-                    kv_lens_sum,
-                    device,
-                )
-                num_token_blocks = self._kv_index_blocks(bs)
-                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    kv_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-                )
+                if self.dcp_size > 1:
+                    # Rank-local shard of prefix + draft rows; the kernel's
+                    # round-robin causal map places the draft_num real q rows
+                    # at the end of the global sequence (padded to the 4-row
+                    # block like decode).
+                    assert draft_num <= self.dcp_decode_qlen, (
+                        f"DCP target-verify supports <= {self.dcp_decode_qlen} "
+                        f"draft rows on the asm kernel, got {draft_num}"
+                    )
+                    kv_indptr, kv_indices, _ = self._dcp_decode_kv_metadata(
+                        forward_batch.req_pool_indices, kv_lens, bs
+                    )
+                    qo_indptr = self.qo_indptr_dcp[: bs + 1]
+                else:
+                    kv_indptr = self.kv_indptr[: bs + 1]
+                    kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                    kv_indices = self._get_kv_indices_scratch(
+                        kv_lens_sum,
+                        device,
+                    )
+                    num_token_blocks = self._kv_index_blocks(bs)
+                    create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        kv_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                        TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+                    )
 
                 # if self.kv_cache_dtype == fp8_dtype:
                 if _use_mla_ps_kernel:
-                    max_seqlen_qo = draft_num
+                    max_seqlen_qo = (
+                        self.dcp_decode_qlen if self.dcp_size > 1 else draft_num
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -1688,8 +1711,11 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
-                    draft_num,
+                    (self.dcp_decode_qlen if self.dcp_size > 1 else draft_num),
                     None,
+                    g_kv_indptr=(
+                        self.g_kv_indptr[: bs + 1] if self.dcp_size > 1 else None
+                    ),
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -2044,7 +2070,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.max_context_len + self.page_size - 1
                 ) // self.page_size
 
-                if not self.use_triton_unified_attention and self.dcp_size > 1:
+                if not self.use_triton_unified_attention and self.dcp_size > 1 and self.use_mla:
                     kv_indptr, kv_indices, _ = self._dcp_decode_kv_metadata(
                         req_pool_indices, seq_lens, bs, self.cuda_graph_kv_indices
                     )
@@ -2190,36 +2216,43 @@ class AiterAttnBackend(AttentionBackend):
                 kv_lens = seq_lens + self.num_draft_tokens
             else:
                 kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
-            if seq_lens_sum is not None:
-                kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+            if self.dcp_size > 1 and self.use_mla:
+                # DCP: rank-local prefix + draft rows into the graph buffers.
+                kv_indptr, kv_indices, _ = self._dcp_decode_kv_metadata(
+                    req_pool_indices, kv_lens, bs, self.cuda_graph_kv_indices
                 )
-                assert_buffer_fits(
-                    kv_indices_used,
-                    kv_indices.numel(),
-                    "aiter target_verify kv_indices",
-                    bs=bs,
-                    seq_lens_sum=seq_lens_sum,
+                qo_indptr = self.qo_indptr_dcp[: bs + 1]
+            else:
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+                if seq_lens_sum is not None:
+                    kv_indices_used = seq_lens_sum + (
+                        self.num_draft_tokens * bs if self.use_mla else 0
+                    )
+                    assert_buffer_fits(
+                        kv_indices_used,
+                        kv_indices.numel(),
+                        "aiter target_verify kv_indices",
+                        bs=bs,
+                        seq_lens_sum=seq_lens_sum,
+                    )
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
-            num_token_blocks = self._kv_index_blocks(bs)
-            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-            )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla:
-                max_q_len = self.num_draft_tokens
+                max_q_len = (self.dcp_decode_qlen if self.dcp_size > 1 else self.num_draft_tokens)
                 if _use_mla_ps_kernel:
                     num_kv_splits = self.max_split_per_batch
 
@@ -2254,6 +2287,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_last_page_len,
                     max_q_len,
                     max_kv_len,
+                    g_kv_indptr=(self.g_kv_indptr[: bs + 1] if self.dcp_size > 1 and self.use_mla else None),
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -2820,6 +2854,15 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.dcp_size > 1:
+                    out, lse = self._forward_mla_decode_dcp(
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        K_Buffer,
+                        layer,
+                        k_descale,
+                        qlen_real=forward_batch.spec_info.draft_token_num,
+                    )
+                    return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim), lse
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
