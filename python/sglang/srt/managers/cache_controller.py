@@ -1371,6 +1371,13 @@ class HiCacheController:
                     : (storage_hit_count // self.page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
+                # Zero usable hits (terminated ops also report 0 here): the op
+                # will never be forwarded to prefetch_buffer, so retire the root
+                # span now instead of leaving it to __del__ on the revoke path.
+                # The op is still queued for the tree cache's absent-hash
+                # accounting, which does not need the span open.
+                if storage_hit_count == 0:
+                    self._finish_op_trace(operation)
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
