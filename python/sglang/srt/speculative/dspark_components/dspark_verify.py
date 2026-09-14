@@ -78,7 +78,9 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
-def candidate_request_length_bound(reqs, pending_verify_tokens: int = 0) -> Optional[int]:
+def candidate_request_length_bound(
+    reqs, pending_verify_tokens: int = 0
+) -> Optional[int]:
     """Bound committed positions without reading asynchronous acceptance results.
 
     The overlap loop can have one unprocessed result, which may overshoot the
