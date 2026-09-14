@@ -60,7 +60,9 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(
+        self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
+    ) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
@@ -78,7 +80,7 @@ class DecodeHiCachePreallocMixin:
                 last_host_node
             ):
                 matched_len = l1_prefix_len + l2_host_hit_length
-                suffix_tokens = req.origin_input_ids[matched_len:]
+                suffix_tokens = req.origin_input_ids[matched_len:max_prefix_len]
                 last_hash = self.tree_cache.get_last_hash_value(last_host_node)
                 prefix_keys = (
                     self.tree_cache.get_prefix_hash_values(last_host_node)
@@ -218,6 +220,7 @@ class DecodeHiCacheTransferMixin:
             dr.req.origin_input_ids,
             cow_mamba=False,
             include_req=True,
+            max_prefix_len=pm.decode_prefix_len,
         )
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(

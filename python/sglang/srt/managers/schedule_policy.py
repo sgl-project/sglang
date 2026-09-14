@@ -145,6 +145,7 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    max_prefix_len: Optional[int] = None,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -155,6 +156,10 @@ def match_prefix_for_req(
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
