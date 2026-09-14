@@ -365,6 +365,25 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
+    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Eager/replay seam, resolved by backend STATE (no argument).
+
+        Returns True when this ``(bs, forward_mode)`` has a pre-bound
+        cuda-graph wrapper: i.e. at cuda-graph replay (the runner always pads to
+        a captured bucket) and harmlessly at an eager forward that lands on a
+        captured bs+mode in a graph-enabled server -- there is one forward
+        stream per backend, and the bound wrapper is always re-planned by
+        ``out_graph`` before the next ``graph.replay()``, so a transient eager
+        plan cannot leak into a later replay. Returns False for pure-eager runs
+        (no wrapper was ever captured for this bs/mode) and for plain EXTEND
+        (never captured) -> build into the persistent eager wrappers.
+        """
+        if forward_mode.is_decode_or_idle():
+            return bs in self.decode_cuda_graph_metadata
+        if forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
+            return bs in self.prefill_cuda_graph_metadata
+        return False
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
@@ -524,6 +543,53 @@ class FlashInferAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if in_capture:
+            num_tokens = forward_batch.positions.numel()
+            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+
+        # Single eager == replay == capture metadata path; `use_bound` selects
+        # the pre-bound cuda-graph wrapper vs the persistent eager wrapper.
+        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
+        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
+
+        # in_capture-only tail: fast_decode_plan install + binding the freshly
+        # refilled SWA buffer slice onto the just-created capture metadata. These
+        # depend on in_capture (not use_bound) so they stay out of the converged
+        # body, which is merged into a shared helper in a follow-up commit.
+        if in_capture and forward_mode.is_decode_or_idle():
+            # fast_decode_plan needs _cached_module from the initial begin_forward
+            # above, so install it only after that first plan has run.
+            for w in self.decode_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_decode_plan, w)
+
+        if (
+            in_capture
+            and self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+        ):
+            n = forward_batch.out_cache_loc.shape[0]
+            self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                :n
+            ]
+
+    def _compute_forward_metadata(
+        self, forward_batch: ForwardBatch, *, use_bound: bool
+    ):
+        """Single source of truth for FlashInfer forward metadata, shared by
+        eager, capture, and replay.
+
+        ``use_bound`` selects the wrapper the metadata is planned into: the
+        per-bs pre-bound cuda-graph wrapper (capture / replay / eager-at-
+        captured-bs) vs the persistent eager wrapper. Plain EXTEND (and eager
+        DLLM_EXTEND) only ever run with use_bound=False (the decode graph never
+        captures plain EXTEND). The in_capture-only side effects (pre-roll,
+        fast_decode_plan install, capture SWA binding) live in
+        init_forward_metadata_out_graph around this call.
+        """
+        bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -532,35 +598,99 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if in_capture:
-            num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+        # Eager-only SWA write-target translation (the bound path refills the
+        # captured cuda_graph_swa_out_cache_loc buffer in the tail below).
+        swa_out_cache_loc = None
+        if (
+            not use_bound
+            and self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+        ):
+            assert self._swa_kv_pool is not None
+            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
 
         if forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
+            if use_bound:
+                self.indices_updater_decode.update(
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                    seq_lens_sum,
+                    decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                    encoder_lens=(
+                        encoder_lens[:bs] if encoder_lens is not None else None
+                    ),
+                    spec_info=spec_info,
+                    fixed_split_size=None,
+                    disable_split_kv=self.disable_cuda_graph_kv_split,
+                )
+                # Eager-fallback at a captured bs (can_run_graph False, e.g.
+                # replace_embeds / unsupported encoder_lens) reaches this bound
+                # branch via init_forward_metadata, so install a DecodeMetadata
+                # pointing at the just-refilled bs-bound wrappers; otherwise
+                # self.forward_metadata may still hold a previous PrefillMetadata.
+                # Replay re-assigns forward_metadata in init_forward_metadata_in_graph;
+                # this is the eager-fallback parallel.
+                self.forward_metadata = DecodeMetadata(
+                    self.decode_cuda_graph_metadata[bs]
+                )
+            else:
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu,
+                    seq_lens_sum,
+                    decode_wrappers=self.decode_wrappers,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                    fixed_split_size=self.decode_split_tile_size,
+                    disable_split_kv=False,
+                )
+                self.forward_metadata = DecodeMetadata(
+                    self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+                )
         elif forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
-            )
-        elif forward_mode.is_dllm_extend():
+            if use_bound:
+                self.indices_updater_prefill.update(
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                    use_ragged=False,
+                    encoder_lens=(
+                        encoder_lens[:bs] if encoder_lens is not None else None
+                    ),
+                    spec_info=spec_info,
+                )
+                # Same eager-fallback rationale as the decode bound branch above.
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_cuda_graph_metadata[bs],
+                    False,
+                    False,
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=self.prefill_wrappers_verify,
+                    use_ragged=False,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_verify,
+                    False,
+                    False,
+                    swa_out_cache_loc=swa_out_cache_loc,
+                )
+        elif forward_mode.is_dllm_extend() and use_bound:
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -573,72 +703,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
             )
         else:
-            raise ValueError("Invalid forward mode")
-
-        if in_capture and forward_mode.is_decode_or_idle():
-            # fast_decode_plan needs _cached_module from the initial begin_forward
-            # above, so install it only after that first plan has run.
-            for w in self.decode_cuda_graph_metadata[bs]:
-                w.begin_forward = partial(fast_decode_plan, w)
-
-        # Refill the SWA write-target buffer from the live out_cache_loc before
-        # replay (bound onto the metadata at capture below).
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
-            n = forward_batch.out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-            if in_capture:
-                self.forward_metadata.swa_out_cache_loc = (
-                    self.cuda_graph_swa_out_cache_loc[:n]
-                )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        swa_out_cache_loc = None
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
-            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
-
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                decode_wrappers=self.decode_wrappers,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-                fixed_split_size=self.decode_split_tile_size,
-                disable_split_kv=False,
-            )
-            self.forward_metadata = DecodeMetadata(
-                self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
-            )
-        elif forward_batch.forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_wrappers_verify,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_verify,
-                False,
-                False,
-                swa_out_cache_loc=swa_out_cache_loc,
-            )
-        else:
+            # Plain EXTEND (and eager DLLM_EXTEND) -- eager only; the decode
+            # graph never captures plain EXTEND, and eager DLLM_EXTEND lands here
+            # with use_bound=False (matching the old eager body's `else`).
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
@@ -685,6 +752,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+            )
+
+        # Bound-path SWA: refill the captured write-target buffer from the live
+        # out_cache_loc before replay (bound onto the metadata at capture by the
+        # in_capture tail below). The eager (use_bound=False) path instead
+        # threads swa_out_cache_loc through the metadata constructed above.
+        if (
+            use_bound
+            and self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+        ):
+            assert self._swa_kv_pool is not None
+            n = forward_batch.out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
             )
 
     def init_static_metadata_buffers(

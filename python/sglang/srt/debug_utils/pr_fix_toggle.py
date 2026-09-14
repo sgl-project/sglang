@@ -60,7 +60,7 @@ patches:
 
 _PR_REVERT_YAML_27360 = """
 patches:
-  - target: sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend._apply_cuda_graph_metadata
+  - target: sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend._compute_forward_metadata
     edits:
       - match: |
           cache_loc = cache_loc[:, :decode_length]

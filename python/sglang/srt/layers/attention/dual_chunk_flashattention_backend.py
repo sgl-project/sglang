@@ -174,6 +174,24 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
+    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Eager/replay seam, resolved by backend STATE (no argument).
+
+        Returns True when this ``(bs, forward_mode)`` has a pre-bound cuda-graph
+        metadata object: i.e. at decode-graph replay (the runner always pads to a
+        captured bucket) and harmlessly at an eager forward that lands on a
+        captured bs in a graph-enabled server -- there is one forward stream per
+        backend, and the bound metadata buffers are always re-filled by
+        ``out_graph`` before the next ``graph.replay()``, so a transient eager
+        write cannot leak into a later replay. Only decode/idle is ever captured
+        (``_bind_metadata_buffers``). Returns False for pure-eager runs
+        (``init_cuda_graph_state`` never ran -> no ``decode_metadata``) and for
+        prefill -> build a fresh metadata object. Never raises KeyError.
+        """
+        if not forward_mode.is_decode_or_idle():
+            return False
+        return bs in getattr(self, "decode_metadata", {})
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -181,18 +199,16 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
     ):
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
 
         if in_capture:
             self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
 
-        self._apply_cuda_graph_metadata(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            forward_mode=forward_mode,
-        )
+        # Single eager == replay == capture metadata path; `use_bound` selects the
+        # pre-bound cuda-graph metadata object vs a freshly built one (see
+        # _use_cuda_graph_buffers). Always bound at capture.
+        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
+        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
 
         if in_capture and forward_mode.is_decode_or_idle():
             # Restore max_seq_len scalars — replay sets actual values but CUDA
@@ -203,60 +219,50 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             md.max_seq_len_succ = self.max_context_len
             md.max_seq_len_inter = self.max_context_len
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+    def _compute_forward_metadata(
+        self, forward_batch: ForwardBatch, *, use_bound: bool
+    ):
+        """Single source of truth for Dual-Chunk FlashAttention forward metadata,
+        shared by eager, capture, and replay.
 
-        forward_mode: ForwardMode = forward_batch.forward_mode
-        assert forward_mode.is_prefill() or forward_mode.is_decode()
-        batch_size = forward_batch.batch_size
+        ``use_bound`` selects the metadata destination: the per-bs pre-bound
+        cuda-graph metadata object in ``decode_metadata`` (capture / replay /
+        eager-at-captured-bs; decode-only) vs a freshly built
+        ``DualChunkFlashAttentionMetadata`` (pure-eager prefill or decode).
+        """
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
 
-        metadata = DualChunkFlashAttentionMetadata()
-        metadata.seq_lens_tensor = forward_batch.seq_lens.to(torch.int32)
-        metadata.seq_lens = forward_batch.seq_lens.tolist()
-        metadata.max_seq_len = forward_batch.seq_lens.max().item()
+        if use_bound:
+            # Bound cuda-graph buffers (decode-only).
+            assert forward_mode.is_decode()
+            seq_lens = seq_lens[:bs]
+            req_pool_indices = req_pool_indices[:bs]
+            metadata = self.decode_metadata[bs]
 
-        metadata.orig_seq_lens_tensor = forward_batch.orig_seq_lens
-        metadata.orig_seq_lens = forward_batch.orig_seq_lens.tolist()
+            metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
+            metadata.seq_lens = seq_lens.tolist()
+            metadata.max_seq_len = seq_lens.max().item()
 
-        metadata.block_tables = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, : metadata.max_seq_len
-        ]
-        # Convert the block table to a strided format.
-        if self.page_size > 1:
-            strided_indices = torch.arange(
-                0, metadata.block_tables.shape[1], self.page_size, device=self.device
-            )
-            metadata.block_tables = (
-                metadata.block_tables[:, strided_indices] // self.page_size
-            )
+            metadata.orig_seq_lens_tensor.copy_(seq_lens)
+            metadata.orig_seq_lens = seq_lens.tolist()
 
-        metadata.query_start_loc = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=metadata.seq_lens_tensor.device
-        )
-        if forward_mode.is_prefill():
-            metadata.query_start_loc[1:] = torch.cumsum(
-                forward_batch.extend_seq_lens.to(torch.int32), dim=0, dtype=torch.int32
-            )
-        else:
-            metadata.query_start_loc[1:] = torch.cumsum(
-                torch.arange(
-                    batch_size,
-                    dtype=metadata.query_start_loc.dtype,
-                    device=metadata.query_start_loc.device,
-                ),
-                dim=0,
-                dtype=torch.int32,
-            )
-        metadata.seq_start_loc = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=metadata.seq_lens_tensor.device
-        )
-        metadata.seq_start_loc[1:] = torch.cumsum(
-            metadata.seq_lens_tensor, dim=0, dtype=torch.int32
-        )
+            block_tables = self.req_to_token[req_pool_indices, : metadata.max_seq_len]
+            # Convert the block table to a strided format.
+            if self.page_size > 1:
+                strided_indices = torch.arange(
+                    0, block_tables.shape[1], self.page_size, device=self.device
+                )
+                block_tables = block_tables[:, strided_indices] // self.page_size
+            metadata.block_tables.fill_(0)
+            metadata.block_tables[
+                : block_tables.shape[0], : block_tables.shape[1]
+            ].copy_(block_tables)
 
-        if self.original_max_position_embeddings > 0:
-            if forward_mode.is_prefill():
-                metadata.scaling_factor = (
+            if self.original_max_position_embeddings > 0:
+                scaling_factor = (
                     0.1
                     * torch.log(
                         metadata.orig_seq_lens_tensor
@@ -264,17 +270,8 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     )
                     + 1.0
                 ).clip(min=1)
-            else:
-                metadata.scaling_factor = (
-                    0.1
-                    * torch.log(
-                        metadata.orig_seq_lens_tensor
-                        / self.original_max_position_embeddings
-                    )
-                    + 1.0
-                ).clip(min=1)
+                metadata.scaling_factor.copy_(scaling_factor)
 
-        if forward_mode.is_decode():
             cache_seq_lens = metadata.orig_seq_lens_tensor
 
             chunk_len = self.chunk_size - self.local_size
@@ -282,36 +279,28 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
             seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
             max_seq_len_intra = seq_lens_intra.max().item()
-            metadata.seq_lens_intra = seq_lens_intra
+            metadata.seq_lens_intra.copy_(seq_lens_intra)
             metadata.max_seq_len_intra = max_seq_len_intra
 
-            block_tables_intra = torch.zeros(
-                batch_size,
-                (max_seq_len_intra - 1) // self.page_size + 1,
-                dtype=metadata.block_tables.dtype,
-                device=metadata.block_tables.device,
-            )
-            for i in range(batch_size):
+            metadata.block_tables_intra.fill_(0)
+            for i in range(bs):
                 st = chunk_num_curr[i] * chunk_len // self.page_size
                 ed = min(
                     st + (max_seq_len_intra - 1) // self.page_size + 1,
                     (cache_seq_lens[i] - 1) // self.page_size + 1,
                 )
-                block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
-            metadata.block_tables_intra = block_tables_intra
+                metadata.block_tables_intra[i, : ed - st] = metadata.block_tables[
+                    i, st:ed
+                ]
 
-            metadata.seq_lens_succ = (
+            seq_lens_succ = (
                 chunk_num_curr - (chunk_num_curr - 1).clip(min=0)
             ) * chunk_len
+            metadata.seq_lens_succ.copy_(seq_lens_succ)
             metadata.max_seq_len_succ = metadata.seq_lens_succ.max().item()
             if metadata.max_seq_len_succ:
-                block_tables_succ = torch.zeros(
-                    batch_size,
-                    (metadata.max_seq_len_succ - 1) // self.page_size + 1,
-                    dtype=metadata.block_tables.dtype,
-                    device=metadata.block_tables.device,
-                )
-                for i in range(batch_size):
+                metadata.block_tables_succ.fill_(0)
+                for i in range(bs):
                     start = (
                         (chunk_num_curr[i] - 1).clip(min=0)
                         * chunk_len
@@ -321,15 +310,151 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
                         (cache_seq_lens[i] - 1) // self.page_size + 1,
                     )
-                    block_tables_succ[i, : end - start] = metadata.block_tables[
-                        i, start:end
-                    ]
-                metadata.block_tables_succ = block_tables_succ
+                    metadata.block_tables_succ[i, : end - start] = (
+                        metadata.block_tables[i, start:end]
+                    )
 
-            metadata.seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
+            seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
+            metadata.seq_lens_inter.copy_(seq_lens_inter)
             metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
 
-        self.forward_metadata = metadata
+            self.forward_metadata = metadata
+        else:
+            # Freshly built metadata object (pure-eager prefill or decode).
+            assert forward_mode.is_prefill() or forward_mode.is_decode()
+            batch_size = forward_batch.batch_size
+
+            metadata = DualChunkFlashAttentionMetadata()
+            metadata.seq_lens_tensor = forward_batch.seq_lens.to(torch.int32)
+            metadata.seq_lens = forward_batch.seq_lens.tolist()
+            metadata.max_seq_len = forward_batch.seq_lens.max().item()
+
+            metadata.orig_seq_lens_tensor = forward_batch.orig_seq_lens
+            metadata.orig_seq_lens = forward_batch.orig_seq_lens.tolist()
+
+            metadata.block_tables = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len
+            ]
+            # Convert the block table to a strided format.
+            if self.page_size > 1:
+                strided_indices = torch.arange(
+                    0,
+                    metadata.block_tables.shape[1],
+                    self.page_size,
+                    device=self.device,
+                )
+                metadata.block_tables = (
+                    metadata.block_tables[:, strided_indices] // self.page_size
+                )
+
+            metadata.query_start_loc = torch.zeros(
+                batch_size + 1,
+                dtype=torch.int32,
+                device=metadata.seq_lens_tensor.device,
+            )
+            if forward_mode.is_prefill():
+                metadata.query_start_loc[1:] = torch.cumsum(
+                    forward_batch.extend_seq_lens.to(torch.int32),
+                    dim=0,
+                    dtype=torch.int32,
+                )
+            else:
+                metadata.query_start_loc[1:] = torch.cumsum(
+                    torch.arange(
+                        batch_size,
+                        dtype=metadata.query_start_loc.dtype,
+                        device=metadata.query_start_loc.device,
+                    ),
+                    dim=0,
+                    dtype=torch.int32,
+                )
+            metadata.seq_start_loc = torch.zeros(
+                batch_size + 1,
+                dtype=torch.int32,
+                device=metadata.seq_lens_tensor.device,
+            )
+            metadata.seq_start_loc[1:] = torch.cumsum(
+                metadata.seq_lens_tensor, dim=0, dtype=torch.int32
+            )
+
+            if self.original_max_position_embeddings > 0:
+                if forward_mode.is_prefill():
+                    metadata.scaling_factor = (
+                        0.1
+                        * torch.log(
+                            metadata.orig_seq_lens_tensor
+                            / self.original_max_position_embeddings
+                        )
+                        + 1.0
+                    ).clip(min=1)
+                else:
+                    metadata.scaling_factor = (
+                        0.1
+                        * torch.log(
+                            metadata.orig_seq_lens_tensor
+                            / self.original_max_position_embeddings
+                        )
+                        + 1.0
+                    ).clip(min=1)
+
+            if forward_mode.is_decode():
+                cache_seq_lens = metadata.orig_seq_lens_tensor
+
+                chunk_len = self.chunk_size - self.local_size
+                chunk_num_curr = (cache_seq_lens - 1) // chunk_len
+
+                seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
+                max_seq_len_intra = seq_lens_intra.max().item()
+                metadata.seq_lens_intra = seq_lens_intra
+                metadata.max_seq_len_intra = max_seq_len_intra
+
+                block_tables_intra = torch.zeros(
+                    batch_size,
+                    (max_seq_len_intra - 1) // self.page_size + 1,
+                    dtype=metadata.block_tables.dtype,
+                    device=metadata.block_tables.device,
+                )
+                for i in range(batch_size):
+                    st = chunk_num_curr[i] * chunk_len // self.page_size
+                    ed = min(
+                        st + (max_seq_len_intra - 1) // self.page_size + 1,
+                        (cache_seq_lens[i] - 1) // self.page_size + 1,
+                    )
+                    block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
+                metadata.block_tables_intra = block_tables_intra
+
+                metadata.seq_lens_succ = (
+                    chunk_num_curr - (chunk_num_curr - 1).clip(min=0)
+                ) * chunk_len
+                metadata.max_seq_len_succ = metadata.seq_lens_succ.max().item()
+                if metadata.max_seq_len_succ:
+                    block_tables_succ = torch.zeros(
+                        batch_size,
+                        (metadata.max_seq_len_succ - 1) // self.page_size + 1,
+                        dtype=metadata.block_tables.dtype,
+                        device=metadata.block_tables.device,
+                    )
+                    for i in range(batch_size):
+                        start = (
+                            (chunk_num_curr[i] - 1).clip(min=0)
+                            * chunk_len
+                            // self.page_size
+                        )
+                        end = min(
+                            start
+                            + (metadata.max_seq_len_succ - 1) // self.page_size
+                            + 1,
+                            (cache_seq_lens[i] - 1) // self.page_size + 1,
+                        )
+                        block_tables_succ[i, : end - start] = metadata.block_tables[
+                            i, start:end
+                        ]
+                    metadata.block_tables_succ = block_tables_succ
+
+                metadata.seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
+                metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
+
+            self.forward_metadata = metadata
 
     def forward_extend(
         self,
@@ -605,94 +730,6 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             metadata.max_seq_len_inter = self.max_context_len
 
             self.decode_metadata[bs] = metadata
-
-        self.forward_metadata = metadata
-
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-    ):
-        """Shared capture+replay body for the cuda-graph init path.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph`.
-        """
-        assert forward_mode.is_decode()
-        seq_lens = seq_lens[:bs]
-        req_pool_indices = req_pool_indices[:bs]
-        metadata = self.decode_metadata[bs]
-
-        metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
-        metadata.seq_lens = seq_lens.tolist()
-        metadata.max_seq_len = seq_lens.max().item()
-
-        metadata.orig_seq_lens_tensor.copy_(seq_lens)
-        metadata.orig_seq_lens = seq_lens.tolist()
-
-        block_tables = self.req_to_token[req_pool_indices, : metadata.max_seq_len]
-        # Convert the block table to a strided format.
-        if self.page_size > 1:
-            strided_indices = torch.arange(
-                0, block_tables.shape[1], self.page_size, device=self.device
-            )
-            block_tables = block_tables[:, strided_indices] // self.page_size
-        metadata.block_tables.fill_(0)
-        metadata.block_tables[: block_tables.shape[0], : block_tables.shape[1]].copy_(
-            block_tables
-        )
-
-        if self.original_max_position_embeddings > 0:
-            scaling_factor = (
-                0.1
-                * torch.log(
-                    metadata.orig_seq_lens_tensor
-                    / self.original_max_position_embeddings
-                )
-                + 1.0
-            ).clip(min=1)
-            metadata.scaling_factor.copy_(scaling_factor)
-
-        cache_seq_lens = metadata.orig_seq_lens_tensor
-
-        chunk_len = self.chunk_size - self.local_size
-        chunk_num_curr = (cache_seq_lens - 1) // chunk_len
-
-        seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
-        max_seq_len_intra = seq_lens_intra.max().item()
-        metadata.seq_lens_intra.copy_(seq_lens_intra)
-        metadata.max_seq_len_intra = max_seq_len_intra
-
-        metadata.block_tables_intra.fill_(0)
-        for i in range(bs):
-            st = chunk_num_curr[i] * chunk_len // self.page_size
-            ed = min(
-                st + (max_seq_len_intra - 1) // self.page_size + 1,
-                (cache_seq_lens[i] - 1) // self.page_size + 1,
-            )
-            metadata.block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
-
-        seq_lens_succ = (chunk_num_curr - (chunk_num_curr - 1).clip(min=0)) * chunk_len
-        metadata.seq_lens_succ.copy_(seq_lens_succ)
-        metadata.max_seq_len_succ = metadata.seq_lens_succ.max().item()
-        if metadata.max_seq_len_succ:
-            metadata.block_tables_succ.fill_(0)
-            for i in range(bs):
-                start = (
-                    (chunk_num_curr[i] - 1).clip(min=0) * chunk_len // self.page_size
-                )
-                end = min(
-                    start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
-                    (cache_seq_lens[i] - 1) // self.page_size + 1,
-                )
-                metadata.block_tables_succ[i, : end - start] = metadata.block_tables[
-                    i, start:end
-                ]
-
-        seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
-        metadata.seq_lens_inter.copy_(seq_lens_inter)
-        metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
 
         self.forward_metadata = metadata
 
