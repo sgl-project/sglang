@@ -673,6 +673,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     has_timing_data: bool = False
 
+    def __setstate__(self, state: object):
+        # __getstate__ intentionally returns an empty dict when timing data is
+        # disabled. Unpickling bypasses the dataclass initializer, so restore
+        # mutable defaults before applying the serialized state.
+        self.queue_reason_durations = {}
+        self.queue_reason_checks = {}
+        super().__setstate__(state)
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not (self.enable_metrics or self.has_timing_data):
@@ -726,6 +734,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_queue_wait_reason(self, reason: str, ts=None):
         """Attribute queue residence time to the latest admission blocker."""
         ts = ts or time.perf_counter()
+        self.has_timing_data = True
         self.queue_reason_checks[reason] = self.queue_reason_checks.get(reason, 0) + 1
         if reason == self.queue_wait_reason:
             return
