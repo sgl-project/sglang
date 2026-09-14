@@ -202,6 +202,33 @@ def _defer_gated_residual(
     return residual_gate_add(residual, update, gate)
 
 
+def _flux2_derive_rope_tensors(
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """(cos_sin_cache, complex_freqs) from one (cos, sin) pair.
+
+    Called once per Flux2Transformer2DModel.forward() instead of once per
+    block: freqs_cis is identical across every block in a forward pass, so
+    deriving it per-attention-call recomputed the same tensors up to 56x
+    per denoising step.
+    """
+    if freqs_cis is None:
+        return None, None
+    cos, sin = freqs_cis
+    cos_sin_cache = torch.cat(
+        [
+            cos.to(dtype=torch.float32).contiguous(),
+            sin.to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+    # is_neox=False here, so this can hit the NPU _apply_rotary_emb_complex
+    # fast path in RotaryEmbedding instead of the interleaved fallback (no
+    # fused NPU kernel for it).
+    complex_freqs = torch.complex(cos.to(torch.float32), sin.to(torch.float32))
+    return cos_sin_cache, complex_freqs
+
+
 def _flux2_gated_resnorm(
     norm: nn.Module,
     residual: torch.Tensor,
@@ -611,7 +638,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
@@ -633,17 +661,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
-
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
 
         joint_qkv = None
         sp_txt_pad = 0
@@ -686,6 +703,13 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                         tensor.contiguous()
                         for tensor in (encoder_query, encoder_key, encoder_value)
                     ]
+                # complex_freqs covers [text, image] positions in order (same
+                # table cos_sin_cache/positions index into); slice per call the
+                # same way position_offset selects rows below — the class's
+                # complex_freqs path does not do positional indexing itself.
+                text_freqs_complex = (
+                    complex_freqs[:text_seq_len] if complex_freqs is not None else None
+                )
                 encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
                     q=encoder_query,
                     k=encoder_key,
@@ -693,8 +717,15 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     k_norm=self.norm_added_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=cos_sin_cache,
+                    freqs_complex=text_freqs_complex,
                     is_neox=False,
                     allow_inplace=True,
+                )
+                img_seq_len = query.shape[1]
+                img_freqs_complex = (
+                    complex_freqs[text_seq_len : text_seq_len + img_seq_len]
+                    if complex_freqs is not None
+                    else None
                 )
                 query, key = apply_qk_norm_with_optional_rope(
                     q=query,
@@ -703,6 +734,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     k_norm=self.norm_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=cos_sin_cache,
+                    freqs_complex=img_freqs_complex,
                     is_neox=False,
                     position_offset=text_seq_len,
                     allow_inplace=True,
@@ -717,6 +749,10 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query, key, value = [
                     tensor.contiguous() for tensor in (query, key, value)
                 ]
+            seq_len = query.shape[1]
+            joint_freqs_complex = (
+                complex_freqs[:seq_len] if complex_freqs is not None else None
+            )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -724,6 +760,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
             )
@@ -880,7 +917,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         **kwargs,
     ) -> torch.Tensor:
@@ -907,16 +945,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if complex_freqs is not None:
+            complex_freqs = complex_freqs[: query.shape[1]]
 
         # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
         # here too — the single-stream block previously ran norm and RoPE as separate ops.
@@ -927,6 +957,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             k_norm=self.norm_k,
             head_dim=self.head_dim,
             cos_sin_cache=cos_sin_cache,
+            freqs_complex=complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -1019,7 +1050,8 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor | PendingGatedResidual,
         encoder_hidden_states: Optional[torch.Tensor],
         temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
@@ -1046,7 +1078,8 @@ class Flux2SingleTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
-            freqs_cis=freqs_cis,
+            cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1164,7 +1197,8 @@ class Flux2TransformerBlock(nn.Module):
         temb_mod_params_txt: Tuple[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
         ],
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[
@@ -1230,7 +1264,8 @@ class Flux2TransformerBlock(nn.Module):
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
-            freqs_cis=freqs_cis,
+            cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1676,6 +1711,14 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(sin[:t_loc], sin[t_loc:], sp_txt_pad, dim=0),
                     )
 
+        # freqs_cis/singles_freqs_cis are fixed for the rest of this forward
+        # pass, so derive cos_sin_cache/complex_freqs once here instead of
+        # once per block (56x per full denoising step).
+        cos_sin_cache, complex_freqs = _flux2_derive_rope_tensors(freqs_cis)
+        singles_cos_sin_cache, singles_complex_freqs = _flux2_derive_rope_tensors(
+            singles_freqs_cis
+        )
+
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -1683,7 +1726,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
-                freqs_cis=freqs_cis,
+                cos_sin_cache=cos_sin_cache,
+                complex_freqs=complex_freqs,
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )
@@ -1703,7 +1747,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
-                freqs_cis=singles_freqs_cis,
+                cos_sin_cache=singles_cos_sin_cache,
+                complex_freqs=singles_complex_freqs,
                 joint_attention_kwargs=joint_attention_kwargs,
                 text_seq_len=txt_real,
                 num_replicated_prefix=num_replicated_prefix,
