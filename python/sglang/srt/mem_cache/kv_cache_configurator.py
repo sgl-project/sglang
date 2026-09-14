@@ -275,17 +275,16 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    swa_attention_layer_ids: list[int] = field(init=False)
 
     def __post_init__(self) -> None:
+        self.swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
         if (
             get_exec().kernel.attention_backend == "ascend"
             and self.is_hybrid_swa_compress
             and not self.is_hybrid_swa
         ):
-            (
-                self.model_config.swa_attention_layer_ids,
-                self.model_config.full_attention_layer_ids,
-            ) = get_hybrid_layer_ids(
+            self.swa_attention_layer_ids, _ = get_hybrid_layer_ids(
                 self.model_config.hf_config.architectures,
                 self.model_config.hf_text_config,
             )
@@ -320,6 +319,27 @@ class KVCacheConfigurator:
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)
+
+    def get_layer_kv_shapes(self) -> list[tuple[int, int, int]]:
+        model = self.model_config
+        full_shape = (
+            model.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            model.head_dim,
+            model.v_head_dim,
+        )
+        swa_shape = (
+            model.get_swa_num_kv_heads(get_parallel().attn_tp_size),
+            model.swa_head_dim,
+            model.swa_v_head_dim,
+        )
+        return [
+            swa_shape if layer_id in self.swa_attention_layer_ids else full_shape
+            for layer_id in range(
+                self.layer_info.start_layer, self.layer_info.end_layer
+            )
+        ]
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -1581,25 +1601,9 @@ class KVCacheConfigurator:
             NPUMHATokenToKVPool,
         )
 
-        layer_kv_shapes = None
-        if self.is_hybrid_swa_compress:
-            model = self.model_config
-            full_shape = (
-                model.get_num_kv_heads(
-                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-                ),
-                model.head_dim,
-                model.v_head_dim,
-            )
-            swa_shape = (
-                model.get_swa_num_kv_heads(get_parallel().attn_tp_size),
-                model.swa_head_dim,
-                model.swa_v_head_dim,
-            )
-            layer_kv_shapes = [
-                swa_shape if i in model.swa_attention_layer_ids else full_shape
-                for i in range(self.layer_info.start_layer, self.layer_info.end_layer)
-            ]
+        layer_kv_shapes = (
+            self.get_layer_kv_shapes() if self.is_hybrid_swa_compress else None
+        )
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,

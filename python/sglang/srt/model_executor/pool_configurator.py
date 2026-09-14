@@ -203,10 +203,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
-        self._use_layerwise_kv_shapes = (
-            get_exec().kernel.attention_backend == "ascend"
-            and kvc.is_hybrid_swa_compress
-        )
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -403,28 +399,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
-        elif self._use_layerwise_kv_shapes:
-            start_layer = kvc.layer_info.start_layer
-            end_layer = kvc.layer_info.end_layer
-            full_layers = sum(
-                start_layer <= layer_id < end_layer
-                for layer_id in model_config.full_attention_layer_ids
-            )
-            swa_layers = sum(
-                start_layer <= layer_id < end_layer
-                for layer_id in model_config.swa_attention_layer_ids
-            )
-            assert full_layers + swa_layers == num_layers
-
-            full_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
-            swa_heads = model_config.get_swa_num_kv_heads(tp_size)
-            cell_size = (
-                full_heads
-                * (model_config.head_dim + model_config.v_head_dim)
-                * full_layers
-                + swa_heads
-                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-                * swa_layers
+        elif (
+            get_exec().kernel.attention_backend == "ascend"
+            and kvc.is_hybrid_swa_compress
+        ):
+            layer_kv_shapes = kvc.get_layer_kv_shapes()
+            assert len(layer_kv_shapes) == num_layers
+            cell_size = sum(
+                head_num * (head_dim + v_head_dim)
+                for head_num, head_dim, v_head_dim in layer_kv_shapes
             ) * kv_size
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
