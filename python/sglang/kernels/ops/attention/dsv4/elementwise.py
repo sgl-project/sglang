@@ -8,12 +8,14 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 if _is_xpu:
     from sgl_kernel import fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_xpu
@@ -203,7 +205,18 @@ def fused_q_indexer_rope_hadamard_quant(
             freqs_real,
             positions,
         )
-    return q_fp8, weights_out
+    return _as_indexer_fp8(q_fp8, weights_out)
+
+
+def _as_indexer_fp8(
+    q_fp8: torch.Tensor, weights_out: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize q from E4M3FN to E4M3FNUZ on gfx94x, following normalize_e4m3fn_to_e4m3fnuz."""
+    if not _is_fp8_fnuz:
+        return q_fp8, weights_out
+    raw = q_fp8.view(torch.uint8)
+    raw.masked_fill_(raw == 0x80, 0)
+    return raw.view(torch.float8_e4m3fnuz), weights_out.mul_(2.0)
 
 
 def fused_q_indexer_rope_first_quant(
