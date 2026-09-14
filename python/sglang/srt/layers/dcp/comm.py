@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import os
 import warnings
 from typing import Optional
 
@@ -382,6 +383,10 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
+# Private prototype. Set consistently on all DCP ranks before process startup.
+# Unsupported metadata retains the original fi_a2a implementation.
+_FI_A2A_K3_FUSED = os.environ.get("SGLANG_DCP_FI_A2A_K3_FUSED", "0") == "1"
+_FI_A2A_K3_IPC = os.environ.get("SGLANG_DCP_FI_A2A_K3_IPC", "0") == "1"
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
@@ -394,6 +399,14 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         return
 
     import torch.distributed as dist
+
+    if _FI_A2A_K3_IPC:
+        # Explicit single-node path. No fabric probe override or fake MNNVL VA.
+        from flashinfer.comm.dcp_alltoall import _K3DcpIpcWorkspace
+
+        owner = _K3DcpIpcWorkspace(cp_group.device_group)
+        _FI_A2A_STATE = {"ipc_owner": owner, "cp_rank": cp_group.rank_in_group}
+        return
 
     try:
         from flashinfer.comm.dcp_alltoall import (
@@ -422,6 +435,10 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
             "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
             "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
         )
+
+    if _FI_A2A_K3_FUSED:
+        # Fail before entering capture/communication if the prototype is absent.
+        pass
 
     cp_size = cp_group.world_size
     cp_rank = cp_group.rank_in_group
@@ -539,6 +556,39 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
+    if "ipc_owner" in state:
+        from flashinfer.comm.dcp_alltoall import _k3_fused_dcp_supported
+
+        supported = _k3_fused_dcp_supported(
+            cp_attn_out, cp_attn_lse, N, is_lse_base_on_e
+        )
+        if not supported:
+            # The narrow IPC prototype does not change any other model/layout.
+            return dcp_a2a_lse_reduce(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                is_lse_base_on_e,
+                comm_backend="a2a",
+            )
+        if _FI_A2A_K3_FUSED:
+            return state["ipc_owner"].fused(cp_attn_out, cp_attn_lse, is_lse_base_on_e)
+
+    if _FI_A2A_K3_FUSED:
+        from flashinfer.comm.dcp_alltoall import (
+            _decode_cp_a2a_k3_fused,
+            _k3_fused_dcp_supported,
+        )
+
+        if _k3_fused_dcp_supported(cp_attn_out, cp_attn_lse, N, is_lse_base_on_e):
+            return _decode_cp_a2a_k3_fused(
+                cp_attn_out,
+                cp_attn_lse,
+                state["workspace"],
+                state["cp_rank"],
+                is_lse_base_on_e,
+            )
+
     # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
     # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
     # field as opaque bytes and we only ever read slot 0 back off the wire.
@@ -555,13 +605,16 @@ def _dcp_fi_a2a_lse_reduce(
         softmax_stats[..., 0].permute(2, 0, 1),
     )
 
-    o_out, stats_out = decode_cp_a2a_alltoall(
-        partial_o,
-        softmax_stats,
-        state["workspace"],
-        state["cp_rank"],
-        N,
-    )
+    if "ipc_owner" in state:
+        o_out, stats_out = state["ipc_owner"].exchange(partial_o, softmax_stats)
+    else:
+        o_out, stats_out = decode_cp_a2a_alltoall(
+            partial_o,
+            softmax_stats,
+            state["workspace"],
+            state["cp_rank"],
+            N,
+        )
 
     recv_output = o_out.permute(2, 0, 1, 3)
     recv_lse = stats_out[..., 0].permute(2, 0, 1)
