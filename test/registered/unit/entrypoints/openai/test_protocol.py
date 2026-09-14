@@ -705,6 +705,20 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(data["strict"], False)
         self.assertNotIn("defer_loading", data)
 
+    def test_chat_function_tool_accepts_nullable_strict(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Call the tool"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "strict": None},
+                }
+            ],
+        )
+
+        self.assertIsNone(request.tools[0].function.strict)
+
     def test_function_defer_loading_true_serialized(self):
         f = Function(name="foo", defer_loading=True)
         data = f.model_dump()
