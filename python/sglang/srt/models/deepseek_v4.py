@@ -2753,37 +2753,32 @@ class DeepseekV4DecoderLayer(nn.Module):
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
-    def _hc_mix_and_combine(
+    def _hc_combine(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
         apply_pre: Optional[torch.Tensor],
         norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mixing coefficients come from x; the sublayer input is x collapsed with
-        apply_pre (None selects copy 0), then RMS-normalized.
-        Returns (y, pre, post, comb)."""
-        from sglang.kernels.ops.layernorm.mhc import (
-            hc_combine,
-            hc_mix_stats,
-            hc_mix_stats_sinkhorn,
-        )
+    ) -> torch.Tensor:
+        """The sublayer input: x collapsed with apply_pre (None selects copy 0),
+        then RMS-normalized, on the current stream. Forks ``stats_stream`` for
+        :meth:`_hc_mix_stats`: after the combine for a tiny input so the two do
+        not compete for SMs, before it otherwise so they overlap."""
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
 
-        dtype = x.dtype
-        x_flat = x.flatten(1)
-
-        def combine_and_norm():
-            if apply_pre is None:
-                return norm(x[:, 0, :].contiguous())
+        tiny = 0 < x.shape[0] <= 8
+        if stats_stream is not None and not tiny:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        if apply_pre is None:
+            y = norm(x[:, 0, :].contiguous())
+        else:
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
+            x_flat = x.flatten(1)
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
-                and 0 < x.shape[0] <= 8
+                and tiny
                 and self.hc_mult == 4
                 and x_flat.shape[1] == 20480
                 and x.dtype == norm.weight.dtype == torch.bfloat16
@@ -2794,11 +2789,36 @@ class DeepseekV4DecoderLayer(nn.Module):
             ):
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
-                return hc_combine_norm(
+                y = hc_combine_norm(
                     x_flat, apply_pre, norm.weight, norm.variance_epsilon
                 )
-            return norm(hc_combine(x_flat, apply_pre, self.hc_mult, dtype))
+            else:
+                y = norm(hc_combine(x_flat, apply_pre, self.hc_mult, x.dtype))
+        if stats_stream is not None and tiny:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        return y
 
+    def _hc_mix_stats(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        stats_stream: Optional[torch.cuda.Stream] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mixing coefficients (pre, post, comb) from x, on ``stats_stream`` when
+        one is given (forked by :meth:`_hc_combine`).
+
+        Callers record this right before they join the stream: at CUDA-graph
+        replay a join continues on the lane of its first-recorded parent, so
+        recording the side stream ahead of the main-stream kernels it joins
+        would carry the main chain onto a fresh stream at every layer."""
+        from sglang.kernels.ops.layernorm.mhc import (
+            hc_mix_stats,
+            hc_mix_stats_sinkhorn,
+        )
+
+        x_flat = x.flatten(1)
         if (
             x.is_cuda
             and torch.version.cuda is not None
@@ -2808,18 +2828,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             and x.dtype == torch.bfloat16
         ):
-            # The split-K partial fixes the reduction order;
-            # fusing the reduction and sinkhorn preserves batch invariance.
+            # The split-K partial fixes the reduction order; fusing the
+            # reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
-            # Avoid competing with the statistics projection for a tiny input;
-            # the coefficients still overlap the attention or FFN that follows.
-            y = (
-                combine_and_norm()
-                if stats_stream is not None and 0 < x.shape[0] <= 8
-                else None
-            )
             if stats_stream is not None:
-                stats_stream.wait_stream(main_stream)
                 x.record_stream(stats_stream)
             with (
                 torch.cuda.stream(stats_stream)
@@ -2841,12 +2853,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # after the caller joins it, on the main stream.
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
-            if y is None:
-                y = combine_and_norm()
-            return y, pre, post, comb
+            return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
-            # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch reductions can
-            # change order with num_tokens. Kernel upcasts let x_flat remain a bf16 view.
+            # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch
+            # reductions can change order with num_tokens. Kernel upcasts let
+            # x_flat remain a bf16 view.
             mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
         else:
             x_flat = x_flat.float()
@@ -2862,8 +2873,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = combine_and_norm()
-        return y, pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
+        return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
 
     def _get_hc_stats_stream(self, hidden_states, forward_batch):
         # Verify batches can also compute coefficients beside the
@@ -2894,35 +2904,37 @@ class DeepseekV4DecoderLayer(nn.Module):
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
         )
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
                 x=x, positions=positions, forward_batch=forward_batch, x_quant=None
             )
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            stats_stream,
+        )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_moe_ffn_dp_sync(
+            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+        )
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
-        )
-        x = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+            stats_stream,
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
