@@ -731,7 +731,6 @@ def update_kpool_write_plan(
     forward_mode: ForwardMode,
     slots_per_page: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
-    include_deep_gemm_schedule: bool = True,
 ) -> None:
     if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
         return
@@ -767,34 +766,13 @@ def update_kpool_write_plan(
             effective_n_per_batch.to(torch.int32)
         )
 
-    # In-graph replay updates plan lengths too late for host schedule construction;
-    # the caller rebuilds the schedule from raw seq_lens out of graph.
-    if include_deep_gemm_schedule and plan.pool_schedule_metadata is not None:
+    if plan.pool_schedule_metadata is not None:
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
-
-
-def refresh_kpool_pool_schedule_from(
-    metadata: DSAMetadata,
-    pool_seqlens_per_q: torch.Tensor,
-    *,
-    slots_per_page: int,
-) -> None:
-    """Use an explicit source because the captured plan buffer remains stale
-    until replay."""
-    plan = metadata.kpool_write_plan
-    if plan is None or plan.pool_schedule_metadata is None:
-        return
-    new_schedule = _compute_pool_schedule_metadata(
-        pool_seqlens_per_q,
-        slots_per_page=slots_per_page,
-    )
-    if new_schedule is not None:
-        plan.pool_schedule_metadata.copy_(new_schedule)
 
 
 def init_kpool_write_plan(

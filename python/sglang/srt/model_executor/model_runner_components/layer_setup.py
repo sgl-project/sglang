@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import msgspec
 from torch import nn
 
+from sglang.srt.utils import is_npu
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -156,12 +158,13 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    _assert_pp_mtp_compat(
-        model_has_mtp_layers=model_has_mtp_layers,
-        spec_algorithm=spec_algorithm,
-        num_effective_layers=num_effective_layers,
-        model_num_layers=model_num_layers,
-    )
+    if not is_npu():
+        _assert_pp_mtp_compat(
+            model_has_mtp_layers=model_has_mtp_layers,
+            spec_algorithm=spec_algorithm,
+            num_effective_layers=num_effective_layers,
+            model_num_layers=model_num_layers,
+        )
 
     return ModelLayerInfo(
         start_layer=pp_range.start_layer,

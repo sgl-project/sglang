@@ -50,7 +50,11 @@ import torch.distributed as dist
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    publish,
+)
 
 from .protocol import (
     CacheConfig,
@@ -465,7 +469,7 @@ class WeightCacheDaemon:
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
-        if not self.server_args.enable_eplb:
+        if not get_exec().moe.enable_eplb:
             return
 
         from sglang.srt.eplb.expert_location import (
