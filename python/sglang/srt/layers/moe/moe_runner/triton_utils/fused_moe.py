@@ -145,6 +145,14 @@ def _can_use_fused_silu_mul_quant_fp8(
         return False
 
     activation_size = hidden_size // 2
+    # Disable when speculative decoding is active: the fused kernel's FP8
+    # output differs slightly from the two-kernel path, and the perturbation
+    # accumulates across multiple draft steps, reducing accept_length.
+    from sglang.srt.server_args import get_global_server_args
+
+    if get_global_server_args().speculative_algorithm is not None:
+        return False
+
     return (
         _is_cuda
         and hidden_dtype in (torch.bfloat16, torch.float16)
