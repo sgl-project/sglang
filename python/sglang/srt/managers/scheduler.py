@@ -187,6 +187,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromModelExpressReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
@@ -1770,6 +1771,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_disk,
                 ),
                 (
+                    UpdateWeightsFromModelExpressReqInput,
+                    self.weight_updater.update_weights_from_modelexpress,
+                ),
+                (
                     InitWeightsUpdateGroupReqInput,
                     self.weight_updater.init_weights_update_group,
                 ),
@@ -1896,6 +1901,9 @@ class Scheduler(
         destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
+        generator = getattr(self.tp_worker.model_runner, "modelexpress_generator", None)
+        if generator is not None:
+            generator.close()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
