@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferStatus,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -141,6 +142,7 @@ class TestNixlBackendInitialization(CustomTestCase):
                     "SGLANG_DISAGG_STAGING_BUFFER": "false",
                 },
             ),
+            get_context().override_server_args(device="cuda") as server_args,
             patch.object(CommonKVManager, "__init__", return_value=None),
             patch(
                 "sglang.srt.disaggregation.nixl.conn.get_parallel",
@@ -155,7 +157,8 @@ class TestNixlBackendInitialization(CustomTestCase):
             patch.object(NixlKVManager, "_start_decode_listener_thread"),
             patch.object(NixlKVManager, "_start_heartbeat_checker_thread"),
         ):
-            NixlKVManager.__init__(mgr, args, mode, SimpleNamespace(device="cuda"))
+            self.assertIsNone(server_args.device)
+            NixlKVManager.__init__(mgr, args, mode, server_args)
             get_device_module.assert_called_once_with("cuda")
 
     def test_backend_initialization_selects_device_in_deadline_thread(self):
