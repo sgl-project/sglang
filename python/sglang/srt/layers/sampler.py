@@ -774,6 +774,12 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     return batch_next_token_ids
 
 
+def _ascend_sampling_stream_capturing() -> bool:
+    if not is_npu():
+        return False
+    return bool(torch.npu.is_current_stream_capturing())
+
+
 def top_k_top_p_min_p_sampling_from_logits_ascend(
     logits: torch.Tensor,
     top_ks: torch.Tensor,
@@ -787,10 +793,22 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
     Takes temperature-scaled logits as input (softmax is applied internally).
     """
-    # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
-        (top_ks <= 1024) & (top_ks >= 1)
+    # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024].
+    # Reading the device predicate on the host is forbidden during graph capture,
+    # so capture the tensor-only fallback instead.
+    use_fused_top_k_top_p = False
+    if (
+        hasattr(torch_npu, "npu_top_k_top_p")
+        and not _ascend_sampling_stream_capturing()
     ):
+        use_fused_top_k_top_p = bool(torch.all((top_ks <= 1024) & (top_ks >= 1)))
+
+    if use_fused_top_k_top_p:
+        # torch_npu.npu_top_k_top_p requires ``top_ps`` to share the logits
+        # dtype (e.g. DT_BFLOAT16); SamplingBatchInfo builds top_ps as float32,
+        # which the op rejects with AclNN_Parameter_Error (EZ1001, 161002).
+        # Cast to the logits dtype so the fused path works for every caller.
+        top_ps = top_ps.to(dtype=logits.dtype)
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
