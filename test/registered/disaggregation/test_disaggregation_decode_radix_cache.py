@@ -50,6 +50,7 @@ class DisaggregationDecodeRadixCacheTestMixin:
     transfer_backend_name = None
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     gsm8k_min_score = 0.80
+    gsm8k_eval_args = {"api": "completion", "max_tokens": 512}
 
     @classmethod
     def setUpClass(cls):
@@ -106,11 +107,10 @@ class DisaggregationDecodeRadixCacheTestMixin:
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
             num_examples=500,
             num_threads=100,
             num_shots=6,
+            **self.gsm8k_eval_args,
         )
 
         metrics_first = run_eval(args)
