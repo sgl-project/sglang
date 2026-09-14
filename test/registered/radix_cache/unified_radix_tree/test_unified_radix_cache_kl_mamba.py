@@ -56,14 +56,17 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
                 "--mamba-max-states-per-path",
                 "3",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -101,7 +104,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
@@ -122,7 +125,10 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "4",
                 "--weight-loader-prefetch-checkpoints",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -160,7 +166,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 str(MAMBA_CHUNKED_PREFILL_SIZE),
                 "--mem-fraction-static",
                 "0.85",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
@@ -190,6 +196,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "4",
             ],
             env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },

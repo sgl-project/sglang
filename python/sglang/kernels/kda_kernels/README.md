@@ -20,6 +20,7 @@ load Triton, CUTLASS, or compile a JIT extension.
 | Diffusion residual-gate add | `residual_gate_add_jit.py` | [sgl-project/sglang#29361](https://github.com/sgl-project/sglang/pull/29361), merge commit `495f13fa12` |
 | LTX2 QK-norm split-RoPE | `ltx2_qknorm_split_rope_jit.py` | [sgl-project/sglang#29708](https://github.com/sgl-project/sglang/pull/29708), merge commit `fcb9f229b3` |
 | FLUX.2 FP8 producer and QKV packing fusions | `layernorm_modulate_triton.py`, `flux2_qkv_epilogue_jit.py`, `flux2_token_cat_fp8_triton.py` | [sgl-project/sglang#37162](https://github.com/sgl-project/sglang/pull/37162), merge commit `1c3ad92438` |
+| Qwen3.8 QSA packed-varlen decode on SM121 | `qwen38_qsa_sm121/` | [radixark/KDA-1.5#4](https://github.com/radixark/KDA-1.5/pull/4) at `414ce456e14a`; see the package README |
 
 For JIT kernels, the Python entry module and the corresponding source under
 `csrc/` move together. The shared `sglang.kernels.jit` loader remains build
