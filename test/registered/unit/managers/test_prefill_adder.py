@@ -714,6 +714,94 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 
+    def test_pre_match_negotiation_settles_a_denied_pass_without_matching(self):
+        """A request that fits with no cache hit passes the KV gates for any
+        prefix match, so the pass verdict can be taken before the radix walk;
+        a denied pass reports True (the scheduler breaks before matching)."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=10_000, delayer=delayer)
+
+        denied = adder.prefill_pass_denied_before_matching(self._create_delayer_req(50))
+
+        self.assertTrue(denied)
+        self.assertEqual(delayer.calls, [True])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_pre_match_negotiation_allowed_pass_falls_through(self):
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=10_000, delayer=delayer)
+        req = self._create_delayer_req(50)
+
+        self.assertFalse(adder.prefill_pass_denied_before_matching(req))
+        self.assertEqual(delayer.calls, [True])
+        # The usual path still admits the request afterwards.
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+
+    def test_pre_match_negotiation_skipped_when_fit_depends_on_the_match(self):
+        """Without a cache hit the request does not fit, so whether add_one_req
+        reaches the negotiate depends on the prefix match: no early verdict,
+        no negotiate call, the caller matches as before."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+
+        self.assertFalse(
+            adder.prefill_pass_denied_before_matching(self._create_delayer_req(50))
+        )
+        self.assertEqual(delayer.calls, [])
+
+    def test_pre_match_negotiation_skipped_without_a_delayer(self):
+        adder = self.create_adder(self.create_running_batch())
+        self.assertFalse(
+            adder.prefill_pass_denied_before_matching(self._create_delayer_req(50))
+        )
+
+    def test_pre_match_negotiation_sizes_a_fresh_request_from_its_prompt(self):
+        """A request that has never been through init_next_round_input still
+        holds the empty fill array; the verdict must size it from the prompt,
+        not from that array, or a non-fitting request negotiates prefillable."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+        req = self._create_delayer_req(0)
+        req.origin_input_ids = list(range(50))
+        req.output_ids = []
+        req._refresh_fill_ids.side_effect = lambda: setattr(
+            req, "full_untruncated_fill_ids", req.origin_input_ids + req.output_ids
+        )
+
+        self.assertFalse(adder.prefill_pass_denied_before_matching(req))
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(len(req.full_untruncated_fill_ids), 50)
+
+    def test_pre_match_negotiation_keeps_one_swa_window_of_lock_margin(self):
+        """Locking the candidate's own prefix can protect up to one window of
+        SWA tokens, and the SWA budget saturates at the window, so the pass is
+        only settled early when the pool has that margin to spare."""
+        delayer = _RecordingDelayer(allow=False)
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self.mock_tree_cache.sliding_window_size = 128
+        adder = self.create_adder(
+            self.create_running_batch(), prefill_delayer_single_pass=delayer
+        )
+        adder.is_hybrid_swa = True
+        adder._swa_req_ring = False
+        req = self._create_delayer_req(50)
+        need = adder._swa_budget_for_req(
+            50, adder._swa_new_tokens(req), swa_host_hit_length=0
+        )
+
+        self.mock_token_allocator.swa_available_size.return_value = need + 128
+        self.assertFalse(adder.prefill_pass_denied_before_matching(req))
+        self.assertEqual(delayer.calls, [])
+
+        self.mock_token_allocator.swa_available_size.return_value = need + 129
+        self.assertTrue(adder.prefill_pass_denied_before_matching(req))
+        self.assertEqual(delayer.calls, [True])
+
     def test_delayer_not_consulted_when_post_lock_recheck_rejects(self):
         """Locking the request's own prefix converts evictable tokens into
         protected ones, so a request can pass the pre-lock KV gate yet fail
@@ -809,6 +897,7 @@ class TestPrefillAdder(CustomTestCase):
         req.host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
+        req.is_dllm.return_value = False
         req.set_extend_range = MagicMock(
             side_effect=lambda start, end: setattr(
                 req, "extend_range", Range(start, end)

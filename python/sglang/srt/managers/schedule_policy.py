@@ -1263,6 +1263,69 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    def prefill_pass_denied_before_matching(self, req: Req) -> bool:
+        """Settle the prefill delayer's per-pass verdict before the scheduler
+        computes ``req``'s prefix match, when the verdict cannot depend on it.
+
+        ``add_one_req`` negotiates with ``local_prefillable=True`` once the
+        request passes the KV budget checks, which use the prefix match to size
+        the extend. A request that fits with no cache hit at all passes those
+        checks for any match, so the negotiation can run first and, when the
+        pass is a decode pass, the radix walk for this candidate is skipped.
+        Returns False whenever the outcome could depend on the match (the
+        caller then falls through to the usual match-then-add path).
+        """
+        if self.prefill_delayer_single_pass is None or req.is_dllm():
+            return False
+        if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            return False
+        if req.sampling_params.ignore_eos and self.tree_cache.disable:
+            return False
+        max_new = min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        # init_next_round_input has not run yet for this candidate: a fresh
+        # request still carries an empty array, a returning one its last fill.
+        req._refresh_fill_ids()
+        input_tokens = len(req.full_untruncated_fill_ids)
+        total_tokens = (
+            input_tokens
+            + max_new
+            + self.page_size
+            + self._mamba_gap_budget_for_req(req)
+        )
+        if total_tokens >= self.rem_total_tokens:
+            return False
+        real_input_tokens = self.ceil_paged_tokens(input_tokens)
+        if self.is_hybrid_swa:
+            swa_needed = self._swa_budget_for_req(
+                real_input_tokens, self._swa_new_tokens(req), swa_host_hit_length=0
+            )
+            if self._swa_req_ring:
+                if swa_needed > self.rem_swa_tokens:
+                    return False
+            # The SWA budget saturates at one window, so a smaller real extend
+            # does not shrink it; locking the candidate's own prefix can move up
+            # to one window of SWA tokens from evictable to protected.
+            elif (
+                swa_needed + self.tree_cache.sliding_window_size >= self.rem_swa_tokens
+            ):
+                return False
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            return False
+        return not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+            local_prefillable=True,
+            running_batch=self.running_batch.batch_size(),
+            max_prefill_bs=self.max_prefill_bs,
+            max_running_requests=self.max_running_requests,
+            waiting_queue_len=self.waiting_queue_len,
+        )
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):

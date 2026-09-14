@@ -3868,6 +3868,10 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if adder.prefill_pass_denied_before_matching(req):
+                # Decode pass settled without walking the radix tree for this
+                # candidate; nothing was allocated for it yet.
+                break
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
