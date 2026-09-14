@@ -145,7 +145,7 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
                 module.forward = forward
                 return output
 
@@ -265,7 +265,7 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
     def forward(*args, **kwargs):
         module.forward = original_forward
         output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs, tie_weights=False
         )
         on_forward_end()
         module.forward = forward
