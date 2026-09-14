@@ -109,8 +109,6 @@ else
     mkdir -p "${ascend_test_util_path}"
     mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
     cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
-    # Prefer the installed sglang package over the repo cloned in the image WORKDIR.
-    export PYTHONPATH=${sglang_pkg_path}:$PYTHONPATH
 fi
 
 # set environment of cann
