@@ -255,6 +255,12 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
+    # DeepGEMM 0.2 defaults BF16 GEMMs to cuBLASLt, whose reduction can
+    # depend on the batch size. Older wheels always use the invariant kernel.
+    get_deterministic = getattr(deep_gemm, "get_deterministic_algorithms", None)
+    deterministic = get_deterministic() if get_deterministic else True
+    if not deterministic:
+        deep_gemm.use_deterministic_algorithms(True)
     try:
         deep_gemm.bf16_gemm_nn(a, b, out)
     except RuntimeError as e:
@@ -264,6 +270,9 @@ def _matmul_persistent_deepgemm(
             f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
             f"for small matrices. Original error: {e}"
         ) from e
+    finally:
+        if not deterministic:
+            deep_gemm.use_deterministic_algorithms(False)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
