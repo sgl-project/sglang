@@ -246,12 +246,9 @@ def _gather_varlen_kv(
 ) -> torch.Tensor:
     """Gather paged KV rows into the contiguous buffer varlen prefill needs.
 
-    An fp8 cache is dequantized here rather than handed to the kernel as fp8, so
-    fp8_e4m3 stays a cache-format choice and prefill attention keeps running in the
-    input dtype. Feeding fp8 straight through would force q to fp8 as well -- the
-    triton varlen path rejects a mix of fp8 and non-fp8 inputs.
-
-    index_select has no fp8 kernel, hence the uint8 round-trip.
+    fp8 is dequantized here rather than passed through: the triton varlen path
+    rejects a mix of fp8 and non-fp8 inputs, so passing it would force q to fp8
+    too. index_select has no fp8 kernel, hence the uint8 round-trip.
     """
     flat = cache.view(-1, num_heads * head_dim)
     if flat.dtype == fp8_dtype:
@@ -260,8 +257,11 @@ def _gather_varlen_kv(
             _varlen_fp8_gather_logged = True
             logger.info("aiter varlen prefill: dequantizing fp8 KV cache on gather")
         gathered = (
-            flat.view(torch.uint8).index_select(0, tok_idx).view(fp8_dtype)
-        ).to(out_dtype)
+            flat.view(torch.uint8)
+            .index_select(0, tok_idx)
+            .view(fp8_dtype)
+            .to(out_dtype)
+        )
         if descale is not None:
             gathered = gathered * descale.to(out_dtype)
     else:
@@ -424,11 +424,9 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
-        # Route no-prefix extend through flash_attn_varlen_func instead of the
-        # CK-tile mha_batch_prefill_func, which has no gfx12 kernels. An fp8 KV
-        # cache is allowed: _gather_varlen_kv dequantizes on the way into the
-        # varlen buffer, so the kernel still sees the input dtype. Opt-in, so
-        # gfx942/gfx950 keep the batch_prefill path unless asked otherwise.
+        # Route extend through flash_attn_varlen_func instead of CK-tile
+        # mha_batch_prefill_func, which has no gfx12 kernels. Opt-in, so
+        # gfx942/gfx950 keep batch_prefill unless asked otherwise.
         self.use_aiter_varlen_prefill = get_bool_env_var("SGLANG_AITER_VARLEN_PREFILL")
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
@@ -3089,17 +3087,11 @@ class AiterAttnBackend(AttentionBackend):
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            # Unpaged bf16 varlen prefill. mha_batch_prefill_func is CK-tile
-            # FMHA whose codegen targets gfx9 only, so on gfx12 (and under
-            # ENABLE_CK=0) it has no kernels at all. flash_attn_varlen_func
-            # falls back to aiter's Triton MHA there. That fallback accepts a
-            # block_table argument but drops it before reaching the kernel
-            # (mha.py hardcodes block_table_=None), so the paged cache has to
-            # be gathered into a contiguous varlen buffer first, exactly like
-            # the ASM context-prefill branch above. Chunked prefill makes
-            # prefixed batches unavoidable at concurrency (one partially
-            # prefilled request re-enters alongside fresh ones), so the
-            # no-prefix-only version of this was not viable.
+            # mha_batch_prefill_func has no gfx12 kernels, so go through
+            # flash_attn_varlen_func (aiter's Triton MHA under ENABLE_CK=0). It
+            # accepts block_table but silently discards it, so paged KV must be
+            # gathered into a contiguous buffer first. Chunked prefill makes
+            # prefixed batches unavoidable at concurrency.
             if (
                 self.use_aiter_varlen_prefill
                 and not self.kv_cache_is_vectorized_5d
@@ -3117,14 +3109,10 @@ class AiterAttnBackend(AttentionBackend):
                     kv_slots = self.forward_metadata.kv_indices
                     seq_lens = forward_batch.seq_lens[:bs].to(torch.long)
                     # kv_indptr strides in TOKENS and kv_indices holds one pool
-                    # slot per token (create_flashinfer_kv_indices_triton fills
-                    # it from req_to_token), so there is no page arithmetic to
-                    # do here. Scaling these entries by page_size overshoots a
-                    # prefixed chunk's own tokens, so attention reads stale
-                    # slots for exactly the newest tokens: GSM8K 0.961 -> 0.410.
-                    # Clamp per-seq kvlen to the tokens this batch actually has
-                    # in kv_indices; metadata can disagree with seq_lens in
-                    # mixed/spec batches, which would gather out of bounds.
+                    # slot per token, so no page arithmetic applies: scaling by
+                    # page_size reads stale slots for the newest tokens
+                    # (GSM8K 0.961 -> 0.410). Clamp to the tokens this batch
+                    # actually has, since metadata can disagree with seq_lens.
                     toks_per_seq = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(
                         torch.long
                     )
@@ -3172,12 +3160,13 @@ class AiterAttnBackend(AttentionBackend):
                         cu_seqlens_k = cu_k.to(torch.int32)
                         max_kv_len = int(self.forward_metadata.max_kv_len)
                 else:
-                    # No prefix: kv is exactly the k/v just computed, so the
-                    # page table is not needed and no gather is required.
+                    # No prefix: kv is the k/v just computed, so no gather.
                     k_in = k.contiguous().view(
                         -1, layer.tp_k_head_num, layer.qk_head_dim
                     )
-                    v_in = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                    v_in = v.contiguous().view(
+                        -1, layer.tp_v_head_num, layer.v_head_dim
+                    )
                     cu_seqlens_k = self.qo_indptr[:bs0]
                     max_kv_len = self.forward_metadata.max_q_len
 
