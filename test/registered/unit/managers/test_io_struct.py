@@ -1,9 +1,11 @@
+import asyncio
 import copy
 import re
 import unittest
 import weakref
 from array import array
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
 import numpy as np
@@ -23,7 +25,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
@@ -1139,6 +1145,66 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestGenerateReqInputTokenization(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.context_len = 10
+        self.manager.num_reserved_tokens = 0
+        self.manager.allow_auto_truncate = True
+        self.manager.validate_total_tokens = True
+        self.manager.is_generation = True
+        self.manager.model_config = SimpleNamespace(
+            vocab_size=32, hf_config=SimpleNamespace(architectures=[])
+        )
+        self.manager.tokenizer = None
+        self.manager.mm_processor = None
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.rid_to_state = {}
+
+    async def _tokenize(self, req):
+        self.manager.rid_to_state[req.rid] = SimpleNamespace(
+            time_stats=APIServerReqTimeStats()
+        )
+        return await self.manager._tokenize_one_request(req)
+
+    def test_batch_truncation_matches_independent_requests(self):
+        async def tokenize_requests():
+            prompts = [[1] * 8, [2] * 2]
+            independent = []
+            for prompt in prompts:
+                req = GenerateReqInput(
+                    input_ids=prompt, sampling_params={"max_new_tokens": 4}
+                )
+                req.normalize_batch_and_arguments()
+                independent.append(await self._tokenize(req))
+
+            batch = GenerateReqInput(
+                input_ids=prompts, sampling_params={"max_new_tokens": 4}
+            )
+            batch.normalize_batch_and_arguments()
+            batched = [await self._tokenize(batch[i]) for i in range(batch.batch_size)]
+            return independent, batched
+
+        independent, batched = asyncio.run(tokenize_requests())
+        self.assertEqual(
+            [req.sampling_params.max_new_tokens for req in independent], [2, 4]
+        )
+        self.assertEqual(
+            [
+                (list(req.input_ids), req.sampling_params.max_new_tokens)
+                for req in batched
+            ],
+            [
+                (list(req.input_ids), req.sampling_params.max_new_tokens)
+                for req in independent
+            ],
+        )
 
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
