@@ -611,6 +611,9 @@ class VisionFlash4Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
@@ -621,17 +624,18 @@ class VisionFlash4Attention(nn.Module):
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
 
-        output = flash_attn_func(
-            q,
-            k,
-            v,
+        fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens_gpu,
             cu_seqlens_k=cu_seqlens_gpu,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            window_size=window_size,
             ver=4,
         )
+        if s_aux is not None:
+            fa_kwargs["sinks"] = s_aux
+        output = flash_attn_func(q, k, v, **fa_kwargs)
 
         return output
 
