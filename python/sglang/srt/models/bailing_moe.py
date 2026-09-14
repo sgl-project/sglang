@@ -753,10 +753,6 @@ class BailingMoEModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states if residual is None else hidden_states + residual
-                    )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -765,7 +761,8 @@ class BailingMoEModel(nn.Module):
                     residual,
                     captured_last_layer_outputs=(
                         aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
+                        if i in self.layers_to_capture
+                        or getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
                 )
