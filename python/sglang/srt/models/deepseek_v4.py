@@ -116,7 +116,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
@@ -451,13 +451,14 @@ def _apply_wo_a_bf16_matmul(
     is_decode: bool,
     is_target_verify: bool = False,
     fuse_mxfp8_quant: bool = False,
+    is_prefill: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
-    verify batches up to 384 rows write token-major output directly to avoid
-    the layout copy before wo_b. ROCm decode can use aiter batched GEMM;
-    other cases use torch.einsum.
+    verify batches up to 384 rows and large prefill batches write token-major
+    output directly to avoid the layout copy before wo_b. ROCm decode can use
+    aiter batched GEMM; other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -471,6 +472,11 @@ def _apply_wo_a_bf16_matmul(
             or (
                 is_target_verify
                 and 0 < o.shape[0] <= 384
+                and get_platform().is_blackwell
+            )
+            or (
+                is_prefill
+                and 4096 <= o.shape[0] <= 65536
                 and get_platform().is_blackwell
             )
         )
@@ -1215,7 +1221,15 @@ class MQALayer(MqaAttentionBase):
             if (
                 _is_cuda
                 and q_out is not None
-                and 0 < q.shape[0] <= 8
+                and (
+                    0 < q.shape[0] <= 8
+                    or (
+                        self.is_dsv41
+                        and get_platform().is_blackwell
+                        and self.n_local_heads == 16
+                        and 4096 <= q.shape[0] <= 65536
+                    )
+                )
                 and self.head_dim == 512
                 and self.qk_rope_head_dim == 64
                 and q.dtype == q_out.dtype == torch.bfloat16
@@ -2145,6 +2159,7 @@ class MQALayer(MqaAttentionBase):
                         wo_a,
                         is_decode=forward_batch.forward_mode.is_decode(),
                         is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                        is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                         fuse_mxfp8_quant=(
                             not get_forward().sp_active
                             and getattr(
@@ -2325,6 +2340,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Rebuilt after weight loading, like the norm cache above. Keep the
         # original FP32 parameters intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
+        self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
             and get_platform().is_sm100
@@ -2342,6 +2358,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             if ENABLE_JIT_DEEPGEMM:
                 self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
+                if (
+                    getattr(getattr(self, "config", None), "model_type", None)
+                    == "deepseek_v41"
+                ):
+                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                        split_bf16_hc_weight,
+                    )
+
+                    self._hc_attn_bf16_parts = split_bf16_hc_weight(
+                        self.hc_attn_fn.data
+                    )
+                    self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
 
     def hc_pre(
         self,
@@ -2803,7 +2831,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
-                and 0 < x.shape[0] <= 8
+                and (
+                    0 < x.shape[0] <= 8
+                    or (
+                        self.config.model_type == "deepseek_v41"
+                        and 4096 <= x.shape[0] <= 65536
+                    )
+                )
                 and self.hc_mult == 4
                 and x_flat.shape[1] == 20480
                 and x.dtype == norm.weight.dtype == torch.bfloat16
@@ -2850,7 +2884,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     is_batch_invariant_mode_enabled,
                 )
 
-                parts = None
+                parts = bf16_parts = None
                 if (
                     x_flat.shape[0] >= 128
                     and x_flat.is_contiguous()
@@ -2860,9 +2894,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ):
                     if hc_fn is self.hc_attn_fn:
                         parts = getattr(self, "_hc_attn_tf32_parts", None)
+                        bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
                     elif hc_fn is self.hc_ffn_fn:
                         parts = getattr(self, "_hc_ffn_tf32_parts", None)
-                if parts is not None:
+                        bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
+                if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
+                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                        hc_mix_stats_sinkhorn_bf16x3,
+                    )
+
+                    pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
+                        x_flat,
+                        bf16_parts,
+                        hc_scale,
+                        hc_base,
+                        self.hc_sinkhorn_iters,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                    )
+                elif parts is not None:
                     from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
                         hc_mix_stats_sinkhorn_deepgemm,
                     )
@@ -4111,6 +4161,67 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+
+    @torch.inference_mode()
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        """Tune resident MXFP8 linears without touching request/KV/draft state.
+
+        FlashInfer covers all M buckets through ``num_tokens`` from one call.
+        Decode/verify warmup only covers small M; the untuned large-M heuristic
+        can be substantially slower. Tune each distinct weight layout once and
+        call the quantization method directly to avoid TP collectives and model
+        side effects. The runner owns the synchronized autotune context.
+        """
+        if getattr(self.config, "model_type", None) != "deepseek_v41":
+            return 0
+        seen = set()
+        # The backbone excludes vision and lm_head, whose prefill shapes differ.
+        for layer in self.model.modules():
+            method = getattr(layer, "quant_method", None)
+            if not isinstance(method, Fp8LinearMethod):
+                continue
+            if not (method.use_mxfp8 or method.block_fp8_as_mxfp8):
+                continue
+            if method.block_fp8_as_mxfp8 and not getattr(
+                layer, "block_fp8_mxfp8_ready", False
+            ):
+                # Some weights have a model-specific consumer or retain the
+                # block-FP8 fallback; they have no swizzled MXFP8 scale buffer.
+                continue
+            backend = method.mxfp8_dense_backend
+            if backend is None or not backend.is_flashinfer_cutedsl():
+                continue
+            if method.block_fp8_as_mxfp8:
+                # Tune large row counts; small decode/verify shapes and
+                # deterministic execution retain their pinned tactic.
+                method.mxfp8_prefill_autotune_min_tokens = 4096
+            weight = layer.weight
+            scale = layer.weight_scale_inv_swizzled
+            key = (
+                weight.shape,
+                weight.stride(),
+                weight.dtype,
+                scale.shape,
+                scale.stride(),
+                scale.dtype,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            x = torch.zeros(
+                (num_tokens, weight.shape[1]),
+                dtype=dtype,
+                device=weight.device,
+            )
+            method.apply(layer, x)
+            del x
+        if seen:
+            logger.info(
+                "FlashInfer prefill autotune: %d MXFP8 weight layouts at M=%d.",
+                len(seen),
+                num_tokens,
+            )
+        return len(seen)
 
     @property
     def routed_experts_weights_of_layer(self):
