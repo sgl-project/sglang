@@ -604,11 +604,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
-        schedule = SimpleNamespace(
-            max_prefill_tokens=16384,
-            chunked_prefill_size=4096,
-            max_running_requests=256,
-        )
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
         spec = SimpleNamespace(
             speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
         )
