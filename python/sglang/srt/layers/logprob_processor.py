@@ -462,6 +462,7 @@ class InputLogprobProcessor:
         pruned_states: torch.Tensor,
         sample_indices: Optional[torch.Tensor],
         input_logprob_indices: torch.Tensor,
+        input_logprob_temperatures: Optional[torch.Tensor],
         token_to_seq_idx: list[int],
         lm_head: VocabParallelEmbedding,
         get_logits_fn: Callable,
@@ -483,6 +484,7 @@ class InputLogprobProcessor:
             pruned_states,
             sample_indices,
             input_logprob_indices,
+            input_logprob_temperatures,
             token_to_seq_idx,
             lm_head,
             get_logits_fn,
@@ -495,6 +497,7 @@ class InputLogprobProcessor:
         pruned_states: torch.Tensor,
         sample_indices: torch.Tensor,
         input_logprob_indices: torch.Tensor,
+        input_logprob_temperatures: Optional[torch.Tensor],
         token_to_seq_idx: list[int],
         lm_head: VocabParallelEmbedding,
         get_logits_fn: Callable,
@@ -584,6 +587,10 @@ class InputLogprobProcessor:
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
             chunk_logprobs = chunk_logits[chunk_indices]
             del chunk_logits
+            if input_logprob_temperatures is not None:
+                chunk_logprobs = (
+                    chunk_logprobs / input_logprob_temperatures[chunk_mask, None]
+                )
 
             # End at the last row inside the chunk; token_to_seq_idx[end_idx]
             # belongs to the next chunk and would emit its sequence twice.
