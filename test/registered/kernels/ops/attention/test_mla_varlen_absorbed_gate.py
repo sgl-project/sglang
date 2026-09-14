@@ -1,10 +1,4 @@
-"""Capability contract for the varlen absorbed-MLA extend path.
-
-A subclass that swaps the decode kernel must state whether it can also serve a
-ragged query, rather than inherit the base class' answer: the ragged path is
-_run_varlen_absorbed_kernel(), and supports_varlen_absorbed_mla decides whether
-forward_extend() reaches it at all.
-"""
+"""Capability and dispatch contract for varlen absorbed-MLA extend."""
 
 import unittest
 from types import SimpleNamespace
@@ -13,14 +7,13 @@ from unittest.mock import MagicMock, patch, sentinel
 import torch
 
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
-from sglang.srt.layers.attention.flashinfer_mla_backend import (
-    FlashInferMLAAttnBackend,
-)
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     _get_cute_dsl_workspace_buffer,
     _get_varlen_absorbed_workspace_buffer,
+    configured_varlen_absorbed_mla_supported,
     varlen_absorbed_mla_supported,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -39,35 +32,25 @@ def _skip_unless_fp4_dtype_available(test_case):
 
 
 class TestVarlenAbsorbedMLAGate(CustomTestCase):
-    # In-tree backends that swap the decode kernel. Pinned so the scan below
-    # cannot pass vacuously when an import above is dropped, and so that adding
-    # a backend forces a conscious answer on supports_varlen_absorbed_mla.
     DECODE_KERNEL_OVERRIDERS = (TokenspeedMLABackend, CuteDslMLABackend)
 
-    def test_base_backend_supports_varlen(self):
-        self.assertTrue(TRTLLMMLABackend.supports_varlen_absorbed_mla)
+    def test_base_backend_owns_varlen_extend(self):
+        self.assertTrue(TRTLLMMLABackend.owns_varlen_absorbed_extend)
 
-    def test_tokenspeed_opts_out(self):
-        # It inherits backend == "trtllm-gen", so the opt-out must be explicit.
-        self.assertFalse(TokenspeedMLABackend.supports_varlen_absorbed_mla)
+    def test_tokenspeed_does_not_own_varlen_extend(self):
+        self.assertFalse(TokenspeedMLABackend.owns_varlen_absorbed_extend)
         self.assertTrue(issubclass(TokenspeedMLABackend, TRTLLMMLABackend))
 
-    def test_cutedsl_opts_out(self):
-        self.assertFalse(CuteDslMLABackend.supports_varlen_absorbed_mla)
+    def test_decode_only_cutedsl_does_not_own_varlen_extend(self):
+        self.assertFalse(CuteDslMLABackend.owns_varlen_absorbed_extend)
         self.assertTrue(issubclass(CuteDslMLABackend, TRTLLMMLABackend))
 
-    def test_opted_out_backends_have_no_ragged_kernel(self):
-        # Premise of both opt-outs: neither brings its own ragged path, so the
-        # capability they decline really is unimplemented rather than declared
-        # away. If either grows one, revisit its flag.
+    def test_decode_overrides_do_not_own_a_varlen_extend_kernel(self):
         for cls in self.DECODE_KERNEL_OVERRIDERS:
             with self.subTest(cls=cls.__name__):
                 self.assertNotIn("_run_varlen_absorbed_kernel", cls.__dict__)
 
-    def test_shipped_subclasses_declare_support_explicitly(self):
-        # The defect was a subclass nobody had inventoried. Any shipped subclass
-        # that swaps the decode kernel must state its choice rather than inherit
-        # one. Test-local subclasses are excluded so this stays order-independent.
+    def test_shipped_decode_overrides_declare_ownership_explicitly(self):
         found = set()
         for cls in TRTLLMMLABackend.__subclasses__():
             if not cls.__module__.startswith("sglang."):
@@ -75,14 +58,14 @@ class TestVarlenAbsorbedMLAGate(CustomTestCase):
             if "_run_decode_kernel" not in cls.__dict__:
                 continue
             with self.subTest(cls=cls.__name__):
-                self.assertIn("supports_varlen_absorbed_mla", cls.__dict__)
+                self.assertIn("owns_varlen_absorbed_extend", cls.__dict__)
             found.add(cls)
         self.assertEqual(
             found,
             set(self.DECODE_KERNEL_OVERRIDERS),
             "the set of in-tree decode-kernel overrides changed; update "
             "DECODE_KERNEL_OVERRIDERS after deciding the new class' "
-            "supports_varlen_absorbed_mla",
+            "owns_varlen_absorbed_extend",
         )
 
 
@@ -97,15 +80,15 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
 
     _BACKEND = "sglang.srt.layers.attention.trtllm_mla_backend"
 
-    def _server_args(self):
+    def _server_args(self, *, kv_cache_dtype="fp8_e4m3", model_dtype=torch.bfloat16):
         from sglang.srt.server_args import ServerArgs
 
-        return ServerArgs(model_path="dummy")
+        args = ServerArgs(model_path="dummy", kv_cache_dtype=kv_cache_dtype)
+        args._model_config = SimpleNamespace(dtype=model_dtype)
+        return args
 
     def test_server_args_delegates_to_the_backend_predicate(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            trtllm_mla_has_varlen_absorbed,
-        )
+        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
 
         args = self._server_args()
         for supported in (True, False):
@@ -116,18 +99,46 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
                         return_value=("trtllm_mla", "trtllm_mla"),
                     ),
                     patch(
-                        f"{self._BACKEND}.varlen_absorbed_mla_supported",
+                        f"{self._BACKEND}.configured_varlen_absorbed_mla_supported",
                         return_value=supported,
                     ) as helper,
                 ):
                     has = trtllm_mla_has_varlen_absorbed(args)
                 self.assertEqual(has, supported)
-                helper.assert_called_once_with(args.kv_cache_dtype)
+                helper.assert_called_once_with(args.kv_cache_dtype, torch.bfloat16)
+
+    def test_auto_kv_uses_resolved_model_dtype(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
+
+        for model_dtype, expected in (
+            (torch.bfloat16, True),
+            (torch.float16, False),
+        ):
+            with self.subTest(model_dtype=model_dtype):
+                args = self._server_args(kv_cache_dtype="auto", model_dtype=model_dtype)
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.overrides.attention_backends_of",
+                        return_value=("trtllm_mla", "trtllm_mla"),
+                    ),
+                    patch(f"{self._BACKEND}.is_sm100_supported", return_value=True),
+                ):
+                    self.assertEqual(trtllm_mla_has_varlen_absorbed(args), expected)
+
+    def test_configured_auto_and_explicit_forms_match_runtime_gate(self):
+        with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
+            self.assertTrue(
+                configured_varlen_absorbed_mla_supported("auto", torch.bfloat16)
+            )
+            self.assertFalse(
+                configured_varlen_absorbed_mla_supported("auto", torch.float16)
+            )
+            self.assertTrue(
+                configured_varlen_absorbed_mla_supported("fp8_e4m3", torch.float16)
+            )
 
     def test_other_backends_are_never_excluded(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            trtllm_mla_has_varlen_absorbed,
-        )
+        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
 
         args = self._server_args()
         with patch(
@@ -162,14 +173,35 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
             with self.subTest(name=name):
                 self.assertIsNot(resolve(name), torch.float4_e2m1fn_x2)
 
-    def test_string_and_dtype_forms_agree(self):
-        # ServerArgs passes the CLI string, the backend passes a torch dtype.
-        _skip_unless_fp4_dtype_available(self)
+    def test_only_supported_string_and_dtype_forms_are_allowed(self):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
-            self.assertFalse(varlen_absorbed_mla_supported("nvfp4"))
-            self.assertFalse(varlen_absorbed_mla_supported(torch.float4_e2m1fn_x2))
-            self.assertTrue(varlen_absorbed_mla_supported("fp8_e4m3"))
-            self.assertTrue(varlen_absorbed_mla_supported(torch.float8_e4m3fn))
+            for dtype in (
+                "bf16",
+                "bfloat16",
+                "fp8_e4m3",
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ):
+                with self.subTest(dtype=dtype):
+                    self.assertTrue(varlen_absorbed_mla_supported(dtype))
+            for dtype in (
+                "auto",
+                "fp8_e5m2",
+                "mxfp8",
+                "nvfp4",
+                "fp4_mx_block16",
+                torch.float16,
+                torch.float8_e5m2,
+            ):
+                with self.subTest(dtype=dtype):
+                    self.assertFalse(varlen_absorbed_mla_supported(dtype))
+
+            try:
+                fp4_dtype = torch.float4_e2m1fn_x2
+            except AttributeError:
+                pass
+            else:
+                self.assertFalse(varlen_absorbed_mla_supported(fp4_dtype))
 
     def test_non_sm10_is_unsupported_whatever_the_kv_dtype(self):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=False):
@@ -185,6 +217,7 @@ class TestVarlenAbsorbedMLARouting(CustomTestCase):
         backend.backend = "trtllm-gen"
         backend.disable_chunked_prefix_cache = False
         backend._varlen_absorbed_arch_dtype_ok = True
+        backend._kv_shard_pool = None
 
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,

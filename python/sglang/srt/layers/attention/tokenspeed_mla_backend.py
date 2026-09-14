@@ -110,8 +110,8 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
-    # No varlen support; explicit opt-out since we inherit backend == "trtllm-gen".
-    supports_varlen_absorbed_mla = False
+    # Tokenspeed overrides decode only and does not own the extend path.
+    owns_varlen_absorbed_extend = False
 
     def __init__(
         self,

@@ -24,11 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    is_cpu,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import is_cpu, is_mps, parse_connector_type
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
 logger = logging.getLogger(__name__)
@@ -174,13 +170,16 @@ def apply_cuda_graph_compatibility(server_args: Any):
 def trtllm_mla_has_varlen_absorbed(server_args: Any) -> bool:
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    if attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla":
+    cfg = resolved_view(server_args)
+    if attention_backends_of(cfg)[0] != "trtllm_mla":
         return True
     from sglang.srt.layers.attention.trtllm_mla_backend import (
-        varlen_absorbed_mla_supported,
+        configured_varlen_absorbed_mla_supported,
     )
 
-    return varlen_absorbed_mla_supported(server_args.kv_cache_dtype)
+    return configured_varlen_absorbed_mla_supported(
+        cfg.kv_cache_dtype, model_config_of(server_args).dtype
+    )
 
 
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
@@ -288,10 +287,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import (
-        is_deepseek_v4,
-        uses_kda_attention,
-    )
+    from sglang.srt.configs.model_config import is_deepseek_v4, uses_kda_attention
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [

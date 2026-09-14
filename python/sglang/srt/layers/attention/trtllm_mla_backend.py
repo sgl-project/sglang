@@ -66,6 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -73,7 +74,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_float4_e2m1fn_x2,
-    is_fp4_dtype,
     is_sm100_supported,
 )
 
@@ -185,17 +185,31 @@ def varlen_absorbed_mla_supported(kv_cache_dtype: Union[str, torch.dtype]) -> bo
     """Whether trtllm_mla can serve a captured-graph extend with absorbed MLA
     over a ragged query, instead of the slower FlashInfer paged-MLA fallback.
 
-    Shared by the backend (torch dtype) and ServerArgs (--kv-cache-dtype
-    string) so config and kernel can't disagree.
+    Accepts both the ServerArgs string and the runtime torch dtype.
 
     - Arch: flashinfer's backend="auto" resolves to XQA off SM100, and XQA
       raises on cum_seq_lens_q.
-    - FP4 KV: already dequantized to bf16 by MLATokenToKVPoolFP4, and the
-      packed dtype isn't accepted by trtllm-gen anyway.
+    FlashInfer 0.6.18 supports this path with BF16 or FP8 E4M3 KV. FP4 uses
+    the paged fallback, and other FP8 formats are unsupported.
     """
     if not is_sm100_supported():
         return False
-    return not is_fp4_dtype(kv_cache_dtype)
+    return kv_cache_dtype in (
+        "bf16",
+        "bfloat16",
+        "fp8_e4m3",
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    )
+
+
+def configured_varlen_absorbed_mla_supported(
+    kv_cache_dtype: str, model_dtype: torch.dtype
+) -> bool:
+    """Resolve ``auto`` conservatively before the KV cache is materialized."""
+    return varlen_absorbed_mla_supported(
+        model_dtype if kv_cache_dtype == "auto" else kv_cache_dtype
+    )
 
 
 @dataclass
@@ -243,9 +257,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Opt out when this backend cannot run absorbed MLA with a ragged query under
-    # a piecewise prefill CUDA graph.
-    supports_varlen_absorbed_mla: bool = True
+    # This class owns the absorbed-MLA extend path used under prefill graphs.
+    owns_varlen_absorbed_extend: bool = True
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
@@ -286,10 +299,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Runtime parameters
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
-        # Static hw/dtype eligibility -- ServerArgs reads the same predicate.
-        self._varlen_absorbed_arch_dtype_ok = varlen_absorbed_mla_supported(
-            self.data_type
-        )
+        # Require both the pre-load config decision and the resolved runtime
+        # dtype to be supported.
+        self._varlen_absorbed_arch_dtype_ok = configured_varlen_absorbed_mla_supported(
+            get_model().kv_cache_dtype, config.dtype
+        ) and varlen_absorbed_mla_supported(self.data_type)
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -316,7 +330,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.workspace_size, model_runner.device
             )
             if self.backend == "trtllm-gen"
-            and self.supports_varlen_absorbed_mla
+            and self.owns_varlen_absorbed_extend
             and self._varlen_absorbed_arch_dtype_ok
             else None
         )
@@ -887,7 +901,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # ragged q avoids the FlashInfer fallback's whole-KV-pool conversion.
             use_varlen_absorbed = (
                 (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-                and self.supports_varlen_absorbed_mla
+                and self.owns_varlen_absorbed_extend
                 and self.backend == "trtllm-gen"
                 and self._varlen_absorbed_arch_dtype_ok
                 and forward_batch.spec_info is None
@@ -1736,7 +1750,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             _pm is not None
             and _pm.block_kv_indices is not None
-            and self.supports_varlen_absorbed_mla
+            and self.owns_varlen_absorbed_extend
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             # absorbed (attn_mqa) only -- never the MHA companion layer
