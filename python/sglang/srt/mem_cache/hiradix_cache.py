@@ -997,7 +997,17 @@ class HiRadixCache(RadixCache):
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
-        if self.cache_controller.write_policy == "write_back" or chunked:
+        if self.cache_controller.write_policy == "write_back":
+            return
+        if chunked:
+            # A chunked request must not count its own in-flight prefix as a
+            # hit, but write-through still needs to preserve newly inserted
+            # nodes before they can be evicted.
+            if (
+                self.cache_controller.write_policy == "write_through"
+                and not node.backuped
+            ):
+                self.write_backup(node)
             return
         node.hit_count += 1
 

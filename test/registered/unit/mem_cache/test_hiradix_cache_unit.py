@@ -78,11 +78,13 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         cache.write_through_threshold = 1 << 30
         return cache, allocator
 
-    def _insert(self, cache, allocator, tokens):
+    def _insert(self, cache, allocator, tokens, chunked=False):
         key = RadixKey(array("q", tokens))
         value = allocator.alloc(len(tokens))
         self.assertIsNotNone(value)
-        return cache.insert(InsertParams(key=key, value=value[: len(tokens)]))
+        return cache.insert(
+            InsertParams(key=key, value=value[: len(tokens)], chunked=chunked)
+        )
 
     def _leaf_for(self, cache, tokens):
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -117,6 +119,25 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(len(stored_cpu[0].block_hashes), 2)
+
+    def test_chunked_insert_backs_up_first_seen_prefix(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4], chunked=True)
+        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6], chunked=True)
+
+        leaf = self._leaf_for(cache, [1, 2, 3, 4, 5, 6])
+        self.assertIsNot(leaf, cache.root_node)
+        self.assertTrue(leaf.parent.backuped)
+        self.assertTrue(leaf.backuped)
+
+        cache.writing_check(write_back=True)
+        stored_cpu = self._stored_cpu_events(cache)
+        self.assertEqual(
+            [list(event.token_ids) for event in stored_cpu],
+            [[1, 2, 3, 4], [5, 6]],
+        )
 
 
 if __name__ == "__main__":
