@@ -228,6 +228,32 @@ def build_kv_cache(
     )
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
+    # QSA compressed-attention models (e.g. Qwen3.8-Flash-Next) are
+    # susceptible to the chunked-prefill radix-insert race: a retracted
+    # request frees KV pages that the radix tree already references, and
+    # the QSA compressed-KV slot (full_slot // ratio) then reads data from
+    # a different request.  Auto-enable the guard unless the user
+    # explicitly overrides it.
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        parse_qsa_profile,
+    )
+
+    _qsa_profile = parse_qsa_profile(model_config.hf_text_config)
+    _is_qsa_compressed = (
+        _qsa_profile is not None and _qsa_profile.variant == QSA_VARIANT_COMPRESSED
+    )
+    if server_args.disable_chunked_radix_insert is None:
+        disable_chunked_radix_insert = _is_qsa_compressed
+        if _is_qsa_compressed:
+            logger.info(
+                "Auto-enabled --disable-chunked-radix-insert for QSA "
+                "compressed-attention model (prevents chunked-prefill "
+                "radix-insert race, see issue #38319)."
+            )
+    else:
+        disable_chunked_radix_insert = server_args.disable_chunked_radix_insert
+
     sliding_window_size = None
     if is_hybrid_swa:
         sliding_window_size = tp_worker.sliding_window_size
@@ -296,6 +322,7 @@ def build_kv_cache(
         enable_session_radix_cache=server_args.enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        disable_chunked_radix_insert=disable_chunked_radix_insert,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,

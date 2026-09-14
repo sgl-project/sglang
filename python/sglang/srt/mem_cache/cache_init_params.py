@@ -36,6 +36,13 @@ class CacheInitParams:
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
 
+    # When True, MambaRadixCache skips the radix insert during chunked
+    # prefill (cache_unfinished_req with chunked=True) and defers it to
+    # cache_finished_req.  This eliminates the race where a retracted
+    # request frees KV pages that the radix tree already references,
+    # which corrupts QSA compressed-KV slots (full_slot // ratio).
+    disable_chunked_radix_insert: bool = False
+
     pp_rank: int = 0
     pp_size: int = 1
 
