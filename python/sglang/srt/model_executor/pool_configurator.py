@@ -417,9 +417,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             assert full_layers + swa_layers == num_layers
 
             full_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
-            swa_heads = max(
-                1, model_config.hf_text_config.swa_num_key_value_heads // tp_size
-            )
+            swa_heads = model_config.get_swa_num_kv_heads(tp_size)
             cell_size = (
                 full_heads
                 * (model_config.head_dim + model_config.v_head_dim)
