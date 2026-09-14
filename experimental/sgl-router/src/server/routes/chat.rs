@@ -1292,56 +1292,28 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Whether the router's `input_ids` may be forwarded for this request.
+/// Forward generated IDs only for request shapes verified against the engine.
+/// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
-/// We forward only when the engine, fed `input_ids`, would have produced the
-/// SAME prompt the router tokenized. When `input_ids` is present the engine
-/// uses it verbatim and ignores everything that would otherwise steer its
-/// `messages`-side tokenization (only stop tokens / tool-call constraint are
-/// still taken from `messages`). The router renders with Dynamo, which does
-/// not replicate the engine's request normalization, so any field that
-/// changes the engine's rendering and whose Dynamo rendering has not been
-/// verified identical makes the forwarded ids wrong. This predicate is
-/// conservative by construction: any such signal returns `false` and the
-/// engine tokenizes from `messages` (always correct).
+/// Exclude requests that may render differently with dynamo-render:
+/// - Non-leading system turns or consecutive users, which strict templates rewrite.
+/// - Historical `reasoning_content`, which may be injected into message content.
+/// - Tools/functions, whose schemas the engine normalizes before rendering.
+/// - Non-string or missing content, which the engine flattens or blanks.
+/// - Template overrides, kwargs, reasoning controls, or task selection.
+/// - Assistant continuations, whose final turn the engine handles separately.
 ///
-/// Verified-and-safe: plain text `messages` with a string `content`.
-/// Not verified -> omit:
-///   * historical `reasoning_content`: Dynamo may inject it into message content.
-///   * `tools` / `functions`: the engine serializes tool schemas through its
-///     own model dump; Dynamo renders the caller's JSON.
-///   * non-string or missing `content` (arrays, `null`):
-///     the engine flattens or blanks these before rendering; Dynamo does not.
-///   * `chat_template`: an OpenAI-compatible per-request template override
-///     (e.g. vLLM); the router renders with the model's default template, so a
-///     custom one would diverge. (SGLang ignores it today, but block it so the
-///     offload stays correct across engines / future versions.)
-///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
-///     `reasoning` / `reasoning_effort`, `task`: thinking/mode toggles the
-///     engine normalizes differently from Dynamo.
-///   * `continue_final_message: true`, or a trailing `assistant` message: the
-///     engine rewrites/strips the final assistant turn; Dynamo renders it
-///     verbatim.
-///
-/// NOTE: the router renders in the engine's default (non-thinking) mode. The
-/// only way a plain request diverges is an engine build that applies a
-/// non-default mode the router can't observe from the request
-/// (`SGLANG_DEFAULT_THINKING`, `--chat-template`, default template kwargs):
-/// the same router/engine tokenization-parity assumption that cache-aware
-/// routing already depends on. The same assumption covers
-/// `add_special_tokens`: the router renders specials via the chat template, which
-/// matches the engine on tokenizers that auto-add them (the common case); a
-/// tokenizer that does not would diverge by a leading special, again undetectable
-/// from the request.
+/// Matching model files and engine defaults are still required. Worker template
+/// overrides and default kwargs cannot be inferred from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value)
         || request_has_non_text_content(value)
         || request_has_reasoning_content(value)
+        || request_has_role_rewrites(value)
     {
         return false;
     }
-    // Fields that steer the engine's template tokenization and whose Dynamo
-    // rendering is not verified identical.
+    // Request controls whose rendering has not been verified against the engine.
     for key in [
         "chat_template",
         "chat_template_kwargs",
@@ -1397,10 +1369,7 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Whether the request carries tool / function definitions. Dynamo renders
-/// the caller's tool JSON while the engine renders its own model dump of it,
-/// so the router's `input_ids` would differ; the caller must let the engine
-/// tokenize these itself.
+/// Tool schemas require engine normalization before rendering.
 fn request_has_tools(value: &serde_json::Value) -> bool {
     let nonempty = |key: &str| {
         value.get(key).is_some_and(|v| match v {
@@ -1412,7 +1381,7 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
-/// Dynamo may inject historical reasoning into content the engine leaves unchanged.
+/// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
 fn request_has_reasoning_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
@@ -1426,8 +1395,19 @@ fn request_has_reasoning_content(value: &serde_json::Value) -> bool {
         })
 }
 
+/// Message orders dynamo-render may rewrite for strict templates.
+fn request_has_role_rewrites(value: &serde_json::Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().skip(1).any(|m| m["role"] == "system")
+        || messages
+            .windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user")
+}
+
 /// Detect non-string or missing content, which requires engine tokenization:
-/// the engine normalizes arrays and nulls differently from Dynamo.
+/// the engine normalizes arrays and nulls differently from dynamo-render.
 fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
@@ -1748,6 +1728,29 @@ mod tests {
             .unwrap()
             .remove("reasoning_content");
         assert!(input_ids_safe_to_forward(&value));
+    }
+
+    #[test]
+    fn role_rewrites_are_expected_forwarding_omissions() {
+        for roles in [
+            vec!["user", "user"],
+            vec!["system", "system", "user"],
+            vec!["user", "assistant", "system", "user"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| serde_json::json!({"role": role, "content": "text"}))
+                .collect();
+            let value = serde_json::json!({"messages": messages});
+            assert!(!input_ids_safe_to_forward(&value), "{roles:?}");
+            assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        }
+        assert!(input_ids_safe_to_forward(&serde_json::json!({"messages": [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]})));
     }
 
     /// Every field the engine honors on the `messages` path but which the
