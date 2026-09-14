@@ -64,7 +64,7 @@ def handle_mps_backends(server_args: Any):
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
         # only lift the CUDA default, so an explicit --triton-attention-num-kv-splits holds
-        if server_args.triton_attention_num_kv_splits == 8:
+        if getattr(server_args, "triton_attention_num_kv_splits", None) == 8:
             declare_resolution(
                 server_args,
                 "_handle_amd_specifics",
