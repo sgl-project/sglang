@@ -492,6 +492,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def discard_storage_prefetch_accounting(self, req_id: str) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
+    def has_uncommitted_restore(self, req: Any) -> bool:
+        """Whether a restore still owns device slots outside the cache.
+
+        Such a request must not be rematched from the waiting queue: the
+        rematch reassigns ``req.prefix_indices``, which is the only handle on
+        those slots until the normal cache path commits them. Caches that only
+        hand out slots they already own have nothing to report.
+        """
+        return False
+
     def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(req_id), None
