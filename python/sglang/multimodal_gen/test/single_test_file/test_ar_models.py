@@ -71,7 +71,7 @@ class ARCluster(DisaggCluster):
             "--tokenizer-path",
             os.path.join(local_model, "processor"),
             "--enable-multimodal",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "1",
             "--image-processor-backend",
             "pil",
