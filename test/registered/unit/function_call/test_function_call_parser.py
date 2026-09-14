@@ -3326,6 +3326,103 @@ class TestGlm47MoeDetector(unittest.TestCase):
         ]
         self.detector = Glm47MoeDetector()
 
+    def test_streaming_drains_two_complete_no_arg_calls_from_one_increment(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=f"Run {name}",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            )
+            for name in ("first", "second")
+        ]
+        result = Glm47MoeDetector().parse_streaming_increment(
+            "<tool_call>first</tool_call><tool_call>second</tool_call>", tools
+        )
+
+        names = [(call.tool_index, call.name) for call in result.calls if call.name]
+        parameters = {
+            index: "".join(
+                call.parameters
+                for call in result.calls
+                if call.tool_index == index and call.parameters
+            )
+            for index in (0, 1)
+        }
+        self.assertEqual(names, [(0, "first"), (1, "second")])
+        self.assertEqual(parameters, {0: "{}", 1: "{}"})
+
+    def test_streaming_drains_two_complete_calls_with_args_from_one_increment(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=f"Run {name}",
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                ),
+            )
+            for name in ("first", "second")
+        ]
+        result = Glm47MoeDetector().parse_streaming_increment(
+            "<tool_call>first<arg_key>value</arg_key>"
+            "<arg_value>one</arg_value></tool_call>"
+            "<tool_call>second<arg_key>value</arg_key>"
+            "<arg_value>two</arg_value></tool_call>",
+            tools,
+        )
+
+        streamed = {}
+        for call in result.calls:
+            item = streamed.setdefault(
+                call.tool_index, {"name": None, "parameters": ""}
+            )
+            if call.name:
+                item["name"] = call.name
+            item["parameters"] += call.parameters
+        self.assertEqual(
+            streamed,
+            {
+                0: {"name": "first", "parameters": '{"value": "one"}'},
+                1: {"name": "second", "parameters": '{"value": "two"}'},
+            },
+        )
+
+    def test_streaming_drain_preserves_partial_second_call(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=f"Run {name}",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            )
+            for name in ("first", "second")
+        ]
+        detector = Glm47MoeDetector()
+
+        first_result = detector.parse_streaming_increment(
+            "<tool_call>first</tool_call><tool_call>sec", tools
+        )
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in first_result.calls if call.name],
+            [(0, "first")],
+        )
+
+        second_result = detector.parse_streaming_increment("ond</tool_call>", tools)
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in second_result.calls if call.name],
+            [(1, "second")],
+        )
+        self.assertEqual("".join(call.parameters for call in second_result.calls), "{}")
+
     def test_multiple_tool_calls(self):
         text = (
             "<tool_call>get_weather"
