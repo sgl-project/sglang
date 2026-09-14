@@ -25,6 +25,7 @@ limitations under the License.
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #endif
 
@@ -127,6 +128,17 @@ __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
   x = fmaxf(fminf(x, kFP8Max), -kFP8Max);
   y = fmaxf(fminf(y, kFP8Max), -kFP8Max);
   return __nv_fp8x2_e4m3(float2{x, y});
+}
+#elif HIP_FP8_TYPE_OCP && !HIP_FP8_TYPE_FNUZ
+// gfx950/gfx12xx write OCP e4m3 natively, so take v_cvt_pk_fp8_f32 -- RNE, both lanes in
+// one instruction. Not gfx942: hardware only converts to fnuz there, and this kernel writes
+// E4M3FN on every arch (the indexer caller allocates float8_e4m3fn), so gfx942 keeps the
+// software cast below. Testing FNUZ too because HIP sets both macros on the host pass and
+// on targets outside its list. Clip rather than ask for __HIP_SATFINITE: the x2 fast path
+// converts the value it was handed, not the clamped one (ROCm 7.2).
+__device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
+  const float2 v{fmaxf(fminf(x, kFP8Max), -kFP8Max), fmaxf(fminf(y, kFP8Max), -kFP8Max)};
+  return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
 }
 #else
 // Software float -> FP8 E4M3 conversion for ROCm

@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 
 TOPK = 2048
 
@@ -189,6 +189,36 @@ class TestDSATransformIndex(CustomTestCase):
                 extend_lens_cpu=extend_lens_cpu,
                 cu_seqlens_q=cu_seqlens_q,
             )
+
+    def test_prefill_page_table_row_stride_is_not_specialized(self):
+        kernel = transform_index_module.transform_index_page_table_prefill_kernel
+        stride_param = next(
+            param for param in kernel.params if param.name == "page_table_stride_0"
+        )
+
+        self.assertFalse(stride_param.is_constexpr)
+        self.assertTrue(stride_param.do_not_specialize)
+
+    def test_prefill_dynamic_page_table_row_strides(self):
+        context_lengths = (4096, 4160, 4224)
+        kernel = transform_index_module.transform_index_page_table_prefill_kernel
+
+        self._check_case(
+            [2, 1],
+            context_lengths[0],
+            page_table_is_expanded=True,
+        )
+        kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+        specialization_count = len(kernel_cache)
+
+        for context_length in context_lengths[1:]:
+            with self.subTest(context_length=context_length):
+                self._check_case(
+                    [2, 1],
+                    context_length,
+                    page_table_is_expanded=True,
+                )
+                self.assertEqual(len(kernel_cache), specialization_count)
 
     def test_mixed_lengths_padding_and_empty_batch(self):
         self._check_case(

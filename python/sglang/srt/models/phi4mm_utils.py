@@ -242,8 +242,9 @@ class GLUPointWiseConv(nn.Module):
                     x[:, self.output_dim : self.output_dim * 2, :] + self.b2
                 )
             else:
-                x = (x[:, 0 : self.output_dim, :]) * (
-                    x[:, self.output_dim : self.output_dim * 2, :]
+                x = (
+                    (x[:, 0 : self.output_dim, :])
+                    * (x[:, self.output_dim : self.output_dim * 2, :])
                 )
         else:
             if self.bias_in_glu:
@@ -1111,7 +1112,7 @@ class NemoConvSubsampling(torch.nn.Module):
             and subsampling_conv_chunking_factor % 2 != 0
         ):
             raise ValueError(
-                "subsampling_conv_chunking_factor should be -1, 1, or a " "power of 2"
+                "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
             )
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
 
@@ -1578,7 +1579,7 @@ class NemoConvSubsampling(torch.nn.Module):
             and subsampling_conv_chunking_factor % 2 != 0
         ):
             raise ValueError(
-                "subsampling_conv_chunking_factor should be -1, 1, or a " "power of 2"
+                "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
             )
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
 

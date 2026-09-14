@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
@@ -8,6 +8,7 @@ RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
     ca-certificates \
+    ffmpeg \
     git \
     curl \
     wget \
@@ -15,8 +16,9 @@ RUN apt-get update && \
     gcc \
     g++ \
     make \
+    libssl-dev \
     libsqlite3-dev \
-    google-perftools \
+    libgoogle-perftools-dev \
     libtbb-dev \
     libnuma-dev \
     numactl
@@ -39,10 +41,11 @@ RUN source /opt/.venv/bin/activate && \
     git checkout ${VER_SGLANG} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . && \
+    uv pip install ".[diffusion]" && \
     cd sglang/kernels/aot && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install .
+    uv pip install . && \
+    uv pip install "sgl-eval==0.1.0"
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so

@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_with_error_check,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-16-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 

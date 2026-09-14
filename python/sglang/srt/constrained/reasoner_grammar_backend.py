@@ -14,7 +14,7 @@
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -38,7 +38,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def __init__(
         self,
         grammar: Optional[BaseGrammarObject],
-        think_end_ids: List[int],
+        think_end_ids: Sequence[int],
         think_excluded_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
@@ -73,6 +73,26 @@ class ReasonerGrammarObject(BaseGrammarObject):
         else:
             self.tokens_in_think = -1
             self.tokens_after_end = 0
+
+    def set_request_think_end_ids(self, think_end_ids: Sequence[int]) -> None:
+        """Select one request-specific reasoning terminator before decoding."""
+        token_ids = tuple(think_end_ids)
+        if not token_ids:
+            raise ValueError("request reasoning terminator must not be empty")
+        if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+            raise ValueError("request reasoning terminator must contain token IDs")
+        if (
+            self.current_token is not None
+            or self._thinking_match_history
+            or (self.tokens_in_think, self.tokens_after_end) not in ((0, -1), (-1, 0))
+        ):
+            raise RuntimeError(
+                "request reasoning terminator must be selected before decoding"
+            )
+
+        self.think_end_ids = token_ids
+        self._think_end_matcher = TokenSequenceMatcher(token_ids)
+        self._matched_think_end_tokens = 0
 
     def _is_thinking(self):
         return self.tokens_in_think >= 0 and self.tokens_after_end == -1

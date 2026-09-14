@@ -63,7 +63,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 
 _DEFAULT_PERCENTILE_LINES: list[str] = [
     "      [blue]p1        [/]    -1.8000      -1.8000   [dim]+0.00e+00[/]",
@@ -473,8 +473,7 @@ class TestFormatComparisonRichMinimal:
         assert_rich_tags_balanced(result)
 
         assert result == (
-            "[red]❌[/] [bold red]hidden_states                 [/] "
-            "rel_diff=5.00e-01"
+            "[red]❌[/] [bold red]hidden_states                 [/] rel_diff=5.00e-01"
         )
 
     def test_shape_mismatch(self) -> None:
@@ -1046,7 +1045,7 @@ class TestFormatAbsDiffPercentilesRich:
         result: str = _format_abs_diff_percentiles_rich(diff)
 
         assert result == (
-            "p1=1.00e-04  p5=1.00e-04  p50=2.00e-04  " "p95=4.00e-04  p99=5.00e-04"
+            "p1=1.00e-04  p5=1.00e-04  p50=2.00e-04  p95=4.00e-04  p99=5.00e-04"
         )
 
     def test_high_p99_coloring(self) -> None:
@@ -1123,7 +1122,7 @@ class TestFormatReplicatedChecks:
         result: str = format_replicated_checks(checks)
 
         assert result == (
-            "Replicated checks:\n" "  ✅ axis=tp group=0 idx=1 vs 0: n/a diff"
+            "Replicated checks:\n  ✅ axis=tp group=0 idx=1 vs 0: n/a diff"
         )
 
 

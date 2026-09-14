@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=290, stage="nightly", runner_config="4-gpu-h100")
 register_amd_ci(
     est_time=300,
     suite="nightly-amd-4-gpu",
@@ -290,7 +290,7 @@ def _run_e2e_scenario(
     print(f"Comparator debug output: {debug_file}")
 
     assert result.returncode == 0, (
-        f"Comparator failed (rc={result.returncode}). " f"Debug output: {debug_file}"
+        f"Comparator failed (rc={result.returncode}). Debug output: {debug_file}"
     )
 
 

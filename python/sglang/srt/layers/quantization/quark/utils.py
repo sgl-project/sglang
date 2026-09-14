@@ -2,8 +2,18 @@
 
 import re
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Optional
+
+
+@dataclass
+class Nvfp4SourceConfig:
+    """Dispatch marker for online NVFP4 -> MXFP4 re-quantization, carried on
+    `QuarkConfig.dequantization_config` to represent an NVFP4 source
+    Only ModelOpt / AMD Quark NVFP4 (per-tensor `weight_scale_2`
+    that multiplies the per-block scale) is supported."""
+
 
 import torch
 

@@ -25,7 +25,6 @@ from sglang.srt.utils import add_prefix
 
 
 class Step3p7ForConditionalGeneration(nn.Module):
-
     # NVFP4 checkpoints (e.g. huangyu-nv/step3p7-nvfp4-moe-only-kvfp8) use
     # "model.language_model." prefix, while sglang parameters are named
     # "language_model.model.". This mapper remaps the quantization ignore

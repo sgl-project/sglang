@@ -13,10 +13,7 @@ by driving the deployment scale.
 
 from __future__ import annotations
 
-import logging
-
 import httpx
-import pytest
 from conftest import (
     NAMESPACE,
     _cleanup_port_forward,
@@ -24,7 +21,7 @@ from conftest import (
     _poll_until,
     _port_forward_start,
     _wait_for_deployment_ready,
-    logger,
+    _wait_for_replacement_pod_ready,
 )
 
 ROUTER_RESTART_PORT = 8092
@@ -132,7 +129,10 @@ class TestRouterRestart:
                 _cleanup_port_forward("router-restart-pre-kill", pf_holder[0])
                 pf_holder[0] = None
 
-            _wait_for_deployment_ready("sgl-router")
+            if old_pod:
+                _wait_for_replacement_pod_ready(old_pod, "app=sgl-router")
+            else:
+                _wait_for_deployment_ready("sgl-router")
 
             pf_holder[0] = _port_forward_start(
                 NAMESPACE, "sgl-router", ROUTER_RESTART_PORT, 8090

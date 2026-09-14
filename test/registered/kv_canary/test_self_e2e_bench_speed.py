@@ -20,7 +20,7 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
 # benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=304, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
@@ -36,11 +36,11 @@ _PROFILE_NO_GRAPH_STEPS = 3
 def _make_server_args(
     *, canary_on: bool, disable_cuda_graph: bool = False
 ) -> ServerArgs:
-    # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
+    # install_canary asserts --cuda-graph-backend-prefill=disabled; pass on both sides for apples-to-apples.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")

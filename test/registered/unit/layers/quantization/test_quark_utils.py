@@ -2,14 +2,63 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.quark.utils import e8m0_to_f32
+from sglang.srt.layers.quantization.quark.utils import (
+    e8m0_to_f32,
+    should_ignore_layer,
+)
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestShouldIgnoreLayer(CustomTestCase):
+    """MiniMax-M3 MXFP4: sparse index_qkv_proj packs only q/k (the DSA value
+    projection is disabled, so index_v_proj is absent on disk)."""
+
+    _LAYER = "language_model.model.layers.3.self_attn.index_qkv_proj"
+    _IGNORE = (
+        "language_model.model.layers.3.self_attn.index_q_proj",
+        "language_model.model.layers.3.self_attn.index_k_proj",
+    )
+    # The fix lives in the model: index_qkv_proj maps to only q/k (no v).
+    _MAPPING = {
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+    }
+
+    def test_minimax_dsa_index_qkv_ignored(self):
+        # Both present shards are excluded -> fused module stays bf16, no raise.
+        self.assertTrue(should_ignore_layer(self._LAYER, self._IGNORE, self._MAPPING))
+
+    def test_all_shards_agree_still_works(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        ignore = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+        )
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertTrue(should_ignore_layer(layer, ignore, mapping))
+
+    def test_no_shards_ignored(self):
+        layer = "model.layers.0.self_attn.qkv_proj"
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.assertFalse(should_ignore_layer(layer, (), mapping))
+
+    def test_mixed_schemes_raise(self):
+        # Safety net preserved: if a fused module genuinely mixes excluded and
+        # quantized shards, the loader must fail loudly rather than guess.
+        layer = "model.layers.0.self_attn.qkv_proj"
+        ignore = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+        )  # v_proj NOT excluded -> inconsistent with q/k
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        with self.assertRaises(ValueError):
+            should_ignore_layer(layer, ignore, mapping)
 
 
 class TestE8M0ToF32(CustomTestCase):

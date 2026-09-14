@@ -40,6 +40,14 @@ from .dots_vlm_vit import DotsVisionTransformer
 class DotsVLMForCausalLM(nn.Module):
     """DotsVLM model for sglang inference"""
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.language_config, quant_config
+        )
+
     def __init__(
         self, config: DotsVLMConfig, quant_config: Optional[QuantizationConfig] = None
     ) -> None:

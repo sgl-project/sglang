@@ -65,9 +65,9 @@ class MistralEagleModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        assert (
-            get_pp_group().world_size == 1
-        ), "MistralForCausalLMEagle currently does not support pipeline parallelism"
+        assert get_pp_group().world_size == 1, (
+            "MistralForCausalLMEagle currently does not support pipeline parallelism"
+        )
         self.pp_group = get_pp_group()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

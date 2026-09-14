@@ -46,9 +46,7 @@ user_msg_template: str = "<｜User｜>{content}<｜Assistant｜>"
 assistant_msg_template: str = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
 thinking_template = "{reasoning_content}"
 
-response_format_template: str = (
-    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
-)
+response_format_template: str = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
 tool_call_template: str = (
     '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
 )

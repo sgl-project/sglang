@@ -47,9 +47,9 @@ class TestMMLU:
         )
         metrics = run_eval(args)
 
-        assert (
-            metrics["score"] >= 0.65
-        ), f"MMLU score {metrics['score']:.2f} below threshold 0.65"
+        assert metrics["score"] >= 0.65, (
+            f"MMLU score {metrics['score']:.2f} below threshold 0.65"
+        )
         logger.info("MMLU score: %.2f (threshold: 0.65)", metrics["score"])
 
     def test_mmlu_extended(self, setup_backend):
@@ -70,7 +70,7 @@ class TestMMLU:
         )
         metrics = run_eval(args)
 
-        assert (
-            metrics["score"] >= 0.65
-        ), f"MMLU score {metrics['score']:.2f} below threshold 0.65"
+        assert metrics["score"] >= 0.65, (
+            f"MMLU score {metrics['score']:.2f} below threshold 0.65"
+        )
         logger.info("MMLU extended score: %.2f (threshold: 0.65)", metrics["score"])

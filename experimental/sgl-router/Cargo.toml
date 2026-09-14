@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["."]
+members = [".", "sgl-kv-indexer"]
 
 [package]
 name = "sgl-router"
@@ -33,6 +33,7 @@ axum = { version = "0.8", features = ["macros", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -62,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
 rand = "0.8"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"
 kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
@@ -86,6 +87,7 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
+tonic = { version = "0.14.6", features = ["transport"] }
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"

@@ -8,12 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="stage-b-test-4-npu-a3",
-    nightly=True,
-    disabled="accuracy testcase",
-)
+register_npu_ci(est_time=4800, suite="full-acc-4-npu-a3", nightly=True)
 
 QWEN3_VL_8B_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -45,7 +40,7 @@ QWEN3_VL_8B_OTHER_ARGS = [
     "qwen",
     "--reasoning-parser",
     "qwen3",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     8,
     16,
     32,

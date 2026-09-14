@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -36,6 +37,8 @@ class LinearAttnModelSpec:
     support_mamba_cache: bool = True
     support_mamba_cache_extra_buffer: bool = False
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
+    hybrid_backend_class_name: str | None = None
+    config_predicate: Callable[[Any], bool] | None = None
 
 
 _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []
@@ -54,7 +57,9 @@ def register_linear_attn_model(spec: LinearAttnModelSpec) -> None:
 def get_linear_attn_config(hf_config: Any) -> Optional[tuple[LinearAttnModelSpec, Any]]:
     for spec in _LINEAR_ATTN_MODEL_REGISTRY:
         config = hf_config.get_text_config() if spec.unwrap_text_config else hf_config
-        if isinstance(config, spec.config_class):
+        if isinstance(config, spec.config_class) and (
+            spec.config_predicate is None or spec.config_predicate(config)
+        ):
             return spec, config
     return None
 

@@ -1,3 +1,5 @@
+"""Four-Blackwell Kimi Linear TokenSpeed DCP + DSpark static acceptance test."""
+
 import json
 import socket
 import tempfile
@@ -20,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=201, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 GSM8K_SCORE_THRESHOLD = 0.88
@@ -39,6 +41,7 @@ def _has_four_blackwell_gpus() -> bool:
 
 
 def _write_dummy_qwen3_dspark_draft(root: Path) -> str:
+    """Write a dummy Qwen3 DSpark config with Kimi Linear dimensions."""
     draft_dir = root / "qwen3-dspark-kimi-proxy"
     draft_dir.mkdir()
     config = {
@@ -165,7 +168,6 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 8,
             other_args=other_args,
             env={
-                "SGLANG_PREP_IN_CUDA_GRAPH": "1",
                 "SGLANG_RAGGED_VERIFY_MODE": "static",
             },
         )

@@ -13,6 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
+import hashlib
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -20,6 +21,9 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_dcp_sharded_triton as set_mla_kv_buffer_dcp_sharded_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
@@ -52,7 +56,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 
-_EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+_EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "lru": LRUStrategy,
     "lfu": LFUStrategy,
     "fifo": FIFOStrategy,
@@ -63,15 +67,19 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(
+    eviction_policy: str, config: Optional[dict[str, Any]] = None
+) -> EvictionStrategy:
+    """Build the eviction strategy; ``config`` is passed to it as keyword arguments."""
     policy = eviction_policy.lower()
     try:
-        return _EVICTION_POLICY_FACTORIES[policy]()
+        factory = _EVICTION_POLICY_FACTORIES[policy]
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
         raise ValueError(
             f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
         ) from None
+    return factory(**config) if config else factory()
 
 
 def maybe_init_custom_mem_pool(
@@ -112,6 +120,36 @@ def get_hash_str(
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
+def storage_namespace_seed(
+    extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[str]:
+    """Seed storage chains; preserve unnamespaced keys and Rust byte parity."""
+    if extra_key is None and cache_salt is None:
+        return None
+    digest = hashlib.sha256(b"sglang-cache-namespace-v1")
+    # Presence and UTF-8 byte length distinguish absent, empty and joined parts.
+    for part in (extra_key, cache_salt):
+        if part is None:
+            digest.update(b"\x00")
+            continue
+        encoded = part.encode("utf-8")
+        digest.update(b"\x01" + len(encoded).to_bytes(8, "little") + encoded)
+    return digest.hexdigest()
+
+
+def get_storage_hash_str(
+    key: Any,
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    """Seed new storage chains with the request namespace."""
+    if prior_hash is None:
+        prior_hash = storage_namespace_seed(
+            getattr(key, "extra_key", None), getattr(key, "cache_salt", None)
+        )
+    return get_hash_str(key, prior_hash, page_size=page_size)
+
+
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert SHA256 hex string to signed 64-bit integer for events.
 
@@ -130,9 +168,48 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    hash_values = get_storage_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)
     return hash_values
+
+
+def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
+    """Hash tokens with the legacy salt seed; omit extra_key."""
+    namespace = (node.key.extra_key, node.key.cache_salt)
+    if namespace == (None, None):
+        return compute_node_hash_values(node, page_size)
+
+    if node.event_hash_value is not None:
+        return node.event_hash_value
+
+    missing_nodes = []
+    current = node
+    while current is not None and current.key is not None and len(current.key) > 0:
+        if (current.key.extra_key, current.key.cache_salt) != namespace:
+            raise ValueError("Radix path contains mismatched cache namespaces")
+        if current.event_hash_value is not None:
+            break
+        missing_nodes.append(current)
+        current = current.parent
+
+    if current is not None and current.event_hash_value:
+        parent_hash = current.event_hash_value[-1]
+    elif node.key.cache_salt is not None:
+        parent_hash = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + node.key.cache_salt.encode("utf-8")
+        ).hexdigest()
+    else:
+        parent_hash = None
+
+    for missing_node in reversed(missing_nodes):
+        hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)
+        assert isinstance(hash_values, list)
+        missing_node.event_hash_value = hash_values
+        if hash_values:
+            parent_hash = hash_values[-1]
+
+    assert node.event_hash_value is not None
+    return node.event_hash_value
 
 
 def split_node_hash_value(

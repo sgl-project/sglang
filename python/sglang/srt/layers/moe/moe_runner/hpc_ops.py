@@ -146,12 +146,12 @@ def fused_experts_none_to_hpc_ops(
             "this backend also expects global top-k ids, so other quant "
             "methods must not run with --moe-runner-backend hpc_ops."
         )
-    assert (
-        quant_info.w13_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
-    assert (
-        quant_info.w2_weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    assert quant_info.w13_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w13_weight, got {quant_info.w13_weight.dtype}"
+    )
+    assert quant_info.w2_weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8 w2_weight, got {quant_info.w2_weight.dtype}"
+    )
     _check_runner_config_supported(runner_config)
 
     x = dispatch_output.hidden_states

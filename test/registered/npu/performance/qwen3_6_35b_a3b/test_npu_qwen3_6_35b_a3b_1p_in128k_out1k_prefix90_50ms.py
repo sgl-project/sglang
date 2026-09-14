@@ -9,9 +9,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-perf-2-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 QWEN3_6_35B_A3B_128K_PREFIX_ENVS = {
@@ -41,7 +40,7 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     65536,
     "--trust-remote-code",
     "--enable-prefill-delayer",
-    "--mamba-scheduler-strategy",
+    "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--max-running-requests",
     103,
@@ -49,7 +48,7 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     85,
     "--mem-fraction-static",
     0.85,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     8,

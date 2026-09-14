@@ -69,9 +69,9 @@ def store_sf_interleaved(
     page_size: int = 128,
 ):
     """Scatter-write per-token scale factors into interleaved page layout."""
-    assert (
-        page_size == 128
-    ), f"Interleaved SF layout requires page_size=128, got {page_size}"
+    assert page_size == 128, (
+        f"Interleaved SF layout requires page_size=128, got {page_size}"
+    )
     num_tokens, nheads, sf_dim = sf_in.shape
     assert sf_dim == 4, f"Expected sf_dim=4 (hdim=128, sf_vec_size=32), got {sf_dim}"
 

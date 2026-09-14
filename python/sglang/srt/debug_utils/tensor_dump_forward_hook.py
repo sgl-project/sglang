@@ -158,7 +158,7 @@ def register_forward_hook_for_model(
     model_top_level_module_matched, _ = tensor_dumper._add_hook_recursive(
         model, "", top_level_module_name, layers_module_name
     )
-    assert (
-        model_top_level_module_matched
-    ), f"model should have a module named {top_level_module_name}"
+    assert model_top_level_module_matched, (
+        f"model should have a module named {top_level_module_name}"
+    )
     return tensor_dumper

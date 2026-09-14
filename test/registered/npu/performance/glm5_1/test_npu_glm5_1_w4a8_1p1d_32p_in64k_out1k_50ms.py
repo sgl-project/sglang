@@ -13,7 +13,7 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
-    disabled="performance testcase",
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {
@@ -70,7 +70,7 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     "--served-model-name",
     "glm-5",
     "--chunked-prefill-size",
-    16384,
+    32768,
     "--max-prefill-tokens",
     180000,
     "--moe-a2a-backend",
@@ -127,7 +127,7 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "deepep",
     "--deepep-mode",
     "low_latency",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     3,
@@ -139,7 +139,6 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     180000,
     "--tokenizer-worker-num",
     16,
-    "--prefill-round-robin-balance",
     "--disable-shared-experts-fusion",
     "--dtype",
     "bfloat16",
@@ -151,6 +150,14 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "glm45",
     "--tool-call-parser",
     "glm47",
+    "--speculative-algorithm",
+    "NEXTN",
+    "--speculative-num-steps",
+    3,
+    "--speculative-eagle-topk",
+    1,
+    "--speculative-num-draft-tokens",
+    4,
 ]
 
 GLM_5_1_PD_SEP_MODEL_CONFIG = {
@@ -164,6 +171,9 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
 }
 
 
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBase):
     """Test NPU performance for GLM-5.1-w4a8 PD separation 4 nodes in3k5 out1k5"""
 
@@ -171,8 +181,8 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBa
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     dataset_name = "random"
-    max_concurrency = 1
-    num_prompts = 1
+    max_concurrency = 32
+    num_prompts = 64
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

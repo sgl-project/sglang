@@ -18,6 +18,16 @@ _is_musa = is_musa()
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
 
+if _is_cuda:
+    from sglang.kernels.ops.moe.moe_align_small_numel import (
+        SMALL_NUMEL_LIMIT,
+        moe_align_small_numel,
+    )
+
+# Where the CUDA kernel's own small-batch single-block path stops: its
+# per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
+_CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
@@ -92,6 +102,28 @@ def moe_align_block_size(
     cumsum_buffer = torch.empty(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
+
+    # Tiny-batch fast path (bs=1 decode): one single-CTA triton launch replaces
+    # the generic align + count_and_sort pair, covering the corner the CUDA
+    # small-batch kernel cannot reach. Below that bucket limit the CUDA kernel
+    # is already a single launch and does O(numel) work where this one does
+    # O(numel ** 2) pairwise, so leave that side to it. ignore_invalid_expert is
+    # a different contract from the "+1 offset" convention this kernel implements.
+    if (
+        _is_cuda
+        and topk_ids.numel() <= SMALL_NUMEL_LIMIT
+        and num_experts + 1 > _CUDA_SMALL_BATCH_MAX_BUCKETS
+        and not ignore_invalid_expert
+    ):
+        moe_align_small_numel(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
     use_jit_align = False

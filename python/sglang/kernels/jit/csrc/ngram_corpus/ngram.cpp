@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string>
 
+namespace sglang {
+
 namespace ngram {
 
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
@@ -212,3 +214,5 @@ void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {
 }
 
 }  // namespace ngram
+
+}  // namespace sglang

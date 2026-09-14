@@ -46,6 +46,12 @@ class WritePlan:
     write_seed_slot_indices: torch.Tensor
     write_num_valid_reqs: torch.Tensor
 
+    @staticmethod
+    def allocation_bytes(write_req_capacity: int) -> int:
+        return (
+            2 * write_req_capacity + 1
+        ) * torch.int64.itemsize + torch.int32.itemsize
+
     @classmethod
     def allocate(
         cls,

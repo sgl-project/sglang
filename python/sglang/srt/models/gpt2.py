@@ -41,7 +41,6 @@ from sglang.srt.utils import add_prefix
 
 
 class GPT2Attention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -95,7 +94,6 @@ class GPT2Attention(nn.Module):
 
 
 class GPT2MLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -133,7 +131,6 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -182,7 +179,6 @@ class GPT2Block(nn.Module):
 
 
 class GPT2Model(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,
@@ -230,7 +226,6 @@ class GPT2Model(nn.Module):
 
 
 class GPT2LMHeadModel(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,

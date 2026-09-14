@@ -201,7 +201,6 @@ class ModelSlimConfig(QuantizationConfig):
 
 
 class ModelSlimLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

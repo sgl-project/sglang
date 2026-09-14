@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-large")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's
@@ -211,7 +211,6 @@ class TestWeightCheckerE2E(CustomTestCase):
                 self.assertNotIn("cos_sin_cache", name)
                 self.assertNotIn("inv_freq", name)
                 self.assertNotIn("freqs_cis", name)
-                self.assertNotIn("_weight_fp32", name)
 
     def test_z_snapshot_reset_compare_detects_diff(self):
         """Destructive: leaves weights randomized. Named test_z_* so it runs last."""

@@ -4,10 +4,10 @@ SGLang processes are torn down with SIGKILL (kill_process_tree, PDEATHSIG),
 which skips every Python-level unlink path, so /dev/shm segments accumulate
 until the tmpfs is full and the next scheduler init dies with SIGBUS.
 
-Segments created through make_shm_name() embed the creator pid, which lets a
-later server startup safely unlink segments whose creator is gone. The sweep
-only runs in CI (single-tenant runner containers); on shared dev machines a
-pid check against another user's process is not authoritative, so we skip.
+Pid-stamped names (see _creator_pid) are unlinked once their creator is dead;
+pid-less families (_ORPHAN_PREFIXES) are unlinked unconditionally, safe only
+because the sweep runs at CI job start right after killall.py. CI-only
+(SGLANG_IS_IN_CI): both rules assume a single-tenant runner container.
 """
 
 import logging
@@ -20,10 +20,16 @@ logger = logging.getLogger(__name__)
 _SHM_DIR = Path("/dev/shm")
 _SGL_SHM_PREFIX = "sgl_shm"
 
+_ORPHAN_PREFIXES = (
+    "sglang_loads_",  # managers/load_snapshot.py slot files
+    "cuda.shm.",  # CUDA IPC segments
+    "nccl-",  # NCCL communicator segments
+    "sem.loky-",  # loky/joblib semaphores
+)
+
 
 def make_shm_name(kind: str) -> str:
-    """Name a shared-memory segment so cleanup_stale_shm can identify and
-    reclaim it after its creator process dies: sgl_shm_<kind>_<pid>_<rand>."""
+    """Pid-stamped name (sgl_shm_<kind>_<pid>_<rand>) the sweep can reclaim."""
     return f"{_SGL_SHM_PREFIX}_{kind}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
@@ -60,11 +66,10 @@ def _pid_alive(pid: int) -> bool:
 
 
 def cleanup_stale_shm() -> None:
-    """Unlink shared-memory segments whose creator process is dead.
+    """Unlink leaked shared-memory segments (rules in module docstring).
 
-    CI-only: gated on SGLANG_IS_IN_CI because the pid-liveness check is only
-    trustworthy when the container runs one job at a time. Best-effort: never
-    raises, since a failed sweep must not block server startup.
+    Best-effort: never raises, since a failed sweep must not block server
+    startup.
     """
     try:
         _cleanup_stale_shm_impl()
@@ -75,9 +80,8 @@ def cleanup_stale_shm() -> None:
 
 
 def _is_in_ci() -> bool:
-    # Read the env var directly (same semantics as sglang.utils.is_in_ci) so
-    # this module stays import-free and runnable by path from CI scripts
-    # before sglang is installed.
+    # Same semantics as sglang.utils.is_in_ci, read directly so the module
+    # stays import-free (CI runs it by path before sglang is installed).
     return os.environ.get("SGLANG_IS_IN_CI", "false").lower() in ("true", "1")
 
 
@@ -96,10 +100,13 @@ def _cleanup_stale_shm_impl() -> None:
         return
     for entry in entries:
         pid = _creator_pid(entry.name)
-        if pid is None or pid == os.getpid() or _pid_alive(pid):
+        if pid is not None:
             # A recycled pid reads as alive, so pid-reuse degrades to
             # under-collection (segment leaks), never to deleting a live
             # segment. Keep that bias when changing this check.
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+        elif not entry.name.startswith(_ORPHAN_PREFIXES):
             continue
         try:
             size = entry.stat().st_size

@@ -1,7 +1,7 @@
 """Fused Q/K GemmaRMSNorm + NeoX RoPE + gate deinterleave (Triton).
 
-Single kernel launch fusing per-head GemmaRMSNorm, partial NeoX RoPE,
-and gate deinterleave for Qwen3.5's interleaved Q+Gate layout.
+Single kernel launch fusing per-head GemmaRMSNorm, partial NeoX RoPE over 1-D or
+mrope positions, and gate deinterleave for Qwen3.5's interleaved Q+Gate layout.
 
 2D grid (T, num_q_heads + num_kv_heads) — each program handles one
 (token, head) pair. Q programs also copy the gate slice.
@@ -39,12 +39,14 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     k_weight_ptr,
     cos_sin_cache_ptr,
     positions_ptr,
+    mrope_axis_map_ptr,
     stride_qg_t,
     stride_k_t,
     stride_qo_t,
     stride_ko_t,
     stride_gate_t,
     stride_cos_t,
+    stride_pos_axis,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -56,6 +58,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     FP16: tl.constexpr,
     HAS_PASS: tl.constexpr,
     HAS_GATE: tl.constexpr,
+    MROPE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
@@ -104,8 +107,14 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     xr1 = (xr1 * inv_rms * (wr1 + 1.0)).to(out_dtype).to(tl.float32)
     xr2 = (xr2 * inv_rms * (wr2 + 1.0)).to(out_dtype).to(tl.float32)
 
-    pos = tl.load(positions_ptr + token).to(tl.int64)
-    cache_off = pos * stride_cos_t
+    if MROPE:
+        axis = tl.load(mrope_axis_map_ptr + rot_offs, mask=rot_mask, other=0)
+        pos = tl.load(
+            positions_ptr + axis * stride_pos_axis + token, mask=rot_mask, other=0
+        )
+    else:
+        pos = tl.load(positions_ptr + token)
+    cache_off = pos.to(tl.int64) * stride_cos_t
     cos = tl.load(
         cos_sin_cache_ptr + cache_off + rot_offs, mask=rot_mask, other=0.0
     ).to(tl.float32)
@@ -141,6 +150,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
     has_gate: bool = True,
+    mrope_axis_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -149,8 +159,20 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         k: [T, num_kv_heads * head_dim]
         q_weight, k_weight: [head_dim] — raw GemmaRMSNorm weights (kernel adds +1.0)
         cos_sin_cache: [max_seq_len, rotary_dim] — [cos..., sin...]
-        positions: [T] — token positions
+        positions: [T] token positions, or [3, T] mrope rows (temporal, height, width)
+        mrope_axis_map: [rotary_dim // 2] — the axis owning each rotary lane, from
+            MRotaryEmbedding
     """
+    assert positions.dim() in (1, 2), f"want [T] or [3, T], got {positions.shape}"
+    mrope = positions.dim() == 2
+    assert mrope == (mrope_axis_map is not None), "mrope_axis_map needs [3, T]"
+    if mrope:
+        assert positions.shape[0] == 3 and positions.stride(1) == 1, (
+            f"want [3, T] contiguous over T, got {positions.shape} "
+            f"stride {positions.stride()}"
+        )
+        lanes = rotary_dim // 2
+        assert mrope_axis_map.shape == (lanes,), f"want one axis per lane ({lanes})"
     T = q_gate.shape[0]
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
@@ -178,12 +200,14 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         k_weight,
         cos_sin_cache,
         positions,
+        mrope_axis_map,
         q_gate.stride(0),
         k.stride(0),
         q_out.stride(0),
         k_out.stride(0),
         gate_out.stride(0),
         cos_sin_cache.stride(0),
+        positions.stride(0),
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         HEAD_DIM=head_dim,
@@ -195,6 +219,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         FP16=q_gate.dtype == torch.float16,
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
+        MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
     )
 

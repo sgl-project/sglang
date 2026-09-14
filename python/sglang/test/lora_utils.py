@@ -4,8 +4,35 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.utils import is_xpu
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l
+from sglang.test.test_utils import calculate_rouge_l, is_in_amd_ci
+
+_IS_XPU = is_xpu()
+
+
+def _assert_lora_output_match(
+    srt_str: str, hf_str: str, rouge_tol: float, context: str
+):
+    """Compare SRT vs HF greedy output strings.
+
+    Everywhere except XPU we keep the historical strict exact-match (SGLang and HF
+    kernels agree numerically enough for greedy argmax to pick identical tokens).
+    On XPU, small kernel-level fp differences can make greedy decoding diverge
+    after a shared prefix even when the LoRA math is correct, so we fall back to
+    the same ROUGE-L tolerance the per-adaptor comparison path uses.
+    """
+    srt_str = srt_str.strip(" ")
+    hf_str = hf_str.strip(" ")
+    if not _IS_XPU:
+        assert srt_str == hf_str, (srt_str, hf_str)
+        return
+    rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
+    if rouge_score < rouge_tol:
+        raise AssertionError(
+            f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} for {context}. "
+            f"SRT: {srt_str!r} HF: {hf_str!r}"
+        )
 
 
 @dataclasses.dataclass
@@ -124,6 +151,7 @@ CI_MULTI_LORA_MODELS = [
                 rouge_l_tolerance=0.9,
             ),
         ],
+        rouge_l_tolerance=0.9 if is_in_amd_ci() else 1.0,
         max_loras_per_batch=2,
         max_loaded_loras=4,
     ),
@@ -616,7 +644,6 @@ def run_lora_test_by_batch(
         )
 
     for i in range(len(prompts)):
-
         srt_output_str = srt_outputs.output_strs[i].strip()
         hf_output_str = hf_outputs.output_strs[i].strip()
         rouge_score = calculate_rouge_l([srt_output_str], [hf_output_str])[0]
@@ -625,17 +652,22 @@ def run_lora_test_by_batch(
         print("HF output:", hf_output_str)
         print("SRT no lora output:", srt_no_lora_outputs.output_strs[i].strip())
         print("HF no lora output:", hf_no_lora_outputs.output_strs[i].strip())
-        assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i].strip(
-            " "
-        ), (
-            srt_outputs.output_strs[i].strip(" "),
-            hf_outputs.output_strs[i].strip(" "),
+        rouge_tol = (
+            adaptors[i].rouge_l_tolerance
+            if adaptors[i].rouge_l_tolerance is not None
+            else model_case.rouge_l_tolerance
         )
-        assert srt_no_lora_outputs.output_strs[i].strip(
-            " "
-        ) == hf_no_lora_outputs.output_strs[i].strip(" "), (
-            srt_no_lora_outputs.output_strs[i].strip(" "),
-            hf_no_lora_outputs.output_strs[i].strip(" "),
+        _assert_lora_output_match(
+            srt_outputs.output_strs[i],
+            hf_outputs.output_strs[i],
+            rouge_tol,
+            f"base '{base_path}', adaptor '{adaptor_names[i]}', backend '{backend}' (LoRA)",
+        )
+        _assert_lora_output_match(
+            srt_no_lora_outputs.output_strs[i],
+            hf_no_lora_outputs.output_strs[i],
+            rouge_tol,
+            f"base '{base_path}', backend '{backend}' (no-LoRA baseline)",
         )
 
 
@@ -785,7 +817,7 @@ def run_lora_multiple_batch_on_model_cases(
             with srt_runner, hf_runner:
                 for i, (prompts, lora_paths) in enumerate(batches):
                     print(
-                        f"\n--- Running Batch {i+1} --- prompts: {prompts}, lora_paths: {lora_paths}"
+                        f"\n--- Running Batch {i + 1} --- prompts: {prompts}, lora_paths: {lora_paths}"
                     )
 
                     srt_outputs = srt_runner.batch_forward(
@@ -816,7 +848,7 @@ def run_lora_multiple_batch_on_model_cases(
                                 f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
                             )
 
-                    print(f"--- Batch {i+1} Comparison Passed --- ")
+                    print(f"--- Batch {i + 1} Comparison Passed --- ")
 
 
 def run_lora_batch_splitting_equivalence_test(
@@ -851,9 +883,9 @@ def run_lora_batch_splitting_equivalence_test(
 
     def _run_test(model_case: LoRAModelCase, torch_dtype: torch.dtype):
         lora_adapter_paths = [a.name for a in model_case.adaptors]
-        assert (
-            len(lora_adapter_paths) >= max_loras_per_batch
-        ), f"Need at least {max_loras_per_batch} adapters for this test"
+        assert len(lora_adapter_paths) >= max_loras_per_batch, (
+            f"Need at least {max_loras_per_batch} adapters for this test"
+        )
 
         max_new_tokens = 64
         base_path = model_case.base

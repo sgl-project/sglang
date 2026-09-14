@@ -163,7 +163,7 @@ def main(args):
     pt = 0
     for subject, num_qs in zip(subjects[: args.nsub], num_questions):
         print(
-            f"subject: {subject}, #q:{num_qs}, acc: {np.mean(cors[pt: pt + num_qs]):.3f}"
+            f"subject: {subject}, #q:{num_qs}, acc: {np.mean(cors[pt : pt + num_qs]):.3f}"
         )
         pt += num_qs
     assert pt == len(cors)

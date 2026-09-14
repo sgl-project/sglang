@@ -387,9 +387,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_fp8_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_int4_scale[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_int4_scale[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_fp8_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -432,9 +432,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-        assert (
-            not moe_runner_config.no_combine
-        ), f"no_combine={moe_runner_config.no_combine} is not supported."
+        assert not moe_runner_config.no_combine, (
+            f"no_combine={moe_runner_config.no_combine} is not supported."
+        )
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=layer.w13_weight,

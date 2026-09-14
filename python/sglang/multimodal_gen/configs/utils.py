@@ -1,7 +1,33 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import argparse
+import os
+from dataclasses import fields
+from operator import attrgetter
 from typing import Any
+
+
+def expand_path_fields(obj) -> None:
+    """Expand paths in dataclass configuration without modifying other fields."""
+    for f in fields(obj):
+        value = attrgetter(f.name)(obj)
+        if f.name.endswith("_path") and isinstance(value, str):
+            setattr(obj, f.name, os.path.expanduser(value))
+        elif f.name.endswith("_path") and isinstance(value, list):
+            setattr(
+                obj,
+                f.name,
+                [os.path.expanduser(v) if isinstance(v, str) else v for v in value],
+            )
+        elif f.name.endswith("_paths") and isinstance(value, dict):
+            setattr(
+                obj,
+                f.name,
+                {
+                    k: os.path.expanduser(v) if isinstance(v, str) else v
+                    for k, v in value.items()
+                },
+            )
 
 
 def update_config_from_args(

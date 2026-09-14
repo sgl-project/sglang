@@ -152,9 +152,9 @@ def per_token_group_quant_int8(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     iinfo = torch.iinfo(dtype)
@@ -197,15 +197,15 @@ def sglang_per_token_group_quant_int8(
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
 ):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
     assert dtype == torch.int8
     # per_token_group_quant bakes the int8 constants in ([-128, 127], eps 1e-10).
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    assert eps == 1e-10, (
+        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    )
 
     return per_token_group_quant(x, group_size=group_size, out_dtype=dtype)
 

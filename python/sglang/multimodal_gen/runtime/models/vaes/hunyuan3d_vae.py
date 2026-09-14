@@ -475,7 +475,6 @@ class Transformer(nn.Module):
 
 
 class CrossAttentionDecoder(nn.Module):
-
     def __init__(
         self,
         *,

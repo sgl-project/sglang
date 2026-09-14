@@ -67,14 +67,14 @@ class _SpecialTokensCachePatcher:
         )
 
         def patched_add_special_tokens(self, *args, **kwargs):
-            assert (
-                False
-            ), "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+            assert False, (
+                "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+            )
 
         def patched_add_tokens(self, new_tokens, special_tokens=False):
-            assert (
-                not special_tokens
-            ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            assert not special_tokens, (
+                "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            )
             return tokenizer_cls._original_add_tokens(
                 self, new_tokens, special_tokens=False
             )

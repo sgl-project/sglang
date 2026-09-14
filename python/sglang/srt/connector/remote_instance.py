@@ -14,11 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 class RemoteInstanceConnector(BaseConnector):
-
     def __init__(self, url: str, device: torch.device = "cpu"):
-        assert (
-            device.type == "cuda" or device.type == "npu"
-        ), "RemoteInstanceConnector only supports cuda device."
+        assert device.type == "cuda" or device.type == "npu", (
+            "RemoteInstanceConnector only supports cuda device."
+        )
         super().__init__(url)
         self.url = url
         self.device = device
@@ -31,12 +30,12 @@ class RemoteInstanceConnector(BaseConnector):
         group_rank: int = 1,
         world_size: int = 2,
     ):
-        assert (
-            self.device.type == "cuda" or self.device.type == "npu"
-        ), "RemoteInstanceConnector only supports cuda device."
-        assert (
-            gpu_id != -1 and tp_rank != -1
-        ), "gpu_id and tp_rank must be specified for RemoteInstanceConnector. "
+        assert self.device.type == "cuda" or self.device.type == "npu", (
+            "RemoteInstanceConnector only supports cuda device."
+        )
+        assert gpu_id != -1 and tp_rank != -1, (
+            "gpu_id and tp_rank must be specified for RemoteInstanceConnector. "
+        )
 
         self.device_id = torch.device(self.device.type, gpu_id)
 

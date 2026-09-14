@@ -50,7 +50,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x: x)
+            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
 
 
 class LlamaModel(nn.Module):

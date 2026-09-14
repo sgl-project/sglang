@@ -63,26 +63,47 @@ from sglang.kernels import select_kernel, KernelBackend
 jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
 ```
 
-## `BaseFusedOp` — the per-operator implementation contract
+## `BaseFusedOp` — the unified operator contract
 
-Multi-backend operators (currently the `layernorm` and `activation` groups)
-are implemented as `BaseFusedOp` subclasses: one logical operator with one
-`forward_<backend>` method per backend, all sharing one signature behind a
-single `forward()`:
+`BaseFusedOp` is a standard `torch.nn.Module` (it replaced the former
+`sglang.srt.layers.utils.MultiPlatformOp`) that carries one logical operator
+with interchangeable implementations along **two independent dimensions**:
 
-- `forward_native` — **required**; the pure-`torch` correctness reference
-  every other backend is checked against.
-- `forward_torch_compile` — inherited for free as
-  `torch.compile(forward_native)`.
-- `forward_triton` / `forward_jit` / `forward_aot` /
-  `forward_cute_dsl` / `forward_flashinfer` / `forward_deepgemm` — opt-in
-  overrides. A backend is *available* iff its method is overridden.
+- **Kernel backends (provenance)** — one `forward_<backend>` method per
+  implementation source, all sharing one signature behind a single
+  `forward()`:
+  - `forward_native` — **required**; the pure-`torch` correctness reference
+    every other implementation is checked against.
+  - `forward_torch_compile` — inherited for free as
+    `torch.compile(forward_native)`.
+  - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
+    `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
+    `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
+    method is overridden; it joins **auto-selection** only when also declared
+    in `capabilities` (device support is metadata, not guesswork).
+- **Platforms / devices** — optional composite per-device paths:
+  `forward_cuda`, `forward_hip` (falls back to `forward_cuda`),
+  `forward_npu`, `forward_xpu`, `forward_musa` (no implicit CUDA fallback —
+  MUSA ops opt into the CUDA path with an explicit `forward_musa`),
+  `forward_cpu` (AMX CPUs), plus `forward_<key>` /
+  `register_oot_forward()` for out-of-tree platform plugins. CUDA / HIP are
+  **not** kernel backends.
 
-`forward()` auto-selects the best available backend by the class's `priority`,
-filtered per call through `backend_eligible()` (a
-`CapabilityRequirement`-vs-`PlatformInfo` check, extensible with per-call
-shape/dtype gates), and degrades to the native reference when no optimized
-backend fits. The public `ops.<group>` functions stay thin wrappers over
+Dispatch priority, highest first: explicit `forward(..., backend=...)` →
+global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → OOT platform
+override → declared optimized kernel backends by `priority` (filtered by
+`backend_eligible()`, a `CapabilityRequirement`-vs-`PlatformInfo` check
+extensible with per-call shape/dtype gates) → platform-specific forward →
+`forward_native`. The static part of the decision is resolved once and cached
+on the instance, so the hot path stays a single indirect call.
+
+`BaseFusedOp` also owns the torch.compile mode protocol
+(`enter_torch_compile(num_tokens)` / `leave_torch_compile()`, both
+idempotent): while an outer model is compiled, ops switch to their
+compile-safe native path so device kernels are never traced (TopK and Fused
+MoE override `_torch_compile_forward()` to keep their bs>1 behavior).
+
+The public `ops.<group>` functions stay thin wrappers over
 module-level instances, so the import surface is unchanged; each instance also
 registers all of its backends as `KernelSpec`s so the registry inventory and
 `select_kernel(..., backend=...)` keep working.

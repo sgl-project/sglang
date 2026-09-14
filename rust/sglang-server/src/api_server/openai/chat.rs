@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -33,41 +34,49 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
+    openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::ids::Rid;
+use crate::message::request::GenerateRequest;
+use crate::message::response::{ChunkExtras, ResponseItem};
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
 async fn chat_completions(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => return openai_error(StatusCode::BAD_REQUEST, rejection.body_text()),
+        Err(rejection) => {
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+        }
     };
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
             format!("The model `{}` does not exist", request.model),
+            false,
         );
     }
     if request.messages.is_empty() {
-        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty");
+        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
+            false,
         );
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1");
+        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
@@ -75,6 +84,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "max_completion_tokens must be positive",
+            false,
         );
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
@@ -87,6 +97,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "audio, prediction, web search, and multimodal inputs are not supported",
+            false,
         );
     }
     #[allow(deprecated)]
@@ -94,6 +105,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "deprecated function_call/functions are not supported; use tools and tool_choice",
+            false,
         );
     }
 
@@ -110,6 +122,7 @@ async fn chat_completions(
         return openai_error(
             StatusCode::BAD_REQUEST,
             "tool calls require --tool-call-parser",
+            false,
         );
     }
     // Python gates the split on `request.separate_reasoning` (default true);
@@ -143,7 +156,9 @@ async fn chat_completions(
         &state.server_args,
     ) {
         Ok(sampling) => sampling,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, message, false);
+        }
     };
 
     let stream = request.stream.unwrap_or(false);
@@ -244,6 +259,7 @@ pub(super) async fn prepare_chat_request(
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "this model has no usable chat template",
+            false,
         ));
     };
     // Template stops first, then the request's own — Python
@@ -255,6 +271,7 @@ pub(super) async fn prepare_chat_request(
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
+            false,
         )
     })?;
     Ok((request, prompt))
@@ -271,7 +288,7 @@ pub(super) fn chat_sampling(
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-    server_args: &crate::runtime::ServerArgs,
+    server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
@@ -287,7 +304,7 @@ pub(super) fn chat_sampling(
     sampling
         .normalize(
             server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size.unwrap_or(u64::MAX),
+            server_args.model_config.vocab_size,
         )
         .map_err(|error| error.to_string())?;
     Ok(sampling)
@@ -340,10 +357,7 @@ impl SamplingDefaults {
     };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
-    pub(super) fn with_model_defaults(
-        mut self,
-        model: &crate::runtime::DefaultSamplingParams,
-    ) -> SamplingDefaults {
+    pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
         self.temperature = model.temperature;
         self.top_p = model.top_p;
         self
@@ -409,7 +423,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
+    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -428,7 +442,9 @@ pub(super) async fn unary_chat(
     for (index, rid, rx) in submitted {
         let output = match collect_output(rx, &mut guard, &rid).await {
             Ok(output) => output,
-            Err((status, message)) => return openai_error(status, message),
+            Err((status, message)) => {
+                return openai_error(status, message, false);
+            }
         };
 
         if prompt_tokens == 0 {
@@ -491,7 +507,7 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
+    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -527,7 +543,7 @@ pub(super) fn chat_event_stream(
 
         for (index, rid, rx) in submitted {
             rids.push(rid);
-            streams.push(indexed_egress_stream(index, rx));
+            streams.push(indexed_decode_stream(index, rx));
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id.clone(),
@@ -559,28 +575,28 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(500, "response truncated before completion")),
+                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
                 };
                 continue;
             };
             let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
+                ResponseItem::Frame(output) => output,
+                ResponseItem::Done(output) => {
                     guard.disarm(&rids[index]);
                     output
                 }
-                EgressItem::Error(error) => {
+                ResponseItem::Error(error) => {
                     guard.disarm(&rids[index]);
                     yield Annotated {
                         data: None,
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(streaming_error(error.http_status(), error.to_string())),
+                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
                     };
                     continue;
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
+                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
             };
             if let Some((code, message)) = output
                 .finish_reason
@@ -592,7 +608,7 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(code, message)),
+                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
                 };
                 continue;
             }
@@ -822,6 +838,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
             bytes: Some(token.as_bytes().to_vec()),
             token,
             logprob,
+            token_id: u32::try_from(token_id).ok(),
             top_logprobs,
         });
     }
@@ -839,8 +856,8 @@ mod tests {
         merge_template_stops, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
-    use crate::runtime::DefaultSamplingParams;
+    use crate::message::config::DefaultSamplingParams;
+    use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
@@ -908,7 +925,7 @@ mod tests {
         ));
         assert_eq!(
             formatter.stop_strs(),
-            Some(crate::message::OneOrMany::Many(vec![
+            Some(crate::message::types::OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
@@ -1006,6 +1023,7 @@ mod tests {
         let logprobs = chat_logprobs(Some(&extras));
         let token = &logprobs.content.unwrap()[0];
         assert_eq!(token.token, "x");
+        assert_eq!(token.token_id, Some(7));
         assert_eq!(token.top_logprobs.len(), 2);
         assert_eq!(token.top_logprobs[1].token, "y");
     }

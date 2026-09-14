@@ -85,7 +85,7 @@ def load_tokenizer_with_fallback(primary, fallback, slug):
                 raise
             continue
     raise RuntimeError(
-        f"No accessible tokenizer for slug={slug} " f"(tried: {primary}, {fallback})"
+        f"No accessible tokenizer for slug={slug} (tried: {primary}, {fallback})"
     )
 
 

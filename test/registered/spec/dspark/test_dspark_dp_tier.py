@@ -1,6 +1,11 @@
 import random
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
@@ -8,7 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestLocalVerifyTierNumTokens(CustomTestCase):
@@ -46,6 +51,48 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
         self.assertIsNone(
             dp_global_verify_tier_num_tokens(global_tier_num_tokens=[100, -1, 50, 0])
         )
+
+
+class TestDraftDpSyncMetadata(CustomTestCase):
+    def test_preserves_unscaled_request_counts_for_cuda_graph_admission(self):
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_moe_sync = True
+        proposer._draft_block_spec_info = SimpleNamespace(
+            num_tokens_per_req=6,
+            num_tokens_for_logprob_per_req=1,
+        )
+        proposer.draft_model_runner = SimpleNamespace(device="cpu")
+        proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+
+        forward_batch = SimpleNamespace(input_ids=torch.arange(6))
+        batch = SimpleNamespace(
+            global_num_tokens=[1, 3, 0, 2],
+            global_num_tokens_for_logprob=[1, 3, 0, 2],
+            can_run_decode_cuda_graph=True,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
+
+        self.assertEqual(
+            forward_batch.original_global_num_tokens_cpu,
+            [1, 3, 0, 2],
+        )
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
+        # The LOCAL count reuses the proposer's persistent buffer; the GLOBAL
+        # count is the invariant every DP rank agrees on.
+        self.assertIs(
+            forward_batch.num_token_non_padded, proposer._num_token_non_padded
+        )
+        self.assertEqual(forward_batch.num_token_non_padded.item(), 6)
+        self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
+        self.assertEqual(forward_batch.global_num_token_non_padded.item(), 6)
+        self.assertEqual(forward_batch.global_num_token_non_padded.dtype, torch.int32)
+        self.assertEqual(forward_batch.global_num_token_non_padded_cpu, 6)
+        self.assertTrue(forward_batch.can_run_decode_cuda_graph)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

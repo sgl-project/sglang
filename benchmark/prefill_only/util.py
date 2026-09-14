@@ -383,14 +383,14 @@ async def send_warmup_requests(
                 http_url, data=request_json, headers=headers
             ) as resp:
                 if resp.status == 200:
-                    print(f"Warmup request {i+1}/{num_warmup} completed successfully")
+                    print(f"Warmup request {i + 1}/{num_warmup} completed successfully")
                 else:
                     print(
-                        f"Warmup request {i+1}/{num_warmup} failed with status {resp.status}"
+                        f"Warmup request {i + 1}/{num_warmup} failed with status {resp.status}"
                     )
 
         except Exception as e:
-            print(f"Warmup request {i+1}/{num_warmup} failed with error: {e}")
+            print(f"Warmup request {i + 1}/{num_warmup} failed with error: {e}")
 
     print("HTTP warmup requests completed")
 
@@ -745,7 +745,6 @@ async def run_generic_benchmark(
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300)
     ) as session:
-
         # Send START_PROFILE if profiling is enabled
         if config.profile:
             await send_profile_request("START_PROFILE", http_url, session=session)

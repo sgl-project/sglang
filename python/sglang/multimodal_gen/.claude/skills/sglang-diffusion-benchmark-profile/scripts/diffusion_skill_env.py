@@ -13,6 +13,14 @@ OUTPUT_DIR_NAMES = {
 
 
 def get_repo_root() -> Path:
+    # Prefer the checkout that owns this skill. A benchmark helper may be
+    # loaded directly from a secondary worktree while another SGLang install
+    # is first on sys.path; importing that install would point assets and
+    # outputs at the wrong repository.
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "python" / "sglang" / "__init__.py").is_file():
+            return parent
+
     import sglang
 
     return Path(sglang.__file__).resolve().parents[2]

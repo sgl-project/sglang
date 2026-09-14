@@ -31,7 +31,6 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class PhiMoEConfig(PretrainedConfig):
-
     model_type = "phimoe"
 
     def __init__(
@@ -229,7 +228,6 @@ class PhiMoE(nn.Module):
 
 
 class PhiMoEAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -325,7 +323,6 @@ class PhiMoEAttention(nn.Module):
 
 
 class PhiMoEDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,
@@ -396,7 +393,6 @@ class PhiMoEDecoderLayer(nn.Module):
 
 
 class PhiMoEModel(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,
@@ -449,7 +445,6 @@ class PhiMoEModel(nn.Module):
 
 
 class PhiMoEForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,

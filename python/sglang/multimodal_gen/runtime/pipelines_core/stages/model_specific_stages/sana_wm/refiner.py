@@ -37,7 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 from .base import (
     SanaWMDecodingStage,
@@ -725,6 +725,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             return batch
 
         batch_size = int(batch.latents.shape[0])
+        total_iterations = batch_size * (len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1)
+        batch.record_stage_iterations(total_iterations, total_iterations)
         prompts = self._prompts_for_batch(batch, batch_size)
         fps = float(getattr(batch, "fps", 16) or 16)
 

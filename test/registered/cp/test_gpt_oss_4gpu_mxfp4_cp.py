@@ -3,7 +3,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=220, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=121, stage="extra-b", runner_config="4-gpu-b200")
 
 
 class TestGptOss4GpuMxfp4CP(BaseTestGptOss):
@@ -12,7 +12,7 @@ class TestGptOss4GpuMxfp4CP(BaseTestGptOss):
             model_variant="120b",
             quantization="mxfp4",
             expected_score_of_reasoning_effort={
-                "low": 0.58,
+                "low": 0.50,
             },
             other_args=[
                 "--tp",

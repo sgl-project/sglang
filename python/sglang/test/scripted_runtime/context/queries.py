@@ -117,7 +117,7 @@ def remaining_prompt_tokens(ctx: ScriptedContext, rid: str) -> int:
     req = find_req_by_rid(ctx, rid)
     if req is None:
         return 0
-    return max(0, len(req.origin_input_ids) - req.kv_committed_len)
+    return max(0, len(req.origin_input_ids) - req.kv.kv_committed_len)
 
 
 def chunks_done(ctx: ScriptedContext, rid: str) -> int:

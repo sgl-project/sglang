@@ -120,6 +120,8 @@ class NgramVerifyInput(SpecInput):
     ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            return
+
         if self.new_seq_lens is not None:
             self.new_seq_lens = self.new_seq_lens[new_indices]
         self.accept_tokens = self.accept_tokens.reshape(-1, self.draft_token_num)[
@@ -134,6 +136,8 @@ class NgramVerifyInput(SpecInput):
             self.future_indices = torch.cat(
                 (self.future_indices, spec_info.future_indices), dim=0
             )
+            return
+
         if self.new_seq_lens is not None:
             assert spec_info.new_seq_lens is not None
             self.new_seq_lens = torch.cat(

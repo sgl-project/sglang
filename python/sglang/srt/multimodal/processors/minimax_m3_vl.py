@@ -267,7 +267,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output=base_output,
             mm_tokens=self.mm_tokens,
             video_metadata=video_metadata,

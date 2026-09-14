@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/modeling_kimi_vl.py
-# This file is meant to be used in kimi_vl.py only
+# Shared MoonViT building blocks for kimi_vl.py and kimi_k25.py
 # Copyright 2025 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc. team. All rights reserved.
 #
 # The code is based on llava (llava/modeling_llava.py) and DeepSeek-V3 (DeepSeek-V3/modeling_deepseek.py), but modified for KimiVL.
@@ -103,7 +103,6 @@ def apply_rope(
 
 
 class Learnable2DInterpPosEmb(nn.Module):
-
     def __init__(
         self, height: int, width: int, dim: int, interpolation_mode: str = "bicubic"
     ) -> None:
@@ -159,7 +158,6 @@ class Learnable2DInterpPosEmb(nn.Module):
 
 
 class MoonVisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -169,14 +167,14 @@ class MoonVisionPatchEmbed(nn.Module):
         pos_emb_width: int = 14,
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, (int, Sequence)
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, (int, Sequence)), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -402,7 +400,6 @@ class MLP2(nn.Module):
 
 
 class MoonVitEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -475,7 +472,6 @@ class MoonVitEncoderLayer(nn.Module):
 
 
 class MoonVitEncoder(nn.Module):
-
     def __init__(
         self,
         hidden_dim: int,
@@ -566,8 +562,44 @@ def patch_merger(
     return outputs
 
 
-class MoonVitVLProjector(nn.Module):
+def tpool_patch_merger(
+    x: torch.Tensor,
+    grid_thws: torch.Tensor,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+    *,
+    grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+) -> List[torch.Tensor]:
+    """Group spatial patches and average only across real video frames.
 
+    ``grid_thw_list`` lets a graph-aware tower pass the host grid it already
+    has instead of paying a device sync for ``grid_thws.tolist()``.
+    """
+
+    d_model = x.size(-1)
+    outputs = []
+    pre_sum = 0
+    shapes = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
+    for t, h, w in shapes:
+        t, h, w = int(t), int(h), int(w)
+        seq = x[pre_sum : pre_sum + t * h * w]
+        kernel_height, kernel_width = merge_kernel_size
+        new_height, new_width = h // kernel_height, w // kernel_width
+        reshaped_seq = seq.view(
+            t, new_height, kernel_height, new_width, kernel_width, d_model
+        )
+        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous()
+        reshaped_seq = reshaped_seq.squeeze(0) if t == 1 else reshaped_seq.mean(dim=0)
+        outputs.append(
+            reshaped_seq.view(
+                new_height * new_width, kernel_height * kernel_width, d_model
+            )
+        )
+        pre_sum += t * h * w
+
+    return outputs
+
+
+class MoonVitVLProjector(nn.Module):
     def __init__(
         self,
         in_channels: int,

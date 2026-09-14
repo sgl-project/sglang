@@ -45,10 +45,14 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
         RequestState.DENOISING_RUNNING,
     },
     RequestState.DENOISING_WAITING: {RequestState.DENOISING_RUNNING},
-    RequestState.DENOISING_RUNNING: {RequestState.DENOISING_DONE},
+    RequestState.DENOISING_RUNNING: {
+        RequestState.DENOISING_WAITING,
+        RequestState.DENOISING_DONE,
+    },
     RequestState.DENOISING_DONE: {
         RequestState.DECODER_WAITING,
         RequestState.DECODER_RUNNING,
+        RequestState.DONE,
     },
     RequestState.DECODER_WAITING: {RequestState.DECODER_RUNNING},
     RequestState.DECODER_RUNNING: {RequestState.DONE},

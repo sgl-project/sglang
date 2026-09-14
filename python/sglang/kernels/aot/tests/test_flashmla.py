@@ -198,9 +198,7 @@ def reference_torch_prefill(
 
     kvs = torch.index_select(
         kvs, 0, indices.masked_fill(invalid_indices_mask, 0).flatten()
-    ).view(
-        s_q, topk, 576
-    )  # [s_q, topk, d_qk]
+    ).view(s_q, topk, 576)  # [s_q, topk, d_qk]
     attn_score = qs @ kvs.transpose(1, 2)  # [s_q, h_q, topk]
     attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float("-inf"))
     attn_score *= sm_scale * math.log2(math.e)

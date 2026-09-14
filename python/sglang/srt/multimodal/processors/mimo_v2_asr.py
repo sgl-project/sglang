@@ -250,11 +250,14 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
 
         loop = asyncio.get_running_loop()
         try:
-            input_ids, audio_inputs, position_ids, rope_deltas = (
-                await loop.run_in_executor(
-                    self.io_executor,
-                    lambda: self._process_contents(contents),
-                )
+            (
+                input_ids,
+                audio_inputs,
+                position_ids,
+                rope_deltas,
+            ) = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self._process_contents(contents),
             )
         except RuntimeError as e:
             logger.error(f"MiMo ASR processor failed in process_mm_data_async: {e}")

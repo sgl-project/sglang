@@ -40,7 +40,6 @@ PACKAGE_LIST = [
     "pydantic",
     "python-multipart",
     "pyzmq",
-    "torchao",
     "uvicorn",
     "uvloop",
     "vllm",

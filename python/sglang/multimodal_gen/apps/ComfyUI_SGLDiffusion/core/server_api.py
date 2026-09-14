@@ -99,7 +99,8 @@ class SGLDiffusionServerAPI:
             seed: Random seed for reproducible generation
             enable_teacache: Enable TEA cache acceleration
             response_format: Response format ("b64_json" or "url")
-            quality: Image quality ("auto", "standard", "hd") - only for generation
+            quality: Request optimization tier ("auto", "lossless",
+                "extra-high", "high") - only for generation
             style: Image style ("vivid" or "natural") - only for generation
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
@@ -219,6 +220,7 @@ class SGLDiffusionServerAPI:
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
         output_path: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a video using SGLang Diffusion API and wait for completion.
@@ -238,6 +240,10 @@ class SGLDiffusionServerAPI:
             enable_teacache: Enable TEA cache acceleration
             generator_device: Device for random generator ("cuda" or "cpu")
             input_reference: Path to input reference image for image-to-video
+            extra_fields: Model-specific request fields merged into the payload
+                last, so a caller can reach a model's own request surface
+                (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
+                shifts) without this client growing a parameter per model
 
         Returns:
             Dictionary containing completed video job information with file_path
@@ -281,6 +287,10 @@ class SGLDiffusionServerAPI:
             payload["input_reference"] = input_reference
         if output_path:
             payload["output_path"] = output_path
+        # merged last so a model-specific field wins over a generic default of
+        # the same name (H3 sizes its output from `target`, not `size`)
+        if extra_fields:
+            payload.update(extra_fields)
 
         try:
             # Create video generation job

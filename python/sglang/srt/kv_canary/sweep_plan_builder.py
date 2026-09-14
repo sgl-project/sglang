@@ -35,9 +35,9 @@ def build_verify_plan_radix_sweep(
     prev_slot_indices = walk_result.prev_slot_indices.to(device)
 
     if swa_window_size > 0:
-        assert (
-            full_to_swa_index_mapping is not None
-        ), "full_to_swa_index_mapping is required when SWA is enabled"
+        assert full_to_swa_index_mapping is not None, (
+            "full_to_swa_index_mapping is required when SWA is enabled"
+        )
         slot_indices = _swa_translate(
             indices=slot_indices, lut=full_to_swa_index_mapping
         )

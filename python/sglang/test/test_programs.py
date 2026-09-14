@@ -262,16 +262,16 @@ def test_parallel_decoding():
         # Generate detailed tips
         forks = s.fork(fork_size)
         for i in range(fork_size):
-            forks[
-                i
-            ] += f"Now, I expand tip {i+1} into a detailed paragraph:\nTip {i+1}:"
+            forks[i] += (
+                f"Now, I expand tip {i + 1} into a detailed paragraph:\nTip {i + 1}:"
+            )
             forks[i] += sgl.gen("detailed_tip", max_tokens, stop=["\n\n"])
         forks.join()
 
         # Concatenate tips and summarize
         s += "Here are these tips with detailed explanation:\n"
         for i in range(fork_size):
-            s += f"Tip {i+1}:" + forks[i]["detailed_tip"] + "\n"
+            s += f"Tip {i + 1}:" + forks[i]["detailed_tip"] + "\n"
 
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
 
@@ -294,7 +294,7 @@ def test_parallel_encoding(check_answer=True):
         forks += lambda i: f"Statement {i}: " + contexts[i] + "\n"
         forks.join(mode="concate_and_append")
 
-        s += "Now, please answer the following question. " "Do not list options."
+        s += "Now, please answer the following question. Do not list options."
         s += "\nQuestion: " + question + "\n"
         s += "ASSISTANT:" + sgl.gen("answer", max_tokens=max_tokens)
 
@@ -474,9 +474,9 @@ def test_completion_speculative():
     gen_character_no_spec().sync()
     usage_with_no_spec = token_usage.prompt_tokens
 
-    assert (
-        usage_with_spec < usage_with_no_spec
-    ), f"{usage_with_spec} vs {usage_with_no_spec}"
+    assert usage_with_spec < usage_with_no_spec, (
+        f"{usage_with_spec} vs {usage_with_no_spec}"
+    )
 
 
 def test_chat_completion_speculative():
@@ -612,9 +612,9 @@ def test_gen_min_new_tokens():
 
     def assert_min_tokens(tokenizer, text):
         token_ids = tokenizer.encode(text)
-        assert (
-            len(token_ids) >= MIN_TOKENS
-        ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+        assert len(token_ids) >= MIN_TOKENS, (
+            f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+        )
 
     tokenizer = get_tokenizer(model_path)
 

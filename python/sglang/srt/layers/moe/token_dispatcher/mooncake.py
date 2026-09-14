@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -63,8 +64,6 @@ class EPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("mooncake_ep_state")
@@ -231,7 +230,7 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        active_ranks = self._get_active_ranks()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -271,7 +270,7 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        active_ranks = self._get_active_ranks()
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
@@ -285,6 +284,12 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = False
         self.handle = None
         return combined_hidden_states, event, hook
+
+    def _get_active_ranks(self) -> torch.Tensor:
+        elastic_state = ElasticEPStateManager.instance()
+        if elastic_state is not None:
+            return elastic_state.active_ranks
+        return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
     def _get_buffer(self):
         return EPBuffer.get_ep_buffer(

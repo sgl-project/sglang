@@ -7,7 +7,7 @@ SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
   # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
+  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
@@ -28,7 +28,7 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
@@ -158,15 +158,7 @@ find_latest_image() {
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry.
-  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
-  # `docker manifest inspect --insecure` because that command runs in the
-  # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 10.44.14.109:5000 (every probe either fast-fails with TLS
-  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
-  # The actual local-registry pull still happens in the call site below via
-  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
-  # docker daemon on the host and inherits its insecure-registries config.
+  # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -272,19 +264,9 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
+  # Temporarily bypass the shared local registry while concurrent CI pulls
+  # saturate it. Keep using the authenticated, retried public-registry path.
+  retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
 CACHE_HOST=/home/runner/sglang-data

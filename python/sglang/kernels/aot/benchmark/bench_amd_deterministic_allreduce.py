@@ -245,7 +245,7 @@ def worker(world_size, rank, port, results_queue):
             if input_size_bytes > custom_ar.max_size:
                 if rank == 0:
                     print(
-                        f"  Deterministic kernel skipped: input size ({input_size_bytes/(1024*1024):.1f} MB) > buffer size ({custom_ar.max_size/(1024*1024):.1f} MB)"
+                        f"  Deterministic kernel skipped: input size ({input_size_bytes / (1024 * 1024):.1f} MB) > buffer size ({custom_ar.max_size / (1024 * 1024):.1f} MB)"
                     )
                 deterministic_kernel_available = False
             else:
@@ -412,17 +412,17 @@ def worker(world_size, rank, port, results_queue):
             }
 
             print(
-                f"    All-Reduce:     {lat_ar_median*1000:.3f}ms, Deterministic: {ar_deterministic}, Max variance: {ar_max_variance:.6f}"
+                f"    All-Reduce:     {lat_ar_median * 1000:.3f}ms, Deterministic: {ar_deterministic}, Max variance: {ar_max_variance:.6f}"
             )
             print(
-                f"    RS+All-Gather:   {lat_rs_ag_median*1000:.3f}ms, Deterministic: {rs_ag_deterministic}, Max variance: {rs_ag_max_variance:.6f}"
+                f"    RS+All-Gather:   {lat_rs_ag_median * 1000:.3f}ms, Deterministic: {rs_ag_deterministic}, Max variance: {rs_ag_max_variance:.6f}"
             )
             if custom_ar is not None and lat_custom_ar_median is not None:
                 overhead_custom = (
                     (lat_custom_ar_median - lat_ar_median) / lat_ar_median
                 ) * 100
                 print(
-                    f"    Custom AR:       {lat_custom_ar_median*1000:.3f}ms, Deterministic: {custom_ar_deterministic}, Max variance: {custom_ar_max_variance:.6f}, Overhead: {overhead_custom:+.1f}%"
+                    f"    Custom AR:       {lat_custom_ar_median * 1000:.3f}ms, Deterministic: {custom_ar_deterministic}, Max variance: {custom_ar_max_variance:.6f}, Overhead: {overhead_custom:+.1f}%"
                 )
             if lat_deterministic_kernel_median is not None:
                 overhead_kernel = (
@@ -433,7 +433,7 @@ def worker(world_size, rank, port, results_queue):
                     / lat_rs_ag_median
                 ) * 100
                 print(
-                    f"    Deterministic Kernel: {lat_deterministic_kernel_median*1000:.3f}ms, Deterministic: {deterministic_kernel_deterministic}, Max variance: {deterministic_kernel_max_variance:.6f}, Overhead: {overhead_kernel:+.1f}%, Speedup vs RS+AG: {speedup_kernel_vs_rs_ag:+.1f}%"
+                    f"    Deterministic Kernel: {lat_deterministic_kernel_median * 1000:.3f}ms, Deterministic: {deterministic_kernel_deterministic}, Max variance: {deterministic_kernel_max_variance:.6f}, Overhead: {overhead_kernel:+.1f}%, Speedup vs RS+AG: {speedup_kernel_vs_rs_ag:+.1f}%"
                 )
             if lat_optimized_rs_ag_median is not None:
                 overhead_opt = (
@@ -443,7 +443,7 @@ def worker(world_size, rank, port, results_queue):
                     (lat_rs_ag_median - lat_optimized_rs_ag_median) / lat_rs_ag_median
                 ) * 100
                 print(
-                    f"    Optimized RS+AG: {lat_optimized_rs_ag_median*1000:.3f}ms, Deterministic: {optimized_rs_ag_deterministic}, Max variance: {optimized_rs_ag_max_variance:.6f}, Overhead: {overhead_opt:+.1f}%, Speedup vs RS+AG: {speedup_vs_rs_ag:+.1f}%"
+                    f"    Optimized RS+AG: {lat_optimized_rs_ag_median * 1000:.3f}ms, Deterministic: {optimized_rs_ag_deterministic}, Max variance: {optimized_rs_ag_max_variance:.6f}, Overhead: {overhead_opt:+.1f}%, Speedup vs RS+AG: {speedup_vs_rs_ag:+.1f}%"
                 )
             print(f"    RS+AG Overhead: {overhead_rs_ag:+.1f}%")
 
@@ -515,8 +515,8 @@ def main():
             ar_det_str = "✓" if r["all_reduce"]["deterministic"] else "✗"
             rs_ag_det_str = "✓" if r["rs_ag"]["deterministic"] else "✗"
             line = (
-                f"{bs:<8} {r['all_reduce']['latency_median']*1000:<12.3f} {ar_det_str:<8} "
-                f"{r['rs_ag']['latency_median']*1000:<15.3f} {rs_ag_det_str:<10} "
+                f"{bs:<8} {r['all_reduce']['latency_median'] * 1000:<12.3f} {ar_det_str:<8} "
+                f"{r['rs_ag']['latency_median'] * 1000:<15.3f} {rs_ag_det_str:<10} "
                 f"{r['overhead_rs_ag_pct']:<12.1f}"
             )
             if r.get("custom_ar") is not None:
@@ -526,7 +526,7 @@ def main():
                     (custom_ar["latency_median"] - r["all_reduce"]["latency_median"])
                     / r["all_reduce"]["latency_median"]
                 ) * 100
-                line += f" {custom_ar['latency_median']*1000:<18.3f} {custom_ar_det_str:<15} {custom_ar_overhead:<15.1f}"
+                line += f" {custom_ar['latency_median'] * 1000:<18.3f} {custom_ar_det_str:<15} {custom_ar_overhead:<15.1f}"
             if r.get("deterministic_kernel") is not None:
                 det_kernel = r["deterministic_kernel"]
                 det_kernel_det_str = "✓" if det_kernel["deterministic"] else "✗"
@@ -538,7 +538,7 @@ def main():
                     (r["rs_ag"]["latency_median"] - det_kernel["latency_median"])
                     / r["rs_ag"]["latency_median"]
                 ) * 100
-                line += f" {det_kernel['latency_median']*1000:<18.3f} {det_kernel_det_str:<15} {det_kernel_overhead:<15.1f} {speedup_kernel:<10.1f}"
+                line += f" {det_kernel['latency_median'] * 1000:<18.3f} {det_kernel_det_str:<15} {det_kernel_overhead:<15.1f} {speedup_kernel:<10.1f}"
             if r.get("optimized_rs_ag") is not None:
                 opt_rs_ag = r["optimized_rs_ag"]
                 opt_rs_ag_det_str = "✓" if opt_rs_ag["deterministic"] else "✗"
@@ -550,7 +550,7 @@ def main():
                     (r["rs_ag"]["latency_median"] - opt_rs_ag["latency_median"])
                     / r["rs_ag"]["latency_median"]
                 ) * 100
-                line += f" {opt_rs_ag['latency_median']*1000:<18.3f} {opt_rs_ag_det_str:<15} {opt_rs_ag_overhead:<15.1f} {speedup:<10.1f}"
+                line += f" {opt_rs_ag['latency_median'] * 1000:<18.3f} {opt_rs_ag_det_str:<15} {opt_rs_ag_overhead:<15.1f} {speedup:<10.1f}"
             print(line)
 
         print("=" * 80)

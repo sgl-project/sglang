@@ -39,9 +39,14 @@ from sglang.srt.debug_utils.dumper import (
     get_tensor_info,
     get_truncated_value,
 )
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.distributed.parallel_state import get_default_distributed_backend
+from sglang.srt.utils import get_device, get_device_module, kill_process_tree
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -50,8 +55,9 @@ from sglang.test.test_utils import (
     run_distributed_test,
 )
 
-register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
+register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-xpu-2-gpu", nightly=True)
 
 
 @contextmanager
@@ -389,47 +395,6 @@ class TestTorchSave:
         assert "skip the tensor" in captured.out
 
 
-class TestLog:
-    def test_log_format(self):
-        with _capture_stdout() as captured:
-            _log("hello")
-        out = captured.getvalue()
-        assert "hello" in out, out
-        assert "[Dumper, rank=" in out, out
-        assert ", t=" in out, out
-
-
-class TestCompareTensorsQuick:
-    def test_identical(self):
-        a = torch.tensor([1.0, 2.0, 3.0])
-        s = _compare_tensors_quick(a, a.clone())
-        assert "rel_diff=0" in s, s
-        assert "max_abs=0" in s, s
-
-    def test_diverged(self):
-        a = torch.tensor([1.0, 2.0, 3.0])
-        b = torch.tensor([1.0, 2.0, 4.0])  # last element differs by 1
-        s = _compare_tensors_quick(a, b)
-        assert "max_abs=1" in s, s
-        assert "rel_diff=" in s, s
-
-    def test_shape_mismatch(self):
-        s = _compare_tensors_quick(torch.zeros(3), torch.zeros(4))
-        assert "shape mismatch" in s, s
-
-    def test_dtype_unified(self):
-        s = _compare_tensors_quick(
-            torch.zeros(3, dtype=torch.float32),
-            torch.zeros(3, dtype=torch.float64),
-        )
-        assert "rel_diff=" in s, s
-        assert "max_abs=" in s, s
-
-    def test_empty(self):
-        s = _compare_tensors_quick(torch.zeros(0), torch.zeros(0))
-        assert s == "empty"
-
-
 class TestCollectiveTimeout:
     def test_watchdog_fires_on_timeout(self):
         block_event = threading.Event()
@@ -464,11 +429,15 @@ class TestDumperDistributed:
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
-            run_distributed_test(self._test_basic_func, tmpdir=str(tmp_path))
+            run_distributed_test(
+                self._test_basic_func,
+                tmpdir=str(tmp_path),
+                backend=get_default_distributed_backend(get_device()),
+            )
 
     @staticmethod
     def _test_basic_func(rank, tmpdir):
-        tensor = torch.randn(10, 10, device=f"cuda:{rank}")
+        tensor = torch.randn(10, 10, device=get_device(rank))
 
         dumper.dump("tensor_a", tensor, arg=100)
         dumper.step()
@@ -483,7 +452,7 @@ class TestDumperDistributed:
         dumper.configure(filter=None)
         dumper.step()
 
-        dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
+        dumper.dump_dict("obj", {"a": torch.randn(3, device=get_device(rank)), "b": 42})
         dumper.step()
 
         dist.barrier()
@@ -496,7 +465,10 @@ class TestDumperDistributed:
 
     def test_collective_timeout(self):
         with temp_set_env(DUMPER_ENABLE="1"):
-            run_distributed_test(self._test_collective_timeout_func)
+            run_distributed_test(
+                self._test_collective_timeout_func,
+                backend=get_default_distributed_backend(get_device()),
+            )
 
     @staticmethod
     def _test_collective_timeout_func(rank):
@@ -524,11 +496,15 @@ class TestDumperDistributed:
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
-            run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
+            run_distributed_test(
+                self._test_file_content_func,
+                tmpdir=str(tmp_path),
+                backend=get_default_distributed_backend(get_device()),
+            )
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
-        tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
+        tensor = torch.arange(12, device=get_device(rank)).reshape(3, 4).float()
 
         dumper.dump("content_check", tensor)
         dumper.step()
@@ -550,13 +526,17 @@ class TestDumperFileWriteControl:
             DUMPER_DIR=str(tmp_path),
             DUMPER_FILTER="name.startswith('keep')",
         ):
-            run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
+            run_distributed_test(
+                self._test_filter_func,
+                tmpdir=str(tmp_path),
+                backend=get_default_distributed_backend(get_device()),
+            )
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
-        dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
-        dumper.dump("not_keep_this", torch.randn(5, device=f"cuda:{rank}"))
+        dumper.dump("keep_this", torch.randn(5, device=get_device(rank)))
+        dumper.dump("skip_this", torch.randn(5, device=get_device(rank)))
+        dumper.dump("not_keep_this", torch.randn(5, device=get_device(rank)))
         dumper.step()
 
         dist.barrier()
@@ -572,11 +552,17 @@ class TestDumperFileWriteControl:
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
-            run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
+            run_distributed_test(
+                self._test_save_false_func,
+                tmpdir=str(tmp_path),
+                backend=get_default_distributed_backend(get_device()),
+            )
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
+        dumper.dump(
+            "no_save_tensor", torch.randn(5, device=get_device(rank)), save=False
+        )
         dumper.step()
 
         dist.barrier()
@@ -734,9 +720,9 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
     for p in exist:
         assert any(p in f for f in filenames), f"{p} not found in {filenames}"
     for p in not_exist:
-        assert not any(
-            p in f for f in filenames
-        ), f"{p} should not exist in {filenames}"
+        assert not any(p in f for f in filenames), (
+            f"{p} should not exist in {filenames}"
+        )
 
 
 def _load_dump(path: Path) -> dict:
@@ -750,9 +736,9 @@ def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
         for f in Path(tmpdir).glob("*/*.pt")
         if f"rank={rank}" in f.name and name in f.name
     ]
-    assert (
-        len(matches) == 1
-    ), f"Expected 1 file matching rank={rank} name={name}, got {matches}"
+    assert len(matches) == 1, (
+        f"Expected 1 file matching rank={rank} name={name}, got {matches}"
+    )
     return matches[0]
 
 
@@ -1642,7 +1628,11 @@ class TestZmqPortIsolation:
             thread = threading.Thread(
                 target=run_distributed_test,
                 args=(_dumper_worker,),
-                kwargs={"http_port": port, "stop_event": stop_event},
+                kwargs={
+                    "http_port": port,
+                    "stop_event": stop_event,
+                    "backend": get_default_distributed_backend(get_device()),
+                },
             )
             thread.start()
             threads.append(thread)
@@ -1657,9 +1647,9 @@ class TestZmqPortIsolation:
                 )
                 resp.raise_for_status()
                 states = resp.json()
-                assert (
-                    len(states) == 2
-                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+                assert len(states) == 2, (
+                    f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+                )
         finally:
             for event in stop_events:
                 event.set()
@@ -1679,7 +1669,11 @@ class TestDumperHttp:
             thread = threading.Thread(
                 target=run_distributed_test,
                 args=(_dumper_worker,),
-                kwargs={"http_port": http_port, "stop_event": stop_event},
+                kwargs={
+                    "http_port": http_port,
+                    "stop_event": stop_event,
+                    "backend": get_default_distributed_backend(get_device()),
+                },
             )
             thread.start()
             try:
@@ -1719,9 +1713,9 @@ class TestDumperHttp:
             val = state
             for k in keys:
                 val = val[k]
-            assert (
-                val == expected
-            ), f"rank {rank}: {path}={val!r}, expected {expected!r}"
+            assert val == expected, (
+                f"rank {rank}: {path}={val!r}, expected {expected!r}"
+            )
 
     def test_configure_enable_toggle(self, dumper_http_url: str):
         for enable in [True, False]:
@@ -1915,9 +1909,9 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         )
 
         dumped_output = captured[f"{P}model.mutator.output"]["value"]
-        assert (
-            dumped_output == 999.0
-        ).all(), "post-hook should capture outputs after forward"
+        assert (dumped_output == 999.0).all(), (
+            "post-hook should capture outputs after forward"
+        )
 
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
@@ -2374,9 +2368,9 @@ class TestDumperE2E:
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2
             for rank, state in enumerate(states):
-                assert (
-                    state["config"]["enable"] is True
-                ), f"rank {rank}: enable should be True after configure"
+                assert state["config"]["enable"] is True, (
+                    f"rank {rank}: enable should be True after configure"
+                )
                 assert state["config"]["dir"] == dump_dir
 
             resp = requests.post(
@@ -2403,16 +2397,16 @@ class TestDumperE2E:
                 )
 
             for rank in range(2):
-                assert any(
-                    f"rank={rank}" in f for f in filenames
-                ), f"No dump files for rank {rank}"
+                assert any(f"rank={rank}" in f for f in filenames), (
+                    f"No dump files for rank {rank}"
+                )
 
             sample_file = dump_files[0]
             loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
             assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
-            assert (
-                "value" in loaded and "meta" in loaded
-            ), f"Missing value/meta keys: {loaded.keys()}"
+            assert "value" in loaded and "meta" in loaded, (
+                f"Missing value/meta keys: {loaded.keys()}"
+            )
             assert "name" in loaded["meta"]
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
@@ -2438,22 +2432,22 @@ class TestDumperE2E:
                 "attn_cp_size",
             ]
             for key in expected_keys:
-                assert (
-                    key in par
-                ), f"Missing {key} in sglang_parallel_info, got: {sorted(par)}"
+                assert key in par, (
+                    f"Missing {key} in sglang_parallel_info, got: {sorted(par)}"
+                )
 
             rids_files = [f for f in dump_files if "name=rids" in f.name]
             rids_loaded = torch.load(
                 rids_files[0], map_location="cpu", weights_only=False
             )
             rids_value = rids_loaded["value"]
-            assert isinstance(
-                rids_value, list
-            ), f"rids should be a list, got {type(rids_value)}"
+            assert isinstance(rids_value, list), (
+                f"rids should be a list, got {type(rids_value)}"
+            )
             assert len(rids_value) > 0, "rids should be non-empty"
-            assert all(
-                isinstance(r, str) for r in rids_value
-            ), f"each rid should be a str, got {[type(r) for r in rids_value]}"
+            assert all(isinstance(r, str) for r in rids_value), (
+                f"each rid should be a str, got {[type(r) for r in rids_value]}"
+            )
         finally:
             kill_process_tree(proc.pid)
 
@@ -2912,9 +2906,9 @@ class TestRecomputeStatus:
             model(torch.randn(2, 4))
 
         for key, data in captured.items():
-            assert (
-                "recompute_status" in data["meta"]
-            ), f"missing recompute_status in {key}"
+            assert "recompute_status" in data["meta"], (
+                f"missing recompute_status in {key}"
+            )
             assert data["meta"]["recompute_status"] == "disabled"
 
     def test_detect_recompute_status_default(self) -> None:
@@ -3263,9 +3257,9 @@ def _run_graft_test(worker_func, **kwargs):
 def _graft_worker_entry(rank, role_port, worker_func, result_queue, kwargs):
     import traceback
 
-    torch.cuda.set_device(rank)
+    get_device_module().set_device(rank)
     dist.init_process_group(
-        backend="nccl",
+        backend=get_default_distributed_backend(get_device()),
         init_method=f"tcp://127.0.0.1:{role_port}",
         world_size=1,
         rank=0,
@@ -3353,9 +3347,9 @@ def _graft_split_worker_entry(
             config=_dumper_module.DumperConfig.from_env()
         )
 
-        torch.cuda.set_device(global_rank)
+        get_device_module().set_device(global_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=get_default_distributed_backend(get_device()),
             init_method=f"tcp://127.0.0.1:{role_port}",
             world_size=1,
             rank=0,
@@ -3473,6 +3467,7 @@ def _make_grafter_test_config(
     role = "baseline" if rank == 0 else "target"
     return DumperConfig(
         grafter_enable=True,
+        grafter_backend=get_default_distributed_backend(get_device()),
         grafter_role=role,
         grafter_b2t_filter=b2t_filter,
         grafter_t2b_filter=t2b_filter,
@@ -3505,10 +3500,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=get_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [1.0, 2.0, 3.0], f"got {target.tolist()}"
@@ -3538,10 +3533,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 1:
-                tensor = torch.tensor([4.0, 5.0, 6.0], device="cuda:1")
+                tensor = torch.tensor([4.0, 5.0, 6.0], device=get_device(1))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:0")
+                target = torch.zeros(3, device=get_device(0))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [4.0, 5.0, 6.0], f"got {target.tolist()}"
         finally:
@@ -3553,8 +3548,7 @@ class TestGrafterDistributed:
         # worker prepends tmp_path to sys.path so import_module sees it.
         module_name = "_xform_user_basic"
         (tmp_path / f"{module_name}.py").write_text(
-            "def transform(graft_input):\n"
-            "    return graft_input.received_list[0] * 2\n"
+            "def transform(graft_input):\n    return graft_input.received_list[0] * 2\n"
         )
         graft_port = find_available_port(29610)
         _run_graft_test(
@@ -3580,10 +3574,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=get_device(1))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [2.0, 4.0, 6.0], f"got {target.tolist()}"
         finally:
@@ -3606,7 +3600,7 @@ class TestGrafterDistributed:
             )
         )
         try:
-            target = torch.tensor([7.0, 7.0, 7.0], device=f"cuda:{rank}")
+            target = torch.tensor([7.0, 7.0, 7.0], device=get_device(rank))
             grafter.maybe_intercept(value=target, tags={"name": "other"})
             assert target.tolist() == [7.0, 7.0, 7.0], "tensor must not be modified"
             assert grafter._pg is None, "group must not init for unmatched name"
@@ -3634,11 +3628,11 @@ class TestGrafterDistributed:
         try:
             if rank == 0:
                 # Baseline sends shape=(3,)
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
                 # Target's local target has shape=(4,) — mismatch with sender.
-                target = torch.tensor([7.0, 7.0, 7.0, 7.0], device="cuda:1")
+                target = torch.tensor([7.0, 7.0, 7.0, 7.0], device=get_device(1))
                 # No exception should propagate; tensor must stay unchanged.
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
@@ -3646,7 +3640,9 @@ class TestGrafterDistributed:
                     7.0,
                     7.0,
                     7.0,
-                ], f"target should be unchanged after shape-mismatch graft, got {target.tolist()}"
+                ], (
+                    f"target should be unchanged after shape-mismatch graft, got {target.tolist()}"
+                )
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
@@ -3684,17 +3680,19 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.tensor([9.0, 9.0, 9.0], device="cuda:1")
+                target = torch.tensor([9.0, 9.0, 9.0], device=get_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
                     9.0,
                     9.0,
                     9.0,
-                ], f"target must be unchanged when transform throws, got {target.tolist()}"
+                ], (
+                    f"target must be unchanged when transform throws, got {target.tolist()}"
+                )
                 output = captured.getvalue()
                 assert "transform/copy_ raised RuntimeError" in output, output
                 assert "intentional test error" in output, output
@@ -3738,14 +3736,14 @@ class TestGrafterDistributed:
         try:
             if rank == 0:
                 # Baseline (sender) attaches an extras dict.
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(
                     value=tensor,
                     tags={"name": "x"},
                     extras={"fill_value": 42.0},
                 )
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=get_device(1))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
                     42.0,
@@ -3775,17 +3773,17 @@ class TestGrafterDistributed:
             with _capture_stdout() as captured:
                 if rank == 1:
                     time.sleep(4)
-                tensor = torch.tensor([1.0, 2.0, 3.0], device=f"cuda:{rank}")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(rank))
                 if rank == 0:
                     grafter.maybe_intercept(value=tensor, tags={"name": "x"})
                 else:
-                    target = torch.zeros(3, device=f"cuda:{rank}")
+                    target = torch.zeros(3, device=get_device(rank))
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
             output = captured.getvalue()
             if rank == 0:
-                assert (
-                    "WARNING" in output
-                ), f"expected WARNING in rank 0 output: {output}"
+                assert "WARNING" in output, (
+                    f"expected WARNING in rank 0 output: {output}"
+                )
                 assert "has not completed after 2s" in output, output
         finally:
             if grafter._pg is not None:
@@ -3810,11 +3808,11 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 # Note: extras kwarg omitted entirely → None on the wire.
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=get_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 # Default identity transform copies tensor through; recv log
@@ -3846,18 +3844,18 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                t1 = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
-                t2 = torch.tensor([4.0, 5.0, 6.0], device="cuda:0")
+                t1 = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
+                t2 = torch.tensor([4.0, 5.0, 6.0], device=get_device(0))
                 grafter.maybe_intercept(value=t1, tags={"name": "x"})
                 pg_after_first = grafter._pg
                 assert pg_after_first is not None
                 grafter.maybe_intercept(value=t2, tags={"name": "x"})
-                assert (
-                    grafter._pg is pg_after_first
-                ), "_pg must be cached across calls, not re-initialized"
+                assert grafter._pg is pg_after_first, (
+                    "_pg must be cached across calls, not re-initialized"
+                )
             else:
-                target1 = torch.zeros(3, device="cuda:1")
-                target2 = torch.zeros(3, device="cuda:1")
+                target1 = torch.zeros(3, device=get_device(1))
+                target2 = torch.zeros(3, device=get_device(1))
                 grafter.maybe_intercept(value=target1, tags={"name": "x"})
                 pg_after_first = grafter._pg
                 assert pg_after_first is not None
@@ -3905,10 +3903,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=get_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.tensor([7.0, 7.0, 7.0], device="cuda:1")
+                target = torch.tensor([7.0, 7.0, 7.0], device=get_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 # target must be unchanged; error must be logged with traceback.
@@ -4190,9 +4188,9 @@ def _e2e_transform(graft_input):
     the transform is just identity. Real workflows would compute a
     non-trivial override (scale, reshape, decode, ...) using the extras.
     """
-    assert (
-        graft_input.received_extras_list[0]["my_extra_key"] == "my_extra_value"
-    ), graft_input.received_extras_list
+    assert graft_input.received_extras_list[0]["my_extra_key"] == "my_extra_value", (
+        graft_input.received_extras_list
+    )
     return graft_input.received_list[0]
 
 
@@ -4248,6 +4246,7 @@ class TestGrafterE2eExample:
             DUMPER_GRAFTER_MASTER_PORT=str(graft_port),
             DUMPER_GRAFTER_BASELINE_WORLD_SIZE="1",
             DUMPER_GRAFTER_TARGET_WORLD_SIZE="1",
+            DUMPER_GRAFTER_BACKEND=get_default_distributed_backend(get_device()),
             DUMPER_GRAFTER_B2T_FILTER="name == 'attn_output'",
             DUMPER_GRAFTER_T2B_FILTER="name == 'attn_input'",
             DUMPER_GRAFTER_GROUP_NAME="grafter_e2e",
@@ -4287,7 +4286,7 @@ class TestGrafterE2eExample:
         # min/max/mean/sample fields wildcard out.
         tinfo_f32_4 = (
             r"type=<class 'torch\.Tensor'> shape=torch\.Size\(\[4\]\) "
-            r"dtype=torch\.float32 device=cuda:\d stride=\(1,\) "
+            r"dtype=torch\.float32 device=\w+:\d stride=\(1,\) "
             r"req_grad=False .*"
         )
         diff = r"rel_diff=[-\d.eE+]+ max_abs=[-\d.eE+]+ mean_abs=[-\d.eE+]+"
@@ -4305,7 +4304,7 @@ class TestGrafterE2eExample:
             r"\A"
             f"{prefix}\\[Grafter\\] init group: role=baseline "
             r"baseline_world=1 target_world=1 rank=0 "
-            r"init_method=tcp://127\.0\.0\.1:\d+ backend=nccl "
+            r"init_method=tcp://127\.0\.0\.1:\d+ backend=\w+ "
             r"name=grafter_e2e\n"
             f"{prefix}\\[Grafter\\] recv role=baseline dir=t2b "
             f"tags={attn_input_tags} n_senders=1 "
@@ -4322,7 +4321,7 @@ class TestGrafterE2eExample:
             r"\A"
             f"{prefix}\\[Grafter\\] init group: role=target "
             r"baseline_world=1 target_world=1 rank=1 "
-            r"init_method=tcp://127\.0\.0\.1:\d+ backend=nccl "
+            r"init_method=tcp://127\.0\.0\.1:\d+ backend=\w+ "
             r"name=grafter_e2e\n"
             f"{prefix}\\[Grafter\\] send role=target dir=t2b "
             f"tags={attn_input_tags} extras={extras_lit} "
@@ -4358,7 +4357,7 @@ class TestGrafterE2eExample:
         # `_e2e_transform` runs on the recv side, asserts the dummy extras
         # made it across, then returns target's q so baseline's local
         # placeholder is overwritten via .copy_().
-        q = torch.tensor([99.0, 99.0, 99.0, 99.0], device="cuda:0")
+        q = torch.tensor([99.0, 99.0, 99.0, 99.0], device=get_device(0))
         dumper.dump("attn_input", q)
         assert q.tolist() == [1.0, 2.0, 3.0, 4.0], (
             f"baseline's q should be overwritten by target's via the t->b graft, "
@@ -4382,7 +4381,7 @@ class TestGrafterE2eExample:
 
         # Step 1: graft input. target sends its real q to baseline along
         # with a dummy extras key the recv-side transform will assert on.
-        q = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda:1")
+        q = torch.tensor([1.0, 2.0, 3.0, 4.0], device=get_device(1))
         dumper.dump(
             "attn_input",
             q,

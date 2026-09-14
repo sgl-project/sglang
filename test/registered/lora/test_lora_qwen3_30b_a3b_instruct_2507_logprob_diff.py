@@ -34,7 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=72, stage="extra-b", runner_config="4-gpu-b200")
 
 BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-30B-A3B-Instruct-2507"
@@ -67,7 +67,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRAQwen3_30B_A3B_Instruct_2507_LogprobDiff(CustomTestCase):
-
     def test_lora_qwen3_30b_a3b_instruct_2507_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

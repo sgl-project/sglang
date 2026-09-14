@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,10 +10,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
@@ -32,9 +26,10 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -220,6 +215,36 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
+
+    def test_multi_item_scoring_mixed_batch_with_empty_query(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_mixed_batch_empty_query",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0),
+            extend_lens=(9, 7),
+            mis_delimiter_indices=((0, 3, 8), (4, 6)),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case)
+
+    def test_multi_item_scoring_crosses_chunk_boundaries(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_chunk_boundaries",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(198,),
+            mis_delimiter_indices=((5, 68, 132, 197),),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case, max_context_len=256)
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # shuffled_pages is the default for all tests; this method opts

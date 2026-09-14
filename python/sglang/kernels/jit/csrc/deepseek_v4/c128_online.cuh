@@ -19,6 +19,8 @@
 #include <cfloat>
 #include <cstdint>
 
+namespace sglang {
+
 namespace device::compress {
 
 /// \brief Plan entry for online compress 128 prefill.
@@ -67,8 +69,6 @@ static_assert(alignof(OnlinePrefillPlan) == sizeof(OnlinePrefillPlan));
 static_assert(sizeof(OnlinePrefillPlan) == kOnlinePrefillPlanDim * sizeof(OnlinePrefillPlanTensorDtype));
 
 }  // namespace host::compress
-
-namespace {
 
 using OnlinePlan = device::compress::OnlinePrefillPlan;
 using IndiceT = int32_t;
@@ -594,8 +594,6 @@ struct FlashCompress128OnlineKernel {
   }
 };
 
-}  // namespace
-
 namespace host::compress {
 
 using OnlinePlanResult = tvm::ffi::Tuple<uint32_t, uint32_t>;
@@ -718,9 +716,7 @@ inline OnlinePlanResult plan_online_prefill(
 
 }  // namespace host::compress
 
-namespace {
-
 [[maybe_unused]]
 constexpr auto& plan_compress_online_prefill = host::compress::plan_online_prefill;
 
-}  // namespace
+}  // namespace sglang

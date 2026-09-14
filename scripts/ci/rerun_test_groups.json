@@ -1,0 +1,8 @@
+{
+  "rust-server": [
+    "registered/rust/test_run_rust_tests.py",
+    "registered/core/test_srt_endpoint.py",
+    "registered/vlm/test_rust_native_mm_e2e.py",
+    "registered/vlm/test_rust_native_mm_mmmu.py"
+  ]
+}

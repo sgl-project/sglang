@@ -88,6 +88,7 @@ class FusedMoELoadingMixin(abc.ABC):
         quant_method: UnquantizedFusedMoEMethod,
         moe_runner_config: MoeRunnerConfig,
         moe_tp_rank: int,
+        moe_tp_size: int,
     ) -> None:
         super().__init__()
         helper = FusedMoE.__new__(FusedMoE)
@@ -97,6 +98,7 @@ class FusedMoELoadingMixin(abc.ABC):
         helper.moe_runner_config = moe_runner_config
         helper.use_triton_kernels = False
         helper.moe_tp_rank = moe_tp_rank
+        helper.moe_tp_size = moe_tp_size
         helper.use_presharded_weights = False
         helper.use_flashinfer_trtllm_moe = False
         # Keep this parameterless loading helper out of the module tree so

@@ -158,11 +158,14 @@ class StorageBackendFactory:
         mem_pool_host: Any,
     ) -> HiCacheStorage:
         """Create built-in backend with original initialization logic."""
-        if backend_name == "file":
+        if backend_name in ("file", "sim"):
             return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
+        elif backend_name == "npu_memcache":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
@@ -199,6 +202,10 @@ StorageBackendFactory.register_backend(
 )
 
 StorageBackendFactory.register_backend(
+    "sim", "sglang.srt.mem_cache.storage.sim_storage", "SimHiCacheStorage"
+)
+
+StorageBackendFactory.register_backend(
     "nixl",
     "sglang.srt.mem_cache.storage.nixl.hicache_nixl",
     "HiCacheNixl",
@@ -208,6 +215,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "npu_memcache",
+    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store",
+    "NpuMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(

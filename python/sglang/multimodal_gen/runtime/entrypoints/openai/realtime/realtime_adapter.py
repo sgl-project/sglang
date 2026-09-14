@@ -126,6 +126,7 @@ def build_realtime_sampling_params(
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        quality=getattr(request, "quality", None),
         condition_inputs=chunk_inputs.condition_inputs,
         realtime_chunk_size=chunk_size,
     )

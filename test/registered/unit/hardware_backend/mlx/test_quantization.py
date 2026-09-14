@@ -17,7 +17,7 @@ import importlib.util
 import platform
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-b-e2e-mlx, not stage-a:
@@ -27,7 +27,6 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 # fails with LocalEntryNotFoundError on a runner with no pre-warmed cache. The
 # macOS CI lane (pr-test-mlx.yml) only dispatches stage-b-e2e-mlx via a gated
 # workflow_dispatch, matching the models_e2e correctness tests' convention.
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_mlx_ci(est_time=10, suite="stage-b-e2e-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -119,8 +118,8 @@ class TestMlxQuantization(unittest.TestCase):
         self.assertGreater(
             reduction,
             0.40,
-            f"expected >40% memory reduction with mlx_q4, got {reduction*100:.1f}% "
-            f"(fp16={mem_fp/1024**3:.2f} GB, q4={mem_q4/1024**3:.2f} GB)",
+            f"expected >40% memory reduction with mlx_q4, got {reduction * 100:.1f}% "
+            f"(fp16={mem_fp / 1024**3:.2f} GB, q4={mem_q4 / 1024**3:.2f} GB)",
         )
 
     def test_mlx_q8_creates_quantized_linear_modules(self):

@@ -11,6 +11,54 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// How the SSE pump ended, reported to the `on_complete` hook.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamEnd {
+    /// No upstream stream error and no pump panic.
+    pub transport_ok: bool,
+    /// An SSE error event (`data: {"error"...}`) rode the stream.
+    pub saw_error_event: bool,
+    /// The client dropped the response body before upstream finished.
+    pub client_disconnect: bool,
+}
+
+/// A `data:` line whose payload's first JSON key is `error` — tolerant of
+/// SSE-legal framing variants (no space after `data:`, whitespace after `{`),
+/// so the match is anchored to the spec rather than one serializer's bytes.
+fn is_error_event_line(line: &[u8]) -> bool {
+    line.strip_prefix(b"data:")
+        .map(|p| p.trim_ascii_start())
+        .and_then(|p| p.strip_prefix(b"{"))
+        .map(|p| p.trim_ascii_start())
+        .is_some_and(|p| p.starts_with(b"\"error\""))
+}
+
+/// Line-start bytes that suffice to decide `is_error_event_line`.
+const LINE_PROBE: usize = 32;
+
+/// Finds error events emitted after an SSE response commits a 200.
+/// Line-anchored, so lookalike text inside event payloads cannot match.
+#[derive(Default)]
+struct ErrorEventScanner {
+    line_start: Vec<u8>,
+}
+
+impl ErrorEventScanner {
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        let mut hit = false;
+        for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
+            if i > 0 {
+                hit |= is_error_event_line(&self.line_start);
+                self.line_start.clear();
+            }
+            let room = LINE_PROBE - self.line_start.len();
+            self.line_start
+                .extend_from_slice(&segment[..segment.len().min(room)]);
+        }
+        hit
+    }
+}
+
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// Spawns one tokio task per stream so the handler can return immediately.
@@ -47,14 +95,8 @@ use tokio_stream::wrappers::ReceiverStream;
 /// guard scope).
 ///
 /// # Completion hook
-/// When `on_complete` is `Some`, the closure runs exactly once when the
-/// pump task finishes. The bool argument is `true` on clean stream end
-/// (including a clean client disconnect after at least the headers
-/// landed cleanly), `false` on upstream stream error or pump panic.
-/// `forward_streaming_to` passes a closure that records the worker's
-/// circuit-breaker outcome — without this hook, a worker that returns
-/// 2xx headers and then drops the stream mid-flight would stay credited
-/// as healthy.
+/// When `on_complete` is `Some`, it runs exactly once when the pump task
+/// finishes with the transport, SSE error-event, and client-disconnect state.
 ///
 /// # First-byte hook
 /// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
@@ -65,7 +107,7 @@ use tokio_stream::wrappers::ReceiverStream;
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
-    on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Body
 where
@@ -75,11 +117,14 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let tx_for_panic = tx.clone();
-        // Capture the pump's outcome so we can report it through `on_complete`
-        // AFTER `pump.catch_unwind()` settles. The closure inside owns
-        // `outcome_setter`; the outer scope reads `outcome_holder` once.
-        let outcome_holder = Arc::new(parking_lot::Mutex::new(true));
-        let outcome_setter = Arc::clone(&outcome_holder);
+        let outcome = Arc::new(parking_lot::Mutex::new(StreamEnd {
+            transport_ok: true,
+            saw_error_event: false,
+            client_disconnect: false,
+        }));
+        let outcome_setter = Arc::clone(&outcome);
+        // `None` once an error event is found — the scan is done for good.
+        let mut scanner = Some(ErrorEventScanner::default());
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -95,17 +140,19 @@ where
                     std::io::Error::other(msg)
                 });
                 let is_err_chunk = item.is_err();
-                // Fire the time-to-first-token hook on the first successful
-                // chunk from upstream. `take()` makes it fire at most once;
-                // an error-first stream never produced a token, so it's left
-                // unfired (and dropped on task end).
-                if !is_err_chunk {
-                    if let Some(hook) = on_first_byte.take() {
-                        hook();
+                match &item {
+                    Ok(bytes) => {
+                        // TTFT hook: at most once (`take()`); an error-first
+                        // stream never produced a token, so it stays unfired.
+                        if let Some(hook) = on_first_byte.take() {
+                            hook();
+                        }
+                        if scanner.as_mut().is_some_and(|scanner| scanner.feed(bytes)) {
+                            outcome_setter.lock().saw_error_event = true;
+                            scanner = None;
+                        }
                     }
-                }
-                if is_err_chunk {
-                    *outcome_setter.lock() = false;
+                    Err(_) => outcome_setter.lock().transport_ok = false,
                 }
                 if tx.send(item).await.is_err() {
                     // Receiver dropped. If we were about to ship an upstream
@@ -114,6 +161,7 @@ where
                     // not a router-side fault.
                     if !is_err_chunk {
                         tracing::debug!("SSE client disconnected mid-stream");
+                        outcome_setter.lock().client_disconnect = true;
                     }
                     break;
                 }
@@ -139,8 +187,9 @@ where
                 .await;
         }
         if let Some(hook) = on_complete {
-            let ok = !panicked && *outcome_holder.lock();
-            hook(ok);
+            let mut end = *outcome.lock();
+            end.transport_ok &= !panicked;
+            hook(end);
         }
     });
     Body::from_stream(ReceiverStream::new(rx))
@@ -393,5 +442,141 @@ mod tests {
             final_polls < 1000,
             "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
         );
+    }
+
+    #[test]
+    fn error_event_scanner_detects_engine_error_event() {
+        let mut scanner = ErrorEventScanner::default();
+        assert!(!scanner.feed(b"data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\n\n"));
+        assert!(
+            scanner.feed(b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n")
+        );
+    }
+
+    #[test]
+    fn error_event_scanner_detects_error_split_across_chunks() {
+        let mut scanner = ErrorEventScanner::default();
+        assert!(!scanner.feed(b"data: {\"err"));
+        assert!(scanner.feed(b"or\": {\"code\": 503}}\n\n"));
+    }
+
+    #[test]
+    fn error_event_scanner_ignores_error_text_inside_content() {
+        let mut scanner = ErrorEventScanner::default();
+        assert!(!scanner.feed(
+            b"data: {\"choices\": [{\"delta\": {\"content\": \"data: {\\\"error\\\" is how it looks\"}}]}\n\n",
+        ));
+        assert!(!scanner.feed(b"data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn error_event_scanner_accepts_sse_framing_variants() {
+        for event in [
+            &b"data:{\"error\": {\"code\": 503}}\n\n"[..],
+            b"data: { \"error\": {\"code\": 503}}\n\n",
+            b"data:  {\"error\": \"queue full\"}\n\n",
+        ] {
+            assert!(
+                ErrorEventScanner::default().feed(event),
+                "missed variant: {}",
+                String::from_utf8_lossy(event)
+            );
+        }
+    }
+
+    #[test]
+    fn error_event_scanner_bounds_line_buffer() {
+        let mut scanner = ErrorEventScanner::default();
+        let big = vec![b'x'; 1 << 20];
+        assert!(!scanner.feed(&big));
+        assert_eq!(scanner.line_start.len(), LINE_PROBE);
+    }
+
+    fn body_with_completion(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+    ) -> (Body, tokio::sync::oneshot::Receiver<StreamEnd>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                let _ = tx.send(end);
+            })),
+            None,
+        );
+        (body, rx)
+    }
+
+    async fn stream_end(rx: tokio::sync::oneshot::Receiver<StreamEnd>) -> StreamEnd {
+        rx.await.expect("completion hook dropped")
+    }
+
+    #[tokio::test]
+    async fn completion_reports_error_event() {
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"err")),
+            Ok(Bytes::from_static(b"or\": {\"code\": 503}}\n\n")),
+        ];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await.unwrap();
+        let end = stream_end(completion).await;
+        assert!(end.transport_ok);
+        assert!(end.saw_error_event);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_error_event_then_transport_error() {
+        let chunks = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"error\": {\"code\": 503}}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await;
+        let end = stream_end(completion).await;
+        assert!(!end.transport_ok);
+        assert!(end.saw_error_event);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_upstream_error() {
+        let chunks = vec![Err(std::io::Error::other("upstream failed"))];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await;
+        let end = stream_end(completion).await;
+        assert!(!end.transport_ok);
+        assert!(!end.saw_error_event);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_clean_end() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"data: [DONE]\n\n",
+        ))];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await.unwrap();
+        let end = stream_end(completion).await;
+        assert!(end.transport_ok);
+        assert!(!end.saw_error_event);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_client_disconnect() {
+        let chunks = std::iter::repeat_with(|| {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: x\n\n"))
+        })
+        .take(1000)
+        .collect();
+        let (body, completion) = body_with_completion(chunks);
+        let mut stream = body.into_data_stream();
+        let _ = stream.next().await;
+        drop(stream);
+        let end = stream_end(completion).await;
+        assert!(end.transport_ok);
+        assert!(end.client_disconnect);
     }
 }

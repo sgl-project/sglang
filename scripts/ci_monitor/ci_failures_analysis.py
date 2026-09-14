@@ -27,6 +27,51 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 
+def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Drop pre-cutover AMD names without changing the shared analyzer."""
+
+    filtered = {}
+    for full_name, data in job_data.items():
+        # This caller was renamed by the AMD job-name cutover. Other outer
+        # callers, including AITER's *-rocm720 callers, are still current.
+        name_parts = full_name.split(" / ")
+        if "call-pr-test-amd-extra-rocm720" in name_parts[:-1]:
+            continue
+
+        leaf_name = name_parts[-1]
+        if leaf_name.startswith(("wait-for-stage-a-amd", "wait-for-stage-b-amd")):
+            continue
+        if leaf_name in {
+            "call-gate",
+            "call-pr-test-amd-extra",
+            "check-all-jobs",
+            "check-changes",
+            "pr-gate",
+            "pr-test-amd-extra-finish",
+            "pr-test-amd-finish",
+            "pr-test-amd-rocm720-finish",
+        }:
+            continue
+
+        # Old display-name stems ended in -rocm<digits>. Their version was not
+        # reliable enough to map forward: a -rocm720 PR job could run rocm724.
+        stem = leaf_name.split(" (", 1)[0]
+        _, separator, version = stem.rpartition("-rocm")
+        if separator and version.isdigit():
+            continue
+
+        # An intermediate nightly schema showed only the ROCm flavor. Current
+        # names always include both the flavor and runner inside parentheses.
+        if leaf_name.endswith(")") and " (" in leaf_name:
+            details = leaf_name.rsplit(" (", 1)[1][:-1]
+            if details.startswith("rocm") and details[4:].isdigit():
+                continue
+
+        filtered[full_name] = data
+
+    return filtered
+
+
 class SGLangFailuresAnalyzer:
     """Analyzes consecutive failures in GitHub Actions workflows."""
 
@@ -47,6 +92,7 @@ class SGLangFailuresAnalyzer:
             "check-changes",
             "pr-test-finish",  # Nvidia workflow teardown
             "pr-test-amd-finish",  # AMD workflow teardown
+            "pr-test-amd-rocm720-finish",  # Default AMD ROCm 7.2 teardown
             "call-gate",
             "pr-gate",
             "check-all-jobs",
@@ -663,9 +709,9 @@ class SGLangFailuresAnalyzer:
                     runner_instance_key = f"{runner_labels_str}_{runner_id}"
                     runner_instance_stats[runner_instance_key]["total_jobs"] += 1
                     # Store runner name for reference
-                    runner_instance_stats[runner_instance_key][
-                        "runner_name"
-                    ] = runner_name
+                    runner_instance_stats[runner_instance_key]["runner_name"] = (
+                        runner_name
+                    )
 
                     # Calculate queue time (time from created to started) per instance
                     created_at = job.get("created_at")
@@ -2456,7 +2502,7 @@ def main():
         # These 4 don't have scheduled events, so filter by main branch instead
         pr_test_amd_scheduled_runs = analyzer.get_recent_runs(
             limit=pr_test_scheduled_limit,
-            workflow_filter=["pr-test-amd.yml"],
+            workflow_filter=["pr-test-amd-rocm720.yml"],
             filters={"branch": "main"},
         )
         pr_test_xeon_scheduled_runs = analyzer.get_recent_runs(
@@ -2483,7 +2529,7 @@ def main():
         )
         nightly_amd_scheduled_runs = analyzer.get_recent_runs(
             limit=nightly_scheduled_limit,
-            workflow_filter=["nightly-test-amd.yml"],
+            workflow_filter=["nightly-test-amd-rocm720.yml"],
             filters={"event": "schedule"},
         )
         nightly_intel_scheduled_runs = analyzer.get_recent_runs(
@@ -2505,7 +2551,7 @@ def main():
         )
         pr_test_amd_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
-            workflow_filter=["pr-test-amd.yml"],
+            workflow_filter=["pr-test-amd-rocm720.yml"],
         )
         pr_test_xeon_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
@@ -2527,7 +2573,7 @@ def main():
         )
         nightly_amd_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
-            workflow_filter=["nightly-test-amd.yml"],
+            workflow_filter=["nightly-test-amd-rocm720.yml"],
         )
         nightly_intel_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
@@ -2646,6 +2692,21 @@ def main():
             if nightly_npu_general_runs
             else ({}, {})
         )
+
+        # AMD renamed its display names to carry the actual ROCm flavor. Reset
+        # only AMD history at that boundary so legacy failures cannot remain
+        # "current" under names that no longer exist. Other platforms continue
+        # to use the unmodified shared analyzer results. General AMD reports
+        # intentionally omit old-schema rows from branches that have not moved
+        # to the new names; their ROCm flavor cannot be mapped reliably.
+        pr_test_amd_scheduled_data = _filter_legacy_amd_job_rows(
+            pr_test_amd_scheduled_data
+        )
+        nightly_amd_scheduled_data = _filter_legacy_amd_job_rows(
+            nightly_amd_scheduled_data
+        )
+        pr_test_amd_general_data = _filter_legacy_amd_job_rows(pr_test_amd_general_data)
+        nightly_amd_general_data = _filter_legacy_amd_job_rows(nightly_amd_general_data)
 
         # Analyze runner health and consecutive failures on all runs
         (

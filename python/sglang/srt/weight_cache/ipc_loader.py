@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
+"""IPC Model Loader — loads model weights from a Weight Cache Daemon.
 
-Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Only 1x GPU
-memory needed — engine and daemon share the same physical GPU memory via CUDA IPC.
-Engine depends on daemon staying alive.
+Zero-copy mode: param.data points directly to transport-mapped GPU memory.
+Backends are negotiated per daemon response (torch IPC by default, VMM FD when
+available). Engine depends on daemon staying alive.
 """
 
 import logging
@@ -22,17 +22,20 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
+    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
 )
+from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,7 @@ class IpcModelLoader(BaseModelLoader):
     def __init__(
         self,
         load_config: LoadConfig,
-        socket_path: str,
+        socket_path: Optional[str] = None,
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
@@ -76,6 +79,8 @@ class IpcModelLoader(BaseModelLoader):
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self.preloaded_weights_bytes = 0
+        self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
 
     def load_model(
         self,
@@ -89,6 +94,7 @@ class IpcModelLoader(BaseModelLoader):
         (fallback to disk loading would cause OOM on shared GPUs).
         In client mode, falls back to DefaultModelLoader.
         """
+        self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
@@ -99,7 +105,7 @@ class IpcModelLoader(BaseModelLoader):
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
-        cache_data = self._fetch_from_cache(model_config)
+        cache_data = self._fetch_from_cache(model_config, device_config)
 
         if cache_data is None:
             if self.weight_cache_mode == "daemon":
@@ -118,8 +124,22 @@ class IpcModelLoader(BaseModelLoader):
             return self._fallback_load(model_config, device_config)
 
         entries = cache_data["entries"]
+        # Older daemons omit this field; missing metadata means no correction.
+        preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
+        if preloaded_weights_bytes is None:
+            preloaded_weights_bytes = 0
+        if (
+            isinstance(preloaded_weights_bytes, bool)
+            or not isinstance(preloaded_weights_bytes, int)
+            or preloaded_weights_bytes < 0
+        ):
+            raise RuntimeError(
+                "[IpcModelLoader] Daemon returned invalid weight-memory metadata: "
+                f"{preloaded_weights_bytes=}"
+            )
         logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} IPC handles from daemon "
+            f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+            f"(transport={self._transport_backend.name}) "
             f"in {time.perf_counter() - tic:.2f}s"
         )
 
@@ -135,6 +155,7 @@ class IpcModelLoader(BaseModelLoader):
             entries,
             quant_config,
         )
+        self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -337,7 +358,7 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
-            imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+            imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
             if name in existing_names:
@@ -416,6 +437,9 @@ class IpcModelLoader(BaseModelLoader):
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
+        # Keep transport backend alive for the model lifetime (VMM backend owns
+        # VA mappings that must stay mapped while tensors are in use).
+        model._weight_cache_transport_backend = self._transport_backend
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -424,7 +448,7 @@ class IpcModelLoader(BaseModelLoader):
 
         return model
 
-    def _fetch_from_cache(self, model_config) -> Optional[dict]:
+    def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
 
         Returns the daemon response dict on success, None if the daemon is
@@ -432,6 +456,10 @@ class IpcModelLoader(BaseModelLoader):
         failures so they are never silently swallowed as a disk-load fallback.
         """
         import socket as socket_mod
+
+        if self.socket_path is None:
+            device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
+            self.socket_path = get_socket_path(device_uuid)
 
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An
@@ -473,7 +501,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_parallel
+            from sglang.srt.layers.dp_attention import get_moe_cp_size
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -483,6 +511,9 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
+            moe_dp_size = get_moe_cp_size()
+            moe_dp_rank = ps.moe_dp_rank
+            moe_ep_rank = ps.moe_ep_rank
 
             dp_size = get_parallel().dp_size
 
@@ -501,6 +532,14 @@ class IpcModelLoader(BaseModelLoader):
                 pp_rank=pp_rank,
                 dp_size=dp_size,
                 ep_size=ep_size,
+                moe_dp_size=moe_dp_size,
+                moe_dp_rank=moe_dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                enable_dp_attention=ps.enable_dp_attention,
+                enable_dp_lm_head=ps.enable_dp_lm_head,
+                attn_cp_size=ps.attn_cp_size,
+                moe_dense_tp_size=ps.moe_dense_tp_size,
+                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
@@ -529,6 +568,9 @@ class IpcModelLoader(BaseModelLoader):
                     f"  Daemon config: {daemon_config}"
                 )
 
+            backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
+            self._transport_backend = get_client_transport_backend(backend_name)
+            result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result
 
         except RuntimeError:
