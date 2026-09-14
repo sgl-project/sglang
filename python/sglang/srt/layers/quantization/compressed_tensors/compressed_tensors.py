@@ -192,7 +192,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
 
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+        from sglang.srt.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            VocabParallelEmbedding,
+        )
 
         if isinstance(layer, ParallelLMHead):
             scheme = self.get_lm_head_scheme(layer=layer, layer_name=prefix)
@@ -201,6 +204,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return None
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+
+        # ParallelLMHead subclasses VocabParallelEmbedding and returned above, so
+        # only a real embedding lookup reaches here.
+        if isinstance(layer, VocabParallelEmbedding):
+            weight_quant = self.get_embedding_weight_quant(layer, layer_name=prefix)
+            if weight_quant is None:
+                # The common case: the checkpoint leaves the embedding table
+                # unquantized, and the layer's own UnquantizedEmbeddingMethod
+                # default is the right answer.
+                return None
+            # No scheme here implements the embedding lookup, so returning None
+            # would hand the layer UnquantizedEmbeddingMethod, which registers a
+            # plain `weight` that a pack-quantized checkpoint (weight_packed /
+            # weight_scale / weight_shape) can never fill. Loading then only
+            # warns, and the model serves an embedding table that was never
+            # written -- zero logits, and token id 0 for every position.
+            raise NotImplementedError(
+                f"The checkpoint quantizes the embedding table at '{prefix}' "
+                f"(num_bits={weight_quant.num_bits}, type={weight_quant.type}, "
+                f"strategy={weight_quant.strategy}, "
+                f"group_size={weight_quant.group_size}), which SGLang's "
+                "compressed-tensors support does not implement. Serving it "
+                "would leave the embedding table unloaded and generate only "
+                "token id 0. Use a checkpoint that leaves the embedding "
+                "unquantized, e.g. by adding it to the recipe's `ignore` list."
+            )
 
         from sglang.srt.layers.radix_attention import RadixAttention
 
@@ -1038,6 +1067,30 @@ class CompressedTensorsConfig(QuantizationConfig):
         return self.get_linear_scheme(
             layer=layer, layer_name=layer_name, matched_target=matched_target
         )
+
+    def get_embedding_weight_quant(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[QuantizationArgs]:
+        """The weight quantization a config group declares for this embedding.
+
+        ``None`` when the checkpoint leaves the embedding table alone, which is
+        the ordinary case: llm-compressor recipes target ``Linear`` and quantize
+        the embedding only when asked to. A config group targeting ``Embedding``
+        matches here through ``find_matched_target``'s module-class pass, which
+        substring-matches the target against ``VocabParallelEmbedding``.
+
+        ``find_matched_target`` raises for a module no target names at all, so
+        that is caught: an embedding nothing targets is simply not quantized.
+        """
+        if layer_name is None or not self.target_scheme_map:
+            return None
+        try:
+            scheme_dict = self.get_scheme_dict(layer, layer_name=layer_name)
+        except ValueError:
+            return None
+        if scheme_dict is None:
+            return None
+        return cast(Optional[QuantizationArgs], scheme_dict.get("weights"))
 
     def get_scheme_dict(
         self,
