@@ -675,6 +675,202 @@ def fused_conv_window_scatter_multi(
     )
 
 
+@triton.jit
+def _fused_conv_strip_commit_kernel(
+    conv_ptr,  # [num_layers, cache_size, W-1, D] contiguous
+    strip_ptr,  # [num_layers, strip_size, T, D]
+    tail_indices_raw_ptr,  # [total_requests] slot holding the pre-verify tail
+    dst_indices_raw_ptr,  # [total_requests] slot receiving the new state
+    step_indices_raw_ptr,  # [total_requests], entry >= 0 means valid
+    conv_layer_stride,
+    conv_slot_stride,
+    conv_w_stride,
+    strip_layer_stride,
+    strip_req_stride,
+    strip_t_stride,
+    D,
+    strip_req_size,
+    strip_t_size,
+    conv_slot_size,
+    W_MINUS_1: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Rebuild one request's committed conv window from its strip.
+
+    See fused_conv_strip_commit for what a strip is. With ``tail`` the W-1
+    samples committed before verify (``conv[tail_idx]``) and ``step`` the
+    number of accepted draft steps, the new window is a slice of
+    ``tail ++ strip``:
+
+        new_state[w] = (tail ++ strip)[1 + step + w]      for w in [0, W-2]
+
+    (the same window convention as the dense layout's ``unfold(...)[:, 1:]``).
+
+    In-place safety: the main commit has ``dst == tail``. The w loop runs in
+    ascending order and iteration w reads tail row ``1 + step + w``, which lies
+    above every row written so far (0..w-1), so no read sees a fresh write.
+    Programs cover disjoint (layer, channel block) tiles and requests own
+    distinct slots.
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_d = tl.program_id(2)
+
+    step = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    if step < 0:
+        return
+
+    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    tail_idx = tl.load(tail_indices_raw_ptr + pid_req).to(tl.int64)
+
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < conv_slot_size)
+        & (tail_idx >= 0)
+        & (tail_idx < conv_slot_size)
+        & (pid_req < strip_req_size)
+        & (step < strip_t_size)
+    ):
+        return
+
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_off < D
+
+    conv_layer_base = conv_ptr + pid_layer * conv_layer_stride
+    tail_base = conv_layer_base + tail_idx * conv_slot_stride
+    dst_base = conv_layer_base + dst_idx * conv_slot_stride
+    strip_base = (
+        strip_ptr
+        + pid_layer * strip_layer_stride
+        + pid_req.to(tl.int64) * strip_req_stride
+    )
+
+    for w in tl.static_range(W_MINUS_1):
+        # Position in (tail ++ strip); p ranges [1+step, step+W-1].
+        p = step + 1 + w
+        in_tail = p < W_MINUS_1
+        in_strip = p >= W_MINUS_1
+        # Clamped offsets keep the inactive branch's address in bounds.
+        tail_p = tl.minimum(p, W_MINUS_1 - 1)
+        strip_t = tl.maximum(p - W_MINUS_1, 0)
+        v_tail = tl.load(
+            tail_base + tail_p * conv_w_stride + d_off,
+            mask=d_mask & in_tail,
+            other=0.0,
+        )
+        v_strip = tl.load(
+            strip_base + strip_t * strip_t_stride + d_off,
+            mask=d_mask & in_strip,
+            other=0.0,
+        )
+        val = tl.where(in_tail, v_tail, v_strip)
+        tl.store(dst_base + w * conv_w_stride + d_off, val, mask=d_mask)
+
+
+def fused_conv_strip_commit(
+    conv_states: torch.Tensor,  # [num_layers, cache_size, W-1, D] (contiguous)
+    strip: torch.Tensor,  # [num_layers, strip_size, T, D]
+    tail_indices_raw: torch.Tensor,  # [total_requests]
+    dst_indices_raw: torch.Tensor,  # [total_requests]
+    step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+):
+    """Commit accepted conv states from the strip layout.
+
+    A strip is the verify-time record of one request's T fresh conv inputs,
+    one row per draft token (``strip[layer, req, t]`` is the conv input of
+    draft token t), kept instead of a (W-1)-wide window snapshot per draft
+    token. Consecutive draft tokens share all but one window sample, so the
+    accepted window is rebuilt at commit time from the pre-verify state
+    ``tail = conv_states[:, tail_idx]``:
+
+        conv_states[:, dst] = (tail ++ strip[:, req])[1 + step : step + W]
+
+    Dense-layout counterpart: :func:`fused_conv_window_scatter_with_mask`.
+
+    Ordering: the main commit overwrites the working slot (``dst == tail``),
+    so any call with a different ``dst`` (the mamba track copy) must run
+    before it for the same requests. Requests with ``step < 0`` or an
+    out-of-range dst/tail slot are skipped (CUDA-graph pad rows). The launch
+    shape depends only on the request count, so the call is CUDA-graph safe.
+    """
+    total_requests = step_indices_raw.shape[0]
+    if total_requests == 0:
+        return
+
+    if not (
+        conv_states.is_cuda and strip.is_cuda and conv_states.device == strip.device
+    ):
+        raise ValueError(
+            "fused_conv_strip_commit requires conv_states and strip to be CUDA "
+            f"tensors on the same device ({conv_states.device=}, {strip.device=})."
+        )
+    if conv_states.ndim != 4 or strip.ndim != 4:
+        raise ValueError(
+            f"Unexpected ranks: {conv_states.ndim=} (want 4) {strip.ndim=} (want 4)"
+        )
+    if conv_states.shape[0] != strip.shape[0]:
+        raise ValueError(
+            f"Layer dim mismatch: {conv_states.shape[0]=} vs {strip.shape[0]=}"
+        )
+    if conv_states.shape[3] != strip.shape[3]:
+        raise ValueError(
+            f"Channel dim mismatch: {conv_states.shape[3]=} vs {strip.shape[3]=}"
+        )
+    if conv_states.dtype != strip.dtype:
+        raise ValueError(f"dtype mismatch: {conv_states.dtype=} vs {strip.dtype=}")
+    if not conv_states.is_contiguous():
+        raise ValueError("conv_states in fused_conv_strip_commit must be contiguous")
+    if strip.stride(3) != 1:
+        raise ValueError("strip must be contiguous along the channel axis")
+    for name, idx in (
+        ("tail_indices_raw", tail_indices_raw),
+        ("dst_indices_raw", dst_indices_raw),
+        ("step_indices_raw", step_indices_raw),
+    ):
+        if idx.ndim != 1:
+            raise ValueError(f"{name} must be 1D, got {idx.shape}")
+    if not (
+        tail_indices_raw.shape[0] == total_requests
+        and dst_indices_raw.shape[0] == total_requests
+    ):
+        raise ValueError(
+            f"indices length mismatch: {tail_indices_raw.shape[0]=} "
+            f"{dst_indices_raw.shape[0]=} vs {total_requests=}"
+        )
+
+    num_layers = conv_states.shape[0]
+    conv_slot_size = conv_states.shape[1]
+    w_minus_1 = conv_states.shape[2]
+    D = conv_states.shape[3]
+
+    tail_indices_raw = tail_indices_raw.to(torch.int32).contiguous()
+    dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
+    step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+
+    BLOCK_D = min(triton.next_power_of_2(D), 1024)
+    grid = (total_requests, num_layers, triton.cdiv(D, BLOCK_D))
+
+    _fused_conv_strip_commit_kernel[grid](
+        conv_states,
+        strip,
+        tail_indices_raw,
+        dst_indices_raw,
+        step_indices_raw,
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        strip.stride(0),
+        strip.stride(1),
+        strip.stride(2),
+        D,
+        strip.shape[1],
+        strip.shape[2],
+        conv_slot_size,
+        W_MINUS_1=w_minus_1,
+        BLOCK_D=BLOCK_D,
+    )
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -708,6 +904,31 @@ def scatter_mamba_states_after_mtp_verify(
         return
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
+
+    # 4D intermediate [layers, slots, T, dim] is a strip (fused_conv_strip_commit); 5D is a dense window snapshot
+    strip_pairs = [p for p in pairs if p[1].dim() == 4]
+    if strip_pairs:
+        pairs = [p for p in pairs if p[1].dim() != 4]
+        for conv_states, strip in strip_pairs:
+            # track copy first: the main commit overwrites the slot it reads
+            if mamba_track_indices is not None:
+                n_track = mamba_steps_to_track.shape[0]
+                fused_conv_strip_commit(
+                    conv_states,
+                    strip,
+                    state_indices_tensor[:n_track],
+                    mamba_track_indices[:n_track],
+                    mamba_steps_to_track,
+                )
+            fused_conv_strip_commit(
+                conv_states,
+                strip,
+                state_indices_tensor,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        if not pairs:
+            return
     if _conv_multi_eligible(pairs):
         fused_conv_window_scatter_multi(
             pairs,

@@ -788,6 +788,15 @@ class MambaPool:
                 # overlapping stores) and `fused_conv_window_scatter_with_mask`
                 # consume the view through its strides.
                 #
+                # strip layout (TML sconv): [layers, size + 1, T, dim], see fused_conv_strip_commit
+                conv_intermediate_strip = cache_params.shape.conv_intermediate_strip
+                if conv_intermediate_strip and (
+                    speculative_eagle_topk is not None and speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "conv_intermediate_strip requires a linear draft chain "
+                        f"(topk <= 1), got {speculative_eagle_topk=}"
+                    )
                 # Dedup the sliding-window conv-intermediate only when it is safe:
                 # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
                 # verify (topk > 1) keep the dense layout -- see
@@ -795,13 +804,35 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = (
-                    not cache_params.shape.disable_conv_window_dedup
+                    not conv_intermediate_strip
+                    and not cache_params.shape.disable_conv_window_dedup
                     and conv_window_dedup_enabled(
                         _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                     )
                 )
                 self._intermediate_conv_window_phys = []
-                if dedup_conv_window:
+                if conv_intermediate_strip:
+                    dim_axis = cache_params.shape.conv_slice_axis
+                    self.conv_window_axis = 1 - dim_axis
+                    intermediate_conv_window_cache = []
+                    for conv_shape in conv_state_shape:
+                        assert len(conv_shape) == 2, (
+                            f"strip layout expects 2D conv shapes, got {conv_shape}"
+                        )
+                        intermediate_conv_window_cache.append(
+                            torch.zeros(
+                                size=(
+                                    num_mamba_layers,
+                                    spec_state_size + 1,
+                                    speculative_num_draft_tokens,
+                                    conv_shape[dim_axis],
+                                ),
+                                dtype=conv_dtype,
+                                device="cuda",
+                            )
+                        )
+                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                elif dedup_conv_window:
                     win_len = cache_params.shape.conv_kernel - 1
                     self.conv_window_axis = self._detect_conv_window_axis(
                         conv_state_shape, win_len

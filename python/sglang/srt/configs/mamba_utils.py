@@ -124,6 +124,11 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def spec_intermediate_bytes_per_req(self, ndt: int) -> int:
+        """Bytes MambaPool allocates per request for the speculative intermediates
+        of ``ndt`` draft tokens: one state snapshot per draft token."""
+        return self.mamba_cache_per_req * ndt
+
     def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.
 
@@ -172,6 +177,8 @@ class Mamba2StateShape:
     # Conv tuples read (dim, K-1) — the window axis is last, which the
     # deduplicated conv-intermediate layout requires.
     disable_conv_window_dedup: bool = False
+    # Speculative conv intermediates as strips of the fresh conv inputs; see fused_conv_strip_commit.
+    conv_intermediate_strip: bool = False
 
     intermediate_size: int
     conv_dim: int
@@ -256,6 +263,8 @@ class KimiLinearStateShape:
     # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
     # along the dim axis, so the dedup conv-intermediate layout must stay off.
     disable_conv_window_dedup: bool = True
+    # Speculative conv intermediates as strips of the fresh conv inputs; see fused_conv_strip_commit.
+    conv_intermediate_strip: bool = False
     # Per-slot conv tensors are [K-1, sharded_channels], unlike the usual
     # [sharded_channels, K-1] layout.
     conv_slice_axis: int = 1
