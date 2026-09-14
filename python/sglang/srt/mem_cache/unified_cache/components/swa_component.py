@@ -211,11 +211,11 @@ class SWAComponent(TreeComponent):
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedSWAAllocatorBase,
         )
 
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedSWAAllocatorBase):
             return allocator
         return None
 

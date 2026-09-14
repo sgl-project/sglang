@@ -1422,7 +1422,6 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
-        separate_draft_indices = self.disagg_prefill_bootstrap_queue.kv_manager.uses_separate_draft_kv_indices
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1442,20 +1441,11 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            if separate_draft_indices:
-                draft_page_indices = kv_to_page_indices(raw_kv_indices, page_size)
-                req.disagg_kv_sender.send_with_draft_indices(
-                    page_indices,
-                    draft_page_indices,
-                    send_state_indices,
-                    num_kv_tokens=seg_end - seg_start,
-                )
-            else:
-                req.disagg_kv_sender.send(
-                    page_indices,
-                    send_state_indices,
-                    num_kv_tokens=seg_end - seg_start,
-                )
+            req.disagg_kv_sender.send(
+                page_indices,
+                send_state_indices,
+                num_kv_tokens=seg_end - seg_start,
+            )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
