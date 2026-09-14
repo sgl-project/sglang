@@ -1498,6 +1498,7 @@
                   {
                     "group": "Qwen-Image",
                     "pages": [
+                      "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
                     ]

@@ -6,6 +6,27 @@ This page tracks supported SGLang Diffusion model families and their optimizatio
 
 For model-specific usage recipes, start from the [Diffusion Cookbook](/cookbook/diffusion/intro). Cookbook pages cover the primary models with examples; this page keeps the compact support and compatibility inventory.
 
+## Qwen-Image 2.1 integration status
+
+Qwen-Image 2.1 has a separate native pipeline for text-to-image and optional
+reference-image conditioning. Validation on two B200 GPUs used small random
+checkpoints: CLI generation/editing, multiple outputs, HTTP generation/editing,
+TP, Ulysses, Ring + FA, CFG parallel, encoder folding, layerwise offload, FA/Sage,
+parallel tiled VAE decode, Cache-DiT and breakable CUDA graph replay passed.
+The DiT, Qwen3-VL embeddings and VAE were compared against the reference
+implementation; request-local prefix KV reuse also has CUDA regression tests.
+
+Full-checkpoint image quality, peak memory, latency, LoRA and quantized
+checkpoints remain unverified. Breakable graphs replay only matching warmup
+signatures, including condition-prefix length; other shapes run eagerly.
+Do not infer compatibility from the older Qwen-Image row.
+
+Use an authorized local checkpoint with `--model-id Qwen-Image-2.1`.
+See the [Qwen-Image 2.1 cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1)
+for checkpoint layout and usage. This entry does not assert public weight
+availability. Public nightly cases and image ground truths are deferred until
+an accessible checkpoint and a full-model baseline are available.
+
 ## Supported model inventory
 
 Pass the `Hugging Face Model ID` to `--model-path` for `sglang generate` or `sglang serve`. Python API users can pass the same ID to SGLang Diffusion model-loading helpers.

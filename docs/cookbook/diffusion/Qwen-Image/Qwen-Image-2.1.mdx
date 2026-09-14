@@ -1,0 +1,110 @@
+---
+title: Qwen-Image 2.1
+description: "Run Qwen-Image 2.1 text-to-image and image-conditioned generation with SGLang Diffusion."
+tag: NEW
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "image editing", "block-causal attention", "64-channel latents"]} />
+
+## 1. Quick start
+
+Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prerelease=allow`,
+then install this integration from its source checkout with
+`uv pip install -e "python[diffusion]"`. Use an authorized checkpoint directory in
+place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux;
+full-checkpoint deployment and image-quality validation are pending.
+
+<Deployment config={config} />
+
+## 2. Model capabilities
+
+Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
+through one pipeline. Qwen3-VL encodes the instruction and reference images;
+a single-stream transformer inserts each reference image's latents into its
+corresponding position in that sequence. Block-causal attention keeps each
+image internally bidirectional while respecting the order of text and images.
+
+Choose this pipeline for checkpoints declaring `QwenImage21Pipeline`,
+`QwenImage21Transformer2DModel`, and `AutoencoderKLQwenImage21`. The older
+Qwen-Image and Qwen-Image-Edit checkpoints use different components and latent
+packing. They cannot share this model's VAE or transformer weights. Text and
+condition-image activations use timestep zero, allowing their attention keys
+and values to be reused for the remaining denoising steps.
+
+## 3. Checkpoint layout
+
+The checkpoint directory must contain `model_index.json` and the `processor`,
+`text_encoder`, `transformer`, `vae`, and `scheduler` subdirectories. The
+processor must include the Qwen3-VL tokenizer assets. SGLang loads all three
+neural components natively. A separate tokenizer directory is not required.
+
+Use `--model-id Qwen-Image-2.1` when the checkpoint directory has a different
+name. The model ID is a routing identifier; it does not grant access to model
+weights. Keep checkpoint access credentials in your environment.
+
+## 4. Offline requests
+
+### Text-to-image
+
+```bash Command
+sglang generate \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --prompt "A capybara reading a book by candlelight" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 1 \
+  --seed 0 --save-output
+```
+
+### Image-conditioned editing
+
+```bash Command
+sglang generate \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --image-path /path/to/input.png \
+  --prompt "Move the scene to a snowy mountain at sunrise" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 1 \
+  --seed 0 --save-output
+```
+
+Height and width must be positive multiples of 32. Reference images preserve
+their aspect ratio and are resized to approximately the requested output area;
+the same resized image feeds the VLM and VAE. Image labels are deterministic
+(`Picture 1`, `Picture 2`, and so on). Multiple outputs receive independent
+noise seeds and independent prefix caches.
+
+## 5. Runtime features
+
+The API requires a text prompt; precomputed embeddings alone do not provide
+the image-token positions needed by this pipeline.
+
+The default is 40 Euler flow-matching steps with CFG disabled. To use CFG,
+provide `--negative-prompt` and a `--guidance-scale` greater than one. CFG uses
+the ordinary linear combination without the older Qwen-Image norm correction.
+Positive and negative prompts have separate request-owned prefix caches.
+
+TP uses native parallel projections. Ulysses and Ring shard target-image
+attention while keeping the condition prefix replicated. The target token
+count, `(height / 16) × (width / 16)`, must be divisible by the SP degree. Encoder
+parallelism uses the shared native encoder runtime. VAE tiling and parallel
+tiled decode use the standard VAE runtime; tiled decode can differ from full
+image decode near tile boundaries.
+
+Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
+Graph execution fills each request's prefix caches eagerly, then replays
+matching warmup graphs with those cache tensors as inputs. Warmup and request
+condition-prefix lengths must match, in addition to the output resolution;
+unseen shapes run eagerly. Text buckets alone cannot pad condition KV without
+changing attention semantics. FlashAttention, Sage
+attention and Torch SDPA are wired through the native attention layers;
+causal text runs use exact masked SDPA. Sage and Cache-DiT can change numerical
+results and require application-specific quality checks.
+
+See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
+for validation scope. No full-checkpoint latency or quality claim is made here.
