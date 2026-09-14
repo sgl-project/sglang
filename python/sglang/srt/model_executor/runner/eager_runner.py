@@ -130,8 +130,13 @@ class EagerRunner(BaseRunner):
             ),
             dp_size=sa.dp_size,
         )
-        # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        # NOTE: warmup() is deferred to ModelRunner.init_backends (after the
+        # attention static metadata buffers are allocated). FlashInfer autotune
+        # and PP DeepGEMM warmup both call attn_backend.init_forward_metadata
+        # via _dummy_run, which reads pre-bound cuda_graph_* buffers; running
+        # warmup before init_static_metadata_buffers would AttributeError on
+        # backends (e.g. Triton) that no longer keep a fresh-allocation eager
+        # fallback after the use_bound deprecation.
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Adapter over the eager registry for the autotune dummy forward; fills

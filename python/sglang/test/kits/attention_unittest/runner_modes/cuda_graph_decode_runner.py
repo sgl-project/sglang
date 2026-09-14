@@ -291,6 +291,15 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
         max_bs=capture_batch_size,
         max_num_tokens=batch.input_ids.numel(),
     )
+    # Mirror EAGLEDraftExtendCudaGraphRunner.capture_one_shape: register the
+    # captured bs so the backend's _compute_forward_metadata takes the bound
+    # DRAFT_EXTEND_V2 layout. Without this, MLA draft-extend-v2 cuda-graph
+    # cases fall through to the plain-EXTEND branch which the SimpleNamespace
+    # fb_view doesn't support (no extend_prefix_lens_cpu).
+    if batch.forward_mode.is_draft_extend_v2():
+        captured = getattr(backend, "_draft_extend_v2_captured_bs", None)
+        if captured is not None:
+            captured.add(capture_batch_size)
     backend.init_forward_metadata_out_graph(batch, in_capture=True)
     backend.init_forward_metadata_in_graph(batch)
 

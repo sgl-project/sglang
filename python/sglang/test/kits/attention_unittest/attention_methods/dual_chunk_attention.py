@@ -646,6 +646,18 @@ def build_dual_chunk_attention_fixture(
         backend = ATTENTION_BACKENDS[case.backend](runner)
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
+    # Mirror ModelRunner.init_backends: allocate static metadata buffers up
+    # front (use_bound deprecated — eager writes into the bound buffers).
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+    if (
+        type(backend).init_static_metadata_buffers
+        is not AttentionBackend.init_static_metadata_buffers
+    ):
+        backend.init_static_metadata_buffers(
+            max_bs=case.batch_size,
+            max_num_tokens=case.num_input_tokens,
+        )
 
     actual_module = ProjectedDualChunkAttention(
         hidden_size=hidden_size,

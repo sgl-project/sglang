@@ -324,15 +324,12 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 return
 
-        # Single eager == replay == capture metadata path; `use_bound` selects
-        # the pre-bound cuda-graph FlashAttentionMetadata buffers (capture /
-        # replay / eager-at-captured-bs; in-place fused-kernel fill) vs a fresh
-        # eager FlashAttentionMetadata (torch ops). Eager reaches the same
-        # _compute_forward_metadata via the base init_forward_metadata wrapper
-        # (out_graph(in_capture=False) + in_graph); the capture-only pre-roll
-        # above and fixups below are skipped there.
-        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
-        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
+        # Single eager == replay == capture metadata path; the seam between
+        # pre-bound cuda-graph FlashAttentionMetadata buffers (in-place
+        # fused-kernel fill) and a fresh per-iter FlashAttentionMetadata
+        # (torch ops) is internal to _compute_forward_metadata. Eager reaches
+        # the same body via the base init_forward_metadata wrapper.
+        self._compute_forward_metadata(forward_batch, in_capture=in_capture)
 
         if in_capture:
             if forward_mode.is_decode_or_idle() and spec_info is None:
@@ -360,17 +357,10 @@ class FlashAttentionBackend(AttentionBackend):
                 # sees num_tokens_per_bs (not 1) for all replays of this graph.
                 self.forward_metadata.max_seq_len_q = num_tokens // bs
 
-    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """Eager/replay seam, resolved by backend STATE (no argument).
-
-        Returns True when this ``(bs, forward_mode)`` has a pre-bound cuda-graph
-        metadata buffer for that mode (keyed exactly like the use_bound=True
-        branches of :py:meth:`_compute_forward_metadata`): i.e. at decode-graph
-        replay (the runner always pads to a captured bucket) and harmlessly at
-        an eager forward landing on a captured bs+mode (one forward stream per
-        backend; the bound buffer is refilled by out_graph before the next
-        ``graph.replay()``). Returns False for pure-eager runs (the dicts were
-        never populated) and for plain EXTEND (never captured).
+    def _has_captured_metadata(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Whether ``(bs, forward_mode)`` has a captured cuda-graph metadata
+        buffer for that mode. Internal to ``_compute_forward_metadata``; see
+        that method for the seam semantics.
         """
         if forward_mode.is_decode_or_idle():
             if self.topk > 1:
@@ -385,18 +375,17 @@ class FlashAttentionBackend(AttentionBackend):
         return False
 
     def _compute_forward_metadata(
-        self, forward_batch: ForwardBatch, *, use_bound: bool
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
     ):
         """Single source of truth for FlashAttention forward metadata, shared by
         eager, capture, and replay.
 
-        ``use_bound`` selects the metadata storage: the per-bs pre-bound
-        cuda-graph ``FlashAttentionMetadata`` buffers, filled in place via the
-        fused kernels + ``.copy_()`` (capture / replay / eager-at-captured-bs),
-        vs a fresh ``FlashAttentionMetadata`` built with torch ops (pure eager /
-        plain EXTEND). Plain EXTEND only ever runs with use_bound=False (the
-        decode graph never captures it; the use_bound per-mode branches only
-        cover the modes the runner captures).
+        Internally selects between the per-bs pre-bound cuda-graph
+        ``FlashAttentionMetadata`` (filled in place via the fused kernels +
+        ``.copy_()``) and a fresh ``FlashAttentionMetadata`` built with torch
+        ops (pure eager / plain EXTEND / non-captured bs). Plain EXTEND never
+        has a captured metadata; the captured-bucket per-mode branches only
+        cover the modes the runner captures.
         """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -407,13 +396,17 @@ class FlashAttentionBackend(AttentionBackend):
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         # During capture the runner sets a consistent seq_lens_cpu (see
         # decode_cuda_graph_runner), so reading the forward_batch field here
-        # matches the old in-capture `seq_lens.cpu()`. The use_bound path slices
-        # [:bs]; the eager path reads full tensors.
+        # matches the old in-capture `seq_lens.cpu()`. The captured-bucket path
+        # slices [:bs]; the fresh path reads full tensors.
         seq_lens_cpu = forward_batch.seq_lens_cpu
 
-        if use_bound:
-            # ---- bound cuda-graph buffers: in-place fused-kernel fill -------
-            # (old _apply_cuda_graph_metadata body, verbatim) ----------------
+        # Internalize the captured-bucket seam — every caller goes through
+        # this method; the public API does not expose it.
+        _has_captured = in_capture or self._has_captured_metadata(bs, forward_mode)
+
+        if _has_captured:
+            # ---- captured-bucket cuda-graph buffers: in-place fused-kernel
+            # fill (old _apply_cuda_graph_metadata body, verbatim) -----------
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs]
             req_pool_indices = req_pool_indices[:bs]
@@ -778,8 +771,8 @@ class FlashAttentionBackend(AttentionBackend):
                     f"FA3 cuda-graph metadata only supports the modes the "
                     f"full cuda-graph runner captures (decode / idle / target_verify "
                     f"/ draft_extend / draft_extend_v2). Got {forward_mode=}. "
-                    f"Piecewise / breakable capture must route through the eager "
-                    f"path (use_bound=False) instead."
+                    f"Piecewise / breakable capture must route through the "
+                    f"fresh per-iter path instead."
                 )
 
             if encoder_lens is not None:

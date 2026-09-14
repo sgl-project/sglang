@@ -489,6 +489,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return ret
 
         with forward_context(ForwardContext(attn_backend=attn_backend)):
+            # Register bs BEFORE init_forward_metadata_out_graph so the bound
+            # DRAFT_EXTEND_V2 branch fires during the capture call itself.
+            captured = getattr(attn_backend, "_draft_extend_v2_captured_bs", None)
+            if captured is not None:
+                captured.add(bs)
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)

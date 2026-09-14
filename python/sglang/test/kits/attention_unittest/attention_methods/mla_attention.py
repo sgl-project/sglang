@@ -890,6 +890,20 @@ def build_mla_attention_fixture(
         backend = ATTENTION_BACKENDS[case.backend](runner)
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
+    # Mirror ModelRunner.init_backends: allocate the backend's static metadata
+    # buffers up front for backends that own them (override the ABC's
+    # NotImplementedError default). use_bound was deprecated so the eager
+    # forward path writes into the bound buffers and needs them allocated.
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+    if (
+        type(backend).init_static_metadata_buffers
+        is not AttentionBackend.init_static_metadata_buffers
+    ):
+        backend.init_static_metadata_buffers(
+            max_bs=case.batch_size,
+            max_num_tokens=case.num_input_tokens,
+        )
 
     actual_module = TinyDeepseekMLAAttention(
         hidden_size=hidden_size,

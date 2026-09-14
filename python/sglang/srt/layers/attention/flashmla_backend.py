@@ -112,31 +112,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            bs = forward_batch.batch_size
-            # use_bound selects the pre-bound cuda-graph buffers (capture /
-            # replay / eager-at-captured-bs) vs freshly allocated tensors. In
-            # out_graph use_bound is always True (capture sets in_capture; replay
-            # pads to a captured bs), matching the old always-bound path.
-            use_bound = in_capture or (
-                getattr(self, "cuda_graph_kv_indices", None) is not None
-                and bs <= self.cuda_graph_kv_indices.shape[0]
-            )
-            self._compute_decode_target_verify_metadata(
-                forward_batch, use_bound=use_bound
-            )
+            self._compute_decode_target_verify_metadata(forward_batch)
         else:
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
 
-    def _compute_decode_target_verify_metadata(
-        self, forward_batch: ForwardBatch, *, use_bound: bool
-    ):
+    def _compute_decode_target_verify_metadata(self, forward_batch: ForwardBatch):
         """Single source of truth for FlashMLA decode/target-verify metadata,
-        shared by eager / capture / replay.
-
-        ``use_bound`` selects the pre-bound cuda-graph buffers (capture / replay
-        / eager-at-captured-bs) vs freshly allocated tensors.
+        shared by eager / capture / replay. Writes into the pre-bound
+        ``cuda_graph_*`` buffers (allocated once at
+        ``init_static_metadata_buffers`` for both eager and graph runs).
         """
         forward_mode = forward_batch.forward_mode
         bs = forward_batch.batch_size
@@ -159,42 +145,38 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_seqlen_pad = triton.cdiv(seq_max, PAGE_SIZE)
         q_head_mult = self.num_draft_tokens if forward_mode.is_target_verify() else 1
 
-        if use_bound:
+        # cuda_graph_kv_indices is sized for the cuda-graph max_bs at init;
+        # eager fallback when ``bs > cuda_graph_config.decode.max_bs`` (i.e.
+        # ``can_run_graph`` rejects so the runner dispatches eager) would
+        # launch the Triton fill with grid bs > buffer rows and then
+        # ``cuda_graph_num_splits[: bs + 1].copy_`` would index past the
+        # preallocated buffer. Fall back to a fresh ``(bs, max_seqlen_pad)``
+        # allocation for over-sized eager batches, matching pre-refactor.
+        if bs <= self.cuda_graph_kv_indices.shape[0]:
             block_kv_indices = self.cuda_graph_kv_indices
-            create_flashmla_kv_indices_triton[
-                (
-                    bs,
-                    get_num_kv_index_blocks_flashmla(
-                        block_kv_indices.stride(0), PAGE_SIZE
-                    ),
-                )
-            ](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                block_kv_indices.stride(0),
-            )
+            use_bound_num_splits = True
         else:
             block_kv_indices = torch.full(
                 (bs, max_seqlen_pad),
                 -1,
-                dtype=torch.int32,
-                device=seq_lens.device,
+                dtype=self.cuda_graph_kv_indices.dtype,
+                device=self.cuda_graph_kv_indices.device,
             )
-            create_flashmla_kv_indices_triton[
-                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-            ](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                max_seqlen_pad,
+            use_bound_num_splits = False
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(block_kv_indices.stride(0), PAGE_SIZE),
             )
+        ](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens,
+            None,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            block_kv_indices.stride(0),
+        )
 
         mla_metadata, num_splits = get_mla_metadata(
             seq_lens.to(torch.int32),
@@ -203,40 +185,39 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             is_fp8_kvcache=self.is_fp8_kvcache,
         )
 
-        if use_bound:
-            actual_num_sm_parts = mla_metadata.shape[0]
-            assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
-                f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
-                f"{self.cuda_graph_mla_metadata.shape[0]}"
-            )
-            if (
-                self.cuda_graph_mla_metadata_view is None
-                or actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]
-            ):
-                if self.cuda_graph_mla_metadata_view is not None:
-                    logger.warning(
-                        f"num_sm_parts mismatch in CUDA Graph replay: "
-                        f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
-                        f"replay={actual_num_sm_parts}. "
-                        f"This may indicate batch size changed between capture and replay."
-                    )
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
+        actual_num_sm_parts = mla_metadata.shape[0]
+        assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
+            f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
+            f"{self.cuda_graph_mla_metadata.shape[0]}"
+        )
+        if (
+            self.cuda_graph_mla_metadata_view is None
+            or actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]
+        ):
+            if self.cuda_graph_mla_metadata_view is not None:
+                logger.warning(
+                    f"num_sm_parts mismatch in CUDA Graph replay: "
+                    f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
+                    f"replay={actual_num_sm_parts}. "
+                    f"This may indicate batch size changed between capture and replay."
+                )
+            self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                :actual_num_sm_parts
+            ]
+        if use_bound_num_splits:
             self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata_view,
-                self.cuda_graph_num_splits_view,
-                block_kv_indices[:bs, :max_seqlen_pad],
-            )
+            num_splits_for_metadata = self.cuda_graph_num_splits_view
         else:
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits,
-                block_kv_indices,
-            )
+            # Fresh allocation when bs exceeds the cuda-graph num_splits buffer
+            # (parallel to the block_kv_indices fallback above).
+            num_splits_for_metadata = num_splits
+        self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+        self.forward_metadata = FlashMLADecodeMetadata(
+            self.cuda_graph_mla_metadata_view,
+            num_splits_for_metadata,
+            block_kv_indices[:bs, :max_seqlen_pad],
+        )
 
     def init_static_metadata_buffers(
         self,
