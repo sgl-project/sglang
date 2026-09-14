@@ -147,7 +147,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "grouped_threshold", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -204,12 +204,20 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "grouped_threshold", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "grouped_threshold", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
+
+    /// Number of prefill workers dedicated to short requests (for grouped_threshold policy)
+    #[arg(long, default_value_t = 2, help_heading = "PD Disaggregation")]
+    prefill_short_count: usize,
+
+    /// Character count threshold for short vs long requests (for grouped_threshold policy)
+    #[arg(long, default_value_t = 4096, help_heading = "PD Disaggregation")]
+    prefill_length_threshold: usize,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -783,6 +791,20 @@ impl CliArgs {
                     "min_group" => ManualAssignmentMode::MinGroup,
                     other => panic!("Unknown assignment mode: {}", other),
                 },
+            },
+            "grouped_threshold" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: self.eviction_interval as usize,
+                prefill_short_count: self.prefill_short_count,
+                prefill_length_threshold: self.prefill_length_threshold,
+            },
+            "bucket" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: self.eviction_interval as usize,
+                prefill_short_count: self.prefill_short_count,
+                prefill_length_threshold: self.prefill_length_threshold,
             },
             _ => PolicyConfig::RoundRobin,
         }

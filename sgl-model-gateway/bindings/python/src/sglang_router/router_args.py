@@ -65,6 +65,8 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
+    prefill_short_count: int = 2
+    prefill_length_threshold: int = 4096
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
@@ -324,6 +326,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.bucket_adjust_interval_secs,
             help="Interval in seconds between bucket boundary adjustment operations",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-short-count",
+            type=int,
+            default=RouterArgs.prefill_short_count,
+            help="Number of prefill workers dedicated to short requests (for grouped_threshold policy)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-length-threshold",
+            type=int,
+            default=RouterArgs.prefill_length_threshold,
+            help="Character count threshold for short vs long requests (for grouped_threshold policy)",
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",
