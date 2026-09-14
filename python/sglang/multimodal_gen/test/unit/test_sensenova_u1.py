@@ -556,7 +556,7 @@ def test_sensenova_u1_scheduler_capabilities():
 
 
 def _make_sensenova_u1_scheduler_request(
-    request_id: str, prompt: str, seed: int, **sampling_overrides
+    request_id: str, prompt: str, seed: int | list[int], **sampling_overrides
 ) -> Req:
     sampling = SenseNovaU1SamplingParams(
         prompt=prompt,
@@ -652,6 +652,19 @@ def test_sensenova_u1_scheduler_rejects_heterogeneous_generation_options(
     )
 
     assert not scheduler._can_dynamic_batch(base, candidate)
+
+
+def test_sensenova_u1_scheduler_normalizes_single_output_seed_lists():
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    requests = [
+        _make_sensenova_u1_scheduler_request("request-0", "first", [7]),
+        _make_sensenova_u1_scheduler_request("request-1", "second", 19),
+    ]
+
+    merged = scheduler._try_merge_generation_reqs(requests)
+
+    assert merged.extra["dynamic_batch_seeds"] == [7, 19]
 
 
 def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
