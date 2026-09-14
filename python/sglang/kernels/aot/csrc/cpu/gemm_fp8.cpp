@@ -406,7 +406,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, B
 
     const __m512 vscale = _mm512_set1_ps(scale);
 
-    auto loadc = [&](auto i) { 
+    auto loadc = [&](auto i) {
       constexpr int col = i % COLS;
       if constexpr (has_bias) {
         vc[i] = _mm512_loadu_ps(bias + col * 16);
@@ -427,7 +427,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, B
 
       if constexpr (col == 0) {
         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
-        if constexpr (PREFETCH_SIZE_K > 0){
+        if constexpr (PREFETCH_SIZE_K > 0) {
           _mm_prefetch(a_ptr + row * lda2 + k + PREFETCH_SIZE_K, _MM_HINT_T0);
         }
       }
@@ -703,19 +703,19 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
       bool do_unpack = true) {
     constexpr int BLOCK_N = block_size_n();
 
-     // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
+    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
     const int ldb_tmp = block_size_n();
 
     // accumulate across K per BLOCK_K
     for (int k = 0; k < K; k += BLOCK_K) {
       int kb_size = std::min(BLOCK_K, K - k);
       unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp);
-    
+
       const bool add_C = (k != 0);
       at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
     }
-     
-    // copy from Ctmp to C and apply scale
+
+    // copy from Ctmp to C and mul scale
     for (int m = 0; m < M; ++m) {
       if constexpr (has_bias) {
         copy_mul_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N, scale);
@@ -1244,6 +1244,7 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       bool do_unpack)
 
 INSTANTIATE_TINYGEMM_TEMPLATE_PER_TENSOR(at::BFloat16);
+INSTANTIATE_TINYGEMM_TEMPLATE_PER_TENSOR(at::Half);
 
 inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
   if (bias.has_value()) {
