@@ -879,6 +879,30 @@ class ExecOffload(msgspec.Struct):
         ),
     ] = None
 
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
+        ),
+    ] = None
+
 
 class ExecDllm(msgspec.Struct):
     """Namespace ``exec.dllm``."""
