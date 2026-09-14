@@ -1,9 +1,12 @@
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 from sglang.srt.utils.auth import AuthLevel, _iter_effective_routes
@@ -58,7 +61,61 @@ def test_normal_routes_remain_open_when_no_key_is_configured():
     client = TestClient(create_app(_server_args()))
 
     assert client.get("/openapi.json").status_code == 200
-    assert client.post("/v1/set_lora").status_code == 403
+    assert client.post("/v1/set_lora").status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/set_lora", {"lora_nickname": "default"}),
+        ("/v1/merge_lora_weights", {}),
+        ("/v1/unmerge_lora_weights", {}),
+        ("/update_weights_from_disk", {"model_path": "/fake"}),
+        ("/update_weights_from_tensor", {"serialized_named_tensors": ["fake"]}),
+        ("/release_memory_occupation", {}),
+        ("/resume_memory_occupation", {}),
+    ],
+)
+@pytest.mark.parametrize(
+    "api_key,admin_api_key,token,status",
+    [
+        (None, None, None, 200),
+        ("user-secret", None, None, 401),
+        ("user-secret", None, "user-secret", 200),
+        (None, "admin-secret", None, 401),
+        (None, "admin-secret", "admin-secret", 200),
+        ("user-secret", "admin-secret", "user-secret", 401),
+        ("user-secret", "admin-secret", "admin-secret", 200),
+    ],
+)
+def test_management_routes_follow_srt_auth_policy(
+    monkeypatch, path, payload, api_key, admin_api_key, token, status
+):
+    forward = AsyncMock(
+        return_value=SimpleNamespace(error=None, output={"success": True})
+    )
+    monkeypatch.setattr(async_scheduler_client, "forward", forward)
+    client = TestClient(create_app(_server_args(api_key, admin_api_key)))
+
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    assert client.post(path, json=payload, headers=headers).status_code == status
+    if status == 200:
+        forward.assert_awaited_once()
+    else:
+        forward.assert_not_awaited()
+
+
+def test_admin_key_only_protects_management_and_keeps_normal_routes_open():
+    client = TestClient(create_app(_server_args(admin_api_key="admin-secret")))
+
+    assert client.get("/openapi.json").status_code == 200
+    assert client.post("/v1/set_lora").status_code == 401
+    assert (
+        client.post(
+            "/v1/set_lora", headers={"Authorization": "Bearer admin-secret"}
+        ).status_code
+        == 422
+    )
 
 
 def test_api_key_protects_normal_routes_and_keeps_probes_public():
@@ -79,6 +136,12 @@ def test_api_key_protects_normal_routes_and_keeps_probes_public():
     )
     assert client.get("/liveness").status_code == 200
     assert client.get("/liveness-admin").status_code == 401
+    assert (
+        client.post(
+            "/v1/set_lora", headers={"Authorization": "Bearer user-secret"}
+        ).status_code
+        == 422
+    )
 
 
 def test_cors_preflight_does_not_require_authentication():
@@ -120,10 +183,6 @@ def test_sensitive_management_routes_require_admin_auth():
         "/update_weights_from_tensor",
         "/release_memory_occupation",
         "/resume_memory_occupation",
-    ):
-        assert _route_auth_level(app, path) == AuthLevel.ADMIN_FORCE
-
-    for path in (
         "/update_weights_from_tensor_checker",
         "/get_weights_checksum",
     ):

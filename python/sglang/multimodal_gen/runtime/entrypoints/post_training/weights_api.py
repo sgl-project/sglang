@@ -18,7 +18,7 @@ router = APIRouter()
 
 
 @router.post("/update_weights_from_disk")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(request: Request):
     """Update model weights from disk inplace without restarting the server."""
     body = await request.json()
@@ -60,7 +60,7 @@ async def update_weights_from_disk(request: Request):
 
 
 @router.post("/update_weights_from_tensor")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(request: Request):
     """Update model weights from serialized tensor payloads."""
     body = await request.json()
@@ -161,7 +161,7 @@ async def get_weights_checksum(request: Request):
 
 
 @router.post("/release_memory_occupation")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation():
     """Release GPU memory occupation (sleep the engine)."""
     try:
@@ -186,7 +186,7 @@ async def release_memory_occupation():
 
 
 @router.post("/resume_memory_occupation")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation():
     """Resume GPU memory occupation (wake the engine)."""
     try:

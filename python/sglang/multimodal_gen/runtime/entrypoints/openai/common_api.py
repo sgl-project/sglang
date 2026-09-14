@@ -84,7 +84,7 @@ async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
 
 
 @router.post("/set_lora")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def set_lora(
     lora_nickname: Union[str, List[str]] = Body(..., embed=True),
     lora_path: Optional[Union[str, List[Optional[str]]]] = Body(None, embed=True),
@@ -133,7 +133,7 @@ async def set_lora(
 
 
 @router.post("/merge_lora_weights")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def merge_lora_weights(
     target: str = Body("all", embed=True),
     strength: float = Body(1.0, embed=True),
@@ -156,7 +156,7 @@ async def merge_lora_weights(
 
 
 @router.post("/unmerge_lora_weights")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unmerge_lora_weights(
     target: str = Body("all", embed=True),
 ):
