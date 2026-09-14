@@ -819,7 +819,8 @@ def cap_correct_len(
     verify_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ell_r = (verify_lens.to(device=correct_len.device) - 1).to(correct_len.dtype)
-    capped = torch.minimum(correct_len, ell_r)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = torch.clamp(torch.minimum(correct_len, ell_r), min=0)
     cap_trim_lens = correct_len - capped
     return capped, cap_trim_lens
 
@@ -839,7 +840,8 @@ def _cap_correct_len_kernel(
     cl = tl.load(correct_len_ptr + offs, mask=mask, other=0).to(tl.int64)
     vl = tl.load(verify_lens_ptr + offs, mask=mask, other=0).to(tl.int64)
     ell = vl - 1
-    capped = tl.minimum(cl, ell)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = tl.maximum(tl.minimum(cl, ell), 0)
     trim = cl - capped
     tl.store(capped_ptr + offs, capped, mask=mask)
     tl.store(trim_ptr + offs, trim, mask=mask)
