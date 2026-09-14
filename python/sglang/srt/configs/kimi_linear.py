@@ -59,6 +59,12 @@ class KimiLinearConfig(PretrainedConfig):
         activation_situ_linear_beta: float | None = None,
         mla_use_output_gate: bool = False,
         max_position_embeddings: int = 4096,
+        index_topk: int | None = None,
+        index_n_heads: int | None = None,
+        index_head_dim: int | None = None,
+        index_topk_freq: int | None = None,
+        index_skip_topk_offset: int | None = None,
+        indexer_rope_interleave: bool = False,
         **kwargs,
     ):
         self.model_type = model_type
@@ -113,6 +119,13 @@ class KimiLinearConfig(PretrainedConfig):
         self.activation_situ_linear_beta = activation_situ_linear_beta
         self.mla_use_output_gate = mla_use_output_gate
         self.max_position_embeddings = max_position_embeddings
+
+        self.index_topk = index_topk
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = index_head_dim
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = index_skip_topk_offset
+        self.indexer_rope_interleave = indexer_rope_interleave
 
         if linear_attn_config is not None:
             assert linear_attn_config["kda_layers"] is not None

@@ -192,6 +192,33 @@ def is_npu() -> bool:
     return True
 
 
+def normalize_npu_device_name(device_name: object) -> str:
+    """Normalize an Ascend product name for capability checks."""
+    return "".join(
+        character for character in str(device_name).casefold() if character.isalnum()
+    )
+
+
+def is_npu_atlas_a5_device_name(device_name: object) -> bool:
+    """Return whether a normalized product name identifies an Atlas A5 NPU."""
+    normalized_name = normalize_npu_device_name(device_name)
+    return normalized_name.startswith(("ascend950", "atlasa5"))
+
+
+def is_npu_atlas_a5(device_id: int = 0) -> bool:
+    """Detect Atlas A5 without caching a probe made before torch_npu loads."""
+    npu_module = vars(torch).get("npu")
+    if npu_module is None or not npu_module.is_available():
+        return False
+
+    get_device_name = vars(npu_module).get("get_device_name")
+    if get_device_name is None:
+        import torch_npu
+
+        get_device_name = torch_npu.npu.get_device_name
+    return is_npu_atlas_a5_device_name(get_device_name(device_id))
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()

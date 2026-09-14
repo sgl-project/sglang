@@ -106,6 +106,12 @@ class KimiK3Config(PretrainedConfig):
         if self.vision_config.text_hidden_size != self.text_config.hidden_size:
             self.vision_config.text_hidden_size = self.text_config.hidden_size
 
+        # Ensure the text config carries an architecture name so that
+        # is_deepseek_dsa(text_config) can match when DSA attributes
+        # (index_topk, etc.) are present in the checkpoint.
+        if getattr(self.text_config, "architectures", None) is None:
+            self.text_config.architectures = ["KimiK3LinearForCausalLM"]
+
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder

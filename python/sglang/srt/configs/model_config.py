@@ -119,23 +119,55 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def _hf_text_config(config):
+    """Return the text_config sub-config for multimodal models, else None."""
+    if isinstance(config, dict):
+        return config.get("text_config")
+    return getattr(config, "text_config", None)
+
+
 def is_deepseek_dsa(config) -> bool:
+    if _hf_arch(config) not in (
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+        "LongcatFlashForCausalLM",
+        "LongcatFlashForCausalLMNextN",
+        "Dots3NoteForCausalLM",
+        "Dots3NoteForCausalLMNextN",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+        "KimiLinearForCausalLM",
+    ):
+        return False
+    # For multimodal models (e.g. KimiK3), DSA params live in text_config.
+    if _hf_attr(config, "index_topk") is not None:
+        return True
+    text_cfg = _hf_text_config(config)
+    return text_cfg is not None and _hf_attr(text_cfg, "index_topk") is not None
+
+
+def can_use_npu_quant_lightning_indexer(
+    server_args,
+    config: PretrainedConfig,
+    kv_cache_dtype: torch.dtype,
+    device_id: int = 0,
+) -> bool:
+    from sglang.srt.utils.common import is_npu_atlas_a5
+
+    if not is_deepseek_dsa(config):
+        return False
+    index_head_dim = _hf_attr(config, "index_head_dim")
+    if index_head_dim is None:
+        index_head_dim = _hf_attr(_hf_text_config(config), "index_head_dim")
     return (
-        _hf_arch(config)
-        in (
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "DeepseekV3ForCausalLMNextN",
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-            "GlmMoeDsaForCausalLM",
-            "GlmMoeDsaForCausalLMNextN",
-            "LongcatFlashForCausalLM",
-            "LongcatFlashForCausalLMNextN",
-            "Dots3NoteForCausalLM",
-            "Dots3NoteForCausalLMNextN",
-        )
-        and _hf_attr(config, "index_topk") is not None
+        index_head_dim == 128
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and is_npu_atlas_a5(device_id)
     )
 
 
@@ -143,6 +175,7 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+        "KimiLinearForCausalLM",
     )
 
 
@@ -169,7 +202,10 @@ def is_deepseek_v4(config) -> bool:
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
-    return config.index_head_dim
+    val = _hf_attr(config, "index_head_dim")
+    if val is None:
+        val = _hf_attr(_hf_text_config(config), "index_head_dim")
+    return val
 
 
 def is_minimax_sparse(config: PretrainedConfig) -> bool:
@@ -219,30 +255,42 @@ def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
 
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
-    return config.index_topk
+    val = _hf_attr(config, "index_topk")
+    if val is None:
+        val = _hf_attr(_hf_text_config(config), "index_topk")
+    return val
 
 
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    # DSA params may live in text_config for multimodal models.
+    text_cfg = _hf_text_config(config)
+
     # LongCat computes fresh top-k indices every cli_factor layers.
-    cli_factor = getattr(config, "cli_factor", 1)
-    if cli_factor is None:
-        cli_factor = 1
+    cli_factor = getattr(config, "cli_factor", None) or (
+        getattr(text_cfg, "cli_factor", None) if text_cfg else None
+    ) or 1
     assert cli_factor > 0, f"cli_factor must be positive, got {cli_factor}"
     if cli_factor > 1:
         return layer_id % cli_factor != 0
 
     pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None and text_cfg is not None:
+        pattern = getattr(text_cfg, "index_topk_pattern", None)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
 
-    freq = getattr(config, "index_topk_freq", 1)
+    freq = getattr(config, "index_topk_freq", None)
+    if freq is None and text_cfg is not None:
+        freq = getattr(text_cfg, "index_topk_freq", None)
     if freq is None:
         freq = 1
     assert freq > 0, f"index_topk_freq must be positive, got {freq}"
     offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is None and text_cfg is not None:
+        offset = getattr(text_cfg, "index_skip_topk_offset", None)
     if offset is not None:
         assert offset > 0, (
             "index_skip_topk_offset must be positive; offset <= 0 "
@@ -255,7 +303,10 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
-    return config.index_n_heads
+    val = _hf_attr(config, "index_n_heads")
+    if val is None:
+        val = _hf_attr(_hf_text_config(config), "index_n_heads")
+    return val
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -1020,6 +1071,7 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = getattr(tc, "index_head_dim", None)
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures

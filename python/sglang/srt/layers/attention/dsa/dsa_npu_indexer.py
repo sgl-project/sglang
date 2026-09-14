@@ -32,10 +32,27 @@ class DSANPUIndexerMixin:
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+        backend = get_attn_backend()
+        fm = backend.forward_metadata
+        if fm is None:
+            fm = getattr(
+                getattr(backend, "full_attn_backend", None),
+                "forward_metadata",
+                None,
+            )
+        if fm is not None:
+            if fm.seq_lens_cpu_int is None:
+                actual_seq_lengths_kv = fm.seq_lens
+            else:
+                actual_seq_lengths_kv = fm.seq_lens_cpu_int
         else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
+            actual_seq_lengths_kv = forward_batch.seq_lens_cpu.int()
+        # During cuda graph capture seq_lens are filled with 0, which causes
+        # npu_lightning_indexer to crash (sparse_count > 0 but 0 KV positions).
+        # Clamp to 1: a no-op during real inference (active requests always have
+        # seq_len >= 1) but keeps the kernel alive inside the captured graph.
+        if actual_seq_lengths_kv is not None:
+            actual_seq_lengths_kv = actual_seq_lengths_kv.clamp(min=1)
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -186,10 +203,11 @@ class DSANPUIndexerMixin:
         )
         if is_prefill:
             if (
-                self.dsa_enable_prefill_cp
+                fm is not None
+                and self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                get_attn_backend().forward_metadata.actual_seq_lengths_q = (
+                fm.actual_seq_lengths_q = (
                     forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
                     forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
                 )
@@ -202,31 +220,33 @@ class DSANPUIndexerMixin:
                         forward_batch.attn_cp_metadata.kv_len_next_tensor
                         + forward_batch.extend_prefix_lens.squeeze()
                     )
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
+                    fm.actual_seq_lengths_kv = (
                         total_kv_len_prev_tensor,
                         total_kv_len_next_tensor,
                     )
                 else:
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
+                    fm.actual_seq_lengths_kv = (
                         forward_batch.attn_cp_metadata.kv_len_prev_tensor,
                         forward_batch.attn_cp_metadata.kv_len_next_tensor,
                     )
-                actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
-                )
-                actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
-                )
+                actual_seq_lengths_q = fm.actual_seq_lengths_q
+                actual_seq_lengths_kv = fm.actual_seq_lengths_kv
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
+            if fm is None or fm.actual_seq_lengths_q is None:
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
                 ):
-                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
+                    num_draft_tokens = getattr(
+                        get_attn_backend(), "speculative_num_draft_tokens", None
+                    )
+                    if num_draft_tokens is None:
+                        from sglang.srt.runtime_context import get_spec
+
+                        num_draft_tokens = get_spec().speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
                         num_draft_tokens + bs,
@@ -241,9 +261,7 @@ class DSANPUIndexerMixin:
                         device=k.device,
                     )
             else:
-                actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
-                )
+                actual_seq_lengths_q = fm.actual_seq_lengths_q
 
         past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
@@ -257,7 +275,25 @@ class DSANPUIndexerMixin:
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        if fm is not None:
+            block_table = fm.block_tables
+        else:
+            backend = get_attn_backend()
+            req_pool = forward_batch.req_pool_indices
+            max_len = int(forward_batch.seq_lens_cpu.max().item())
+            page_size = getattr(backend, "page_size", None)
+            if page_size is None:
+                page_size = getattr(
+                    getattr(backend, "full_attn_backend", None),
+                    "page_size",
+                    1,
+                )
+            block_table = (
+                backend.req_to_token_pool.req_to_token[
+                    req_pool, :max_len:page_size
+                ]
+                // page_size
+            )
         if (
             is_prefill
             and self.dsa_enable_prefill_cp

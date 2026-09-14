@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    can_use_npu_quant_lightning_indexer,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -1038,7 +1039,7 @@ class KVCacheConfigurator:
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 is_dsa_model=is_dsa_model,
             )
-        elif self.use_mla_backend and is_dsa_model:
+        elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
             )
@@ -1292,6 +1293,15 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
+        enable_quant_lightning_indexer = (
+            is_dsa_model
+            and can_use_npu_quant_lightning_indexer(
+                self.server_args,
+                self.model_config.hf_config,
+                self.kv_cache_dtype,
+                self.gpu_id,
+            )
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1304,6 +1314,15 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            enable_npu_quant_lightning_indexer=enable_quant_lightning_indexer,
+            kv_cache_dim=(
+                calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+                if enable_quant_lightning_indexer
+                else None
+            ),
         )
         return token_to_kv_pool
 
@@ -1567,12 +1586,32 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         extra_args = {}
         if self.use_mla_backend:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            if is_dsa_model:
+                extra_args["index_head_dim"] = get_dsa_index_head_dim(
+                    self.model_config.hf_config
+                )
+            enable_quant_lightning_indexer = (
+                is_dsa_model
+                and can_use_npu_quant_lightning_indexer(
+                    self.server_args,
+                    self.model_config.hf_config,
+                    self.kv_cache_dtype,
+                    self.gpu_id,
+                )
+            )
+            if enable_quant_lightning_indexer:
+                extra_args["enable_npu_quant_lightning_indexer"] = True
+                extra_args["kv_cache_dim"] = calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
         full_attention_layer_ids = (
             [0]
             if self.is_draft_worker

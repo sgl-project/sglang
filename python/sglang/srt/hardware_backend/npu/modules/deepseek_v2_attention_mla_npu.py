@@ -377,7 +377,7 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        if m.rotary_emb.is_neox_style:
+        if m.rotary_emb is not None and m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
@@ -447,12 +447,13 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if m.layer_id == 0:
-            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                0, positions
-            )
+        if m.rotary_emb is not None:
+            if m.layer_id == 0:
+                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+                    0, positions
+                )
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -533,7 +534,23 @@ def forward_dsa_core_npu(
         )
     else:
         attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        if (
+            attn_output.shape[0] >= 65536
+            or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
+            or m.w_vc.shape[-1] >= 65536
+        ):
+            # npu_transpose_batchmatmul does not support dimensions >= 65536.
+            torch.ops.npu.batch_matmul_transpose(
+                attn_output, m.w_vc, attn_bmm_output
+            )
+        else:
+            attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+                attn_output,
+                m.w_vc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

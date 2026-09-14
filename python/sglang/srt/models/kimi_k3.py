@@ -112,6 +112,13 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
@@ -2118,6 +2125,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
+            rope_theta=getattr(config, "rope_theta", 10000.0),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
             skip_rope=True,
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
@@ -2546,12 +2555,13 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
         # (same as the LayerCommunicator models' is_idle skip).
         if forward_batch.forward_mode.is_idle():
-            return hidden_states
+            return hidden_states, None
 
         # mlp-sync (DP attention OR MoE a2a/EP — require_mlp_sync) pads
         # extend batches to a multiple of attn_tp_size
@@ -2570,22 +2580,27 @@ class KimiK3DecoderLayer(nn.Module):
                 num_real = min(int(sum(extend_lens)), num_padded)
         if num_real != num_padded:
             with k3_sp_collective.o_proj_output_rows(num_padded):
-                attn_out = self._run_self_attn_inner(
+                attn_out, topk_indices = self._run_self_attn_inner(
                     hidden_states[:num_real],
                     positions[:num_real],
                     forward_batch,
                     zero_allocator,
+                    prev_topk_indices=prev_topk_indices,
                 )
             padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
                 attn_out, num_padded
             )
             if padded_o_proj is not None:
-                return padded_o_proj
+                return padded_o_proj, topk_indices
             out = hidden_states.new_zeros(num_padded, attn_out.shape[-1])
             out[:num_real] = attn_out
-            return out
+            return out, topk_indices
         return self._run_self_attn_inner(
-            hidden_states, positions, forward_batch, zero_allocator
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices=prev_topk_indices,
         )
 
     def _run_self_attn_inner(
@@ -2594,7 +2609,8 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # For MLA layers with q_lora_rank, set up communicator attn_inputs
         # before the forward call (normally done by LayerCommunicator).
         from sglang.srt.layers.communicator import (
@@ -2607,17 +2623,33 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-        )
+        # KimiK3MLAAttention (extends DeepseekV2AttentionMLA) accepts
+        # prev_topk_indices via **kwargs and returns (hidden_states,
+        # topk_indices) when DSA is enabled; KimiK3DeltaAttention does not.
+        if isinstance(self.self_attn, DeepseekV2AttentionMLA):
+            result = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        else:
+            result = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
-        return result
+        # DSA MLA forward returns (hidden_states, topk_indices); KDA returns
+        # a plain tensor.
+        if isinstance(result, tuple):
+            return result[0], result[1]
+        return result, None
 
     def forward(
         self,
@@ -2629,7 +2661,8 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         input_sharded: bool = False,
         keep_sharded: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool, Optional[torch.Tensor]]:
         if attn_res is not None:
             return self._forward_attn_residual(
                 positions,
@@ -2640,6 +2673,7 @@ class KimiK3DecoderLayer(nn.Module):
                 zero_allocator,
                 input_sharded,
                 keep_sharded,
+                prev_topk_indices=prev_topk_indices,
             )
 
         assert not input_sharded
@@ -2650,8 +2684,12 @@ class KimiK3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
+        hidden_states, topk_indices = self._run_self_attn(
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices=prev_topk_indices,
         )
         # standard path returns a full-size residual to the next layer, so
         # complete the deferred o_proj reduction as a plain all-reduce
@@ -2660,7 +2698,7 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        return hidden_states, residual, False
+        return hidden_states, residual, False, topk_indices
 
     def _forward_attn_residual(
         self,
@@ -2672,7 +2710,8 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         input_sharded: bool,
         keep_sharded: bool,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool, Optional[torch.Tensor]]:
         # Between attn-res layers hidden_states carries the previous layer's
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
@@ -2720,8 +2759,12 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
+        hidden_states, topk_indices = self._run_self_attn(
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices=prev_topk_indices,
         )
 
         # ---- Complete o_proj's deferred reduction ----
@@ -2796,9 +2839,9 @@ class KimiK3DecoderLayer(nn.Module):
         )
         if shard_lo >= 0:
             if keep_sharded:
-                return out, None, True
+                return out, None, True, topk_indices
             out = _sp_all_gather_rows(out)
-        return out, None, False
+        return out, None, False, topk_indices
 
 
 class KimiK3LinearModel(nn.Module):
@@ -2816,6 +2859,7 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
+        self.use_dsa = is_deepseek_dsa(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -2874,6 +2918,13 @@ class KimiK3LinearModel(nn.Module):
                 )
         else:
             self.norm = PPMissingLayer()
+
+    def _dsa_forward_uses_topk(self) -> bool:
+        if not self.use_dsa:
+            return False
+        backend = get_attn_backend()
+        backend = getattr(backend, "primary", backend)
+        return not getattr(backend, "use_mha", False)
 
     def forward(
         self,
@@ -2942,12 +2993,33 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+
+        # DSA: carry topk_indices across layers (IndexTopKShareState, same
+        # pattern as DeepseekV2Model).
+        dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        initial_topk_indices = None
+        if not self.pp_group.is_first_rank and pp_proxy_tensors is not None:
+            initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and hidden_states.shape[0] != 0
+                and self.use_dsa
+                and dsa_forward_uses_topk
+                and dsa_layer_skips_topk(self.config, self.start_layer)
+                and initial_topk_indices is None
+            ):
+                raise AssertionError(
+                    f"PP stage starting at layer {self.start_layer} requires "
+                    "DSA topk_indices from the previous stage."
+                )
+        index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
+
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual, sp_sharded = self.layers[i](
+                hidden_states, residual, sp_sharded, topk_indices = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
@@ -2956,7 +3028,9 @@ class KimiK3LinearModel(nn.Module):
                     zero_allocator=zero_allocator,
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
+                    prev_topk_indices=index_topk_share.topk_indices,
                 )
+                index_topk_share.update(topk_indices)
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
@@ -2973,9 +3047,34 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            # Forward DSA topk_indices to the next PP stage when the next
+            # stage starts on a skip-topk layer (same logic as DeepseekV2Model).
+            if (
+                self.use_dsa
+                and dsa_forward_uses_topk
+                and self.end_layer < self.config.num_hidden_layers
+                and dsa_layer_skips_topk(self.config, self.end_layer)
+            ):
+                topk_indices = index_topk_share.topk_indices
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and hidden_states.shape[0] != 0
+                ):
+                    assert topk_indices is not None, (
+                        f"PP stage ending at layer {self.end_layer} must forward "
+                        "DSA topk_indices because the next stage starts on a "
+                        "skip-topk layer."
+                    )
+                if topk_indices is None:
+                    topk_indices = hidden_states.new_empty(
+                        (0, get_dsa_index_topk(self.config)), dtype=torch.int32
+                    )
+                proxy_tensors["topk_indices"] = topk_indices
+            return PPProxyTensors(proxy_tensors)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -3095,6 +3194,13 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+
+        # Initialize the attn-TP context for DSA (same as DeepseekV2ForCausalLM).
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
+        get_attn_tp_context().init_context(
+            config.q_lora_rank, is_deepseek_dsa(config)
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

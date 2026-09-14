@@ -3646,6 +3646,9 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        index_head_dim: Optional[int] = None,
+        enable_npu_quant_lightning_indexer: bool = False,
+        kv_cache_dim: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3718,7 +3721,7 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
 
-            self.full_kv_pool = TokenToKVPoolClass(
+            mla_pool_kwargs = dict(
                 size=size,
                 page_size=self.page_size,
                 dtype=dtype,
@@ -3728,6 +3731,14 @@ class HybridLinearKVPool(KVCache):
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
             )
+            if index_head_dim is not None:
+                mla_pool_kwargs["index_head_dim"] = index_head_dim
+            if enable_npu_quant_lightning_indexer:
+                mla_pool_kwargs["enable_npu_quant_lightning_indexer"] = (
+                    enable_npu_quant_lightning_indexer
+                )
+                mla_pool_kwargs["kv_cache_dim"] = kv_cache_dim
+            self.full_kv_pool = TokenToKVPoolClass(**mla_pool_kwargs)
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
@@ -3744,6 +3755,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def post_capture_backed_bytes(self) -> int:
         return self.full_kv_pool.post_capture_backed_bytes
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
@@ -3963,6 +3978,20 @@ class HybridLinearKVPool(KVCache):
         # pool never translates.
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def get_index_k_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_buffer(layer_id)
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_index_k_buffer(layer_id, loc, index_k)
 
 
 class MLATokenToKVPool(KVCache):
