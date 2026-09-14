@@ -1036,10 +1036,10 @@ class Fp8LinearMethod(LinearMethodBase):
             assert _is_cpu_amx_available, (
                 "Fp8LinearMethod on CPU requires that CPU has AMX support"
             )
-            _amx_process_weight_after_loading(layer, ["weight"])
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
+            layer.weight = Parameter(
+                layer.weight.data.t().contiguous(), requires_grad=False
             )
+            _amx_process_weight_after_loading(layer, ["weight"])
             return
 
         if self.use_marlin:
@@ -2644,6 +2644,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale=layer.w2_weight_scale_inv,
             )
             return self.runner.run(dispatch_output, quant_info)
+        if self.runner.runner_backend.is_cpu():
+            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
