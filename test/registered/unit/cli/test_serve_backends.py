@@ -6,7 +6,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import sglang
-
 from sglang.cli.serve import serve
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
