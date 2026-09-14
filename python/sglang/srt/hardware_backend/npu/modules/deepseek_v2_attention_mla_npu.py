@@ -1,4 +1,3 @@
-import re
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -11,18 +10,21 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_is_npu_arch35 = is_npu_arch35()
 
 
 # region MHA
@@ -347,6 +349,20 @@ def forward_mla_core_npu(
 
 
 # region DSA
+def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
+    """Apply RoPE to interleaved Q/K and return half-layout outputs."""
+    rotary_emb.get_cos_sin_with_position(positions)
+    cos = rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
+    )
+    sin = rotary_emb.position_sin.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
+    )
+    q_pe = torch_npu.npu_interleave_rope(q_pe.unsqueeze(2), cos, sin).squeeze(2)
+    k_pe = torch_npu.npu_interleave_rope(k_pe.unsqueeze(2), cos, sin).squeeze(2)
+    return q_pe, k_pe
+
+
 def forward_dsa_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -357,7 +373,11 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
+    mla_preprocess_used = (
+        is_mla_preprocess_enabled()
+        and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+    )
+    if mla_preprocess_used:
         (
             q_pe,
             k_pe,
@@ -443,16 +463,25 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        q_nope_out = torch_npu.npu_transpose_batchmatmul(
+            q_nope,
+            m.w_kc,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
 
-        q_nope_out = q_nope_out.transpose(0, 1)
-
-        if m.layer_id == get_token_to_kv_pool().start_layer:
-            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                0, positions
+        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+            # Match the half-layout RoPE outputs used by MLA preprocessing.
+            q_pe, k_pe = _apply_interleaved_rope_with_half_output(
+                m.rotary_emb, positions, q_pe, k_pe
             )
-
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        else:
+            if m.layer_id == get_token_to_kv_pool().start_layer:
+                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+                    0, positions
+                )
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -482,6 +511,7 @@ def forward_dsa_prepare_npu(
         forward_batch,
         zero_allocator,
         positions,
+        mla_preprocess_used,
     )
 
 
@@ -495,6 +525,7 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
+    mla_preprocess_used: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
@@ -505,33 +536,31 @@ def forward_dsa_core_npu(
         k_nope.contiguous(),
         k_nope.contiguous(),
         forward_batch,
-        save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
+        save_kv_cache=not mla_preprocess_used,
         q_rope=q_pe.contiguous(),
         k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
-
-    if (
+    if _is_npu_arch35 or (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_output = attn_output.transpose(0, 1)
-        torch.bmm(
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
-            out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-                0, 1
-            ),
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
         )
     else:
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
         attn_output = attn_output.contiguous()
         torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
@@ -569,11 +598,14 @@ def npu_mla_preprocess(
             m.v_head_dim,
             m.quant_config,
         )
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and m.mla_preprocess.uses_mlaprolog()
+            and m.w_kc is not None
+        ):
+            m.w_kc.untyped_storage().resize_(0)
     # mlaprolog does not require additional calculation of q_lora
-    _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(
-        re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore
-    )
-    if _is_mlaprolog:
+    if m.mla_preprocess.uses_mlaprolog():
         (
             q_pe,
             k_pe,
