@@ -24,6 +24,7 @@ class Workload:
     samples: int = 64
     rounds: int = 2
     seed: int = 32774
+    attention_split_tile: int = 256
 
     def validate(self):
         if (
@@ -33,9 +34,12 @@ class Workload:
             or self.warmups < 2
             or self.samples < 2
             or self.rounds < 1
+            or self.attention_split_tile < self.warmups + self.samples + 16
+            or self.attention_split_tile & (self.attention_split_tile - 1)
         ):
             raise ValueError(
-                "Use unique even per-rank buckets in [2, 64], warmups/samples >=2, rounds >=1"
+                "Use unique even buckets in [2, 64], warmups/samples >=2, rounds >=1, "
+                "and a power-of-two attention tile covering the configured context"
             )
 
     def tokens(self, rank, bucket, step):
@@ -82,6 +86,11 @@ def model_args(workload, configuration, nccl_port, *, resolve_tokenizer=False):
         "triton",
         "--attention-backend",
         "triton",
+        # Adaptive KV splitting changes reduction partitions with TBO's batch
+        # size, amplifying BF16 rounding through FP8 routing. One context-sized
+        # tile keeps this non-EP computation comparable without relaxing logits.
+        "--triton-attention-split-tile-size",
+        str(workload.attention_split_tile),
         "--nccl-ep-mode",
         "low_latency",
         "--enable-nccl-ep-cuda-graph",
@@ -180,7 +189,7 @@ def run(
         passed=False,
         source_head=source_head(),
         rank=rank,
-        implementation="nccl_ep_full_model_decode_v1",
+        implementation="nccl_ep_full_model_decode_v2",
         configuration=configuration,
         workload=asdict(workload),
         workload_fingerprint=workload.fingerprint(),
@@ -220,6 +229,18 @@ def run(
         report["captured_buckets"] = list(runner.decode_cuda_graph_runner.capture_bs)
         if not set(workload.buckets) <= set(report["captured_buckets"]):
             raise ValueError("Not all requested per-rank Graph buckets were captured")
+        attention = runner.decode_cuda_graph_runner.attn_backend
+        attention_backends = (
+            [attention.primary, *attention.children]
+            if hasattr(attention, "children")
+            else [attention]
+        )
+        report["attention_partition"] = dict(
+            tile=workload.attention_split_tile,
+            max_kv_splits=[b.max_kv_splits for b in attention_backends],
+        )
+        if any(b.max_kv_splits != 1 for b in attention_backends):
+            raise ValueError("The bounded workload must use one attention KV partition")
         config = runner.model_config.hf_config
         if (
             config.num_hidden_layers,
@@ -245,6 +266,7 @@ def run(
                 "enable_single_batch_overlap",
                 "enable_eplb",
                 "nccl_ep_num_max_dispatch_tokens_per_rank",
+                "triton_attention_split_tile_size",
             )
         }
         report["measurement_scope"] = (
@@ -371,13 +393,20 @@ def main():
     parser.add_argument("--warmups", type=int, default=32)
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--attention-split-tile", type=int, default=256)
     parser.add_argument("--nccl-port", type=int, default=29619)
     parser.add_argument("--reports", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-bucket", type=int)
     parser.add_argument("--describe", action="store_true")
     args = parser.parse_args()
-    workload = Workload(tuple(args.buckets), args.warmups, args.samples, args.rounds)
+    workload = Workload(
+        tuple(args.buckets),
+        args.warmups,
+        args.samples,
+        args.rounds,
+        attention_split_tile=args.attention_split_tile,
+    )
     workload.validate()
     if args.profile_bucket is not None and (
         not args.profile or args.profile_bucket not in workload.buckets

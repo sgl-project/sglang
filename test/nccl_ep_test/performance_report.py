@@ -30,7 +30,7 @@ def validate_pair(reports):
             or not report.get("native_ep_tested")
             or not report.get("cleanup_completed")
             or report.get("profiled")
-            or report.get("implementation") != "nccl_ep_full_model_decode_v1"
+            or report.get("implementation") != "nccl_ep_full_model_decode_v2"
             or report.get("model") != MODEL
             or report.get("revision") != REVISION
             or report.get("model_shape", {}).get("moe_layers") != 26
@@ -49,6 +49,15 @@ def validate_pair(reports):
         if report["workload_fingerprint"] != fingerprint:
             raise ValueError("Workload fingerprint mismatch")
         resolved = report["resolved_args"]
+        partition = report.get("attention_partition", {})
+        expected_backends = 3 if "tbo" in report["configuration"] else 1
+        if (
+            partition.get("tile") != workload.attention_split_tile
+            or partition.get("max_kv_splits") != [1] * expected_backends
+            or resolved.get("triton_attention_split_tile_size")
+            != workload.attention_split_tile
+        ):
+            raise ValueError("Matched fixed attention partitions are required")
         if (
             resolved.get("enable_eplb")
             or resolved.get("ep_size") != 2

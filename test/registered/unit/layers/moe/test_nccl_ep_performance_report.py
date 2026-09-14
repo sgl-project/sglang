@@ -41,7 +41,7 @@ def pair(configuration="serial"):
             native_ep_tested=True,
             cleanup_completed=True,
             profiled=False,
-            implementation="nccl_ep_full_model_decode_v1",
+            implementation="nccl_ep_full_model_decode_v2",
             source_head="head",
             configuration=configuration,
             model=MODEL,
@@ -49,6 +49,7 @@ def pair(configuration="serial"):
             workload=asdict(work),
             workload_fingerprint=work.fingerprint(),
             model_shape=dict(layers=27, moe_layers=26),
+            attention_partition=dict(tile=256, max_kv_splits=[1] * (3 if tbo else 1)),
             bindings={},
             environment={
                 k: None
@@ -59,6 +60,7 @@ def pair(configuration="serial"):
                 enable_single_batch_overlap=False,
                 ep_size=2,
                 enable_eplb=False,
+                triton_attention_split_tile_size=256,
             ),
             records=[
                 dict(
@@ -90,6 +92,13 @@ def test_workloads_keep_rank_specific_tokens_and_identical_kv_history():
     for bad in ((1,), (8, 8), (128,), (3,)):
         with pytest.raises(ValueError):
             replace(workload, buckets=bad).validate()
+    for tile in (64, 112, 255):
+        with pytest.raises(ValueError):
+            replace(workload, attention_split_tile=tile).validate()
+    assert (
+        workload.fingerprint()
+        != replace(workload, attention_split_tile=512).fingerprint()
+    )
 
 
 def test_model_commands_keep_full_weights_capacity_and_graph_buckets():
@@ -100,6 +109,7 @@ def test_model_commands_keep_full_weights_capacity_and_graph_buckets():
         assert cmd[cmd.index("--revision") + 1] == REVISION
         assert cmd[cmd.index("--cuda-graph-bs-decode") + 1 :][:3] == ["8", "32", "64"]
         assert int(cmd[cmd.index("--max-running-requests") + 1]) // 2 >= 64
+        assert cmd[cmd.index("--triton-attention-split-tile-size") + 1] == "256"
 
 
 def test_decode_driver_preserves_execution_evidence_at_runner_boundary(monkeypatch):
@@ -190,6 +200,7 @@ def test_rank_alignment_and_global_dp_throughput():
         "sha",
         "cleanup",
         "fingerprint",
+        "attention",
     ],
 )
 def test_invalid_reports_cannot_publish_performance(mutation):
@@ -215,6 +226,8 @@ def test_invalid_reports_cannot_publish_performance(mutation):
         report["source_head"] = "old"
     elif mutation == "cleanup":
         report["cleanup_completed"] = False
+    elif mutation == "attention":
+        report["attention_partition"]["max_kv_splits"] = [1, 2, 2]
     else:
         report["workload_fingerprint"] = "wrong"
     with pytest.raises(ValueError):

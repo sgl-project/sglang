@@ -235,6 +235,16 @@ one-batch loader, including 26 MoE layers and real attention. Initial prefill is
 one token per request, within the LL budget. It then performs 32 warmup decode
 steps and measures 64 steps, for two rounds per bucket. KV histories are fixed
 by teacher-forced, rank-specific token IDs; sampling and HTTP are excluded.
+
+The full-model comparison uses a fixed 256-token Triton attention KV tile,
+covering its entire configured context. Each primary/child backend must resolve
+to one KV partition. This controls a non-EP numerical confound: the default
+adaptive heuristic selects different partitions for a full batch and TBO's
+halves, and BF16 rounding can propagate through FP8 routing into different
+logits. The partition policy is included in the workload fingerprint and native
+reports; the logit tolerance remains rtol=atol=0.02. These measurements describe
+the controlled attention configuration, not default adaptive-partition accuracy
+or throughput. Both timing and profiling use this same setting.
 With attention DP=2, aggregate tokens per step are twice the per-rank bucket.
 
 Each timed step must actually use Graph and the requested TBO mode. Reports
