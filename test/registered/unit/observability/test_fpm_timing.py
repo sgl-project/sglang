@@ -4,43 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.observability.fpm_timing import (
-    capture_fpm_timing,
-    wrap_forward_with_fpm,
-)
+from sglang.srt.observability.fpm_timing import wrap_forward_with_fpm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.fpm_test_utils import FakeInterval, capture_timing
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-
-
-class FakeEvent:
-    def __init__(self, timestamp):
-        self.timestamp = timestamp
-
-    def elapsed_time(self, end):
-        return end.timestamp - self.timestamp
-
-
-class FakeInterval:
-    def __init__(self, milliseconds, ready=False, start=0, stream=0):
-        self.milliseconds = milliseconds
-        self.ready = ready
-        self.end_event = self
-        self.start_event = FakeEvent(start)
-        self.timestamp = start + milliseconds
-        self.stream = stream
-        self.observer = None
-        self.metadata = None
-
-    def end(self, metadata):
-        self.metadata = metadata
-
-    def query(self):
-        return self.ready
-
-    def elapsed_time(self):
-        return self.milliseconds
 
 
 class TestDeviceTimerCapture(unittest.TestCase):
@@ -81,11 +50,11 @@ class TestDeviceTimerCapture(unittest.TestCase):
             FakeInterval(20, start=20),
         ]
         with patch.object(_TimingInterval, "create", side_effect=intervals) as create:
-            with capture_fpm_timing(timer) as first:
+            with capture_timing(timer) as first:
                 for stage in ("draft", "verify", "draft_extend"):
                     with device_timer_ctx(timer, stage):
                         pass
-            with capture_fpm_timing(timer) as second:
+            with capture_timing(timer) as second:
                 with device_timer_ctx(timer, "decode"):
                     pass
         # Exactly the existing events: capture adds no timing intervals.
@@ -115,7 +84,7 @@ class TestDeviceTimerCapture(unittest.TestCase):
         intervals = [FakeInterval(2, ready=True), FakeInterval(5, start=4)]
         result = Mock()
         with patch.object(_TimingInterval, "create", side_effect=intervals):
-            with capture_fpm_timing(timer) as timing:
+            with capture_timing(timer) as timing:
                 timing.when_ready(result)
                 with timer.wrap({}):
                     pass
@@ -131,7 +100,7 @@ class TestDeviceTimerCapture(unittest.TestCase):
         timer = DeviceTimer()
         intervals = [FakeInterval(2, True, stream=1), FakeInterval(5, True, stream=2)]
         with patch.object(_TimingInterval, "create", side_effect=intervals):
-            with capture_fpm_timing(timer) as timing:
+            with capture_timing(timer) as timing:
                 with timer.wrap({}):
                     pass
                 with timer.wrap({}):
@@ -147,7 +116,7 @@ class TestDeviceTimerCapture(unittest.TestCase):
             "create",
             side_effect=[FakeInterval(4, True), FakeInterval(99, True)],
         ):
-            with capture_fpm_timing(timer) as timing:
+            with capture_timing(timer) as timing:
                 with timer.wrap({}):
                     pass
             with timer.wrap({}):
@@ -159,26 +128,46 @@ class TestDeviceTimerCapture(unittest.TestCase):
     def test_empty_capture_does_not_create_gpu_events(self):
         timer = DeviceTimer()
         with patch.object(_TimingInterval, "create") as create:
-            with capture_fpm_timing(timer) as timing:
+            with capture_timing(timer) as timing:
                 pass
         self.assertEqual(timing.num_intervals, 0)
         create.assert_not_called()
 
     def test_capture_cleans_up_after_exception(self):
         timer = DeviceTimer()
+
+        def forward(batch):
+            raise ValueError("forward failed")
+
+        wrapped = wrap_forward_with_fpm(forward, timer)
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
         with self.assertRaisesRegex(ValueError, "forward failed"):
-            with capture_fpm_timing(timer):
-                raise ValueError("forward failed")
-        with capture_fpm_timing(timer) as timing:
+            wrapped(batch)
+        self.assertIsNone(timer._observer)
+        with capture_timing(timer) as timing:
             pass
         self.assertEqual(timing.num_intervals, 0)
+
+    def test_observer_only_skips_unused_segment_elapsed_time(self):
+        timer = DeviceTimer()
+        interval = FakeInterval(7, ready=True)
+        with (
+            patch.object(interval, "elapsed_time", side_effect=AssertionError),
+            patch.object(_TimingInterval, "create", return_value=interval),
+        ):
+            with capture_timing(timer) as timing:
+                with timer.wrap({}):
+                    pass
+        durations = []
+        timing.when_ready(durations.append)
+        self.assertEqual(durations, [0.007])
 
     def test_zero_elapsed_interval_is_not_a_missing_interval(self):
         timer = DeviceTimer()
         with patch.object(
             _TimingInterval, "create", return_value=FakeInterval(0, True)
         ):
-            with capture_fpm_timing(timer) as timing:
+            with capture_timing(timer) as timing:
                 with timer.wrap({}):
                     pass
         result = Mock()

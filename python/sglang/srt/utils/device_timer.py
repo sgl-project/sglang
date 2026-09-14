@@ -70,9 +70,10 @@ class DeviceTimer:
                 break
 
             self._intervals.popleft()
-            elapsed = interval.elapsed_time() / 1000.0
-            for reporter in self._reporters:
-                reporter(t=elapsed, **interval.metadata)
+            if self._reporters:
+                elapsed = interval.elapsed_time() / 1000.0
+                for reporter in self._reporters:
+                    reporter(t=elapsed, **interval.metadata)
             if interval.observer is not None:
                 # Observers can retain intervals; break the back-reference first.
                 observer, interval.observer = interval.observer, None

@@ -135,7 +135,7 @@ def decode(data: bytes) -> ForwardPassMetrics:
 class _FpmPublisherThread:
     """Background thread that serializes and sends ForwardPassMetrics over ZMQ.
 
-    Also emits periodic heartbeats when idle.
+    Heartbeats require an explicit idle state from the scheduler.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -156,6 +156,7 @@ class _FpmPublisherThread:
         self._seq = count()
         self._worker_id = worker_id
         self._dp_rank = dp_rank
+        self._idle = False
 
         self._ctx = zmq.Context()
         self._pub = self._ctx.socket(zmq.PUB)
@@ -167,6 +168,10 @@ class _FpmPublisherThread:
             target=self._run, daemon=True, name="fpm-zmq-publisher"
         )
         self._thread.start()
+
+    def set_idle(self, idle: bool) -> None:
+        """A quiet publisher queue alone does not mean GPU execution is idle."""
+        self._idle = idle
 
     def publish(self, metrics: ForwardPassMetrics) -> None:
         if not self._running:
@@ -200,7 +205,10 @@ class _FpmPublisherThread:
                 if metrics is None:
                     break
             except queue.Empty:
-                if time.monotonic() - last_publish >= self.HEARTBEAT_INTERVAL:
+                if (
+                    self._idle
+                    and time.monotonic() - last_publish >= self.HEARTBEAT_INTERVAL
+                ):
                     metrics = ForwardPassMetrics(
                         worker_id=self._worker_id,
                         dp_rank=self._dp_rank,
