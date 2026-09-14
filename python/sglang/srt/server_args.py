@@ -1746,7 +1746,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="Sparse-attention top-k backend. 'auto' uses FlashInfer routing for supported GVR_2 inputs and sgl-kernel otherwise. 'flashinfer-gvr' forces GVR_2 and requires a FlashInfer build with hint-free top_k_varlen. Decode reuses previous-step raw indices; prefill starts without hints. 'torch' requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="Sparse-attention top-k backend. 'auto' uses FlashInfer routing for supported GVR_2 inputs and sgl-kernel otherwise. 'flashinfer-gvr' forces GVR_2 and requires a FlashInfer build with hint-free top_k_varlen. Prefill and decode run without previous-step hints. 'torch' requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),

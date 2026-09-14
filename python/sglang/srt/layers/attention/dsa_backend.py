@@ -421,24 +421,12 @@ class DeepseekSparseAttnBackend(
         self.gvr_state = None
         if self.dsa_topk_backend.uses_varlen():
             from sglang.srt.layers.attention.dsa.gvr_topk import (
-                GvrTopkState,
                 check_flashinfer_gvr_available,
-                gvr_available,
             )
 
             if self.dsa_topk_backend.is_flashinfer_gvr():
                 check_flashinfer_gvr_available(self.device)
-            if (
-                gvr_available(torch.device(self.device))
-                and self.dsa_index_topk in (512, 1024, 2048)
-                and model_runner.server_args.speculative_algorithm is None
-            ):
-                self.gvr_state = GvrTopkState(
-                    num_layers=model_runner.model_config.num_hidden_layers,
-                    num_slots=self.req_to_token.shape[0],
-                    top_k=self.dsa_index_topk,
-                    device=self.device,
-                )
+            # Leave gvr_state=None: prefill and decode both use hint-free GVR_2.
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:

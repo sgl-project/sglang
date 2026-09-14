@@ -42,9 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.gvr_topk import (
-    GvrTopkState,
     check_flashinfer_gvr_available,
-    gvr_available,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -541,18 +539,7 @@ class DeepseekV4AttnBackend(
         )
         if self.dsa_topk_backend.is_flashinfer_gvr():
             check_flashinfer_gvr_available(self.device)
-        if (
-            self.dsa_topk_backend.uses_varlen()
-            and gvr_available(torch.device(self.device))
-            and self.c4_topk in (512, 1024, 2048)
-            and model_runner.server_args.speculative_algorithm is None
-        ):
-            self.gvr_state = GvrTopkState(
-                num_layers=model_runner.model_config.num_hidden_layers,
-                num_slots=model_runner.req_to_token_pool.req_to_token.shape[0],
-                top_k=self.c4_topk,
-                device=self.device,
-            )
+        # GVR_2 samples the current scores without SGLang temporal hint state.
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
