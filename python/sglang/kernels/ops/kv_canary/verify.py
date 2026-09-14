@@ -197,6 +197,10 @@ class VerifyPlan:
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
 
+    @staticmethod
+    def allocation_bytes(verify_capacity: int) -> int:
+        return 4 * verify_capacity * torch.int64.itemsize + 2 * torch.int32.itemsize
+
     @classmethod
     def allocate(cls, *, verify_capacity: int, device: torch.device) -> VerifyPlan:
         if verify_capacity <= 0:

@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (

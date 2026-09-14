@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -578,7 +580,7 @@ def _conv_multi_build_meta(pairs, block_size: int):
             ]
         )
         block_start += triton.cdiv(elem, block_size)
-    meta = torch.tensor(rows, dtype=torch.int64, device=pairs[0][0].device)
+    meta = make_ptr_table(rows, device=pairs[0][0].device)
     return meta, block_start
 
 
@@ -740,13 +742,15 @@ def _fused_commit_track_indices_kernel(
     last_correct_out_ptr,
     track_steps_out_ptr,
     dtn,
+    accept_stride,
     interval,
     HAS_TRACK: tl.constexpr,
 ):
     b = tl.program_id(0).to(tl.int64)
     al = tl.load(accept_lens_ptr + b).to(tl.int64)
+    row = b * accept_stride
     base = b * dtn
-    last = tl.load(accept_index_ptr + base + al - 1).to(tl.int64) - base
+    last = tl.load(accept_index_ptr + row + al - 1).to(tl.int64) - base
     tl.store(last_correct_out_ptr + b, last)
     if HAS_TRACK:
         pre = tl.load(seq_lens_ptr + b).to(tl.int64)
@@ -755,7 +759,7 @@ def _fused_commit_track_indices_kernel(
         tp = (post // interval) * interval
         ti = tp - pre - 1
         ti = tl.where(ti < 0, 0, ti)
-        cand = tl.load(accept_index_ptr + base + ti).to(tl.int64) - base
+        cand = tl.load(accept_index_ptr + row + ti).to(tl.int64) - base
         tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))
 
 
@@ -766,8 +770,9 @@ def fused_commit_track_indices(
     draft_token_num: int,
     mamba_track_interval: int,
 ):
-    """Single-launch replacement for the eager index math in
-    ``commit_mamba_states_after_verify`` (index ranges, gathers, floordiv chain)."""
+    """Single-launch replacement for the eager verify-commit index math;
+    accept_index is [bs, tree_depth] but its values index bs * draft_token_num rows."""
+    accept_index = accept_index.contiguous()
     bs = accept_lens.shape[0]
     last_correct_step_indices = torch.empty(
         bs, dtype=torch.int64, device=accept_lens.device
@@ -785,6 +790,7 @@ def fused_commit_track_indices(
         last_correct_step_indices,
         mamba_steps_to_track,
         draft_token_num,
+        accept_index.shape[1],
         mamba_track_interval,
         HAS_TRACK=has_track,
     )

@@ -36,11 +36,11 @@ _PROFILE_NO_GRAPH_STEPS = 3
 def _make_server_args(
     *, canary_on: bool, disable_cuda_graph: bool = False
 ) -> ServerArgs:
-    # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
+    # install_canary asserts --cuda-graph-backend-prefill=disabled; pass on both sides for apples-to-apples.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")

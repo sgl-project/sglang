@@ -48,6 +48,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.kvcache.kv_indices import (
+    kv_indices_num_token_blocks as kv_indices_num_token_blocks,
+)
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )

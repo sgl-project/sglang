@@ -541,6 +541,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     Post-reasoning content is unwrapped from the XTML ``response`` /
     ``message`` markers; a ``tools`` channel is passed through raw for the
     kimi_k3 tool-call detector.
+
+    The model does not always honour the pre-filled think channel: on very long
+    prompts (~1M tokens) it sometimes emits a zero-length think section and
+    writes the reply directly, closing with
+    ``<|close|>response<|sep|><|close|>message<|sep|>`` and never producing
+    ``<|close|>think<|sep|>`` or ``<|open|>response<|sep|>``. A bare
+    ``<|close|>response<|sep|>`` therefore proves the preceding text was the
+    response channel, and it is reported as content rather than reasoning
+    (see :meth:`_skipped_think_channel`).
     """
 
     def __init__(
@@ -581,6 +590,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._reasoning_done = False
         self._tools_passthrough = False
         self._stream_text = ""
+        self._streamed_reasoning: list[str] = []
+        self._discard_delayed_think_close = False
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -596,6 +607,22 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         ]
         return min(found) if found else -1
 
+    @staticmethod
+    def _skipped_think_channel(
+        text: str,
+        start: int = 0,
+        think_close_idx: int = -1,
+        next_channel_idx: int = -1,
+    ) -> bool:
+        response_close_idx = text.find(RESPONSE_CLOSE, start)
+        return response_close_idx != -1 and all(
+            boundary_idx == -1 or response_close_idx < boundary_idx
+            for boundary_idx in (think_close_idx, next_channel_idx)
+        )
+
+    def _clean_skipped_think_content(self, text: str) -> str:
+        return self._clean_content(text.replace(self.think_end_token, ""))
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self.think_end_token not in text:
@@ -607,13 +634,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
         close_idx = text.find(self.think_end_token, start)
         tools_idx = text.find(self.tool_start_token, start)
+        channel_idx = self._next_channel_idx(text, start)
+        if self._skipped_think_channel(text, start, close_idx, channel_idx):
+            return StreamingParseResult(
+                normal_text=self._clean_skipped_think_content(text[start:])
+            )
         if close_idx != -1 and tools_idx != -1 and tools_idx < close_idx:
             return StreamingParseResult(
                 reasoning_text=strip_partial_marker_suffix(text[start:tools_idx]),
                 normal_text=self._clean_content(text[tools_idx:]),
             )
         if close_idx == -1:
-            channel_idx = self._next_channel_idx(text, start)
             if channel_idx != -1:
                 return StreamingParseResult(
                     reasoning_text=strip_partial_marker_suffix(text[start:channel_idx]),
@@ -665,22 +696,38 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             close_idx = buf.find(self.think_end_token)
             tools_idx = buf.find(self.tool_start_token)
+            channel_idx = self._next_channel_idx(buf)
+            if self._skipped_think_channel(
+                buf,
+                think_close_idx=close_idx,
+                next_channel_idx=channel_idx,
+            ):
+                replay = "".join(self._streamed_reasoning)
+                self._streamed_reasoning.clear()
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._discard_delayed_think_close = True
+                return StreamingParseResult(
+                    normal_text=(replay + self._drain_content()) or None
+                )
+
             if close_idx != -1 and not (tools_idx != -1 and tools_idx < close_idx):
                 reasoning_text = buf[:close_idx]
                 self._buffer = buf[close_idx + len(self.think_end_token) :]
                 self._in_reasoning = False
                 self._reasoning_done = True
+                self._streamed_reasoning.clear()
                 return StreamingParseResult(
                     reasoning_text=reasoning_text or None,
                     normal_text=self._drain_content() or None,
                 )
 
-            channel_idx = self._next_channel_idx(buf)
             if channel_idx != -1:
                 reasoning_text = strip_partial_marker_suffix(buf[:channel_idx])
                 self._buffer = buf[channel_idx:]
                 self._in_reasoning = False
                 self._reasoning_done = True
+                self._streamed_reasoning.clear()
                 self._tools_passthrough = buf.startswith(
                     self.tool_start_token, channel_idx
                 )
@@ -691,18 +738,26 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
+            markers = [
+                self.think_end_token,
+                self.tool_start_token,
+                RESPONSE_OPEN,
+                RESPONSE_CLOSE,
+                MESSAGE_CLOSE,
+            ]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = partial_suffix_len(buf, markers)
             emit = buf[: len(buf) - holdback] if holdback else buf
             emit = strip_partial_marker_suffix(emit)
             self._buffer = buf[len(emit) :]
+            self._streamed_reasoning.append(emit)
             return StreamingParseResult(reasoning_text=emit)
 
         return StreamingParseResult(normal_text=self._drain_content())
 
     def finish(self) -> StreamingParseResult:
+        self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
             return super().finish()
         text, self._stream_text = self._stream_text, ""
@@ -724,25 +779,46 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         if not buf:
             return ""
         if self._tools_passthrough:
-            self._buffer = ""
-            return buf
+            holdback = (
+                partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            if self._discard_delayed_think_close:
+                emit = emit.replace(self.think_end_token, "")
+            return emit
 
         tools_idx = buf.find(TOOLS_OPEN)
         if tools_idx != -1:
-            head = buf[:tools_idx]
+            holdback = (
+                partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            head = emit[:tools_idx]
+            tail = emit[tools_idx:]
             for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
                 head = head.replace(marker, "")
+            if self._discard_delayed_think_close:
+                head = head.replace(self.think_end_token, "")
+                tail = tail.replace(self.think_end_token, "")
             self._tools_passthrough = True
-            self._buffer = ""
-            return head + buf[tools_idx:]
+            return head + tail
 
-        holdback = partial_suffix_len(
-            buf, [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
-        )
+        markers = [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
+        if self._discard_delayed_think_close:
+            markers.append(self.think_end_token)
+        holdback = partial_suffix_len(buf, markers)
         emit = buf[: len(buf) - holdback] if holdback else buf
         self._buffer = buf[len(emit) :]
         for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
             emit = emit.replace(marker, "")
+        if self._discard_delayed_think_close:
+            emit = emit.replace(self.think_end_token, "")
         return emit
 
 
@@ -965,6 +1041,71 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+
+class GraniteThinkingDetector(BaseReasoningFormatDetector):
+    """Detector for Granite 4.2 thinking models (ibm-granite/granite-4.2-*).
+
+    Strips leading newlines from content after </think> — the Granite chat
+    template writes ``\\n</think>\\n``, so content starts with ``\\n``.
+    Matches the behavior of the HF plugin ``granite_thinking_parser.py``.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._content_started = False
+        self._reasoning_seen = False
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = self._detect_and_parse_impl(text)
+        think_end_present = self.think_end_token in text
+        # HF plugin swaps when parsed content is absent (text ends at </think>);
+        # newline-only content the plugin strips itself, without swapping.
+        content_absent = think_end_present and not ret.normal_text
+        if think_end_present and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+        if (
+            self._force_nonempty_content
+            and not ret.normal_text
+            and (content_absent or not think_end_present)
+        ):
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        was_in_reasoning = self._in_reasoning
+        ret = super().parse_streaming_increment(new_text)
+        # Sampling only the pre-call state misses a whole think block arriving
+        # in one chunk; post-call evidence keeps stripping chunk-independent.
+        if (
+            was_in_reasoning
+            or self._in_reasoning
+            or self.stripped_think_start
+            or ret.reasoning_text
+        ):
+            self._reasoning_seen = True
+        if self._reasoning_seen and not self._content_started and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+            if ret.normal_text:
+                self._content_started = True
+        return ret
 
 
 class MiniMaxM3Detector(BaseReasoningFormatDetector):
@@ -2047,6 +2188,7 @@ class ReasoningParser:
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
+        "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
@@ -2100,6 +2242,10 @@ class ReasoningParser:
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        if model_type.lower() == "granite_thinking_parser":
+            if chat_template_kwargs.get("enable_thinking") is False:
+                kwargs["force_nonempty_content"] = True
 
         if model_type.lower() == "k2_horizon":
             # Template kwargs are the final values passed to Jinja and therefore

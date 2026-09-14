@@ -223,7 +223,8 @@
             "runtime_peak_allocated_mb": 11483.0,
             "load_peak_host_anon_mb": 32768.0,
             "runtime_peak_host_anon_mb": 32768.0,
-            "estimated_full_test_time_s": 283.0
+            "estimated_full_test_time_s": 283.0,
+            "timing_tolerance": 0.9
         }
     }
 }

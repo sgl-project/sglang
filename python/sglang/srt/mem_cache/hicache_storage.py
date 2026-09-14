@@ -533,10 +533,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            tmp_path = (
-                f"{tensor_path}.tmp."
-                f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-            )
+            tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
             self._evictor.commit(suffixed)

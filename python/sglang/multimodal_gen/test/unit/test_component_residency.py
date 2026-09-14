@@ -3,12 +3,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
     ResidencyState,
     WarmupPhasePeak,
+    build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     ComponentResidencyError,
@@ -16,7 +19,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
     ResidentStrategy,
+    SnapshotOffloadStrategy,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    weight_snapshot,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
 )
@@ -24,6 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding 
     RealtimeTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+    _load_weights_into_module,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -50,6 +64,141 @@ def test_component_offload_releases_preferred_component_after_request():
     strategy.finish_request(module, use, state, preferred=True)
 
     strategy.finish_use.assert_called_once_with(module, use, state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("host_storage", ["pageable", "pinned", "mmap"])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_snapshot_offload_preserves_host_storage_and_live_buffers(
+    tmp_path, monkeypatch, host_storage, prefetch
+):
+    module = torch.nn.Linear(16, 16, bias=False)
+    if host_storage == "pinned":
+        module.weight.data = module.weight.detach().pin_memory()
+    elif host_storage == "mmap":
+        checkpoint = str(tmp_path / "model.safetensors")
+        save_file(module.state_dict(), checkpoint)
+        module.load_state_dict(load_file(checkpoint), assign=True)
+    module.register_buffer("counter", torch.zeros((), dtype=torch.int64))
+    original_host = module.weight.detach()
+    pointer = original_host.data_ptr()
+    x = torch.randn(2, 16, device="cuda")
+    expected = torch.nn.functional.linear(x, original_host.to("cuda"))
+    args = SimpleNamespace(residency_mode=lambda _: "snapshot-offload")
+    strategy = build_component_residency_strategy("vae", module, args)
+    assert isinstance(strategy, SnapshotOffloadStrategy)
+    use = ComponentUse("decode", "vae")
+    state = ResidencyState()
+
+    original_to = torch.Tensor.to
+    weight_d2h = []
+
+    def tracked_to(tensor, *args, **kwargs):
+        device = kwargs.get("device", args[0] if args else None)
+        if (
+            tensor.device.type == "cuda"
+            and isinstance(device, (str, torch.device))
+            and torch.device(device).type == "cpu"
+            and tensor.numel() == 256
+        ):
+            weight_d2h.append(tensor.numel())
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", tracked_to)
+    for iteration in range(3):
+        if prefetch:
+            strategy.prefetch_for_use(module, use, state)
+        else:
+            strategy.prepare_for_use(module, use, state)
+        strategy.wait_for_use(module, use, state)
+        assert weight_snapshot(module)["weight"].data_ptr() == pointer
+        totals = component_residency_bytes(module)
+        assert sum(totals[k] for k in ("host", "host_pinned", "host_mapped")) == 1024
+        torch.testing.assert_close(module(x), expected, rtol=0, atol=0)
+        module.counter.add_(1)
+        strategy.finish_use(module, use, state)
+        assert module.weight.device.type == "cpu"
+        assert module.weight.data_ptr() == pointer
+        assert module.counter.item() == iteration + 1
+        assert weight_snapshot(module) is None
+    assert not weight_d2h
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_offload_refit_and_lora_context_refresh_weights():
+    module = torch.nn.Linear(4, 4, bias=False)
+    strategy = SnapshotOffloadStrategy()
+    use = ComponentUse("denoise", "transformer")
+    state = ResidencyState()
+    strategy.prefetch_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    _load_weights_into_module(module, [("weight", torch.full((4, 4), 2.0))])
+    assert module.weight.device.type == "cpu"
+    strategy.prepare_for_use(module, use, state)
+    torch.testing.assert_close(module.weight, torch.full((4, 4), 2.0, device="cuda"))
+
+    pipeline = SimpleNamespace(modules={"transformer": module})
+    with LoRAPipeline._temporarily_disable_offload(
+        pipeline, target="transformer", use_module_names_only=True
+    ):
+        # exercise the same weight-mutation boundary as merge and layer replacement
+        module.weight = torch.nn.Parameter(torch.full((4, 4), 3.0))
+    strategy.prepare_for_use(module, use, state)
+    torch.testing.assert_close(module.weight, torch.full((4, 4), 3.0, device="cuda"))
+    strategy.finish_use(module, use, state)
+    with LoRAPipeline._temporarily_disable_offload(
+        pipeline, target="transformer", use_module_names_only=True
+    ):
+        with torch.no_grad():
+            module.weight.sub_(1)
+    strategy.prepare_for_use(module, use, state)
+    torch.testing.assert_close(module.weight, torch.full((4, 4), 2.0, device="cuda"))
+    strategy.finish_use(module, use, state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_offload_dtype_tied_storage_and_strategy_rebuild():
+    module = torch.nn.Module()
+    storage = torch.randn(32, dtype=torch.bfloat16)
+    module.register_parameter("a", torch.nn.Parameter(storage[:16]))
+    module.register_parameter("b", torch.nn.Parameter(storage[16:]))
+    module.register_parameter("tied", module.a)
+    strategy = SnapshotOffloadStrategy()
+    use = ComponentUse("decode", "vae", target_dtype=torch.bfloat16)
+    state = ResidencyState()
+    strategy.prepare_for_use(module, use, state)
+    assert module.a is module.tied
+    rebuilt = SnapshotOffloadStrategy()
+    rebuilt.finish_use(module, use, state)
+    assert module.a is module.tied
+    assert (
+        module.a.untyped_storage().data_ptr() == module.b.untyped_storage().data_ptr()
+    )
+    assert module.a.data_ptr() == storage.data_ptr()
+    rebuilt.prepare_for_use(
+        module, ComponentUse("decode", "vae", target_dtype=torch.float32), state
+    )
+    rebuilt.finish_use(module, use, state)
+    assert module.a.dtype == torch.float32
+    assert module.a is module.tied
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_offload_sleep_uses_existing_host_storage():
+    module = torch.nn.Linear(4, 4, bias=False)
+    host_pointer = module.weight.data_ptr()
+    strategy = SnapshotOffloadStrategy()
+    use = ComponentUse("denoise", "transformer")
+    state = ResidencyState()
+    strategy.prepare_for_use(module, use, state)
+    pipeline = SimpleNamespace(modules={"transformer": module})
+    controller = MemoryOccupationController(pipeline, rank=0, use_fsdp_inference=False)
+    controller._move_modules(["transformer"], "cpu")
+    assert module.weight.data_ptr() == host_pointer
+    assert weight_snapshot(module) is None
+    strategy.prepare_for_use(module, use, state)
+    strategy.finish_use(module, use, state)
+    assert module.weight.data_ptr() == host_pointer
 
 
 def test_component_offload_keeps_preferred_component_after_warmup():

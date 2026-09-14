@@ -632,7 +632,7 @@ class C4IndexerBackendMixin:
         # reading logits, so DeepGEMM can receive an empty range for them.
         if self.dsa_topk_backend.is_sgl_kernel():
             ke = torch.where(ke - ks > c4_indexer.index_topk, ke, ks)
-        c4_page_size = indexer_metadata.c4_page_size
+        c4_page_size = indexer_metadata.compressed_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
@@ -793,7 +793,7 @@ class C4IndexerBackendMixin:
             return F.pad(tensor, pad, value=value)
 
         c4_seq_lens = match_num_queries(
-            indexer_metadata.c4_seq_lens, value=0 if use_aiter_fp4 else 1
+            indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
         )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
@@ -837,14 +837,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -856,7 +856,7 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
             elif self.dsa_topk_backend.is_flashinfer():
@@ -865,16 +865,16 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+            elif self.dsa_topk_backend.should_use_topk_v2():
                 topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     # The cached plan routes rows by their index in the full
                     # range, so a chunk needs one built over its own rows.
                     (
@@ -882,6 +882,7 @@ class C4IndexerBackendMixin:
                         if rows == all_rows or not is_hip()
                         else plan_topk_v2(c4_seq_lens[rows])
                     ),
+                    row_raw_indices,
                 )
             else:
                 topk_transform_paged(
@@ -889,7 +890,7 @@ class C4IndexerBackendMixin:
                     c4_seq_lens[rows],
                     page_table[rows],
                     c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     row_raw_indices,
                 )
 
@@ -964,7 +965,7 @@ class C4IndexerBackendMixin:
                     _c4sl[rows],
                     page_table[rows],
                     metadata,
-                    indexer_metadata.max_c4_seq_len,
+                    indexer_metadata.max_compressed_seq_len,
                     False,
                 )
                 run_topk_transform(rows, logits)
@@ -990,7 +991,7 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                        compressed_seq_lens=indexer_metadata.compressed_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
                     )

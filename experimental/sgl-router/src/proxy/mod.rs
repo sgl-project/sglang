@@ -164,7 +164,7 @@ impl Proxy {
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
     // Each parameter is a distinct, required input to a single upstream
-    // forward (target, breaker, path, headers, body, plus the two
+    // forward (target, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
     // satisfy the arg-count heuristic would add indirection without clarity.
     #[allow(clippy::too_many_arguments)]
@@ -177,6 +177,7 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -217,23 +218,30 @@ impl Proxy {
         // is recorded as a failure. For 5xx headers we record_failure
         // up front and skip the pump hook (the body we surface is the
         // error response — its stream completing is not a worker win).
-        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+        let caller_end_hook = if status.is_success() {
+            on_stream_end
+        } else {
+            None
+        };
+        let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
             if status.is_server_error() {
                 breaker.record_failure();
                 None
             } else {
                 let breaker_for_hook = Arc::clone(breaker);
-                Some(Box::new(move |ok| {
-                    if ok {
+                Some(Box::new(move |end| {
+                    if end.transport_ok {
                         breaker_for_hook.record_success();
                     } else {
                         breaker_for_hook.record_failure();
                     }
+                    if let Some(hook) = caller_end_hook {
+                        hook(end);
+                    }
                 }))
             };
-        // Only record TTFT for successful streams — a 4xx/5xx error body
-        // streaming back is not a generated token, so drop the hook for
-        // non-2xx responses.
+        // Only record TTFT for successful streams; error-body chunks are not
+        // generated tokens.
         let first_byte_hook = if status.is_success() {
             on_first_byte
         } else {

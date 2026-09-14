@@ -92,7 +92,6 @@ blackwell:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*nvfp4*'
-      - 'python/sglang/kernels/aot/csrc/attention/cutlass_sm100_mla/**/*'
       - 'python/sglang/srt/layers/attention/trtllm_mla_backend.py'
       - 'python/sglang/srt/layers/attention/trtllm_mha_backend.py'
 

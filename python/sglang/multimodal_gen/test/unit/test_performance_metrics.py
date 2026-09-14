@@ -572,3 +572,65 @@ def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
     worker._release_warmup_pool(_warmup_req())
     worker._release_warmup_pool(SimpleNamespace(is_warmup=False, extra={}))
     assert calls == []
+
+
+def _timing_validator(timing_tolerance: float | None) -> PerformanceValidator:
+    return PerformanceValidator(
+        scenario=ScenarioConfig(
+            stages_ms={"DenoisingStage": 1000.0},
+            denoise_step_ms={1: 100.0},
+            expected_e2e_ms=1000.0,
+            expected_avg_denoise_ms=100.0,
+            expected_median_denoise_ms=100.0,
+            timing_tolerance=timing_tolerance,
+        ),
+        tolerances=ToleranceConfig(0.25, 0.25, 0.25, 0.3, 0.2),
+        step_fractions=(),
+    )
+
+
+def _validate_scaled(validator: PerformanceValidator, scale: float) -> None:
+    summary = PerformanceSummary(
+        1000.0 * scale,
+        100.0 * scale,
+        100.0 * scale,
+        {"DenoisingStage": 1000.0 * scale},
+        [],
+        {1: 100.0 * scale},
+        {1: 100.0 * scale},
+    )
+    validator.collect_metrics = lambda _record: summary
+    validator.validate(None)
+
+
+def test_timing_tolerance_override_widens_wall_clock_checks_only():
+    with patch.object(current_platform, "is_hip", return_value=False):
+        # 1.7x the baseline fails at the profile's 25% e2e tolerance
+        with pytest.raises(AssertionError, match="E2E Latency"):
+            _validate_scaled(_timing_validator(None), 1.7)
+
+        # the same run passes for a case that declares a 90% timing tolerance
+        _validate_scaled(_timing_validator(0.9), 1.7)
+
+        # the override is a ceiling, not a blank cheque
+        with pytest.raises(AssertionError, match="E2E Latency"):
+            _validate_scaled(_timing_validator(0.9), 2.5)
+
+
+def test_timing_tolerance_override_leaves_memory_guards_alone():
+    validator = _timing_validator(0.9)
+    regression = PerformanceSummary(
+        0.0,
+        0.0,
+        0.0,
+        {},
+        [],
+        {},
+        {},
+        load_peak_vram_mb=10_000.0,
+        runtime_peak_vram_mb=10_201.0,
+    )
+
+    with patch.object(current_platform, "is_hip", return_value=False):
+        with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
+            validator.validate_peak_vram(regression, 10_000.0, 10_000.0)

@@ -1,0 +1,206 @@
+---
+title: DeepSeek-V4.1
+description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300 and MI350X."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+DeepSeek-V4.1 Flash support has **not shipped in an SGLang release yet**, so a stock `pip install sglang` cannot serve it. Use the preview Docker image below.
+
+</Tab>
+
+<Tab title="Docker">
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker).
+
+**NVIDIA GPUs** — every NVIDIA cell on this page uses the preview build `lmsysorg/sglang:dev-dsv41` (H200 / B200 / B300 / GB300); the command panel picks it automatically.
+
+```bash Command
+docker pull lmsysorg/sglang:dev-dsv41
+
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:dev-dsv41 \
+    sglang serve <use args below>
+```
+
+**AMD GPUs (ROCm)** — ROCm support for this model is likewise a preview build, `lmsysorg/sglang:dev-dsv41-mi35x`; the command panel picks it automatically for the MI350X cell.
+
+```bash Command
+docker pull lmsysorg/sglang:dev-dsv41-mi35x
+
+docker run \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --shm-size 32g --ipc=host \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    lmsysorg/sglang:dev-dsv41-mi35x \
+    sglang serve <use args below>
+```
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command:
+
+- **Low-Latency** — fastest reply for a single user. Pick for chat.
+- **High-Throughput** — most tokens per second across many users. Best for batch jobs.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx";
+
+<Deployment config={config} />
+
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+
+## 1. Model Introduction
+
+**DeepSeek-V4.1 Flash** is a sparse-attention Mixture-of-Experts model (`model_type: deepseek_v4.1`) served through SGLang's `dsv4` backend: 40 decoder layers, 384 routed experts at top-6 plus one shared expert, fp8 dense weights at a 32-wide `ue8m0` block scale with fp4 routed experts. It also carries **DSpark**, its own three-stage speculative draft, which the Low-Latency recipe turns on.
+
+**Architecture.** Every layer keeps one 512-wide KV latent per position and uses it as both key and value for all 64 query heads, with no separate value projection. Each layer reads two stores that behave oppositely: **compressed latents**, produced only at source layers and shared forward, collapsing 2 positions into 1 in layers 2–19 and 1-to-1 from layer 20 on; and a **128-position sliding window**, recomputed per layer from that layer's own activations, so it can never be shared but also never grows with context. Consumers address a source's cache by plain `loc // ratio` arithmetic with no mapping table, so compressed state lives and dies with the full prefix for free. The residual stream is four parallel copies mixed by a per-token doubly stochastic matrix; each sublayer's mixing coefficients are consumed by the *next* sublayer, which lets that projection overlap the main GEMMs.
+
+**Sparse retrieval.** KV source layers and index source layers are different lists — four of the former, eight of the latter. The four extra index layers produce no keys at all; they re-score layer 20's keys with their own query, so retrieval decisions are made twice as often as keys are stored. Each retrieving layer picks a top-512 candidate set.
+
+**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group, which costs an all-reduce per engram layer. `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` (**opt-in**) moves them to one shared host copy instead: both all-reduces disappear, the freed HBM goes to the KV pool, and output is bitwise unchanged — at the cost of host RAM, a longer load, and needing huge-page backing to keep the gather cheap.
+
+**SWA bounded replay.** Because the window store is per-layer and cheap to rebuild, it need not all be recomputed. `--enable-decoder-swa-bounded-replay` (**opt-in**) runs the early layers over the whole extend and the late layers over only each request's last 128 tokens, sharing late-layer KV from source layer 20. Prefill gets materially faster. It is validated on the decode path only, refuses prompt logprobs by design, is not numerically equivalent to full prefill, and is excluded at launch with the prefill CUDA graph and with DP attention.
+
+**Kernels.** At decode token counts these kernels are launch-bound rather than bandwidth-bound, so the work is fusion and overlap: the compressor projection, ratio-2 pooling, RoPE with fp4 quantization and indexer packing, paged fp4 indexer scoring with top-k resolved straight to cache addresses, and the mHC statistics and Sinkhorn — with compression, indexing and mHC overlapped against attention and FFN on dedicated streams. All of it is selected automatically; the environment switches it once sat behind were removed, so there is nothing to turn on. One caveat outranks the fusions: **output is not bitwise stable across batch composition today** — two default kernels are shape-guarded to a single token — and `--enable-deterministic-inference` is refused on this backend.
+
+**Recommended generation:** reasoning evaluations were run at `temperature=1.0`, `top_p=0.95` with reasoning effort `max` (informational — do not hardcode these in application code).
+
+**Resources:** [HuggingFace](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
+
+## 2. Configuration Tips
+
+### Do not override the backends
+
+`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them.
+
+Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+Enable the reasoning parser — `--reasoning-parser auto` resolves to `deepseek-v41` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer. The parser puts the thinking block in `reasoning_content` and the answer in `content`; without it both arrive concatenated in `content`.
+
+The parser can only split a thinking block the model actually produced, and **thinking is off by default** (`SGLANG_DEFAULT_THINKING=false`). Sending `reasoning_effort` turns it on: any value other than `none` also switches `chat_template_kwargs.thinking` on for you. A request that carries neither comes back with an empty `reasoning_content` however the parser is configured.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4.1-Flash",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="high",
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+On the request, `reasoning_effort` accepts the tiers `low`, `high`, `xhigh` and `max`, or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
+
+### 3.2 Tool Calling
+
+Enable the tool-call parser — `--tool-call-parser auto` resolves to `deepseekv41` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. DeepSeek-V4.1 uses spaced DSML tool tags, which the stock DeepSeek-V4 detector does not parse — the `deepseekv41` detector is required.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather in a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    },
+}]
+
+resp = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4.1-Flash",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+    reasoning_effort="high",
+)
+choice = resp.choices[0]
+print("finish_reason:", choice.finish_reason)
+print("tool_calls:", choice.message.tool_calls)
+print("reasoning:", getattr(choice.message, "reasoning_content", None))
+```
+
+</Accordion>
+
+A successful call returns `finish_reason: "tool_calls"` with a single `get_weather` entry whose arguments carry the requested location. If you see the raw DSML markup in `content` instead, the parser flag is missing.
+
+### 3.3 Speculative Decoding (DSpark)
+
+DSpark is DeepSeek-V4.1 Flash's own bundled draft — there is no EAGLE or MTP path for this model, and no `--speculative-num-steps` knob (the draft-token count is resolved from the checkpoint). Turn it on with `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`, which is what the Low-Latency cells do.
+
+What to expect:
+
+- A DSpark step costs meaningfully more than a plain decode step, so the win at bs=1 is roughly the accept length divided by that fixed step cost. It is a real speed-up on interactive workloads, but not proportional to the number of draft tokens.
+- Acceptance is strongly workload-dependent — highest on maths and code, lower on open-ended chat, lower still on agentic traces. Size your expectations from the workload you actually run, and measure it rather than assuming.
+- The step cost does not move with accept length or with the draft block size, so tuning `--speculative-dspark-block-size` will not buy throughput. This is also why the High-Throughput recipe turns speculation off: at large batch the fixed step cost stops paying for itself.
+
+### 3.4 PD Disaggregation
+
+Prefill/decode disaggregation is validated token-identical against a single server across 32 greedy prompts, with GSM8K matching through the router. Use the **PD Disaggregation** card in the Playground to generate the prefill role, the decode role and the router command.
+
+One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
+
+PD and speculative decoding cannot be combined.
+
+### 3.5 HiCache (Hierarchical KV Caching)
+
+HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
+
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**: the Playground emits `--enable-hierarchical-cache` on top of the recipe's flags, and cold KV pages spill to CPU pinned memory (L2, GPU + CPU) instead of being dropped from the GPU pool. The host pool is sized by ratio (`--hicache-ratio 2`), not by a fixed `--hicache-size`.
+
+The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
+
+The card is not offered on MI350X: the ROCm recipes run `--disable-radix-cache`, and the server rejects that alongside `--enable-hierarchical-cache`.
+
+Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).

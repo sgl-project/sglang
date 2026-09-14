@@ -46,6 +46,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
     is_flashinfer_available,
     next_power_of_2,
 )
@@ -209,8 +210,9 @@ class FlashInferMhaChunkKVRunner:
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
-    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
-    # can never carry more seqs than the pool.
+    # kv_indptr/qo_indptr are preallocated at (padded max bs + 1), where the
+    # padding only covers MLP-sync alignment; an extend batch can never carry
+    # more seqs than the req pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
     # Verify metadata is ragged-layout aware via generate_attn_arg_prefill;
@@ -254,7 +256,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             ),
         )
 
-        max_bs = model_runner.req_to_token_pool.size
+        # The eager / cuda-graph runners pad the request count to the
+        # attn-tp (and cp) alignment under MLP sync (DP attention, DeepEP,
+        # MegaMoE), so the dummy batch can exceed req_to_token_pool.size.
+        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -1175,7 +1180,10 @@ class FlashInferMLAMultiStepDraftBackend:
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
 
-        max_bs = model_runner.req_to_token_pool.size * self.topk
+        max_bs = (
+            get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
+            * self.topk
+        )
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,

@@ -52,11 +52,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hip,
     is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
@@ -229,8 +231,19 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # TODO: this logic should be fixed in non-hip platform
+        self.is_hip_dspark_draft = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        )
+        if self.is_hip_dspark_draft:
+            # Drafts never join the dcp group so we ignore it
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -748,22 +761,16 @@ class TritonAttnBackend(AttentionBackend):
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Copy the cuda-graph WRITE loc into the capture-stable buffer and
-        return the ``[:n]`` view; no-op for non-unified pools.
-
-        Runs BEFORE graph.replay() so it reads the live post-compaction v2p.
-        The capture batch is runner-built with zeros, which is safe because
-        slot 0 is the reserved sink in every id space.
-        """
+        """Runs BEFORE graph.replay(), so it reads the live post-compaction
+        v2p; no-op for non-unified pools."""
+        # The buffer exists only for a translating pool; return before naming it.
         if not self.kv_index_translator.is_translating:
             return None
-        out_cache_loc = forward_batch.out_cache_loc
-        n = out_cache_loc.shape[0]
-        # Zero the padded tail first: a smaller replay batch leaves [n:] holding
-        # stale ids that the captured store would write; send them to slot 0 (sink).
-        self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(out_cache_loc)
-        return self.cuda_graph_out_cache_loc_full_physical[:n]
+        return self.kv_index_translator.fill_capture_write_loc(
+            out=self.cuda_graph_out_cache_loc_full_physical,
+            forward_batch=forward_batch,
+            width=self.cuda_graph_out_cache_loc_full_physical.numel(),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""

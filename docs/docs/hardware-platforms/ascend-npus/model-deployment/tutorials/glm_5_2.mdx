@@ -23,7 +23,7 @@ multi-node deployment, prefill-decode disaggregation, feature configuration, and
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`  |
 | Quantization                  | `--quantization modelslim`                                                        |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 16384` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g., `--cuda-graph-bs 16` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 16` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                      |
 | DP LM Head                    | `--enable-dp-lm-head`                                                             |
@@ -220,7 +220,7 @@ python3 -m sglang.launch_server \
         --mem-fraction-static 0.7 \
         --port 8000 \
         --served-model-name glm-5 \
-        --cuda-graph-bs 16 \
+        --cuda-graph-bs-decode 16 \
         --quantization modelslim \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
@@ -302,7 +302,7 @@ do
         --mem-fraction-static 0.8 \
         --port 8000 \
         --served-model-name glm-5 \
-        --cuda-graph-max-bs 32 \
+        --cuda-graph-max-bs-decode 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --speculative-draft-model-quantization unquant \
@@ -421,8 +421,8 @@ do
         --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
-        --cuda-graph-max-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
-        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
         NODE_RANK=$i

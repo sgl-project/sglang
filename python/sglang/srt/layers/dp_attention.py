@@ -17,7 +17,6 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
-    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -72,7 +71,7 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    get_parallel().stamp_derived_widths(attn_dp_size=new_dp_size)
+    get_parallel().override_permanently(attn_dp_size=new_dp_size)
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -351,7 +350,8 @@ def compute_dp_attention_world_info(
     """This rank's place in the attention topology, plus the widths it sits in.
 
     The widths come from `derive_attention_widths`; what this adds is the two
-    ranks, which are per-process and so are not part of the stamped set.
+    ranks, which are per-process and so are not among the widths
+    `override_permanently` records.
     """
     attn_dp_size, attn_tp_size = derive_attention_widths(
         tp_size=tp_size,
@@ -392,7 +392,7 @@ def initialize_dp_attention(
     _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    get_parallel().stamp_derived_widths(attn_dp_size=_ATTN_DP_SIZE)
+    get_parallel().override_permanently(attn_dp_size=_ATTN_DP_SIZE)
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
@@ -821,12 +821,19 @@ def _dp_gather_via_all_gatherv(
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
+def _note_dp_gather_in_prefill_graph() -> None:
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_dp_gather = True
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    _note_dp_gather_in_prefill_graph()
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
@@ -884,6 +891,7 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    _note_dp_gather_in_prefill_graph()
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
@@ -900,6 +908,7 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    _note_dp_gather_in_prefill_graph()
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
         # global (sum_len) tensor back to per-rank token counts. Fall through to
@@ -1036,14 +1045,6 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
-
-
-def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
-
-
-def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

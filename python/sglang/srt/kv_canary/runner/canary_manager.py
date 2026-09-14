@@ -64,6 +64,7 @@ class CanaryManager:
         self._model_forward_bracket_depth: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
+        self._launch_capacities = launch_capacities
 
         self._device_state = CanaryDeviceState.allocate(
             config=config,
@@ -165,6 +166,11 @@ class CanaryManager:
                 is_eagle_draft_decode=is_eagle_draft_decode,
             )
             for _ in range(num_sfms)
+        )
+
+    def per_forward_workspace_bytes(self) -> int:
+        return self._launch_capacities.per_forward_workspace_bytes(
+            num_buffer_groups=len(self._buffer_groups)
         )
 
     @contextlib.contextmanager

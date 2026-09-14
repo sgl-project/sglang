@@ -365,7 +365,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
-        metadata.c1_flashmla_metadata = object()
+        metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
         return metadata
@@ -377,10 +377,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         from sglang.srt.server_args import ServerArgs
 
-        # cg-refactor folded the legacy enable_breakable_cuda_graph flag
-        # into cuda_graph_config. Verify the per-phase backend selectors
-        # default to None (i.e. nothing opted into BREAKABLE without an
-        # explicit CLI flag).
+        # Breakable graphs require explicit opt-in for each phase.
         sa = ServerArgs(model_path="dummy")
         self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
         self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
@@ -519,7 +516,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
+            "c0_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
@@ -604,6 +601,30 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        model_runner = SimpleNamespace()
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+        ):
+            # Prefill chunk / max_prefill_tokens dominates.
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
+            # Decode rows = requests x draft tokens dominate.
+            schedule.max_running_requests = 8192
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+
+        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
+            trtllm._check_trtllm_query_rows(64)
+            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+                trtllm._check_trtllm_query_rows(65)
+
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,
@@ -660,13 +681,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
-    """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
-
-    The KV-store consumers run in paths that never invoke
-    `init_forward_metadata_in_graph` (eager idle, runners that only run the
-    out-graph prep) or whose batch is re-padded after init (DP attention).
-    The resolver must use the per-forward cached value only when it is
-    provably current and fall back to translating `out_cache_loc` otherwise.
+    """SWA writes must translate live locations for idle or missing/mismatched caches.
+    A matching cache on an active forward must be reused.
     """
 
     def _make_backend(self, mapping: torch.Tensor):

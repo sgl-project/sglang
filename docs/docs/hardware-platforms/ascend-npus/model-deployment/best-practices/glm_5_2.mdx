@@ -171,12 +171,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-max-bs 8 \
+        --cuda-graph-max-bs-decode 8 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 8 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \

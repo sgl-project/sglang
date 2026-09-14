@@ -2,6 +2,7 @@
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
 import os
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -39,6 +40,14 @@ class NPUPlatformBase(Platform):
     device_type: str = "npu"
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        return t.is_npu
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:

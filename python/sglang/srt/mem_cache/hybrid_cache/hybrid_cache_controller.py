@@ -39,6 +39,8 @@ from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+from sglang.srt.mem_cache.utils import get_storage_hash_str
+
 logger = logging.getLogger(__name__)
 
 
@@ -576,7 +578,7 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        hash_value = self.get_hash_str(
+        hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value

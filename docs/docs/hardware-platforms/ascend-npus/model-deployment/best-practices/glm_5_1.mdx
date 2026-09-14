@@ -307,12 +307,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 \
+        --cuda-graph-bs-decode 1 2 3 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 16 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -507,12 +506,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 \
+        --cuda-graph-bs-decode 1 2 3 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -719,12 +717,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 \
+        --cuda-graph-bs-decode 1 2 3 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 16 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -921,12 +918,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 \
+        --cuda-graph-bs-decode 1 2 3 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 16 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -1120,12 +1116,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 \
+        --cuda-graph-bs-decode 1 2 3 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -1330,12 +1325,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 4 5 6 \
+        --cuda-graph-bs-decode 1 2 3 4 5 6 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 32 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
@@ -1540,12 +1534,11 @@ do
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
-        --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 \
+        --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 \
         --disaggregation-transfer-backend ascend \
         --watchdog-timeout 9000 \
         --context-length 180000 \
         --tokenizer-worker-num 4 \
-        --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \

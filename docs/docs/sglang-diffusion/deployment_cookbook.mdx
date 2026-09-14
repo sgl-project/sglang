@@ -132,7 +132,7 @@ See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served
 
 The modes tune native pipeline components declared to the component residency manager. DiTs, text/image encoders, VAEs, vocoders, adapters, and upsamplers can use layerwise offload when their native module declares its executable layer structure. Explicitly selecting an unsupported component fails at startup instead of falling back to another residency mode.
 
-For direct control, assign one of `resident`, `component-offload`, or `layerwise-offload` with `--component-residency COMPONENT=MODE`:
+For direct control, assign one of `resident`, `component-offload`, `snapshot-offload`, or `layerwise-offload` with `--component-residency COMPONENT=MODE`:
 
 ```bash
 sglang generate \

@@ -1847,6 +1847,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
+        # Injected backends (e.g. Ray) route metrics out of process and can't
+        # introspect prometheus_client buckets here.
+        if self._histogram_cls is not None:
+            return False
         his = self.histogram_time_to_first_token.labels(
             **self.labels, is_streaming="true"
         )
@@ -1865,10 +1869,17 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
         adjusted_interval = internval / num_new_tokens
+        his = self.histogram_inter_token_latency.labels(**labels)
+
+        if self._histogram_cls is not None:
+            # Injected backend (e.g. Ray): the bucket internals below don't
+            # exist, so use the public observe() API.
+            for _ in range(num_new_tokens):
+                his.observe(adjusted_interval)
+            return
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
         # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
-        his = self.histogram_inter_token_latency.labels(**labels)
         his._sum.inc(internval)
 
         for i, bound in enumerate(his._upper_bounds):

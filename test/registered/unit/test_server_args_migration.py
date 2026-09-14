@@ -151,10 +151,88 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 ]
             )
 
-    def test_deprecated_flags_still_work(self):
-        """Deprecated flags set the correct dest field."""
-        sa = self._parse(["--stream-output"])
-        self.assertTrue(sa.incremental_streaming_output)
+    def test_the_deprecated_flag_still_reaches_its_replacement(self):
+        """`--disable-cuda-graph` is the one deprecated alias left standing.
+
+        It is worth a test because it is not a rename. The flag writes
+        `disable_cuda_graph`, which is `no_cli=True` -- so this spelling is its
+        only way in -- and the cuda-graph hook is what turns that into the two
+        phase backends the replacement flag sets directly. Asserting the
+        backends, against the baseline of not passing it, covers that second
+        half; asserting the dest alone would not.
+        """
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            default_prefill_backend,
+        )
+
+        def backends(argv):
+            sa = self._parse(argv)
+            parse_cuda_graph_config(sa)
+            config = resolution_result(sa, "cuda_graph_config")
+            return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
+
+        # Not a literal: the prefill default is BREAKABLE on CUDA and
+        # TC_PIECEWISE elsewhere, and this file runs on the CPU runner.
+        self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
+        self.assertEqual(
+            backends(["--disable-cuda-graph"]),
+            (True, Backend.DISABLED, Backend.DISABLED),
+        )
+
+    def test_each_deprecation_shape_does_its_job(self):
+        """The four `Deprecated*Action` shapes, on a throwaway parser.
+
+        Only `DeprecatedStoreTrueAction` has a registration in `ServerArgs`
+        today (`--disable-cuda-graph`, covered above). The other three are kept
+        for the next flag that needs them, which makes this the only thing
+        standing between them and silent rot -- and it doubles as the worked
+        example of which shape to reach for.
+        """
+        from sglang.srt.arg_groups.argparse_actions import (
+            DeprecatedAction,
+            DeprecatedAliasStoreAction,
+            DeprecatedStoreConstAction,
+            DeprecatedStoreTrueAction,
+        )
+
+        def parser_with(**kwargs):
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--old", **kwargs)
+            return parser
+
+        # An old boolean whose field survives.
+        args = parser_with(
+            action=DeprecatedStoreTrueAction, dest="new", new_flag="--new"
+        ).parse_args(["--old"])
+        self.assertIs(args.new, True)
+
+        # An old boolean replaced by one value of a valued flag.
+        args = parser_with(
+            action=DeprecatedStoreConstAction,
+            dest="backend",
+            const_value="disabled",
+            new_flag="--backend",
+        ).parse_args(["--old"])
+        self.assertEqual(args.backend, "disabled")
+
+        # An old valued flag, renamed: the value survives the move.
+        args = parser_with(
+            action=DeprecatedAliasStoreAction, dest="new", new_flag="--new"
+        ).parse_args(["--old", "fa3"])
+        self.assertEqual(args.new, "fa3")
+
+        # Retired outright: stop, and say what to use instead.
+        parser = parser_with(
+            action=DeprecatedAction, dest="gone", error_message="use --new instead"
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--old"])
+
+        # Without a message it is a no-op that warns rather than a hard stop.
+        args = parser_with(action=DeprecatedAction, dest="gone").parse_args(["--old"])
+        self.assertIsNone(args.gone)
 
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""

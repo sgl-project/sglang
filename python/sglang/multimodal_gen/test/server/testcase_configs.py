@@ -127,6 +127,11 @@ class ScenarioConfig:
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
+    # Per-case override for the wall-clock tolerances (e2e, denoise and stage
+    # timings) when a case's runtime is dominated by shared-runner host I/O
+    # rather than by the code under test. Memory guards keep the profile
+    # tolerance -- they are what such a case actually protects.
+    timing_tolerance: float | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -148,6 +153,7 @@ class ScenarioConfig:
             runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            timing_tolerance=optional_float("timing_tolerance"),
         )
 
 
@@ -312,11 +318,7 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
-    # Send the request this many times in one server session; performance and
-    # consistency are validated on the last one. >1 asserts a warm second
-    # request meets the same baselines -- a leak in residency arming, courier
-    # in-flight tracking, or host copies shows up as the second request
-    # degrading or dying.
+    # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -328,6 +330,8 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
         if self.sampling_params is None:
             object.__setattr__(
                 self,

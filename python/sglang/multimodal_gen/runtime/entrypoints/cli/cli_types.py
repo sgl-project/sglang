@@ -5,7 +5,7 @@
 
 import argparse
 
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 class CLISubcommand:

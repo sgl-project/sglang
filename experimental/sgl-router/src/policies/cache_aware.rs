@@ -75,7 +75,9 @@ impl CacheAwarePolicy {
         if let Some((selector, request)) = ctx.prefill_cache_bucket() {
             candidates = candidates
                 .into_iter()
-                .filter_map(|candidate| selector.bind_prefill_cache_candidate(candidate, request))
+                .filter_map(|candidate| {
+                    selector.prepare_prefill_cache_candidate(candidate, request)
+                })
                 .collect();
         }
 

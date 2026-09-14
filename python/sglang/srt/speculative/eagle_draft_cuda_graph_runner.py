@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -139,6 +140,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []  # disables patch_model torch.compile wrapping
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -342,6 +344,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
@@ -667,7 +670,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
         # each speculative step).  The glue-graph optimisation is not applied
         # here — see __init__ comment for why.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        self.draft_attn_backend.init_forward_metadata_out_graph(
+            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
+        )
         self.raw_bs = raw_bs
         self.bs = bs
 

@@ -75,6 +75,7 @@ class _RecordingKVManager:
         self.is_mla_backend = False
         self.is_hybrid_mla_backend = False
         self.enable_custom_mem_pool = False
+        self.max_transfer_batch_indices = 0
         self.pp_size = pp_size
         self.kv_args = SimpleNamespace(prefill_start_layer=prefill_start_layer)
         self.blocks = []

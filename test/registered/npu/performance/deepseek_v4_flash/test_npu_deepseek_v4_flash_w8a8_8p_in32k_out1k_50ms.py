@@ -25,6 +25,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
@@ -80,7 +81,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--kv-cache-dtype",
     "bfloat16",
     "--skip-server-warmup",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

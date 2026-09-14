@@ -21,13 +21,13 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    is_port_available,
+from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.multimodal_gen.runtime.utils.process import (
+    kill_itself_when_parent_died,
     kill_process_tree,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 
 _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10

@@ -441,7 +441,10 @@ class GroupCoordinator:
         if current_platform.is_cpu() and is_shm_available(
             input_.dtype, self.world_size, len(self.ranks)
         ):
-            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            output_tensor = torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            if separate_tensors:
+                return list(output_tensor.chunk(world_size, dim=dim))
+            return output_tensor
         else:
             all_gather_single(output_tensor, input_, group=self.device_group)
 

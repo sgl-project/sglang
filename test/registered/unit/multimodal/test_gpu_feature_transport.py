@@ -1016,6 +1016,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.tokenizer = object()
+        scheduler.disable_radix_cache = False
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
         scheduler._get_multimodal_inputs = MagicMock(

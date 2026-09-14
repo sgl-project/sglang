@@ -624,10 +624,19 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "unified layout has no per-layer contiguous regions; "
-            "KV transfer / disaggregation is unsupported."
-        )
+        """PD-transfer registration: ONE entry, the raw buffer, addressed as
+        ``raw_ptr + physical_page_id * page_envelope_bytes``.
+
+        Same whole-envelope contract as `UnifiedMLATokenToKVPool`: the transfer
+        item is one page across ALL layers and both K and V, because the
+        per-layer views overlap inside the envelope and index in kernel-facing
+        ids. A peer must therefore build an identical spec -- enforced on the
+        wire by `_validate_envelope_kv_layout`.
+        """
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError(
@@ -1063,11 +1072,35 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape=None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
+        if short_conv_layer_ids or ngram_context_len:
+            raise ValueError(
+                "Qwen4-Exp PLE side states are not supported with "
+                "--enable-unified-memory"
+            )
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        self.short_conv_pool = ShortConvPool(
+            size=0,
+            state_shape=None,
+            layer_ids=[],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.ngram_pool = NGramPool(
+            size=0,
+            context_len=0,
+            eos_token_id=0,
+            device=device,
+        )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
@@ -1106,6 +1139,15 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """This pool's ids ARE virtual; page_size is 1, so the translate is the
+        plain gather this table serves, which keeps `mamba_translate_is_fusable`
+        true despite the override."""
+        if self.mamba_allocator is None:
+            return None
+        return self.mamba_allocator.virtual_to_physical
 
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         """Virtual mamba ids -> physical slot ids."""
@@ -1849,6 +1891,7 @@ def init_unified_mamba_swa_pools(
     lazy_compaction: bool = False,
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    decode_pre_alloc_size: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -1974,6 +2017,7 @@ def init_unified_mamba_swa_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        pre_alloc_size=decode_pre_alloc_size,
     )
     allocator = UnifiedMambaSWATokenToKVPoolAllocator(
         unified_buffer=shared_pool,

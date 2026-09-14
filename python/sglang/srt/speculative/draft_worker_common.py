@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_spec
+from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -36,13 +36,17 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags.
     """
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    platform_fallback = (
+        "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
+    )
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return platform_fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
-        fallback = "triton" if torch.version.hip else "flashinfer"
+        fallback = platform_fallback
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",

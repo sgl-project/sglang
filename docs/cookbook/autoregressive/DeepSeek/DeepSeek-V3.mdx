@@ -392,7 +392,7 @@ python3 -m sglang.launch_server \
 The default configuration is `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Find the best values for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). The minimum viable config is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`.
 
 <Note>
-For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs` to include your target batch sizes (default captured sizes for speculative decoding: 48).
+For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs-decode` to include your target batch sizes (default captured sizes for speculative decoding: 48).
 </Note>
 
 <Tip>
@@ -404,7 +404,7 @@ The spec-v2 overlap scheduler is enabled by default. It improves performance by 
 DeepSeek V3 uses [Multi-head Latent Attention (MLA)](https://arxiv.org/pdf/2405.04434), an attention mechanism that improves inference efficiency. SGLang implements several optimizations:
 
 - **Weight Absorption:** Reorders matrix multiplications to improve decoding phase efficiency.
-- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, CutlassMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
+- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
 - **FP8 Quantization:** W8A8 FP8 and KV Cache FP8, with BMM operators for weight-absorbed MLA in FP8.
 - **CUDA Graph & Torch.compile:** Both MLA and MoE support CUDA Graph and Torch.compile for reduced decoding latency.
 - **Chunked Prefix Cache:** Increases throughput for long-sequence chunked prefill (FlashAttention3 backend only).

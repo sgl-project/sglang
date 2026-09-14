@@ -397,6 +397,12 @@ class ComponentLoader(ABC):
             ComponentAttentionBackendNotAppliedError,
             ComponentCheckpointUnsupportedError,
             ComponentResidencyError,
+            # the native fallback answers "there is no customized implementation
+            # for this architecture"; a checkpoint that cannot be read is a
+            # different failure and the fallback cannot read it either, so let
+            # the original error name the file instead of reporting it as a
+            # missing implementation
+            OSError,
         ):
             raise
         except Exception as e:

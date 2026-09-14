@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from openai import Client
 
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
+from sglang.multimodal_gen.runtime.realtime.video import (
     RAW_RGB_CONTENT_TYPE,
     RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,

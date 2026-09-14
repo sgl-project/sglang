@@ -18,9 +18,8 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# Fixed segment slots (one per request) baked into the captured prefill LoRA
-# kernel grids; batches with more requests fall back to eager prefill.
-PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
+# Match the dense kernels' token tile.
+PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE = 16
 
 
 class TritonLoRABackend(BaseLoRABackend):
@@ -55,7 +54,11 @@ class TritonLoRABackend(BaseLoRABackend):
         return embedding_lora_a_fwd(
             input_ids=input_ids,
             weights=weights,
-            batch_info=self.batch_info,
+            batch_info=(
+                self._sgemm_info()
+                if self.batch_info is self.prefill_cuda_graph_batch_info
+                else self.batch_info
+            ),
             vocab_size=vocab_size,
             extra_embeddings=extra_embeddings,
         )
@@ -163,7 +166,7 @@ class TritonLoRABackend(BaseLoRABackend):
     ):
         max_tokens = max_bs_in_cuda_graph * num_tokens_per_req
         mlpb = self.max_loras_per_batch
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,
@@ -200,8 +203,10 @@ class TritonLoRABackend(BaseLoRABackend):
                 permutation=torch.zeros(max_tokens, dtype=torch.int32),
             )
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        num_slots = PREFILL_CUDA_GRAPH_LORA_SEGMENTS
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
+        num_slots = max_num_tokens if max_num_requests is None else max_num_requests
         mlpb = self.max_loras_per_batch
         with torch.device(self.device):
             # bs pinned at num_slots so the captured grids cover any replay
@@ -217,6 +222,22 @@ class TritonLoRABackend(BaseLoRABackend):
                 lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
                 scalings=torch.zeros(mlpb, dtype=torch.float),
                 permutation=None,
+            )
+            chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
+            # Ragged request boundaries need up to num_slots - 1 extra tiles.
+            num_chunks = min(
+                max_num_tokens,
+                (max_num_tokens + chunk_size - 1) // chunk_size + num_slots - 1,
+                65535,
+            )
+            self.prefill_cuda_graph_sgemm_batch_info = dataclasses.replace(
+                self.prefill_cuda_graph_batch_info,
+                bs=num_chunks,
+                num_segments=num_chunks,
+                max_len=chunk_size,
+                seg_lens=torch.zeros(num_chunks, dtype=torch.int32),
+                seg_indptr=torch.zeros(num_chunks + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(num_chunks, dtype=torch.int32),
             )
         self.prefill_cuda_graph_max_bs = num_slots
         self.prefill_cuda_graph_max_tokens = max_num_tokens
@@ -357,6 +378,39 @@ class TritonLoRABackend(BaseLoRABackend):
             self.compute_sgemm_routing(use_cuda_graph)
         else:
             self.sgemm_batch_info = None
+            if use_prefill_cuda_graph:
+                sgemm = self.prefill_cuda_graph_sgemm_batch_info
+                chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
+                num_tokens = max(1, forward_batch.extend_num_tokens)
+                num_chunks = min(
+                    num_tokens,
+                    (num_tokens + chunk_size - 1) // chunk_size
+                    + self.prefill_cuda_graph_max_bs
+                    - 1,
+                )
+                # Larger grids keep the request view to fit CUDA's y/z limit.
+                if num_chunks <= sgemm.seg_lens.numel():
+                    indices, lengths = merge_and_chunk_segments(
+                        weight_indices, forward_batch.extend_seq_lens_cpu, chunk_size
+                    )
+                    num_segments = len(lengths)
+                    sgemm.bs = num_chunks
+                    sgemm.num_segments = num_segments
+                    sgemm.weight_indices[:num_segments].copy_(
+                        torch.tensor(
+                            indices, dtype=torch.int32, pin_memory=True, device="cpu"
+                        ),
+                        non_blocking=True,
+                    )
+                    sgemm.seg_lens[:num_segments].copy_(
+                        torch.tensor(
+                            lengths, dtype=torch.int32, pin_memory=True, device="cpu"
+                        ),
+                        non_blocking=True,
+                    )
+                    sgemm.seg_lens[num_segments:].zero_()
+                    torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
+                    self.sgemm_batch_info = sgemm
 
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)

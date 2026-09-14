@@ -373,7 +373,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
 
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
     """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice with
-    host-int, page-aligned bounds, so `free_swa(..., start_pos=)` must reach the
+    host-int, page-aligned bounds, so `free_swa_segment` must reach the
     swa side with caller-derived page ids: no `torch.unique` and no stale-slot
     `.item()` on the per-step path.
     """
@@ -429,15 +429,15 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
-            alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
+            alloc.free_swa_segment(v[: 4 * self.PS], start_pos=0)
+            alloc.free_swa_segment(v[4 * self.PS :], start_pos=4 * self.PS)
 
     def test_full_only_segment_free_never_syncs(self):
         """Request-finish shape: the swa side is already tombstoned, so the
         full side must free by page reps rather than `free_full`'s dedup."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v, start_pos=0)
+        alloc.free_swa_segment(v, start_pos=0)
         before = alloc.full_available_size()
         with (
             mock.patch.object(
@@ -456,7 +456,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         with self.assertRaises(AssertionError):
-            alloc.free_swa(v[1 : 5 * self.PS], start_pos=1)
+            alloc.free_swa_segment(v[1 : 5 * self.PS], start_pos=1)
 
     def test_start_pos_path_matches_the_fallback_end_state(self):
         """Derived property: the stride-rep path and the dedup fallback leave
@@ -468,7 +468,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 v1 = a1.alloc(6 * self.PS)
                 v2 = a2.alloc(6 * self.PS)
                 self.assertTrue(torch.equal(v1, v2))
-                a1.free_swa(v1[: 4 * self.PS], start_pos=0)
+                a1.free_swa_segment(v1[: 4 * self.PS], start_pos=0)
                 a2.free_swa(v2[: 4 * self.PS])  # fallback (radix shape)
                 self.assertTrue(
                     torch.equal(
@@ -487,8 +487,8 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         liveness filter (radix eviction and the ratchet can overlap)."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(4 * self.PS)
-        alloc.free_swa(v, start_pos=0)
-        alloc.free_swa(v, start_pos=0)  # all tombstoned -> filtered to empty
+        alloc.free_swa_segment(v, start_pos=0)
+        alloc.free_swa_segment(v, start_pos=0)  # all tombstoned -> filtered to empty
 
 
 @unittest.skipUnless(

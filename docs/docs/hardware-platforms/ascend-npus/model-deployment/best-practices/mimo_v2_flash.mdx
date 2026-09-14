@@ -129,7 +129,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -159,7 +159,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -314,7 +314,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -344,7 +344,7 @@ do
         --max-running-requests 32 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -499,7 +499,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -529,7 +529,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -684,7 +684,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -714,7 +714,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \

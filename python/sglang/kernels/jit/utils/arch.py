@@ -42,7 +42,7 @@ def _jit_cuda_version() -> tuple[int, ...]:
     """CUDA version of the nvcc that JIT builds actually run.
 
     The target has to match the compiler, not the toolkit PyTorch was built
-    against: a cu129 wheel on a CUDA 12.8 toolkit would otherwise select
+    against: a cu130 wheel on a CUDA 12.8 toolkit would otherwise select
     `sm_120f`, which nvcc 12.8 rejects. Resolve nvcc the way tvm-ffi does
     (`CUDA_HOME` / `CUDA_PATH`, then `$PATH`, then `/usr/local/cuda`) and fall
     back to `torch.version.cuda` when it cannot be probed.

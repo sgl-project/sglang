@@ -111,6 +111,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -247,8 +248,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
-        del forward, stream_idx, variant_label
+        del forward, stream_idx, variant_label, attention_variant
         buffers = self.buffers
         request_bs = size
         expanded_bs = request_bs * self.captured_req_width
