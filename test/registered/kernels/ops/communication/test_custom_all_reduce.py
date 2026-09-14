@@ -188,7 +188,7 @@ def test_custom_all_reduce(
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
+    comm.force_algo(algo)
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
