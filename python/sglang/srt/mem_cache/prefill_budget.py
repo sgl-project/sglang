@@ -381,7 +381,7 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
         finishes = candidate >= extend_input_len
         headroom = max_new_tokens if finishes else 0
         if self._fits(
-            self.ceil_paged_tokens(candidate) + headroom + self.page_size,
+            candidate + headroom + self.page_size,
             self.swa_tokens(candidate, headroom, chunk_limit=chunk_limit),
         ):
             return chunk_limit
@@ -400,6 +400,6 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
         chunk_limit: int | None,
     ) -> bool:
         return self._fits(
-            paged_input + max_new_tokens + self.page_size,
+            extend_input_len + max_new_tokens + self.page_size,
             self.swa_tokens(extend_input_len, max_new_tokens, chunk_limit=chunk_limit),
         )

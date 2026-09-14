@@ -1,11 +1,15 @@
 """CPU regressions for allocator-owned prefill admission and pending demand."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -19,12 +23,14 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _shared_allocator():
+def _shared_allocator(*, page_size=4, total_bytes=1024):
     return init_unified_swa_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
@@ -34,12 +40,12 @@ def _shared_allocator():
         swa_head_num=1,
         swa_head_dim=4,
         swa_v_head_dim=4,
-        page_size=4,
+        page_size=page_size,
         start_layer=0,
         end_layer=2,
         swa_attention_layer_ids=[1],
         full_attention_layer_ids=[0],
-        total_bytes=1024,
+        total_bytes=total_bytes,
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
@@ -137,6 +143,76 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         self.allocator.evict_to_free_tokens = MagicMock()
         evict_from_tree_cache(self.cache, 8)
         self.allocator.evict_to_free_tokens.assert_called_once_with(self.cache, 8)
+
+
+class TestSharedPrefillAdmission(unittest.TestCase):
+    def _new_admission(self, page_size, pool_pages, *, ignore_eos=False):
+        allocator = _shared_allocator(
+            page_size=page_size, total_bytes=pool_pages * page_size * 16
+        )
+        req = Req(
+            rid="unaligned-prompt",
+            origin_input_text=None,
+            origin_input_ids=array("q", [1] * (page_size + 1)),
+            sampling_params=SamplingParams(max_new_tokens=1, ignore_eos=ignore_eos),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_req_len = 16 * page_size
+        scheduler.max_total_num_tokens = allocator.size_full
+        scheduler.page_size = page_size
+        scheduler.max_new_tokens_limit = None
+        scheduler.sliding_window_size = page_size
+        scheduler.chunked_prefill_size = page_size
+        scheduler.token_to_kv_pool_allocator = allocator
+        with get_parallel().override(attn_dcp_size=1):
+            scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
+        req._refresh_fill_ids()
+
+        cache = SimpleNamespace(
+            sliding_window_size=page_size,
+            disable=True,
+            full_evictable_size=lambda: 0,
+            swa_evictable_size=lambda: 0,
+            is_chunk_cache=lambda: True,
+            supports_mamba=lambda: False,
+        )
+        adder = PrefillAdder(
+            page_size=page_size,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=16 * page_size,
+            rem_chunk_tokens=page_size,
+        )
+        return allocator, req, adder
+
+    def test_unaligned_final_chunk_makes_progress(self):
+        for page_size in (4, 64):
+            with self.subTest(page_size=page_size):
+                allocator, req, adder = self._new_admission(page_size, pool_pages=7)
+                req.prefix_indices = allocator.alloc(page_size)
+                self.assertIsNotNone(req.prefix_indices)
+                self.assertTrue(allocator.can_reserve(page_size + 2, page_size + 2))
+
+                self.assertIsNone(adder.add_chunked_req(req))
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(req.extend_range.length, 1)
+
+    def test_unaligned_ignore_eos_enters_empty_pool(self):
+        for page_size in (4, 64):
+            with self.subTest(page_size=page_size):
+                allocator, req, adder = self._new_admission(
+                    page_size, pool_pages=6, ignore_eos=True
+                )
+                self.assertEqual(len(req.prefix_indices), 0)
+                self.assertTrue(allocator.can_reserve(2 * page_size + 2, 2 * page_size))
+
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(adder.can_run_list, [req])
 
 
 class TestFixedPrefillMemoryBudget(unittest.TestCase):
