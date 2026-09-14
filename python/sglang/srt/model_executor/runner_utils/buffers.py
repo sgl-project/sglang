@@ -28,12 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    NgramEmbeddingInfo,
-    PPProxyTensors,
-    compute_local_num_token_non_padded,
-)
+from sglang.srt.model_executor.forward_batch_info import NgramEmbeddingInfo
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
@@ -241,118 +236,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
-    def populate_from_forward_batch(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        raw_bs: int,
-        raw_num_token: int,
-        bs: int,
-        seq_len_fill_value: int,
-        require_gathered_buffer: bool,
-        num_tokens_per_req: int,
-        dsa_enable_prefill_cp: bool,
-        enable_num_token_non_padded_flag: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
-        if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            if self.mamba_track_indices is not None:
-                self.mamba_track_indices.zero_()
-            if self.mamba_track_mask is not None:
-                self.mamba_track_mask.fill_(False)
-
-        # Build batched copy lists for all GPU tensors.
-        dsts = [
-            self.input_ids[:raw_num_token],
-            self.req_pool_indices[:raw_bs],
-            self.seq_lens[:raw_bs],
-            self.out_cache_loc[:raw_num_token],
-            self.positions[:raw_num_token],
-        ]
-        srcs = [
-            forward_batch.input_ids,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-        ]
-
-        if self.ngram_embedding_info is not None:
-            ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
-                ngram_embedding_info.column_starts
-            )
-            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
-                ngram_embedding_info.req_lens
-            )
-
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            dsts.append(self.mamba_track_indices[:raw_bs])
-            srcs.append(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            dsts.append(self.mamba_track_mask[:raw_bs])
-            srcs.append(forward_batch.mamba_track_mask)
-
-        if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            dsts.append(self.encoder_lens[:raw_bs])
-            srcs.append(forward_batch.encoder_lens)
-
-        if forward_batch.mrope_positions is not None:
-            dsts.append(self.mrope_positions[:, :raw_num_token])
-            srcs.append(forward_batch.mrope_positions)
-
-        if self.rids_int is not None and forward_batch.rids_int is not None:
-            dsts.append(self.rids_int[:raw_bs])
-            srcs.append(forward_batch.rids_int)
-        if (
-            self.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
-        ):
-            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
-            srcs.append(forward_batch.bootstrap_room_ids_int)
-
-        if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_req)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_req)
-
-        if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not dsa_enable_prefill_cp:
-                num_tokens_per_dp = bs * num_tokens_per_req
-                local = compute_local_num_token_non_padded(
-                    global_num_token_non_padded=forward_batch.num_token_non_padded,
-                    num_tokens_per_dp=num_tokens_per_dp,
-                    sharded=forward_batch.attn_tp_sequence_sharded,
-                )
-                dsts.append(self.num_token_non_padded)
-                srcs.append(local)
-            else:
-                dsts.append(self.num_token_non_padded)
-                srcs.append(forward_batch.num_token_non_padded)
-
-        # Pipeline-parallel proxy tensors.
-        if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
-            for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
-                dim = src.shape[0]
-                dsts.append(buf[:dim])
-                srcs.append(src)
-
-        # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
-
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-
 
 @dataclass
 class PrefillInputBuffers(ForwardInputBuffers):
@@ -437,50 +320,3 @@ class PrefillInputBuffers(ForwardInputBuffers):
             mrope_positions=mrope_positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
-    def populate_from_forward_batch(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        raw_num_tokens: int,
-        static_num_tokens: int,
-        is_multimodal: bool,
-    ) -> None:
-        """Copy serving-batch values into static buffers and zero out
-        the padding region between raw_num_tokens and
-        static_num_tokens.
-        """
-        if static_num_tokens != raw_num_tokens:
-            self.out_cache_loc.zero_()
-            self.input_ids[raw_num_tokens:static_num_tokens].zero_()
-            self.positions[raw_num_tokens:static_num_tokens].zero_()
-            if is_multimodal:
-                self.input_embeds[raw_num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
-                self.mrope_positions[:, raw_num_tokens:static_num_tokens].zero_()
-
-        bs = forward_batch.batch_size
-
-        self.input_ids[:raw_num_tokens].copy_(forward_batch.input_ids)
-        self.positions[:raw_num_tokens].copy_(forward_batch.positions)
-        self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
-
-        if self.mamba_track_indices is not None:
-            if forward_batch.mamba_track_indices is not None:
-                self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-            self.mamba_track_indices[bs:].zero_()
-        if self.mamba_track_mask is not None:
-            if forward_batch.mamba_track_mask is not None:
-                self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-            else:
-                self.mamba_track_mask[:bs].zero_()
-            self.mamba_track_mask[bs:].zero_()
-        if self.mamba_track_seqlens is not None:
-            if forward_batch.mamba_track_seqlens is not None:
-                self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
-            self.mamba_track_seqlens[bs:].zero_()
-
-        if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_num_tokens].copy_(
-                forward_batch.mrope_positions
-            )

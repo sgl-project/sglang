@@ -29,6 +29,7 @@ from sglang.kernels.ops.diffusion import (
     mount_hunyuan_qknorm,
     mount_lingbot_video_gated_residual,
     mount_lingbot_video_rmsnorm,
+    mount_ltx2_qknorm_split_rope,
     mount_ltx2_rms_norm_modulate,
     mount_nvfp4_bias_gelu,
     mount_qwen_image_added_qkv,
@@ -41,6 +42,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_hunyuan_qknorm,
     unmount_lingbot_video_gated_residual,
     unmount_lingbot_video_rmsnorm,
+    unmount_ltx2_qknorm_split_rope,
     unmount_ltx2_rms_norm_modulate,
     unmount_nvfp4_bias_gelu,
     unmount_qwen_image_added_qkv,
@@ -124,6 +126,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -150,10 +156,6 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.component_load import (
-    load_transformer_if_needed,
-    register_loaded_transformer,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -203,6 +205,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused LN+modulate (affine folding)",
         mount_fused_ln_modulate,
         unmount_fused_ln_modulate,
+    ),
+    (
+        "LTX-2 Hopper QKNorm+split-RoPE",
+        mount_ltx2_qknorm_split_rope,
+        unmount_ltx2_qknorm_split_rope,
     ),
     (
         "LTX-2 fused RMSNorm+modulate",
@@ -333,6 +340,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     @property
     def role_affinity(self):
         return RoleType.DENOISER
+
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
 
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
@@ -2242,6 +2254,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 len(cfg_policy.branches) == 2
                 and get_classifier_free_guidance_world_size() == 2
+                and not cfg_policy.parallel_uses_serial_arithmetic
             ):
                 return run_two_branch_cfg_parallel(
                     cfg_policy,

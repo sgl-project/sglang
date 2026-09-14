@@ -143,6 +143,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             else:
                 overrides["page_size"] = 64
                 logger.warning("Setting page size to 64 for DeepSeek DSA.")
+        elif get_platform().is_xpu:
+            overrides["page_size"] = 128
+            logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
     else:
         # DeepSeek V3/R1/V3.1
         if get_platform().is_sm100:

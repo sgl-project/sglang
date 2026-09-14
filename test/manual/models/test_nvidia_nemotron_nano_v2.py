@@ -34,7 +34,7 @@ class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
         "256",
         "--mem-fraction-static",
         "0.8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
     ]
 
@@ -88,7 +88,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
     other_args = SPECULATIVE_DECODING_OTHER_ARGS + [
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
     ]
 

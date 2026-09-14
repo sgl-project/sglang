@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -153,11 +155,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         )
         # Host-pool retraction transfers full and sliding-window components
         # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        #
+        # The unified pool is excluded for the same reason hierarchical cache is
+        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
+        # device buffers with the ids it is handed, and under the unified pool
+        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
+        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
+        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
+        # asks for 418 GB of host memory per component.
+        supports_host_pool = (
+            not uses_ssm_state(tp_worker.model_runner.model_config)
+            and not memory.enable_unified_memory
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -312,8 +324,8 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,
