@@ -261,19 +261,15 @@ def fp8_mqa_logits_make_fused_kv(
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
 
 
-# ---- MQA-logits memory budget, shared by the DSA and DSV4 indexers ----------
-# The indexer scores every query row against every key column into one fp32
-# logits matrix that no pool sized by mem_fraction_static accounts for.
+# MQA-logits memory budget shared by the DSA and DSV4 indexers.
 MQA_LOGITS_BYTES_PER_ELEM = 4
-# Below this many elements the matrix cannot threaten the free remainder, so
-# callers skip the mem_get_info host sync entirely.
 MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
 MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
 # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
 MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
 # DeepGEMM pads the logits row stride to 1024 bytes, i.e. 256 fp32 columns.
 MQA_LOGITS_ROW_ALIGN_ELEMS = 256
-# Arbitrary floor so a tiny budget cannot degrade into hundreds of launches.
+# Arbitrary; keeps a tiny budget from degrading into hundreds of launches.
 MQA_LOGITS_MIN_ROWS_PER_CHUNK = 128
 
 
@@ -308,11 +304,8 @@ def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
 
 
 def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
-    """Static budget further capped by the memory free right now.
-
-    The free-memory read (``mem_get_info``) synchronizes the host, so callers
-    pass ``allow_sync=False`` inside CUDA graph capture. XPU has no such query.
-    """
+    """Static budget capped by current free memory; mem_get_info syncs, so
+    callers pass allow_sync=False under CUDA graph capture."""
     budget = mqa_logits_static_budget_bytes(device_index=device_index)
     if allow_sync and not is_xpu():
         free_mem, _ = torch.cuda.mem_get_info(device_index)
