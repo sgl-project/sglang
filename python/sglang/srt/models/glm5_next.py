@@ -1231,6 +1231,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 return "Shared experts fusion requires CUDA or opted-in gfx942 AITER."
             if text_config.n_shared_experts != 1:
                 return "The gfx942 path supports exactly one fused shared expert."
+            # CK stage1 currently ignores this argument. Keep the separate
+            # shared expert (and its clamp) until a native clamped path qualifies.
+            if getattr(text_config, "swiglu_limit", None) is not None:
+                return "The gfx942 fused shared-expert path does not support clamping."
             if quant_config is not None and (
                 quant_config.get_name() != "fp8"
                 or getattr(quant_config, "weight_block_size", None) != [128, 128]
@@ -1253,6 +1257,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 return (
                     "The gfx942 FP8 path does not fuse quantization-excluded experts."
                 )
+            if quant_config is not None:
+                # Default CK split-K fails the one-token FP8 correctness gate.
+                # An environment override alone is not a qualified dispatcher.
+                return "The gfx942 fused FP8 path needs a qualified decode dispatcher."
         if _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:

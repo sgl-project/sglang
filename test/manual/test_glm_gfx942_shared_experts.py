@@ -45,6 +45,7 @@ def gate(
     sm=None,
     quant=None,
     wrapped=False,
+    clamp=None,
 ):
     ns = dict(
         _is_cuda=cuda,
@@ -62,7 +63,10 @@ def gate(
     extract(UTILS, "_module_path_match", ns)
     extract(UTILS, "is_layer_skipped", ns)
     config = SimpleNamespace(
-        n_shared_experts=shared, num_hidden_layers=3, first_k_dense_replace=1
+        n_shared_experts=shared,
+        num_hidden_layers=3,
+        first_k_dense_replace=1,
+        swiglu_limit=clamp,
     )
     if wrapped:
         config = SimpleNamespace(text_config=config)
@@ -86,10 +90,9 @@ def fp8(ignored=(), block=(128, 128), name="fp8", mxfp8=False, fp4_experts=False
     "kwargs",
     [
         {},
-        {"quant": fp8()},
         {"wrapped": True},
-        {"quant": fp8(["model.layers.1.mlp.gate"])},
         {"cuda": True, "enabled": False, "aiter": False, "gfx942": False, "sm": 90},
+        {"cuda": True, "sm": 90, "clamp": 10.0, "quant": fp8()},
     ],
 )
 def test_supported_paths(kwargs):
@@ -107,6 +110,8 @@ def test_supported_paths(kwargs):
         {"ep": 8},
         {"deepep": True},
         {"quant": fp8(name="awq")},
+        {"quant": fp8()},
+        {"quant": fp8(["model.layers.1.mlp.gate"])},
         {"quant": fp8(block=(1, 32), mxfp8=True)},
         {"quant": fp8(fp4_experts=True)},
         {"quant": fp8(["model.layers.1.mlp.shared_experts"])},
@@ -118,6 +123,14 @@ def test_supported_paths(kwargs):
 )
 def test_unsupported_paths_keep_unfused(kwargs):
     assert gate(**kwargs) is not None
+
+
+@pytest.mark.parametrize("clamp", [0.0, 1.0, 10.0])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("quant", [None, fp8()])
+def test_clamped_amd_config_keeps_separate_shared_expert(clamp, wrapped, quant):
+    reason = gate(clamp=clamp, wrapped=wrapped, quant=quant)
+    assert "does not support clamping" in reason
 
 
 def test_weight_loader_and_wrapper_read_one_published_decision():
