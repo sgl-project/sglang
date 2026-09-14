@@ -159,7 +159,7 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.rebuild_origin_input_ids(req.origin_input_ids[:max_req_input_len])
             return None
         else:
             error_msg = (

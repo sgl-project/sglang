@@ -11,6 +11,7 @@ import torch
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -134,14 +135,14 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        all_tokens = to_array(req.origin_input_ids) + to_array(req.output_ids[:-1])
         prefill_offloaded_len = (
             len(req.origin_input_ids) // self.page_size * self.page_size
         )
         state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
+                all_tokens[:prefill_offloaded_len]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None

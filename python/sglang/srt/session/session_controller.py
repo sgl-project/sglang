@@ -24,12 +24,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.viewable_array import to_array
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_slice_len(stop: int, total: int) -> int:
+    if stop < 0:
+        stop += total
+    return max(0, min(total, stop))
 
 
 class SessionReqNode:
@@ -185,32 +192,36 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+            output_len = len(last_req.token_buf) - last_req.origin_input_len
+            kept_output_len = (
+                0
+                if session_params.drop_previous_output
+                else min(last_req.sampling_params.max_new_tokens, output_len)
             )
+            kept_output = to_array(last_req.output_ids[:kept_output_len])
 
-            if session_params.drop_previous_output:
-                input_ids = last_req.origin_input_ids[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids = input_ids[: session_params.offset] + req.input_ids
-            else:
-                input_ids += req.input_ids
-
-            input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
-            if session_params.drop_previous_output:
-                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-
-            if session_params.offset and session_params.offset != 0:
+            if self.streaming:
+                input_ids = last_req.token_buf.freeze_and_clone()
                 input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
+                    last_req.origin_input_ids_unpadded.freeze_and_clone()
                 )
             else:
-                input_ids_unpadded += req.input_ids
+                input_ids = last_req.token_buf.clone()
+                input_ids_unpadded = last_req.origin_input_ids_unpadded.clone()
+
+            keep_len = last_req.origin_input_len + kept_output_len
+            if session_params.offset and session_params.offset != 0:
+                keep_len = min(session_params.offset, keep_len)
+
+            input_ids.truncate(_resolve_slice_len(keep_len, len(input_ids)))
+            input_ids.extend(req.input_ids)
+
+            input_ids_unpadded.extend(kept_output)
+            if session_params.offset and session_params.offset != 0:
+                input_ids_unpadded.truncate(
+                    _resolve_slice_len(session_params.offset, len(input_ids_unpadded))
+                )
+            input_ids_unpadded.extend(req.input_ids)
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids

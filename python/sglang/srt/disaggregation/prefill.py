@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -590,7 +589,7 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                req.output_ids.append(next_token_id)
+                req.append_output_id(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
@@ -1035,7 +1034,7 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
-        req.output_ids = array("q")
+        req.reset_output_ids()
         req.start_send_idx = 0
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None

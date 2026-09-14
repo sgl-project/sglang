@@ -48,6 +48,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -72,6 +73,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.viewable_array import ViewableArray, to_array
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -667,14 +669,14 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: array[int],
+        origin_input_ids: Union[array[int], ViewableArray],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[array[int]] = None,
+        origin_input_ids_unpadded: Optional[Union[array[int], ViewableArray]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -708,18 +710,22 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = origin_input_ids
-        self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else self.origin_input_ids
-        )  # Before image padding
-        # Each decode stage's output ids
-        self.output_ids = array("q")
-        # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
-        self.full_untruncated_fill_ids = array("q")
+        self.token_buf = (
+            origin_input_ids
+            if isinstance(origin_input_ids, ViewableArray)
+            else ViewableArray(origin_input_ids)
+        )
+        self.origin_input_len: int = len(self.token_buf)
+        # Before image padding
+        if origin_input_ids_unpadded:
+            self.origin_input_ids_unpadded = (
+                origin_input_ids_unpadded
+                if isinstance(origin_input_ids_unpadded, ViewableArray)
+                else ViewableArray(origin_input_ids_unpadded)
+            )
+        else:
+            assert not isinstance(origin_input_ids, ViewableArray)
+            self.origin_input_ids_unpadded = ViewableArray(origin_input_ids)
         self.fill_len: int = 0
 
         self.session = session
@@ -1014,9 +1020,37 @@ class Req(ReqDllmMixin):
         self.hisparse_staging = False
 
     @property
+    def origin_input_ids(self) -> memoryview:
+        return self.token_buf.readonly_view(None, self.origin_input_len)
+
+    @property
+    def output_ids(self) -> memoryview:
+        return self.token_buf.readonly_view(self.origin_input_len, None)
+
+    def append_output_id(self, token_id: int) -> None:
+        self.token_buf.append(token_id)
+
+    def extend_output_ids(self, token_ids: Iterable[int]) -> None:
+        self.token_buf.extend(token_ids)
+
+    def overwrite_output_id(self, offset: int, token_id: int) -> None:
+        self.token_buf.overwrite(self.origin_input_len + offset, token_id)
+
+    def truncate_output_ids(self, length: int) -> None:
+        self.token_buf.truncate(self.origin_input_len + length)
+
+    def reset_output_ids(self) -> None:
+        self.token_buf.truncate(self.origin_input_len)
+
+    def rebuild_origin_input_ids(self, new_origin_input_ids: Iterable[int]) -> None:
+        assert self.origin_input_len == len(self.token_buf)
+        self.token_buf = ViewableArray(new_origin_input_ids)
+        self.origin_input_len = len(self.token_buf)
+
+    @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
-        return len(self.origin_input_ids) + len(self.output_ids)
+        return len(self.token_buf)
 
     @property
     def is_prefill_only(self) -> bool:
@@ -1090,8 +1124,20 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_full_untruncated_fill_ids(self) -> Union[memoryview, array]:
+        if self.is_dllm():
+            ids = self.token_buf.materialize()
+            ids += array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
+            return ids
+        return self.token_buf.readonly_view()
+
+    def get_fill_ids_sliced(self, slice_len: int) -> array:
+        if self.is_dllm():
+            return to_array(self.get_full_untruncated_fill_ids()[:slice_len])
+        return self.token_buf.materialize(0, slice_len)
+
     def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.fill_len]
+        return self.get_fill_ids_sliced(self.fill_len)
 
     def init_next_round_input(
         self,
@@ -1101,10 +1147,9 @@ class Req(ReqDllmMixin):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
-        else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-        input_len = len(self.full_untruncated_fill_ids)
+        full_untruncated_fill_ids = self.get_full_untruncated_fill_ids()
+        input_len = len(full_untruncated_fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1122,7 +1167,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
+        token_ids_to_match = full_untruncated_fill_ids[
             : self._compute_max_prefix_len(input_len)
         ]
 
@@ -1207,9 +1252,9 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
-            )
+            self.surr_and_decode_ids = self.origin_input_ids_unpadded.materialize(
+                self.surr_offset
+            ) + to_array(output_ids)
             self.cur_decode_ids_len = len(output_ids)
         else:
             self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
@@ -1237,7 +1282,7 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        return self.tokenizer.decode(list(self.output_ids[-tail_len:]))
 
     def check_match_stop_str_prefix(self) -> bool:
         """
@@ -1314,7 +1359,7 @@ class Req(ReqDllmMixin):
         for token_count in range(
             max(1, len(token_window) - new_accepted_len + 1), len(token_window)
         ):
-            if matched(self.tokenizer.decode(token_window[:token_count])):
+            if matched(self.tokenizer.decode(list(token_window[:token_count]))):
                 return start + token_count
 
         # The full tail window is already known to match by the caller.
@@ -1358,11 +1403,11 @@ class Req(ReqDllmMixin):
             if token_id >= self.vocab_size or token_id < 0:
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 if self.sampling_params.stop_token_ids:
-                    self.output_ids[offset] = next(
-                        iter(self.sampling_params.stop_token_ids)
+                    self.overwrite_output_id(
+                        offset, next(iter(self.sampling_params.stop_token_ids))
                     )
                 if self.eos_token_ids:
-                    self.output_ids[offset] = next(iter(self.eos_token_ids))
+                    self.overwrite_output_id(offset, next(iter(self.eos_token_ids)))
                 self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
                 self.finished_len = offset + 1
                 return True
@@ -1445,7 +1490,7 @@ class Req(ReqDllmMixin):
         # Therefore, we discard the generated output_ids and restart prefill and generation
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
-            self.output_ids = array("q")
+            self.reset_output_ids()
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1496,7 +1541,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.full_untruncated_fill_ids)
+            logprob_start_len = len(self.get_full_untruncated_fill_ids())
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -1510,8 +1555,8 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = array(
-            "q", [0]
+        self.rebuild_origin_input_ids(
+            array("q", [0])
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
@@ -1536,7 +1581,7 @@ class Req(ReqDllmMixin):
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"input_ids={list(self.origin_input_ids)}, output_ids={list(self.output_ids)}, "
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
@@ -2345,8 +2390,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.fill_len = len(req.get_full_untruncated_fill_ids())
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
