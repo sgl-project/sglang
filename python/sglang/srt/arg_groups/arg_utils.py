@@ -47,6 +47,8 @@ from typing import (
     Annotated,
     Any,
     Literal,
+    Mapping,
+    Sequence,
     Union,
     get_args,
     get_origin,
@@ -57,6 +59,27 @@ import msgspec
 import msgspec.structs
 
 A = Annotated
+
+# What the readbacks publish in a credential's place. A fixed string, so a
+# reader diffing two dumps of the same configuration does not see a change.
+# `launch_command` uses it as typed; the record-side readbacks use
+# `redacted_value`, which keeps the count of values the record holds.
+REDACTED = "<redacted>"
+
+
+def redacted_value(value: Any) -> str:
+    """The marker a record-side readback publishes for a configured credential:
+    ``<redacted:1 value>`` for one, ``<redacted:N values>`` for a field that
+    holds several (a list, tuple or set of credentials).
+
+    The count is the one diagnostic a redacted field can keep: whether auth is
+    configured at all, and, for a field that carries a set of keys, how many the
+    parse produced. An operator who passed six keys and sees ``1 value`` learns
+    that the flag did not fan out, without a key reaching the log. Callers pass
+    only set values; ``None`` stays ``None`` so an unset credential still reads
+    as unset. Same configuration, same string, so diffs of two dumps stay quiet."""
+    n = len(value) if isinstance(value, (list, tuple, set, frozenset)) else 1
+    return f"<redacted:{n} value{'' if n == 1 else 's'}>"
 
 
 class Arg(msgspec.Struct, frozen=True):
@@ -90,6 +113,10 @@ class Arg(msgspec.Struct, frozen=True):
     # that depends on the machine, on another field, or on anything impure is a
     # decision, and decisions stay in a hook where their order is visible.
     fallback: Any = None
+    # When True, the field holds a credential. `resolved_dict` and the launch
+    # command publish `REDACTED` in its place; the record keeps the real value,
+    # so the auth middleware and the SSL loader read the field as before.
+    secret: bool = False
 
 
 class Derived(msgspec.Struct, frozen=True):
@@ -203,6 +230,160 @@ def resolvable_fields(cls) -> frozenset:
         if arg is not None and arg.resolvable:
             names.add(field.name)
     return frozenset(names)
+
+
+@functools.cache
+def secret_fields(cls) -> frozenset:
+    """Names of ``cls`` fields whose ``Arg`` metadata declares ``secret=True``:
+    the credentials the readbacks redact.
+
+    Non-record types (e.g. mock config objects in tests) have no Arg metadata
+    and yield an empty set."""
+    if not is_record(cls):
+        return frozenset()
+    hints = get_type_hints(cls, include_extras=True)
+    names = set()
+    for field in record_fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.secret:
+            names.add(field.name)
+    return frozenset(names)
+
+
+def _cli_spellings(cls, names) -> frozenset:
+    """Every option string ``add_cli_args_from_dataclass`` registers for the
+    fields in ``names``: the ``cli_name`` (or the derived ``--field-name``)
+    and each alias. ``no_cli`` fields register nothing."""
+    hints = get_type_hints(cls, include_extras=True)
+    flags = set()
+    for field in record_fields(cls):
+        if field.name not in names:
+            continue
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is None or arg.no_cli:
+            continue
+        flags.add(arg.cli_name or _field_to_cli_name(field.name))
+        flags.update(arg.aliases or ())
+    return frozenset(flags)
+
+
+@functools.cache
+def cli_flags(cls) -> frozenset:
+    """Every CLI spelling the record registers. What an abbreviated flag is
+    resolved against."""
+    if not is_record(cls):
+        return frozenset()
+    return _cli_spellings(cls, {field.name for field in record_fields(cls)})
+
+
+@functools.cache
+def secret_cli_flags(cls) -> frozenset:
+    """The CLI spellings of ``secret_fields(cls)``: ``--api-key`` and any
+    alias the field declares. What ``redacted_argv`` looks for."""
+    if not is_record(cls):
+        return frozenset()
+    return _cli_spellings(cls, secret_fields(cls))
+
+
+def _resolve_flag(cls, flag: str) -> str | None:
+    """The registered spelling argparse read ``flag`` as, or ``None``.
+
+    An exact spelling or alias resolves to itself. So does a proper prefix of
+    exactly one registered spelling: argparse accepts abbreviations
+    (``allow_abbrev`` defaults to True) and resolves a prefix only when it is
+    unique among every option string, so once the parse has succeeded a prefix
+    unique among the record's spellings resolved to that spelling. A prefix
+    that also matched a flag registered outside the record was ambiguous to
+    argparse, and there was no parse to redact. A value, or a flag the
+    metadata does not know, resolves to nothing."""
+    known = cli_flags(cls)
+    if flag in known:
+        return flag
+    if not flag.startswith("--"):
+        return None
+    matches = [spelling for spelling in known if spelling.startswith(flag)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _spells_a_secret_flag(cls, flag: str) -> bool:
+    """Whether argparse read ``flag`` as a credential flag of ``cls``."""
+    return _resolve_flag(cls, flag) in secret_cli_flags(cls)
+
+
+def _spells_a_public_flag(cls, flag: str) -> bool:
+    """Whether argparse read ``flag`` as a non-credential flag of ``cls``: the
+    one position where the value pass leaves a matching token alone."""
+    resolved = _resolve_flag(cls, flag)
+    return resolved is not None and resolved not in secret_cli_flags(cls)
+
+
+def redacted_argv(cls, argv: Sequence[str], record: Any = None) -> list[str]:
+    """``argv`` with every credential of ``cls`` replaced by ``REDACTED``.
+    Everything else is returned as typed.
+
+    Two passes. The first reads the flags the way argparse did: a token that
+    spells a credential flag (exact, alias, or unique abbreviation) hides the
+    value after it, or after its ``=``. The second runs when ``record`` (the
+    parsed record, or the argparse namespace) is given, and hides the parsed
+    credential values themselves wherever a whole token, or the value half of
+    a ``--flag=VALUE`` token, equals one. It closes any spelling the first pass
+    cannot know, such as a flag registered outside the record with a
+    credential ``dest``. It leaves one position alone: the value of a flag
+    that resolves (exact, alias, or unique abbreviation) to a non-credential
+    field of ``cls``, as the token after it or as its ``=`` half. argparse
+    bound that token to a field the metadata knows is public, so
+    ``--api-key 1 --tp 1`` keeps ``--tp 1`` readable. A matching token
+    anywhere else (after a flag the metadata does not know, standalone) is
+    hidden, because nothing says what argparse bound it to, and there the
+    alternative under-hides a key."""
+    out: list[str] = []
+    hide_next = False
+    for token in argv:
+        if hide_next:
+            out.append(REDACTED)
+            hide_next = False
+            continue
+        flag, sep, _value = token.partition("=")
+        if _spells_a_secret_flag(cls, flag):
+            out.append(f"{flag}={REDACTED}" if sep else flag)
+            hide_next = not sep
+            continue
+        out.append(token)
+    if record is None:
+        return out
+
+    values = {
+        value
+        for name in secret_fields(cls)
+        if isinstance(value := getattr(record, name, None), str) and value
+    }
+    if not values:
+        return out
+    for i, token in enumerate(out):
+        if token in values and not token.startswith("-"):
+            prev_flag, prev_sep, _ = out[i - 1].partition("=") if i else ("", "", "")
+            if not prev_sep and _spells_a_public_flag(cls, prev_flag):
+                continue
+            out[i] = REDACTED
+            continue
+        flag, sep, value = token.partition("=")
+        if sep and value in values and flag.startswith("-"):
+            if _spells_a_public_flag(cls, flag):
+                continue
+            out[i] = f"{flag}={REDACTED}"
+    return out
+
+
+def redacted_call(cls, name: str, kwargs: Mapping[str, Any]) -> str:
+    """``name(k=v, ...)`` spelled with ``repr`` values, every credential kwarg
+    of ``cls`` replaced by its ``redacted_value`` marker. How the in-process
+    ``Engine`` records the call that built its record."""
+    secrets = secret_fields(cls)
+    parts = (
+        f"{k}={redacted_value(v)!r}" if k in secrets and v is not None else f"{k}={v!r}"
+        for k, v in kwargs.items()
+    )
+    return f"{name}(" + ", ".join(parts) + ")"
 
 
 @functools.cache

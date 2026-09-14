@@ -18,6 +18,12 @@ Current coverage:
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
   pre-existing flat `kv_events_config` string all remain visible.
+
+* `TestServerInfoRedactsCredentials` -- the endpoint half of
+  `server_args/test_credential_redaction.py`: the response carries the
+  redaction marker, not the keys, in the spread fields (with the count of
+  values the field holds) and in `launch_command`. `/server_info` is `AuthLevel.NORMAL`, so a caller
+  holding only `api_key` reads whatever it publishes.
 """
 
 import asyncio
@@ -28,12 +34,13 @@ from types import SimpleNamespace
 import msgspec
 import msgspec.structs
 
+from sglang.srt.arg_groups.arg_utils import REDACTED
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -585,6 +592,50 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
                     load_publish_endpoint=endpoint,
                 )
                 check_load_publish_args(args)  # must not raise
+
+
+class TestServerInfoRedactsCredentials(CustomTestCase):
+    """The endpoint publishes the redaction marker, not the credentials."""
+
+    def test_no_credential_reaches_the_response_body(self):
+        # Assembled at runtime so a secret scanner does not read a literal
+        # credential assignment here.
+        api_key, admin_api_key, ssl_keyfile_password = (
+            "-".join(("sentinel", *parts))
+            for parts in (
+                ("api", "key", "2b7f"),
+                ("admin", "api", "key", "9c31"),
+                ("ssl", "keyfile", "pw", "4e08"),
+            )
+        )
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--api-key",
+                api_key,
+                f"--admin-api-key={admin_api_key}",
+                "--ssl-keyfile-password",
+                ssl_keyfile_password,
+            ]
+        )
+
+        info = _call_server_info_with(args)
+
+        # the record-side readback keeps the count of values; the command line
+        # echo below carries the plain marker
+        self.assertEqual(info["api_key"], "<redacted:1 value>")
+        self.assertEqual(info["admin_api_key"], "<redacted:1 value>")
+        self.assertEqual(info["ssl_keyfile_password"], "<redacted:1 value>")
+        self.assertEqual(
+            info["launch_command"],
+            f"--model-path dummy --api-key {REDACTED} "
+            f"--admin-api-key={REDACTED} --ssl-keyfile-password {REDACTED}",
+        )
+        body = json.dumps(info, default=str)
+        for sentinel in (api_key, admin_api_key, ssl_keyfile_password):
+            with self.subTest(sentinel=sentinel):
+                self.assertNotIn(sentinel, body)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,9 @@ from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
     record_fields,
+    redacted_argv,
+    redacted_value,
+    secret_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
@@ -317,12 +320,27 @@ class ServerArgs:
         resolution decided. Nested dataclass fields are expanded
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
+
+        A field declared `Arg(secret=True)` reads as its `redacted_value`
+        marker when set (`<redacted:1 value>`, or the count of values a field
+        that holds several carries): this dict is what the `server_args=`
+        startup line logs and what `/server_info` answers, and `/server_info`
+        answers a caller holding only `api_key`, so a published `admin_api_key`
+        is an escalation, not just a disclosure. An unset credential still
+        reads as `None`; whether a key is configured is visible from outside
+        anyway, and the count is the one thing the operator still needs from
+        the line: that the keys they passed all parsed.
         """
 
-        return {
-            field.name: _plain(resolution_result(self, field.name))
-            for field in record_fields(type(self))
-        }
+        secrets = secret_fields(type(self))
+        dump: dict[str, Any] = {}
+        for field in record_fields(type(self)):
+            value = resolution_result(self, field.name)
+            if field.name in secrets and value is not None:
+                dump[field.name] = redacted_value(value)
+            else:
+                dump[field.name] = _plain(value)
+        return dump
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -732,8 +750,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     server_args = ServerArgs.from_cli_args(raw_args)
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
-    # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # subprocess copy can answer the same question the launcher can. The
+    # credentials are redacted here, once, because every reader of this string
+    # (`/server_info`, its gRPC and in-process twins) publishes it. The record
+    # goes along so the values the parse produced are hidden under any
+    # spelling, abbreviated flags included.
+    server_args._launch_command = " ".join(redacted_argv(ServerArgs, argv, server_args))
     return server_args
 
 

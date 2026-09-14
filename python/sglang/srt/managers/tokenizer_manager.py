@@ -3155,7 +3155,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "config_updates": get_context().overrides_log(),
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
+                    # The record's copy, redacted at capture. The raw
+                    # `sys.argv` carries `--api-key VALUE` verbatim.
+                    "launch_command": self.server_args.launch_command,
                 }
                 with open(filename, "wb") as f:
                     try:
