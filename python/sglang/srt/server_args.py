@@ -887,6 +887,10 @@ class ServerArgs:
             aliases=["--nccl-init-addr"],
         ),
     ] = None
+    gated_launch_port: A[
+        Optional[int],
+        "The port of the gated launch control server. When set, every rank blocks right after the distributed environment is initialized, before any sizable GPU allocation, until `POST /gate/activate` is sent to this port on the host of the first rank. This lets an external orchestrator defer the memory hungry part of startup to a safe window. Defaults to None, which disables the gate.",
+    ] = None
     nnodes: A[int, "The number of nodes."] = 1
     node_rank: A[int, "The node rank."] = 0
     tp_size: A[

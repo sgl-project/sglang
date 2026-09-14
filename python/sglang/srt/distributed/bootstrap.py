@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
@@ -112,6 +113,10 @@ def init_torch_distributed(
             _prewarm_nccl(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
+
+    maybe_wait_for_gated_launch(
+        host=server_args.host, port=server_args.gated_launch_port
+    )
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
