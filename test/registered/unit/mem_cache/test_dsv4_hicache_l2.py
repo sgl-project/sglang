@@ -242,6 +242,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_kv_pool=SimpleNamespace(kernel_page_size=32),
             c4_indexer_kv_pool=indexer_pool,
             unified_region_buffers=lambda ratio: (c4_buffer, 256),
+            unified_rope_region_buffers=lambda ratio: None,
         )
         params = SimpleNamespace(
             page_size=128,
