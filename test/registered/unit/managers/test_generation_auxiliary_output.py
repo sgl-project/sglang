@@ -499,6 +499,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         finished_len=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
+        to_finish=None,
+        finished_reason=None,
         return_logprob=False,
         return_sampling_mask=False,
         grammar=None,
