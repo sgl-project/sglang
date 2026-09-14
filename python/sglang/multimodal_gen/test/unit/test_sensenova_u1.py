@@ -928,6 +928,6 @@ def test_sensenova_u1_defaults_lora_targets_to_the_generation_branch():
     )
     assert explicit.lora_target_modules == ["q_proj"]
 
-    # No adapter, no default: the attribute is left as the caller set it.
-    unused = _validate_server_args_with_lora()
-    assert unused.lora_target_modules is None
+    # Keep the generation-branch default when the adapter is loaded dynamically.
+    dynamic = _validate_server_args_with_lora()
+    assert dynamic.lora_target_modules == ["_mot_gen"]
