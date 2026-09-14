@@ -254,7 +254,18 @@ class DeepseekV2WeightLoaderMixin:
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        # The q_a_proj / kv_a_proj_with_mqa halves of a layer are fused into one
+        # parameter only once BOTH have been seen. Keep the pending halves on the
+        # model instead of in a per-call dict: online weight updates
+        # (update_weights_from_tensor, RL weight sync) call load_weights in
+        # chunks, and a pair split across two calls would otherwise never be
+        # written -- leaving that layer's fused projection at its initial value.
+        if fuse_qkv_a_proj:
+            if not hasattr(self, "_pending_fused_a_proj"):
+                self._pending_fused_a_proj = {}
+            cached_a_proj = self._pending_fused_a_proj
+        else:
+            cached_a_proj = None
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -412,9 +423,21 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
-                                loaded_weight
-                            )
+                            new_half = _clone_if_runai_streamed_tensor(loaded_weight)
+                            old_half = cached_a_proj.get(name)
+                            if (
+                                old_half is not None
+                                and old_half.shape == new_half.shape
+                                and new_half.is_floating_point()
+                            ):
+                                # A half that arrives again while its partner is
+                                # still pending is a sparse (NaN-masked) delta:
+                                # merge it into the pending copy instead of
+                                # overwriting, so no changed positions are lost.
+                                new_half = torch.where(
+                                    torch.isnan(new_half), old_half, new_half
+                                )
+                            cached_a_proj[name] = new_half
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
