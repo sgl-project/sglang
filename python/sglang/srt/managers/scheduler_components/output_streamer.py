@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ class SchedulerOutputStreamer:
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            current_weight_version=self.server_args.weight_version,
         )
         for req in reqs:
             if req is skip_req:
@@ -263,6 +265,7 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    current_weight_version: Optional[str]
 
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -291,6 +294,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -416,6 +420,16 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+        else:
+            self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -621,5 +635,8 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
             dp_ranks=dp_ranks,
         )

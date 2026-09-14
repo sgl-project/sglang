@@ -138,6 +138,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.utils.weight_versions import (
+    add_weight_versions_to_meta_info,
+    compute_weight_version_spans,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1396,6 +1400,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             AbortReq(
                 rid=tokenized_obj.rid,
                 abort_message="Aborted by AbortReq before dispatch to scheduler",
+                weight_versions=compute_weight_version_spans(
+                    [],
+                    current_version=self.server_args.weight_version,
+                    num_output_tokens=0,
+                ),
             )
         )
         return True
@@ -2055,6 +2064,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                if (
+                    recv_obj.weight_versions is not None
+                    and (spans := recv_obj.weight_versions[i]) is not None
+                ):
+                    add_weight_versions_to_meta_info(
+                        meta_info,
+                        spans,
+                        num_output_tokens=recv_obj.completion_tokens[i],
+                    )
                 # Add detailed cache breakdown if available
                 if (
                     hasattr(recv_obj, "cached_tokens_details")
@@ -2885,6 +2903,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        if recv_obj.weight_versions is not None:
+            add_weight_versions_to_meta_info(
+                meta_info,
+                recv_obj.weight_versions,
+                num_output_tokens=len(state.output_ids),
+            )
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
