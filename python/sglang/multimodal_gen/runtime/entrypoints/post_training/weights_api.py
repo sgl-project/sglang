@@ -1,14 +1,18 @@
 """Weight update API for the diffusion engine."""
 
+import msgspec
 from fastapi import APIRouter, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.srt.utils.json_response import orjson_response
@@ -201,3 +205,40 @@ async def resume_memory_occupation():
     payload = response.output
     success = bool(payload["success"])
     return orjson_response(payload, status_code=200 if success else 400)
+
+
+async def _forward_weight_group_request(request: Request, request_type):
+    try:
+        req = msgspec.convert(await request.json(), type=request_type)
+    except (ValueError, TypeError) as exc:
+        return orjson_response({"success": False, "message": str(exc)}, status_code=400)
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as exc:
+        return orjson_response({"success": False, "message": str(exc)}, status_code=500)
+    if response.output is None:
+        return orjson_response(
+            {"success": False, "message": response.error}, status_code=500
+        )
+    return orjson_response(
+        response.output, status_code=200 if response.output["success"] else 400
+    )
+
+
+@router.post("/init_weights_update_group")
+async def init_weights_update_group(request: Request):
+    return await _forward_weight_group_request(request, InitWeightsUpdateGroupReqInput)
+
+
+@router.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(request: Request):
+    return await _forward_weight_group_request(
+        request, DestroyWeightsUpdateGroupReqInput
+    )
+
+
+@router.post("/update_weights_from_distributed")
+async def update_weights_from_distributed(request: Request):
+    return await _forward_weight_group_request(
+        request, UpdateWeightsFromDistributedReqInput
+    )

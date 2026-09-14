@@ -2,10 +2,38 @@ from __future__ import annotations
 
 from typing import Any, List
 
+import torch.distributed as dist
+
+from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
 class SchedulerPostTrainingMixin:
+    def _weight_group_result(self, result: tuple[bool, str]) -> OutputBatch:
+        world = get_world_group()
+        results = [None] * world.world_size
+        dist.all_gather_object(results, result, group=world.cpu_group)
+        for rank, (success, message) in enumerate(results):
+            if not success:
+                message = f"Rank {rank}: {message}"
+                return OutputBatch(
+                    output={"success": False, "message": message}, error=message
+                )
+        return OutputBatch(output={"success": True, "message": result[1]})
+
+    def _handle_init_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
+        return self._weight_group_result(self.worker.init_weights_update_group(reqs[0]))
+
+    def _handle_destroy_weights_update_group(self, reqs: List[Any]) -> OutputBatch:
+        return self._weight_group_result(
+            self.worker.destroy_weights_update_group(reqs[0])
+        )
+
+    def _handle_update_weights_from_distributed(self, reqs: List[Any]) -> OutputBatch:
+        return self._weight_group_result(
+            self.worker.update_weights_from_distributed(reqs[0])
+        )
+
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
