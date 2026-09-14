@@ -118,11 +118,14 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         forward_fn = mock.Mock(return_value=object())
         post_warmup_hook = mock.Mock()
 
-        with mock.patch(
-            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend."
-            "defer_symmetric_memory_graph_registration",
-            return_value=contextlib.nullcontext(True),
-        ), mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+        with (
+            mock.patch(
+                "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend."
+                "defer_symmetric_memory_graph_registration",
+                return_value=contextlib.nullcontext(True),
+            ),
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+        ):
             backend.capture_one(
                 ShapeKey(size=4),
                 forward_fn,
