@@ -173,18 +173,50 @@ class TestMoonEPPoolRows(CustomTestCase):
                     specs={**SPECS, moonep_weights.W2_WEIGHT: ((4, 16), torch.uint8)},
                 )
 
-    def test_group_rows_keep_home_groups_and_remap_the_prefetch_tail(self):
-        num_global_experts = EP_SIZE * NUM_LOCAL_EXPERTS
-        expert_ids = torch.cat(
-            [torch.arange(num_global_experts), torch.tensor([12, -1])]
-        )
-        rows = moonep_weights.group_rows(7, expert_ids, num_global_experts)
 
-        home = moonep_weights.expert_rows(7, torch.arange(num_global_experts))
-        self.assertEqual(rows[:num_global_experts].tolist(), home.tolist())
-        # slot_base = this rank's chunk + this layer's block + its own experts.
-        self.assertEqual(rows[num_global_experts].item(), NUM_LOCAL_EXPERTS)
-        self.assertEqual(rows[num_global_experts + 1].item(), -1)
+class TestMoonEPLocalSegments(CustomTestCase):
+    """Per-group (start, real rows) of the local groups, and the psum layout built from them."""
+
+    def test_local_groups_come_out_in_block_order_with_pads_removed(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            _moonep_local_segments,
+        )
+
+        # 8 global experts, 2 ranks x 4, rank 1 owns e4..e7, plus 2 slots;
+        # segments are padded to 4 rows. Non-empty on rank 1: e5 (2 real),
+        # e7 (1 real), slot0 (3 real). Every other group is empty.
+        pool = SimpleNamespace(num_local_experts=4, num_prefetch_slots=2, ep_rank=1)
+        lengths = [0, 0, 0, 0, 0, 4, 0, 4, 4, 0]  # padded, per cu_seqlens group
+        cu_seqlens = torch.tensor(lengths, dtype=torch.int32).cumsum(0).to(torch.int32)
+        n_pad = torch.tensor([0, 0, 0, 0, 0, 2, 0, 3, 1, 0], dtype=torch.int32)
+        zero_fill = torch.stack([torch.zeros_like(n_pad), n_pad], dim=1)
+        plan = SimpleNamespace(zero_fill_ranges=zero_fill)
+
+        seg_start, seg_len = _moonep_local_segments(
+            pool, cu_seqlens, plan, num_global_experts=8
+        )
+        # Block order: home experts e4..e7, then slots 0..1.
+        self.assertEqual(seg_start.tolist(), [0, 0, 4, 4, 8, 12])
+        self.assertEqual(seg_len.tolist(), [0, 2, 0, 1, 3, 0])
+        self.assertEqual(seg_start.dtype, torch.int32)
+        self.assertEqual(seg_len.dtype, torch.int32)
+
+    def test_psum_layout_ends_and_aligned_row_bound(self):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import _moonep_psum_layout
+
+        # Three groups, segments padded to 128: g0 rows 0..127 with 2 real,
+        # g1 empty, g2 rows 128..255 with 130 real -> spills into a second
+        # 128-row tile, so the bound is 384. DeepGEMM reads g as
+        # [align(psum[g-1], 128), psum[g]).
+        seg_start = torch.tensor([0, 128, 128], dtype=torch.int32)
+        seg_len = torch.tensor([2, 0, 130], dtype=torch.int32)
+        psum, rows_end = _moonep_psum_layout(seg_start, seg_len)
+        self.assertEqual(psum.tolist(), [2, 128, 258])
+        self.assertEqual(psum.dtype, torch.int32)
+        self.assertEqual(rows_end.tolist(), [384])
+        self.assertEqual(rows_end.dtype, torch.int32)
 
 
 class TestMoonEPMIndices(CustomTestCase):

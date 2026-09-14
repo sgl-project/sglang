@@ -9,6 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
+    MoonEPDispatcher,
     MoonEPDispatchOutput,
     MoonEPExpertWeightLayout,
     get_moonep_expert_weight_layout,
@@ -196,6 +197,68 @@ class TestMoonEPBuffer(unittest.TestCase):
 
         self.assertEqual(buffer.destroy_calls, 1)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
+
+
+class TestMoonEPDispatchPadding(unittest.TestCase):
+    """Buffer capacity per batch, and what the padded tokens route to."""
+
+    def test_capacity_rung_is_the_smallest_power_of_two_that_fits(self):
+        from sglang.srt.layers.moe.token_dispatcher.moonep import _capacity_rung
+
+        self.assertEqual(_capacity_rung(1, 512), 8)
+        self.assertEqual(_capacity_rung(8, 512), 8)
+        self.assertEqual(_capacity_rung(9, 512), 16)
+        self.assertEqual(_capacity_rung(48, 512), 64)
+        self.assertEqual(_capacity_rung(512, 512), 512)
+        # The decode cap bounds the ladder even when it is not a power of two.
+        self.assertEqual(_capacity_rung(100, 200), 128)
+        self.assertEqual(_capacity_rung(150, 200), 200)
+
+    def test_phase_capacity_picks_a_rung_below_the_decode_cap(self):
+        me = SimpleNamespace(
+            decode_max_dispatch_tokens_per_rank=512,
+            num_max_dispatch_tokens_per_rank=16384,
+        )
+        pick = MoonEPDispatcher._phase_capacity
+        self.assertEqual(pick(me, 8), 8)
+        self.assertEqual(pick(me, 200), 256)
+        self.assertEqual(pick(me, 512), 512)
+        self.assertEqual(pick(me, 513), 16384)
+
+    def test_padded_tokens_repeat_the_batch_assignments_with_zero_weight(self):
+        me = SimpleNamespace(num_experts=6, _first_home_expert=lambda: 3)
+        hidden = torch.ones(3, 4, dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[5, 1], [2, 5], [0, 4]], dtype=torch.int32)
+        topk_weights = torch.ones(3, 2, dtype=torch.float32)
+
+        h, ids, w, n = MoonEPDispatcher._pad_to_capacity(
+            me, hidden, topk_ids, topk_weights, capacity=8
+        )
+        self.assertEqual(n, 3)
+        self.assertEqual(tuple(h.shape), (8, 4))
+        self.assertEqual(h[3:].abs().sum().item(), 0.0)
+        self.assertEqual(w[3:].abs().sum().item(), 0.0)
+        self.assertEqual(ids[:3].tolist(), topk_ids.tolist())
+        # Padded rows cycle through the real assignments: the set of
+        # non-empty experts, hence of buffer segments, does not grow.
+        self.assertEqual(ids[3:].tolist(), [[5, 1], [2, 5], [0, 4], [5, 1], [2, 5]])
+        self.assertEqual(
+            set(ids[3:].reshape(-1).tolist()), set(topk_ids.reshape(-1).tolist())
+        )
+
+    def test_empty_batch_pads_to_this_ranks_first_home_expert(self):
+        me = SimpleNamespace(num_experts=6, _first_home_expert=lambda: 3)
+        hidden = torch.ones(0, 4, dtype=torch.bfloat16)
+        topk_ids = torch.zeros((0, 2), dtype=torch.int32)
+        topk_weights = torch.zeros((0, 2), dtype=torch.float32)
+
+        h, ids, w, n = MoonEPDispatcher._pad_to_capacity(
+            me, hidden, topk_ids, topk_weights, capacity=8
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(tuple(ids.shape), (8, 2))
+        self.assertEqual(set(ids.reshape(-1).tolist()), {3})
+        self.assertEqual(w.abs().sum().item(), 0.0)
 
 
 class TestMoonEPExpertWeightLayout(unittest.TestCase):
