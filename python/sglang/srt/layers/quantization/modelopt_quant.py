@@ -2298,8 +2298,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
         self.use_flashinfer_trtllm_weight_layout = (
-            self.enable_flashinfer_trtllm_moe
-            and not get_moe_a2a_backend().is_megamoe()
+            self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
 
