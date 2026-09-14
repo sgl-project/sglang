@@ -129,10 +129,14 @@ class TestHcMixStatsBf16x3(CustomTestCase):
                 (4096, True, False),
                 (4096, False, True),
             ]:
-                with self.subTest(rows=rows, invariant=invariant), patch(
-                    "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
-                    return_value=invariant,
-                ), patch(target, wraps=hc_mix_stats_sinkhorn_bf16x3) as fast:
+                with (
+                    self.subTest(rows=rows, invariant=invariant),
+                    patch(
+                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                        return_value=invariant,
+                    ),
+                    patch(target, wraps=hc_mix_stats_sinkhorn_bf16x3) as fast,
+                ):
                     layer._hc_mix_and_combine(
                         x[:rows].view(rows, 4, 5120),
                         layer.hc_attn_fn,
