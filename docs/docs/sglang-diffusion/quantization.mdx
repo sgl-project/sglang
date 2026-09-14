@@ -637,6 +637,21 @@ representative NVFP4 subset and includes
 
 ## ModelOpt FP8
 
+<Warning>
+The official `black-forest-labs/FLUX.2-klein-4b-fp8` repository contains a
+Diffusion Single File checkpoint, not an SGLang-ready ModelOpt transformer
+override. Do not pass its `.safetensors` file to
+`--transformer-weights-path`: the single-file conversion produces split QKV
+parameters, while SGLang's FLUX.2 FP8 path expects packed QKV parameters, so
+weight loading fails.
+
+For FLUX.2 [klein] 4B, use the BF16
+`black-forest-labs/FLUX.2-klein-4B` checkpoint or convert the FP8 file to an
+SGLang-compatible packed ModelOpt transformer override first. The published
+`lmsys/flux2-dev-modelopt-fp8-sglang-transformer` override is only compatible
+with `black-forest-labs/FLUX.2-dev`; do not pair it with a Klein base model.
+</Warning>
+
 ### Usage Examples
 
 Converted ModelOpt FP8 transformer repos should be loaded as transformer
