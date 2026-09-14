@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import os
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
+    get_grammar_compile_max_workers,
     register_grammar_backend,
 )
 from sglang.srt.runtime_context import get_context  # noqa: E402
@@ -527,6 +529,45 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 self.backend._init_value_dispatch((key_type, key_string), False)
 
                 dispatch.assert_called_once_with(key_string)
+
+
+class TestGrammarCompileMaxWorkers(unittest.TestCase):
+    """Test grammar-compile thread pool sizing (container/cgroup safety cap).
+
+    os.cpu_count() is not cgroup-aware, so the pool must not scale with the
+    host CPU count: on a many-core host inside a low-cpu-limit container an
+    oversized pool oversubscribes the CFS quota and stalls the scheduler.
+    """
+
+    def test_capped_at_8(self):
+        for cpu_count, expected in [
+            (1, 1),
+            (2, 1),
+            (4, 2),
+            (16, 8),
+            (17, 8),
+            (172, 8),  # many-core host: must stay capped
+        ]:
+            self.assertEqual(get_grammar_compile_max_workers(cpu_count), expected)
+
+    def test_defaults_to_host_cpu_count(self):
+        with patch("os.cpu_count", return_value=32):
+            self.assertEqual(get_grammar_compile_max_workers(), 8)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"SGLANG_GRAMMAR_COMPILE_MAX_WORKERS": "4"}):
+            self.assertEqual(get_grammar_compile_max_workers(172), 4)
+
+    def test_env_zero_means_auto(self):
+        with patch.dict(os.environ, {"SGLANG_GRAMMAR_COMPILE_MAX_WORKERS": "0"}):
+            self.assertEqual(get_grammar_compile_max_workers(172), 8)
+
+    def test_at_least_one_worker(self):
+        self.assertEqual(get_grammar_compile_max_workers(0), 1)
+
+    def test_backend_executor_is_bounded(self):
+        backend = BaseGrammarBackend()
+        self.assertLessEqual(backend.executor._max_workers, 8)
 
 
 if __name__ == "__main__":
