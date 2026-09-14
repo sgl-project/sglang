@@ -204,6 +204,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._dcp_pack_buffers = None
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -337,6 +338,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
+
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        if self._dcp_pack_buffers is not None or not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size,
+        )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -888,6 +901,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        pack_buffer=None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -920,52 +934,76 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
-        layers_current_pp_stage = len(src_kv_ptrs)
-        src_groups, dst_groups = group_concurrent_contiguous(
-            plan.src_token_indices,
-            plan.dst_token_indices,
-        )
+        from sglang.srt.disaggregation.common.dcp_pack import iter_dcp_transfer_chunks
 
-        layers_params = [
-            (
-                src_kv_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                dcp_token_item_lens[layer_id],
+        # Each worker owns its pack buffer. Exhaust the synchronous sends for
+        # this chunk before advancing the iterator and overwriting the buffer.
+        for (
+            src_kv_ptrs,
+            src_token_indices,
+            dst_token_indices,
+        ) in iter_dcp_transfer_chunks(
+            pack_buffer=pack_buffer,
+            kv_data_ptrs=src_kv_ptrs,
+            src_token_indices=plan.src_token_indices,
+            dst_token_indices=plan.dst_token_indices,
+            token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
+        ):
+            layers_current_pp_stage = len(src_kv_ptrs)
+            src_groups, dst_groups = group_concurrent_contiguous(
+                src_token_indices,
+                dst_token_indices,
             )
-            for layer_id in range(layers_current_pp_stage)
-        ]
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, token_item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            return [
+            layers_params = [
                 (
-                    src_ptr + int(src_group[0]) * token_item_len,
-                    dst_ptr + int(dst_group[0]) * token_item_len,
-                    len(src_group) * token_item_len,
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    dcp_token_item_lens[layer_id],
                 )
-                for src_group, dst_group in zip(src_groups, dst_groups)
+                for layer_id in range(layers_current_pp_stage)
             ]
 
-        def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
-            return self._transfer_data(
-                mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
-            )
+            def set_transfer_blocks(
+                src_ptr: int, dst_ptr: int, token_item_len: int
+            ) -> List[Tuple[int, int, int]]:
+                return [
+                    (
+                        src_ptr + int(src_group[0]) * token_item_len,
+                        dst_ptr + int(dst_group[0]) * token_item_len,
+                        len(src_group) * token_item_len,
+                    )
+                    for src_group, dst_group in zip(src_groups, dst_groups)
+                ]
 
-        if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
-                for src_ptr, dst_ptr, token_item_len in layers_params
-            ]
-            return self._await_transfer_futures(futures)
+            def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
+                return self._transfer_data(
+                    mooncake_session_id,
+                    set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+                )
 
-        transfer_blocks = []
-        for src_ptr, dst_ptr, token_item_len in layers_params:
-            transfer_blocks.extend(
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
-            )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+            if self.enable_custom_mem_pool:
+                futures = [
+                    executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
+                    for src_ptr, dst_ptr, token_item_len in layers_params
+                ]
+                try:
+                    ret = self._await_transfer_futures(futures)
+                finally:
+                    if pack_buffer is not None:
+                        # Even when one layer fails, another running send may
+                        # still read this worker's pack buffer.
+                        concurrent.futures.wait(futures)
+            else:
+                transfer_blocks = []
+                for src_ptr, dst_ptr, token_item_len in layers_params:
+                    transfer_blocks.extend(
+                        set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
+                    )
+                ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+            if ret != 0:
+                return ret
+        return 0
 
     def send_kvcache_slice(
         self,
@@ -1747,6 +1785,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                pack_buffer=self._dcp_pack_buffers[worker_index],
                             )
                         elif (
                             self.is_mla_backend
@@ -2041,6 +2080,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
+                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:

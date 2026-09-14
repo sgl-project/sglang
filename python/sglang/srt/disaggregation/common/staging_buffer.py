@@ -143,11 +143,17 @@ class StagingBuffer:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "cudaMalloc"
         self.data_ptr = self.buffer.data_ptr()
+        self._gather_stream = None
 
         logger.info(
             f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
             f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
         )
+
+    def get_gather_stream(self):
+        if self._gather_stream is None:
+            self._gather_stream = torch.cuda.Stream(device=self.device)
+        return self._gather_stream
 
     def get_ptr(self) -> int:
         return self.data_ptr
