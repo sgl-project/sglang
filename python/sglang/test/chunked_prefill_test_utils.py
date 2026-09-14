@@ -34,7 +34,7 @@ KV_CANARY_ARGS: List[str] = [
     "partial",
     "--kv-canary-sweep-interval",
     "100",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
 ]
 
 

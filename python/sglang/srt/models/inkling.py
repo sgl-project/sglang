@@ -80,7 +80,6 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
-    mamba_extra_buffer_enabled,
 )
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
@@ -1021,7 +1020,7 @@ class InklingForConditionalGeneration(nn.Module):
         if get_disagg().disaggregation_mode != "decode":
             assert not get_memory().disable_radix_cache
             assert not get_schedule().disable_hybrid_swa_memory
-            assert mamba_extra_buffer_enabled()
+            assert get_exec().mamba.enable_mamba_extra_buffer
 
         from types import SimpleNamespace
 
