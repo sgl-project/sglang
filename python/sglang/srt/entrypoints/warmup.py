@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, List
 
@@ -159,3 +160,46 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# Warm one schema and the shared token-mask kernels. Other schemas still need
+# their own grammar compilation on first use.
+_GRAMMAR_WARMUP_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["topic", "items"],
+    },
+    sort_keys=True,
+)
+
+
+@warmup("structured_output")
+async def structured_output(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Warm JSON-constrained decoding with --warmups structured_output.
+
+    This compiles one example grammar and launches shared token-mask kernels
+    before serving client traffic. It does not precompile arbitrary schemas
+    or change the KV-cache allocation budget.
+    """
+    req = GenerateReqInput(
+        text="Name a topic and list three items in it.",
+        sampling_params={
+            "max_new_tokens": 32,
+            "temperature": 0.0,
+            "json_schema": _GRAMMAR_WARMUP_SCHEMA,
+        },
+    )
+    if disaggregation_mode != "null":
+        req.bootstrap_room = 0
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    # Drain the generator rather than taking the first item, so the grammar is installed
+    # and the kernel launch has happened by the time this returns.
+    async for _ in tokenizer_manager.generate_request(req, None):
+        pass
+    logger.info("Structured-output warmup completed.")
