@@ -1,0 +1,384 @@
+name: Bytedance Backfill Image Formats (zstd + nydus)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_refs:
+        description: |
+          目标镜像引用列表，每行一个，不含格式后缀。
+          auto_rename=true 且 source_image_ref 为空时，以此为源镜像列表进行重命名+补全。
+          格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<tag>
+          示例: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
+        required: false
+        type: string
+        default: ""
+      source_image_ref:
+        description: |
+          可选源镜像。auto_rename=true 时从该镜像生成标准 tag；
+          auto_rename=false 时将它复制到 image_refs 指定的唯一目标，再补全格式。
+          可用于把旧 repo 中的历史镜像规范化到 serving/<framework>:<tag>。
+        required: false
+        type: string
+        default: ""
+      auto_rename:
+        description: |
+          启用自动重命名：从源镜像 tag 提取版本号，按 ServingKit 日构建规则自动生成标准 tag。
+          有 source_image_ref 时以它为准；否则以 image_refs 中的镜像为准。
+          重命名后自动补全 zstd + nydus 格式。
+        required: false
+        type: boolean
+        default: false
+      auto_rename_mode:
+        description: "自动重命名模式: manual→iaas.dev, nightly→iaas.nightly, version→byted.{tag_value}"
+        required: false
+        type: string
+        default: "manual"
+      auto_rename_tag_value:
+        description: "version 模式下的 tag_value（仅 auto_rename_mode=version 时需要）"
+        required: false
+        type: string
+        default: ""
+concurrency:
+  group: backfill-image-formats-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    environment: prod
+    env:
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      NYDUS_VERSION: "2.3.0"
+      DEFAULT_SGLANG_VERSION: "0.0.0dev"
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Install nydus tooling
+        run: |
+          set -euo pipefail
+          if command -v nydusify &>/dev/null && command -v nydus-image &>/dev/null; then
+            echo "[nydus] tools already installed: $(nydusify --version 2>&1 | head -1)"
+            exit 0
+          fi
+          tarball="nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz"
+          url="https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/${tarball}"
+          retry() { for i in $(seq 1 5); do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; }
+          retry curl -fL --retry 5 --retry-all-errors --retry-delay 2 -o "/tmp/${tarball}" "${url}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          sudo install -m 0755 /tmp/nydus-static/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 /tmp/nydus-static/nydus-image /usr/local/bin/nydus-image
+          nydusify --version
+          nydus-image --version
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.auto_rename }}" = "false" ] && [ -z "${{ inputs.image_refs }}" ]; then
+            echo "ERROR: image_refs is required when auto_rename is disabled"
+            exit 1
+          fi
+          if [ "${{ inputs.auto_rename }}" = "false" ] && [ -n "${{ inputs.source_image_ref }}" ]; then
+            target_count=0
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              target_count=$((target_count + 1))
+            done <<< "${{ inputs.image_refs }}"
+            if [ "${target_count}" -ne 1 ]; then
+              echo "ERROR: exact-copy mode requires exactly one image_refs target"
+              exit 1
+            fi
+          fi
+          echo "Input validation passed."
+
+      - name: Auto-rename and backfill
+        env:
+          IMAGE_REFS: ${{ inputs.image_refs }}
+          SOURCE_IMAGE_REF: ${{ inputs.source_image_ref }}
+          AUTO_RENAME: ${{ inputs.auto_rename }}
+          AUTO_RENAME_MODE: ${{ inputs.auto_rename_mode }}
+          AUTO_RENAME_TAG_VALUE: ${{ inputs.auto_rename_tag_value }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            for i in $(seq 1 5); do
+              "$@" && return 0
+              echo "  [retry] attempt $i/5 failed; sleeping 15s"
+              sleep 15
+            done
+            return 1
+          }
+
+          generate_tag() {
+            local source_tag="$1"
+            local source_ref="$2"
+            local version
+            version="$(echo "${source_tag}" | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | sed 's/^v//' || true)"
+            if [ -z "${version}" ]; then
+              echo "  Version is not present in tag '${source_tag}'; inspecting the image..." >&2
+              if ! docker pull "${source_ref}" >&2; then
+                echo "  ERROR: failed to pull source image for version detection: ${source_ref}" >&2
+                return 1
+              fi
+
+              local detected_version=""
+              local python_cmd
+              for python_cmd in python3 python; do
+                if detected_version="$(
+                  docker run --rm --entrypoint "${python_cmd}" "${source_ref}" \
+                    -c 'import importlib.metadata as m; print(m.version("sglang"))' \
+                    2>/dev/null
+                )" && [ -n "${detected_version}" ]; then
+                  echo "  Detected installed sglang version with ${python_cmd}: ${detected_version}" >&2
+                  break
+                fi
+                detected_version=""
+              done
+
+              version="$(echo "${detected_version}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | head -1 || true)"
+              if [ "${version}" = "0.0.0" ]; then
+                echo "  Ignoring placeholder package version: ${detected_version}" >&2
+                version=""
+              fi
+
+              # Source-overlay images can intentionally retain a 0.0.0 wheel
+              # version. Resolve their recorded build commit to the nearest
+              # release tag in this repository.
+              if [ -z "${version}" ]; then
+                local build_commit
+                build_commit="$(
+                  docker image inspect "${source_ref}" \
+                    --format '{{ index .Config.Labels "ai.sglang.build.commit" }}' \
+                    2>/dev/null || true
+                )"
+                if [[ "${build_commit}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+                  echo "  Resolving recorded build commit: ${build_commit}" >&2
+                  if ! git cat-file -e "${build_commit}^{commit}" 2>/dev/null; then
+                    git fetch --quiet --no-tags origin "${build_commit}" --depth=1000 || true
+                  fi
+                  git fetch --quiet --tags origin || true
+                  local release_tag
+                  release_tag="$(
+                    git describe --tags --match 'v[0-9]*' --abbrev=0 "${build_commit}" \
+                      2>/dev/null || true
+                  )"
+                  version="$(
+                    echo "${release_tag}" | \
+                      grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | \
+                      sed 's/^v//' || true
+                  )"
+                  if [ -n "${version}" ]; then
+                    echo "  Resolved ${build_commit} to release baseline ${release_tag}" >&2
+                  fi
+                fi
+              fi
+
+              # Older images without source provenance may still record the
+              # versioned ServingKit image they were built from.
+              if [ -z "${version}" ]; then
+                local base_image
+                base_image="$(
+                  docker image inspect "${source_ref}" \
+                    --format '{{ index .Config.Labels "ai.sglang.build.base-image" }}' \
+                    2>/dev/null || true
+                )"
+                version="$(
+                  echo "${base_image}" | \
+                    grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | \
+                    head -1 | sed 's/^v//' || true
+                )"
+                if [ -n "${version}" ]; then
+                  echo "  Detected version from base-image metadata: ${version}" >&2
+                fi
+              fi
+
+              if [ -z "${version}" ]; then
+                version="${DEFAULT_SGLANG_VERSION}"
+                echo "  WARNING: unable to determine a non-placeholder sglang version from the tag, container, build commit, or image metadata" >&2
+                echo "  Source image: ${source_ref}" >&2
+                echo "  Falling back to default sglang version: ${version}" >&2
+              fi
+            fi
+            echo "  Using sglang version: ${version}" >&2
+
+            local timestamp="$(TZ=Asia/Shanghai date +'%Y%m%d%H%M')"
+            local new_tag
+            case "${AUTO_RENAME_MODE}" in
+              nightly) new_tag="v${version}.iaas.nightly.${timestamp}" ;;
+              manual)  new_tag="v${version}.iaas.dev.${timestamp}" ;;
+              version)
+                if [ -z "${AUTO_RENAME_TAG_VALUE}" ]; then
+                  echo "  ERROR: auto_rename_tag_value is required for version mode" >&2
+                  return 1
+                fi
+                new_tag="v${version}.byted.${AUTO_RENAME_TAG_VALUE}.${timestamp}"
+                ;;
+              *)
+                echo "  ERROR: unknown auto_rename_mode: ${AUTO_RENAME_MODE}" >&2
+                return 1
+                ;;
+            esac
+
+            echo "${new_tag}"
+          }
+
+          rename_and_backfill() {
+            local source_ref="$1"
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') Processing: ${source_ref} ==="
+
+            local source_tag="${source_ref##*:}"
+            local source_registry_ns="${source_ref%%:*}"
+
+            if [ "${AUTO_RENAME}" = "true" ]; then
+              local new_tag
+              new_tag="$(generate_tag "${source_tag}" "${source_ref}")" || return 1
+              local target_ref="${source_registry_ns}:${new_tag}"
+              echo "  Generated target: ${target_ref}"
+
+              if docker manifest inspect "${target_ref}" >/dev/null 2>&1; then
+                echo "  Target already exists, using existing: ${target_ref}"
+              else
+                echo "  Renaming: ${source_ref} -> ${target_ref}"
+                docker pull "${source_ref}"
+                docker tag "${source_ref}" "${target_ref}"
+                docker push "${target_ref}"
+                echo "  Renamed: ${target_ref}"
+              fi
+              backfill_one "${target_ref}"
+            else
+              backfill_one "${source_ref}"
+            fi
+          }
+
+          copy_and_backfill() {
+            local source_ref="$1"
+            local target_ref="$2"
+            local allowed_prefix="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/"
+
+            if [[ "${target_ref}" != "${allowed_prefix}"* ]]; then
+              echo "ERROR: exact-copy target must start with ${allowed_prefix}"
+              return 1
+            fi
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') Normalize: ${source_ref} -> ${target_ref} ==="
+            if docker manifest inspect "${target_ref}" >/dev/null 2>&1; then
+              echo "  Target already exists, using existing: ${target_ref}"
+            else
+              # Both registries are reachable directly from the self-hosted
+              # runner. Its inherited proxy returns a gateway timeout for the
+              # production CR endpoint, so keep this registry-to-registry copy
+              # on the internal route.
+              retry env \
+                HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= \
+                https_proxy= http_proxy= all_proxy= \
+                crane copy "${source_ref}" "${target_ref}"
+              echo "  Copied: ${target_ref}"
+            fi
+            backfill_one "${target_ref}"
+          }
+
+          backfill_one() {
+            local image_ref="$1"
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') Backfill: ${image_ref} ==="
+
+            if ! docker manifest inspect "${image_ref}" >/dev/null 2>&1; then
+              echo "  ERROR: base image not found: ${image_ref}"
+              return 1
+            fi
+            echo "  OCI base verified"
+
+            # zstd
+            if docker manifest inspect "${image_ref}-zstd" >/dev/null 2>&1; then
+              echo "  [zstd] already exists"
+            else
+              echo "  [zstd] backfilling..."
+              docker pull "${image_ref}"
+              tmp_dockerfile=$(mktemp /tmp/Dockerfile.zstd.XXXXXX)
+              echo "FROM ${image_ref}" > "${tmp_dockerfile}"
+              docker buildx build \
+                --platform linux/amd64 \
+                --output "type=image,name=${image_ref}-zstd,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true" \
+                -f "${tmp_dockerfile}" \
+                /tmp
+              rm -f "${tmp_dockerfile}"
+              echo "  [zstd] published ${image_ref}-zstd"
+            fi
+
+            # nydus
+            if docker manifest inspect "${image_ref}-nydus" >/dev/null 2>&1; then
+              echo "  [nydus] already exists"
+            else
+              echo "  [nydus] backfilling..."
+              retry nydusify convert \
+                --nydus-image /usr/local/bin/nydus-image \
+                --source "${image_ref}" \
+                --target "${image_ref}-nydus"
+              echo "  [nydus] published ${image_ref}-nydus"
+            fi
+
+            echo "  done: ${image_ref}"
+          }
+
+          echo "=== $(date '+%H:%M:%S') Backfill Image Formats ==="
+          echo "  auto_rename: ${AUTO_RENAME}"
+          echo "  auto_rename_mode: ${AUTO_RENAME_MODE}"
+          # Determine source images
+          if [ "${AUTO_RENAME}" = "true" ] && [ -n "${SOURCE_IMAGE_REF}" ]; then
+            echo "  Using source_image_ref as rename source"
+            rename_and_backfill "${SOURCE_IMAGE_REF}"
+          elif [ "${AUTO_RENAME}" = "true" ]; then
+            echo "  Using image_refs as rename source"
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              rename_and_backfill "$line"
+            done <<< "${IMAGE_REFS}"
+          elif [ -n "${SOURCE_IMAGE_REF}" ]; then
+            echo "  Exact copy to image_refs target, then direct backfill"
+            target_ref=""
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              target_ref="$line"
+            done <<< "${IMAGE_REFS}"
+            copy_and_backfill "${SOURCE_IMAGE_REF}" "${target_ref}"
+          else
+            echo "  Direct backfill (no rename)"
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              backfill_one "$line"
+            done <<< "${IMAGE_REFS}"
+          fi
+
+          echo ""
+          echo "All backfills complete."
