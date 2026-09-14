@@ -37,8 +37,8 @@
 //! EAGLE-family workers (`is_bigram = is_eagle`) hash KV blocks over
 //! overlapping `(t_i, t_{i+1})` token pairs. That path is implemented as a
 //! separate [`compute_block_hashes_bigram`] (below) rather than branching
-//! inside the non-bigram fast path; `CacheAwareZmqPolicy::select` chooses
-//! between the two from the worker-reported bigram flag.
+//! inside the non-bigram fast path. Prefix providers choose between them
+//! using the worker-reported bigram flag.
 
 use sha2::{Digest, Sha256};
 

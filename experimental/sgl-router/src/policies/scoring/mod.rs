@@ -57,6 +57,11 @@ pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether scoring corrects Engine Load with recent dispatch timestamps.
+    fn needs_dispatch_timestamps(&self) -> bool {
+        false
+    }
+
     /// Optional eligibility view for policies that provide both signals.
     fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
         None
@@ -141,6 +146,10 @@ impl<T: ScoringPolicy> Policy for T {
 
     fn needs_load_snapshot(&self) -> bool {
         ScoringPolicy::needs_load_snapshot(self)
+    }
+
+    fn needs_dispatch_timestamps(&self) -> bool {
+        ScoringPolicy::needs_dispatch_timestamps(self)
     }
 
     fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
@@ -281,6 +290,14 @@ impl Policy for Pipeline {
         self.inner.needs_load_snapshot() || self.filters.iter().any(|p| p.needs_load_snapshot())
     }
 
+    fn needs_dispatch_timestamps(&self) -> bool {
+        self.inner.needs_dispatch_timestamps()
+            || self
+                .filters
+                .iter()
+                .any(|policy| policy.needs_dispatch_timestamps())
+    }
+
     fn commit_prefill_selection(
         &self,
         ctx: &SelectionContext<'_>,
@@ -340,6 +357,10 @@ impl Policy for ScorePolicy {
         self.inner.needs_request_tokens()
     }
 
+    fn needs_dispatch_timestamps(&self) -> bool {
+        self.inner.needs_dispatch_timestamps()
+    }
+
     fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
         self.inner.attach_metrics(metrics);
     }
@@ -373,6 +394,12 @@ impl ScoringPolicy for FusedScorePolicy {
             .iter()
             .any(|(policy, _)| policy.needs_load_snapshot())
     }
+
+    fn needs_dispatch_timestamps(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|(policy, _)| policy.needs_dispatch_timestamps())
+    }
 }
 
 /// Owned boxes as the borrowed views [`admit`] consumes. Shared by the tests
@@ -390,7 +417,8 @@ mod tests {
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
+    use crate::policies::load_based::LoadBasedPolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
@@ -412,18 +440,23 @@ mod tests {
     }
 
     fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_workers(
+        EngineLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, running, waiting, used, capacity)| {
                     (
                         worker.url.clone(),
-                        EngineWorkerLoad {
+                        NativeCacheWorkerLoad {
                             num_running_reqs: *running,
                             num_waiting_reqs: *waiting,
-                            num_tokens: *used,
+                            num_waiting_uncached_tokens: *waiting,
+                            num_used_tokens: *used,
+                            num_total_tokens: *used,
                             max_total_num_tokens: *capacity,
+                            max_running_requests: 64,
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -606,22 +639,36 @@ mod tests {
 
         let plain = FusedScorePolicy::new(vec![term(by(1.0), None)]).unwrap();
         assert!(!Policy::needs_load_snapshot(&plain));
+        assert!(!Policy::needs_dispatch_timestamps(&plain));
         let fused =
             FusedScorePolicy::new(vec![term(by(1.0), None), term(LoadHungry, None)]).unwrap();
         assert!(Policy::needs_load_snapshot(&fused));
+        assert!(!Policy::needs_dispatch_timestamps(&fused));
+
+        let load_fused = FusedScorePolicy::new(vec![
+            term(by(1.0), None),
+            term(LoadBasedPolicy::new(), None),
+        ])
+        .unwrap();
+        assert!(Policy::needs_dispatch_timestamps(&load_fused));
 
         let pipeline = Pipeline::new(
             vec![Arc::new(Keep(vec!["a"], OnEmpty::Abstain))],
-            Arc::new(fused),
+            Arc::new(load_fused),
         )
         .unwrap();
         assert!(pipeline.needs_load_snapshot());
+        assert!(pipeline.needs_dispatch_timestamps());
 
         let score = ScorePolicy::new(Arc::new(by(1.0)));
         assert!(
             score.needs_load_snapshot(),
             "shared admission requires a snapshot"
         );
+        assert!(!score.needs_dispatch_timestamps());
+
+        let load_score = ScorePolicy::new(Arc::new(LoadBasedPolicy::new()));
+        assert!(load_score.needs_dispatch_timestamps());
     }
 
     #[test]

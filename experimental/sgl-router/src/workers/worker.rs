@@ -67,9 +67,8 @@ impl SlotRegistry {
 
     /// Count of currently-claimed slots acquired at or after `since`. Used to
     /// bound how many of this worker's in-flight requests are dispatches the
-    /// engine hasn't reported back on yet (see
-    /// `crate::policies::cache_aware_zmq::WorkerLoads::load_of`), rather than
-    /// adding the full in-flight count — which would also include long-held
+    /// engine hasn't reported back on yet, rather than adding the full
+    /// in-flight count — which would also include long-held
     /// slots from slow-draining streaming responses (see
     /// `crate::proxy::Proxy::forward_streaming_to`'s `stream_guards` doc)
     /// that the engine's own last report likely already accounts for.

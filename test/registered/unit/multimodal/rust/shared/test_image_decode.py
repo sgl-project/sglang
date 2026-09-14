@@ -19,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _mm_rust_utils import load_core  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CORE = load_core()
 DECODE = CORE and CORE.common.image_decode_rgb
