@@ -47,6 +47,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -863,7 +864,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if is_true_on_policy_enabled(get_global_server_args())
             else {}
         )
         self.input_layernorm = RMSNorm(
