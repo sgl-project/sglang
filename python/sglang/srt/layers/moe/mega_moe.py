@@ -47,6 +47,8 @@ _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 def _use_amd_flydsl_mega_moe() -> bool:
     return envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+
+
 def _mega_moe_mma_type() -> str:
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 

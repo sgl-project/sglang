@@ -56,6 +56,7 @@ from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 

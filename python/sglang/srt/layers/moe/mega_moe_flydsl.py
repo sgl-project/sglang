@@ -369,9 +369,9 @@ def _run_mega_routed(
     x_in = x_in.contiguous()
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
-    assert (
-        x_in.shape[0] <= selected_mtpr
-    ), f"Aiter MegaMoE local tokens {x_in.shape[0]} exceed MTPR {selected_mtpr}"
+    assert x_in.shape[0] <= selected_mtpr, (
+        f"Aiter MegaMoE local tokens {x_in.shape[0]} exceed MTPR {selected_mtpr}"
+    )
     mega = _get_or_build_mega_moe(
         moe.experts,
         model_dim=hidden_size,
