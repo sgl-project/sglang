@@ -95,9 +95,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
-        ``num_tokens`` or nothing evictable remains."""
+        ``num_tokens`` or nothing evictable remains.
+
+        Return whether capacity was realized, or None if it still needs checking.
+        """
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 

@@ -149,9 +149,11 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
     if tree_cache is not None and not tree_cache.is_chunk_cache():
-        tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
             tree_cache, num_tokens
         )
 
