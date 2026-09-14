@@ -51,7 +51,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
         """Init the metadata for a forward pass."""
 
         bs = forward_batch.batch_size

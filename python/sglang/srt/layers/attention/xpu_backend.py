@@ -106,7 +106,17 @@ class XPUAttentionBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        """Eager-only entry point. XPU builds FlashAttentionMetadata fields by
+        advanced-indexing the req_to_token table, returning fresh tensors each
+        call -- the resulting tensor addresses are not stable across iters and
+        cannot be safely captured into a cuda graph. Decode cuda-graph capture
+        (which is not auto-disabled for XPU -- _handle_xpu_backends only
+        disables the prefill graph) would otherwise pin the capture-time
+        page_table address, and later replays would see metadata from a
+        different request. Keep this as init_forward_metadata so graph paths
+        fall back to the base ABC default (no-op _out_graph + _in_graph) and
+        XPU stays eager-only here.
+        """
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
