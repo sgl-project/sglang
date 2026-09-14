@@ -153,6 +153,12 @@ def _cpu_jit_one_layer_mla_copy(
     cache_dst[indices_dst] = cache_src[indices_src]
 
 
+def _cpu_per_layer_mla_lf_pf_copy(*, src, dst, src_indices, dst_indices, layer_id, **_):
+    src_indices = src_indices.to(dtype=torch.int64, device="cpu")
+    dst_indices = dst_indices.to(dtype=torch.int64, device="cpu")
+    dst[dst_indices, layer_id] = src[src_indices]
+
+
 def _cpu_per_layer_pf_lf_copy(
     *,
     src,
@@ -618,6 +624,61 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             self.assertTrue(torch.equal(layer[device_indices], expected[layer_id]))
             self.assertTrue(
                 torch.equal(host.kv_buffer[host_indices, layer_id], expected[layer_id])
+            )
+
+    def test_layer_sharded_mla_page_first_backup_uses_per_layer_fallback(self):
+        full_layer_num = 4
+        owned_start, owned_end = 1, 3
+        host_indices = _indices(0, 4)
+        device_indices = _indices(4, 8)
+        kv_cache_dim = 5
+        device_layers = [
+            (torch.arange(8 * kv_cache_dim, dtype=torch.uint8) + layer_id * 20)
+            .reshape(8, 1, kv_cache_dim)
+            .clone()
+            for layer_id in range(full_layer_num)
+        ]
+        device_pool = SimpleNamespace(
+            layer_num=full_layer_num,
+            layer_shard_enabled=True,
+            layer_shard_size=2,
+            kv_buffer=device_layers,
+        )
+        device_pool._owned_local_layer_range = lambda: (owned_start, owned_end)
+
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.device_pool = device_pool
+        host.layout = "page_first"
+        host.layer_num = owned_end - owned_start
+        host.kv_cache_dim = kv_cache_dim
+        host.token_stride_size = kv_cache_dim
+        host.layout_dim = host.token_stride_size * host.layer_num
+        host.dtype = torch.uint8
+        host.can_use_jit = False
+        host.can_use_write_back_jit = False
+        host.dcp_size = 1
+        host.dcp_rank = 0
+        host.mtp_draft_device_pools = ()
+        host.kv_buffer = torch.zeros(
+            8, host.layer_num, 1, kv_cache_dim, dtype=torch.uint8
+        )
+
+        with mock.patch(
+            f"{MLA_POOL_HOST_MODULE}.transfer_kv_per_layer_mla_lf_pf",
+            side_effect=_cpu_per_layer_mla_lf_pf_copy,
+            create=True,
+        ) as fallback:
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="kernel"
+            )
+
+        self.assertEqual(fallback.call_count, host.layer_num)
+        for host_layer, device_layer in enumerate(range(owned_start, owned_end)):
+            self.assertTrue(
+                torch.equal(
+                    host.kv_buffer[host_indices, host_layer],
+                    device_layers[device_layer][device_indices],
+                )
             )
 
     @unittest.skip(
