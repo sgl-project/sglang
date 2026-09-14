@@ -1079,9 +1079,11 @@ class Glm5NextModel(nn.Module):
 
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.visual": "visual",
+        },
         orig_to_new_prefix={
             "model.language_model.": "model.",
-            "model.visual.": "visual.",
         },
         orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
