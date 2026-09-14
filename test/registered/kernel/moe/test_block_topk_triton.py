@@ -14,8 +14,8 @@ from sglang.srt.models.llada2 import block_topk_triton
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large-amd")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, suite="jit-kernel-unit-test-amd")
 
 
 def block_topk_reference(

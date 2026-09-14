@@ -119,12 +119,11 @@ def _require_block_routing_simulated_experts_compatibility() -> None:
         )
     if simulate_uniform_experts:
         raise ValueError(
-            "LLaDA2 block routing does not support " "SGLANG_SIMULATE_UNIFORM_EXPERTS"
+            "LLaDA2 block routing does not support SGLANG_SIMULATE_UNIFORM_EXPERTS"
         )
     if simulate_round_robin_experts:
         raise ValueError(
-            "LLaDA2 block routing does not support "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+            "LLaDA2 block routing does not support SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
         )
 
 
