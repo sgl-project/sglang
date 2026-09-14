@@ -3,7 +3,6 @@ SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
 ARG VER_SGLANG=main
-ARG SGLANG_COMMIT=""
 
 ARG VER_TORCH=2.8.0+spacemit.1
 ARG VER_TORCHVISION=0.23.0
@@ -57,6 +56,7 @@ RUN uv pip install \
     --index-strategy unsafe-best-match
 
 # 6. Install SGLang Source
+ARG SGLANG_COMMIT=""
 WORKDIR /sgl-workspace
 RUN git clone ${SGLANG_REPO} sglang && \
     cd sglang && \
