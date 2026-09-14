@@ -535,7 +535,6 @@ class _FakeResolvedArgs:
     decode_attention_backend: A[str | None, Arg(help="dab"), NS("exec.kernel")] = None
     disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
     mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
-    uses_mamba_radix_cache: A[bool, Arg(help="umrc"), NS("exec.mamba")] = False
     speculative_algorithm: A[str | None, Arg(help="sa"), NS("spec")] = None
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
@@ -1160,37 +1159,29 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
         """It used to be asserted that two spellings agreed. There is one now:
         the declaration computes it at publish, and the bag carries it."""
         for disable_radix_cache in (False, True):
-            for uses_mamba_radix_cache in (False, True):
-                for strategy in self._STRATEGIES:
-                    with self.subTest(
-                        radix=disable_radix_cache,
-                        uses=uses_mamba_radix_cache,
-                        strategy=strategy,
-                    ):
-                        reset_context()
-                        publish(
-                            ServerArgs(
-                                model_path="dummy",
-                                disable_radix_cache=disable_radix_cache,
-                                uses_mamba_radix_cache=uses_mamba_radix_cache,
-                                mamba_radix_cache_strategy=strategy,
-                            ),
-                            role="test",
-                        )
-                        expected = (
-                            disable_radix_cache is False
-                            and uses_mamba_radix_cache
-                            and strategy in ("extra_buffer", "extra_buffer_lazy")
-                        )
-                        self.assertEqual(
-                            get_exec().mamba.enable_mamba_extra_buffer, expected
-                        )
-                        self.assertEqual(
-                            get_exec().mamba.enable_mamba_extra_buffer_lazy,
-                            disable_radix_cache is False
-                            and uses_mamba_radix_cache
-                            and strategy == "extra_buffer_lazy",
-                        )
+            for strategy in self._STRATEGIES:
+                with self.subTest(radix=disable_radix_cache, strategy=strategy):
+                    reset_context()
+                    publish(
+                        ServerArgs(
+                            model_path="dummy",
+                            disable_radix_cache=disable_radix_cache,
+                            mamba_radix_cache_strategy=strategy,
+                        ),
+                        role="test",
+                    )
+                    expected = disable_radix_cache is False and strategy in (
+                        "extra_buffer",
+                        "extra_buffer_lazy",
+                    )
+                    self.assertEqual(
+                        get_exec().mamba.enable_mamba_extra_buffer, expected
+                    )
+                    self.assertEqual(
+                        get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                        disable_radix_cache is False
+                        and strategy == "extra_buffer_lazy",
+                    )
 
     def test_prefill_buffer_ceiling_matches_the_member(self):
         from sglang.srt.runtime_context import max_prefill_buffer_tokens

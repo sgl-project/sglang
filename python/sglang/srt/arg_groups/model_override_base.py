@@ -285,12 +285,10 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     ``get_exec().mamba.enable_mamba_extra_buffer`` -- computed from this same
     function by the declaration in ``arg_groups/fields/exec_.py``. Resolution
     needs it before there is a bag to read, which is why it is still a
-    function. ``uses_mamba_radix_cache`` is arch-derived, so an explicit
-    strategy stays inert for models without mamba state."""
-    return (
-        cfg.disable_radix_cache is False
-        and cfg.uses_mamba_radix_cache
-        and cfg.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
+    function."""
+    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
+        "extra_buffer",
+        "extra_buffer_lazy",
     )
 
 

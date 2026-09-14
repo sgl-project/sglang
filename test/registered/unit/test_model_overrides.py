@@ -591,6 +591,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
 
+    def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "needs mamba state"):
+            self._construct(
+                "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
+            )
+
+    def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_radix_cache=True,
+        )
+        self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
+
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(

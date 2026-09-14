@@ -58,8 +58,8 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # spec today, but giving it one would silently stop this pin from firing.
     if cfg.mamba_radix_cache_strategy == "auto":
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
-    # The extra-buffer predicates also require the arch-derived leaf, which the
-    # generic resolution likewise never sets for Inkling.
+    # The generic resolution never sets the arch-derived leaf for Inkling, and
+    # handle_mamba_radix_cache rejects extra_buffer on a model without it.
     if not cfg.disable_radix_cache:
         overrides["uses_mamba_radix_cache"] = True
     # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
