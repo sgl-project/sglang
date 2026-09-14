@@ -83,6 +83,47 @@ def _indexed_gate_bf16_kernel(
     )
 
 
+def _is_compiling() -> bool:
+    return torch.compiler.is_compiling()
+
+
+def can_use_indexed_scale_shift_bf16_cpu(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        not _is_compiling()
+        and x.device.type == shift.device.type == scale.device.type == indices.device.type == "cpu"
+        and x.dtype == shift.dtype == scale.dtype == torch.bfloat16
+        and indices.dtype in (torch.int32, torch.int64)
+        and x.dim() == shift.dim() == scale.dim() == 2
+        and indices.dim() == 1
+        and x.is_contiguous()
+        and indices.is_contiguous()
+        and shift.stride(-1) == 1
+        and scale.stride(-1) == 1
+        and x.shape[0] == indices.shape[0]
+        and shift.shape == scale.shape
+        and x.shape[1] == shift.shape[1]
+    )
+
+
+def _eager_indexed_scale_shift_bf16_(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    x.copy_(
+        (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(
+            x.dtype
+        )
+    )
+    return x
+
+
 def indexed_scale_shift_bf16_(
     x: torch.Tensor,
     shift: torch.Tensor,
@@ -92,22 +133,22 @@ def indexed_scale_shift_bf16_(
     rows, hidden_size = x.shape
     if rows == 0:
         return x
-    block_n = triton.next_power_of_2(hidden_size)
-    _indexed_scale_shift_bf16_kernel[(rows,)](
-        x,
-        x,
-        shift,
-        scale,
-        indices,
-        hidden_size,
-        x.stride(0),
-        shift.stride(0),
-        scale.stride(0),
-        indices.stride(0),
-        BLOCK_N=block_n,
-        num_warps=8,
-    )
-    return x
+    if _is_compiling():
+        return _eager_indexed_scale_shift_bf16_(x, shift, scale, indices)
+    if x.is_cuda:
+        block_n = triton.next_power_of_2(hidden_size)
+        _indexed_scale_shift_bf16_kernel[(rows,)](
+            x, x, shift, scale, indices, hidden_size, x.stride(0), shift.stride(0),
+            scale.stride(0), indices.stride(0), BLOCK_N=block_n, num_warps=8
+        )
+        return x
+    if can_use_indexed_scale_shift_bf16_cpu(x, shift, scale, indices):
+        import sgl_kernel  # noqa: F401
+
+        return torch.ops.sgl_kernel.indexed_scale_shift_bf16_(
+            x, shift, scale, indices
+        )
+    return _eager_indexed_scale_shift_bf16_(x, shift, scale, indices)
 
 
 def _indexed_gate_bf16(
