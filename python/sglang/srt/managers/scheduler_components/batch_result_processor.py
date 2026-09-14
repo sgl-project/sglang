@@ -92,6 +92,47 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     return stride
 
 
+def spec_finish_candidates(
+    next_token_ids: torch.Tensor,
+    accept_lens: torch.Tensor,
+    *,
+    stride: int,
+    candidate_tokens: set[int],
+    vocab_size: Optional[int],
+) -> List[bool]:
+    """Per request, whether any accepted token could finish it by token.
+
+    A token finishes a request only if it is a stop / EOS token or lies outside
+    the vocabulary; ``candidate_tokens`` is the union of every request's stop and
+    EOS ids, so a False here is exact and a True only says the per-request check
+    must run. Padded verify rows beyond ``accept_lens`` are ignored.
+    """
+    bs = accept_lens.shape[0]
+    ids = next_token_ids.view(bs, stride)
+    hit = ids < 0
+    if vocab_size is not None:
+        hit |= ids >= vocab_size
+    if candidate_tokens:
+        hit |= torch.isin(ids, torch.tensor(sorted(candidate_tokens), dtype=ids.dtype))
+    valid = torch.arange(stride, dtype=accept_lens.dtype).unsqueeze(0) < (
+        accept_lens.unsqueeze(1)
+    )
+    return (hit & valid).any(dim=1).tolist()
+
+
+def _finish_check_needed(req: Req, token_candidate: bool) -> bool:
+    """Whether ``update_finish_state`` can change ``req``: a stop/EOS/out-of-vocab
+    candidate token, a pending finish, a stop string or regex, a grammar, or the
+    length cap reached. Everything else returns from ``update_finish_state``
+    without touching the request."""
+    if token_candidate or req.to_finish is not None or req.grammar is not None:
+        return True
+    params = req.sampling_params
+    if params.stop_strs or params.stop_regex_strs:
+        return True
+    return len(req.output_ids) >= params.max_new_tokens
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -971,6 +1012,12 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
+        is_spec = not batch.spec_algorithm.is_none()
+        overlap = self.enable_overlap or self.enable_overlap_mlx
+        finish_candidates = (
+            self._spec_finish_candidates(batch, result) if is_spec else None
+        )
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -987,9 +1034,7 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
@@ -997,7 +1042,6 @@ class SchedulerBatchResultProcessor:
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
-            is_spec = not batch.spec_algorithm.is_none()
 
             req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
@@ -1014,7 +1058,12 @@ class SchedulerBatchResultProcessor:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
-            req.update_finish_state(new_accept_len)
+            # Skip the per-token stop / EOS scans when the batch-level candidate
+            # test already proved this request cannot finish this step.
+            if finish_candidates is None or _finish_check_needed(
+                req, finish_candidates[i]
+            ):
+                req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)
@@ -1074,6 +1123,42 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph,
             running_batch=batch,
             num_generated_tokens=num_generated_tokens,
+        )
+
+    def _spec_finish_candidates(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> Optional[List[bool]]:
+        """Batch-level token finish candidates for a speculative decode result,
+        or None when the padded token tensor is not available on the host."""
+        next_token_ids = result.next_token_ids
+        accept_lens = result.accept_lens
+        if not (torch.is_tensor(next_token_ids) and torch.is_tensor(accept_lens)):
+            return None
+        if not (next_token_ids.is_cpu and accept_lens.is_cpu):
+            return None
+        candidates: set[int] = set()
+        vocab_size: Optional[int] = None
+        for req in batch.reqs:
+            stop_ids = req.sampling_params.stop_token_ids
+            if stop_ids:
+                candidates.update(stop_ids)
+            if req.eos_token_ids:
+                candidates.update(req.eos_token_ids)
+            tokenizer = req.tokenizer
+            if tokenizer is not None:
+                candidates.add(tokenizer.eos_token_id)
+                if tokenizer.additional_stop_token_ids:
+                    candidates.update(tokenizer.additional_stop_token_ids)
+            if req.vocab_size is not None and (
+                vocab_size is None or req.vocab_size < vocab_size
+            ):
+                vocab_size = req.vocab_size
+        return spec_finish_candidates(
+            next_token_ids,
+            accept_lens,
+            stride=_get_speculative_output_stride(result),
+            candidate_tokens=candidates,
+            vocab_size=vocab_size,
         )
 
     def _normalize_decode_outputs(
