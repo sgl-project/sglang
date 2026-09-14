@@ -158,8 +158,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
-        self._eager_verify_row_meta = None
-        self._small_extend_row_meta = None
+        self._eager_verify_row_meta: Optional[tuple[int, SimpleNamespace]] = None
+        self._small_extend_row_meta: Optional[tuple[int, SimpleNamespace]] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -1426,7 +1426,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         """Per-row metadata for a small extend, built once per forward batch."""
         cached = self._small_extend_row_meta
-        if cached is not None and cached[0] is forward_batch:
+        if cached is not None and cached[0] == id(forward_batch):
             return cached[1]
         extend_lens = [int(n) for n in forward_batch.extend_seq_lens_cpu]
         prefix_lens = [int(n) for n in forward_batch.extend_prefix_lens_cpu]
@@ -1453,7 +1453,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             else 1,
             rows=sum(extend_lens),
         )
-        self._small_extend_row_meta = (forward_batch, row_meta)
+        self._small_extend_row_meta = (id(forward_batch), row_meta)
         return row_meta
 
     def _forward_gpu_triton_small_extend(
@@ -1563,7 +1563,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if row_meta is None:
             # eager verify: the row metadata is layer-invariant, so build it once per forward
             cached = self._eager_verify_row_meta
-            if cached is not None and cached[0] is forward_batch:
+            if cached is not None and cached[0] == id(forward_batch):
                 row_meta = cached[1]
             else:
                 # seq_lens is the prefix length on GPU verify batches
@@ -1579,7 +1579,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         int(ndt)
                     ),
                 )
-                self._eager_verify_row_meta = (forward_batch, row_meta)
+                self._eager_verify_row_meta = (id(forward_batch), row_meta)
         per_query_seq_lens = row_meta.per_query_seq_lens
         per_query_req = row_meta.per_query_req
         per_query_req = per_query_req.to(forward_batch.req_pool_indices.dtype)
