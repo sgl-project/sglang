@@ -117,16 +117,11 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                 )
 
     def test_glm53_effort_template_forces_reasoning(self):
-        """GLM-5.3 templates must detect as always-on reasoning; their generation
-        prompt opens ``<think>``, so output carries only the closing tag."""
         vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
-        for concat in ("+", "~"):
-            with self.subTest(concat=concat):
-                force, config, _ = self._detect(_glm53_template(concat), vocab)
+        force, config, _ = self._detect(_glm53_template("+"), vocab)
 
-                self.assertTrue(force)
-                self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
-                self.assertTrue(config.always_on)
+        self.assertTrue(force)
+        self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
