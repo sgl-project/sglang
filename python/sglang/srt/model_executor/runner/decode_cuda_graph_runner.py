@@ -570,16 +570,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
         DP rank drafts independently with no cross-DP collective, so its
         hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
+        local batch size. Everything else keeps the dp-global padding path.
+
+        The DFLASH dense draft has the same property (and the same
+        draft_tp_context = attn-TP group): idle DP ranks simply skip the draft
+        step, so there is no cross-DP collective to keep in lockstep and the
+        graph can be replayed per DP rank."""
         if not model_runner.is_draft_worker:
             return False
-        if not model_runner.spec_algorithm.is_dspark():
-            return False
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
-        )
+        if model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                draft_is_deepseek_v4,
+            )
 
-        return not draft_is_deepseek_v4()
+            return not draft_is_deepseek_v4()
+        return model_runner.spec_algorithm.is_dflash_family()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
