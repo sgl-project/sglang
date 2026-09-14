@@ -776,6 +776,7 @@ def fused_qkv_split_l2norm_gdn_prefill_kernel(
     NUM_V_HEADS: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    NUM_QK_HEADS_POW2: tl.constexpr,
     HEAD_QK_POW2: tl.constexpr,
     V_BLOCK: tl.constexpr,
 ):
@@ -785,22 +786,25 @@ def fused_qkv_split_l2norm_gdn_prefill_kernel(
     qk_dim: tl.constexpr = NUM_QK_HEADS * HEAD_QK
     v_dim: tl.constexpr = NUM_V_HEADS * HEAD_V
 
-    # [NUM_QK_HEADS, HEAD_QK_POW2] so the reduction runs along the head dim and
-    # every head of this token is normalized in one pass.
-    head = tl.arange(0, NUM_QK_HEADS)[:, None]
+    # [NUM_QK_HEADS_POW2, HEAD_QK_POW2] so the reduction runs along the head dim
+    # and every head of this token is normalized in one pass. Both axes are
+    # padded because tl.arange needs a power of two, and num_qk_heads is
+    # cdiv(num_k_heads, attn_tp_size), which need not be one.
+    head = tl.arange(0, NUM_QK_HEADS_POW2)[:, None]
     dim = tl.arange(0, HEAD_QK_POW2)[None, :]
-    inner = dim < HEAD_QK
+    inner = (head < NUM_QK_HEADS) & (dim < HEAD_QK)
     flat = head * HEAD_QK + dim
 
     b_q = tl.load(row + flat * MIXED_QKV_STRIDE_D, mask=inner, other=0.0).to(tl.float32)
-    # Divide by sqrt rather than multiplying by the reciprocal so the result is
-    # bit-identical to l2norm_fwd_kernel, which the unfused path runs.
+    # Divide by sqrt rather than multiplying by the reciprocal, matching the
+    # form l2norm_fwd_kernel uses. The reduction block shape still differs, so
+    # this lands within an ulp of it rather than bit-exactly on it.
     b_q = b_q / tl.sqrt(tl.sum(b_q * b_q, axis=1) + eps)[:, None]
     tl.store(q + i_t * qk_dim + flat, b_q.to(q.dtype.element_ty), mask=inner)
 
-    b_k = tl.load(
-        row + (qk_dim + flat) * MIXED_QKV_STRIDE_D, mask=inner, other=0.0
-    ).to(tl.float32)
+    b_k = tl.load(row + (qk_dim + flat) * MIXED_QKV_STRIDE_D, mask=inner, other=0.0).to(
+        tl.float32
+    )
     b_k = b_k / tl.sqrt(tl.sum(b_k * b_k, axis=1) + eps)[:, None]
     tl.store(k + i_t * qk_dim + flat, b_k.to(k.dtype.element_ty), mask=inner)
 
@@ -856,6 +860,7 @@ def fused_qkv_split_l2norm_gdn_prefill(
         num_v_heads,
         head_qk,
         head_v,
+        NUM_QK_HEADS_POW2=triton.next_power_of_2(num_qk_heads),
         HEAD_QK_POW2=triton.next_power_of_2(head_qk),
         V_BLOCK=triton.next_power_of_2(num_v_heads * head_v),
         num_warps=8,

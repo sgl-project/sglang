@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -144,21 +145,12 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_strided_gating_matches_contiguous(self):
-        _, (_, _, b, a) = self._projection_views(torch.bfloat16)
-        a_log = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
-        dt_bias = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
-        g_view, beta_view = fused_gdn_gating(a_log, a, b, dt_bias)
-        g_ref, beta_ref = fused_gdn_gating(
-            a_log, a.contiguous(), b.contiguous(), dt_bias
-        )
-        torch.testing.assert_close(g_view, g_ref, rtol=0, atol=0)
-        torch.testing.assert_close(beta_view, beta_ref, rtol=0, atol=0)
-
-    def test_fused_split_from_strided_mixed_qkv_matches_unpack(self):
-        (qkvz, ba), (mixed_qkv, _, _, _) = self._projection_views(torch.bfloat16)
-        q_view, k_view, v_view = fused_qkv_split_gdn_prefill(
-            mixed_qkv,
+    def test_view_path_matches_contiguous_unpack(self):
+        # The strided views must be indistinguishable from the fused unpack
+        # copy they replace, for both consumers they feed on HIP: the QKV
+        # split and the B/A gating.
+        (qkvz, ba), (mixed_qkv, _, b, a) = self._projection_views(torch.bfloat16)
+        split_args = (
             self.NUM_QK_HEADS,
             self.NUM_QK_HEADS,
             self.NUM_V_HEADS,
@@ -174,18 +166,19 @@ class TestGdnPrefillLayout(unittest.TestCase):
             self.HEAD_DIM,
             self.HEAD_DIM,
         )
-        q_ref, k_ref, v_ref = fused_qkv_split_gdn_prefill(
-            mixed_ref,
-            self.NUM_QK_HEADS,
-            self.NUM_QK_HEADS,
-            self.NUM_V_HEADS,
-            self.HEAD_DIM,
-            self.HEAD_DIM,
-            self.HEAD_DIM,
-        )
-        torch.testing.assert_close(q_view, q_ref, rtol=0, atol=0)
-        torch.testing.assert_close(k_view, k_ref, rtol=0, atol=0)
-        torch.testing.assert_close(v_view, v_ref, rtol=0, atol=0)
+        for view, ref in zip(
+            fused_qkv_split_gdn_prefill(mixed_qkv, *split_args),
+            fused_qkv_split_gdn_prefill(mixed_ref, *split_args),
+        ):
+            torch.testing.assert_close(view, ref, rtol=0, atol=0)
+
+        a_log = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
+        dt_bias = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
+        for view, ref in zip(
+            fused_gdn_gating(a_log, a, b, dt_bias),
+            fused_gdn_gating(a_log, a.contiguous(), b.contiguous(), dt_bias),
+        ):
+            torch.testing.assert_close(view, ref, rtol=0, atol=0)
 
     def test_fused_split_l2norm_matches_split_then_l2norm(self):
         for dtype in (torch.bfloat16, torch.float16):
@@ -213,68 +206,89 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 torch.testing.assert_close(v, v_ref, rtol=0, atol=0)
                 # Fusing the norm changes the reduction block shape, so Q/K
                 # land within an ulp of the two-launch path rather than on it.
-                torch.testing.assert_close(
-                    q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3
-                )
-                torch.testing.assert_close(
-                    k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3
-                )
+                torch.testing.assert_close(q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3)
                 for normalized in (q, k):
                     norms = normalized.float().pow(2).sum(-1).sqrt()
                     torch.testing.assert_close(
                         norms, torch.ones_like(norms), rtol=0, atol=5e-3
                     )
 
-    def test_fused_split_l2norm_qwen35_tp2_shape_and_empty_batch(self):
-        num_qk, num_v, head = 8, 32, 128
-        qkv_dim = 2 * num_qk * head + num_v * head
-        for tokens in (0, 17):
-            with self.subTest(tokens=tokens):
-                qkvz = torch.randn(
-                    tokens,
-                    qkv_dim + num_v * head,
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-                mixed_qkv = qkvz[:, :qkv_dim]
-                q, k, v = fused_qkv_split_l2norm_gdn_prefill(
-                    mixed_qkv, num_qk, num_v, head, head
-                )
-                self.assertEqual(q.shape, (1, tokens, num_qk, head))
-                self.assertEqual(k.shape, (1, tokens, num_qk, head))
-                self.assertEqual(v.shape, (1, tokens, num_v, head))
-                if tokens == 0:
-                    continue
-                torch.testing.assert_close(
-                    v[0].reshape(tokens, -1),
-                    mixed_qkv[:, 2 * num_qk * head :],
-                    rtol=0,
-                    atol=0,
-                )
+    def test_fused_split_l2norm_post_conv_layout(self):
+        # forward_extend passes the post-conv tensor, a [T, qkv_dim] view of a
+        # [qkv_dim, T] allocation, so the head dim is the strided axis rather
+        # than the contiguous one. num_qk is cdiv(num_k_heads, attn_tp_size)
+        # and need not be a power of two; 8/32 is the Qwen3.5 TP2 shape.
+        for num_qk in (8, 6):
+            for tokens in (0, 17):
+                with self.subTest(num_qk=num_qk, tokens=tokens):
+                    num_v, head = 4 * num_qk, self.HEAD_DIM
+                    qkv_dim = 2 * num_qk * head + num_v * head
+                    mixed_qkv = torch.randn(
+                        qkv_dim, tokens, dtype=torch.bfloat16, device="cuda"
+                    ).transpose(0, 1)
 
-    def test_qwen35_tp2_ratio4_views_and_empty_batch(self):
-        num_qk, num_v, head = 8, 32, 128
-        qkv_dim = 2 * num_qk * head + num_v * head
-        for tokens in (0, 17):
-            with self.subTest(tokens=tokens):
-                qkvz = torch.randn(
-                    tokens,
-                    qkv_dim + num_v * head,
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-                ba = torch.randn(tokens, 2 * num_v, dtype=torch.bfloat16, device="cuda")
-                mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
-                    qkvz, ba, num_qk, num_v, head, head
-                )
-                self.assertEqual(mixed_qkv.shape, (tokens, qkv_dim))
-                self.assertEqual(z.shape, (tokens, num_v, head))
-                self.assertEqual(b.shape, (tokens, num_v))
-                self.assertEqual(a.shape, (tokens, num_v))
-                if tokens == 0:
-                    continue
-                self.assertFalse(mixed_qkv.is_contiguous())
-                torch.testing.assert_close(mixed_qkv, qkvz[:, :qkv_dim], rtol=0, atol=0)
+                    q, k, v = fused_qkv_split_l2norm_gdn_prefill(
+                        mixed_qkv, num_qk, num_v, head, head
+                    )
+                    self.assertEqual(q.shape, (1, tokens, num_qk, head))
+                    self.assertEqual(k.shape, (1, tokens, num_qk, head))
+                    self.assertEqual(v.shape, (1, tokens, num_v, head))
+                    if tokens == 0:
+                        continue
+
+                    self.assertEqual(mixed_qkv.stride(), (1, tokens))
+                    q_ref, k_ref, v_ref = fused_qkv_split_gdn_prefill(
+                        mixed_qkv, num_qk, num_qk, num_v, head, head, head
+                    )
+                    torch.testing.assert_close(v, v_ref, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3
+                    )
+                    torch.testing.assert_close(
+                        k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3
+                    )
+
+
+class TestGdnQkL2NormContract(unittest.TestCase):
+    """extend() must default the Q/K norm on and forward it untouched.
+
+    Re-hardcoding it drops the HIP fused-split saving silently, and losing
+    the forward feeds unnormalized Q/K into the recurrence. No tensor-level
+    test above can see either.
+    """
+
+    def _forwarded_norm_switch(self, **kwargs) -> bool:
+        # Imported here so the contract check does not need a GPU build.
+        from sglang.srt.layers.attention.linear.kernels import gdn_triton
+
+        captured = {}
+
+        def fake_chunk_gated_delta_rule(**call_kwargs):
+            captured.update(call_kwargs)
+            return None, None
+
+        with mock.patch.object(
+            gdn_triton, "chunk_gated_delta_rule", fake_chunk_gated_delta_rule
+        ):
+            gdn_triton.TritonGDNKernel().extend(
+                q=None,
+                k=None,
+                v=None,
+                g=None,
+                beta=None,
+                ssm_states=None,
+                cache_indices=None,
+                query_start_loc=None,
+                **kwargs,
+            )
+        return captured["use_qk_l2norm_in_kernel"]
+
+    def test_norm_switch_defaults_on_and_forwards(self):
+        # Callers that did not pre-normalize keep the in-kernel norm.
+        self.assertTrue(self._forwarded_norm_switch())
+        # The HIP fused split pre-normalizes, so it switches the norm off.
+        self.assertFalse(self._forwarded_norm_switch(use_qk_l2norm_in_kernel=False))
 
 
 if __name__ == "__main__":

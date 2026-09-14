@@ -930,13 +930,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         use_fused_split = (
             is_cuda() or is_hip() or is_xpu()
         ) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-        # chunk_gated_delta_rule would otherwise L2-normalize Q and K in two
-        # extra launches; folding the norm into the split also drops the Q/K
-        # round-trip through HBM. Speculative verify keeps the plain split
-        # because its kernels normalize internally.
+        # HIP folds the Q/K L2-norm into the split; CUDA uses
+        # gdn_prefill_qkv_prepare_fwd. Only TritonGDNKernel.extend reads the
+        # flag, so gate on the kernel rather than on the platform.
         qk_l2norm_applied = (
             use_fused_split
             and is_hip()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not is_target_verify
             and layer.num_q_heads == layer.num_k_heads
             and layer.head_q_dim == layer.head_k_dim
@@ -1058,7 +1058,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
-                qk_l2norm_applied=qk_l2norm_applied,
+                use_qk_l2norm_in_kernel=not qk_l2norm_applied,
             )
 
             if is_npu() and last_recurrent_state is not None:
