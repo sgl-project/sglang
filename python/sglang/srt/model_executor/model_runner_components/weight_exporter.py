@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ class WeightExporter:
         )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+        backend = "hccl" if backend == "nccl" and is_npu() else backend
+        device_type = "cuda" if not is_npu() else "npu"
 
         logger.info(
             f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
@@ -60,7 +63,7 @@ class WeightExporter:
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
+                device_id=torch.device(device_type, self.gpu_id),
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
