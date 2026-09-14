@@ -168,6 +168,12 @@ this contract) are rejected, not interpreted as whole-block hits. SSD metadata i
 retained; existing prefix candidates use locally usable HBM/DRAM only. Snapshot
 v1 remains available but cannot represent complete hybrid placement.
 
+An explicit empty `component_types` list revokes placement at that tier in both
+Snapshot v2 and live recovery. Omitted/nil component types retain legacy
+whole-block semantics. Recoverable Bridges reject unknown event tags and
+component labels instead of advancing the stream past an unhandled mutation.
+Workers advertise snapshot versions only with a routable snapshot endpoint.
+
 Router `/metrics` exports:
 
 - `sgl_router_indexer_complete_queries_total`
@@ -202,3 +208,5 @@ logs/metrics remain in pytest's temporary directory.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for requirements, measured results,
 commit breakdown and limitations.
+See [SNAPSHOT_V2_VALIDATION.md](SNAPSHOT_V2_VALIDATION.md) for the September 14
+source synchronization, protocol corrections and fresh validation results.
