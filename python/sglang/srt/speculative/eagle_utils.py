@@ -43,7 +43,9 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_SPEC_MATCH_SAMPLE = get_bool_env_var("SGLANG_SPEC_MATCH_SAMPLE") and _is_hip
+_SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY = (
+    get_bool_env_var("SGLANG_SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY") and _is_hip
+)
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
@@ -381,13 +383,13 @@ def select_target_predict(
     sampling_info: SamplingBatchInfo,
     draft_token_num: int,
 ) -> torch.Tensor:
-    if not _SPEC_MATCH_SAMPLE or sampling_info.is_all_greedy:
+    if not _SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY or sampling_info.is_all_greedy:
         return torch.argmax(next_token_logits, dim=-1)
 
     if sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling:
         logger.warning_once(
-            "SGLANG_SPEC_MATCH_SAMPLE: top_p/top_k truncation has no ROCm kernel; "
-            "falling back to greedy verify."
+            "SGLANG_SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY does not implement "
+            "top_p/top_k truncation yet; falling back to greedy verify."
         )
         return torch.argmax(next_token_logits, dim=-1)
 
