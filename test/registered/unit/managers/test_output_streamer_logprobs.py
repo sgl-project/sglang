@@ -28,6 +28,7 @@ class _FakeReq:
         )
         self.output_ids = []
         self.output_ids_through_stop = []
+        self.output_text_required = True
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
         self.send_decode_id_offset = 0

@@ -111,5 +111,78 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
 
+class TestNativeGrpcOutputShape(CustomTestCase):
+    @staticmethod
+    def _submit_generate(*, tokenizer_manager=None, **kwargs):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = tokenizer_manager or SimpleNamespace(
+            request_logger=SimpleNamespace(log_requests=False, log_requests_level=0),
+            dump_requests_folder="",
+            crash_dump_folder="",
+            request_metrics_exporter_manager=SimpleNamespace(
+                exporter_enabled=lambda: False
+            ),
+        )
+        captured = []
+
+        async def capture(obj, chunk_callback, stream, request):
+            captured.append(obj)
+
+        handle._run_generate = capture
+        handle._submit_on_tm_loop = asyncio.run
+        handle.submit_request(
+            req_type="generate",
+            req_dict={"input_ids": [1], "sampling_params": {}, "stream": True},
+            chunk_callback=_RecordingCallback(),
+            **kwargs,
+        )
+        return captured[0]
+
+    def test_submit_request_marks_token_id_generate_no_text(self):
+        obj = self._submit_generate(output_text_required=False)
+
+        self.assertFalse(obj._output_text_required)
+
+    def test_submit_request_defaults_to_text_required(self):
+        obj = self._submit_generate()
+
+        self.assertTrue(obj._output_text_required)
+
+    def test_internal_output_consumers_keep_text(self):
+        cases = {
+            "request logging": {
+                "request_logger": SimpleNamespace(
+                    log_requests=True, log_requests_level=2
+                )
+            },
+            "request dump": {"dump_requests_folder": "/dump"},
+            "crash dump": {"crash_dump_folder": "/crash"},
+            "metrics exporter": {
+                "request_metrics_exporter_manager": SimpleNamespace(
+                    exporter_enabled=lambda: True
+                )
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                manager_config = {
+                    "request_logger": SimpleNamespace(
+                        log_requests=False, log_requests_level=0
+                    ),
+                    "dump_requests_folder": "",
+                    "crash_dump_folder": "",
+                    "request_metrics_exporter_manager": SimpleNamespace(
+                        exporter_enabled=lambda: False
+                    ),
+                }
+                manager_config.update(overrides)
+                manager = SimpleNamespace(**manager_config)
+                obj = self._submit_generate(
+                    tokenizer_manager=manager, output_text_required=False
+                )
+
+                self.assertTrue(obj._output_text_required)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
