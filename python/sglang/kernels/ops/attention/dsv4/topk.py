@@ -136,19 +136,22 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
     row_starts: Optional[torch.Tensor] = None,
     row_to_batch: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
-    Two output modes, chosen by whether ``page_tables`` is given and resolved to
-    a device-side template parameter, so an unused page-table gather is compiled
-    out rather than skipped at runtime:
+    Output mode is chosen from ``page_tables`` and ``out_raw_indices`` and
+    resolved to a device-side template parameter, so an unused page-table gather
+    is compiled out rather than skipped at runtime:
 
     * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
       indices and no page table is read.
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
+    * Both outputs given -- ``out_page_indices`` receives the page-table
+      transform and ``out_raw_indices`` receives the selected raw indices.
 
     ``row_starts`` and ``row_to_batch`` are both ``(rows,)`` int32 and both
     optional; omitting them gives the decode layout this kernel was written for
@@ -183,7 +186,24 @@ def topk_transform_paged_v2(
             "topk_transform_paged_v2 packed rows (row_starts / row_to_batch) "
             "are only supported on ROCm"
         )
+        # The raw output is written straight from the kernel's index register,
+        # bypassing the residue correction the packed path carries in `bias`,
+        # so it would be short by up to 3. The C++ side rejects this too; it is
+        # repeated here to fail before the JIT module is built.
+        assert out_raw_indices is None, (
+            "topk_transform_paged_v2: row_starts is incompatible with out_raw_indices"
+        )
     if is_xpu():
+        if out_raw_indices is not None:
+            topk_transform_paged(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
         torch.ops.sgl_kernel.topk_transform_paged(
             scores,
             seq_lens,
@@ -201,6 +221,7 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        out_raw_indices,
         row_starts,
         row_to_batch,
     )
