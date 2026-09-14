@@ -467,7 +467,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(1000), indexer_metadata=None
         )
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend._full_seq_len_for_capture = 4096
+        backend._active_decode_graph_width = 2048
         calls = []
 
         def fake_build_forward_metadata(
@@ -487,7 +488,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
         self.assertIs(calls[0][0], static_forward_batch)
-        self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
+        self.assertEqual(calls[0][1], backend._full_seq_len_for_capture)
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)

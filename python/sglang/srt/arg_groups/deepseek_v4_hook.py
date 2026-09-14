@@ -193,3 +193,41 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
         f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
     )
+
+
+def validate_deepseek_v4_decode_graph_widths(server_args: ServerArgs) -> None:
+    """Reject decode-graph capture widths alongside features that cannot serve them.
+
+    The widths narrow the DSV4 indexer's captured working width, which only
+    holds for plain decode graphs replayed from the full graph backend on a
+    single stream. Checking here means a bad combination fails while arguments
+    are still being resolved, rather than after a model has been built.
+    """
+    if not envs.SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS.get():
+        return
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if server_args.speculative_algorithm:
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS supports plain decode only; it "
+            "cannot be combined with speculative decoding "
+            f"({server_args.speculative_algorithm!r}). Unset one of them."
+        )
+    if server_args.dllm_algorithm is not None:
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS supports plain decode only; it "
+            "cannot be combined with diffusion decoding "
+            f"({server_args.dllm_algorithm!r}). Unset one of them."
+        )
+    if server_args.enable_pdmux:
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS does not support PDMux. "
+            "Unset one of them."
+        )
+    if server_args.cuda_graph_config.decode.backend != Backend.FULL:
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS requires the full decode graph "
+            f"backend, got {server_args.cuda_graph_config.decode.backend!r}. "
+            "Select full decode graphs or unset the variable."
+        )
