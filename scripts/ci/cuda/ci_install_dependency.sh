@@ -707,17 +707,6 @@ install_extra_deps() {
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
     NIXL_BIN_NAME="nixl-cu13"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
-        NIXL_BIN_NAME="nixl-cu13"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    else
-        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        NIXL_BIN_NAME="nixl-cu12"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
-    fi
 
     # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #3272 wheels -----------
     MOONCAKE_WHEEL_ZIP_URL=""
