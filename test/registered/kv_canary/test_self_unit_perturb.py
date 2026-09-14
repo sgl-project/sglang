@@ -206,7 +206,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [2], dtype=torch.int32, device=device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         head_snapshot = group.k_head.clone()
         v_head_snapshot = group.v_head.clone()
@@ -288,7 +288,7 @@ class TestReqToTokenPerturb(CustomTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int32, device=device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         targets = collect_active_slots(
             maybe_inaccurate_forward_batch=forward_batch,

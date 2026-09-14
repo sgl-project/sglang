@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
@@ -230,6 +231,21 @@ register_kernel(
         ),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_fp8_linear",
+        backend=KernelBackend.KDA,
+        target=f"{_KDA_PACKAGE}.sm120_fp8:try_sm120_fp8_linear",
+        capabilities=_SM12X,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float8_e4m3fn", "float32"),
+            description=(
+                "Adaptive static per-tensor FP8 linear for small batches on SM12x"
+            ),
+        ),
+        description=("SM12x streaming GEMV plus KDA CUTLASS skinny GEMM dispatch."),
+    )
+)
 
 
 def fp8_scaled_mm(
@@ -297,6 +313,23 @@ def try_qwen3x_nvfp4_gemm(
     )
 
 
+def try_sm120_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    output_scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor | None:
+    """Run the best validated SM12x FP8 small-batch path, or return ``None``."""
+    return get_kernel("gemm.sm120_fp8_linear", KernelBackend.KDA)(
+        input,
+        weight,
+        input_scale,
+        output_scale,
+        bias,
+    )
+
+
 __all__ = [
     "Fp8ScaledMMOp",
     "bmm_fp8",
@@ -304,6 +337,7 @@ __all__ = [
     "fp8_scaled_mm",
     "tiny_gemm_bf16",
     "try_qwen3x_nvfp4_gemm",
+    "try_sm120_fp8_linear",
 ]
 
 

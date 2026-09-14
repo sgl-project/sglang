@@ -11,7 +11,8 @@ if TYPE_CHECKING:
 class ScriptedLockRefExhauster:
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
-        self._locked: List[Any] = []
+        # (node, dec receipt) pairs; the receipt bounds the release walk.
+        self._locked: List[tuple[Any, Any]] = []
 
     def exhaust(self, *, leave_refs: int) -> None:
         tree_cache = self.scheduler.tree_cache
@@ -24,17 +25,17 @@ class ScriptedLockRefExhauster:
                 return
 
             target = evictable[0]
-            tree_cache.inc_lock_ref(to_node_handle(tree_cache, target))
+            result = tree_cache.inc_lock_ref(to_node_handle(tree_cache, target))
 
             newly_locked = [node for node in evictable if _node_lock_ref(node) > 0]
             if not newly_locked:
                 return
-            self._locked.append(target)
+            self._locked.append((target, result.to_dec_params()))
 
     def release(self) -> None:
         tree_cache = self.scheduler.tree_cache
-        for node in self._locked:
-            tree_cache.dec_lock_ref(to_node_handle(tree_cache, node))
+        for node, dec_params in self._locked:
+            tree_cache.dec_lock_ref(to_node_handle(tree_cache, node), dec_params)
         self._locked.clear()
 
     def _evictable_nodes(self) -> List[Any]:

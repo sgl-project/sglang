@@ -25,6 +25,11 @@ from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
     ChatGLMConfig,
+    Cosmos3Config,
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
     DbrxConfig,
     DeepseekVL2Config,
     Dots3Config,
@@ -32,7 +37,11 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    FalconMambaConfig,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
+    HYV4Config,
     InklingAudioConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -50,6 +59,8 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
@@ -57,8 +68,10 @@ from sglang.srt.configs import (
     MultiModalityConfig,
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
+    NanbeigeConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
+    NemotronH_Omni_Reasoning_V3_Config,
     NemotronHConfig,
     NemotronHPuzzleConfig,
     Olmo3Config,
@@ -67,6 +80,8 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
     Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
@@ -113,17 +128,27 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MuseGlimmerConfig,
         MuseGlimmerAssistantConfig,
         KimiK3Config,
+        Glm5NextConfig,
+        Glm5NextTextConfig,
         KimiLinearConfig,
         Qwen3NextConfig,
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
         FalconH1Config,
+        FalconMambaConfig,
+        Mamba2Config,
+        MambaConfig,
         GraniteMoeHybridConfig,
+        HYV4Config,
         DotsVLMConfig,
         DotsOCRConfig,
         Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
+        NemotronH_Omni_Reasoning_V3_Config,
         NemotronHConfig,
         NemotronHPuzzleConfig,
+        NanbeigeConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
@@ -222,6 +247,42 @@ for name, cls in _CONFIG_REGISTRY.items():
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:
             logger.warning("Failed to register config %s: %s", name, e)
+
+# Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
+# with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
+# flattened onto the top-level config in `get_config` — the same path the base
+# Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
+# `from_pretrained` reload that drops that flattening.
+try:
+    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
+except ValueError as e:
+    err = str(e).lower()
+    if "already registered" not in err and "already used" not in err:
+        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
+
+# Cosmos3-Edge native text support starts from the checkpoint root config, then
+# consumes ``text_config`` in ``sglang.srt.models.cosmos3_edge``. Keep it out of
+# `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
+# root config after `AutoConfig.from_pretrained`, matching other multimodal
+# configs that use a text sub-config.
+for _cosmos3_edge_config_cls in (
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeConfig,
+):
+    try:
+        AutoConfig.register(
+            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
+        )
+    except ValueError as e:
+        err = str(e).lower()
+        if "already registered" not in err and "already used" not in err:
+            logger.warning(
+                "Failed to register config %s: %s",
+                _cosmos3_edge_config_cls.model_type,
+                e,
+            )
 
 
 # ---------------------------------------------------------------------------

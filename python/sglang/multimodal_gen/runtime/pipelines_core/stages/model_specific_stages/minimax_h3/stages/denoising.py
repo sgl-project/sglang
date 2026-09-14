@@ -443,6 +443,12 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # one denoise per sigma interval: steps - 1
+        return max(1, num_inference_steps - 1)
+
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
@@ -670,11 +676,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
+            or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()
+            or current_platform.is_xpu()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, MPS, XPU, or Ascend NPU"
             )
 
         device = current_platform.get_local_torch_device()
@@ -741,6 +749,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 server_args=server_args,
                 device=device,
             )
+            if build_vsa_h3_step_metadata is None:
+                from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+                    prepare_hybrid_attention_metadata,
+                )
+
+                build_vsa_h3_step_metadata = prepare_hybrid_attention_metadata(
+                    model=model,
+                    packed=packed,
+                    latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                    server_args=server_args,
+                    device=device,
+                )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],

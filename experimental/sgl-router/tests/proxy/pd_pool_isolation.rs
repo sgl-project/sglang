@@ -45,9 +45,12 @@ fn config() -> Config {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },
@@ -204,31 +207,19 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
     assert!(!prefill_body.is_empty());
 }
 
-/// Task C: PD-mode chat request carries an `x-sgl-decode-url` header
-/// pointing at the host-affinity decode peer. With two prefill workers
-/// on different hosts and a decode worker on each, the affinity helper
-/// MUST pick the decode peer co-located with the chosen prefill.
-///
-/// Round-robin will select prefill workers deterministically (alphabetic
-/// dashmap order is not guaranteed; the test fires several requests so
-/// at least one lands on each prefill, and asserts the per-host pairing
-/// holds across all of them).
+/// PD-mode chat request carries an `x-sgl-decode-url` header for the final
+/// Decode decision. Step 1 defaults to Decode P2; the header remains an
+/// observability contract regardless of which Decode policy produced it.
 #[tokio::test]
-async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
+async fn pd_mode_chat_dispatch_sets_final_decode_header() {
     use std::collections::HashSet;
     let prefill_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let prefill_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    // MockWorker URLs always bind to `127.0.0.1`, so every worker
-    // shares the same host string and the affinity helper's
-    // same-host branch is moot here — the helper still returns a
-    // decode peer via the load-tiebreak fallback. The unit tests in
-    // `policies::registry::tests::decoder_picks_same_host_when_available`
-    // carry the real burden of pinning the host-affinity rules; this
-    // integration test only asserts the wiring is in place (the
-    // `x-sgl-decode-url` header IS set on PD requests, and the
-    // value is one of the registered decode worker URLs).
+    // MockWorker URLs all bind to `127.0.0.1`; this test deliberately does
+    // not assert a host relation. It pins only the HTTP wiring: the final D
+    // selected by the role-local policy is reflected on the P request.
     let ctx = build_ctx(vec![
         WorkerSpec {
             id: WorkerId("p1".into()),
@@ -267,9 +258,8 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    // Every request that hit a prefill mock MUST carry the decode-hint
-    // header. The header value MUST be one of the two registered
-    // decode worker URLs.
+    // Every request that hit a prefill mock MUST carry the final-decode
+    // header. The value MUST be one of the two registered Decode URLs.
     let decode_urls: HashSet<String> = [decode_a.url.clone(), decode_b.url.clone()]
         .into_iter()
         .collect();
@@ -345,9 +335,9 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
 }
 
 /// PD-mode chat response carries `x-sgl-decode-url` so external tests
-/// can observe decode affinity end-to-end (without sniffing the proxy
+/// can observe final Decode selection end-to-end (without sniffing the proxy
 /// hop into the upstream prefill worker). Mirrors the request-side
-/// behavior asserted by `pd_mode_chat_dispatch_sets_decode_affinity_header`.
+/// behavior asserted by `pd_mode_chat_dispatch_sets_final_decode_header`.
 #[tokio::test]
 async fn pd_mode_chat_response_carries_decode_affinity_header() {
     use std::collections::HashSet;
