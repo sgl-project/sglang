@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,7 +60,16 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        scheduler.token_to_kv_pool_allocator = None
+        scheduler.sliding_window_size = None
+        scheduler.chunked_prefill_size = None
+        scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+            size=max_total_num_tokens,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        scheduler.token_to_kv_pool_allocator.page_size = page_size
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):

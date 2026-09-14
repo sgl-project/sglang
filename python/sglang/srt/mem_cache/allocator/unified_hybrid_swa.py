@@ -531,6 +531,57 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             compacted=False,
         )
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
+
+        return SharedSWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (self.current_full_capacity, self.full_available_size()),
+            (self.current_swa_capacity, self.swa_available_size()),
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+
+        def fits(candidate):
+            return self.can_reserve(
+                input_tokens + candidate + self.page_size,
+                estimate_swa_kv_tokens(
+                    input_tokens,
+                    candidate,
+                    sliding_window_size=sliding_window_size,
+                    page_size=self.page_size,
+                    allocation_limit=chunk_size,
+                ),
+                empty_pool=True,
+                require_token_slack=True,
+            )
+
+        if not fits(0):
+            return None
+        if fits(max_new_tokens):
+            return max_new_tokens
+        lo, hi = 0, max_new_tokens
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
     def evict_to_free_tokens(
         self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
     ) -> None:
@@ -1303,17 +1354,33 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Mamba competes for the shared gap too; retain the tri-pool's existing
+        # token and state-slot admission until it has a three-way reservation.
+        return SWATokenToKVPoolAllocator.create_prefill_budget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(self, *args, **kwargs):
+        return BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(
+            self, *args, **kwargs
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.conserve_full_available_size()),
+            (swa_capacity, self.conserve_swa_available_size()),
+        )
+
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         """Joint-aware eviction: one tri-lifetime node frees bytes on several sides
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
         # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
         for _ in range(4):
             before = self.available_size()
             if before >= num_tokens:
                 return
-            evict_from_tree_cache(tree_cache, num_tokens)
+            SWATokenToKVPoolAllocator.evict_to_free_tokens(self, tree_cache, num_tokens)
             if self.available_size() <= before:
                 return  # no progress
 
