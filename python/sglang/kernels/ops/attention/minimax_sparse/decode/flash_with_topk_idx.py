@@ -865,6 +865,9 @@ def flash_decode_with_topk_idx(
     assert num_q_heads % num_kv_heads == 0
     # packed rows of one request share its K cache, so score them as extra q heads in one pass
     pack = int(packed_queries) if packed_queries else 1
+    if pack > 1 and local_blocks <= 0:
+        # exactness needs the per-row local re-forcing below, so no local blocks means no packing
+        pack = 1
     if pack > 1:
         assert disable_index_value and not use_dense_main_attn
         assert batch_size % pack == 0
@@ -1034,14 +1037,13 @@ def flash_decode_with_topk_idx(
         )
         batch_size, num_q_heads = num_rows, heads_per_row
         seq_lens, slot_ids = row_seq_lens, row_slot_ids
-        if local_blocks > 0:
-            # the kernel forced only the longest row's local blocks, so re-force each row's own
-            num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
-            block_ids = torch.arange(score.shape[2], device=score.device)
-            is_local = (
-                block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
-            ) & (block_ids[None, :] < num_blocks[:, None])
-            score = score.masked_fill(is_local[None], 1e29)
+        # the kernel forced only the longest row's local blocks, so re-force each row's own
+        num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
+        block_ids = torch.arange(score.shape[2], device=score.device)
+        is_local = (
+            block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
+        ) & (block_ids[None, :] < num_blocks[:, None])
+        score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (

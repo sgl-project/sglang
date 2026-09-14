@@ -22,6 +22,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -1410,9 +1413,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     SMALL_EXTEND_MAX_TOKENS = 8
 
     def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
+        """Route a few-token EXTEND over cached prefixes to the decode kernels.
+
+        Eager forwards only: the row metadata comes from host lists, so a captured
+        copy would replay capture-time lengths.
+        """
         extend_lens = forward_batch.extend_seq_lens_cpu
         return (
             not self.is_npu
+            and not is_in_breakable_cuda_graph()
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and extend_lens is not None
             and len(extend_lens) > 0
