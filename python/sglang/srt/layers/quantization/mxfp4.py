@@ -283,6 +283,7 @@ def quant_dequant_mxfp4(
 
 
 class Mxfp4Config(QuantizationConfig):
+    supports_kimi_k3_quantized_latent_projections = True
 
     def __init__(
         self,

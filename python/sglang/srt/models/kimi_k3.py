@@ -1710,8 +1710,11 @@ class KimiK3DeltaAttention(nn.Module):
         and the width is padded to a multiple of 8 so every fused-output row
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
-        Called once after weight loading. Block-FP8 inputs are dequantized into
-        the BF16 tiny-GEMM buffers here."""
+        Called once from load_weights (after all weights are loaded, before
+        cuda graph capture). Block-FP8 inputs are dequantized into the BF16
+        tiny-GEMM buffers here; any other quantized or mixed-dtype
+        checkpoints keep the unfused path so the quant_method (scales,
+        packed layouts, etc.) is respected."""
         if not self.use_full_rank_gate:
             return
         if _is_npu:
@@ -1731,6 +1734,17 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w = torch.cat(weights, dim=0).contiguous()
             self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
+            if any(getattr(mod, "weight", None) is None for mod in mods):
+                return
+            # Only plain bf16/fp16 dense weights are merged: quantized or
+            # mixed-dtype checkpoints keep the unfused path so the
+            # quant_method (scales, packed layouts, etc.) is respected.
+            dtypes = {m.weight.dtype for m in [*mods, self.f_b_proj]}
+            if len(dtypes) != 1 or next(iter(dtypes)) not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=pad_rows_to)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
@@ -3199,8 +3213,23 @@ class KimiK3ForConditionalGeneration(nn.Module):
         },
     )
 
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
     packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
     }
 
     def __init__(
@@ -3230,7 +3259,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
             language_prefix = (
                 maybe_prefix(prefix, "language_model")
-                if uses_wrapper_quant_prefix
+                if (is_ppu() or uses_wrapper_quant_prefix)
                 else prefix
             )
             self.language_model = KimiK3LinearForCausalLM(
