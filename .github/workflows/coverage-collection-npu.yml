@@ -195,15 +195,22 @@ jobs:
           cp -r python/sglang "${COVSTUB}/"
 
       - name: Build test case map
+        shell: bash
         run: |
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          # Date tag derivation must match scripts/ci/npu/precise-test/run_tests_with_coverage.sh
-          # (GITHUB_RUN_STARTED_AT is identical across all jobs of one run,
-          # immune to cross-midnight splits).
-          COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
-          COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          # Date tag derivation must match scripts/ci/npu/precise-test/run_tests_with_coverage.sh.
+          # The custom k8s runner only injects explicitly-set env vars, so
+          # GITHUB_RUN_STARTED_AT may be absent (set -u would abort); fall back
+          # to local date exactly like run_tests_with_coverage.sh does, so both
+          # sides derive the same tag.
+          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
+            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+            COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          else
+            COV_DATE_TAG="$(date +%Y%m%d)"
+          fi
           COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
           COVSTUB="${RUN_DIR}/outputs/covstub"
           # Placed outside outputs/ so it is NOT included in outputs.tar.gz.
@@ -248,10 +255,10 @@ jobs:
           tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
 
       - name: Upload outputs and map to OBS
-        continue-on-error: true
         env:
           OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
           OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+        shell: bash
         run: |
           set -euo pipefail
 
