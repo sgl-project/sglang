@@ -1451,6 +1451,45 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
     assert torch.equal(got, mrope.transpose(0, 1))
 
 
+def test_qsa_short_extend_prepares_all_visible_scratch_and_skips_pack():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    num_tokens = 8
+    positions = torch.arange(num_tokens, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+        positions=positions,
+        mrope_positions=None,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        out_cache_loc=torch.arange(num_tokens, dtype=torch.int32),
+        _original_forward_mode=None,
+    )
+
+    backend.init_forward_metadata(forward_batch)
+    metadata = backend.forward_metadata.indexer_metadata
+
+    assert metadata.prefill_all_visible
+    assert metadata.prefill_all_visible_scratch.shape == (num_tokens, FINAL_TOPK)
+    assert metadata.prefill_compressed_scratch is None
+    assert metadata.prefill_compressed_cu_seqlens is None
+    assert metadata.prefill_row_starts is None
+    assert metadata.prefill_row_ends is None
+
+
+def test_qsa_all_visible_host_guard_boundaries():
+    eligible = QwenSparseAttnBackend._can_use_qsa_prefill_all_visible
+    assert eligible(TOKEN_TOPK, 128, TOKEN_TOPK)
+    assert not eligible(TOKEN_TOPK + 1, 128, TOKEN_TOPK)
+    assert not eligible(TOKEN_TOPK, 257, TOKEN_TOPK)
+
+
 def test_qsa_speculative_pseudo_extend_is_rejected():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
@@ -1674,6 +1713,10 @@ class _DispatchIndexer:
         self.selected = "prefill"
         return torch.tensor([1])
 
+    def select_prefill_all_visible_tokens(self, *args):
+        self.selected = "all_visible"
+        return torch.tensor([3])
+
     def select_decode_tokens(self, *args):
         self.selected = "decode"
         return torch.tensor([2])
@@ -1690,6 +1733,8 @@ class _DispatchMetadata:
     compress_member_rows = None
     decode_logical_positions = None
     pending_ring_slots = None
+    prefill_all_visible = False
+    prefill_all_visible_scratch = None
     # Consumed by the real _pending_ring_slots helper the dispatch indexer
     # borrows: one token row owned by request slot 1.
     token_to_batch_idx = torch.zeros(2, dtype=torch.int32)
@@ -1849,6 +1894,26 @@ def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     assert indexer.selected == "decode"
     assert indexer.logical_positions.tolist() == [6]
     assert decode_result.item() == 2
+
+
+def test_qsa_forward_cuda_dispatches_all_visible_before_prefill_mqa():
+    indexer = _DispatchIndexer()
+    metadata = _DispatchMetadata()
+    metadata.prefill_all_visible = True
+    metadata.prefill_all_visible_scratch = torch.empty(1, FINAL_TOPK, dtype=torch.int32)
+    inputs = torch.zeros(1, 16)
+    positions = torch.zeros(1, dtype=torch.int64)
+
+    result = QSAIndexer.forward_cuda(
+        indexer,
+        inputs,
+        positions,
+        SimpleNamespace(forward_mode=_ForwardMode(False)),
+        metadata,
+    )
+
+    assert indexer.selected == "all_visible"
+    assert result.item() == 3
 
 
 def test_qsa_fast_topk_returns_sequence_relative_indices():

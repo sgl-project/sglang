@@ -73,6 +73,179 @@ def qsa_fast_topk(
     return output
 
 
+@triton.jit(do_not_specialize=["ss_b"])
+def _pack_qsa_prefill_compressed_keys_kernel(
+    compressed_k,
+    token_slot_table,
+    sequence_lengths,
+    compressed_cu_seqlens,
+    output,
+    sk_n: tl.constexpr,
+    sk_h: tl.constexpr,
+    sk_d: tl.constexpr,
+    ss_b,
+    ss_t: tl.constexpr,
+    so_n: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Pack one request's compressed-cache rows into its ragged segment."""
+
+    request = tl.program_id(0)
+    row_block = tl.program_id(1)
+    head = tl.program_id(2)
+    rows = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    dims = tl.arange(0, BLOCK_D)
+    num_blocks = tl.load(sequence_lengths + request) // COMPRESS_RATIO
+    valid_rows = rows < num_blocks
+    raw_slots = tl.load(
+        token_slot_table + request * ss_b + rows * COMPRESS_RATIO * ss_t,
+        mask=valid_rows,
+        other=0,
+    ).to(tl.int64)
+    compressed_slots = raw_slots // COMPRESS_RATIO
+    packed_rows = tl.load(compressed_cu_seqlens + request).to(tl.int64) + rows
+    mask = valid_rows[:, None] & (dims[None, :] < HEAD_DIM)
+    src = compressed_slots[:, None] * sk_n + head * sk_h + dims[None, :] * sk_d
+    dst = packed_rows[:, None] * so_n + head * so_h + dims[None, :] * so_d
+    tl.store(output + dst, tl.load(compressed_k + src, mask=mask), mask=mask)
+
+
+def qsa_pack_prefill_compressed_keys(
+    compressed_k: torch.Tensor,
+    token_slot_table: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compressed_cu_seqlens: torch.Tensor,
+    output: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Gather page-fragmented compressed keys without a host readback."""
+
+    if output.shape[0] == 0:
+        return output
+    batch = sequence_lengths.shape[0]
+    num_kv_heads, head_dim = compressed_k.shape[1:]
+    block_rows = 8
+    max_blocks = token_slot_table.shape[1] // compress_ratio
+    _pack_qsa_prefill_compressed_keys_kernel[
+        (batch, triton.cdiv(max_blocks, block_rows), num_kv_heads)
+    ](
+        compressed_k,
+        token_slot_table,
+        sequence_lengths,
+        compressed_cu_seqlens,
+        output,
+        compressed_k.stride(0),
+        compressed_k.stride(1),
+        compressed_k.stride(2),
+        token_slot_table.stride(0),
+        token_slot_table.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        COMPRESS_RATIO=compress_ratio,
+        HEAD_DIM=head_dim,
+        BLOCK_ROWS=block_rows,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return output
+
+
+QSA_PREFILL_ALL_VISIBLE_MAX_BATCH = 256
+_QSA_PREFILL_ALL_VISIBLE_BLOCK_N = 512
+
+
+@triton.jit(do_not_specialize=["batch"])
+def _qsa_prefill_all_visible_indices_kernel(
+    query_positions,
+    token_to_batch_idx,
+    sequence_lengths,
+    output,
+    batch,
+    TOKEN_TOPK: tl.constexpr,
+    FINAL_TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SEQUENCE_WIDTH: tl.constexpr,
+):
+    """Materialize every causally visible logical token index."""
+
+    row = tl.program_id(0)
+    column_tile = tl.program_id(1)
+
+    query_position = tl.load(query_positions + row)
+    request = tl.load(token_to_batch_idx + row)
+    sequence_lanes = tl.arange(0, SEQUENCE_WIDTH)
+    sequence_values = tl.load(
+        sequence_lengths + sequence_lanes,
+        mask=sequence_lanes < batch,
+        other=0,
+    )
+    sequence_length = tl.sum(tl.where(sequence_lanes == request, sequence_values, 0))
+    visible = tl.minimum(query_position + 1, sequence_length.to(tl.int64))
+    visible = tl.minimum(tl.maximum(visible, 0), TOKEN_TOPK)
+
+    columns = column_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    values = tl.where(columns.to(tl.int64) < visible, columns, -1)
+    tl.store(
+        output + row.to(tl.int64) * FINAL_TOPK + columns,
+        values,
+        mask=columns < FINAL_TOPK,
+    )
+
+
+def qsa_prefill_all_visible_indices(
+    query_positions: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    output: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Write the QSA short-context result with one asynchronous Triton launch."""
+
+    rows = query_positions.numel()
+    final_topk = token_topk + compress_ratio - 1
+    if query_positions.ndim != 1 or token_to_batch_idx.ndim != 1:
+        raise ValueError("QSA all-visible positions and request ids must be 1-D")
+    if token_to_batch_idx.numel() != rows:
+        raise ValueError(
+            "QSA all-visible positions and request ids must have equal size"
+        )
+    if sequence_lengths.ndim != 1:
+        raise ValueError("QSA all-visible sequence lengths must be 1-D")
+    if sequence_lengths.shape[0] > QSA_PREFILL_ALL_VISIBLE_MAX_BATCH:
+        raise ValueError("QSA all-visible batch exceeds the Triton selection width")
+    if output.shape != (rows, final_topk):
+        raise ValueError(
+            f"QSA all-visible output must be [{rows}, {final_topk}], got {output.shape}"
+        )
+    if output.dtype != torch.int32 or not output.is_contiguous():
+        raise ValueError("QSA all-visible output must be contiguous int32")
+    if rows == 0:
+        return output
+
+    _qsa_prefill_all_visible_indices_kernel[
+        (rows, triton.cdiv(final_topk, _QSA_PREFILL_ALL_VISIBLE_BLOCK_N))
+    ](
+        query_positions,
+        token_to_batch_idx,
+        sequence_lengths,
+        output,
+        sequence_lengths.shape[0],
+        TOKEN_TOPK=token_topk,
+        FINAL_TOPK=final_topk,
+        BLOCK_N=_QSA_PREFILL_ALL_VISIBLE_BLOCK_N,
+        SEQUENCE_WIDTH=QSA_PREFILL_ALL_VISIBLE_MAX_BATCH,
+        num_warps=4,
+    )
+    return output
+
+
 def _rerank_qsa_topk_candidates(
     logits: torch.Tensor,
     candidates: torch.Tensor,
@@ -344,11 +517,14 @@ def qsa_sparse_attention_reference(
 
 
 __all__ = [
+    "QSA_PREFILL_ALL_VISIBLE_MAX_BATCH",
     "average_pool_qsa_keys",
     "expand_qsa_block_indices",
     "torch_expand_qsa_block_indices",
     "triton_expand_qsa_block_indices",
     "qsa_fast_topk",
+    "qsa_pack_prefill_compressed_keys",
+    "qsa_prefill_all_visible_indices",
     "qsa_sparse_attention",
     "qsa_sparse_attention_reference",
 ]

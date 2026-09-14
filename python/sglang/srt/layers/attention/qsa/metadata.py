@@ -11,7 +11,10 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+from sglang.srt.layers.attention.qsa.kernel import (
+    qsa_fast_topk,
+    qsa_pack_prefill_compressed_keys,
+)
 
 
 def build_qsa_row_ranges(
@@ -90,6 +93,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    prefill_compressed_cu_seqlens: Optional[torch.Tensor] = None
+    prefill_row_starts: Optional[torch.Tensor] = None
+    prefill_row_ends: Optional[torch.Tensor] = None
+    prefill_compressed_scratch: Optional[torch.Tensor] = None
+    prefill_all_visible: bool = False
+    prefill_all_visible_scratch: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -133,48 +142,37 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         its assigned pages, in block order.
         """
 
-        pool = self.token_to_kv_pool
-        ratio = self.compress_ratio
-        compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # DSV4-style addressing: a group's compressed slot is its first
-            # raw slot // ratio (the page-aligned allocator keeps the group
-            # contiguous in one page), read straight off the request's
-            # token-slot row.
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
-            )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
-        compressed_keys = (
-            torch.cat(parts, dim=0)
-            if parts
-            else compressed_buffer.new_empty(
-                (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-            )
-        )
         num_valid_tokens = self.token_to_batch_idx.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(
                 "QSA prefill positions are shorter than the request mapping: "
                 f"positions={positions.numel()}, mapping={num_valid_tokens}"
             )
-        positions = positions[:num_valid_tokens]
-        row_starts, row_ends, _ = build_qsa_row_ranges(
+        if (
+            self.prefill_compressed_cu_seqlens is None
+            or self.prefill_row_starts is None
+            or self.prefill_row_ends is None
+            or self.prefill_compressed_scratch is None
+        ):
+            raise RuntimeError(
+                "QSA prefill pack metadata was not initialized by the attention backend"
+            )
+        compressed_buffer = self.token_to_kv_pool.get_qsa_compressed_k_buffer(layer_id)
+        compressed_keys = qsa_pack_prefill_compressed_keys(
+            compressed_buffer,
+            self.token_slot_table,
             sequence_lengths,
-            positions.to(sequence_lengths.device),
-            self.token_to_batch_idx.to(sequence_lengths.device),
+            self.prefill_compressed_cu_seqlens,
+            self.prefill_compressed_scratch,
             self.compress_ratio,
         )
-        return compressed_keys, row_starts, row_ends, sequence_lengths
+        return (
+            compressed_keys,
+            self.prefill_row_starts,
+            self.prefill_row_ends,
+            sequence_lengths,
+        )
 
     def get_decode_mqa_inputs(
         self, layer_id: int
