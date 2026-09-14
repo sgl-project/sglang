@@ -56,7 +56,13 @@ def model():
         ensure_distributed_env_defaults()
         maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
     torch.manual_seed(42)
-    return QwenImage21Transformer2DModel(config, {}).cuda().eval()
+    model = QwenImage21Transformer2DModel(config, {}).cuda().eval()
+    # Parallel linear layers allocate empty weights for checkpoint loading.
+    for name, param in model.named_parameters():
+        torch.nn.init.normal_(param, std=0.02)
+        if name.endswith(("norm_q.weight", "norm_k.weight")):
+            torch.nn.init.ones_(param)
+    return model
 
 
 def inputs(seed, edit):

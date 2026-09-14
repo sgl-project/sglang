@@ -306,6 +306,20 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
 
+    def test_native_qwen21_adapter_overrides_generic_family_match(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = True
+        transformer = _make_transformer("QwenImage21Transformer2DModel")
+        transformer.transformer_blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=6)
+
+        module.enable_cache_on_transformer(transformer, config, has_separate_cfg=True)
+
+        adapter = module.cache_dit.enable_calls[0]["target"]
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+        self.assertIs(adapter.blocks, transformer.transformer_blocks)
+
     def test_custom_adapter_is_retained_until_disable(self):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False
