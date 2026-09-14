@@ -155,6 +155,7 @@ class SamplingBatchInfo:
             return_sampling_masks, device
         )
 
+        # None selects the uncached fallback; {} is a valid empty cache for merging.
         processor_indices = {}
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together

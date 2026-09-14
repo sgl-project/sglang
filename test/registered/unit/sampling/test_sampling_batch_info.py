@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
@@ -729,6 +730,29 @@ class TestFromScheduleBatch(CustomTestCase):
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
+
+    def test_merge_preserves_processor_cache_after_batch_without_processors(self):
+        self._exec_ns.features.enable_custom_logit_processor = True
+        left_batch = MagicMock()
+        left_batch.reqs = [self._make_req(), self._make_req()]
+        left_batch.device = DEVICE
+        left = SamplingBatchInfo.from_schedule_batch(left_batch, VOCAB_SIZE)
+
+        processor_str = DisallowedTokensLogitsProcessor.to_str()
+        req = self._make_req()
+        req.custom_logit_processor = processor_str
+        req.sampling_params.custom_params = {"token_ids": [1]}
+        right_batch = MagicMock()
+        right_batch.reqs = [req]
+        right_batch.device = DEVICE
+        right = SamplingBatchInfo.from_schedule_batch(right_batch, VOCAB_SIZE)
+
+        left.merge_batch(right)
+
+        self.assertIsNotNone(left.custom_logit_processor_row_indices)
+        rows, indices = left.custom_logit_processor_row_indices[hash(processor_str)]
+        self.assertEqual(rows, [2])
+        self.assertEqual(indices.tolist(), [2])
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
