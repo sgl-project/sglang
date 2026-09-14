@@ -187,10 +187,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Mark repository safe
-        run: |
-          git config --system --add safe.directory ${GITHUB_WORKSPACE}
-
       - name: Copy sglang source to covstub
         run: |
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"

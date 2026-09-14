@@ -288,7 +288,6 @@ jobs:
             python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${{ inputs.self_name }} \
               --auto-partition-id ${{ matrix.partition }} \
               --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
-              ${{ inputs.is_nightly_pipeline_job && '--nightly' || '' }} \
               -o /tmp/selected_tests.txt
             echo "Selected test files:"
             cat /tmp/selected_tests.txt

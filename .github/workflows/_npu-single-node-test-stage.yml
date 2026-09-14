@@ -409,7 +409,7 @@ jobs:
           # unchanged for the default (false) path.
           if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
             pip install coverage==7.8.*
-            ${PYTHON_FOR_SGLANG} -u ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${test_suite} ${PARTITION_ARGS} ${{ inputs.is_nightly_pipeline_job && '--nightly' || '' }} -o /tmp/selected_tests.txt
+            ${PYTHON_FOR_SGLANG} -u ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${test_suite} ${PARTITION_ARGS} -o /tmp/selected_tests.txt
             echo "Selected test files:"
             cat /tmp/selected_tests.txt
             if [ -s /tmp/selected_tests.txt ]; then

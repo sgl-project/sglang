@@ -4,12 +4,13 @@ List the test files selected for a CI suite without running them.
 
 Standalone extraction of `test/run_suite.py --list-tests-output`: discover
 the registered tests under test/registered/, filter them by hardware
-backend / suite / nightly flag, then write the selected test file paths
-(one per line) to the output file.
+backend / suite (PR per-commit tests only; nightly-registered tests are
+excluded), then write the selected test file paths (one per line) to the
+output file.
 
 Usage:
     python3 list_tests.py --hw npu --suite base-b-test-1-npu-a3 \
-        [--nightly] [--auto-partition-id N --auto-partition-size M] \
+        [--auto-partition-id N --auto-partition-size M] \
         -o /tmp/selected_tests.txt
 """
 
@@ -64,11 +65,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--nightly",
-        action="store_true",
-        help="Include tests registered with nightly=True.",
-    )
-    parser.add_argument(
         "--auto-partition-id",
         type=int,
         help="Use auto load balancing. The part id.",
@@ -116,13 +112,14 @@ def main():
     ]
     all_tests = collect_tests(files)
 
-    # Same filter as run_suite.py: backend + suite + nightly, enabled only.
+    # Same filter as run_suite.py PR mode: backend + suite, per-commit
+    # (non-nightly) tests only, enabled only.
     ci_tests = [
         t
         for t in all_tests
         if t.backend == hw
         and t.effective_suite in suites
-        and t.nightly == args.nightly
+        and not t.nightly
         and t.disabled is None
     ]
 
