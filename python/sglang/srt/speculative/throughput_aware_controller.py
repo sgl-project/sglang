@@ -441,6 +441,18 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Pick best step every update_interval when positions are warmed."""
+        candidates = self._candidates_for_batch(batch_size)
+        if self._current_steps not in candidates:
+            # Batch-size routing constrains which graphs were captured. Honor
+            # it even at cold start or between periodic score updates.
+            rows = score_candidates(
+                self._tracker, self._cost_table, candidates, batch_size
+            )
+            target = pick_best_step(rows, fallback=candidates[len(candidates) // 2])
+            if target < self._current_steps:
+                self._tracker.clear_positions_above(target)
+            self._current_steps = target
+
         if self._should_reevaluate():
             self._reevaluate_and_switch(batch_size)
 
