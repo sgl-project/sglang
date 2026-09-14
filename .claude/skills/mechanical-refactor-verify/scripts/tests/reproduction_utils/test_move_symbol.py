@@ -260,13 +260,7 @@ def test_move_symbol_dedent_leaves_string_literal_interior_lines(
     )
     _apply(r, tmp_path)
     assert (tmp_path / "dst.py").read_text() == (
-        "import os\n"
-        "\n"
-        "def foo(self):\n"
-        "    s = '''raw\n"
-        "    partial\n"
-        "'''\n"
-        "    return s\n"
+        "import os\n\ndef foo(self):\n    s = '''raw\n    partial\n'''\n    return s\n"
     )
 
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import retraction_backup
@@ -129,9 +130,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         )
 
     def _admit_req(self, env, num_tokens: int):
-        req = SimpleNamespace(
-            rid="request", kv=SimpleNamespace(req_pool_idx=None), seqlen=num_tokens + 1
-        )
+        req = SimpleNamespace(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
         self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
         source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)

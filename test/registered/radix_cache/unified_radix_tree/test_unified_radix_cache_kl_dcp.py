@@ -7,7 +7,6 @@ hits return another rank's KV. The KL cases catch that as a large divergence.
 Blackwell-only: the MLA DCP decode path needs ``tokenspeed_mla`` (SM100/12x).
 """
 
-import subprocess
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -25,7 +24,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=280, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 DCP_SIZE = 4
@@ -93,17 +92,15 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
                 str(MAX_MAMBA_CACHE_SIZE),
                 "--enable-metrics",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18, trust_remote_code=True)
 
     @classmethod
     def tearDownClass(cls):
-        cls.process.terminate()
-        try:
-            cls.process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            pass
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 

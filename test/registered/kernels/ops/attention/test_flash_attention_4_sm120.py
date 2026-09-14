@@ -1965,9 +1965,7 @@ def test_sm120_paged_decode_transpose_is_cache_order_independent():
         num_pages,
         device="cuda",
         dtype=torch.int64,
-    ).to(
-        torch.int32
-    )[None]
+    ).to(torch.int32)[None]
     cache_seqlens = torch.tensor(
         [max_seqlen],
         device="cuda",
@@ -2097,9 +2095,7 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
         num_pages,
         device="cuda",
         dtype=torch.int64,
-    ).to(
-        torch.int32
-    )[None]
+    ).to(torch.int32)[None]
     cache_seqlens = torch.tensor(
         [max_seqlen],
         device="cuda",

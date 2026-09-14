@@ -68,7 +68,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
-    "cutlass_mla",
     "trtllm_mla",
     "cutedsl_mla",
     "tokenspeed_mla",
@@ -103,9 +102,10 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sgl_kernel import awq_dequantize
+        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 
-        return awq_dequantize
+        return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_hip:
         from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
@@ -180,3 +180,20 @@ def _get_llama_4_scaling(
         1 + torch.floor(positions / original_max_position_embeddings)
     )
     return scaling[..., None, None]
+
+
+def tiny_router_gemm_max_tokens(
+    *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
+) -> int:
+    """Rows up to which the tiny GEMM beats cuBLAS for the router, -1 when the
+    shape or the device rules it out. Doubles as the kernel's compile-time
+    max_m, so keep it as tight as the measurements allow.
+    """
+    if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
+        return -1
+
+    from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
+
+    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+        return -1
+    return 16
