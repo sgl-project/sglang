@@ -92,6 +92,7 @@ class BaseReasoningFormatDetector:
 
         self._force_nonempty_content = force_nonempty_content
         self._accumulated_reasoning = ""
+        self._prefer_tool_start_boundary = False
 
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
@@ -133,6 +134,17 @@ class BaseReasoningFormatDetector:
         processed_text = text
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
+
+        if self._prefer_tool_start_boundary and self.tool_start_token is not None:
+            think_end_idx = processed_text.find(self.think_end_token)
+            tool_start_idx = processed_text.find(self.tool_start_token)
+            if tool_start_idx != -1 and (
+                think_end_idx == -1 or tool_start_idx < think_end_idx
+            ):
+                return StreamingParseResult(
+                    normal_text=processed_text[tool_start_idx:],
+                    reasoning_text=processed_text[:tool_start_idx],
+                )
 
         if (
             self.think_end_token not in processed_text
@@ -209,6 +221,24 @@ class BaseReasoningFormatDetector:
             self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
+
+        # Step may start a tool call before a delayed reasoning end tag.
+        if (
+            self._in_reasoning
+            and self._prefer_tool_start_boundary
+            and self.tool_start_token is not None
+            and self.tool_start_token in current_text
+        ):
+            think_end_idx = current_text.find(self.think_end_token)
+            tool_start_idx = current_text.find(self.tool_start_token)
+            if think_end_idx == -1 or tool_start_idx < think_end_idx:
+                reasoning_text = current_text[:tool_start_idx]
+                normal_text = current_text[tool_start_idx:]
+                self._buffer = ""
+                self._in_reasoning = False
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
@@ -350,6 +380,34 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
+
+
+class Step3p5Detector(DeepSeekR1Detector):
+    """Reasoning detector for Step-3.5 and Step-3.7 models.
+
+    Step models follow DeepSeek-R1's always-on reasoning behavior, but may
+    begin ``<tool_call>`` without first emitting ``</think>``. Treat the tool
+    marker as an implicit reasoning boundary so the downstream tool parser
+    receives the complete tool-call payload.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        self.tool_start_token = "<tool_call>"
+        self._prefer_tool_start_boundary = True
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -2185,7 +2243,7 @@ class ReasoningParser:
         "minimax-m3": MiniMaxM3Detector,
         "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
-        "step3p5": DeepSeekR1Detector,
+        "step3p5": Step3p5Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "granite_thinking_parser": GraniteThinkingDetector,
