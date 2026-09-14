@@ -115,6 +115,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_mamba_size_gb: A[
+        Optional[str],
+        "Hybrid (attention + Mamba) models only, with --hicache-size: host memory for the Mamba state-checkpoint pool, in gigabytes, or 'auto'. Unset keeps the default split of --hicache-size between the KV and Mamba host pools in proportion to their device bytes. A number reserves that many GB for Mamba checkpoints and gives the rest to KV; 'auto' sizes the Mamba pool to one checkpoint per --chunked-prefill-size tokens of the KV host tier plus 4 x max-running-requests. Boot logs the resulting coverage.",
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(

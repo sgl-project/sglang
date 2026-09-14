@@ -1727,6 +1727,34 @@ class TestHiCacheArgs(unittest.TestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_hicache_mamba_size_gb_needs_a_fixed_budget(self):
+        # Ratio-sized host pools have no --hicache-size budget to carve from.
+        args = self._make_args(
+            enable_hierarchical_cache=True, hicache_mamba_size_gb="14"
+        )
+        with self.assertRaisesRegex(ValueError, "--hicache-size"):
+            handle_hicache(args)
+
+    def test_hicache_mamba_size_gb_accepts_gigabytes_and_auto(self):
+        for knob in ("14", "auto"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_size=32,
+                hicache_mamba_size_gb=knob,
+            )
+            handle_hicache(args)
+
+    def test_hicache_mamba_size_gb_rejects_bad_values(self):
+        # At or above the budget leaves KV no share; anything else is a typo.
+        for knob in ("32", "40", "x"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_size=32,
+                hicache_mamba_size_gb=knob,
+            )
+            with self.assertRaises(ValueError):
+                handle_hicache(args)
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
