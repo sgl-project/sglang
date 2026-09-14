@@ -699,5 +699,40 @@ class TestLTX25DevVariant(unittest.TestCase):
         self.assertEqual(args.component_paths["transformer"], "/some/other/transformer")
 
 
+class TestLTX2TwoStageAutoResidency(unittest.TestCase):
+    def test_custom_strategy_delegates_after_runtime_placement_change(self):
+        from sglang.multimodal_gen.runtime.pipelines import ltx_2_pipeline
+
+        mode = {"value": "resident"}
+        server_args = SimpleNamespace(
+            residency_mode=lambda _name: mode["value"],
+        )
+        manager = SimpleNamespace(
+            pipeline=SimpleNamespace(),
+            server_args=server_args,
+            _active_phase="stage1",
+        )
+        strategy = ltx_2_pipeline.LTX2TwoStageResidencyStrategy(manager)
+        resident = mock.Mock()
+        offloaded = mock.Mock()
+        module = mock.Mock()
+        use = SimpleNamespace(component_name="transformer", phase="stage1")
+        state = SimpleNamespace()
+
+        with mock.patch.object(
+            ltx_2_pipeline,
+            "build_component_residency_strategy",
+            side_effect=(resident, offloaded),
+        ) as build:
+            strategy.prepare_for_use(module, use, state)
+            mode["value"] = "component-offload"
+            strategy.prepare_for_use(module, use, state)
+
+        self.assertTrue(strategy.supports_auto_residency())
+        self.assertEqual(build.call_count, 2)
+        resident.prepare_for_use.assert_called_once_with(module, use, state)
+        offloaded.prepare_for_use.assert_called_once_with(module, use, state)
+
+
 if __name__ == "__main__":
     unittest.main()
