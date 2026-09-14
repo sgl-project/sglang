@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -18,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     should_report_expert_balancedness,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -28,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
-    validate_prefill_cp_platform(server_args)
+    # Through the registry, not a bare call: an out-of-tree replacement of
+    # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
+    # position must also win here, or a package permitting prefill CP on its
+    # own qualified HIP/NPU/MUSA build would still hit the original rejection
+    # at this later, nested call.
+    run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
@@ -114,7 +121,8 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def handle_dcp_validation(server_args: Any):
+def handle_decode_context_parallelism(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(
@@ -132,10 +140,9 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-            "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-            "authoritative fabric probe runs at model-runner init; use 'a2a' "
-            "or 'ag_rs' on clusters without MNNVL."
+            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
+            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
+            "the flag unset to resolve it."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
