@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
+    make_qwen3_rms_norm,
     npu_fia_enabled,
     npu_fused_mlp_enabled,
     npu_fused_norm_enabled,
@@ -70,6 +71,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.srt.layers.layernorm import RMSNorm
 
 
 class _FakeSenseNovaModel:
@@ -408,6 +410,23 @@ def test_sensenova_u1_npu_fused_ops_are_enabled_by_default(
 ):
     monkeypatch.delenv(env_name, raising=False)
     assert enabled()
+
+
+@pytest.mark.parametrize(
+    ("is_npu", "enabled", "uses_native"),
+    [(False, True, True), (True, False, True), (True, True, False)],
+)
+def test_sensenova_u1_shared_rmsnorm_dispatch(
+    monkeypatch, is_npu, enabled, uses_native
+):
+    monkeypatch.setattr(current_platform, "is_npu", lambda: is_npu)
+    monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FUSED_NORM", "1" if enabled else "0")
+
+    norm = make_qwen3_rms_norm(64, eps=1e-6)
+
+    assert isinstance(norm, RMSNorm)
+    assert norm.cast_x_before_out_mul
+    assert (norm._forward_method == norm.forward_native) is uses_native
 
 
 @torch.no_grad()

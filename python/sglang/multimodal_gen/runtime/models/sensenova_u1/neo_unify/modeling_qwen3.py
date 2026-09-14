@@ -11,7 +11,6 @@ from transformers import Qwen3Config
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
@@ -31,6 +30,8 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
     causal_mask_kwargs,
@@ -350,30 +351,14 @@ def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
         print(" ".join(map(str, row)))
 
 
-@use_kernel_forward_from_hub("RMSNorm")
-class Qwen3RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen3RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.device.type == "npu" and npu_fused_norm_enabled():
-            if hasattr(torch.ops.npu, "npu_rms_norm"):
-                return torch.ops.npu.npu_rms_norm(
-                    hidden_states, self.weight, self.variance_epsilon
-                )[0]
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
+    use_npu_kernel = current_platform.is_npu() and npu_fused_norm_enabled()
+    return RMSNorm(
+        hidden_size,
+        eps=eps,
+        cast_x_before_out_mul=True,
+        force_native=not use_npu_kernel,
+    )
 
 
 class Qwen3MLP(nn.Module):
@@ -659,23 +644,29 @@ class Qwen3Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        self.q_norm = Qwen3RMSNorm(
+        self.q_norm = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
         )  # unlike olmo, only on the head dim!
-        self.q_norm_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
-        self.q_norm_hw = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
-        self.q_norm_hw_mot_gen = Qwen3RMSNorm(
+        self.q_norm_mot_gen = make_qwen3_rms_norm(
+            self.head_dim // 2, eps=config.rms_norm_eps
+        )
+        self.q_norm_hw = make_qwen3_rms_norm(
+            self.head_dim // 2, eps=config.rms_norm_eps
+        )
+        self.q_norm_hw_mot_gen = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
         )
 
-        self.k_norm = Qwen3RMSNorm(
+        self.k_norm = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
-        self.k_norm_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
-        self.k_norm_hw = Qwen3RMSNorm(
+        self.k_norm_mot_gen = make_qwen3_rms_norm(
+            self.head_dim // 2, eps=config.rms_norm_eps
+        )
+        self.k_norm_hw = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
-        self.k_norm_hw_mot_gen = Qwen3RMSNorm(
+        self.k_norm_hw_mot_gen = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
         )
 
@@ -1316,14 +1307,16 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
         self.mlp = Qwen3MLP(config)
         self.mlp_mot_gen = Qwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_mot_gen = Qwen3RMSNorm(
+        self.input_layernorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3RMSNorm(
+        self.input_layernorm_mot_gen = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm_mot_gen = Qwen3RMSNorm(
+        self.post_attention_layernorm = make_qwen3_rms_norm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm_mot_gen = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attention_type = config.layer_types[layer_idx]
@@ -1539,8 +1532,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = make_qwen3_rms_norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_mot_gen = make_qwen3_rms_norm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types

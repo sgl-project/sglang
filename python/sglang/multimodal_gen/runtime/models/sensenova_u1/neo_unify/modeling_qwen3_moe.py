@@ -21,8 +21,8 @@ from transformers.utils.deprecation import deprecate_kwarg
 from .configuration_neo_chat import NEOMoELLMConfig
 from .modeling_qwen3 import (
     Qwen3Attention,
-    Qwen3RMSNorm,
     create_block_causal_mask,
+    make_qwen3_rms_norm,
     position_ids_from_indexes,
 )
 from .transformers_compat import (
@@ -199,14 +199,16 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             ),
         )
 
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_mot_gen = Qwen3RMSNorm(
+        self.input_layernorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3RMSNorm(
+        self.input_layernorm_mot_gen = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm_mot_gen = Qwen3RMSNorm(
+        self.post_attention_layernorm = make_qwen3_rms_norm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm_mot_gen = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attention_type = config.layer_types[layer_idx]
@@ -423,8 +425,10 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = make_qwen3_rms_norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_mot_gen = make_qwen3_rms_norm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
