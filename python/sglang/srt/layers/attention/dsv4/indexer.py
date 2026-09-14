@@ -918,6 +918,7 @@ class C4IndexerBackendMixin:
                     c4_sparse_page_indices=c4_sparse_page_indices,
                     raw_indices=raw_indices,
                     compressed_page_size=indexer_metadata.compressed_page_size,
+                    is_final_chunk=forward_batch.contains_last_prefill_chunk,
                 )
             ):
                 logits = self._forward_nonpaged_indexer(

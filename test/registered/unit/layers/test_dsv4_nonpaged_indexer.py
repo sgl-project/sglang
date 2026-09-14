@@ -476,7 +476,7 @@ _SGL_KERNEL_TOPK = SimpleNamespace(
 class TestDSV4PrefillReuse(CustomTestCase):
     query_rows = 10
 
-    def _apply(self, *, layer_id, topk_backend):
+    def _apply(self, *, layer_id, topk_backend, is_final_chunk=False):
         n = self.query_rows
         # Each query row carries its own row id, so the logits name the leader.
         q_indexer = torch.arange(n, dtype=torch.float32).unsqueeze(1)
@@ -508,8 +508,25 @@ class TestDSV4PrefillReuse(CustomTestCase):
                 c4_sparse_page_indices=pages,
                 raw_indices=raw,
                 compressed_page_size=64,
+                is_final_chunk=is_final_chunk,
             )
         return applied, pages, raw, forward, plan
+
+    def test_final_chunk_is_scored_in_full(self):
+        """Reusing the chunk that ends the prompt degraded RULER vt (0:0 -> 11:0
+        broken items when the final chunk was also reused); that chunk must fall
+        through to per-row scoring on every layer."""
+        for layer_id in (22, 24):
+            with self.subTest(layer_id=layer_id):
+                applied, pages, raw, forward, _ = self._apply(
+                    layer_id=layer_id,
+                    topk_backend=_SGL_KERNEL_TOPK,
+                    is_final_chunk=True,
+                )
+                self.assertFalse(applied)
+                forward.assert_not_called()
+                self.assertTrue(bool((pages == 7).all()))
+                self.assertTrue(bool((raw == 7).all()))
 
     def test_every_row_takes_its_window_leader_selection(self):
         n = self.query_rows

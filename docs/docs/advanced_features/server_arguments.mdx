@@ -1476,7 +1476,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepseek-v4-prefill-reuse`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse the DeepSeek V4 indexer top-K across a window of prefill query rows, scoring only the first row of each window. `deep10-inf-w4` also lets the ten deepest C4 indexer layers share one selection per chunk. Only affects single-request prefill on the non-paged indexer fast path; other cases keep the default path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse the DeepSeek V4 indexer top-K across a window of prefill query rows, scoring only the first row of each window. `deep10-inf-w4` also lets the ten deepest C4 indexer layers share one selection per chunk. The chunk that ends a prompt is always scored in full. Only affects single-request prefill on the non-paged indexer fast path; other cases keep the default path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>uniform-w4</code>, <code>deep10-inf-w4</code></td>
     </tr>

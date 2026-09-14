@@ -315,7 +315,8 @@ class ExecKernel(msgspec.Struct):
             "query rows, scoring only the first row of each window. 'uniform-w4' "
             "uses a window of 4 on every C4 indexer layer; 'deep10-inf-w4' also "
             "lets the ten deepest C4 layers of DeepSeek-V4-Flash (24-42) share one "
-            "selection per chunk. Only the non-paged indexer fast path is affected "
+            "selection per chunk. The chunk that ends a prompt is always scored "
+            "in full. Only the non-paged indexer fast path is affected "
             "(a single request with at least "
             "SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS query rows); other "
             "cases and the torch/flashinfer top-k backends keep the default path.",

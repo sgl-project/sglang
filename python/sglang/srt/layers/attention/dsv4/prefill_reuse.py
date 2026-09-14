@@ -100,12 +100,17 @@ def maybe_apply_reuse(
     c4_sparse_page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor],
     compressed_page_size: int,
+    is_final_chunk: bool,
 ) -> bool:
     """Score only the window leaders and broadcast their top-K to every row.
 
     Returns True once the page (and raw) indices of all rows are written, so the
     caller must skip its own scoring and top-K; False means nothing was touched.
     """
+    # The chunk that ends the prompt is always scored in full: reusing its
+    # selection measurably hurts retrieval-style tasks such as RULER vt.
+    if is_final_chunk:
+        return False
     # Only the sgl-kernel transforms are mirrored below.
     if topk_backend.is_torch() or topk_backend.is_flashinfer():
         return False
