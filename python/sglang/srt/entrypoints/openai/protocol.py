@@ -394,6 +394,7 @@ class CompletionRequest(PDRoutingFields):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
@@ -942,6 +943,7 @@ class ChatCompletionRequest(PDRoutingFields):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
@@ -1821,6 +1823,7 @@ class ResponsesRequest(PDRoutingFields):
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
     session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
