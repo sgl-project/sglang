@@ -262,14 +262,20 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
+                retry_with_tiling = False
                 try:
                     decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 except Exception as error:
-                    if "out of memory" in str(error).lower():
-                        # decode runs after denoising, so the DiT and encoders
-                        # are idle but may still hold VRAM; freeing them is the
-                        # lever here. --vae-cpu-offload is not: it moves VAE
-                        # weights, not the activations that overflow.
+                    is_oom = "out of memory" in str(error).lower()
+                    if is_oom and not server_args.pipeline_config.vae_tiling:
+                        retry_with_tiling = hasattr(
+                            self.vae, "enable_tiling"
+                        ) and hasattr(self.vae, "disable_tiling")
+                    # decode runs after denoising, so the DiT and encoders
+                    # are idle but may still hold VRAM; freeing them is the
+                    # lever here. --vae-cpu-offload is not: it moves VAE
+                    # weights, not the activations that overflow.
+                    if is_oom and not retry_with_tiling:
                         if not server_args.pipeline_config.vae_tiling:
                             logger.warning(
                                 "OOM detected during VAE decoding. Enable "
@@ -285,7 +291,33 @@ class DecodingStage(PipelineStage):
                                 "lower the tile size in the model's VAE config, "
                                 "then reduce resolution or frame count."
                             )
-                    raise
+                    if not retry_with_tiling:
+                        raise
+
+                if retry_with_tiling:
+                    logger.warning(
+                        "Full-frame VAE decode ran out of memory; falling back "
+                        "to tiled decode and retrying once. Output may have "
+                        "minor seams at tile boundaries. Pass --vae-tiling to "
+                        "enable this by default, or free components that "
+                        "already finished with --cpu-offload-components "
+                        "dit,text_encoder."
+                    )
+                    if not current_platform.is_cpu():
+                        torch.get_device_module().empty_cache()
+                    self.vae.enable_tiling()
+                    try:
+                        # Raw path, not _get_vae_decode_fn: enable_tiling()
+                        # changes control flow, so a graph compiled for the
+                        # untiled path would be unsound here, and recompiling
+                        # under an OOM is its own risk.
+                        decode_output = self.vae.decode(latents)
+                    except Exception:
+                        logger.warning("Tiled fallback decode also failed.")
+                        raise
+                    finally:
+                        self.vae.disable_tiling()
+
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
