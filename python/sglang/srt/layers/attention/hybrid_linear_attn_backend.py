@@ -23,6 +23,8 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
+FLA_CHUNK_SIZE = 64
+
 logger = logging.getLogger(__name__)
 
 
@@ -281,9 +283,11 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            h_chunk_size = mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // h_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            h_chunk_size = FLA_CHUNK_SIZE
+            num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -302,8 +306,11 @@ class MambaAttnBackendBase(AttentionBackend):
         # Unaligned: intermediate state from h.
         # TODO: handle mamba_cache_chunk_size % page size != 0
         not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
+        lens_aligned = (
             lens_masked[not_aligned] // mamba_cache_chunk_size
+        ) * mamba_cache_chunk_size
+        track_ssm_h_src = (
+            offset_masked[not_aligned] + lens_aligned // h_chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
