@@ -14,7 +14,7 @@ path, exactly as PR #36515 already did for the per-rank shared-slot path.
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 import unittest
 from unittest.mock import patch

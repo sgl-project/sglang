@@ -7,7 +7,7 @@ torch.mm reference.
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 import unittest
 
