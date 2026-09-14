@@ -391,7 +391,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.enable_dp_attention = get_parallel().enable_dp_attention
         # Draft collectives must not wait for idle peer DP ranks.
         self._draft_tp_group = (
-            get_parallel().attn_tp_group if self.enable_dp_attention else get_tp_group()
+            get_parallel().attn_tp_group
+            if self.enable_dp_attention
+            else get_parallel().tp_group
         )
         self._tp_sync = SpecTpSync(self._draft_tp_group)
         with self._draft_context(initializing=True):
@@ -434,8 +436,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             validate_domino_runtime(
                 device=torch.device(self.device),
-                tp_size=int(get_parallel().tp_group.world_size),
-                tp_rank=int(self.ps.tp_rank),
+                tp_size=int(self._draft_tp_group.world_size),
+                tp_rank=int(self._draft_tp_group.rank_in_group),
                 target_vocab_size=int(self.model_runner.model_config.vocab_size),
                 draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
                 hidden_size=int(self.draft_model.config.hidden_size),
@@ -1271,22 +1273,49 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().enable_dp_attention:
             return
 
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
         target_model = self._target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         local_w = embed_module.weight.data
         shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
+        embedding_tp_size = int(getattr(embed_module, "tp_size", 1))
+        parts = [local_w]
+        if embedding_tp_size > 1:
+            tp_group = (
+                get_parallel().attn_tp_group
+                if embed_module.use_attn_tp_group
+                else get_parallel().tp_group
+            )
+            if int(tp_group.world_size) != embedding_tp_size:
+                raise ValueError(
+                    "DFLASH embedding TP size does not match its TP group."
+                )
+            # Gather equal-sized padded shards. The final rank can own fewer
+            # real vocabulary rows, so gathering num_org_elements is unsafe.
+            shard_t = local_w.contiguous()
+            parts = [torch.empty_like(shard_t) for _ in range(embedding_tp_size)]
+            dist.all_gather(parts, shard_t, group=tp_group.device_group)
 
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
+        if shard is None:
+            self._full_embed_gpu = local_w[:vocab_size]
+        else:
+            num_org_padded = int(shard.num_org_elements_padded)
+            org_vocab_size = int(embed_module.org_vocab_size)
+            base_parts = [part[:num_org_padded] for part in parts]
+            base = (
+                base_parts[0] if len(base_parts) == 1 else torch.cat(base_parts, dim=0)
+            )[:org_vocab_size]
+            if embed_module.num_added_embeddings:
+                num_added_padded = int(shard.num_added_elements_padded)
+                added = torch.cat(
+                    [
+                        part[num_org_padded : num_org_padded + num_added_padded]
+                        for part in parts
+                    ],
+                    dim=0,
+                )[: int(embed_module.num_added_embeddings)]
+                base = torch.cat((base, added), dim=0)
+            self._full_embed_gpu = base[:vocab_size]
         if self.ps.tp_rank == 0:
             logger.info(
                 "DFLASH cached full embed on GPU for dp attention: shape=%s",
@@ -2544,7 +2573,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     raise RuntimeError(
                         "DFLASH Domino projector modules are unavailable."
                     )
-                tp_group = get_tp_group()
+                tp_group = get_parallel().tp_group
                 shard = getattr(lm_head, "shard_indices", None)
                 draft_next = domino_greedy_rollout(
                     draft_hidden=draft_hidden,
