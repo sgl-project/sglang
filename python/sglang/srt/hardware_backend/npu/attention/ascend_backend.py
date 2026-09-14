@@ -10,7 +10,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
@@ -403,6 +403,19 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
+        # Read by decide_needs_cpu_seq_lens (OR over the spec-v2 attn backends)
+        # and by EagleWorkerV2 to gate the post-verify seq_lens D2H. DSA
+        # attention (npu_sparse_flash_attention / npu_lightning_indexer)
+        # consumes per-request KV lengths from the device-side seq_lens
+        # buffer, so graph-replay and eager metadata run without the host
+        # mirror. V4 keeps the legacy path: its graph-replay metadata asserts
+        # seq_lens_cpu (DeepseekV4AscendAttnBackend). Hybrid-SWA models stay
+        # on the legacy path because their replay metadata is sized from the
+        # host mirror (see _apply_cuda_graph_metadata).
+        self.needs_cpu_seq_lens = self.is_hybrid_swa or not is_deepseek_dsa(
+            model_runner.model_config.hf_config
+        )
+
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
@@ -474,40 +487,48 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
-            # Overlap scheduling can publish the CPU sequence length one step
-            # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
-            # derive the block-table width from the same source. Otherwise a
-            # page-aligned request can expose KV_S=N while asking FIA for N+1.
-            seq_lens_max = forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
-        ):
+        if self.needs_cpu_seq_lens:
             seq_lens_max = forward_batch.seq_lens.max()
-            seq_lens_max += self.speculative_step_id + 1
-        else:
-            seq_lens_max = forward_batch.seq_lens.max()
-        self.forward_metadata.block_tables = (
-            self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
-        )
-        if self.is_hybrid_swa:
-            self.forward_metadata.block_tables_swa = (
-                (
-                    self.full_to_swa_index_mapping[
-                        self.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
-                    // self.page_size
+            if forward_batch.forward_mode.is_target_verify():
+                # Overlap scheduling can publish the CPU sequence length one step
+                # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
+                # derive the block-table width from the same source. Otherwise a
+                # page-aligned request can expose KV_S=N while asking FIA for N+1.
+                seq_lens_max = (
+                    forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
                 )
-                .to(torch.int32)
-                .contiguous()
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                seq_lens_max += self.speculative_step_id + 1
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
+            )
+            if self.is_hybrid_swa:
+                self.forward_metadata.block_tables_swa = (
+                    (
+                        self.full_to_swa_index_mapping[
+                            self.req_to_token_pool.req_to_token[
+                                forward_batch.req_pool_indices, :seq_lens_max
+                            ]
+                        ][:, :: self.page_size]
+                        // self.page_size
+                    )
+                    .to(torch.int32)
+                    .contiguous()
+                )
+        else:
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :: self.page_size
+                ]
+                // self.page_size
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
@@ -520,8 +541,11 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
                 self.device
             ).int()
+        if forward_batch.seq_lens_cpu is not None:
+            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        else:
+            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens.int()
 
-        self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -737,7 +761,7 @@ class AscendAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
@@ -755,43 +779,58 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
-            max_len += self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            max_len += self.speculative_step_id + 1
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        if self.needs_cpu_seq_lens:
+            max_len = seq_lens_cpu[:bs].max().item()
+            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+                max_len += self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                max_len += self.speculative_step_id + 1
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
-        if self.is_hybrid_swa:
-            full_page_locs = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_len : self.page_size,
-            ]
-            swa_page_table = (
-                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+            if self.is_hybrid_swa:
+                full_page_locs = self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : max_len : self.page_size,
+                ]
+                swa_page_table = (
+                    self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+                )
+
+                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+                metadata.block_tables_swa[bs:, :].fill_(0)
+
+                # Update SWA mask: True = masked out (don't attend), False = attend
+                seq_lens_int = seq_lens[:bs].int()
+                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+                indices = self.graph_metadata["swa_indices"]
+                start_exp = starts.unsqueeze(1)
+                seq_exp = seq_lens_int.unsqueeze(1)
+                mask = (indices.unsqueeze(0) < start_exp) | (
+                    indices.unsqueeze(0) >= seq_exp
+                )
+                metadata.swa_mask[:bs, 0, :].copy_(mask)
+                metadata.swa_mask[bs:, :, :].fill_(True)
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
             )
 
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-
-            # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens[:bs].int()
-            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-            indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1)
-            seq_exp = seq_lens_int.unsqueeze(1)
-            mask = (indices.unsqueeze(0) < start_exp) | (
-                indices.unsqueeze(0) >= seq_exp
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        else:
+            total_pages = min(
+                metadata.block_tables.shape[1],
+                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
-            metadata.swa_mask[:bs, 0, :].copy_(mask)
-            metadata.swa_mask[bs:, :, :].fill_(True)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
-        )
-
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[:bs, :total_pages].copy_(
+                self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : total_pages * self.page_size : self.page_size,
+                ]
+                // self.page_size
+            )
+            if total_pages < metadata.block_tables.shape[1]:
+                metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
@@ -2234,12 +2273,13 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
-            if self.forward_metadata.seq_lens_cpu_int is None:
+            seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
+            if seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+            elif seq_lens_cpu_int.device.type == "cpu":
+                actual_seq_lengths_kv = seq_lens_cpu_int.int().tolist()
             else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
+                actual_seq_lengths_kv = seq_lens_cpu_int.int()
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
@@ -3095,6 +3135,7 @@ class AscendAttnMultiStepDraftBackend:
             self.attn_backends.append(
                 AscendAttnBackend(model_runner, speculative_step_id=step_id)
             )
+        self.needs_cpu_seq_lens = self.attn_backends[0].needs_cpu_seq_lens
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None
