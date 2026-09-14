@@ -1891,21 +1891,6 @@ class LayerwiseOffloadManager:
             target = self._named_buffers[name]
         return target
 
-    def mapped_layer_bytes(self) -> dict[int, int]:
-        """Per layer, the bytes served straight from the checkpoint mapping.
-
-        Those bytes are page cache while the layer streams: not allocated by
-        this process, but memory the kernel must keep for the stream to run at
-        memory speed rather than disk speed.
-        """
-        return {
-            layer_idx: sum(
-                tensor.numel() * tensor.element_size() for tensor in weights.values()
-            )
-            for layer_idx, weights in self._mapped_cpu_weights.items()
-            if weights
-        }
-
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
         """
@@ -2469,6 +2454,21 @@ class LayerwiseOffloadManager:
             )
         return totals
 
+    def mapped_layer_bytes(self) -> dict[int, int]:
+        """Per layer, the bytes served straight from the checkpoint mapping.
+
+        Those bytes are page cache while the layer streams: not allocated by
+        this process, but memory the kernel must keep for the stream to run at
+        memory speed rather than disk speed.
+        """
+        return {
+            layer_idx: sum(
+                tensor.numel() * tensor.element_size() for tensor in weights.values()
+            )
+            for layer_idx, weights in self._mapped_cpu_weights.items()
+            if weights
+        }
+
     def layer_host_store_bytes(self) -> dict[int, int]:
         """Physical anonymous host-store bytes booked for each managed layer."""
         totals = {layer_idx: 0 for layer_idx in self._weight_metadata}
@@ -2773,6 +2773,8 @@ class LayerwiseOffloadManager:
     def finish_layer_forward(self, layer_idx: int) -> None:
         """Release a streamed layer after its forward completes."""
         self._last_forwarded_layer = layer_idx
+        if layer_idx == self.num_layers - 1:
+            self._first_pass = False
         self.release_layer(layer_idx)
 
     def register_forward_hooks(self) -> None:
