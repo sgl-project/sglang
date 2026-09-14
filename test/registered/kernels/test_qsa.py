@@ -47,6 +47,84 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
+class _RecordingCompressedPool:
+    def __init__(self):
+        self.write_locs = None
+        self.compressed = None
+
+    def set_qsa_compressed_k_buffer(self, layer_id, locs, compressed):
+        self.write_locs = locs.clone()
+        self.compressed = compressed.clone()
+
+
+def _run_extend_compression_plan(token_values, end_blocks, capacity):
+    token_k = torch.tensor(token_values, dtype=torch.float32).reshape(-1, 1, 1)
+    token_slot_table = torch.arange(4, 20, dtype=torch.int32).reshape(1, -1)
+    (
+        write_locs,
+        group_positions,
+        group_sequence_ids,
+        member_rows,
+        plan_valid,
+    ) = QwenSparseAttnBackend._qsa_write_plan(
+        token_slot_table=token_slot_table,
+        start_blocks=torch.zeros(1, dtype=torch.long),
+        end_blocks=torch.tensor([end_blocks], dtype=torch.long),
+        capacity=capacity,
+        compress_ratio=COMPRESS_RATIO,
+        row_token_starts=torch.zeros(1, dtype=torch.long),
+        prefix_lens=torch.zeros(1, dtype=torch.long),
+    )
+    pool = _RecordingCompressedPool()
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        compress_member_rows=member_rows,
+        compress_plan_valid=plan_valid,
+        is_cuda_graph=False,
+        write_locs=write_locs,
+        compress_group_positions=group_positions,
+        extend_rope_matrix=torch.zeros(token_k.shape[0], 3, dtype=torch.long),
+    )
+    indexer = SimpleNamespace(
+        layer_id=0,
+        compress_ratio=COMPRESS_RATIO,
+        _use_fused_compress=lambda pool: False,
+        _rope_from_matrix=lambda positions: positions[:, 0],
+        normalize_compressed_keys=lambda keys, positions: keys,
+    )
+    QSAIndexer.update_key_state_and_compress(
+        indexer,
+        token_k,
+        torch.arange(token_k.shape[0]),
+        torch.arange(token_k.shape[0]),
+        metadata,
+        state_stored=True,
+    )
+    return pool, plan_valid, group_sequence_ids
+
+
+@pytest.mark.parametrize("extend_len", [1, 2, 3])
+def test_qsa_short_extend_padding_uses_in_bounds_dummy_reads(extend_len):
+    pool, plan_valid, group_sequence_ids = _run_extend_compression_plan(
+        list(range(1, extend_len + 1)), end_blocks=0, capacity=1
+    )
+
+    assert plan_valid.tolist() == [False]
+    assert group_sequence_ids.tolist() == [0]
+    assert pool.write_locs.tolist() == [0]
+    assert pool.compressed.flatten().tolist() == [1.0]
+
+
+def test_qsa_extend_padding_does_not_change_real_group_compression():
+    pool, plan_valid, _ = _run_extend_compression_plan(
+        [0.0, 1.0, 2.0, 3.0], end_blocks=1, capacity=2
+    )
+
+    assert plan_valid.tolist() == [True, False]
+    assert pool.write_locs.tolist() == [1, 0]
+    assert pool.compressed.flatten().tolist() == [1.5, 0.0]
+
+
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
