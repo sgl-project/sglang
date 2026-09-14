@@ -27,6 +27,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -843,6 +844,49 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def filter_safetensors_files_by_weight_prefix(
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    weight_prefixes: Sequence[str],
+) -> List[str]:
+    """Keep only the shards holding a tensor whose checkpoint name starts with
+    one of ``weight_prefixes``.
+
+    A model that consumes a named slice of a bundled checkpoint (a speculative
+    draft head packed alongside its target) otherwise streams every shard and
+    discards almost all of it. Returns the input unchanged when the index is
+    absent, so a single-shard or unindexed checkpoint keeps loading whole.
+    """
+    if not weight_prefixes:
+        return hf_weights_files
+
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    wanted = {
+        os.path.join(hf_folder, shard)
+        for name, shard in weight_map.items()
+        if name.startswith(tuple(weight_prefixes))
+    }
+    if not wanted:
+        return hf_weights_files
+
+    filtered = [f for f in hf_weights_files if f in wanted]
+    if not filtered:
+        return hf_weights_files
+    logger.info(
+        "Loading %d of %d shards: only these hold weights prefixed %s.",
+        len(filtered),
+        len(hf_weights_files),
+        " or ".join(repr(p) for p in weight_prefixes),
+    )
+    return filtered
 
 
 def maybe_add_mtp_safetensors(

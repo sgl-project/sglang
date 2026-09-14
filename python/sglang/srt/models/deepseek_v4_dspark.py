@@ -649,6 +649,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
 
+    # The draft head is packed into the target's checkpoint and every other
+    # tensor is dropped by _remap_dspark_weight_name, so reading the shards that
+    # hold no "mtp." tensor streams the whole target checkpoint a second time.
+    checkpoint_weight_prefixes = ("mtp.",)
+
     @classmethod
     def shared_experts_fusion_disable_reason(
         cls,
@@ -983,6 +988,34 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        self._assert_draft_body_loaded(
+            params_dict=params_dict, loaded_params=loaded_params
+        )
+
+    def _assert_draft_body_loaded(
+        self, *, params_dict: dict, loaded_params: set
+    ) -> None:
+        """Fail loudly when a draft parameter never received a checkpoint tensor.
+
+        ``checkpoint_weight_prefixes`` narrows the shards the loader reads down to
+        the ones holding "mtp." tensors. If a future remap starts consuming a name
+        outside that prefix, its shard is no longer read and the parameter keeps
+        its uninitialized value -- which costs acceptance rate and raises nothing.
+        The vocab modules are excluded: they exist only under
+        ``uses_own_vocab_modules`` and a checkpoint may legitimately omit them.
+        """
+        owned = {
+            name for name in params_dict if name.startswith(("stages.", "markov_head."))
+        }
+        missing = owned - loaded_params
+        if missing:
+            raise ValueError(
+                f"DSpark V4 draft loaded no weights for {sorted(missing)[:8]} "
+                f"({len(missing)} parameters total). Every draft parameter comes "
+                f"from a checkpoint tensor named {'/'.join(self.checkpoint_weight_prefixes)}*; "
+                f"if that is no longer true, update "
+                f"DeepseekV4ForCausalLMDSpark.checkpoint_weight_prefixes to match."
+            )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
