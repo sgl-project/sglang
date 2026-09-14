@@ -503,6 +503,51 @@ class DSV4AttnMetadata:
             return self.c4_sparse_topk_lengths
         raise ValueError(f"invalid {compress_ratio=}")
 
+    def init_trtllm_sparse_buffers(self) -> None:
+        """Build decode tables with 128 SWA columns followed by compressed KV.
+
+        Indices use -1 for invalid entries; lens include all 128 SWA slots.
+        Only the c4 tail and lens are filled per layer.
+        """
+
+        num_tokens = self.seq_lens_casual.shape[0]
+        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
+
+        # VarSeq reads rows to the 64-token tile boundary. Back every live view
+        # with an aligned parent whose extra rows contain inert values.
+        n_pad = (num_tokens + 63) // 64 * 64
+
+        def _tile_padded(fill, src=None, width=None):
+            shape = (n_pad,) if width is None else (n_pad, width)
+            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+            if src is not None:
+                buf[:num_tokens].copy_(src)
+            return buf[:num_tokens]
+
+        if n_pad != num_tokens:
+            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
+            self.swa_page_indices = _tile_padded(
+                -1, self.swa_page_indices, width=SWA_WINDOW
+            )
+        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
+            assert w4 % 4 == 0, f"{w4=}"
+            # Unwritten c4 rows must remain inert until the per-layer fill.
+            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
+            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
+        if self.c128_page_indices is not None:
+            w128 = self.c128_page_indices.shape[-1]
+            assert w128 % 4 == 0, f"{w128=}"
+            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
+            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
+            self.trtllm_c128_lens = _tile_padded(
+                SWA_WINDOW,
+                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
+            )
+
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
@@ -860,51 +905,6 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
-
-    def init_trtllm_sparse_buffers(self) -> None:
-        """Build decode tables with 128 SWA columns followed by compressed KV.
-
-        Indices use -1 for invalid entries; lens include all 128 SWA slots.
-        Only the c4 tail and lens are filled per layer.
-        """
-
-        num_tokens = self.seq_lens_casual.shape[0]
-        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
-
-        # VarSeq reads rows to the 64-token tile boundary. Back every live view
-        # with an aligned parent whose extra rows contain inert values.
-        n_pad = (num_tokens + 63) // 64 * 64
-
-        def _tile_padded(fill, src=None, width=None):
-            shape = (n_pad,) if width is None else (n_pad, width)
-            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-            if src is not None:
-                buf[:num_tokens].copy_(src)
-            return buf[:num_tokens]
-
-        if n_pad != num_tokens:
-            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
-            self.swa_page_indices = _tile_padded(
-                -1, self.swa_page_indices, width=SWA_WINDOW
-            )
-        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
-        if self.c4_sparse_page_indices is not None:
-            w4 = self.c4_sparse_page_indices.shape[-1]
-            assert w4 % 4 == 0, f"{w4=}"
-            # Unwritten c4 rows must remain inert until the per-layer fill.
-            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
-            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
-        if self.c128_page_indices is not None:
-            w128 = self.c128_page_indices.shape[-1]
-            assert w128 % 4 == 0, f"{w128=}"
-            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
-            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
-            self.trtllm_c128_lens = _tile_padded(
-                SWA_WINDOW,
-                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
-            )
 
 
 @dataclass
