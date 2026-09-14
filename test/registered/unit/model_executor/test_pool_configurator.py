@@ -339,6 +339,30 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
+    def test_draft_does_not_inherit_target_shared_byte_budget(self):
+        """A separate draft pool must not allocate the target's byte envelope again."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr, _, config = self._run(1 << 20, enable_unified_memory=True)
+        self.assertIsNotNone(config.unified_memory_pool_bytes)
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.model_config = mr.model_config
+        configurator.is_hybrid_swa = True
+        configurator.is_draft_worker = False
+        target = configurator._derive_pool_sizes(config=config)
+        configurator.is_draft_worker = True
+        draft = configurator._derive_pool_sizes(config=config)
+        self.assertEqual(
+            target.unified_memory_pool_bytes, config.unified_memory_pool_bytes
+        )
+        self.assertIsNone(draft.unified_memory_pool_bytes)
+        self.assertEqual(
+            draft.full_max_total_num_tokens, config.full_max_total_num_tokens
+        )
+        self.assertEqual(
+            draft.swa_max_total_num_tokens, config.swa_max_total_num_tokens
+        )
+
     def test_unified_capacity_is_maximal_with_draft_pool(self):
         page_size = 8
         full_layers = 2

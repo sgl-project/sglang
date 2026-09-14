@@ -139,7 +139,7 @@ class TestPrefillAdder(CustomTestCase):
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
 
-    def create_shared_adder(self):
+    def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
         self.mock_tree_cache.is_tree_cache.return_value = False
@@ -166,6 +166,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(),
             page_size=4,
             rem_chunk_tokens=16,
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
             token_to_kv_pool_allocator=allocator,
         )
 
@@ -217,6 +218,24 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.mock_tree_cache.inc_lock_ref.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
+
+    def test_shared_continuation_defers_when_decode_consumes_chunk_budget(self):
+        """Mixed decode must not commit an empty or negatively sliced prompt."""
+        for decode_tokens in (16, 28):
+            with self.subTest(decode_tokens=decode_tokens):
+                adder = self.create_shared_adder(num_mixed_decode_tokens=decode_tokens)
+                req = self.create_shared_req("continuation")
+                before = (
+                    adder.memory_budget.total_offset,
+                    adder.memory_budget.swa_offset,
+                )
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [])
+                req.set_extend_range.assert_not_called()
+                self.assertEqual(
+                    (adder.memory_budget.total_offset, adder.memory_budget.swa_offset),
+                    before,
+                )
 
     def test_shared_continuation_uses_memory_chunk_limit(self):
         adder = self.create_shared_adder()

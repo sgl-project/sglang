@@ -127,6 +127,7 @@ class KVIndexTranslator:
         )
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
+            self._capture_page_size = alloc.page_size
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
             self._full_page_multiplier = alloc.kernel_page_multiplier
@@ -175,10 +176,10 @@ class KVIndexTranslator:
         """Host capture rows are indexed by request-token IDs, not kernel IDs.
 
         Unified IDs span the whole virtual table even when admission is capped.
-        The logical page size also covers DCP-widened request-token IDs.
+        DCP widens allocator pages; the runner's page size stays physical.
         """
         if self.is_translating:
-            return self._full_v2p_table.numel() * self.page_size
+            return self._full_v2p_table.numel() * self._capture_page_size
         return max_token_pool_size + self.page_size
 
     # -- per-batch view --------------------------------------------------------

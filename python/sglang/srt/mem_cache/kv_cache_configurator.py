@@ -441,7 +441,10 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
-            unified_memory_pool_bytes=config.unified_memory_pool_bytes,
+            # The target's byte envelope excludes the separate draft allocation.
+            unified_memory_pool_bytes=(
+                None if self.is_draft_worker else config.unified_memory_pool_bytes
+            ),
             c4_max_total_num_tokens=c4_max_total_num_tokens,
             c128_max_total_num_tokens=c128_max_total_num_tokens,
             c4_state_pool_size=c4_state_pool_size,
