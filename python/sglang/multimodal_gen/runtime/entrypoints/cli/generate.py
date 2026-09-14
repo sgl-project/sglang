@@ -20,13 +20,13 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
@@ -163,9 +163,12 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     # respect config file by overriding args with args parsed from it
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
-        sampling_param_fields = {
-            field.name for field in dataclasses.fields(sampling_params_cls)
-        }
+        if hasattr(sampling_params_cls, "supported_override_fields"):
+            sampling_param_fields = sampling_params_cls.supported_override_fields()
+        else:
+            sampling_param_fields = {
+                field.name for field in dataclasses.fields(sampling_params_cls)
+            }
         sampling_params_kwargs.update(
             {
                 key: value
