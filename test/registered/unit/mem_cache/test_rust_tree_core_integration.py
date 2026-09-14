@@ -1827,7 +1827,8 @@ def test_write_through_threshold_assignment_reaches_the_core():
     assert any(isinstance(action, BackupKV) for action in result.cache_actions)
 
 
-def test_unified_swa_backup_when_full_already_has_a_host_copy():
+@pytest.mark.parametrize("backup_nodes", ["leaf", "parent_and_leaf", "parent"])
+def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
     bundle = init_unified_swa_pools(
@@ -1855,20 +1856,45 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy():
     core = _swa_tree_core(window=4, token_to_kv_pool_allocator=allocator)
     core.set_hicache_enabled()
     core.has_swa_host_pool = True
+    sources = []
+    if backup_nodes != "leaf":
+        parent = _insert(core, [1, 2], values[:2].tolist()).last_device_node
+        sources.append((parent, values[:2]))
     node = _insert(core, [1, 2, 3, 4], values.tolist()).last_device_node
-    core.set_component_device_value(
-        node, ComponentType.SWA, allocator.translate_swa_indices_for_transfer(values)
-    )
-    core.commit_backup(node, torch.tensor([100, 101, 102, 103]), {})
+    node_values = values if backup_nodes == "leaf" else values[2:]
+    sources.append((node, node_values))
+    for source_id, source_values in sources:
+        core.set_component_device_value(
+            source_id,
+            ComponentType.SWA,
+            allocator.translate_swa_indices_for_transfer(source_values),
+        )
+    backed_up = {}
+    if backup_nodes == "parent":
+        backed_up[ComponentType.SWA] = [
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=torch.tensor([200, 201]),
+                device_indices=allocator.translate_swa_indices_for_transfer(
+                    node_values
+                ),
+                nodes_to_load=[node],
+            )
+        ]
+        sources.pop()
+    core.commit_backup(node, torch.arange(100, 100 + node_values.numel()), backed_up)
     allocator.free(padding)
 
     full_indices, transfers = core.build_backup_spec(node)
 
     assert full_indices.numel() == 0
     (swa_transfer,) = transfers[ComponentType.SWA]
+    assert swa_transfer.nodes_to_load == [source_id for source_id, _ in sources]
     assert torch.equal(
         swa_transfer.device_indices,
-        allocator.translate_swa_indices_for_transfer(values),
+        allocator.translate_swa_indices_for_transfer(
+            torch.cat([source_values for _, source_values in sources])
+        ),
     )
 
 

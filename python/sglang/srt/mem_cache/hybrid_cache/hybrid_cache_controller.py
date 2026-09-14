@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1048,6 +1049,8 @@ class HybridCacheController(BaseHiCacheController):
                 results = self.storage_backend.batch_get_v2(transfers_nonkv)
                 pool_hits = count_pool_hits(results)
             except Exception:
+                if not get_memory().enable_unified_memory:
+                    raise
                 logger.exception(
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,

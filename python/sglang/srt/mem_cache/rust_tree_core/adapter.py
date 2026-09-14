@@ -751,8 +751,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         if self._swa_backup_index_mapper is not None:
             # Full tree values are stable virtual IDs; stored SWA physical IDs are not.
             for transfer in comp_xfers.get(ComponentType.SWA, ()):
-                full_device_value = self.get_component_device_value(
-                    node_id, ComponentType.FULL
+                full_device_value = torch.cat(
+                    [
+                        self.get_component_device_value(source_id, ComponentType.FULL)
+                        for source_id in transfer.nodes_to_load
+                    ]
                 )
                 assert transfer.device_indices is not None
                 assert transfer.device_indices.numel() == full_device_value.numel()
