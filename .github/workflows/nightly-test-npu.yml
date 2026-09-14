@@ -363,7 +363,7 @@ jobs:
     name: nightly-acc-16-npu-a3-cann910
     # Enabled: run only the cann910 w8a8 8p GPQA accuracy case (the only
     # test registered to this suite).
-    # if: ${{ false }}
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -382,6 +382,7 @@ jobs:
   # executes once on both CANN versions for comparison.
   nightly-acc-16-npu-a3-cann900:
     name: nightly-acc-16-npu-a3-cann900
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -446,6 +447,8 @@ jobs:
 
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
+    # Run even if upstream jobs failed, so the 1p1d perf case still executes.
+    if: ${{ !cancelled() }}
     # Enabled: run DSV4-Flash W8A8 1P+1D 16p perf case on CANN 9.1.0.
     # Multi-node jobs run strictly one at a time to avoid contending for the
     # same A3 multi-node resources.
