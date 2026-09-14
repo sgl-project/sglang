@@ -4,6 +4,13 @@ from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
+# Invoke body of a tool without a strict schema under tool_choice required /
+# named. `True` (any JSON value) lets the grammar emit `"Haifa"`, `[1]` or
+# `null`, which the detector cannot read as arguments. xgrammar compiles a
+# structural-tag schema in strict mode, where a bare {"type": "object"}
+# admits only `{}`; the explicit additionalProperties makes it any object.
+ANY_OBJECT_BODY = {"type": "object", "additionalProperties": True}
+
 
 class DeepSeekV41Detector(DeepSeekV32Detector):
     """DeepSeek V4.1 DSML detector.
@@ -34,9 +41,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     ) -> Optional[StructuralTag]:
         """The builtin "deepseek_v4" shape with the spaced tag names.
 
-        Bodies are JSON: xgrammar's "deepseek_xml" body style also hardcodes
-        the unspaced " parameter" name, and the V3.2-lineage parser accepts a
-        JSON body inside an invoke.
+        Bodies are JSON objects: xgrammar's "deepseek_xml" body style also
+        hardcodes the unspaced " parameter" name, and the V3.2-lineage parser
+        accepts a JSON object body inside an invoke.
         """
         try:
             from xgrammar.structural_tag import (
@@ -56,7 +63,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [
-                tool for tool in tools if tool.function.name == tool_choice.function.name
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
             ]
             if len(tools) != 1:
                 return None
@@ -65,9 +74,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
 
         def invoke_tag(tool: Tool) -> TagFormat:
             function = tool.function
-            schema = function.parameters if function.strict else True
+            schema = function.parameters if function.strict else ANY_OBJECT_BODY
             if schema is None:
-                schema = True
+                schema = ANY_OBJECT_BODY
             return TagFormat(
                 begin=f'{self.invoke_start_token} name="{function.name}">',
                 content=JSONSchemaFormat(json_schema=schema),
