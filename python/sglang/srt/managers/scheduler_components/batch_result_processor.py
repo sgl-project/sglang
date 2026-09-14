@@ -1135,6 +1135,14 @@ class SchedulerBatchResultProcessor:
             accepted_ids = next_token_id
             max_accept = 1
 
+        if req.logprob.top_logprobs_num <= 0 and req.logprob.token_ids_logprob is None:
+            # Per-token appends dominate the spec decode result loop (accept_len
+            # tokens per request per step); extend the lists in one call each.
+            req.logprob.output_token_logprobs_val.extend(
+                accepted_logprobs[: len(accepted_ids)]
+            )
+            req.logprob.output_token_logprobs_idx.extend(accepted_ids)
+            return
         for j, tok_id in enumerate(accepted_ids):
             req.logprob.output_token_logprobs_val.append(accepted_logprobs[j])
             req.logprob.output_token_logprobs_idx.append(tok_id)

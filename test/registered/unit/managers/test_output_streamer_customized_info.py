@@ -376,3 +376,41 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOutputStreamerRustServerMode(unittest.TestCase):
+    def _accumulator(self, rust_server_mode: bool):
+        return _GenerationStreamAccumulator(
+            return_logprob=False,
+            return_hidden_states=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            default_stream_interval=1,
+            default_force_stream_interval=1,
+            get_cached_tokens_details=lambda req: None,
+            current_weight_version=0,
+            rust_server_mode=rust_server_mode,
+        )
+
+    def test_rust_server_mode_skips_time_stats(self):
+        # The Rust request server builds its own metadata and never reads
+        # time_stats, so the per-request collection and the per-batch pickle are
+        # skipped.
+        accumulator = self._accumulator(rust_server_mode=True)
+        req = _FakeReq("r0", [10, 11])
+        req.time_stats = object()
+        accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(accumulator.time_stats, [])
+        self.assertIsNone(payload.time_stats)
+        self.assertEqual(payload.output_ids, [[10, 11]])
+
+    def test_python_tokenizer_mode_keeps_time_stats(self):
+        accumulator = self._accumulator(rust_server_mode=False)
+        req = _FakeReq("r0", [10, 11])
+        req.time_stats = {"marker": 1}
+        accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(unwrap_from_pickle(payload.time_stats), [{"marker": 1}])
