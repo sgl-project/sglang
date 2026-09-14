@@ -29,6 +29,10 @@ BORROW_CUDA_IPC_FEATURE_KEY = "_sglang_borrow_cuda_ipc_feature"
 CUDA_IPC_FEATURE_COPY_EVENT_KEY = "_sglang_cuda_ipc_feature_copy_event"
 RETAINED_CUDA_IPC_FEATURE_PROXY_KEY = "_sglang_retained_cuda_ipc_feature_proxy"
 
+# Per-image content hashes computed at feature-production time (one list entry
+# per bundled item), preserved by item expansion instead of re-hashing.
+PRECOMPUTED_FEATURE_HASHES_KEY = "_sglang_precomputed_feature_hashes"
+
 
 def get_mm_feature_pool_size_per_worker(
     total_pool_size: int, tokenizer_worker_num: int

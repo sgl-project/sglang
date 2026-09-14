@@ -417,10 +417,6 @@ def test_flashinfer_cudnn_metadata_uses_bucketed_element_indptrs():
     assert metadata.flashinfer_max_seqlen == 4096
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 class _K3TowerStub:
     device = torch.device("cpu")
     merge_kernel_size = (2, 2)
@@ -553,9 +549,9 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     def fake_preprocess(images, resize_configs, *args, **kwargs):
         ids = [int(image[0, 0, 0]) for image in images]
         calls.append(ids)
-        pixel_values = torch.cat(
-            [torch.full(size=(patch_counts[i], 2), fill_value=float(i)) for i in ids]
-        )
+        pixel_values = [
+            torch.full(size=(patch_counts[i], 2), fill_value=float(i)) for i in ids
+        ]
         return pixel_values, torch.tensor([grids[i] for i in ids])
 
     # Configured TP size (the IPC consumer count) comes from the published
@@ -614,3 +610,7 @@ def test_kimi_k3_rejects_aggregated_items():
 
     with pytest.raises(ValueError, match="one vision grid per MultimodalDataItem"):
         model.get_image_feature([aggregated])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
