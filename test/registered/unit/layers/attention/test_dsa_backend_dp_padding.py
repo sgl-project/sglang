@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     _trim_trtllm_decode_dp_padding,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -17,11 +18,10 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestDSABackendDPPadding(unittest.TestCase):
     def test_occupied_uneven_decode_with_idle_rank_selects_max_len(self):
-        moe_backend = SimpleNamespace(is_pplx=lambda: False)
         with (
             patch(
                 "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
-                return_value=moe_backend,
+                return_value=MoeA2ABackend.NONE,
             ),
             patch(
                 "sglang.srt.layers.dp_attention.get_attention_dp_size",
