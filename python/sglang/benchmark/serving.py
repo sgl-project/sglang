@@ -1441,9 +1441,16 @@ async def benchmark(
 
     # Run warmup requests
     warmup_tasks = []
+    # Keep warmup at the same concurrency as the measured run. Otherwise,
+    # --warmup-requests also becomes an unbounded warmup burst.
     for _ in range(warmup_requests):
         warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+            asyncio.create_task(
+                limited_request_func(
+                    request_func_input=test_input,
+                    pbar=None,
+                )
+            )
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
@@ -1470,7 +1477,7 @@ async def benchmark(
     if should_flush_cache:
         flush_server_cache(base_url, backend, flush_cache_timeout)
 
-    time.sleep(1.0)
+    await asyncio.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
