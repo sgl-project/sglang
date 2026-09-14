@@ -1,0 +1,68 @@
+# Single-Dockerfile build for GLM-5.3-Flash router image (amd64).
+#
+# Combines:
+#   1. docker/sgl-router.Dockerfile (multi-stage Rust build of experimental/sgl-router)
+#   2. docker/glm53-flash/Dockerfile (tokenizer layer)
+#
+# Build context = sglang repo root, with tokenizer.json placed at
+# docker/glm53-flash/tokenizer.json before invoking.
+#
+# Usage:
+#   docker build -f docker/glm53-flash/Dockerfile.combined \
+#     -t sgl-router:glm53-flash-combine .
+
+ARG RUST_VERSION=1.90
+ARG DEBIAN_VERSION=bookworm
+
+######################## STAGE 1 — chef recipe ##########################
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /work
+COPY experimental/sgl-router/Cargo.toml ./
+COPY experimental/sgl-router/rust-toolchain.toml ./
+RUN mkdir -p src examples && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && echo "fn main() {}" > examples/tokenize_bench.rs \
+    && cargo generate-lockfile \
+    && cargo chef prepare --recipe-path recipe.json \
+    && rm -rf src examples
+
+######################## STAGE 2 — builder ##############################
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /work
+
+ENV PCRE2_SYS_STATIC=1
+
+COPY --from=chef /work/recipe.json ./recipe.json
+COPY --from=chef /work/Cargo.lock ./Cargo.lock
+COPY experimental/sgl-router/rust-toolchain.toml ./
+
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY experimental/sgl-router/Cargo.toml ./
+COPY experimental/sgl-router/src ./src
+COPY experimental/sgl-router/examples ./examples
+
+RUN cargo build --release --bin sgl-router \
+    && strip target/release/sgl-router
+
+######################## STAGE 3 — runtime ##############################
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
+
+# Bake GLM-5.3-Flash tokenizer + chat template.
+USER root
+COPY docker/glm53-flash/tokenizer.json        /tokenizer/tokenizer.json
+COPY docker/glm53-flash/tokenizer_config.json /tokenizer/tokenizer_config.json
+COPY docker/glm53-flash/chat_template.jinja   /tokenizer/chat_template.jinja
+USER nonroot:nonroot
+
+ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
+ENV SGL_ROUTER_TOKENIZER_PATH=/tokenizer/tokenizer.json
+ENV SGL_ROUTER_CHAT_TEMPLATE=/tokenizer/chat_template.jinja
+
+EXPOSE 8090
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/sgl-router"]
