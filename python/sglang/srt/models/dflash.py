@@ -365,10 +365,13 @@ class DFlashAttention(nn.Module):
         return k_by_head.view_as(k)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        # Match K shape so RoPE kernel head-count check passes on all backends.
-        dummy_q = k.new_empty(k.shape)
-        _, k = self.rotary_emb(positions, dummy_q, k)
-        return k
+        # 3-D K with a 1-head dummy Q dispatches to the fused NPU Triton kernel
+        # (fused_rope_qk_mqa) instead of npu_mrope, and wastes only a single
+        # head on the unused Q output.
+        k3 = k.view(-1, self.num_kv_heads, self.head_dim)
+        dummy_q = k3.new_empty(k3.shape[0], 1, self.head_dim)
+        _, k3 = self.rotary_emb(positions, dummy_q, k3)
+        return k3.reshape_as(k)
 
 
 class DFlashMLP(nn.Module):
