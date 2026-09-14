@@ -2295,6 +2295,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        # MegaMoE consumes canonical W13 directly, regardless of the nominal
+        # runner.
+        self.use_flashinfer_trtllm_weight_layout = (
+            self.enable_flashinfer_trtllm_moe
+            and not get_moe_a2a_backend().is_megamoe()
+        )
         self._cache_permute_indices = {}
 
     @property
@@ -2515,6 +2521,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
+        assert not self.use_flashinfer_trtllm_weight_layout, (
+            "MegaMoE NVFP4 weights must use canonical W13 layout"
+        )
         # DeepGEMM nvfp4xnvfp4 layout: e2m1 weights + UE4M3 g16 scales, plus the
         # per-local-expert alphas applied in the L1/L2 epilogues. Activations are
         # quantized per token at dispatch, so w13_input_scale is not used.
@@ -2574,7 +2583,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.enable_flashinfer_trtllm_moe
+            up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
