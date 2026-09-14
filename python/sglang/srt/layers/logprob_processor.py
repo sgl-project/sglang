@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.logprob_types import PerPositionTokenIds
 from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
@@ -131,6 +132,27 @@ def get_top_logprobs(
     )
 
 
+def _gather_position_logprobs(logprobs, rows, log_normalizer=None):
+    """Gather sparse rows with one device-to-host copy per chunk."""
+    lengths = [len(row) for row in rows]
+    row_ids = [i for i, row in enumerate(rows) for _ in row]
+    token_ids = [token for row in rows for token in row]
+    if not token_ids:
+        return [[] for _ in rows]
+    row_tensor = torch.tensor(row_ids, dtype=torch.long, device=logprobs.device)
+    token_tensor = torch.tensor(token_ids, dtype=torch.long, device=logprobs.device)
+    values = logprobs[row_tensor, token_tensor]
+    if log_normalizer is not None:
+        maximum, log_sum = log_normalizer
+        values = (values.float() - maximum[row_tensor]) - log_sum[row_tensor]
+    flat = values.tolist()
+    output, offset = [], 0
+    for length in lengths:
+        output.append(flat[offset : offset + length])
+        offset += length
+    return output
+
+
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs_list: List[Optional[List[int]]],
@@ -141,7 +163,7 @@ def get_token_ids_logprobs_raw(
     vals, idxs = [], []
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
-            if token_ids is None:
+            if token_ids is None or isinstance(token_ids, PerPositionTokenIds):
                 vals.append([])
                 idxs.append([])
             else:
@@ -164,6 +186,14 @@ def get_token_ids_logprobs_raw(
                 # The sequence's rows still occupy logprobs; step over them.
                 vals.append([])
                 idxs.append([])
+                pt += pruned_len
+                continue
+            if isinstance(token_ids, PerPositionTokenIds):
+                rows = token_ids.rows(0, pruned_len)
+                vals.append(
+                    _gather_position_logprobs(logprobs[pt : pt + pruned_len], rows)
+                )
+                idxs.append(rows)
                 pt += pruned_len
                 continue
             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
@@ -319,6 +349,28 @@ def get_token_ids_logprobs_chunk(
             # there is no token ids logprobs to process
             token_ids_logprobs_val.append([])
             token_ids_logprobs_idx.append([])
+            continue
+
+        if isinstance(token_ids, PerPositionTokenIds):
+            count = min(pruned_len, max(0, logprobs.shape[0] - pt))
+            rows = token_ids.rows(split_pruned_len, count)
+            normalizer = (
+                None
+                if log_normalizer is None
+                else (row_max[pt : pt + count], row_log_sum[pt : pt + count])
+            )
+            values = _gather_position_logprobs(
+                logprobs[pt : pt + count], rows, normalizer
+            )
+            if split_pruned_len > 0:
+                token_ids_logprobs_val[-1].extend(values)
+                token_ids_logprobs_idx[-1].extend(rows)
+            else:
+                token_ids_logprobs_val.append(values)
+                token_ids_logprobs_idx.append(rows)
+            if count < pruned_len:
+                next_split_pruned_len = split_pruned_len + count
+            pt += pruned_len
             continue
 
         # Get the token ids logprobs
@@ -714,6 +766,10 @@ def get_token_ids_logprobs_batch_optimized(
         # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
         # indices = [[1, 3], [2], [0, 2, 4]]
     """
+    token_ids_logprobs = [
+        None if isinstance(ids, PerPositionTokenIds) else ids
+        for ids in token_ids_logprobs
+    ]
     batch_size = len(token_ids_logprobs)
     device = logprobs.device
 
