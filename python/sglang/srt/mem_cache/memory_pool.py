@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -132,7 +132,9 @@ def conv_window_dedup_enabled(
     )
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Optional[Union[torch.Tensor, List[torch.Tensor]]]):
+    if t is None:
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -397,17 +399,23 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under --enable-linear-replayssm-spec: the spec ring owns rollback
-        # (verify writes ring records, commit moves cursors), so the per-draft
-        # full-state snapshots are never produced or consumed.
-        intermediate_ssm: Optional[torch.Tensor]
-        intermediate_conv_window: List[torch.Tensor]
+        # None under BOTH
+        # --enable-linear-replayssm-spec (the spec ring owns rollback via cursors)
+        # and gdn_mtp_cache_mode=none (recovery reconstructs h_K after verify). The two modes
+        # are mutually exclusive.
+        # --enable-linear-replayssm-spec (spec ring owns rollback via cursors)
+        # and gdn_mtp_cache_mode=none (recovery reconstructs h_K after verify)
+        # The two
+        # are mutually exclusive.
+        intermediate_ssm: Optional[torch.Tensor] = None
+        # Kept in all modes for accepted conv-state rollback.
+        intermediate_conv_window: Optional[List[torch.Tensor]] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
     ) -> int:
-        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
-        share one overlapping conv-window buffer.
+        """Prefer GDN's trailing axis when both match. Mixed layer layouts cannot share one
+        overlapping conv-window buffer.
         """
         axis = None
         for conv_shape in conv_state_shape:
@@ -695,22 +703,19 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
+                # Cache intermediate SSM states per draft token during target verify.
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # When either mode is on, the intermediate_ssm allocation (~46x the conv state) is skipped:
                 #
-                # ReplaySSM spec-verify owns rollback via the ring + cursors (the
-                # verify kernel never writes per-draft snapshots; the commit never
-                # reads them), so this buffer -- the dominant spec scratch, ~46x
-                # the conv state -- is dead weight there and is skipped. The conv
-                # intermediate windows below STAY (conv rollback consumes them).
-                # The recurrent-verify fallback cannot be reached under the flag
-                # (GDN + linear chain + triton enforced in server_args; the
-                # backend asserts loudly if it ever is).
-                # ReplaySSM skips this dominant scratch (~9GB @ K3 dspark γ=7): the
-                # KDA verify kernel takes intermediate_states_buffer=None (skips the
-                # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
-                # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # ReplaySSM spec-verify owns rollback through the ring and cursors: the verify
+                # kernel never writes per-draft snapshots and the commit never reads them.
+                #
+                # gdn_mtp_cache_mode=none reconstructs h_K from the committed h_0 after verify,
+                # and server_args keeps the two modes apart.
+                #
+                # The conv intermediate windows stay populated in both cases: conv rollback consumes them.
+                cache_mode = get_exec().mamba.gdn_mtp_cache_mode
+                if enable_linear_replayssm_spec or cache_mode == "none":
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -725,8 +730,7 @@ class MambaPool:
                         dtype=ssm_dtype,
                         device="cuda",
                     )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token
-                # during target verify.
+                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify.
                 #
                 # On CUDA (Triton conv kernel + Triton scatter) we use a
                 # *deduplicated sliding-window* layout: consecutive draft tokens'
@@ -814,13 +818,14 @@ class MambaPool:
                     else 0.0
                 )
                 logger.info(
-                    f"Mamba Cache is allocated. "
+                    f"Mamba Cache is allocated (gdn_mtp_cache_mode={cache_mode}). "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
-                    # Report the deduplicated PHYSICAL conv-window buffers (the view
-                    # over-reports its logical, un-deduplicated size).
+                    # Report
+                    # the deduplicated PHYSICAL
+                    # conv-window buffers (the view over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:

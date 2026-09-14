@@ -992,12 +992,39 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        # gdn_mtp_cache_mode=none: capture the per-bucket SSM-state recovery graphs now
+        # that target_verify capture above allocated the recovery stash at its final addresses.
+        # Self-guards (no-op in full mode / non-recovery paths).
+        self.maybe_capture_gdn_recovery_graphs()
+
+    def maybe_capture_gdn_recovery_graphs(self):
+        """Capture per-bucket FlashInfer SSM-state recovery cuda graphs at warmup.
+
+        The recovery stash must exist at its final addresses, hence after the decode
+        and target_verify captures. Bucket padding, side-stream replay,
+        and the capture-failure fallback to eager live in HybridLinearAttnBackend.
+        """
+        if self.device != "cuda" or self.is_draft_worker:
+            return
+        if self.server_args.gdn_mtp_cache_mode == "full":
+            return
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        if not isinstance(self.attn_backend, HybridLinearAttnBackend):
+            return
+        if self.decode_cuda_graph_runner is None:
+            return
+        self.attn_backend.capture_recovery_graphs(
+            self.decode_cuda_graph_runner.capture_bs
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
-            # Capture is target-only. The draft worker runs in the same process
-            # as its target and inits after it, so installing a capturer here
-            # would overwrite the target's process-global one.
+            # Capture is target-only. The draft worker runs in the same process as its target
+            # and inits after it, so installing a capturer here would overwrite the target's process-global one.
             return
 
         set_global_experts_capturer(

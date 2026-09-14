@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -111,6 +111,7 @@ class GDNKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
+        gdn_mtp_cache_mode: str = "full",
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
@@ -196,7 +197,7 @@ class GDNKernelDispatcher:
             self.verify_kernel_is_flashinfer = False
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
-        ) and flashinfer_kernel.supports_target_verify:
+        ) and flashinfer_kernel.can_target_verify(gdn_mtp_cache_mode):
             self.verify_kernel = flashinfer_kernel
             self.verify_kernel_is_flashinfer = True
         else:
@@ -207,10 +208,16 @@ class GDNKernelDispatcher:
             self.decode_kernel, "supports_packed_decode", False
         )
 
+        verify_suffix = (
+            " (none-mode WY output-only)"
+            if self.verify_kernel_is_flashinfer
+            and not self.verify_kernel.supports_target_verify
+            else ""
+        )
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
-            f"verify={self.verify_kernel.__class__.__name__} "
+            f"verify={self.verify_kernel.__class__.__name__}{verify_suffix} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -360,7 +367,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         backends = model_runner.linear_attn_backends
         self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            model_runner.server_args.gdn_mtp_cache_mode,
         )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -370,6 +380,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # RecoverSSM: rebuild the accepted SSM state after verify instead of caching per-draft h.
+        # Resolved once from the mode (server_args makes none-mode exclusive with the ReplaySSM flags), so no branch consults
+        # pool buffers.
+        self._recover_ssm = model_runner.server_args.gdn_mtp_cache_mode == "none"
+        # Per-layer persistent buffers for gdn_mtp_cache_mode=none recovery.
+        self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Draft-token count of the first target-verify forward, constant for the serving session.
+        self._no_cache_draft_token_num: Optional[int] = None
+        # FlashInfer-recovery per-layer persistent token-major post-conv buffer [pool_size, draft, conv_dim]: verify
+        # conv writes into it (out=) and recovery reads k/v as strided views. Empty and unused
+        # on the Triton path.
+        self._conv_out_persist: Dict[int, torch.Tensor] = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -514,6 +536,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            # In cache_mode=none, target verify skips intermediate SSM writes. Accepted h_K is recovered after verification.
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
@@ -522,17 +545,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
-        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-        # proper indexed writes and handle non-contiguous pools directly via
-        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
+        # Page-major envelope: the prefill
+        # kernels (CUDA causal_conv1d_fwd, chunk_gated_delta_rule) write state back
+        # in place assuming
+        # a contiguous slot layout,
+        # so they silently drop
+        # the write
+        # to the strided envelope pool.
+        # Run them
+        # on contiguous
+        # per-sequence copies
+        # (identity-indexed) and scatter
+        # the result back.
+        # No-op for the default contiguous pool.
+        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use proper
+        # indexed writes
+        # and handle
+        # non-contiguous pools directly via cache_indices,
+        # so the gather/scatter
+        # round-trip is unnecessary on CPU.
+        # TODO(ch-wan): drop
+        # these .contiguous() copies
+        # by making
+        # the prefill conv
+        # and chunk_gated_delta_rule kernels honor
+        # the pool's real slot stride
+        # + int64 indexing, like packed_decode
+        # / causal_conv1d_update already do.
         needs_state_gather = (
             (not is_target_verify)
             and (not is_cpu())
@@ -554,9 +593,43 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+            # Choose the recovery kernel before running conv. FlashInfer recovery reads its k/v
+            # as strided views of one conv-out buffer that persists across steps, so the verify
+            # conv call below writes into that buffer (the out= argument further down).
+            #
+            # FlashInfer recovery applies when the decode kernel is FlashInfer and the state
+            # pool is bf16. Otherwise recovery is the Triton kernel with a flat k/v stash.
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                fi_recovery_kernel,
+            )
+
+            _use_fi_recovery = fi_recovery_kernel(self) is not None
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            # FI recovery: write the post-conv output straight
+            # into the persistent conv-out buffer
+            # (out=pbuf[:bs].transpose(1, 2), the same strides empty_like(x) produces),
+            # so the downstream view stays no-copy and the buffer address is stable across capture/replay.
+            _conv_out_arg = None
+            if self._recover_ssm and _use_fi_recovery:
+                conv_dim = mixed_qkv_reshaped.shape[1]
+                pool_size = self.req_to_token_pool.size
+                pbuf = self._conv_out_persist.get(layer.layer_id)
+                if (
+                    pbuf is None
+                    or pbuf.shape[0] < pool_size
+                    or pbuf.shape[1] != draft_token_num
+                    or pbuf.shape[2] != conv_dim
+                ):
+                    with torch.inference_mode(False):
+                        pbuf = torch.empty(
+                            (pool_size, draft_token_num, conv_dim),
+                            dtype=mixed_qkv_reshaped.dtype,
+                            device=mixed_qkv_reshaped.device,
+                        )
+                    self._conv_out_persist[layer.layer_id] = pbuf
+                _conv_out_arg = pbuf[:batch_size].transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -569,6 +642,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+                out=_conv_out_arg,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -630,6 +704,111 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+
+            # RecoverSSM (none-mode): keep post-conv GDN inputs for accepted-state recovery. Persistent buffers give CUDA graph replay
+            # stable addresses.
+            if self._recover_ssm:
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                pool_size = self.req_to_token_pool.size
+                max_tokens = pool_size * draft_token_num
+                actual_seq_len = query.shape[1]
+                batch_size = actual_seq_len // draft_token_num
+
+                stash_entry = self._no_cache_stash.get(layer.layer_id)
+                if _use_fi_recovery:
+                    # FlashInfer recovery: k/v are strided views of the conv-out buffer written above, so only a/b, the gating params,
+                    # and the slice geometry are stashed.
+                    # FI wants [B, T, H], so a/b are pre-shaped to [pool_size, T, ...]
+                    # and a [:B] slice keeps the right shape. Presence of ``conv_dims``
+                    # selects the FI view path.
+                    needs_realloc = (
+                        stash_entry is None or "conv_dims" not in stash_entry
+                    )
+                    if needs_realloc:
+                        # Allocate outside inference_mode so buffers can be updated across forward invocations.
+                        with torch.inference_mode(False):
+                            stash_entry = {
+                                "a": torch.empty(
+                                    (pool_size, draft_token_num, *a.shape[1:]),
+                                    dtype=a.dtype,
+                                    device=a.device,
+                                ),
+                                "b": torch.empty(
+                                    (pool_size, draft_token_num, *b.shape[1:]),
+                                    dtype=b.dtype,
+                                    device=b.device,
+                                ),
+                                "A_log": layer.A_log,
+                                "dt_bias": layer.dt_bias,
+                                # A_log is always float32 (all GDN models define it with dtype=torch.float32).
+                                # No detach or cast needed.
+                                "A_log_f32": layer.A_log,
+                            }
+                        self._no_cache_stash[layer.layer_id] = stash_entry
+                    stash_entry["conv_dims"] = (
+                        layer.q_dim,
+                        layer.k_dim,
+                        layer.v_dim,
+                        layer.num_k_heads,
+                        layer.head_k_dim,
+                        layer.num_v_heads,
+                        layer.head_v_dim,
+                    )
+                    # k/v are not copied here: the recovery reads them from the
+                    # _conv_out_persist views.
+                    stash_entry["a"][:batch_size].copy_(
+                        a.view(batch_size, draft_token_num, *a.shape[1:])
+                    )
+                    stash_entry["b"][:batch_size].copy_(
+                        b.view(batch_size, draft_token_num, *b.shape[1:])
+                    )
+                else:
+                    # Triton recovery: flat stash holds the post-conv k/v + a/b.
+                    # This path has no conv-out buffer.
+                    needs_realloc = (
+                        stash_entry is None
+                        or "conv_dims" in stash_entry
+                        or stash_entry["k"].shape[1] < max_tokens
+                    )
+                    if needs_realloc:
+                        with torch.inference_mode(False):
+                            stash_entry = {
+                                "k": torch.empty(
+                                    (key.shape[0], max_tokens, *key.shape[2:]),
+                                    dtype=key.dtype,
+                                    device=key.device,
+                                ),
+                                "v": torch.empty(
+                                    (value.shape[0], max_tokens, *value.shape[2:]),
+                                    dtype=value.dtype,
+                                    device=value.device,
+                                ),
+                                "a": torch.empty(
+                                    (max_tokens, *a.shape[1:]),
+                                    dtype=a.dtype,
+                                    device=a.device,
+                                ),
+                                "b": torch.empty(
+                                    (max_tokens, *b.shape[1:]),
+                                    dtype=b.dtype,
+                                    device=b.device,
+                                ),
+                                "A_log": layer.A_log,
+                                "dt_bias": layer.dt_bias,
+                                "A_log_f32": layer.A_log,
+                            }
+                        self._no_cache_stash[layer.layer_id] = stash_entry
+                    stash_entry["k"][:, :actual_seq_len].copy_(key)
+                    stash_entry["v"][:, :actual_seq_len].copy_(value)
+                    stash_entry["a"][:actual_seq_len].copy_(a)
+                    stash_entry["b"][:actual_seq_len].copy_(b)
+
+                # Do not store per-call sizes or tensor aliases in the stash.
+                # Eager recovery derives them from current runtime tensors.
+                if self._no_cache_draft_token_num is None:
+                    self._no_cache_draft_token_num = (
+                        forward_batch.spec_info.draft_token_num
+                    )
             if use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
@@ -659,12 +838,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
             else:
-                # The recurrent fallback needs the per-draft snapshots, which
-                # the pool gates OFF under --enable-linear-replayssm-spec (the
-                # same flag that makes `use_replayssm_spec` true above), so
-                # this branch is unreachable with a None buffer by
-                # construction -- keep it loud rather than silently frozen.
-                assert intermediate_state_cache is not None, (
+                # Outside none-mode a None buffer means ReplaySSM reached the recurrent fallback
+                # its pool gates the snapshots off for.
+                #
+                # The kernel would write no h_K and the commit would replay
+                # a frozen state, a silent mis-decode.
+                assert intermediate_state_cache is not None or self._recover_ssm, (
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )
@@ -711,8 +890,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states[cache_indices] = last_recurrent_state
 
             if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
+                # Scatter the in-place-updated contiguous copies back to the strided envelope pool (advanced indexing handles the strides).
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
