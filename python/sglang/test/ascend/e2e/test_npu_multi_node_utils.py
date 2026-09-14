@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -8,13 +9,18 @@ import threading
 import time
 from functools import wraps
 from types import SimpleNamespace
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
-from sglang.test.test_utils import CustomTestCase, popen_launch_server
+from sglang.test.test_utils import (
+    CustomTestCase,
+    _launch_server_process,
+    _wait_for_server_health,
+    popen_launch_server,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -421,6 +427,122 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
         return wrapper
 
     return decorator
+
+
+def _get_cann_version():
+    """Return the CANN toolkit version as a tuple like (9, 0, 0).
+
+    Checks ASCEND_TOOLKIT_HOME / ASCEND_INSTALL_PATH first, then the default
+    install location. Returns None when the version cannot be determined.
+    """
+    candidate_roots = []
+    for env_var in ("ASCEND_TOOLKIT_HOME", "ASCEND_INSTALL_PATH"):
+        path = os.environ.get(env_var)
+        if path and os.path.exists(path):
+            candidate_roots.append(path)
+    default_root = "/usr/local/Ascend/ascend-toolkit/latest"
+    if os.path.exists(default_root):
+        candidate_roots.append(default_root)
+
+    for root in candidate_roots:
+        for sub in ("aarch64-linux", "x86_64-linux", ""):
+            info_file = os.path.join(root, sub, "ascend_toolkit_install.info")
+            if not os.path.isfile(info_file):
+                continue
+            try:
+                with open(info_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if "version" not in line:
+                            continue
+                        nums = re.findall(r"\d+", line)
+                        if nums:
+                            return tuple(int(n) for n in nums[:3])
+            except OSError:
+                continue
+    return None
+
+
+# ``sglang serve`` model-category detection segfaults lightning indexer ops
+# on CANN 9.0 (it imports NPU attention operator libraries in-process and
+# pollutes torch.ops namespaces). Workaround with ``python -m
+# sglang.launch_server`` only on affected CANN versions; keep the original
+# ``sglang serve`` interface on CANN >= 9.1 where the bug does not occur.
+_CANN_SEGFAULT_MAX_VERSION = (9, 1, 0)
+
+
+def popen_launch_server_npu(
+    model: str,
+    base_url: str,
+    timeout: float,
+    other_args: Optional[list] = None,
+    env: Optional[dict] = None,
+):
+    """NPU variant of popen_launch_server with a CANN 9.0 segfault workaround.
+
+    On CANN < 9.1.0, launches via ``python -m sglang.launch_server`` to skip
+    the in-process model-category detection of ``sglang serve`` (which loads
+    NPU attention operator libraries and breaks lightning indexer ops).
+    On CANN >= 9.1.0 (or when the version is undetectable), uses the original
+    ``sglang serve`` interface.
+    """
+    other_args = other_args or []
+    if env is None:
+        env = os.environ.copy()
+    else:
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
+    _, host, port = base_url.split(":")
+    host = host[2:]
+    cann_version = _get_cann_version()
+    if cann_version is not None and cann_version < _CANN_SEGFAULT_MAX_VERSION:
+        logger.info(
+            f"CANN {cann_version} detected, launch via "
+            f"python -m sglang.launch_server (segfault workaround)"
+        )
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+    else:
+        logger.info(
+            f"CANN {cann_version} detected, launch via sglang serve (default)"
+        )
+        command = [
+            "sglang",
+            "serve",
+            "--model-path",
+            model,
+            *[str(x) for x in other_args],
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+    logger.info(f"command={shlex.join(command)}")
+
+    process = _launch_server_process(command, env, None, model)
+    success, error_msg = _wait_for_server_health(process, base_url, None, timeout)
+    if success:
+        return process
+
+    try:
+        kill_process_tree(process.pid)
+    except Exception as e:
+        logger.warning(f"Error killing process after launch failure: {e}")
+    if error_msg and "exited" in error_msg:
+        raise RuntimeError(error_msg + ". Check server logs for errors.")
+    raise TimeoutError(error_msg)
 
 
 # Launch master/worker node

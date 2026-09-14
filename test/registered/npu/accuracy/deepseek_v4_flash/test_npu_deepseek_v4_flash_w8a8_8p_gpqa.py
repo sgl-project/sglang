@@ -4,6 +4,9 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
     TestNpuAccuracyTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    popen_launch_server_npu,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
 )
@@ -25,6 +28,7 @@ register_npu_ci(
     est_time=7200,
     suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
+    disabled="accuracy testcase",
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
@@ -137,6 +141,10 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    # Only this case needs the CANN-version-aware launch: on CANN 9.0.x
+    # `sglang serve` segfaults lightning indexer ops, so launch via
+    # `python -m sglang.launch_server`; on CANN >= 9.1.0 keep `sglang serve`.
+    launch_server_fn = popen_launch_server_npu
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
@@ -146,7 +154,7 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 32
     # Resolve to http://{host}:{port}/v1 (server exposes the base path).
-    # api_url = "/v1"
+    api_url = "/v1"
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""

@@ -476,7 +476,11 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
 
         other_args = list(cls.other_args)
 
-        cls.process = popen_launch_server(
+        # Subclasses may override launch_server_fn to customize the server
+        # launch command (see popen_launch_server_npu for the CANN 9.0
+        # segfault workaround). Defaults to the standard popen_launch_server.
+        launch_server_fn = getattr(cls, "launch_server_fn", popen_launch_server)
+        cls.process = launch_server_fn(
             cls.model,
             cls.base_url,
             timeout=cls.server_timeout,
