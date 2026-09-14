@@ -590,12 +590,7 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
-    # Chunked-prefill fairness: fraction of the chunk budget that a continuing
-    # chunked request leaves to the requests still waiting in the same prefill
-    # iteration (0 disables). With long prompts prefilled in many chunks, this
-    # lets short extends (turn restarts over a cached prefix) ride along instead
-    # of waiting for the whole prompt; waiting requests that would themselves
-    # need chunking are deferred until the current chunked request finishes.
+    # fraction of the chunk budget a continuing chunked request leaves to waiting requests; 0 = off
     SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE = EnvFloat(0.0)
 
     # ===================================================================
@@ -975,27 +970,17 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
-    # Convert MXFP8 dense-linear weights to block-fp8 [128, 128] at load for aiter
-    # block-scale GEMMs, while leaving fused-MoE weights on the native MX per-1x32
-    # path. Use when fully converting MXFP8 weights would route the MoE to a
-    # block-scale kernel that does not support the model's activation (for example,
-    # SwiGLU-OAI).
+    # block-fp8 for MXFP8 dense linears only, so the fused MoE keeps its native per-1x32 path
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
-    # Quark checkpoints keep their excluded linear layers (e.g. every attention
-    # projection of a MoE model) in bf16. With this on, those layers are
-    # quantized to FP8 at load time and served by the dynamic per-token /
-    # per-channel FP8 GEMM (on ROCm together with SGLANG_USE_AITER_FP8_PER_TOKEN=1
-    # this is the aiter preshuffled a8w8 GEMM). Layers whose module name is in
-    # SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES stay bf16.
+    # serve quark-excluded bf16 linear layers as per-token FP8 quantized at load
     SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED = EnvBool(False)
-    SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES = EnvTuple(("gate", "lm_head", "index_qkv_proj"))
-    # Largest token count for which the fused add-RMSNorm kernel also emits the
-    # per-token fp8 activation consumed by the following fp8 linear (gfx95).
-    # None = the MXFP8 dense decode bound (128); raise it (e.g. 16384) when the
-    # attention/dense projections run as online per-token fp8 so prefill chunks
-    # skip the separate activation quant.
+    # module names (whole path components) kept bf16 under the knob above
+    SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES = EnvTuple(
+        ("gate", "lm_head", "index_qkv_proj")
+    )
+    # largest token count for which add-RMSNorm also emits the per-token fp8 activation; None = decode bound
     SGLANG_FUSED_NORM_FP8_QUANT_MAX_M = EnvInt(None)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
@@ -1096,24 +1081,13 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
-    # Triton extend attention over a long cached prefix (>= the token threshold
-    # below): sweep the prefix with larger query tiles and in parallel slices
-    # (one partial O/LSE each) and combine, instead of one serial pass per
-    # (query tile, head). Same math, fp32 partials; the win is parallelism
-    # at few extend rows and halved KV traffic at many rows.
+    # extend attention over a long cached prefix sweeps it in parallel slices and combines fp32 partials
     SGLANG_TRITON_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS = EnvInt(8192)
-    # Within the long-prefix EXTEND route, serve batches whose largest request
-    # has at least MIN_ROWS extend rows with aiter's CK paged batch-prefill
-    # kernel (prefix + chunk in one causal paged call) instead of the
-    # split-prefix Triton kernel. ROCm only; fp8 (per-tensor scales) or bf16
-    # KV at page size 1. Below the threshold the CK kernel is slower.
+    # long-prefix extends with at least MIN_ROWS rows go to aiter's paged batch-prefill (ROCm, page size 1)
     SGLANG_USE_AITER_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS = EnvInt(2048)
-    # Decode attention for grouped-head shapes with one TP-local KV head (EAGLE3
-    # Llama draft, MiniMax-M3 dense layers): serve it with the split-KV
-    # grouped-head verify kernel (one extend row per request) instead of the
-    # per-head decode kernel; ~3x higher KV bandwidth at 100K+ contexts.
+    # grouped-head decode with one TP-local KV head uses the split-KV verify kernel; this reverts it
     SGLANG_DISABLE_TRITON_DECODE_SHARED_KV = EnvBool(False)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
@@ -1651,12 +1625,9 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
-    # Run the sparse prefill main attention through AITER's Gluon paged attention
-    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    # sparse prefill main attention through AITER's Gluon paged attention, Triton on unsupported cases
     SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL = EnvBool(True)
-    # Per-buffer cap (MiB) on the Gluon sparse-prefill gather scratch (K and V
-    # each). The gathered span is the batch's total prefix+chunk length; batches
-    # above the cap fall back to the Triton sparse kernel.
+    # per-buffer cap on the Gluon gather scratch; a batch span above it falls back to Triton
     SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB = EnvInt(2048)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
@@ -1666,10 +1637,7 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
-    # ROCm: allocate the lightning-indexer K cache in fp8_e4m3fn (widening
-    # mode: bf16 q x fp8 k in the score kernels, as in the SM100 fp8 attn-GEMM
-    # mode). Selection-only; main attention K/V stay in kv_cache_dtype. Set to
-    # false for a bf16 index cache.
+    # ROCm: fp8 lightning-indexer K cache (selection only; main K/V keep kv_cache_dtype)
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
