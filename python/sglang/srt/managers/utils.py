@@ -116,9 +116,7 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
-    fpm_start_event: Optional[torch.cuda.Event] = None
-    fpm_end_event: Optional[torch.cuda.Event] = None
+    # Forward pass metrics (FPM)
     fpm_timing: Optional[FpmTiming] = None
     fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
