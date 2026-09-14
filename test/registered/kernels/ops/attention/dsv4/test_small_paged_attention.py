@@ -184,7 +184,9 @@ def test_inverse_rope_dynamic(b, k, ek, pos_dtype):
 )
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
-def test_backend_inverse_rope_contract(enabled, pos_dtype):
+@pytest.mark.parametrize("breakable", [False, True])
+def test_backend_inverse_rope_contract(enabled, pos_dtype, breakable):
+    from contextlib import nullcontext
     from types import SimpleNamespace
 
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -196,7 +198,10 @@ def test_backend_inverse_rope_contract(enabled, pos_dtype):
     )
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.runtime_context import snapshot_context
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.runtime_context import restore_context, snapshot_context
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     state = snapshot_context()
@@ -242,14 +247,13 @@ def test_backend_inverse_rope_contract(enabled, pos_dtype):
             save_kv_cache=False,
             attn_sink=sink,
         )
-        expected = backend._forward_attention(**args)
-        fused_rope_inplace(
-            expected[:, :16, -64:], None, freqs, positions=pos, inverse=True
-        )
-        out = backend._forward_attention(**args, inverse_rope=(freqs, pos))
-        assert out.shape == (b, 16 if enabled else 64, 512)
-        assert torch.equal(out, expected)
+        with enable_breakable_cuda_graph() if breakable else nullcontext():
+            expected = backend._forward_attention(**args)
+            fused_rope_inplace(
+                expected[:, :16, -64:], None, freqs, positions=pos, inverse=True
+            )
+            out = backend._forward_attention(**args, inverse_rope=(freqs, pos))
+            assert out.shape == (b, 16 if enabled and not breakable else 64, 512)
+            assert torch.equal(out, expected)
     finally:
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=256)
-        )
+        restore_context(state)

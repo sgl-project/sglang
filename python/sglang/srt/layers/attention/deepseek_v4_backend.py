@@ -3855,8 +3855,13 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+                is_in_breakable_cuda_graph,
+            )
+
             if (
-                getattr(self, "small_paged_attention_enabled", False)
+                not is_in_breakable_cuda_graph()
+                and getattr(self, "small_paged_attention_enabled", False)
                 and (
                     forward_batch.forward_mode.is_decode()
                     or forward_batch.forward_mode.is_target_verify()

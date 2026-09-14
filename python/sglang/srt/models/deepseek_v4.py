@@ -2113,6 +2113,9 @@ class MQALayer(MqaAttentionBase):
 
         fuse_attention_inverse_rope = (
             self.is_dsv41
+            # The breakable-graph wrapper owns a padded output buffer and
+            # does not forward the fused inverse-RoPE arguments.
+            and not is_in_breakable_cuda_graph()
             and 0 < x.shape[0] <= 8
             and (
                 forward_batch.forward_mode.is_decode()
