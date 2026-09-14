@@ -1307,9 +1307,8 @@ fn build_outgoing_body(
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
 ///   * `tools` / `functions` — the encoder doesn't render tool schemas.
-///   * non-string `content` (multimodal arrays, text-part arrays, `null`,
-///     absent): the engine flattens or blanks these before rendering; the
-///     router's encoder renders them verbatim.
+///   * non-string or missing `content` (arrays, `null`): the engine normalizes
+///     these before rendering; the router's encoder renders them verbatim.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
 ///     custom one would diverge. (SGLang ignores it today, but block it so the
@@ -1359,22 +1358,11 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether the ingress tokenization offload was expected to fire but failed —
-/// the condition behind `sgl_router_ingress_tokenize_errors_total`.
+/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
 ///
-/// True only when ALL of:
-///   * the model has a chat encoder (`has_chat_encoder`), so a chat request
-///     on it SHOULD have produced engine-equivalent ids;
-///   * the request is a chat request (`messages` array present) that
-///     `input_ids_safe_to_forward` would have forwarded;
-///   * the tokens are absent OR not engine-equivalent — i.e. `encode_chat`
-///     render/encode failed and the request silently fell back to engine-side
-///     tokenization.
-///
-/// Non-chat-encoder / non-`messages` requests never expected the offload, so
-/// they are not failures. A tools / multimodal / thinking request is an
-/// expected omission whether or not its render succeeded (a template may
-/// legitimately reject array content), so it is not counted either.
+/// Count chats with a configured encoder that pass the forwarding guard
+/// but lack engine-equivalent tokens. Excluded requests are expected fallbacks,
+/// even when rendering fails.
 fn ingress_tokenize_offload_failed(
     has_chat_encoder: bool,
     request_value: Option<&serde_json::Value>,
@@ -1419,10 +1407,8 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
-/// Whether any message carries non-string content: multimodal or text-part
-/// arrays, `null`, or no `content` at all (tool-call turns). The engine
-/// flattens arrays and blanks `null` before rendering; the router's encoder
-/// renders them verbatim, so the caller must let the engine handle these.
+/// Detect non-string or missing content, which requires engine tokenization:
+/// the engine normalizes arrays and nulls differently from the router's encoder.
 fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
@@ -1696,8 +1682,7 @@ mod tests {
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
     }
 
-    /// Non-string message content (multimodal or text-part arrays, `null`,
-    /// absent) is detected so the caller omits `input_ids`.
+    /// Arrays, nulls, and missing content block `input_ids` forwarding.
     #[test]
     fn request_has_non_text_content_detects_non_string_content() {
         for content in [
@@ -1801,8 +1786,7 @@ mod tests {
         ));
     }
 
-    /// A request the guard would not have forwarded anyway (tools here) is an
-    /// expected omission even when rendering produced nothing.
+    /// Excluded requests are expected fallbacks, even without rendered tokens.
     #[test]
     fn offload_failed_false_for_unforwardable_request() {
         let value = serde_json::json!({
@@ -1812,9 +1796,7 @@ mod tests {
         assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
-    /// A chat request on a chat-encoder model whose tokenization yielded NO
-    /// tokens (encode_chat returned None -> request_tokens None) IS a failure:
-    /// the encoder should have fired but didn't.
+    /// Missing tokens count as a failure for an eligible chat with an encoder.
     #[test]
     fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
