@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+
 
 @triton.autotune(
     configs=[
@@ -64,6 +66,16 @@ import triton.language as tl
         ),
     ],
     key=["chunk_size", "K", "IS_CAUSAL"],
+    prune_configs_by={
+        "early_config_prune": prune_oversized_tiles(
+            {
+                "BLOCK_SIZE_M": ("chunk_size",),
+                "BLOCK_SIZE_N": ("chunk_size",),
+                "BLOCK_SIZE_K": ("K",),
+            }
+        )
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _bmm_chunk_fwd_kernel(

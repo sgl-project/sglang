@@ -120,6 +120,14 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 
 
+def _init_process_global_configs(server_args) -> None:
+    initialize_moe_config()
+    initialize_fp8_gemm_config()
+    initialize_fp4_gemm_config()
+    if initialize_mamba_selective_state_update_backend is not None:
+        initialize_mamba_selective_state_update_backend(server_args)
+
+
 def start_profile(
     profile_activities,
     profile_record_shapes=False,
@@ -705,6 +713,7 @@ def correctness_test(
     tp_rank,
 ):
     publish(server_args, role="scheduler")
+    _init_process_global_configs(server_args)
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -910,14 +919,7 @@ def latency_test(
     # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
     # a spawned child arrives with nothing published.
     publish(server_args, role="scheduler")
-    initialize_moe_config()
-    initialize_fp8_gemm_config()
-    initialize_fp4_gemm_config()
-    # Mamba's selective_state_update dispatches through a process-global backend
-    # that only the Scheduler installs; without it every Mamba model dies in
-    # decode (including the decode CUDA-graph capture inside load_model).
-    if initialize_mamba_selective_state_update_backend is not None:
-        initialize_mamba_selective_state_update_backend(server_args)
+    _init_process_global_configs(server_args)
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         parallel = get_parallel()
