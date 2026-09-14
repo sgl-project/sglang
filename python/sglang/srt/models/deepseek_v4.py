@@ -3392,6 +3392,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         if _FP8_WO_A_GEMM:
             self._setup_fp8_wo_a_scales(is_nextn)
 
+        if get_moe_a2a_backend().is_megamoe() and (
+            weight_names is None
+            or any("shared_experts" in name for name in weight_names)
+        ):
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_shared_expert_weights,
+            )
+
+            mlps = (
+                [self.model.decoder.mlp]
+                if is_nextn
+                else [
+                    self.model.layers[layer_id].mlp
+                    for layer_id in range(self.model.start_layer, self.model.end_layer)
+                ]
+            )
+            for mlp in mlps:
+                if isinstance(mlp, deepseek_v2.DeepseekV2MoE):
+                    build_mega_moe_shared_expert_weights(mlp, force=True)
+
         if is_nextn:
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):

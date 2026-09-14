@@ -556,6 +556,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.is_deepseek_v4 = is_deepseek_v4
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)

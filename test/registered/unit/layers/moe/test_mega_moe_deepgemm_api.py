@@ -101,6 +101,211 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ["fp8xfp4", "mxf4xmxf4"],
         )
 
+    def test_buffer_cache_separates_native_shared_expert_count(self):
+        deep_gemm = ModuleType("deep_gemm")
+        expected_buffers = (object(), object())
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(side_effect=expected_buffers)
+        group = object()
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+        ):
+            actual_buffers = tuple(
+                mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    num_experts=8,
+                    num_max_tokens_per_rank=64,
+                    num_topk=2,
+                    hidden=128,
+                    intermediate_hidden=256,
+                    num_shared_experts=num_shared_experts,
+                )
+                for num_shared_experts in (0, 1)
+            )
+
+        self.assertEqual(actual_buffers, expected_buffers)
+        self.assertEqual(
+            [
+                call.kwargs["num_shared_experts"]
+                for call in deep_gemm.get_symm_buffer_for_mega_moe.call_args_list
+            ],
+            [0, 1],
+        )
+
+    def test_builds_native_shared_weights_without_routed_slot_remap(self):
+        deep_gemm = ModuleType("deep_gemm")
+        transformed_l1 = object()
+        transformed_l2 = object()
+        deep_gemm.transform_weights_for_mega_moe = MagicMock(
+            return_value=(transformed_l1, transformed_l2)
+        )
+        gate_up = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.zeros((32, 16)), requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.ones((1, 1)), requires_grad=False
+            ),
+        )
+        down = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.zeros((16, 16)), requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.ones((1, 1)), requires_grad=False
+            ),
+        )
+        moe = SimpleNamespace(
+            is_deepseek_v4=True,
+            num_fused_shared_experts=0,
+            n_shared_experts=1,
+            shared_experts=SimpleNamespace(gate_up_proj=gate_up, down_proj=down),
+            shared_experts_is_fp8=True,
+            shared_experts_weight_block_size=[128, 128],
+        )
+        requant_results = ((object(), object()), (object(), object()))
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(
+                mega_moe,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_megamoe=lambda: True),
+            ),
+            patch.object(
+                mega_moe,
+                "_prepare_mega_moe_shared_weight_ue8m0",
+                side_effect=requant_results,
+            ) as requant,
+        ):
+            built = mega_moe.build_mega_moe_shared_expert_weights(moe)
+
+        self.assertTrue(built)
+        self.assertEqual(requant.call_count, 2)
+        self.assertIs(moe.mega_shared_l1_weights, transformed_l1)
+        self.assertIs(moe.mega_shared_l2_weights, transformed_l2)
+        self.assertEqual(moe.num_fused_shared_experts, 0)
+        transform_call = deep_gemm.transform_weights_for_mega_moe.call_args
+        self.assertEqual(transform_call.args, requant_results)
+        self.assertEqual(transform_call.kwargs, {"mma_type": "fp8xfp4"})
+
+    def test_native_shared_weight_expands_k128_scale_for_k32_consumption(self):
+        weight = torch.zeros((128, 512), dtype=torch.float8_e4m3fn)
+        raw_scale = torch.tensor([[1.0, 2.0, 4.0, 8.0]])
+        packed_scale = torch.zeros((128, 1), dtype=torch.int32)
+        packed_scale.format_ue8m0 = True
+        unpacked_scale = raw_scale.clone()
+        requantized_weight = torch.zeros_like(weight)
+        requantized_scale = torch.ones((128, 1), dtype=torch.int32)
+        native_scale = torch.empty_strided((128, 4), (1, 128), dtype=torch.int32)
+
+        for scale, should_unpack in (
+            (raw_scale, False),
+            (packed_scale, True),
+        ):
+            with (
+                self.subTest(should_unpack=should_unpack),
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.inverse_transform_scale_ue8m0",
+                    return_value=unpacked_scale,
+                ) as unpack,
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.requant_weight_ue8m0",
+                    return_value=(requantized_weight, requantized_scale),
+                ) as requant,
+                patch(
+                    "sglang.srt.layers.quantization.fp8_utils.transform_scale_ue8m0",
+                    return_value=native_scale,
+                ) as transform,
+            ):
+                actual = mega_moe._prepare_mega_moe_shared_weight_ue8m0(
+                    weight, scale, [128, 128]
+                )
+
+            self.assertIs(actual[0], weight if should_unpack else requantized_weight)
+            self.assertIs(actual[1], native_scale)
+            if should_unpack:
+                requant.assert_not_called()
+                unpack.assert_called_once_with(packed_scale, mn=128)
+            else:
+                requant.assert_called_once_with(weight, raw_scale, [128, 128])
+                unpack.assert_called_once_with(requantized_scale, mn=128)
+            transform.assert_called_once()
+            torch.testing.assert_close(
+                transform.call_args.args[0],
+                torch.tensor(
+                    [
+                        [
+                            1.0,
+                            1.0,
+                            1.0,
+                            1.0,
+                            2.0,
+                            2.0,
+                            2.0,
+                            2.0,
+                            4.0,
+                            4.0,
+                            4.0,
+                            4.0,
+                            8.0,
+                            8.0,
+                            8.0,
+                            8.0,
+                        ]
+                    ]
+                ),
+            )
+            self.assertEqual(transform.call_args.kwargs, {"mn": 128})
+
+    def test_native_shared_weight_drops_packed_k_padding_before_expansion(self):
+        weight = torch.zeros((128, 256), dtype=torch.float8_e4m3fn)
+        packed_scale = torch.zeros((128, 1), dtype=torch.int32)
+        packed_scale.format_ue8m0 = True
+        unpacked_with_padding = torch.tensor([[1.0, 2.0, 0.0, 0.0]])
+        native_scale = torch.empty_strided((128, 2), (1, 128), dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.inverse_transform_scale_ue8m0",
+                return_value=unpacked_with_padding,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.transform_scale_ue8m0",
+                return_value=native_scale,
+            ) as transform,
+        ):
+            mega_moe._prepare_mega_moe_shared_weight_ue8m0(
+                weight, packed_scale, [128, 128]
+            )
+
+        torch.testing.assert_close(
+            transform.call_args.args[0],
+            torch.tensor([[1.0] * 4 + [2.0] * 4]),
+        )
+
+    def test_native_shared_weights_reject_w4a4_routed_mode(self):
+        moe = SimpleNamespace(
+            is_deepseek_v4=True,
+            num_fused_shared_experts=0,
+            n_shared_experts=1,
+            shared_experts=object(),
+            shared_experts_is_fp8=True,
+            shared_experts_weight_block_size=[128, 128],
+        )
+
+        with (
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
+            patch.object(
+                mega_moe,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_megamoe=lambda: True),
+            ),
+        ):
+            self.assertFalse(mega_moe.build_mega_moe_shared_expert_weights(moe))
+
+        self.assertFalse(hasattr(moe, "_mega_moe_shared_weights_built"))
+
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
@@ -213,6 +418,100 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.mega_moe_pre_dispatch.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp4_acts", call.kwargs)
+
+    def test_native_shared_path_wires_scale_layout_weights_and_routed_scaling(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.get_block_m_for_mega_moe = MagicMock(return_value=32)
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        shared_l1_sf = object()
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+            shared_l1_acts_sf=shared_l1_sf,
+            num_max_tokens_per_rank=64,
+        )
+        device_group = SimpleNamespace(size=lambda: 2)
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            should_fuse_routed_scaling_factor_in_topk=False,
+        )
+        topk_output = SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1]]),
+            topk_weights=torch.tensor([[0.6, 0.4]]),
+        )
+        moe = SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=8,
+                swiglu_limit=None,
+            ),
+            experts=experts,
+            gate=MagicMock(return_value=torch.empty((1, 8))),
+            topk=MagicMock(return_value=topk_output),
+            is_hash=False,
+            num_fused_shared_experts=0,
+            n_shared_experts=1,
+            layer_id=0,
+            routed_scaling_factor=2.0,
+            _mega_moe_shared_weights_built=True,
+            mega_shared_l1_weights=object(),
+            mega_shared_l2_weights=object(),
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(
+                mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer
+            ) as get_buffer,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe.ExpertLocationDispatchInfo,
+                "init_new",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=SimpleNamespace(device_group=device_group),
+            ),
+        ):
+            mega_moe._run_mega_routed(
+                moe,
+                torch.zeros((1, 4)),
+                forward_batch=None,
+                input_ids_global=None,
+                num_tokens=1,
+            )
+
+        self.assertEqual(get_buffer.call_args.kwargs["num_shared_experts"], 1)
+        deep_gemm.get_block_m_for_mega_moe.assert_called_once_with(
+            2, 8, 64, 1, 2, "fp8xfp4"
+        )
+        self.assertIs(pre_dispatch.call_args.kwargs["shared_l1_acts_sf"], shared_l1_sf)
+        self.assertEqual(pre_dispatch.call_args.kwargs["shared_block_m"], 32)
+        torch.testing.assert_close(
+            pre_dispatch.call_args.args[2], torch.tensor([[1.2, 0.8]])
+        )
+        kernel_call = deep_gemm.fp8_fp4_mega_moe.call_args
+        self.assertIs(
+            kernel_call.kwargs["shared_l1_weights"],
+            moe.mega_shared_l1_weights,
+        )
+        self.assertIs(
+            kernel_call.kwargs["shared_l2_weights"],
+            moe.mega_shared_l2_weights,
+        )
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)

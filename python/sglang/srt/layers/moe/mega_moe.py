@@ -93,6 +93,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_shared_experts: int = 0,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -104,6 +105,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        num_shared_experts,
         mma_type,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
@@ -115,11 +117,121 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
+            num_shared_experts=num_shared_experts,
             mma_type=mma_type,
             activation="swiglu",
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
+
+
+def _can_fuse_native_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
+    """Whether DeepGEMM can preserve DSV4's routed-FP4/shared-FP8 split."""
+    return bool(
+        get_moe_a2a_backend().is_megamoe()
+        and _device_sm >= 100
+        and getattr(moe, "is_deepseek_v4", False)
+        and _mega_moe_mma_type() == "fp8xfp4"
+        and moe.num_fused_shared_experts == 0
+        and moe.n_shared_experts == 1
+        and hasattr(moe, "shared_experts")
+        and moe.shared_experts_is_fp8
+        and moe.shared_experts_weight_block_size == [128, 128]
+    )
+
+
+def _prepare_mega_moe_shared_weight_ue8m0(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent K128 block-FP8 weights with MegaMoE's K32 scale layout."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        inverse_transform_scale_ue8m0,
+        requant_weight_ue8m0,
+        transform_scale_ue8m0,
+    )
+
+    assert weight.dim() == 2, f"Expected a matrix, got {weight.shape=}"
+    assert weight.dtype == torch.float8_e4m3fn, f"Unexpected {weight.dtype=}"
+    assert weight_block_size == [128, 128], f"Unsupported {weight_block_size=}"
+    mn, k = weight.shape
+    assert mn % 128 == 0 and k % 128 == 0, (
+        "MegaMoE shared FP8 weights require dimensions aligned to 128, "
+        f"got {weight.shape=}"
+    )
+
+    if getattr(weight_scale_inv, "format_ue8m0", False):
+        # The packed runtime representation still describes the original 128x128
+        # block quantization. Recover its logical scales before changing layout.
+        scale_k128 = inverse_transform_scale_ue8m0(weight_scale_inv, mn=mn)
+    else:
+        # DeepGEMM consumes exponent-only UE8M0 scales. Normalize arbitrary
+        # checkpoint FP32 scales once before adapting their granularity.
+        weight, packed_scale_k128 = requant_weight_ue8m0(
+            weight,
+            weight_scale_inv,
+            weight_block_size,
+        )
+        scale_k128 = inverse_transform_scale_ue8m0(packed_scale_k128, mn=mn)
+    # Packed UE8M0 pads its K-scale count to a multiple of four. Drop that
+    # physical padding before expanding each logical K128 scale into K32.
+    scale_k128 = scale_k128[..., : k // 128]
+
+    # Preserve every FP8 bit after the required UE8M0 normalization. Repeating
+    # each K128 scale for its four K32 subgroups gives DeepGEMM the exact same
+    # represented values without a second dequant/requant round trip.
+    scale_k32 = scale_k128.repeat_interleave(4, dim=-1)
+    out_scale = transform_scale_ue8m0(scale_k32, mn=mn)
+    assert out_scale.shape == (mn, k // (32 * 4)), (
+        "Unexpected MegaMoE shared-weight scale layout: "
+        f"{out_scale.shape=}, expected={(mn, k // (32 * 4))}"
+    )
+    assert out_scale.dtype == torch.int32 and out_scale.stride(-2) == 1, (
+        "MegaMoE shared-weight scales must be packed int32 and MN-major, "
+        f"got {out_scale.dtype=} {out_scale.stride()=}"
+    )
+    return weight, out_scale
+
+
+def build_mega_moe_shared_expert_weights(
+    moe: DeepseekV2MoE, *, force: bool = False
+) -> bool:
+    """Build DeepGEMM's separate FP8 shared-weight layout without remapping it.
+
+    The original block-FP8 weights stay on ``moe.shared_experts`` for the
+    non-MegaMoE fallback. DeepGEMM receives per-32 UE8M0 copies, with L1
+    gate/up rows interleaved and both scale tensors transformed for UTCCP.
+    """
+    if getattr(moe, "_mega_moe_shared_weights_built", False) and not force:
+        return True
+    if not _can_fuse_native_mega_moe_shared_experts(moe):
+        return False
+
+    import deep_gemm
+
+    def as_ue8m0_pair(proj):
+        return _prepare_mega_moe_shared_weight_ue8m0(
+            proj.weight.data,
+            proj.weight_scale_inv,
+            moe.shared_experts_weight_block_size,
+        )
+
+    l1_pair = as_ue8m0_pair(moe.shared_experts.gate_up_proj)
+    l2_pair = as_ue8m0_pair(moe.shared_experts.down_proj)
+    shared_l1, shared_l2 = deep_gemm.transform_weights_for_mega_moe(
+        l1_pair,
+        l2_pair,
+        mma_type="fp8xfp4",
+    )
+    moe.mega_shared_l1_weights = shared_l1
+    moe.mega_shared_l2_weights = shared_l2
+    moe._mega_moe_shared_weights_built = True
+    return True
+
+
+def _has_native_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
+    return bool(getattr(moe, "_mega_moe_shared_weights_built", False))
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
@@ -149,15 +261,20 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+    has_native_shared = _has_native_mega_moe_shared_experts(moe)
 
     sbo_overlap_flag = (
         moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
+        and not has_native_shared
         and num_tokens > 0
         and get_is_capture_mode()
     )
 
-    if sbo_overlap_flag:
+    if has_native_shared:
+        shared_output = None
+        mega_stream_ctx = nullcontext()
+    elif sbo_overlap_flag:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
@@ -217,6 +334,8 @@ def _run_mega_routed(
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
+    has_native_shared = _has_native_mega_moe_shared_experts(moe)
+    num_native_shared_experts = moe.n_shared_experts if has_native_shared else 0
     intermediate_size = moe.config.moe_intermediate_size
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -235,11 +354,17 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        num_shared_experts=num_native_shared_experts,
     )
 
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
+        if (
+            has_native_shared
+            and not moe.experts.should_fuse_routed_scaling_factor_in_topk
+        ):
+            topk_weights_in = topk_weights_in * moe.routed_scaling_factor
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
@@ -272,6 +397,18 @@ def _run_mega_routed(
             mma_type=mma_type,
         )
     else:
+        shared_block_m = (
+            deep_gemm.get_block_m_for_mega_moe(
+                ep_group.size(),
+                num_experts,
+                buf.num_max_tokens_per_rank,
+                num_tokens,
+                top_k,
+                mma_type,
+            )
+            if has_native_shared
+            else 0
+        )
         mega_moe_pre_dispatch(
             hidden_states,
             topk_ids_in,
@@ -281,6 +418,8 @@ def _run_mega_routed(
             buf.topk_idx,
             buf.topk_weights,
             quant_group_size=32,
+            shared_l1_acts_sf=(buf.shared_l1_acts_sf if has_native_shared else None),
+            shared_block_m=shared_block_m,
         )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
@@ -297,6 +436,12 @@ def _run_mega_routed(
             moe.experts.mega_l1_weights,
             moe.experts.mega_l2_weights,
             buf,
+            shared_l1_weights=(
+                moe.mega_shared_l1_weights if has_native_shared else None
+            ),
+            shared_l2_weights=(
+                moe.mega_shared_l2_weights if has_native_shared else None
+            ),
             recipe=(1, 1, 32),
             activation="swiglu",
             activation_clamp=swiglu_limit,
@@ -304,7 +449,10 @@ def _run_mega_routed(
         )
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+    if (
+        not has_native_shared
+        and not moe.experts.should_fuse_routed_scaling_factor_in_topk
+    ):
         y.mul_(moe.routed_scaling_factor)
     return y
 
