@@ -4,7 +4,7 @@ import abc
 import logging
 import threading
 from functools import wraps
-from typing import Optional
+from typing import Optional, Union
 
 import psutil
 import torch
@@ -12,7 +12,9 @@ import torch
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
     _cuda_host_unregister,
+    device_uses_allocator,
     get_allocator_from_storage,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -48,14 +50,32 @@ def ranks_per_host() -> int:
     return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
-def host_memory_budget_bytes() -> int:
+def host_memory_budget_bytes(
+    allocator: Optional[HostTensorAllocator] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     psutil reports the whole machine, so co-located ranks each see the same free
     memory; without the split every rank sizes its pool against all of it and
     the host is oversubscribed by the number of ranks it holds.
+
+    When ``allocator`` maps MAP_HUGETLB (SGLANG_HUGEPAGE_SIZE) the pool may
+    come from the kernel's hugetlb pool instead, which MemAvailable excludes.
+    The two are alternatives, not a sum: one mapping is served entirely by one
+    or the other, so the larger of them is the budget, and the reserve stays
+    on plain RAM. The credit needs ``device`` to dispatch to the allocator
+    (npu/musa pin through torch). It is only as safe as the fallback is loud:
+    a mapping the hugetlb pool cannot serve (rounding up to whole pages, a
+    neighbour's reservation, a cgroup limit) is logged at ERROR and lands on
+    plain RAM the budget did not account for; refusing that fallback is a
+    separate knob.
     """
     free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    if allocator is not None and device is not None and device_uses_allocator(device):
+        hugetlb = allocator.free_hugetlb_bytes()
+        if hugetlb:
+            free = max(free, hugetlb)
     return free // ranks_per_host()
 
 
@@ -172,7 +192,9 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(
+            self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
