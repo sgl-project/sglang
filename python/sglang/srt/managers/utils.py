@@ -74,6 +74,8 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Verify-time step count; overlap can switch the worker before CPU feedback.
+    speculative_num_steps: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
     speculative_output_stride: Optional[int] = None

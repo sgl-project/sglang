@@ -774,7 +774,9 @@ class SchedulerBatchResultProcessor:
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            num_steps=result.speculative_num_steps,
         )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):

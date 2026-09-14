@@ -125,7 +125,10 @@ class AdaptiveController:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(

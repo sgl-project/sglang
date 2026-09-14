@@ -464,12 +464,24 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         self,
         num_correct_drafts_per_req: list[int],
         batch_size: int = 0,
+        num_steps: int | None = None,
     ) -> None:
         """Update acceptance tracker only (no step switch here)."""
         if not num_correct_drafts_per_req:
             return
-        self._tracker.update(num_correct_drafts_per_req, self._current_steps)
+        observed_steps = self._current_steps if num_steps is None else num_steps
+        self._tracker.update(num_correct_drafts_per_req, observed_steps)
         self._batch_count += 1
+        logger.debug(
+            "[ThroughputAware] Verify feedback: batch_count=%d bs=%d "
+            "observed_steps=%d current_steps=%d warmed=%s cost_table_empty=%s",
+            self._batch_count,
+            batch_size,
+            observed_steps,
+            self._current_steps,
+            self._tracker.all_positions_warmed(self._current_steps),
+            self._cost_table.is_empty(),
+        )
 
     # ------------------------------------------------------------------
     # Decision logic

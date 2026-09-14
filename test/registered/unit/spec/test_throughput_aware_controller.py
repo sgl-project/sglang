@@ -1,3 +1,4 @@
+import ast
 import json
 import tempfile
 import unittest
@@ -87,6 +88,83 @@ class TestThroughputAwareController(unittest.TestCase):
             controller.on_verify_complete([3], 1)
         controller.activate_step_by_batch(1)
         self.assertEqual(controller.worker.speculative_num_steps, 3)
+
+    def test_delayed_feedback_after_expansion_does_not_observe_undrafted_positions(
+        self,
+    ):
+        controller = self.make_controller()
+        controller.on_verify_complete([1], batch_size=1, num_steps=1)
+        self.assertFalse(controller._tracker.all_positions_warmed(3))
+        self.assertTrue(controller._tracker.is_position_extrapolated(1))
+        self.assertEqual(
+            controller._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
+        )
+
+    def test_delayed_feedback_after_shrink_uses_verify_time_steps(self):
+        controller = self.make_controller()
+        controller.activate_step_by_batch(8)
+        controller.on_verify_complete([2], batch_size=1, num_steps=3)
+        self.assertEqual(
+            controller._tracker.snapshot_position_rates(3), [1.0, 1.0, 0.0]
+        )
+
+    def test_cpu_result_processor_delivers_original_steps_to_controller(self):
+        # Run production callback bodies with an older result than the active
+        # state, avoiding imports of the scheduler's GPU backends.
+        srt = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+        namespace = {}
+        for filename, names in (
+            (
+                "managers/scheduler_components/batch_result_processor.py",
+                {"_get_speculative_output_stride", "_resolve_spec_v2_tokens"},
+            ),
+            ("speculative/eagle_worker_v2.py", {"on_verify_complete_cpu"}),
+        ):
+            tree = ast.parse((srt / filename).read_text(encoding="utf-8"))
+            functions = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name in names
+            ]
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    *functions,
+                ],
+                type_ignores=[],
+            )
+            exec(
+                compile(ast.fix_missing_locations(module), filename, "exec"), namespace
+            )
+
+        controller = self.make_controller()
+        worker = SimpleNamespace(adaptive_controller=controller)
+        worker.on_verify_complete_cpu = lambda *args, **kwargs: namespace[
+            "on_verify_complete_cpu"
+        ](worker, *args, **kwargs)
+        processor = SimpleNamespace(
+            model_worker=worker, advance_grammar_fsm=lambda *args: None
+        )
+        cpu = lambda values: SimpleNamespace(is_cpu=True, tolist=lambda: values)
+        result = SimpleNamespace(
+            next_token_ids=cpu([10, 11]),
+            accept_lens=cpu([2]),
+            speculative_output_stride=None,
+            speculative_num_draft_tokens=2,
+            speculative_num_steps=1,
+            num_non_draft_tokens_per_req=1,
+            block_accept_lens=None,
+            cap_lens=None,
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(is_retracted=True)])
+        tokens = namespace["_resolve_spec_v2_tokens"](processor, result, batch)
+        self.assertEqual(tokens, [[10, 11]])
+        self.assertEqual(controller._batch_count, 1)
+        self.assertTrue(controller._tracker.is_position_extrapolated(1))
 
     def test_batch_change_selects_captured_state_before_tracker_warmup(self):
         controller = self.make_controller()
