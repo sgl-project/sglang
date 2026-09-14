@@ -45,7 +45,13 @@ class _SupportedBinding:
         self._exist = exist  # 1 -> exists / read hit, 0 -> missing
 
     def set_request_context(
-        self, request_id=None, trace_id=None, span_id=None, parent_span_id=None
+        self,
+        request_id=None,
+        trace_id=None,
+        span_id=None,
+        parent_span_id=None,
+        caller_id=None,
+        caller_role=None,
     ):
         self.event_log.append(
             (
@@ -55,6 +61,8 @@ class _SupportedBinding:
                     "trace_id": trace_id,
                     "span_id": span_id,
                     "parent_span_id": parent_span_id,
+                    "caller_id": caller_id,
+                    "caller_role": caller_role,
                 },
             )
         )
@@ -137,13 +145,20 @@ class TestRequestContextMechanism(unittest.TestCase):
         binding = _SupportedBinding()
         store = _make_base_store(binding)
 
-        with store.request_context(request_id="r-1", trace_id="t-1"):
+        with store.request_context(
+            request_id="r-1",
+            trace_id="t-1",
+            caller_id="sglang-tp0",
+            caller_role="prefetch",
+        ):
             pass
 
         self.assertEqual(
             _names(binding.event_log),
             ["set_request_context", "clear_request_context"],
         )
+        # caller_id/caller_role are forwarded to the underlying binding (plan.md
+        # §2.8 / plan_trace.md §2.8), alongside the trace fields.
         self.assertEqual(
             binding.event_log[0][1],
             {
@@ -151,6 +166,8 @@ class TestRequestContextMechanism(unittest.TestCase):
                 "trace_id": "t-1",
                 "span_id": None,
                 "parent_span_id": None,
+                "caller_id": "sglang-tp0",
+                "caller_role": "prefetch",
             },
         )
 
@@ -253,6 +270,46 @@ class TestRequestContextFromExtraInfo(unittest.TestCase):
             },
         )
 
+    def test_request_context_from_extra_info_extracts_caller_fields(self):
+        extract = MooncakeStore._request_context_from_extra_info
+
+        # caller_id / caller_role come through (alongside trace fields) when the
+        # controller populated them.
+        self.assertEqual(
+            extract(
+                HiCacheStorageExtraInfo(
+                    extra_info={
+                        "request_id": "r-1",
+                        "caller_id": "sglang-tp0",
+                        "caller_role": "backup",
+                    }
+                )
+            ),
+            {"request_id": "r-1", "caller_id": "sglang-tp0", "caller_role": "backup"},
+        )
+        # Backup path: no request_id, only caller attribution (plan.md scenario 1).
+        self.assertEqual(
+            extract(
+                HiCacheStorageExtraInfo(
+                    extra_info={"caller_id": "sglang-tp1", "caller_role": "Backup"}
+                )
+            ),
+            {"caller_id": "sglang-tp1", "caller_role": "Backup"},
+        )
+        # Empty / None caller fields are filtered like the trace fields.
+        self.assertEqual(
+            extract(
+                HiCacheStorageExtraInfo(
+                    extra_info={
+                        "caller_id": None,
+                        "caller_role": None,
+                        "request_id": "r-1",
+                    }
+                )
+            ),
+            {"request_id": "r-1"},
+        )
+
 
 class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
     def test_batch_exists_sets_request_context_from_extra_info(self):
@@ -298,7 +355,7 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         )
         self.assertEqual(binding.event_log[0][1]["request_id"], "g-7")
 
-    def test_batch_get_v2_wraps_get_but_batch_set_v2_does_not(self):
+    def test_batch_get_v2_and_batch_set_v2_both_wrap(self):
         transfer = PoolTransfer(
             name=PoolName.KV, host_indices=[0, 1], keys=["k0", "k1"]
         )
@@ -323,21 +380,39 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         )
         self.assertEqual(get_binding.event_log[0][1]["request_id"], "g-9")
 
-        # Write (set) path with the same plumbing must NOT touch request_context,
-        # even when it actually issues a put RPC (exist=0 -> missing -> put).
+        # Write (set) path now ALSO wraps (plan.md §7.3): the backup op's
+        # extra_info reaches the bridge so hop-A/hop-B backup spans correlate to
+        # the (real or virtual) root. exist=0 -> missing -> put RPC issued, all
+        # inside the request_context scope.
         set_binding = _SupportedBinding(exist=0)
         set_store = _make_mooncake_store(set_binding)
         set_store.registered_pools = {PoolName.KV: host_pool}
         set_store._get_hybrid_page_component_keys = lambda keys, t: (list(keys), 1)
 
         set_store.batch_set_v2(
-            [transfer], HiCacheStorageExtraInfo(extra_info={"request_id": "s-9"})
+            [transfer],
+            HiCacheStorageExtraInfo(
+                extra_info={
+                    "request_id": "s-9",
+                    "caller_id": "sglang-tp0",
+                    "caller_role": "backup",
+                }
+            ),
         )
 
-        # No set/clear anywhere; put RPC was issued.
-        self.assertNotIn("set_request_context", _names(set_binding.event_log))
-        self.assertNotIn("clear_request_context", _names(set_binding.event_log))
-        self.assertIn("batch_put_from", _names(set_binding.event_log))
+        # set -> exist -> put -> clear, all scoped; caller fields forwarded too.
+        self.assertEqual(
+            _names(set_binding.event_log),
+            [
+                "set_request_context",
+                "batch_is_exist",
+                "batch_put_from",
+                "clear_request_context",
+            ],
+        )
+        self.assertEqual(set_binding.event_log[0][1]["request_id"], "s-9")
+        self.assertEqual(set_binding.event_log[0][1]["caller_id"], "sglang-tp0")
+        self.assertEqual(set_binding.event_log[0][1]["caller_role"], "backup")
 
     def test_batch_exists_v2_wraps_sidecar_exist(self):
         binding = _SupportedBinding(exist=1)
@@ -364,9 +439,10 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
 
 
 class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
-    def test_write_paths_never_touch_request_context(self):
-        # `set(...)` and `batch_set(...)` drive `_put_batch_zero_copy_impl`; neither
-        # read method's `with request_context(...)` is present on the write paths.
+    def test_set_and_batch_set_stay_bare_but_batch_set_v1_now_wraps(self):
+        # `set(...)` and `batch_set(...)` take no extra_info and intentionally stay
+        # unwrapped (plan.md §7.3); `batch_set_v1(...)` receives extra_info and now
+        # wraps its RPC body in request_context so the backup spans correlate.
         binding = _SupportedBinding(exist=0)  # missing -> put RPC actually runs
 
         # set(): single key (scalar target_location so the simple
@@ -377,7 +453,7 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
         self.assertNotIn("clear_request_context", _names(binding.event_log))
         self.assertIn("batch_put_from", _names(binding.event_log))
 
-        # batch_set(): multiple keys.
+        # batch_set(): multiple keys -- still bare.
         binding.event_log.clear()
         store_batch = _make_mooncake_store(binding)
         store_batch.batch_set(
@@ -387,7 +463,9 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
         self.assertNotIn("clear_request_context", _names(binding.event_log))
         self.assertIn("batch_put_from", _names(binding.event_log))
 
-        # batch_set_v1(): piggybacks on the same non-wrapping machinery.
+        # batch_set_v1(): now wraps its RPC body in request_context, carrying the
+        # extra_info fields (incl. caller attribution) to the bridge. The exist /
+        # put impls are stubbed so only set/clear are observed in order.
         binding.event_log.clear()
         store_v1 = _make_mooncake_store(binding)
         store_v1.mem_pool_host = SimpleNamespace(kv_buffer=object(), page_size=1)
@@ -406,10 +484,19 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
         store_v1.batch_set_v1(
             ["k0", "k1"],
             host_indices=object(),
-            extra_info=HiCacheStorageExtraInfo(extra_info={"request_id": "ignored"}),
+            extra_info=HiCacheStorageExtraInfo(
+                extra_info={
+                    "request_id": "ignored",
+                    "caller_id": "sglang-tp0",
+                    "caller_role": "Backup",
+                }
+            ),
         )
-        self.assertNotIn("set_request_context", _names(binding.event_log))
-        self.assertNotIn("clear_request_context", _names(binding.event_log))
+        self.assertEqual(
+            _names(binding.event_log),
+            ["set_request_context", "clear_request_context"],
+        )
+        self.assertEqual(binding.event_log[0][1]["caller_role"], "Backup")
 
     def test_batch_exists_with_none_extra_info_still_clears_context(self):
         binding = _SupportedBinding(exist=1)
@@ -419,6 +506,8 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
 
         # None extra_info -> set_request_context called with all-None kwargs,
         # then cleared symmetrically (does not leave stale per-thread context).
+        # caller_id/caller_role are also passed (None here, since None extra_info
+        # carries no attribution).
         self.assertEqual(
             _names(binding.event_log),
             ["set_request_context", "batch_is_exist", "clear_request_context"],
@@ -430,6 +519,8 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
                 "trace_id": None,
                 "span_id": None,
                 "parent_span_id": None,
+                "caller_id": None,
+                "caller_role": None,
             },
         )
 

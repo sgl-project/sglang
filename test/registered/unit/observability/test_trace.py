@@ -605,5 +605,104 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertIsNone(ctx.thread_context)
 
 
+
+class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
+    """Caller attribution (caller_id/caller_role) and the 'hicache' trace-module
+    gate introduced for HiCache prefetch/backup root spans (plan.md §5/§4)."""
+
+    def setUp(self):
+        self._snap_threads = dict(mod.threads_info)
+        self._orig_otel = mod.opentelemetry_initialized
+        self._orig_modules = mod.global_trace_modules
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self._orig_otel
+        mod.global_trace_modules = self._orig_modules
+        mod.threads_info.clear()
+        mod.threads_info.update(self._snap_threads)
+
+    def test_set_thread_info_registers_even_when_tracing_disabled(self):
+        # Decoupling (plan.md §5.2): the table is populated regardless of tracing,
+        # so caller_id stays readable when tracing is off (just-propagate path).
+        mod.opentelemetry_initialized = False
+        pid = threading.get_native_id()
+        self.assertNotIn(pid, mod.threads_info)
+        trace_set_thread_info("Prefetch", 1, 0, 0)
+        self.assertIn(pid, mod.threads_info)
+        self.assertEqual(mod.threads_info[pid].thread_label, "Prefetch")
+
+    def test_get_thread_caller_info_format(self):
+        from sglang.srt.observability.trace import get_thread_caller_info
+
+        trace_set_thread_info("Backup", 2, 1, 0)
+        info = get_thread_caller_info()
+        self.assertIsNotNone(info)
+        caller_id, caller_role = info
+        # caller_role is the thread label; caller_id is the rank+host segment
+        # WITHOUT the leading label (so it does not duplicate caller_role).
+        self.assertEqual(caller_role, "Backup")
+        self.assertNotIn("Backup", caller_id)
+        self.assertIn("[TP 2]", caller_id)
+        self.assertIn("[PP 1]", caller_id)
+        self.assertIn("[DP 0]", caller_id)
+        self.assertIn("host:", caller_id)
+        self.assertIn("pid:", caller_id)
+
+    def test_get_thread_caller_info_none_when_unregistered(self):
+        from sglang.srt.observability.trace import get_thread_caller_info
+
+        # A thread that never called trace_set_thread_info returns None so the
+        # controller can cleanly omit caller attribution.
+        out = {}
+
+        def fresh():
+            out["v"] = get_thread_caller_info()
+
+        t = threading.Thread(target=fresh)
+        t.start()
+        t.join()
+        self.assertIsNone(out["v"])
+
+    def test_set_thread_info_first_write_wins(self):
+        pid = threading.get_native_id()
+        trace_set_thread_info("Prefetch", 1, 0, 0)
+        self.assertEqual(mod.threads_info[pid].thread_label, "Prefetch")
+        # Re-registering the same thread is intentionally ignored.
+        trace_set_thread_info("Backup", 9, 9, 9)
+        self.assertEqual(mod.threads_info[pid].thread_label, "Prefetch")
+        self.assertEqual(mod.threads_info[pid].tp_rank, 1)
+
+    def test_trace_modules_hicache_is_opt_in(self):
+        # The hicache root span reuses the existing module-name filter: by
+        # default (modules=['request']) 'hicache' is filtered -> tracing_enable
+        # False -> TraceNullContext -> only propagate caller/request_id (no
+        # exported root span); listing 'hicache' opts into exporting it.
+        set_global_trace_level(1)
+        mod.opentelemetry_initialized = True
+        # default: request only -> hicache filtered (just propagate).
+        mod.global_trace_modules = ["request"]
+        self.assertFalse(
+            TraceReqContext(rid="r", role="Prefetch", module_name="hicache").tracing_enable
+        )
+        # opt-in: hicache listed -> enabled (root span exported).
+        mod.global_trace_modules = ["request", "hicache"]
+        self.assertTrue(
+            TraceReqContext(rid="r", role="Backup", module_name="hicache").tracing_enable
+        )
+        # 'request' module is still allowed when listed.
+        self.assertTrue(
+            TraceReqContext(rid="r", role="Prefetch", module_name="request").tracing_enable
+        )
+
+    def test_trace_disable_takes_precedence(self):
+        set_global_trace_level(1)
+        mod.opentelemetry_initialized = False
+        mod.global_trace_modules = ["hicache"]
+        # Even with 'hicache' listed, tracing off -> disabled (TraceNullContext).
+        self.assertFalse(
+            TraceReqContext(rid="r", role="Prefetch", module_name="hicache").tracing_enable
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
