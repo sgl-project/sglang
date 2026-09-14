@@ -101,10 +101,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "Please omit --enable-torch-compile."
             )
         if getattr(server_args, "lora_target_modules", None) is None:
-            # The official distilled adapter carries only the generation branch.
-            # Keep this default for both startup and dynamically loaded adapters.
-            # Without a target list every nn.Linear in the monolithic model is
-            # wrapped and its base weight cloned into host memory.
+            # The official adapter only targets the generation branch.
             server_args.lora_target_modules = ["_mot_gen"]
         _set_compatible_runtime_defaults(server_args)
         if _is_arg_explicitly_set(

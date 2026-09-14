@@ -850,15 +850,7 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.finish_count == 1
 
 
-# ===== 8-step distilled LoRA =====
-
-
 def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
-    """LoRAPipeline resolves the denoiser as modules["transformer"].
-
-    This pipeline loads one monolithic model under "model", so it must alias it
-    for both the load path and the pre-loaded-modules path.
-    """
     from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
         SenseNovaU1Pipeline,
     )
@@ -878,8 +870,7 @@ def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
     assert "transformer" not in loaded
 
 
-def _validate_server_args_with_lora(**overrides):
-    """Run validate_server_args on a minimal args set, returning the mutated object."""
+def _validate_server_args(**overrides):
     config = SenseNovaU1PipelineConfig()
     args = {
         "num_gpus": 1,
@@ -912,22 +903,25 @@ def _validate_server_args_with_lora(**overrides):
     return server_args
 
 
-def test_sensenova_u1_defaults_lora_targets_to_the_generation_branch():
-    """A target list is needed: without one LoRA wraps every nn.Linear of the
-    monolithic model and clones each base weight into host memory.
-
-    The official distilled adapter only carries the generation branch.
-    """
-    adapter = "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"
-
-    server_args = _validate_server_args_with_lora(lora_path=adapter)
-    assert server_args.lora_target_modules == ["_mot_gen"]
-
-    explicit = _validate_server_args_with_lora(
-        lora_path=adapter, lora_target_modules=["q_proj"]
-    )
-    assert explicit.lora_target_modules == ["q_proj"]
-
-    # Keep the generation-branch default when the adapter is loaded dynamically.
-    dynamic = _validate_server_args_with_lora()
-    assert dynamic.lora_target_modules == ["_mot_gen"]
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param(
+            {"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"},
+            ["_mot_gen"],
+            id="startup-adapter",
+        ),
+        pytest.param(
+            {
+                "lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs",
+                "lora_target_modules": ["q_proj"],
+            },
+            ["q_proj"],
+            id="explicit-targets",
+        ),
+        pytest.param({}, ["_mot_gen"], id="without-adapter"),
+    ],
+)
+def test_sensenova_u1_lora_target_modules(overrides, expected):
+    server_args = _validate_server_args(**overrides)
+    assert server_args.lora_target_modules == expected

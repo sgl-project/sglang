@@ -43,8 +43,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
     width: int = 2048
     num_frames: int = 1
     fps: int = 1
-    # Official 8-step distilled LoRA override: num_inference_steps=8 and
-    # guidance_scale=1.0, the latter also skipping the unconditional branch.
+    # For the official 8-step LoRA, use 8 steps and guidance_scale=1.0.
     num_inference_steps: int = 50
     guidance_scale: float = 4.0
     cfg_norm: str = DEFAULT_CFG_NORM

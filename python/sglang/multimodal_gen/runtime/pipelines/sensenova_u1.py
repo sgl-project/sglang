@@ -50,8 +50,7 @@ class SenseNovaU1Pipeline(LoRAPipeline):
             modules = load_model_and_tokenizer(self.model_path, server_args)
             logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
 
-        # LoRAPipeline resolves the denoiser as modules["transformer"]; this pipeline
-        # loads one monolithic model, so alias it rather than load a second copy.
+        # LoRAPipeline expects the model under "transformer".
         modules["transformer"] = modules["model"]
         return modules
 
