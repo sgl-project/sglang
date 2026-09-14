@@ -12,7 +12,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_exec, get_lora, get_model
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -146,8 +146,18 @@ class WeightUpdater:
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
         model_loader_extra_config: Optional[Union[str, dict]] = None,
+        rebuild_model: bool = False,
     ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
+        """Update engine weights from the disk.
+
+        By default the weights are loaded in-place into the existing model. Some
+        quantization paths (e.g. MXFP4 MoE on the flashinfer backend) replace the
+        raw parameters with derived ones in ``process_weights_after_loading``,
+        which makes a second in-place ``load_weights`` impossible. ``rebuild_model``
+        instead drops the current model, constructs a fresh one and re-runs the
+        full load + post-processing pipeline; CUDA graphs are recaptured since
+        they hold pointers into the old weights.
+        """
         self._assert_weight_cache_inactive("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -162,6 +172,7 @@ class WeightUpdater:
             f"Update engine weights online from disk begin. "
             f"load_format={load_format} "
             f"model_loader_extra_config={model_loader_extra_config} "
+            f"rebuild_model={rebuild_model} "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
@@ -171,6 +182,15 @@ class WeightUpdater:
             load_format=load_format,
             model_loader_extra_config=model_loader_extra_config,
         )
+
+        if rebuild_model:
+            if weight_name_filter is not None:
+                return False, "rebuild_model does not support weight_name_filter."
+            return self._rebuild_model_from_disk(
+                model_path=model_path,
+                load_format=load_format,
+                load_config=load_config,
+            )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
@@ -230,6 +250,252 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def _mem_stats(self: WeightUpdater) -> str:
+        stats = f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
+        if self.device == "cuda":
+            stats += (
+                f", allocated={torch.cuda.memory_allocated(self.gpu_id) / 2**30:.2f} GB"
+                f", reserved={torch.cuda.memory_reserved(self.gpu_id) / 2**30:.2f} GB"
+            )
+        return stats
+
+    def _rebuild_model_reject_reason(
+        self: WeightUpdater, runner: ModelRunner
+    ) -> Optional[str]:
+        """Startup-determined configurations whose post-load state is bound to
+        the model instance or its weights, so dropping the model would leave a
+        dangling or stale collaborator."""
+        if runner.spec_algorithm is not None and runner.spec_algorithm.is_speculative():
+            return (
+                "rebuild_model is not supported with speculative decoding: the "
+                "draft model shares parameters with the target model."
+            )
+        if get_lora().enable_lora:
+            return (
+                "rebuild_model is not supported with LoRA: the lora manager and "
+                "its adapters are bound to the dropped model instance."
+            )
+        if get_exec().moe.enable_eplb or get_exec().moe.elastic_ep_backend is not None:
+            return (
+                "rebuild_model is not supported with EPLB / elastic EP: the "
+                "expert-location mapping is state that lives in the weights "
+                "being replaced."
+            )
+        return None
+
+    def _rebuild_model_from_disk(
+        self: WeightUpdater,
+        *,
+        model_path: str,
+        load_format: str,
+        load_config: LoadConfig,
+    ) -> tuple[bool, str]:
+        runner = self.get_model_runner()
+        reason = self._rebuild_model_reject_reason(runner)
+        if reason is not None:
+            return False, reason
+
+        # The caching allocator only reuses freed blocks on the stream they were
+        # allocated on. The model was loaded on the default stream at startup,
+        # while the scheduler serves requests from its own stream, so the drop
+        # and the reload must both run on the default stream or the new model
+        # is allocated from fresh segments on top of the cached old ones.
+        device_module = torch.get_device_module(self.device)
+        if self.device == "cpu":
+            return self._rebuild_model_body(
+                runner,
+                model_path=model_path,
+                load_format=load_format,
+                load_config=load_config,
+            )
+        device_module.synchronize()
+        with device_module.stream(device_module.default_stream()):
+            result = self._rebuild_model_body(
+                runner,
+                model_path=model_path,
+                load_format=load_format,
+                load_config=load_config,
+            )
+        device_module.default_stream().synchronize()
+        return result
+
+    def _rebuild_model_body(
+        self: WeightUpdater,
+        runner: ModelRunner,
+        *,
+        model_path: str,
+        load_format: str,
+        load_config: LoadConfig,
+    ) -> tuple[bool, str]:
+        from sglang.srt.model_executor.model_runner_components.layer_setup import (
+            adjust_hybrid_swa_layer_ids,
+            resolve_layer_indices,
+        )
+        from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+            load_kv_cache_scales,
+            load_model_with_memory_saver,
+            resolve_sliding_window_size,
+        )
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            prepare_moe_topk,
+        )
+        from sglang.srt.utils.offloader import get_offloader
+
+        logger.info(f"rebuild_model: before drop. {self._mem_stats()}")
+
+        # A still-pending overlapped startup load must commit before the drop:
+        # its prefetch targets the weights about to be freed.
+        if runner.startup_weight_load is not None:
+            runner.finalize_startup_weight_load()
+
+        # The KV pool keeps its startup sizing, so the rebuilt model must span
+        # the same layer range; verified against layer_info after the load.
+        old_layer_span = (
+            runner.layer_info.start_layer,
+            runner.layer_info.end_layer,
+        )
+
+        # Captured graphs replay kernels bound to the old weight pointers and
+        # must not outlive the model they were captured against. Attention
+        # backends and the eager runner hold references into the model and are
+        # recreated below.
+        runner.decode_cuda_graph_runner = None
+        runner.prefill_cuda_graph_runner = None
+        runner.eager_runner = None
+        runner.attn_backend = None
+        runner.decode_attn_backend = None
+        runner.decode_attn_backend_group = None
+        runner.graph_shared_output = None
+        old_model = runner.model
+        runner.model = None
+        # Graph capture caches submodule lists (attention_layers, moe_layers,
+        # ...) on the runner; anything pointing into the old model keeps its
+        # weights alive.
+        old_module_ids = {id(m) for m in old_model.modules()}
+        for name, value in list(vars(runner).items()):
+            if isinstance(value, torch.nn.Module) and id(value) in old_module_ids:
+                setattr(runner, name, None)
+            elif isinstance(value, (list, tuple)) and any(
+                id(v) in old_module_ids for v in value
+            ):
+                setattr(runner, name, type(value)())
+        runner.kv_cache_configurator.model = None
+        # Release the device storage explicitly so a stray reference to the
+        # old model (bound methods, helper objects) cannot keep its weights
+        # resident while the new model is being allocated.
+        for module in old_model.modules():
+            for p in module._parameters.values():
+                if p is not None:
+                    p.data = p.data.new_empty(0)
+            for k, b in module._buffers.items():
+                if b is not None:
+                    module._buffers[k] = b.new_empty(0)
+            for k, v in list(vars(module).items()):
+                if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                    setattr(module, k, v.new_empty(0))
+        del old_model
+        gc.collect()
+        if self.device != "cpu":
+            torch.get_device_module(self.device).empty_cache()
+        logger.info(f"rebuild_model: dropped old model. {self._mem_stats()}")
+
+        try:
+            loaded = load_model_with_memory_saver(
+                model_config=self.model_config,
+                load_config=load_config,
+                device=self.device,
+                gpu_id=self.gpu_id,
+                memory_saver_adapter=runner.memory_saver_adapter,
+                is_draft_worker=runner.is_draft_worker,
+            )
+        except Exception as e:
+            # The old model is gone; there is nothing to roll back to.
+            logger.exception("rebuild_model: failed to load the new model")
+            return False, f"Failed to rebuild model: {e}."
+
+        runner.loader = loaded.loader
+        runner.startup_weight_load = loaded.startup_weight_load
+        transporter = runner.remote_instance_weight_transporter
+        if loaded.remote_instance_weight_info is not None:
+            transporter.weight_info = loaded.remote_instance_weight_info
+        elif transporter.weight_info is not None:
+            # The registered regions point into the dropped model; force the
+            # transporter to re-register against the new weights below.
+            transporter.weight_info = None
+        runner.kv_cache_configurator.model = loaded.model
+        self.update_model_fields(
+            loaded.model,
+            model_path=model_path,
+            load_format=load_format,
+            load_config=load_config,
+        )
+        runner.sliding_window_size = resolve_sliding_window_size(
+            loaded.model, self.model_config
+        )
+        runner.prefill_aware_swa = (
+            hasattr(loaded.model, "is_prefill_aware_swa")
+            and loaded.model.is_prefill_aware_swa()
+        )
+        runner.dtype = self.model_config.dtype
+        logger.info(f"rebuild_model: new model loaded. {self._mem_stats()}")
+
+        if runner.startup_weight_load is not None:
+            runner.finalize_startup_weight_load()
+
+        # Mirror the model-dependent steps of ModelRunner.initialize() /
+        # load_model(): everything that was derived from the old model object
+        # has to be rebuilt against the new one. Managers holding
+        # get_model=lambdas (e.g. expert backup client) follow the swap on
+        # their own; pool-bound components (kv_index_translator, canary) are
+        # untouched.
+        if not runner.is_draft_worker:
+            get_offloader().post_init()
+        runner.maybe_precompile_model_kernels_after_loading()
+        load_kv_cache_scales(
+            model=loaded.model, kv_cache_dtype=get_model().kv_cache_dtype
+        )
+        prepare_moe_topk(
+            model=loaded.model,
+            model_config=runner.model_config,
+            moe_ep_size=runner.ps.moe_ep_size,
+            moe_ep_rank=runner.ps.moe_ep_rank,
+        )
+        runner.maybe_init_dwdp()
+        transporter.maybe_register_and_publish_weight_info()
+        runner.layer_info = resolve_layer_indices(
+            model=loaded.model,
+            model_config=runner.model_config,
+            is_draft_worker=runner.is_draft_worker,
+            spec_algorithm=runner.spec_algorithm,
+        )
+        if (
+            runner.layer_info.start_layer,
+            runner.layer_info.end_layer,
+        ) != old_layer_span:
+            return False, (
+                "rebuild_model produced a different layer span "
+                f"({runner.layer_info.start_layer}..{runner.layer_info.end_layer} "
+                f"vs {old_layer_span[0]}..{old_layer_span[1]}): the KV pool was "
+                "sized for the original model. Restart the server to serve "
+                "this checkpoint."
+            )
+        adjust_hybrid_swa_layer_ids(
+            model_config=runner.model_config,
+            start_layer=runner.layer_info.start_layer,
+            end_layer=runner.layer_info.end_layer,
+            is_hybrid_swa=runner.is_hybrid_swa,
+        )
+        runner.maybe_apply_post_load_model_transforms()
+        runner.maybe_enable_batch_invariant_mode()
+        runner.configure_kv_cache_dtype()
+        runner.init_routed_experts_capturer()
+        runner.init_indexer_capturer()
+        runner.init_attention_backends()
+        runner.init_cuda_graphs()
+
+        logger.info("Update weights end.")
+        return True, "Succeeded to rebuild model weights."
 
     def update_weights_from_distributed(
         self: WeightUpdater,

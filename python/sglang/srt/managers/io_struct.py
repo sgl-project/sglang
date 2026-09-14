@@ -1803,6 +1803,13 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     keep_pause: bool = False
     # Whether to recapture cuda graph after weight update
     recapture_cuda_graph: bool = False
+    # Whether to drop the model and rebuild it from scratch instead of loading
+    # weights in-place. Needed when load-time post-processing replaced the raw
+    # parameters with derived ones (e.g. MXFP4 MoE on the flashinfer backend),
+    # which makes a second in-place load_weights impossible. CUDA graphs are
+    # recaptured unconditionally since they hold pointers into the old weights,
+    # and the cache is flushed even when flush_cache=False.
+    rebuild_model: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
     # Whether to flush the cache after updating weights

@@ -2075,9 +2075,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.load_format is None:
             obj.load_format = self.config_value("load_format")
         logger.info(
-            "Start update_weights. Load format=%s model_loader_extra_config=%s",
+            "Start update_weights. Load format=%s model_loader_extra_config=%s "
+            "rebuild_model=%s",
             obj.load_format,
             obj.model_loader_extra_config,
+            obj.rebuild_model,
         )
 
         if obj.abort_all_requests:
