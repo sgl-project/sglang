@@ -385,7 +385,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           source "$HOME/.cargo/env"
-          cargo test --release --test component tokenizer::parity
+          cargo test --locked --release --test component tokenizer::parity
 
   sgl-router-finish:
     name: finish

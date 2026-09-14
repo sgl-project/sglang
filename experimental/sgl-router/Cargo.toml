@@ -26,7 +26,12 @@ unused_qualifications = "warn"
 dynamo-tokenizers = "=1.8.1"
 # Prepare the Dynamo renderer dependency for the following migration.
 dynamo-renderer = "=5.1.2"
-# Retained until the renderer migration replaces the current implementation.
+# Chat-template rendering for cache-aware routing, retained until the
+# renderer migration replaces it: the engine caches tokens AFTER applying the
+# model's chat template, so the router must render the same template before
+# hashing or its token_ids diverge from the engine's stored blocks. `pycompat`
+# supplies the Python str/dict methods HF templates call; `chrono` backs
+# `strftime_now`.
 minijinja = { version = "2.24", features = ["loop_controls", "json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
