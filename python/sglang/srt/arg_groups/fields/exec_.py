@@ -95,6 +95,13 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -194,6 +201,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -223,6 +231,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -867,6 +876,30 @@ class ExecOffload(msgspec.Struct):
             "--no-ple-offload-embedding to disable.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
+        ),
+    ] = None
+
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
         ),
     ] = None
 
