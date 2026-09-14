@@ -399,6 +399,10 @@ class SpecInput(ABC):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
+    # Optional attention mask shared by speculative algorithms. Keep this a
+    # class-level default for the same dataclass ordering reason as above.
+    custom_mask: Optional[torch.Tensor] = None
+
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
