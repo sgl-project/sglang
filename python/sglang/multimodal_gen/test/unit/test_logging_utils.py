@@ -68,6 +68,35 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
             logger.warning_once("from the caller %d", 1)
         self.assertEqual(captured.records[0].filename, "test_logging_utils.py")
 
+    def test_it_calls_warning_not_log(self):
+        """The level-specific method has to be the one that gets called.
+
+        Routing through `logger.log(WARNING, ...)` formats and filters the same,
+        so it looked equivalent -- but callers and tests patch `logger.warning`,
+        and test_diffusion_bcg_padding asserts on exactly that mock. CI found
+        this; the tests here did not, because they all read the emitted record
+        instead of watching which method produced it.
+        """
+        from unittest import mock
+
+        from sglang.multimodal_gen.runtime.utils.logging_utils import (
+            _print_info_once,
+            _print_warning_once,
+        )
+
+        logger = mock.MagicMock()
+        _print_warning_once(logger, "cfg_parallel_size=%d > n_branches=%d", 2, 1)
+        logger.warning.assert_called_once()
+        self.assertIn(
+            "cfg_parallel_size=2 > n_branches=1", logger.warning.call_args[0][0]
+        )
+        logger.log.assert_not_called()
+
+        info_logger = mock.MagicMock()
+        _print_info_once(info_logger, "degree %d", 2)
+        info_logger.info.assert_called_once()
+        info_logger.log.assert_not_called()
+
     def test_cache_clear_is_still_on_the_helpers(self):
         """`.cache_clear()` is part of these helpers' surface, and is used.
 
