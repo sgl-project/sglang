@@ -3,12 +3,19 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
+
+# only debug
+register_npu_ci(
+    est_time=1800,
+    suite="debug-nightly-perf-16-npu-a3",
+    nightly=True,
+)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
@@ -19,12 +26,10 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_NPU_USE_MULTI_STREAM": "1",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
-    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
@@ -42,6 +47,9 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # DSPARK
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0", 
 }
 
 # Server launch arguments for DSV4-Flash W8A8 single-node 8p PD-mix.
@@ -106,7 +114,7 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
+    model = DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_8P_ENVS
     dataset_name = "random"

@@ -15,6 +15,13 @@ register_npu_ci(
     nightly=True,
 )
 
+# only debug
+register_npu_ci(
+    est_time=3600,
+    suite="debug-nightly-acc-16-npu-a3",
+    nightly=True,
+)
+
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -34,6 +41,9 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
@@ -81,6 +91,14 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
+    "--skip-server-warmup",
+    "--cuda-graph-bs",
+    1,
+    2,
+    4,
+    5,
+    6,
+    # MTP (DSPARK) configuration.
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",
@@ -93,13 +111,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     6,
     "--speculative-dspark-block-size",
     5,
-    "--skip-server-warmup",
-    "--cuda-graph-bs-decode",
-    1,
-    2,
-    4,
-    5,
-    6,
 ]
 
 
