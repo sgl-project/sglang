@@ -17,6 +17,12 @@ register_npu_ci(
 
 register_npu_ci(
     est_time=7200,
+    suite="nightly-acc-16-npu-a3-cann900",
+    nightly=True,
+)
+
+register_npu_ci(
+    est_time=7200,
     suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
 )
@@ -46,11 +52,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
-    # Both default to True. With defaults, the CI image's sglang hits
-    # "Capture cuda graph failed: Expected all tensors to be on the same
-    # device" in ascend_backend._apply_cuda_graph_metadata on the FIRST
-    # decode shape (regardless of the bs list). The multi-stream path also
-    # caused the earlier DSPARK accept-rate collapse; keep both off for CI.
+    # Default true, both cause failures on CI, Keep off.
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
@@ -83,10 +85,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     80000,
     "--chunked-prefill-size",
     131072,
-    # 160 mirrors the validated stable config (local 16-rank run: 198/198 in
-    # ~30min, accept rate 0.40-0.54, score 0.8535 >= 0.8487 threshold).
-    # Values <= 96 trigger a DSPARK accept-rate collapse to ~0.01; reported
-    # to Ascend for investigation of the scheduler/DSPARK race.
     "--max-running-requests",
     160,
     "--dp-size",
@@ -115,11 +113,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     5,
     "--skip-server-warmup",
     "--cuda-graph-bs-decode",
-    # Mirror the validated local script (1 2 4 8 10). CI now runs sglang from
-    # this checkout (PYTHONPATH) with the #37565 device fix, so bs=8/10
-    # capture passes. Keep 5/6 out: on current main the first replay in the
-    # bs=6 bucket collapses DSPARK accept rate to ~0 globally (all DP ranks
-    # pad into the same bucket); never recovers.
     1,
     2,
     4,
@@ -152,7 +145,8 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 32
-    ignore_errors = True
+    # Resolve to http://{host}:{port}/v1 (server exposes the base path).
+    # api_url = "/v1"
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""

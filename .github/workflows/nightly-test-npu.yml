@@ -378,6 +378,24 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+  # Single-point verification: run the DSV4 w8a8 8p GPQA accuracy case on the
+  # default CANN 9.0.0 image (image_a3), mirroring the cann910 job so the case
+  # executes once on both CANN versions for comparison.
+  nightly-acc-16-npu-a3-cann900:
+    name: nightly-acc-16-npu-a3-cann900
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-16-
+      test_type: 'accuracy'
+      test_suite: nightly-acc-16-npu-a3-cann900
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
