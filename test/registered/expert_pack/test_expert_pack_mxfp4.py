@@ -367,7 +367,19 @@ class TestExpertPackMxfp4(unittest.TestCase):
 
 
 def _run_isolated_tests() -> int:
-    """Bound JIT extension loading and avoid locks shared with prior CI jobs."""
+    """Run the tests without inheriting PyTorch's stale JIT lock state.
+
+    PyTorch 2.13 and earlier use ``FileBaton`` for JIT extension builds. If a
+    CI job is killed while holding the baton, its lock file survives and later
+    ``cpp_extension.load()`` calls wait forever. A fresh extension directory
+    keeps each attempt away from locks left by prior jobs, while the timeout
+    and process-group kill bound other compiler or kernel stalls and prevent
+    child processes from leaking into the retry.
+
+    This workaround can be removed once SGLang requires PyTorch 2.14 or newer,
+    where pytorch/pytorch#190543 fixes pytorch/pytorch#189245 by replacing the
+    baton with an OS-backed lock that is released when its owner exits.
+    """
 
     command = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
     for attempt in range(1, _ISOLATED_ATTEMPTS + 1):
