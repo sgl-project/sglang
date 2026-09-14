@@ -83,6 +83,7 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
     return SimpleNamespace(
         layout="page_first",
         can_use_write_back_jit=can_use_write_back_jit,
+        supports_per_pool_backup_indices=False,
         anchor_entry=entries[0],
         entry_map={entry.name: entry for entry in entries},
     )
