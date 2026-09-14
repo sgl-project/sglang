@@ -111,9 +111,10 @@ fn prefill_policy_reason(
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
+/// Minimal probe over the request body — we only need the `stream` field,
+/// the `model` field, whether the caller set its own `rid`, and the output
+/// budget, to decide between buffered vs SSE forwarding and to select a
+/// worker. Deserializing into this struct (vs `serde_json::Value`)
 /// does two things:
 ///
 /// 1. Avoids the per-field heap allocation of `Value` for a multi-MiB body.
@@ -129,6 +130,15 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Presence probe only, for [`resolve_engine_rid`]: did the caller file
+    /// this request under its own `rid`? The value is deliberately ignored —
+    /// SGLang accepts `rid` as a string *or* a list of strings
+    /// (`ChatCompletionRequest.rid` in
+    /// `python/sglang/srt/entrypoints/openai/protocol.py`), so typing this as
+    /// `Option<String>` would turn a body the engine accepts today into a
+    /// router-side 400.
+    #[serde(default)]
+    rid: Option<IgnoredAny>,
     /// Explicit output budget used by Decode Bucket routing.
     #[serde(default)]
     max_tokens: Option<u64>,
@@ -201,6 +211,7 @@ pub async fn chat_completions(
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let requested_max_output_tokens = probe.requested_max_output_tokens();
+    let caller_set_rid = probe.rid.is_some();
     let model_str = probe
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
@@ -813,11 +824,21 @@ pub async fn chat_completions(
     });
     let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
 
+    // The id the engine will know this request by, so the router can tell it to
+    // stop generating when the client goes away. `None` leaves the body
+    // untouched and disables the abort — see `resolve_engine_rid`.
+    let engine_rid = resolve_engine_rid(caller_set_rid, decode_peer.is_some(), &headers);
+
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
-    // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    // `rid`, `input_ids` and/or bootstrap fields, or forwarding the original
+    // bytes untouched when none applies.
+    let outgoing_body = build_outgoing_body(
+        &body,
+        request_value,
+        forward_input_ids,
+        bootstrap.as_ref(),
+        engine_rid.as_deref(),
+    )?;
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -915,6 +936,9 @@ pub async fn chat_completions(
                 Some(stream_guards),
                 Some(make_ttft_hook()),
                 Some(make_stream_end_hook(decode_worker.url.clone())),
+                // Always `None` here: PD mode never mints a rid, so there is
+                // nothing to abort by — see `resolve_engine_rid`.
+                engine_rid.as_deref(),
             );
             tokio::select! {
                 biased;
@@ -942,6 +966,17 @@ pub async fn chat_completions(
         // non-streaming arm.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((guard, active_guard, make_duration_guard()));
+        // Pre-headers abort guard. Once a stream is established the SSE pump's
+        // completion report drives the abort, but that report only exists after
+        // a response arrives. If the stale-request janitor fires while `fetch`
+        // is still awaiting headers, `fetch` is dropped with nothing watching,
+        // even though the engine may already be working. This guard covers
+        // exactly that window: armed until `fetch` resolves to any received
+        // response, at which point the pump (2xx) or nothing (non-2xx, same as
+        // today) takes over.
+        let mut pre_headers_abort_guard = engine_rid
+            .as_deref()
+            .and_then(|rid| ctx.proxy.abort_guard_for(&worker.url, rid, &headers));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
@@ -951,6 +986,10 @@ pub async fn chat_completions(
             Some(stream_guards),
             Some(make_ttft_hook()),
             Some(make_stream_end_hook(worker.url.clone())),
+            // Abort the engine if the client disconnects before it finishes
+            // streaming. The pump's completion report decides; here we only
+            // supply the rid the engine knows this request by.
+            engine_rid.as_deref(),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -958,11 +997,22 @@ pub async fn chat_completions(
         // headers is a correctness regression). The cancellation
         // branch only matters when fetch is still pending — at that
         // point biasing the order is a wash.
-        tokio::select! {
+        let r = tokio::select! {
             biased;
             r = fetch => r,
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        };
+        // A received response (any status) means responsibility has passed to
+        // the SSE pump's completion report (or to nothing, for a non-2xx) —
+        // disarm so this one does not also fire. A pre-dispatch error means
+        // there is nothing to abort. It stays armed only when `fetch` never
+        // resolved (stale timeout) or failed after the request went out.
+        if abort_would_be_pointless(&r) {
+            if let Some(g) = pre_headers_abort_guard.as_mut() {
+                g.disarm();
+            }
         }
+        r
     } else {
         // Plain mode, non-streaming. The handler awaits the full
         // buffered response, so both guards live correctly in this
@@ -971,6 +1021,14 @@ pub async fn chat_completions(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds: (LoadGuard, _) = (guard, active_guard);
+        // Abort-on-disconnect: armed for the whole forward, disarmed once a
+        // complete response is in hand. If the client disconnects first, the
+        // handler future is dropped mid-await and this guard, still armed, tells
+        // the engine to stop. A stale-request timeout (the cancel arm below)
+        // also leaves it armed — we have given up, so the engine should too.
+        let mut abort_guard = engine_rid
+            .as_deref()
+            .and_then(|rid| ctx.proxy.abort_guard_for(&worker.url, rid, &headers));
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,
@@ -979,11 +1037,21 @@ pub async fn chat_completions(
             outgoing_body,
         );
         // Same `biased` order as the streaming arm.
-        tokio::select! {
+        let r = tokio::select! {
             biased;
             r = fetch => r,
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        };
+        // A complete response (any status) means the engine is done with this
+        // request — do not abort it, and neither is there anything to abort
+        // when the request never left the router. Only an early drop (client
+        // disconnect) or a stale timeout leaves the guard armed.
+        if abort_would_be_pointless(&r) {
+            if let Some(g) = abort_guard.as_mut() {
+                g.disarm();
+            }
         }
+        r
     };
 
     // Record the dispatch outcome AFTER we know the client-visible status.
@@ -1178,6 +1246,98 @@ fn should_tokenize_request(
     has_chat_encoder || policy_needs_request_tokens || bucket_enabled
 }
 
+/// Longest `x-request-id` prefix folded into a router-minted rid. Bounds the
+/// engine-facing identifier (and every log line carrying it) against a caller
+/// that sends a multi-kilobyte header.
+const MAX_CORRELATION_ID_CHARS: usize = 64;
+
+/// The caller's correlation id, when it is short and plain enough to embed in
+/// the engine-facing rid. Anything else (absent, empty, over-long, or carrying
+/// characters outside an id alphabet) is rejected so the minted rid stays a
+/// well-behaved token in engine logs.
+fn correlation_id(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let plain = !raw.is_empty()
+        && raw.len() <= MAX_CORRELATION_ID_CHARS
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+    plain.then_some(raw)
+}
+
+/// Whether an `AbortOnDrop` covering this dispatch should stand down, given
+/// how the dispatch ended.
+///
+/// Two ways an abort is pointless, and they are not the same:
+///
+/// * `Ok(_)` — a response was received. The engine is either done (unary) or
+///   the streaming guard inside [`Proxy::forward_streaming_to`] has taken over.
+/// * A **pre-dispatch** error — the request never went out, so the engine has
+///   no such rid. `BreakerOpen` is returned before the worker URL is even
+///   parsed, and `WorkerMisconfigured` is that parse failing. Aborting anyway
+///   would POST at a worker whose breaker the router just found open — adding
+///   load to the one node it decided to stop using.
+///
+/// Every other error keeps the guard armed: a transport failure or a timeout
+/// can mean the request reached the engine and it is still generating.
+fn abort_would_be_pointless<T>(r: &Result<T, ApiError>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => matches!(
+            e,
+            ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }
+        ),
+    }
+}
+
+/// Resolve the engine-facing request id this request will be aborted by if the
+/// client disconnects — minting one to inject into the forwarded body, or
+/// `None` to leave the body untouched and skip the abort entirely.
+///
+/// A minted rid is `router-<x-request-id>-<uuid>`, or `router-<uuid>` when no
+/// usable correlation id is present. The `x-request-id` half is what lets an
+/// operator take a rid out of an engine log line and find the caller's own
+/// request (the router already forwards that header to the worker); the random
+/// half is load-bearing, not decoration — see the prefix note below.
+///
+/// **The minted rid is client-visible.** SGLang reports a request's `rid` as
+/// `meta_info["id"]`, which is what the OpenAI `ChatCompletionResponse.id` /
+/// `ChatCompletionStreamResponse.id` field carries. So injecting one replaces
+/// the engine-minted `uuid4().hex` the caller used to see with this value —
+/// the caller's own `x-request-id` included.
+///
+/// `None`, meaning today's behavior is preserved exactly, in two cases:
+///
+/// * **PD-disaggregated mode.** PD deliberately detaches its prefill so it
+///   outlives the client (KV-transfer correctness); aborting only the decode
+///   half mid-KV-transfer is a riskier change, out of scope here.
+/// * **The caller set its own `rid`.** The engine adopts a body `rid` verbatim,
+///   and its scheduler aborts every in-flight request whose rid *starts with*
+///   the one it is handed (`scheduler.py`'s `req.rid.startswith(recv_req.rid)`).
+///   Aborting by a caller-chosen key would therefore let one caller cancel every
+///   request sharing its prefix — `{"rid": "router-"}` would take out all of a
+///   worker's router-minted traffic on disconnect. Overwriting the caller's
+///   `rid` is not an option either: it is the handle they asked the engine to
+///   file the request under. So such a request simply opts out.
+///
+/// The same prefix rule is why a minted rid ends in a fresh UUID: two callers
+/// can pick colliding `x-request-id` prefixes, but neither can predict the
+/// other's UUID, so one caller cannot steer an abort onto another's request.
+/// The guarantee is unpredictability, not structure — `router-<uuidA>` IS a
+/// prefix of the rid minted for a request whose `x-request-id` happens to be
+/// `<uuidA>`, so a caller that feeds back a rid it already holds can widen its
+/// OWN abort. It cannot reach a rid it was never told.
+fn resolve_engine_rid(caller_set_rid: bool, pd_mode: bool, headers: &HeaderMap) -> Option<String> {
+    if caller_set_rid || pd_mode {
+        return None;
+    }
+    let unique = uuid::Uuid::new_v4().simple();
+    Some(match correlation_id(headers) {
+        Some(id) => format!("router-{id}-{unique}"),
+        None => format!("router-{unique}"),
+    })
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
@@ -1221,9 +1381,10 @@ struct BootstrapFields {
 }
 
 /// Build the body forwarded to the engine, injecting (when present) the
-/// precomputed `input_ids` and/or the PD `bootstrap_*` fields into the
-/// already-parsed request object and serializing once. When neither is
-/// needed, returns the original bytes unchanged (no re-serialize).
+/// router-minted `rid`, the precomputed `input_ids`, and/or the PD
+/// `bootstrap_*` fields into the already-parsed request object and serializing
+/// once. When none is needed, returns the original bytes unchanged (no
+/// re-serialize).
 ///
 /// `input_ids`: the router-computed prompt tokens. When set, the engine skips
 /// its own chat-template tokenization; `messages` are retained in the body so
@@ -1233,25 +1394,31 @@ struct BootstrapFields {
 ///
 /// `value` is the already-parsed request body when one is on hand (the
 /// cache-aware path parses once at ingress); it is consumed so the mutation
-/// reuses that parse. It is `None` only for a load-only policy in PD mode — a
-/// path that never parses at ingress — so the bootstrap injection re-parses
-/// the bytes here (matching the pre-refactor behavior). The body shape was
-/// validated by `parse_probe`; the non-object arm defends against a TOCTOU
-/// regression rather than panicking.
+/// reuses that parse. It is `None` for a load-only policy — a path that never
+/// parses at ingress — so an injection re-parses the bytes here. The body
+/// shape was validated by `parse_probe`; the non-object arm defends against a
+/// TOCTOU regression rather than panicking.
+///
+/// Note the untouched-bytes fast path is now reached only when NOTHING is
+/// injected, which in plain mode means only a caller-supplied `rid` (see
+/// `resolve_engine_rid`). Every other plain-mode request pays a full
+/// `serde_json::Value` round-trip of a body that may be up to
+/// [`MAX_CHAT_BODY_BYTES`].
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() {
+    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
     let parsed = match value {
         Some(v) => v,
-        // Load-only + PD: the ingress skipped the parse, so re-parse for the
-        // bootstrap injection (input_ids is never set on this path).
+        // Load-only policy: the ingress skipped the parse, so re-parse for the
+        // rid / bootstrap injection (input_ids is never set on this path).
         None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?,
@@ -1264,6 +1431,16 @@ fn build_outgoing_body(
             ));
         }
     };
+    if let Some(rid) = rid {
+        // The engine adopts a provided `rid` verbatim (minting one only when
+        // absent), so this is the key the router later aborts by. The caller
+        // passes `Some` only for a router-minted rid, so this never overwrites
+        // one the caller set — see `resolve_engine_rid`.
+        obj.insert(
+            "rid".to_string(),
+            serde_json::Value::String(rid.to_string()),
+        );
+    }
     if let Some(ids) = input_ids {
         obj.insert(
             "input_ids".to_string(),
@@ -1614,7 +1791,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1635,7 +1813,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1650,11 +1828,204 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
         );
+    }
+
+    /// A router-minted `rid` is injected as a top-level string so the engine
+    /// adopts it (and the router can later abort by it). `messages` are
+    /// untouched.
+    #[test]
+    fn build_outgoing_body_injects_rid() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("rid").and_then(|r| r.as_str()),
+            Some("router-abc123"),
+            "the router-minted rid must be injected as a top-level string",
+        );
+        assert!(
+            parsed.get("messages").is_some(),
+            "messages must be retained alongside the injected rid",
+        );
+    }
+
+    /// The load-only path (`value` is `None`) still injects — `build_outgoing_body`
+    /// re-parses the raw body. Pins that a rid-only injection is not silently
+    /// dropped for a policy that skips ingress tokenization.
+    #[test]
+    fn build_outgoing_body_injects_rid_when_value_absent() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let out = build_outgoing_body(&body, None, None, None, Some("router-xyz")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("rid").and_then(|r| r.as_str()),
+            Some("router-xyz")
+        );
+    }
+
+    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    /// With no caller `rid` and no correlation header, the minted rid is
+    /// `router-<uuid>` — self-contained and unique.
+    #[test]
+    fn resolve_engine_rid_mints_uuid_without_correlation_header() {
+        let rid = resolve_engine_rid(false, false, &HeaderMap::new()).expect("plain mode mints");
+        assert!(rid.starts_with("router-"), "got {rid}");
+        assert_eq!(
+            rid.len(),
+            "router-".len() + 32,
+            "a header-less mint is `router-` + a 32-char simple uuid; got {rid}",
+        );
+    }
+
+    /// The caller's `x-request-id` is folded into the minted rid so an operator
+    /// can cross-reference an engine log line against the caller's own request.
+    #[test]
+    fn resolve_engine_rid_folds_in_the_correlation_header() {
+        let rid = resolve_engine_rid(false, false, &headers_with("x-request-id", "gw-abc-123"))
+            .expect("plain mode mints");
+        assert!(
+            rid.starts_with("router-gw-abc-123-"),
+            "the correlation id must appear verbatim in the minted rid; got {rid}",
+        );
+        assert!(
+            rid.len() > "router-gw-abc-123-".len(),
+            "a unique suffix must follow it; got {rid}",
+        );
+    }
+
+    /// Two requests carrying the SAME correlation id must still get distinct
+    /// rids. This is the property that makes the engine's prefix-abort safe:
+    /// no minted rid can ever be a prefix of another request's.
+    #[test]
+    fn resolve_engine_rid_is_unique_per_request_even_with_a_shared_header() {
+        let h = headers_with("x-request-id", "same-id");
+        let a = resolve_engine_rid(false, false, &h).unwrap();
+        let b = resolve_engine_rid(false, false, &h).unwrap();
+        assert_ne!(a, b);
+        assert!(
+            !b.starts_with(&a) && !a.starts_with(&b),
+            "neither minted rid may be a prefix of the other ({a} / {b})",
+        );
+    }
+
+    /// A correlation header that is over-long or carries characters outside an
+    /// id alphabet is dropped rather than embedded, so the engine-facing rid
+    /// stays a bounded, well-behaved token.
+    #[test]
+    fn resolve_engine_rid_rejects_unsuitable_correlation_headers() {
+        let plain_len = "router-".len() + 32;
+        for bad in [
+            "x".repeat(MAX_CORRELATION_ID_CHARS + 1),
+            "has space".to_string(),
+            "quote\"inside".to_string(),
+            String::new(),
+        ] {
+            let rid = resolve_engine_rid(false, false, &headers_with("x-request-id", &bad))
+                .expect("plain mode still mints");
+            assert_eq!(
+                rid.len(),
+                plain_len,
+                "an unsuitable x-request-id ({bad:?}) must be dropped, not embedded; got {rid}",
+            );
+        }
+    }
+
+    /// A dispatch that never left the router leaves nothing to abort. Pinning
+    /// this keeps the guard from POSTing `/abort_request` at a worker whose
+    /// breaker the router just found open — piling load onto the one node it
+    /// decided to stop using.
+    #[test]
+    fn abort_is_pointless_for_a_dispatch_that_never_reached_the_engine() {
+        let ok: Result<(), ApiError> = Ok(());
+        assert!(
+            abort_would_be_pointless(&ok),
+            "a response means engine done"
+        );
+        assert!(abort_would_be_pointless(&Err::<(), _>(
+            ApiError::BreakerOpen {
+                worker: "http://w".into()
+            }
+        )));
+        assert!(abort_would_be_pointless(&Err::<(), _>(
+            ApiError::WorkerMisconfigured {
+                worker: "http://w".into(),
+                source: anyhow::anyhow!("bad url"),
+            }
+        )));
+    }
+
+    /// The converse: an error that can mean "the request reached the engine and
+    /// it is still generating" must keep the guard armed.
+    #[test]
+    fn abort_stays_armed_when_the_engine_may_still_be_generating() {
+        for e in [
+            ApiError::UpstreamTimeout {
+                worker: reqwest::Url::parse("http://w").unwrap(),
+            },
+            ApiError::UpstreamUnreachable {
+                worker: reqwest::Url::parse("http://w").unwrap(),
+                source: anyhow::anyhow!("reset"),
+            },
+            ApiError::StaleRequestExpired {
+                model: "tiny".into(),
+            },
+        ] {
+            assert!(
+                !abort_would_be_pointless(&Err::<(), _>(e)),
+                "an error that may leave the engine generating must keep the abort armed",
+            );
+        }
+    }
+
+    /// PD mode opts out: prefill is detached to outlive the client, so no rid
+    /// is injected and no abort is armed.
+    #[test]
+    fn resolve_engine_rid_is_none_in_pd_mode() {
+        assert!(resolve_engine_rid(false, true, &HeaderMap::new()).is_none());
+    }
+
+    /// The DoS guard: a caller that filed the request under its own `rid` gets
+    /// no abort. The engine aborts by rid PREFIX, so honouring a caller-chosen
+    /// key would let `{"rid": "router-"}` cancel a worker's whole router-minted
+    /// population on disconnect.
+    #[test]
+    fn resolve_engine_rid_is_none_when_the_caller_set_its_own_rid() {
+        assert!(
+            resolve_engine_rid(true, false, &HeaderMap::new()).is_none(),
+            "a caller-supplied rid must neither be reused as an abort key nor overwritten",
+        );
+    }
+
+    /// SGLang accepts a list-valued `rid` (the batch form). Probing it as a
+    /// presence-only `Option<IgnoredAny>` keeps such a body routable — a
+    /// stricter `Option<String>` would turn it into a router-side 400.
+    #[test]
+    fn parse_probe_accepts_a_non_string_rid() {
+        let b = Bytes::from_static(br#"{"model":"tiny","rid":["a","b"]}"#);
+        let p = parse_probe(&b).expect("a list-valued rid must stay routable");
+        assert!(p.rid.is_some(), "the caller did set a rid");
+
+        let b = Bytes::from_static(br#"{"model":"tiny"}"#);
+        assert!(parse_probe(&b).unwrap().rid.is_none());
+
+        // An explicit null is "no rid" — the router may mint one.
+        let b = Bytes::from_static(br#"{"model":"tiny","rid":null}"#);
+        assert!(parse_probe(&b).unwrap().rid.is_none());
     }
 
     /// PD + forwarding: both `input_ids` and the bootstrap fields land in one
@@ -1670,7 +2041,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1765,7 +2137,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
