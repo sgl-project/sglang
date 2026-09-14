@@ -1116,6 +1116,43 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(path.name.endswith(".pkl"))
         self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
 
+    def test_gsp_cache_respects_fast_prepare(self):
+        for mode, alpha in [("uniform", None), ("zipf", 1.5)]:
+            for first_fast in (True, False):
+                with self.subTest(mode=mode, first_fast=first_fast):
+                    kwargs = dict(mode=mode, alpha=alpha, seed=42 + int(first_fast))
+                    first = self._run_gsp(fast_prepare=first_fast, **kwargs)
+                    second = self._run_gsp(fast_prepare=not first_fast, **kwargs)
+                    self.assertEqual(
+                        [row.prompt for row in first], [row.prompt for row in second]
+                    )
+                    for rows, fast in [(first, first_fast), (second, not first_fast)]:
+                        for row in rows:
+                            expected_len = (
+                                1 if fast else len(self.tokenizer.encode(row.prompt))
+                            )
+                            self.assertEqual(row.prompt_len, expected_len)
+                            self.assertEqual(row.text_prompt_len, expected_len)
+
+    def test_gsp_precise_mode_ignores_legacy_fast_cache(self):
+        legacy_path = get_gen_prefix_cache_path(
+            seed=42,
+            num_groups=4,
+            prompts_per_group=5,
+            system_prompt_len=4,
+            question_len=3,
+            output_len=2,
+            tokenizer=self.tokenizer,
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(legacy_path, "wb") as f:
+            pickle.dump([DatasetRow(prompt="LEGACY", prompt_len=1, output_len=2)], f)
+
+        rows = self._run_gsp(fast_prepare=False)
+        self.assertEqual(len(rows), 20)
+        for row in rows:
+            self.assertEqual(row.prompt_len, len(self.tokenizer.encode(row.prompt)))
+
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
         # normalized to sum to 1, with rank starting at 1.
@@ -1275,6 +1312,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1286,6 +1324,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1297,6 +1336,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                fast_prepare=common["fast_prepare"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
