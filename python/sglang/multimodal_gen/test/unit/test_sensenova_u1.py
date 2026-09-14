@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import time
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -553,6 +555,23 @@ def test_sensenova_u1_scheduler_capabilities():
     assert config.supports_sequential_multi_output_inference()
 
 
+def _make_sensenova_u1_scheduler_request(
+    request_id: str, prompt: str, seed: int, **sampling_overrides
+) -> Req:
+    sampling = SenseNovaU1SamplingParams(
+        prompt=prompt,
+        seed=seed,
+        **sampling_overrides,
+    )
+    return Req(
+        request_id=request_id,
+        prompt=prompt,
+        seed=seed,
+        sampling_params=sampling,
+        extra=sampling.build_request_extra(),
+    )
+
+
 def test_sensenova_u1_batch_cost_tracks_resolution_steps_and_cfg():
     config = SenseNovaU1PipelineConfig()
     batch = SimpleNamespace(
@@ -590,36 +609,87 @@ def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
     )
 
 
+def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler._batch_admission = SimpleNamespace(enabled=True)
+    scheduler._batch_metrics_enabled = False
+    request = _make_sensenova_u1_scheduler_request(
+        "request-0", "a mountain lake", 7, think_mode=True
+    )
+    scheduler.waiting_queue = deque([(b"identity", request, time.monotonic())])
+
+    assert not scheduler._can_dynamic_batch(request, request)
+    assert (
+        scheduler._get_dynamic_batch_reject_reason(request, request)
+        == "pipeline_request_unsupported"
+    )
+    items = scheduler.get_next_batch_to_run()
+    assert items is not None
+    assert items[0][0] == b"identity"
+    assert items[0][1] is request
+    assert not scheduler.waiting_queue
+
+
+@pytest.mark.parametrize(
+    "sampling_overrides",
+    [
+        {"guidance_scale": 1.0},
+        {"num_inference_steps": 25},
+        {"cfg_norm": "global"},
+        {"timestep_shift": 2.0},
+        {"t_eps": 0.01},
+    ],
+)
+def test_sensenova_u1_scheduler_rejects_heterogeneous_generation_options(
+    sampling_overrides,
+):
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    base = _make_sensenova_u1_scheduler_request("request-0", "first", 7)
+    candidate = _make_sensenova_u1_scheduler_request(
+        "request-1", "second", 19, **sampling_overrides
+    )
+
+    assert not scheduler._can_dynamic_batch(base, candidate)
+
+
 def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     scheduler = object.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    requests = []
-    for i, (prompt, seed) in enumerate([("short", 7), ("a longer prompt", 19)]):
-        sampling = SenseNovaU1SamplingParams(prompt=prompt, seed=seed)
-        requests.append(
-            SimpleNamespace(
-                prompt=prompt,
-                seed=seed,
-                request_id=f"request-{i}",
-                sampling_params=sampling,
-                extra=sampling.build_request_extra(),
-                is_warmup=False,
-                realtime_session_id=None,
-                session=None,
-                image_path=None,
-                return_file_paths_only=False,
-                num_outputs_per_prompt=1,
-                profile=False,
-            )
-        )
+    requests = [
+        _make_sensenova_u1_scheduler_request(
+            "request-0",
+            "short",
+            7,
+            output_path="/tmp/first",
+            output_file_name="first.png",
+        ),
+        _make_sensenova_u1_scheduler_request(
+            "request-1",
+            "a longer prompt",
+            19,
+            output_path="/tmp/second",
+            output_file_name="second.png",
+        ),
+    ]
     merged = scheduler._try_merge_generation_reqs(requests)
     assert merged.prompt == ["short", "a longer prompt"]
     assert merged.extra["dynamic_batch_seeds"] == [7, 19]
+    expected_paths = [request.output_file_path() for request in requests]
+    assert merged.extra["dynamic_batch_output_paths"] == expected_paths
     assert requests[0].prompt == "short"
     outputs = scheduler._split_batched_output(
-        OutputBatch(output=[torch.tensor([7]), torch.tensor([19])]), requests
+        OutputBatch(
+            output=[torch.tensor([7]), torch.tensor([19])],
+            output_file_paths=expected_paths,
+        ),
+        requests,
     )
     assert [output.output[0].item() for output in outputs] == [7, 19]
+    assert [output.output_file_paths for output in outputs] == [
+        [path] for path in expected_paths
+    ]
     assert (
         scheduler._split_batched_output(
             OutputBatch(output=[torch.tensor([7])]), requests

@@ -565,6 +565,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return "warmup"
         if self._requires_sequential_multi_output(base_req, candidate_req):
             return "sequential_multi_output"
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
+            return "pipeline_request_unsupported"
         if self._has_realtime_session(base_req) or self._has_realtime_session(
             candidate_req
         ):
@@ -603,12 +607,25 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             and any(max(1, int(req.num_outputs_per_prompt or 1)) > 1 for req in reqs)
         )
 
+    def _pipeline_supports_dynamic_batching_for_request(self, *reqs: Req) -> bool:
+        checker = getattr(
+            self.server_args.pipeline_config,
+            "supports_dynamic_batching_for_request",
+            None,
+        )
+        return not callable(checker) or all(checker(req) for req in reqs)
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
             return False
 
         if self._requires_sequential_multi_output(base_req, candidate_req):
+            return False
+
+        if not self._pipeline_supports_dynamic_batching_for_request(
+            base_req, candidate_req
+        ):
             return False
 
         if self._has_realtime_session(base_req) or self._has_realtime_session(

@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_THINK_MODE,
     RESOLUTION_ALIGNMENT,
 )
 
@@ -85,6 +86,10 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
 
     def supports_dynamic_batching(self):
         return True
+
+    def supports_dynamic_batching_for_request(self, batch) -> bool:
+        sampling_params = getattr(batch, "sampling_params", None)
+        return not bool(getattr(sampling_params, "think_mode", DEFAULT_THINK_MODE))
 
     def estimate_request_cost(self, batch) -> float:
         image_tokens = (int(batch.width) // RESOLUTION_ALIGNMENT) * (

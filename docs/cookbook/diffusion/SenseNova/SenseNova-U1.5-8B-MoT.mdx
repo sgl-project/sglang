@@ -92,9 +92,10 @@ sglang serve \
   --batching-delay-ms 100
 ```
 
-Requests in one batch must use the same resolution, inference steps, guidance
-settings, and output options. Batched requests support one output per request
-and require `think_mode=false`.
+Submit requests concurrently so they arrive within the batching delay. Requests
+in one batch must use the same resolution, inference steps, guidance settings,
+and output options. Requests with multiple outputs or `think_mode=true` are
+executed sequentially.
 
 ## 6. Benchmark
 
