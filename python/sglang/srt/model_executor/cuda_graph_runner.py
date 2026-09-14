@@ -72,7 +72,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.true_on_policy import (
-    patch_prefill_only_deterministic_inference_for_cuda_graph,
+    should_force_bfloat16_lm_head,
 )
 from sglang.srt.utils import (
     empty_context,
@@ -914,30 +914,23 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with patch_prefill_only_deterministic_inference_for_cuda_graph(
-            self.model_runner.server_args,
-            attn_backend=getattr(self.model_runner, "attn_backend", None),
-            dvr_target_verify_cuda_graph=getattr(
-                self.model_runner, "enable_dvr_target_verify_cuda_graph", False
-            ),
-        ):
-            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-                if not self.enable_pdmux:
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            if not self.enable_pdmux:
+                with (
+                    graph_capture() as graph_capture_context,
+                    profile_context as prof,
+                ):
+                    self.stream = graph_capture_context.stream
+                    _capture_one_stream()
+            else:
+                set_pdmux_status(False)
+                for i, sg in enumerate(self.stream_groups):
                     with (
-                        graph_capture() as graph_capture_context,
+                        graph_capture(stream=sg[1]) as graph_capture_context,
                         profile_context as prof,
                     ):
                         self.stream = graph_capture_context.stream
-                        _capture_one_stream()
-                else:
-                    set_pdmux_status(False)
-                    for i, sg in enumerate(self.stream_groups):
-                        with (
-                            graph_capture(stream=sg[1]) as graph_capture_context,
-                            profile_context as prof,
-                        ):
-                            self.stream = graph_capture_context.stream
-                            _capture_one_stream(i)
+                        _capture_one_stream(i)
 
         _set_capture_lora_variant(None)
 
@@ -1383,6 +1376,13 @@ class CudaGraphRunner:
                     if output.next_token_logits is not None
                     else None
                 )
+                if next_token_logits is not None and should_force_bfloat16_lm_head(
+                    server_args=self.model_runner.server_args,
+                    use_fp32_lm_head=getattr(
+                        self.model_runner.server_args, "enable_fp32_lm_head", False
+                    ),
+                ):
+                    next_token_logits = next_token_logits.to(torch.bfloat16)
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
