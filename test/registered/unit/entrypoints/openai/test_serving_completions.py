@@ -24,7 +24,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 def _spec_result(index):
@@ -598,6 +598,471 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+
+class ServingCompletionOutputPaddingTestCase(unittest.TestCase):
+    """``--padded-output-tokens``: nothing an observer can count may vary with
+    the completion's real length -- not the token count, the frame count, the
+    reported ``completion_tokens``, or the terminal frame."""
+
+    TARGET = 4
+    PAD_ID = 128001
+    PAD_TEXT = "<|eot|>"
+
+    # Verdicts of every admissible length, standing in for the short structured
+    # answers whose length is the thing being hidden.
+    VERDICTS = {
+        1: [("y", 11)],
+        2: [("sa", 11), ("fe", 12)],
+        3: [("un", 11), ("sa", 12), ("fe", 13)],
+        4: [("t", 11), ("r", 12), ("u", 13), ("e", 14)],
+    }
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", padded_output_tokens=self.TARGET),
+            role="tokenizer",
+        )
+        self.sc = self._make_serving()
+        self.fastapi_request = Mock(spec=Request)
+
+    def _make_serving(self):
+        tm = Mock(spec=TokenizerManager)
+        tm.tokenizer = Mock()
+        tm.tokenizer.decode.return_value = self.PAD_TEXT
+        tm.model_config = Mock(is_multimodal=False)
+        tm.model_config.hf_eos_token_id = {self.PAD_ID, self.PAD_ID + 8}
+        tm.server_args = Mock(enable_cache_report=False)
+        tm.generate_request = AsyncMock()
+        tm.create_abort_task = Mock()
+        return OpenAIServingCompletion(tm, _MockTemplateManager())
+
+    def _request(self, *, logprobs=None, max_tokens=None, **kwargs):
+        # Bind the budget to the padding target. Hardcoding a larger max_tokens
+        # here would send every case down the rejection path instead, so the
+        # padding itself would never be exercised.
+        return CompletionRequest(
+            model="x",
+            prompt="Hello",
+            max_tokens=self.TARGET if max_tokens is None else max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+            logprobs=logprobs,
+            **kwargs,
+        )
+
+    def _chunks(
+        self,
+        pieces,
+        *,
+        want_logprobs=False,
+        supply_logprobs=True,
+        finish="stop",
+        report_tokens=None,
+        coalesce=False,
+    ):
+        """Cumulative manager chunks, one per token unless ``coalesce``."""
+        groups = [pieces] if coalesce else [pieces[: i + 1] for i in range(len(pieces))]
+        chunks = []
+        for i, prefix in enumerate(groups):
+            is_last = i == len(groups) - 1
+            ids = [tid for _, tid in prefix]
+            meta = {
+                "id": "cmpl-pad",
+                "prompt_tokens": 3,
+                "completion_tokens": (
+                    report_tokens if is_last and report_tokens is not None else len(ids)
+                ),
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "finish_reason": ({"type": finish} if is_last else None),
+            }
+            if is_last and finish == "stop":
+                meta["finish_reason"]["matched"] = 2
+            if want_logprobs:
+                # Distinct per position, so a mis-split pairs a visibly wrong
+                # value with its token instead of an identical one.
+                supplied = (
+                    [
+                        (self._logprob_at(n), tid, text)
+                        for n, (text, tid) in enumerate(prefix)
+                    ]
+                    if supply_logprobs
+                    else []
+                )
+                meta["output_token_logprobs"] = supplied
+                meta["output_token_logprobs_length"] = len(supplied)
+                meta["output_top_logprobs"] = (
+                    [
+                        [(self._logprob_at(n), tid, text)]
+                        for n, (text, tid) in enumerate(prefix)
+                    ]
+                    if supply_logprobs
+                    else []
+                )
+            chunks.append(
+                {
+                    "text": "".join(text for text, _ in prefix),
+                    "output_ids": ids,
+                    "meta_info": meta,
+                    "index": 0,
+                }
+            )
+        return chunks
+
+    def _run(self, request, chunks, serving=None):
+        serving = serving or self.sc
+
+        async def fake_generate(*args, **kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        serving.tokenizer_manager.generate_request = fake_generate
+        adapted_request, _ = serving._convert_to_internal_request(request)
+
+        async def collect():
+            return [
+                frame
+                async for frame in serving._generate_completion_stream(
+                    adapted_request, request, self.fastapi_request
+                )
+            ]
+
+        return get_or_create_event_loop().run_until_complete(collect())
+
+    def _shape(self, frames):
+        """Everything an observer can count, with the verdict text projected out."""
+        shape = []
+        for frame in frames:
+            payload = frame[len("data: ") :].strip()
+            if payload == "[DONE]":
+                shape.append(("done",))
+                continue
+            data = json.loads(payload)
+            if "error" in data:
+                shape.append(("error",))
+                continue
+            if data.get("usage"):
+                shape.append(("usage", data["usage"]["completion_tokens"]))
+                continue
+            choice = data["choices"][0]
+            logprobs = choice.get("logprobs")
+            shape.append(
+                (
+                    "choice",
+                    choice["finish_reason"],
+                    choice.get("matched_stop"),
+                    None if logprobs is None else len(logprobs["token_logprobs"]),
+                )
+            )
+        return shape
+
+    def _text(self, frames):
+        out = []
+        for frame in frames:
+            payload = frame[len("data: ") :].strip()
+            if payload == "[DONE]":
+                continue
+            for choice in json.loads(payload).get("choices", []):
+                out.append(choice.get("text") or "")
+        return "".join(out)
+
+    def _expected_shape(self, *, logprob_positions=None):
+        return (
+            [("choice", None, None, logprob_positions)] * self.TARGET
+            + [("choice", "length", None, None)]
+            + [("usage", self.TARGET), ("done",)]
+        )
+
+    def test_every_admissible_length_pads_to_one_shape(self):
+        for length, pieces in self.VERDICTS.items():
+            frames = self._run(self._request(), self._chunks(pieces))
+            self.assertEqual(
+                self._shape(frames),
+                self._expected_shape(),
+                f"a {length}-token completion is distinguishable",
+            )
+            self.assertEqual(self._text(frames), "".join(t for t, _ in pieces))
+
+    def test_logprob_request_modes_do_not_leak_length(self):
+        for mode in (None, 0, 1, 3):
+            expected = self._expected_shape(
+                logprob_positions=None if mode is None else 1
+            )
+            for length, pieces in self.VERDICTS.items():
+                frames = self._run(
+                    self._request(logprobs=mode),
+                    self._chunks(pieces, want_logprobs=mode is not None),
+                )
+                self.assertEqual(
+                    self._shape(frames),
+                    expected,
+                    f"logprobs={mode} leaks a {length}-token completion",
+                )
+
+    def test_missing_manager_logprobs_fall_back_to_filler(self):
+        """A backend that under-supplies logprobs must not put real tokens and
+        pads on differently shaped frames."""
+        for mode in (0, 1, 3):
+            expected = self._expected_shape(logprob_positions=1)
+            for length, pieces in self.VERDICTS.items():
+                frames = self._run(
+                    self._request(logprobs=mode),
+                    self._chunks(pieces, want_logprobs=True, supply_logprobs=False),
+                )
+                self.assertEqual(
+                    self._shape(frames),
+                    expected,
+                    f"logprobs={mode} with no manager metadata leaks {length}",
+                )
+
+    @staticmethod
+    def _logprob_at(position):
+        return -0.5 - position
+
+    def _logprobs_of(self, frames):
+        """(tokens, token_logprobs) per content frame, in order."""
+        out = []
+        for frame in frames:
+            payload = frame[len("data: ") :].strip()
+            if payload == "[DONE]":
+                continue
+            data = json.loads(payload)
+            if "error" in data or data.get("usage") or not data["choices"]:
+                continue
+            logprobs = data["choices"][0].get("logprobs")
+            out.append(
+                None
+                if logprobs is None
+                else (logprobs["tokens"], logprobs["token_logprobs"])
+            )
+        return out
+
+    def test_each_frame_carries_its_own_positions_logprob(self):
+        """The re-split must pair position i with the i-th new token. Handing
+        every frame the filler, or shifting the pairing by one, both leave the
+        frame shape intact and are only visible in the values."""
+        pieces = self.VERDICTS[3]
+        frames = self._run(
+            self._request(logprobs=0), self._chunks(pieces, want_logprobs=True)
+        )
+        expected = [
+            ([text], [self._logprob_at(n)]) for n, (text, _) in enumerate(pieces)
+        ]
+        expected += [([self.PAD_TEXT], [0.0])] * (self.TARGET - len(pieces))
+        self.assertEqual(self._logprobs_of(frames)[: self.TARGET], expected)
+
+    def test_coalesced_chunk_splits_logprobs_positionally(self):
+        """count>1 with a partial supply: the manager merged three tokens into one
+        delta but only priced two of them."""
+        pieces = self.VERDICTS[3]
+        chunk = self._chunks(pieces, want_logprobs=True, coalesce=True)[0]
+        chunk["meta_info"]["output_token_logprobs"] = chunk["meta_info"][
+            "output_token_logprobs"
+        ][:2]
+        chunk["meta_info"]["output_token_logprobs_length"] = 2
+        chunk["meta_info"]["output_top_logprobs"] = chunk["meta_info"][
+            "output_top_logprobs"
+        ][:1]
+        frames = self._run(self._request(logprobs=1), [chunk])
+        self.assertEqual(
+            self._logprobs_of(frames)[:3],
+            [
+                ([pieces[0][0]], [self._logprob_at(0)]),
+                ([pieces[1][0]], [self._logprob_at(1)]),
+                ([self.PAD_TEXT], [0.0]),
+            ],
+        )
+        self.assertEqual(self._shape(frames), self._expected_shape(logprob_positions=1))
+
+    def test_filler_logprob_is_a_finite_number_not_null(self):
+        """pydantic renders a non-finite float as ``null``, a shape no real
+        position ever has, so the pad frame would be identifiable by that alone."""
+        frames = self._run(
+            self._request(logprobs=2),
+            self._chunks(self.VERDICTS[1], want_logprobs=True, supply_logprobs=False),
+        )
+        first = json.loads(frames[0][len("data: ") :])["choices"][0]["logprobs"]
+        self.assertEqual(first["token_logprobs"], [0.0])
+        self.assertIsInstance(first["token_logprobs"][0], float)
+        self.assertEqual(first["top_logprobs"], [{self.PAD_TEXT: 0.0}])
+
+    def test_pad_run_follows_the_wire_count_not_the_manager_count(self):
+        """The pad run is sized from tokens this loop actually framed. Sizing it
+        from meta_info's completion_tokens, which mirrors the manager and can lag
+        or lead, puts the padded total off the target."""
+        pieces = self.VERDICTS[2]
+        chunks = self._chunks(pieces)
+        chunks[-1]["meta_info"]["completion_tokens"] = 1  # manager lags the wire
+        frames = self._run(self._request(), chunks)
+        self.assertEqual(self._shape(frames), self._expected_shape())
+
+    def test_graceful_abort_is_not_padded(self):
+        """A cancelled request keeps its own finish_reason and honest count. An
+        abort carries no status_code unless it was a system error, so padding it
+        would relabel the cancellation as a normal length-capped completion."""
+        aborted = [
+            {
+                "text": "un",
+                "output_ids": [11],
+                "index": 0,
+                "meta_info": {
+                    "id": "cmpl-pad",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "abort", "message": "user abort"},
+                },
+            }
+        ]
+        frames = self._run(self._request(), aborted)
+        self.assertEqual(
+            self._shape(frames),
+            [("choice", "abort", None, None), ("usage", 1), ("done",)],
+        )
+        self.assertEqual(self._text(frames), "un")
+
+    def test_coalesced_delta_is_resplit_one_frame_per_token(self):
+        """The manager merges several decode steps into one delta when the
+        consumer lags; without re-splitting, the frame count would still track
+        the real length even though the token count is padded."""
+        pieces = self.VERDICTS[3]
+        frames = self._run(self._request(), self._chunks(pieces, coalesce=True))
+        self.assertEqual(self._shape(frames), self._expected_shape())
+        self.assertEqual(self._text(frames), "unsafe")
+
+    def test_stop_and_length_finish_are_indistinguishable(self):
+        pieces = self.VERDICTS[2]
+        on_stop = self._run(self._request(), self._chunks(pieces, finish="stop"))
+        on_length = self._run(self._request(), self._chunks(pieces, finish="length"))
+        self.assertEqual(self._shape(on_stop), self._shape(on_length))
+        self.assertEqual(self._shape(on_stop), self._expected_shape())
+
+    def test_more_ids_than_target_refuses_to_report_a_padded_count(self):
+        overrun = [("x", 20 + i) for i in range(self.TARGET + 2)]
+        frames = self._run(self._request(), self._chunks(overrun))
+        error = json.loads(frames[-2][len("data: ") :])
+        self.assertIn("outran --padded-output-tokens", error["error"]["message"])
+        self.assertNotIn(("usage", self.TARGET), self._shape(frames))
+
+    def test_manager_count_above_target_refuses_to_report_a_padded_count(self):
+        frames = self._run(
+            self._request(),
+            self._chunks(self.VERDICTS[2], report_tokens=self.TARGET + 3),
+        )
+        error = json.loads(frames[-2][len("data: ") :])
+        self.assertIn("outran --padded-output-tokens", error["error"]["message"])
+        self.assertIn(str(self.TARGET + 3), error["error"]["message"])
+
+    def test_rejects_a_budget_over_the_target_before_the_engine(self):
+        message = self.sc._validate_request(self._request(max_tokens=self.TARGET + 1))
+        self.assertIsNotNone(message)
+        self.assertIn("padded-output-tokens", message)
+        self.sc.tokenizer_manager.generate_request.assert_not_called()
+
+    def test_admits_a_budget_exactly_equal_to_the_target(self):
+        self.assertIsNone(
+            self.sc._validate_request(self._request(max_tokens=self.TARGET))
+        )
+
+    def test_rejects_when_the_model_exposes_no_terminal_token(self):
+        self.sc.tokenizer_manager.model_config.hf_eos_token_id = set()
+        message = self.sc._validate_request(self._request())
+        self.assertIsNotNone(message)
+        self.assertIn("eos_token_id", message)
+
+    def test_zero_token_completion_is_padded_like_any_other(self):
+        """A completion that emits no tokens at all must still produce the full
+        padded stream. Keying the pad run off frames-already-emitted instead of
+        choices-seen dropped it to a bare usage frame reporting 0, which is the
+        most distinguishable stream of all."""
+        empty = [
+            {
+                "text": "",
+                "output_ids": [],
+                "index": 0,
+                "meta_info": {
+                    "id": "cmpl-pad",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 2},
+                },
+            }
+        ]
+        frames = self._run(self._request(), empty)
+        self.assertEqual(self._shape(frames), self._expected_shape())
+        self.assertEqual(self._text(frames), "")
+
+    def test_every_choice_is_padded_when_n_is_above_one(self):
+        """With n>1 each choice pads independently. A choice that generated
+        nothing was previously absent from the stream, so the frame count
+        revealed how many choices produced tokens."""
+        chunks = [
+            {
+                "text": "a",
+                "output_ids": [11],
+                "index": 0,
+                "meta_info": {
+                    "id": "cmpl-pad",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 2},
+                },
+            },
+            {
+                "text": "",
+                "output_ids": [],
+                "index": 1,
+                "meta_info": {
+                    "id": "cmpl-pad",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 2},
+                },
+            },
+        ]
+        frames = self._run(self._request(n=2), chunks)
+        per_choice = [("choice", None, None, None)] * self.TARGET + [
+            ("choice", "length", None, None)
+        ]
+        self.assertEqual(
+            self._shape(frames),
+            per_choice * 2 + [("usage", self.TARGET * 2), ("done",)],
+        )
+
+    def test_rejects_echo(self):
+        """Echo replays the prompt through the completion stream, which padding
+        does not cover, and with logprobs it prepends input positions into the
+        payload the per-token split consumes."""
+        message = self.sc._validate_request(self._request(echo=True))
+        self.assertIsNotNone(message)
+        self.assertIn("echo", message)
+
+    def test_flag_unset_leaves_the_stream_untouched(self):
+        reset_context()
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        serving = self._make_serving()
+        pieces = self.VERDICTS[2]
+        frames = self._run(self._request(), self._chunks(pieces), serving=serving)
+        self.assertEqual(
+            self._shape(frames),
+            [
+                ("choice", None, None, None),
+                ("choice", "stop", 2, None),
+                ("usage", 2),
+                ("done",),
+            ],
+        )
+        self.assertEqual(self._text(frames), "safe")
 
 
 if __name__ == "__main__":

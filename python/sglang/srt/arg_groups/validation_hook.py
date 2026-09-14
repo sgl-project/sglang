@@ -35,6 +35,24 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+# Ceiling is a sanity bound, not a model limit: a target above the model's own
+# context is rejected per-request by the /v1/completions budget check.
+_MAX_PADDED_OUTPUT_TOKENS = 131072
+
+
+def _validate_output_padding_config(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.padded_output_tokens is None:
+        return
+    if not 1 <= cfg.padded_output_tokens <= _MAX_PADDED_OUTPUT_TOKENS:
+        raise ValueError(
+            f"--padded-output-tokens must be in [1, {_MAX_PADDED_OUTPUT_TOKENS}]; "
+            f"got {cfg.padded_output_tokens}. Silently ignoring an out-of-range "
+            "target would leave the operator believing the output-length side "
+            "channel is closed when it is not."
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -228,6 +246,8 @@ def check_server_args(server_args: Any):
 
     # Check two batch overlap backend requirement.
     check_two_batch_overlap(server_args)
+
+    _validate_output_padding_config(server_args)
 
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:

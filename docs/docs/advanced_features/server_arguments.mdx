@@ -709,6 +709,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--padded-output-tokens`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pad every streaming `/v1/completions` response out to exactly this many output tokens, by appending a run of the model's terminal token after the real completion. Closes the side channel where a short structured completion leaks its content through its length. See [Constant-length output padding](#constant-length-output-padding).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--random-seed`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The random seed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
@@ -1200,6 +1206,58 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
 </tbody>
 </table>
+
+## Constant-length output padding
+
+`--padded-output-tokens N` pads every streaming `/v1/completions` response out to
+exactly `N` output tokens. It exists for deployments that serve short, highly
+structured completions — a classifier answering `safe` / `unsafe`, or
+`false|...` / `true|NN|...` — where the *length* of the answer is as revealing as
+the answer itself. An observer who can only count tokens or SSE frames on an
+otherwise encrypted stream recovers the verdict without decrypting anything.
+
+The padding is a run of the model's own terminal token appended after the real
+completion. Using the model's EOS rather than a configurable pad id keeps the
+feature to one knob: nothing else has to agree on which id means "pad".
+
+**What it equalizes**
+
+- the emitted token count — always exactly `N`
+- the content-frame count — always `N` one-token frames plus one terminal frame
+- the reported `usage.completion_tokens` — always `N`
+- the terminal frame — always `finish_reason: "length"` with no `matched_stop`,
+  so a completion that ended on its own token is indistinguishable from one that
+  filled the budget
+
+**What it does not equalize**
+
+- **Per-frame byte width.** Token ids and logprobs are serialized as decimal
+  text, so a pad frame is a different size from a real one. An observer
+  measuring byte lengths rather than counting frames can still separate them.
+  Closing that would require padding frames to a constant width, which changes
+  the wire format clients consume.
+- **Inter-frame timing.** Pad frames are emitted in a burst once generation
+  finishes; the real tokens arrive at decode speed.
+
+**`N` is a hard limit.** A request whose `max_tokens` exceeds `N` is rejected
+with HTTP 400 before generation starts. The alternatives are both worse:
+truncating would corrupt the completion mid-answer, and rounding the emitted
+length up to the next multiple of `N` would leave a long completion reporting
+`2N` — the same oracle at a coarser scale. A budget of exactly `N` is admitted,
+since the emitted run is clamped at `max_tokens` inclusively. Size `N` at or
+above the largest `max_tokens` your callers send, or the server will turn away
+its own traffic.
+
+**Other rejections.** Two more request shapes get a 400 while the flag is on.
+`echo=true` is refused because the echoed prompt is replayed through the
+completion stream and is not padded, so it would carry the prompt's own length.
+And the model must expose an `eos_token_id` — without one there is no token to
+pad with. Both are operator-visible at request time, not silent downgrades.
+
+**Scope.** Padding applies to the streaming `/v1/completions` path. The hard
+limit applies to every `/v1/completions` request, streaming or not, but a
+non-streaming response is not padded — its `usage.completion_tokens` still
+reports the real length. `/v1/chat/completions` and `/generate` are untouched.
 
 ## Data parallelism
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
