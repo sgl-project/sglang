@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from collections.abc import Iterable
 from functools import wraps
 from typing import Optional, TypeGuard
 
@@ -34,6 +35,19 @@ def uses_shared_host_layout(host_pool: object) -> TypeGuard[HostKVCache]:
         isinstance(host_pool, HostKVCache)
         and host_pool.shared_allocation_domain is not None
     )
+
+
+def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
+    domains = []
+    seen = set()
+    for pool in host_pools:
+        if not uses_shared_host_layout(pool):
+            continue
+        domain = pool.shared_allocation_domain
+        if id(domain) not in seen:
+            seen.add(id(domain))
+            domains.append(domain)
+    return domains
 
 
 def ranks_per_host() -> int:

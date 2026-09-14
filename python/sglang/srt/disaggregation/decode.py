@@ -497,11 +497,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
             )
-        if swa_allocatable_tokens is None:
-            return full_tokens <= full_allocatable_tokens
-        return (
-            full_tokens <= full_allocatable_tokens
-            and swa_tokens <= swa_allocatable_tokens
+        return full_tokens <= full_allocatable_tokens and (
+            swa_allocatable_tokens is None or swa_tokens <= swa_allocatable_tokens
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
