@@ -8,10 +8,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
     is_cpu,
+    is_gfx95_supported,
     is_npu,
     next_power_of_2,
 )
@@ -21,6 +23,7 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+_FP8_E4M3_MAX = 448.0
 
 
 @triton.jit
@@ -352,6 +355,124 @@ def rms_norm_gated(
         residual_in_fp32,
         True,
     )
+
+
+@triton.jit
+def _rms_norm_gated_per_token_fp8_kernel(
+    x,
+    g,
+    weight,
+    output,
+    output_scale,
+    eps,
+    stride_x_m,
+    stride_g_m,
+    stride_output_m,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_offsets = tl.arange(0, NUM_HEADS)[:, None]
+    dim_offsets = tl.arange(0, HEAD_DIM)[None, :]
+    offsets = head_offsets * HEAD_DIM + dim_offsets
+    x_row = tl.load(x + token_idx * stride_x_m + offsets).to(tl.float32)
+    gate_row = tl.load(g + token_idx * stride_g_m + offsets).to(tl.float32)
+    norm_weight = tl.load(weight + dim_offsets).to(tl.float32)
+
+    variance = tl.sum(x_row * x_row, axis=1) / HEAD_DIM
+    gated = (
+        x_row
+        * (1.0 / tl.sqrt(variance[:, None] + eps))
+        * norm_weight
+        * tl.sigmoid(gate_row)
+    )
+    gated = gated.to(tl.bfloat16).to(tl.float32)
+    token_absmax = tl.max(tl.max(tl.abs(gated), axis=1), axis=0)
+    scale = tl.maximum(token_absmax, 1e-12) / FP8_MAX
+    tl.store(output_scale + token_idx, scale)
+
+    quantized = tl.clamp(gated / scale, -FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    tl.store(
+        output + token_idx * stride_output_m + offsets,
+        quantized.to(tl.uint8, bitcast=True),
+    )
+
+
+def can_use_rms_norm_gated_per_token_fp8(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    return (
+        is_gfx95_supported()
+        and x.is_cuda
+        and g.is_cuda
+        and weight.is_cuda
+        and x.dtype == torch.bfloat16
+        and g.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.dim() >= 3
+        and g.dim() >= 3
+        and x.numel() == g.numel()
+        and x.shape[-2:] == g.shape[-2:]
+        and x.shape[-1] == 128
+        and x.shape[-2] in (8, 16)
+        and weight.shape == (128,)
+        and x.is_contiguous()
+        and g.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def rms_norm_gated_per_token_fp8(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not can_use_rms_norm_gated_per_token_fp8(x, g, weight):
+        raise ValueError(
+            "gated RMSNorm PTPC bridge requires contiguous gfx950 BF16 "
+            "[..., tokens, 8|16, 128] inputs and a contiguous [128] weight"
+        )
+
+    num_heads = x.shape[-2]
+    num_tokens = x.numel() // (num_heads * 128)
+    output = torch.empty(
+        (num_tokens, num_heads * 128),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
+    output_scale = torch.empty(
+        (num_tokens, 1),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    if num_tokens == 0:
+        return output, output_scale
+
+    x_2d = x.view(num_tokens, num_heads * 128)
+    g_2d = g.view(num_tokens, num_heads * 128)
+    with torch.cuda.device(x.device):
+        _rms_norm_gated_per_token_fp8_kernel[(num_tokens,)](
+            x=x_2d,
+            g=g_2d,
+            weight=weight,
+            output=output.view(torch.uint8),
+            output_scale=output_scale,
+            eps=eps,
+            stride_x_m=x_2d.stride(0),
+            stride_g_m=g_2d.stride(0),
+            stride_output_m=output.stride(0),
+            NUM_HEADS=num_heads,
+            HEAD_DIM=128,
+            FP8_DTYPE=fp8_dtype_to_triton(torch.float8_e4m3fn),
+            FP8_MAX=_FP8_E4M3_MAX,
+            num_warps=8 if num_heads == 16 else 4,
+        )
+    return output, output_scale
 
 
 class FusedRMSNormGated(nn.Module):

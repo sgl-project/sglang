@@ -7,7 +7,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.attention.fla.fused_norm_gate import (
+    FusedRMSNormGated,
+    can_use_rms_norm_gated_per_token_fp8,
+    rms_norm_gated_per_token_fp8,
+)
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
@@ -313,7 +317,11 @@ GLM53_KDA_PTPC_BF16_MAX_M = {
     "o_proj": 5631,
 }
 GLM53_KDA_PTPC_ALLOWED_K = {
-    "o_proj": (2048,),
+    "o_proj": (1024, 2048),
+}
+GLM53_KDA_FUSED_O_NORM_MIN_M = {
+    1024: 1,
+    2048: 256,
 }
 
 
@@ -579,6 +587,24 @@ class Glm5NextLinearAttention(nn.Module):
         x_2d = x.view(-1, x.shape[-1])
         return aiter.per_token_quant_hip(x_2d, quant_dtype=aiter.dtypes.fp8)
 
+    def _use_fused_o_norm_ptpc(
+        self,
+        core_attn_out: torch.Tensor,
+        norm_gate: torch.Tensor,
+    ) -> bool:
+        if not fp8_ptpc_linear_active(self.o_proj):
+            return False
+        local_k = self.o_proj.weight.shape[1]
+        min_m = GLM53_KDA_FUSED_O_NORM_MIN_M.get(local_k)
+        if min_m is None:
+            return False
+        num_tokens = core_attn_out.numel() // local_k
+        return num_tokens >= min_m and can_use_rms_norm_gated_per_token_fp8(
+            core_attn_out,
+            norm_gate,
+            self.o_norm.weight,
+        )
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -627,10 +653,17 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-
-        o_proj_input = self._maybe_quantize_ptpc_input(self.o_proj, core_attn_out)
+        if self._use_fused_o_norm_ptpc(core_attn_out, norm_gate):
+            o_proj_input = rms_norm_gated_per_token_fp8(
+                core_attn_out,
+                norm_gate,
+                self.o_norm.weight,
+                self.o_norm.eps,
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
+            core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+            o_proj_input = self._maybe_quantize_ptpc_input(self.o_proj, core_attn_out)
         return self.o_proj(o_proj_input)[0]
 
 

@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils, unquant
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.glm5_next import (
+    GLM53_KDA_FUSED_O_NORM_MIN_M,
     GLM53_KDA_PTPC_BF16_MAX_M,
     Glm5NextLinearAttention,
 )
@@ -119,17 +120,17 @@ class TestGLM53KDAPTPC(CustomTestCase):
             method.process_weights_after_loading(layer)
         repack.assert_not_called()
 
-    def test_o_proj_repack_is_limited_to_tp4_local_k(self):
+    def test_o_proj_repack_supports_validated_tp4_and_tp8_local_k(self):
         method = UnquantizedLinearMethod()
         layer = _Linear(method)
         layer._glm53_kda_ptpc_module = "o_proj"
-        layer._fp8_ptpc_allowed_k = (2048,)
+        layer._fp8_ptpc_allowed_k = (1024, 2048)
         with (
             envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"),
             patch.object(unquant, "_use_aiter", True),
             patch.object(unquant, "is_gfx95_supported", return_value=True),
         ):
-            for k, expected in ((2048, True), (1024, False)):
+            for k, expected in ((2048, True), (1024, True), (1536, False)):
                 layer.weight = torch.nn.Parameter(
                     torch.zeros(4096, k, dtype=torch.bfloat16),
                     requires_grad=False,
@@ -312,7 +313,73 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 module._fp8_ptpc_bf16_max_m,
                 GLM53_KDA_PTPC_BF16_MAX_M[name],
             )
-        self.assertEqual(attention.o_proj._fp8_ptpc_allowed_k, (2048,))
+        self.assertEqual(attention.o_proj._fp8_ptpc_allowed_k, (1024, 2048))
+
+    def test_fused_o_norm_dispatch_uses_local_k_and_token_boundaries(self):
+        model_module = sys.modules[Glm5NextLinearAttention.__module__]
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.o_proj = _Linear()
+        attention.o_proj._fp8_ptpc_ready = True
+        attention.o_norm = _Linear()
+        attention.o_norm.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.empty(128, device="meta"),
+                requires_grad=False,
+            ),
+        )
+
+        with (
+            patch.object(
+                model_module,
+                "fp8_ptpc_linear_active",
+                return_value=True,
+            ),
+            patch.object(
+                model_module,
+                "can_use_rms_norm_gated_per_token_fp8",
+                return_value=True,
+            ),
+        ):
+            for local_k, num_tokens, expected in (
+                (1024, 0, False),
+                (1024, 1, True),
+                (2048, 255, False),
+                (2048, 256, True),
+                (1536, 4096, False),
+            ):
+                heads = local_k // 128
+                attention.o_proj.register_parameter(
+                    "weight",
+                    torch.nn.Parameter(
+                        torch.empty(4096, local_k, device="meta"),
+                        requires_grad=False,
+                    ),
+                )
+                core = torch.empty(
+                    1,
+                    num_tokens,
+                    heads,
+                    128,
+                    device="meta",
+                )
+                gate = torch.empty(
+                    num_tokens,
+                    heads,
+                    128,
+                    device="meta",
+                )
+                with self.subTest(local_k=local_k, num_tokens=num_tokens):
+                    self.assertEqual(
+                        attention._use_fused_o_norm_ptpc(core, gate),
+                        expected,
+                    )
+
+        self.assertEqual(
+            GLM53_KDA_FUSED_O_NORM_MIN_M,
+            {1024: 1, 2048: 256},
+        )
 
     def test_model_selector_rejects_unknown_fused_and_quantized_targets(self):
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)

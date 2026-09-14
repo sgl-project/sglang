@@ -21,6 +21,7 @@ TP_SHAPES = {
         "f_b_proj": (2048, 128),
         "g_b_proj": (2048, 128),
         "o_proj": (4096, 2048),
+        "o_path": (4096, 2048),
         "shared_qkvfg": (6400, 4096),
         "packed_qkvfg": (6400, 4096),
     },
@@ -32,6 +33,7 @@ TP_SHAPES = {
         "f_b_proj": (1024, 128),
         "g_b_proj": (1024, 128),
         "o_proj": (4096, 1024),
+        "o_path": (4096, 1024),
         "shared_qkvfg": (3328, 4096),
         "packed_qkvfg": (3328, 4096),
     },
@@ -139,8 +141,9 @@ def load_checkpoint_weight(
             shards.append(weight.narrow(0, tp_rank * shard_size, shard_size))
         return torch.cat(shards).contiguous()
 
-    weight = load(f"{prefix}.{module_name}.weight")
-    if module_name == "o_proj":
+    checkpoint_module_name = "o_proj" if module_name == "o_path" else module_name
+    weight = load(f"{prefix}.{checkpoint_module_name}.weight")
+    if checkpoint_module_name == "o_proj":
         shard_size = weight.shape[1] // tp
         return weight.narrow(1, tp_rank * shard_size, shard_size).contiguous()
     if module_name in {"b_proj", "f_b_proj", "g_b_proj"}:
@@ -317,6 +320,173 @@ def run_first_stage_case(tp: int, module_name: str, m: int, args) -> dict:
     return result
 
 
+@torch.inference_mode()
+def run_o_path_case(tp: int, m: int, args) -> dict:
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.tuned_gemm import tgemm
+
+    from sglang.kernels.ops.attention.fla.fused_norm_gate import (
+        FusedRMSNormGated,
+        rms_norm_gated_per_token_fp8,
+    )
+
+    n, k = TP_SHAPES[tp]["o_path"]
+    heads = k // 128
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(args.seed + tp + m + n + k)
+    x = (
+        torch.randn(
+            m,
+            heads,
+            128,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    gate = torch.randn(
+        m,
+        heads,
+        128,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    norm = FusedRMSNormGated(
+        128,
+        eps=1e-5,
+        activation="sigmoid",
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    norm.weight.data.fill_(1)
+    if args.checkpoint is None:
+        weight = torch.randn(
+            n,
+            k,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        weight_source = "synthetic"
+    else:
+        weight = load_checkpoint_weight(
+            args.checkpoint,
+            args.layer,
+            "o_proj",
+            tp,
+            args.tp_rank,
+        ).to(device="cuda")
+        weight_source = str(args.checkpoint)
+    fp8_weight, weight_scale = aiter.pertoken_quant(
+        weight,
+        quant_dtype=aiter.dtypes.fp8,
+    )
+    fp8_weight = shuffle_weight(fp8_weight, (16, 16)).contiguous()
+    reference_input = norm(x.clone(), gate).flatten(1)
+    quantized_input = aiter.per_token_quant_hip(
+        reference_input,
+        quant_dtype=aiter.dtypes.fp8,
+    )
+    x_norm = x.clone()
+    x_bf16 = x.clone()
+    x_ptpc = x.clone()
+
+    def norm_only():
+        return norm(x_norm, gate)
+
+    def quant_only():
+        return aiter.per_token_quant_hip(
+            reference_input,
+            quant_dtype=aiter.dtypes.fp8,
+        )
+
+    def bf16_gemm_only():
+        return tgemm.mm(reference_input, weight, otype=torch.bfloat16)
+
+    def fp8_gemm_only():
+        return apply_fp8_ptpc_linear(
+            quantized_input,
+            fp8_weight,
+            weight_scale,
+        )
+
+    def bf16_path():
+        return tgemm.mm(
+            norm(x_bf16, gate).flatten(1),
+            weight,
+            otype=torch.bfloat16,
+        )
+
+    def ptpc_path():
+        normalized = norm(x_ptpc, gate).flatten(1)
+        return apply_fp8_ptpc_linear(
+            aiter.per_token_quant_hip(
+                normalized,
+                quant_dtype=aiter.dtypes.fp8,
+            ),
+            fp8_weight,
+            weight_scale,
+        )
+
+    def fused_ptpc_path():
+        return apply_fp8_ptpc_linear(
+            rms_norm_gated_per_token_fp8(
+                x,
+                gate,
+                norm.weight,
+                norm.eps,
+            ),
+            fp8_weight,
+            weight_scale,
+        )
+
+    iters = args.large_iters if m >= 131072 else args.iters
+    functions = {
+        "norm": norm_only,
+        "quant": quant_only,
+        "bf16_gemm": bf16_gemm_only,
+        "fp8_gemm": fp8_gemm_only,
+        "bf16_path": bf16_path,
+        "ptpc_path": ptpc_path,
+        "fused_ptpc_path": fused_ptpc_path,
+    }
+    summaries = {
+        name: summarize(measure_samples(fn, args.warmup, iters, args.inner_iters))
+        for name, fn in functions.items()
+    }
+    result = {
+        "tp": tp,
+        "module": "o_path",
+        "m": m,
+        "n": n,
+        "k": k,
+        "warmup": args.warmup,
+        "iters": iters,
+        "inner_iters": args.inner_iters,
+        "seed": args.seed,
+        "weight_source": weight_source,
+        "bf16": summaries["bf16_path"],
+        "ptpc": summaries["ptpc_path"],
+        "fused_ptpc": summaries["fused_ptpc_path"],
+        "components": summaries,
+        "median_delta": (
+            summaries["ptpc_path"]["median_ms"] / summaries["bf16_path"]["median_ms"]
+            - 1
+        ),
+        "fused_median_delta": (
+            summaries["fused_ptpc_path"]["median_ms"]
+            / summaries["bf16_path"]["median_ms"]
+            - 1
+        ),
+        "unsupported_reason": None,
+    }
+    torch.cuda.empty_cache()
+    return result
+
+
 def write_outputs(results: list[dict], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".json").write_text(json.dumps(results, indent=2) + "\n")
@@ -340,6 +510,8 @@ def write_outputs(results: list[dict], output: Path) -> None:
                 "ptpc_p95_ms",
                 "ptpc_cv",
                 "median_delta",
+                "fused_ptpc_median_ms",
+                "fused_median_delta",
                 "unsupported_reason",
             ),
         )
@@ -367,6 +539,12 @@ def write_outputs(results: list[dict], output: Path) -> None:
                     ),
                     "ptpc_cv": result["ptpc"]["cv"] if result["ptpc"] else None,
                     "median_delta": result["median_delta"],
+                    "fused_ptpc_median_ms": (
+                        result["fused_ptpc"]["median_ms"]
+                        if result.get("fused_ptpc")
+                        else None
+                    ),
+                    "fused_median_delta": result.get("fused_median_delta"),
                     "unsupported_reason": result["unsupported_reason"],
                 }
             )
@@ -378,9 +556,13 @@ def main():
         raise RuntimeError("A gfx950 GPU is required")
     results = [
         (
-            run_first_stage_case(args.tp, module_name, m, args)
-            if module_name in {"shared_qkvfg", "packed_qkvfg"}
-            else run_case(args.tp, module_name, m, args)
+            run_o_path_case(args.tp, m, args)
+            if module_name == "o_path"
+            else (
+                run_first_stage_case(args.tp, module_name, m, args)
+                if module_name in {"shared_qkvfg", "packed_qkvfg"}
+                else run_case(args.tp, module_name, m, args)
+            )
         )
         for module_name in args.modules
         for m in args.m
@@ -394,10 +576,16 @@ def main():
         if result["ptpc"] is None:
             print(f"{prefix} PTPC=unsupported ({result['unsupported_reason']})")
         else:
-            print(
-                f"{prefix} PTPC={result['ptpc']['median_ms']:.4f} ms "
+            suffix = (
+                f"PTPC={result['ptpc']['median_ms']:.4f} ms "
                 f"delta={result['median_delta']:+.2%}"
             )
+            if result.get("fused_ptpc"):
+                suffix += (
+                    f" fused={result['fused_ptpc']['median_ms']:.4f} ms "
+                    f"fused_delta={result['fused_median_delta']:+.2%}"
+                )
+            print(f"{prefix} {suffix}")
 
 
 if __name__ == "__main__":
