@@ -6,6 +6,10 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
+# shadow the installed package on sys.path.
+cd "${sglang_source_path}"
+
 echo "NPU info:"
 npu-smi info
 
@@ -105,6 +109,8 @@ else
     mkdir -p "${ascend_test_util_path}"
     mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
     cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
+    # Prefer the installed sglang package over the repo cloned in the image WORKDIR.
+    export PYTHONPATH=${sglang_pkg_path}:$PYTHONPATH
 fi
 
 # set environment of cann
