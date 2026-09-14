@@ -303,6 +303,61 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def test_dcp_disables_quick_allreduce_without_changing_tp_default():
+    world_size = 8
+
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_DCP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.sampler": Mock(SYNC_TOKEN_IDS_ACROSS_TP=False)},
+        ),
+    ):
+        created_group_kwargs = {}
+
+        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+            group_name = kwargs.get("group_name", "unknown")
+            created_group_kwargs[group_name] = kwargs
+
+            mock_group = Mock()
+            mock_group.device_group = Mock()
+            return mock_group
+
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
+            mock_world = Mock()
+            mock_world.device_group = Mock()
+            mock_world.local_rank = 0
+            mock_world_group.return_value = mock_world
+
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=8,
+                pipeline_model_parallel_size=1,
+                decode_context_parallel_size=8,
+            )
+
+            assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
+            assert "use_quick_allreduce" not in created_group_kwargs["tp"]
+
+            parallel_state.destroy_model_parallel()
+
+
 def _read_group_descs(group_name):
     """Build a real ``GroupCoordinator`` over a single-rank gloo world and read the
     ``group_desc`` back off the live ProcessGroup objects it created.
