@@ -48,6 +48,8 @@ def _hc_mix_persistent_kernel(
     t_raw_ptr,
     out_ptr,
     counters_ptr,
+    s_down_ptr,
+    s_up_ptr,
     K,
     LOWRANK,
     HS,
@@ -60,6 +62,7 @@ def _hc_mix_persistent_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    FP8W: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -92,7 +95,12 @@ def _hc_mix_persistent_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
+        if FP8W:
+            w = w.to(x_ptr.dtype.element_ty)
         acc = tl.dot(xt, tl.trans(w))
+        if FP8W:
+            s = tl.load(s_down_ptr + n, mask=mask_n, other=0.0)
+            acc = acc * s[None, :]
         tl.atomic_add(
             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
             acc,
@@ -130,7 +138,12 @@ def _hc_mix_persistent_kernel(
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
             )
+            if FP8W:
+                w = w.to(x_ptr.dtype.element_ty)
             acc = tl.dot(t, tl.trans(w), acc)
+        if FP8W:
+            s_up = tl.load(s_up_ptr + gj_flat, mask=mask_gj, other=0.0)
+            acc = acc * s_up[None, :]
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
         xg = tl.load(
             x_ptr
@@ -182,6 +195,19 @@ def _deterministic_inference() -> bool:
     return _deterministic_inference_cached
 
 
+def _fp8_pair_if_replaced(w_down: torch.Tensor, w_up: torch.Tensor):
+    """((w_q, s), (w_q, s)) when both weights are the replaced fp8 pair, else None."""
+    if not (w_down.dtype == torch.float8_e4m3fn and w_up.dtype == torch.float8_e4m3fn):
+        return None
+    from sglang.kernels.ops.gemm import sm120_online_fp8 as _gemm_mod
+
+    s_down = _gemm_mod.rowwise_scale_of(w_down)
+    s_up = _gemm_mod.rowwise_scale_of(w_up)
+    if s_down is None or s_up is None:
+        return None
+    return (w_down, s_down), (w_up, s_up)
+
+
 def fused_hc_mix_supported(
     hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> bool:
@@ -189,18 +215,47 @@ def fused_hc_mix_supported(
     # device-scope atomics, so summation order varies across replays.
     if _deterministic_inference():
         return False
-    return (
+    if not (
         hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-        and w_down.dtype == hyper_input_normed.dtype
-        and w_up.dtype == hyper_input_normed.dtype
         and hyper_input_normed.shape[0] <= _FUSED_MIX_MAX_ROWS
         and hyper_input_normed.dim() == 2
         and hyper_input_normed.shape[1] % 2048 == 0
         and hyper_input_normed.is_contiguous()
         and w_down.is_contiguous()
         and w_up.is_contiguous()
-    )
+    ):
+        return False
+    if (
+        w_down.dtype == hyper_input_normed.dtype
+        and w_up.dtype == hyper_input_normed.dtype
+    ):
+        return True
+    return _fp8_pair_if_replaced(w_down, w_up) is not None
+
+
+def _maybe_fp8_weights(w_down: torch.Tensor, w_up: torch.Tensor):
+    """
+    Per-row-scaled fp8 operands for the mix, or None for the bf16 path. The mix pair is born
+    rowwise fp8 at checkpoint ingest when rowwise_mix_enabled holds, so the common path serves
+    the module's own weights.
+
+    Otherwise the bf16 tensors quantize on first use and come from the sm120_online_fp8 weight cache.
+
+    Halves the weight bytes read per mix.
+    """
+    from sglang.kernels.ops.gemm import sm120_online_fp8 as _gemm_mod
+
+    if not _gemm_mod.online_fp8_enabled:
+        return None
+    replaced = _fp8_pair_if_replaced(w_down, w_up)
+    if replaced is not None:
+        return replaced
+    down = _gemm_mod._get_fp8_weight(w_down)
+    up = _gemm_mod._get_fp8_weight(w_up)
+    if down is None or up is None:
+        return None
+    return down, up
 
 
 def fused_hc_mix(
@@ -219,13 +274,21 @@ def fused_hc_mix(
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
+    fp8 = _maybe_fp8_weights(w_down, w_up)
+    if fp8 is not None:
+        (w_down_run, s_down), (w_up_run, s_up) = fp8
+    else:
+        w_down_run, s_down = w_down, w_down  # dummy ptrs, unused when FP8W=False
+        w_up_run, s_up = w_up, w_up
     _hc_mix_persistent_kernel[(num_ctas,)](
         hyper_input_normed,
-        w_down,
-        w_up,
+        w_down_run,
+        w_up_run,
         t_raw,
         out,
         _get_counters(device),
+        s_down,
+        s_up,
         k,
         lowrank,
         hs,
@@ -238,6 +301,7 @@ def fused_hc_mix(
         BLOCK_K=256,
         BLOCK_J=32,
         BLOCK_R=64,
+        FP8W=fp8 is not None,
         num_warps=8,
     )
     return out

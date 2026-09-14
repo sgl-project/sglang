@@ -737,9 +737,30 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                weight = lm_head.weight
+                logits = None
+                if weight.is_cuda and weight.dtype == torch.bfloat16:
+                    from sglang.kernels.ops.gemm.sm120_online_fp8 import (
+                        maybe_sm120_fp8_lm_head,
+                    )
+
+                    logits = maybe_sm120_fp8_lm_head(
+                        hidden_states.to(weight.dtype), weight
+                    )
+                elif weight.dtype == torch.float8_e4m3fn:
+                    # Replaced (sm120 online FP8) or serialized-fp8 lm_head: the scale rides on the weight Parameter, so the NEXTN
+                    # draft that shares the target head reads the same pair.
+                    from sglang.kernels.ops.gemm.sm120_online_fp8 import (
+                        rowwise_scale_of,
+                        sm120_fp8_lm_head_logits,
+                    )
+
+                    if rowwise_scale_of(weight) is not None:
+                        logits = sm120_fp8_lm_head_logits(
+                            hidden_states.bfloat16(), weight
+                        )
+                if logits is None:
+                    logits = torch.matmul(hidden_states.to(weight.dtype), weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

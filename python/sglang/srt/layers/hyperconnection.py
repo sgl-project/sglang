@@ -135,28 +135,41 @@ class GatedResidual(HyperConnectionBase):
         )
 
         if use_mix:
+            # sm120 online FP8: the mix pair is created on meta and the checkpoint shards
+            # quantize into rowwise fp8 on the way in, so no bf16 mix bytes occupy device
+            # memory. The bf16 combine weight shares their allocator segment, and a segment
+            # unmaps only when fully free: a materialized pair freed beside it would keep
+            # the whole segment mapped.
+            from sglang.kernels.ops.gemm import sm120_online_fp8 as _online_mod
+
+            _rowwise = _online_mod.rowwise_mix_enabled(config.params_dtype)
+            _mix_device = "meta" if _rowwise else torch.cuda.current_device()
             self.input_mix_weight_down = nn.Linear(
                 self.hidden_size * self.hc_count,
                 self.config.hc_lowrank,
                 bias=False,
-                device=torch.cuda.current_device(),
+                device=_mix_device,
                 dtype=config.params_dtype,
             )
             self.input_mix_weight_up = nn.Linear(
                 self.config.hc_lowrank,
                 self.hc_count * self.hidden_size,
                 bias=False,
-                device=torch.cuda.current_device(),
+                device=_mix_device,
                 dtype=config.params_dtype,
             )
+            if _rowwise:
+                _online_mod.attach_rowwise_ingest(
+                    [self.input_mix_weight_down, self.input_mix_weight_up]
+                )
             from sglang.srt.environ import envs
 
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
                 envs.SGLANG_HC_MIX_CUDA.get()
                 and torch.cuda.is_available()
-                # The CuTe split-K pair is tcgen05 (sm_100 family) only; the
-                # default-on env must not route Hopper/Ada to it.
+                # The CuTe split-K pair is tcgen05 (sm_100 family) only. The default-on env
+                # must not route Hopper/Ada to it.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
                 and self.hidden_size % 8 == 0
@@ -277,10 +290,21 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
+            w_down = self.input_mix_weight_down.weight
+            w_up = self.input_mix_weight_up.weight
+            if w_down.dtype == torch.float8_e4m3fn:
+                # sm120 online FP8 replacement: prefill rows re-materialize the bf16 operands the torch.compile path expects, row blocks
+                # at a time, from the fp8 pair that stayed resident.
+                from sglang.kernels.ops.gemm.sm120_online_fp8 import (
+                    dequant_rowwise_weight,
+                )
+
+                w_down = dequant_rowwise_weight(w_down, hyper_input_normed.dtype)
+                w_up = dequant_rowwise_weight(w_up, hyper_input_normed.dtype)
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                w_down,
+                w_up,
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)

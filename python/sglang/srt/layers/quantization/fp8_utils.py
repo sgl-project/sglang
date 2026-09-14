@@ -548,6 +548,13 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
     if backend.is_flashinfer_cutedsl():
+        # SM120/SM121 use the CUTLASS MXFP8 implementation.
+        if get_device_sm() in (120, 121):
+            logger.info(
+                "MXFP8 dense GEMM: --fp8-gemm-backend=flashinfer_cutedsl has no "
+                "kernel for SM120/SM121; using the CUTLASS path."
+            )
+            return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
         if not (
             is_blackwell_supported()
             and is_flashinfer_available()

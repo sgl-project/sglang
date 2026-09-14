@@ -774,11 +774,15 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+# e2m1 values indexed by 4-bit code: a packed PLE byte dequantizes as lut[low nibble]
+# and lut[high nibble].
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
-    The table stays in its checkpoint storage dtype (fp8 with a per-tensor
-    weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
+    The table stays in its checkpoint storage dtype
+    (fp8 with a per-tensor weight_scale for fp8 checkpoints, bf16 otherwise). Gathers emit bf16.
     """
 
     _COPIED_ATTRIBUTES = (
@@ -1268,6 +1272,26 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+_ONLINE_MXFP8_METHOD = None
+_ONLINE_MXFP8_RESOLVED = False
+
+
+def _build_mxfp8_linear_method():
+    """An Fp8LinearMethod serving bf16 linears as MXFP8 (dynamic activation)."""
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+    return Fp8LinearMethod(
+        Fp8Config(
+            is_checkpoint_fp8_serialized=False,
+            activation_scheme="dynamic",
+            use_mxfp8=True,
+        )
+    )
+
+
+_ONLINE_MXFP8_LOGGED = False
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1322,6 +1346,91 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
+        self._maybe_convert_linears_to_mxfp8()
+
+    def _maybe_convert_linears_to_mxfp8(self) -> None:
+        """Serve this layer's unquantized bf16 linears as online MXFP8 on sm120.
+
+        With SGLANG_SM120_ONLINE_MXFP8 set, every linear that would run unquantized gets
+        MXFP8 weights: e4m3 with a UE8M0 scale per 32 elements, quantized during
+        process_weights_after_loading and served by flashinfer's block-scale GEMM.
+        Covers attention projections, the dense MLP and the HyperConnection projections.
+        """
+        global _ONLINE_MXFP8_METHOD, _ONLINE_MXFP8_RESOLVED, _ONLINE_MXFP8_LOGGED
+        import logging
+
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_SM120_ONLINE_MXFP8.get():
+            return
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        candidates = []
+        for name, module in self.named_modules():
+            # MoE experts and the router gate stay out: experts are NVFP4 already
+            # in both supported checkpoints, and the router is tiny plus load-balance sensitive (keep its topk ranking exact).
+            if name.endswith(".gate") or isinstance(module, FusedMoE):
+                continue
+            if not isinstance(
+                getattr(module, "quant_method", None), UnquantizedLinearMethod
+            ):
+                continue
+            weight = getattr(module, "weight", None)
+            if (
+                not isinstance(weight, torch.nn.Parameter)
+                or weight.dim() != 2
+                or weight.shape[1] % 32
+                or weight.dtype != torch.bfloat16
+            ):
+                continue
+            # The block-scale kernels refuse small problems: the CUTLASS MXFP8 GEMM needs n
+            # and k >= 128 (in_proj_ba ships n=96), and a GEMV of that size gains nothing from quantizing.
+            if weight.shape[0] < 128 or weight.shape[1] < 128:
+                continue
+            candidates.append(module)
+
+        if not _ONLINE_MXFP8_RESOLVED:
+            _ONLINE_MXFP8_RESOLVED = True
+            quant_method = None
+            try:
+                from sglang.srt.utils import is_sm120_supported
+
+                if is_sm120_supported():
+                    quant_method = _build_mxfp8_linear_method()
+                    backend = quant_method.mxfp8_dense_backend
+                    if backend is None or backend.is_unsupported():
+                        quant_method = None
+            except RuntimeError as exc:
+                # The kernel-side capability probe raises RuntimeError for a genuine decline
+                # (no MXFP8 dense kernel for this device). Any other type is a bug in this path
+                # and must crash: staying bf16 silently would hide it.
+                logging.getLogger(__name__).warning(
+                    "[mratsim's sm120-turbo r22] sm120 online MXFP8 unavailable (%s); unquantized "
+                    "linears stay bf16",
+                    exc,
+                )
+                quant_method = None
+            _ONLINE_MXFP8_METHOD = quant_method
+
+        quant_method = _ONLINE_MXFP8_METHOD
+        if quant_method is None:
+            return
+        for module in candidates:
+            weight = getattr(module, "weight", None)
+            if not isinstance(weight, torch.nn.Parameter):
+                continue
+            if weight.dtype != torch.bfloat16:
+                continue
+            module.quant_method = quant_method
+            if not _ONLINE_MXFP8_LOGGED:
+                _ONLINE_MXFP8_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "[mratsim's sm120-turbo r22] sm120 online MXFP8: unquantized linears quantize at "
+                    "load (dense backend=%s)",
+                    quant_method.mxfp8_dense_backend,
+                )
 
     def _prepare_qwen4_exp_attn(
         self,
@@ -1826,6 +1935,73 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_buffers.add(name)
         return True
 
+    def _log_weight_dtype_census(self):
+        """Log one line per distinct (module family, class, quant method, dtype) combination among
+        resident 2-D weights. The census shows which quant method each module family ended
+        with, so the boot log distinguishes a skipped conversion from an intended bf16 family.
+        """
+        from collections import Counter
+
+        from sglang.kernels.ops.gemm import sm120_online_fp8 as _online
+
+        counts: Counter = Counter()
+        for mod_name, module in self.named_modules():
+            weight = getattr(module, "weight", None)
+            if (
+                weight is None
+                or not isinstance(weight, torch.Tensor)
+                or weight.dim() != 2
+            ):
+                continue
+            method = type(getattr(module, "quant_method", None)).__name__
+            if _online.rowwise_scale_of(weight) is not None:
+                method = "RowwiseFp8"
+            family = ".".join(mod_name.split(".")[:2]) or mod_name
+            counts[(family, type(module).__name__, method, str(weight.dtype))] += 1
+        for (family, cls, method, dtype), n in sorted(counts.items()):
+            logger.info(
+                "[mratsim's sm120-turbo r22] weights %s x%s %s %s x%d",
+                family,
+                cls,
+                method,
+                dtype,
+                n,
+            )
+
+    def post_load_weights(self) -> None:
+        """
+        Replace deferred online-FP8 conversion with resident fp8 weights.
+
+        Runs before CUDA graph capture and before KV pool sizing, so the bytes freed here return
+        to the allocator cache before the pool takes its budget.
+
+        The HyperConnection mix pair is already fp8 (ingested at load), which leaves the lm_head
+        as the only module quantized here.
+
+        Readers are the LogitsProcessor fp8 branch and the draft head that shares
+        this Parameter through set_embed_and_head. Both read the rowwise scale
+        attribute, so the assert fires when a new reader path finds it absent.
+        """
+        from sglang.kernels.ops.gemm import sm120_online_fp8 as _online
+
+        if not _online.online_fp8_enabled:
+            return
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        freed = 0
+        for module in self.modules():
+            if isinstance(module, ParallelLMHead):
+                freed += _online.replace_linears_with_fp8_copies([module])
+        torch.cuda.empty_cache()
+        logger.info(
+            "[mratsim's sm120-turbo r22] sm120 online FP8 replace: %d weights "
+            "rowwise-fp8 at load (%.2f GiB bf16 never materialized), freed "
+            "%.2f GiB (lm_head); the rowwise fp8 tensors are the resident weights",
+            _online._rowwise_load_stats["weights"],
+            _online._rowwise_load_stats["bytes_avoided"] / 2**30,
+            freed / 2**30,
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -1937,7 +2113,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         'text_config.ple_embedding_dtype="float8_e4m3fn" instead'
                     )
                 logger.info(
-                    "PLE embedding switched to fp8 storage: %s (%s)",
+                    "[mratsim's sm120-turbo r22] PLE embedding switched to fp8 storage: %s (%s)",
                     mod_prefix,
                     tuple(emb.weight.data.shape),
                 )
@@ -1960,7 +2136,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if not getattr(load_qwen4_exp_ple_shard, "_warned_downcast", False):
                     load_qwen4_exp_ple_shard._warned_downcast = True
                     logger.warning(
-                        "PLE checkpoint shards are %s but the embedding storage "
+                        "[mratsim's sm120-turbo r22] PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
                         "downcasting is lossy",
                         loaded_weight.dtype,
@@ -2164,6 +2340,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+
+        # sglang's serial loader does not call _post_load_weights
+        # (its other call sites serve capture, dummy, sharded, and remote-instance loads), so the model
+        # fires the hook itself.
+        self.post_load_weights()
+        self._log_weight_dtype_census()
 
         return loaded_params
 
