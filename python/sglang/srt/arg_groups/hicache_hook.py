@@ -49,6 +49,10 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    # Step 0: Select and validate the platform-specific XPU path before the
+    # generic layout/backend compatibility rules run.
+    resolve_xpu_hicache_compatibility(server_args)
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
@@ -57,6 +61,48 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def resolve_xpu_hicache_compatibility(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device != "xpu":
+        if cfg.hicache_io_backend == "xpu":
+            raise ValueError("--hicache-io-backend xpu requires --device xpu")
+        return
+
+    unsupported = []
+    if cfg.hicache_storage_backend is not None:
+        unsupported.append("--hicache-storage-backend")
+    if cfg.disaggregation_mode != "null":
+        unsupported.append("--disaggregation-mode")
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        unsupported.append("--disaggregation-decode-enable-offload-kvcache")
+    if cfg.speculative_algorithm is not None:
+        unsupported.append("--speculative-algorithm")
+    if cfg.enable_hisparse:
+        unsupported.append("--enable-hisparse")
+    if cfg.dcp_size > 1:
+        unsupported.append("--dcp-size")
+    if cfg.hicache_write_policy == "write_through_selective":
+        unsupported.append("--hicache-write-policy write_through_selective")
+    if unsupported:
+        raise NotImplementedError(
+            "XPU HiCache currently supports L1/L2 MHA and MLA caching only; "
+            f"unsupported options: {', '.join(unsupported)}"
+        )
+
+    resolutions = {}
+    if cfg.hicache_io_backend != "xpu":
+        resolutions["hicache_io_backend"] = "xpu"
+    if cfg.hicache_mem_layout != "layer_first":
+        resolutions["hicache_mem_layout"] = "layer_first"
+    if resolutions:
+        declare_resolution(
+            server_args, "_resolve_xpu_hicache_compatibility", **resolutions
+        )
+        logger.info(
+            "XPU HiCache uses the PyTorch xpu I/O backend with layer_first layout"
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

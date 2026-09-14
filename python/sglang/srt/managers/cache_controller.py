@@ -863,6 +863,8 @@ class HiCacheController:
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
+        elif self.io_backend == "xpu":
+            return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
                 device_indices = device_indices.cpu()
