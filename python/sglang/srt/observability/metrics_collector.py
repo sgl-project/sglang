@@ -156,6 +156,11 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Per host pool of a hybrid model's HostPoolGroup (kv, mamba, swa, ...):
+    # {pool label: tokens}; for the mamba pool a token is a checkpoint slot.
+    # Empty when the tree cache has no host pool group.
+    hicache_host_pool_used_tokens: Dict[str, int] = field(default_factory=dict)
+    hicache_host_pool_total_tokens: Dict[str, int] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -649,6 +654,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            # Per-pool view of a hybrid model's host tier (HostPoolGroup):
+            # the anchor gauges above cover the KV pool only, while the
+            # mamba/swa/indexer host pools have their own capacity and
+            # eviction pressure.
+            self.hicache_host_pool_used_tokens = Gauge(
+                name="sglang:hicache_host_pool_used_tokens",
+                documentation="Tokens currently used in each host cache pool "
+                "(kv, mamba, swa, ...); one mamba token is one state "
+                "checkpoint slot.",
+                labelnames=list(labels.keys()) + ["pool"],
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_total_tokens = Gauge(
+                name="sglang:hicache_host_pool_total_tokens",
+                documentation="Total capacity of each host cache pool in "
+                "tokens (kv, mamba, swa, ...).",
+                labelnames=list(labels.keys()) + ["pool"],
                 multiprocess_mode="mostrecent",
             )
 
@@ -1441,6 +1465,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for pool, used in stats.hicache_host_pool_used_tokens.items():
+                self.hicache_host_pool_used_tokens.labels(**self.labels, pool=pool).set(
+                    used
+                )
+            for pool, total in stats.hicache_host_pool_total_tokens.items():
+                self.hicache_host_pool_total_tokens.labels(
+                    **self.labels, pool=pool
+                ).set(total)
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -2209,6 +2241,17 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["pool"],
         )
 
+        # Per-pool host (L2) eviction. Restores per pool are already
+        # sglang:load_back_tokens_total{pool}; this is the other side.
+        self.host_pool_evicted_num_tokens = Counter(
+            name="sglang:hicache_host_pool_evicted_tokens_total",
+            documentation="Host (L2) slots freed by host-tier eviction, by "
+            "host pool (kv, swa, mamba, ...); one mamba slot is one state "
+            "checkpoint. KV counted here under mamba pressure is a prefix "
+            "that lost its host copy because its checkpoints were evicted.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
         self.backup_duration_seconds = Histogram(
             name="sglang:hicache_backup_duration_seconds",
             documentation="Time taken to back up KV cache from GPU to local "
@@ -2263,6 +2306,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)
+
+    def increment_host_pool_evicted_tokens(self, num_tokens: int, pool: str) -> None:
+        self.host_pool_evicted_num_tokens.labels(**self.labels, pool=pool).inc(
+            num_tokens
+        )
 
     def observe_eviction_duration(self, duration_seconds: float) -> None:
         self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)

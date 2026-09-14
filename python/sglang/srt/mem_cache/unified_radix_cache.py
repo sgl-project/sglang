@@ -81,6 +81,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.observability.hicache_pool_stats import host_pool_eviction_counts
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -1299,8 +1300,20 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        self._record_host_pool_evictions(result.host_frees)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
+
+    def _record_host_pool_evictions(
+        self, host_frees: dict[ComponentType, list[torch.Tensor]]
+    ) -> None:
+        """Count host slots a host-eviction step frees, per host pool, before
+        _free_values consumes them (sglang:hicache_host_pool_evicted_tokens_total).
+        KV freed under mamba pressure is a host prefix lost with its checkpoints."""
+        if self.metrics_collector is None or not host_frees:
+            return
+        for pool, freed in host_pool_eviction_counts(host_frees).items():
+            self.metrics_collector.increment_host_pool_evicted_tokens(freed, pool)
 
     # ---- Decode retraction ----
 

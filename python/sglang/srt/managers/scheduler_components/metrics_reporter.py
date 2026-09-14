@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability.hicache_pool_stats import collect_host_pool_stats
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -1155,6 +1156,14 @@ class SchedulerMetricsReporter:
         """
         if not self.scheduler.enable_hierarchical_cache:
             return
+
+        # Per-pool occupancy of a hybrid model's host tier (UnifiedRadixCache
+        # sets host_pool_group; other caches leave the dicts empty).
+        host_pool_group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
+        if host_pool_group is not None:
+            used, total = collect_host_pool_stats(host_pool_group)
+            self.stats.hicache_host_pool_used_tokens = used
+            self.stats.hicache_host_pool_total_tokens = total
 
         host_pool = getattr(
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
