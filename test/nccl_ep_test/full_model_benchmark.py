@@ -53,8 +53,8 @@ class Workload:
         ).hexdigest()
 
 
-def model_args(workload, configuration, nccl_port):
-    """Pure CLI construction, also exercised locally without loading weights."""
+def model_args(workload, configuration, nccl_port, *, resolve_tokenizer=False):
+    """Construct CLI options, optionally resolving the cached pinned tokenizer."""
     workload.validate()
     if configuration not in ("serial", "sbo", "tbo", "sbo-tbo"):
         raise ValueError(configuration)
@@ -98,7 +98,7 @@ def model_args(workload, configuration, nccl_port):
         "--context-length",
         str(workload.warmups + workload.samples + 16),
         "--max-running-requests",
-        str(max(workload.buckets)),
+        str(2 * max(workload.buckets)),  # Global limit is divided by attention DP.
         "--max-total-tokens",
         str(max(workload.buckets) * (workload.warmups + workload.samples + 16) + 1024),
         "--mem-fraction-static",
@@ -108,6 +108,15 @@ def model_args(workload, configuration, nccl_port):
         "--nccl-port",
         str(nccl_port),
     ]
+    if resolve_tokenizer:
+        from huggingface_hub import snapshot_download
+
+        # one_batch does not forward revision to its tokenizer loader. Resolve
+        # the cached snapshot before ServerArgs becomes read-only at setup.
+        args += [
+            "--tokenizer-path",
+            snapshot_download(MODEL, revision=REVISION, local_files_only=True),
+        ]
     if "sbo" in configuration:
         args.append("--enable-single-batch-overlap")
     if "tbo" in configuration:
@@ -122,10 +131,21 @@ def decode_step(tokens, batch, runner):
     batch.input_ids = tokens
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, runner)
-    forward_batch = ForwardBatch.init_new(batch, runner)
+    forward_batch = ForwardBatch.init_new(
+        batch, runner, return_hidden_states_before_norm=False
+    )
     tbo = forward_batch.can_run_tbo
     output = runner.forward(forward_batch)
     return output.logits_output.next_token_logits, output.can_run_graph, tbo
+
+
+def load_benchmark_model(server, nccl_port, rank):
+    from sglang.benchmark.one_batch import load_model
+
+    # The loader uses its own TCP endpoint. torchrun's agent only serves
+    # MASTER_PORT; inheriting its store policy leaves our port without a server.
+    os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+    return load_model(server, SimpleNamespace(nccl_port=nccl_port), rank, rank)
 
 
 def run(
@@ -134,10 +154,7 @@ def run(
     import torch
     import torch.distributed as dist
 
-    from sglang.benchmark.one_batch import (
-        load_model,
-        prepare_synthetic_inputs_for_latency_test,
-    )
+    from sglang.benchmark.one_batch import prepare_synthetic_inputs_for_latency_test
     from sglang.srt.distributed.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
@@ -183,7 +200,9 @@ def run(
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         server = ServerArgs.from_cli_args(
-            parser.parse_args(model_args(workload, configuration, nccl_port))
+            parser.parse_args(
+                model_args(workload, configuration, nccl_port, resolve_tokenizer=True)
+            )
         )
         if server.enable_eplb or server.json_model_override_args != "{}":
             raise ValueError(
@@ -195,11 +214,12 @@ def run(
         initialize_fp4_gemm_config(server)
         # Each worker uses the same externally checked port. PortArgs.init_new
         # would race its availability probe against rank 0 binding the store.
-        wrapper, _ = load_model(
-            server, SimpleNamespace(nccl_port=nccl_port), rank, rank
-        )
+        wrapper, _ = load_benchmark_model(server, nccl_port, rank)
         loaded = True
         runner = wrapper.torch_runner
+        report["captured_buckets"] = list(runner.decode_cuda_graph_runner.capture_bs)
+        if not set(workload.buckets) <= set(report["captured_buckets"]):
+            raise ValueError("Not all requested per-rank Graph buckets were captured")
         config = runner.model_config.hf_config
         if (
             config.num_hidden_layers,

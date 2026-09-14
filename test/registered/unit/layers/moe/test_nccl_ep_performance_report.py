@@ -1,11 +1,14 @@
 """CPU gates for matched workloads, full-model reports and bounded commands."""
 
 import json
+import socket
 import sqlite3
 import sys
 from dataclasses import asdict, replace
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 import torch
@@ -13,7 +16,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from nccl_ep_test.followup_server import MODEL, REVISION
-from nccl_ep_test.full_model_benchmark import Workload, decode_step, model_args
+from nccl_ep_test.full_model_benchmark import (
+    Workload,
+    decode_step,
+    load_benchmark_model,
+    model_args,
+)
 from nccl_ep_test.performance_report import compare_logits, compare_runs, validate_pair
 from nccl_ep_test.performance_suite import build_plan, execute
 from nccl_ep_test.performance_trace import analyze, union_ns
@@ -91,6 +99,7 @@ def test_model_commands_keep_full_weights_capacity_and_graph_buckets():
         assert "--enable-eplb" not in cmd and "--json-model-override-args" not in cmd
         assert cmd[cmd.index("--revision") + 1] == REVISION
         assert cmd[cmd.index("--cuda-graph-bs-decode") + 1 :][:3] == ["8", "32", "64"]
+        assert int(cmd[cmd.index("--max-running-requests") + 1]) // 2 >= 64
 
 
 def test_decode_driver_preserves_execution_evidence_at_runner_boundary(monkeypatch):
@@ -103,7 +112,8 @@ def test_decode_driver_preserves_execution_evidence_at_runner_boundary(monkeypat
     monkeypatch.setattr(
         one_batch, "_maybe_prepare_mlp_sync_batch", lambda *a: calls.append("sync")
     )
-    monkeypatch.setattr(ForwardBatch, "init_new", lambda *a: fb)
+    initialize = create_autospec(ForwardBatch.init_new, return_value=fb)
+    monkeypatch.setattr(ForwardBatch, "init_new", initialize)
     logits = torch.ones(2, 8)
     runner = SimpleNamespace(
         forward=lambda b: SimpleNamespace(
@@ -113,7 +123,50 @@ def test_decode_driver_preserves_execution_evidence_at_runner_boundary(monkeypat
     tokens = torch.tensor([2, 3])
     actual, graph, tbo = decode_step(tokens, batch, runner)
     assert calls == ["prepare", "sync"] and batch.input_ids is tokens
+    initialize.assert_called_once_with(
+        batch, runner, return_hidden_states_before_norm=False
+    )
     assert actual is logits and graph and tbo
+
+
+def test_model_loader_can_host_its_store_under_torchrun(monkeypatch, tmp_path):
+    from dataclasses import make_dataclass
+
+    import huggingface_hub
+
+    from sglang.benchmark import one_batch
+
+    frozen_args = make_dataclass("FrozenArgs", ["tokenizer_path"], frozen=True)
+    server = frozen_args(str(tmp_path))
+
+    def cached_snapshot(repo_id, *, revision, local_files_only):
+        assert (repo_id, revision, local_files_only) == (MODEL, REVISION, True)
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", cached_snapshot)
+    command = model_args(Workload(), "serial", 29619, resolve_tokenizer=True)
+    assert command[command.index("--tokenizer-path") + 1] == str(tmp_path)
+    # torchrun's agent serves MASTER_PORT, not the benchmark's independent port.
+    monkeypatch.setenv("TORCHELASTIC_USE_AGENT_STORE", "True")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    def loader(server, ports, gpu_id, rank):
+        assert server.tokenizer_path == str(tmp_path)
+        rendezvous = torch.distributed.rendezvous(
+            f"tcp://127.0.0.1:{ports.nccl_port}",
+            rank=rank,
+            world_size=1,
+            timeout=timedelta(seconds=1),
+        )
+        store, _, _ = next(rendezvous)
+        store.set("ready", "yes")
+        assert store.get("ready") == b"yes"
+        return "runner", "tokenizer"
+
+    monkeypatch.setattr(one_batch, "load_model", loader)
+    assert load_benchmark_model(server, port, 0) == ("runner", "tokenizer")
 
 
 def test_rank_alignment_and_global_dp_throughput():
