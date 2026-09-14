@@ -140,8 +140,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
-_k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 _moe_latent_mxfp4 = get_bool_env_var("SGLANG_K3_MOE_LATENT_MXFP4")
 _MOE_MXFP4_MIN_TOKENS = 2048
 
