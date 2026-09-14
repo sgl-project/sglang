@@ -275,7 +275,9 @@ def handle_load_format(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_load_format",
-            remote_instance_weight_loader_start_seed_via_nixl=validate_nixl(server_args),
+            remote_instance_weight_loader_start_seed_via_nixl=validate_nixl(
+                server_args
+            ),
         )
 
     # "ipc_cache" is an internal-only load format: ModelRunner sets it
