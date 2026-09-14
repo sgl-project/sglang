@@ -46,6 +46,8 @@ def estimate_swa_kv_tokens(
         # one window. Charging another whole window for a short resume can then
         # block admission forever on an idle pool. Reserve only its uncached
         # tail plus decode headroom, capped at the window.
+        # Including the extension also keeps the reservation large enough for
+        # this pass's prefill allocation.
         reserved = (
             allocated_tail
             + min(extend_input_len + max_new_tokens, sliding_window_size)
@@ -200,6 +202,8 @@ class SWAPrefillBudget(PrefillBudget):
         )
 
     def _chunk_cap(self, max_new_tokens, swa_host_hit_length=0):
+        # Only the sliding window stays locked between chunks, so a smaller
+        # chunk can bound the transient SWA footprint of a longer prompt.
         headroom = self.swa_tokens(
             0, max_new_tokens, swa_host_hit_length=swa_host_hit_length
         )
