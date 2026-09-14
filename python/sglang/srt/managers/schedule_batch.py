@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_schedule,
+    get_server_args,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
@@ -2680,6 +2681,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
+        mamba_state_chunk_size = get_server_args().mamba_state_chunk_size
         chunk_size = mamba_cache_chunk_size()
         # The donated depth has to be a radix node boundary. Read the tree's own
         # page rather than re-deriving how DCP widens it; the kernel still
@@ -2717,15 +2719,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
-            # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
-            # retrieve the correct mamba state from h by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
+            # Cache boundaries can be coarser than the kernel's intermediate-state
+            # boundaries (for example 128-token pages with 64-token states).
+            mamba_track_state_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // mamba_state_chunk_size)
+                * mamba_state_chunk_size
             )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+            if mamba_track_state_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
