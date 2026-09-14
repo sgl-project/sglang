@@ -64,7 +64,7 @@ def _peer(*, n_dst: int, dst_kv_layer_ids: list = (), item_len: int = ITEM_LEN):
 
 
 def _resolve(manager, peer, n_src, n_dst):
-    return NixlKVManager._pp_layer_offset_dst_indices(
+    return NixlKVManager._build_transfer_dst_indices(
         manager, peer_info=peer, n_src=n_src, n_dst=n_dst
     )
 
@@ -117,14 +117,12 @@ class TestPpPrefillToUnpipelinedDecode(CustomTestCase):
 
 
 class TestExistingPairingIsUnchanged(CustomTestCase):
-    """Derived property: the span is reachable only from the geometry the layer-id
-    pairing cannot express. Every other deployment must fall through to
-    build_transfer_entry_pairs, which the resolver signals with None."""
+    """All layouts outside heterogeneous plain MLA retain existing pairing."""
 
-    def test_unpipelined_prefill_defers(self):
+    def test_unpipelined_prefill_uses_positional_pairing(self):
         for n_dst in (NUM_LAYERS, NUM_LAYERS + 1):
             with self.subTest(n_dst=n_dst):
-                self.assertIsNone(
+                self.assertEqual(
                     _resolve(
                         _StubKVManager(
                             pp_size=1, prefill_start_layer=0, n_src=NUM_LAYERS
@@ -132,24 +130,26 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
                         _peer(n_dst=n_dst),
                         NUM_LAYERS,
                         n_dst,
-                    )
+                    ),
+                    list(range(NUM_LAYERS)),
                 )
 
-    def test_matched_pp_defers(self):
+    def test_matched_pp_uses_identity_pairing(self):
         for start, num in _pp_layer_split(NUM_LAYERS, 4):
             with self.subTest(start_layer=start):
-                self.assertIsNone(
+                self.assertEqual(
                     _resolve(
                         _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
                         _peer(n_dst=num),
                         num,
                         num,
-                    )
+                    ),
+                    list(range(num)),
                 )
 
-    def test_published_layer_ids_defer(self):
+    def test_one_sided_layer_ids_are_rejected(self):
         start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
-        self.assertIsNone(
+        with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):
             _resolve(
                 _StubKVManager(
                     pp_size=4,
@@ -161,17 +161,15 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
                 num,
                 NUM_LAYERS,
             )
-        )
-        self.assertIsNone(
+        with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):
             _resolve(
                 _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
                 _peer(n_dst=NUM_LAYERS, dst_kv_layer_ids=range(NUM_LAYERS)),
                 num,
                 NUM_LAYERS,
             )
-        )
 
-    def test_pools_that_are_not_one_region_per_layer_defer(self):
+    def test_heterogeneous_non_plain_mla_requires_layer_ids(self):
         start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
         for label, kwargs, n_dst in (
             ("mha", {"is_mla_backend": False}, 2 * NUM_LAYERS),
@@ -183,7 +181,9 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
             ),
         ):
             with self.subTest(pool=label):
-                self.assertIsNone(
+                with self.assertRaisesRegex(
+                    RuntimeError, "PP-heterogeneous transfer requires layer ids"
+                ):
                     _resolve(
                         _StubKVManager(
                             pp_size=4,
@@ -195,7 +195,6 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
                         num,
                         n_dst,
                     )
-                )
 
 
 class TestMatchedPpWithDraftRegions(CustomTestCase):
@@ -221,19 +220,20 @@ class TestMatchedPpWithDraftRegions(CustomTestCase):
     def test_later_ranks_are_rejected(self):
         for start, num in _pp_layer_split(NUM_LAYERS, 4)[1:]:
             with self.subTest(start_layer=start):
-                self.assertIsNone(
+                with self.assertRaisesRegex(
+                    RuntimeError, "PP-heterogeneous transfer requires layer ids"
+                ):
                     _resolve(
                         _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
                         _peer(n_dst=num + 1),
                         num,
                         num + 1,
                     )
-                )
 
 
 class TestPointerAndIndexViewsAgree(CustomTestCase):
     """Derived property: get_mla_kv_ptrs_with_pp (pointer view) and
-    _pp_layer_offset_dst_indices (index view) read the same span, so a change to
+    _build_transfer_dst_indices (index view) read the same span, so a change to
     one must not silently diverge from the other."""
 
     def test_views_select_the_same_destination_entries(self):

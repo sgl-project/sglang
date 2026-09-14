@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -642,6 +643,50 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
     assert torch.equal(output_result.auxiliary_host_output.values, device_output.values)
     assert all("sampling_observer_output" not in key for key in tensors)
     receiver.future_map.stash.assert_called_once()
+
+
+@pytest.mark.parametrize("dsa_topk_indices", [None, torch.tensor([[2, 5, 7]])])
+def test_pipeline_parallel_dsa_seed_round_trip(dsa_topk_indices):
+    draft_input = EagleDraftInput(
+        topk_p=torch.tensor([[0.8, 0.2]]),
+        topk_index=torch.tensor([[11, 13]]),
+        hidden_states=torch.tensor([[1.0, 2.0]]),
+        dsa_topk_indices=dsa_topk_indices,
+    )
+    result = GenerationBatchResult(
+        logits_output=None,
+        next_token_ids=torch.tensor([17]),
+        next_draft_input=draft_input,
+    )
+    batch = SimpleNamespace(
+        return_logprob=False,
+        req_pool_indices=torch.tensor([3]),
+        input_ids=torch.tensor([5]),
+        spec_info=None,
+    )
+
+    tensors = Scheduler._pp_prepare_tensor_dict(
+        object.__new__(Scheduler), result, batch
+    )
+    if dsa_topk_indices is None:
+        assert "draft_dsa_topk_indices" not in tensors
+    else:
+        assert torch.equal(tensors["draft_dsa_topk_indices"], dsa_topk_indices)
+
+    receiver = object.__new__(Scheduler)
+    receiver.pp_group = SimpleNamespace(is_first_rank=False)
+    receiver.future_map = SimpleNamespace(stash=Mock())
+    Scheduler._pp_prep_batch_result(
+        receiver,
+        batch,
+        PPBatchMetadata(can_run_cuda_graph=True),
+        PPProxyTensors(tensors),
+    )
+
+    if dsa_topk_indices is None:
+        assert batch.spec_info.dsa_topk_indices is None
+    else:
+        assert torch.equal(batch.spec_info.dsa_topk_indices, dsa_topk_indices)
 
 
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():

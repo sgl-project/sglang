@@ -1020,29 +1020,45 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
-    def _pp_layer_offset_dst_indices(
+    def _build_transfer_dst_indices(
         self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
-    ) -> Optional[List[int]]:
-        # Index view of _mla_kv_entry_span_with_pp: the prepped path pre-registers
-        # descriptor lists, so it needs entry indices where the non-prepped path takes
-        # sliced pointers. None keeps the caller on its layer-id pairing.
-        if self.pp_size <= 1 or n_src == n_dst:
-            return None
-        if self.kv_args.kv_layer_ids or peer_info.dst_kv_layer_ids:
-            return None
-        # Only a plain MLA pool is one region per layer: MHA registers a K block then a
-        # V block, the hybrid pool is dense over full-attention layers, and compressed
-        # MLA groups regions by compression bucket.
-        if not self.is_mla_backend or self.is_hybrid_mla_backend:
-            return None
-        if self.kv_args.mla_compression_ratios:
-            return None
+    ) -> List[int]:
+        """Map source entries to destination entries for this transfer.
+
+        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
+        All other layouts use explicit layer IDs, or positional pairing for non-PP.
+        """
+        use_pp_mla_offsets = (
+            self.pp_size > 1
+            and n_src != n_dst
+            and not self.kv_args.kv_layer_ids
+            and not peer_info.dst_kv_layer_ids
+            and self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.mla_compression_ratios
+        )
+        if not use_pp_mla_offsets:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            return [j for _, j in pairs]
 
         start, end = self._mla_kv_entry_span_with_pp(n_src)
         # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
         # span is a matched-pp stage above 0, whose entries start at its own index 0.
         if end > n_dst:
-            return None
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            return [j for _, j in pairs]
 
         indices = list(range(start, end))
         src_item_lens = list(self.kv_args.kv_item_lens)
@@ -1141,18 +1157,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
-            dst_indices = self._pp_layer_offset_dst_indices(
+            dst_indices = self._build_transfer_dst_indices(
                 peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
-            if dst_indices is None:
-                pairs = build_transfer_entry_pairs(
-                    self.kv_args.kv_layer_ids,
-                    peer_info.dst_kv_layer_ids,
-                    n_src,
-                    n_dst,
-                    allow_positional_fallback=self.pp_size == 1,
-                )
-                dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [

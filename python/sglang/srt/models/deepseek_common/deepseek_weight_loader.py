@@ -403,12 +403,7 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip embed_tokens on a pipeline stage that has no embedding
-                        # module. Keying on the parameter rather than on the rank covers
-                        # the last stage, which materializes one for its NextN draft to
-                        # borrow and would otherwise hand the draft an uninitialized
-                        # torch.empty. A PPMissingLayer registers no parameters, so a
-                        # middle stage still skips.
+                        # The last PP stage also owns an embedding for its NextN draft.
                         if ".embed_tokens." in name and name not in params_dict:
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism

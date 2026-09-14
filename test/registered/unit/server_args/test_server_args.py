@@ -2112,13 +2112,9 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
 
 class TestPipelineParallelCompat(CustomTestCase):
-    """What `pipeline-parallel-size > 1` rules out.
+    """Features supported with `pipeline-parallel-size > 1`."""
 
-    Speculative decoding is NOT on that list. The draft is built on the last pipeline
-    stage only (`EAGLEWorkerV2._hosts_draft`) and every earlier stage forwards the
-    target's PP proxy tensors and returns; that machinery is platform-neutral, so the
-    check no longer keys on the platform.
-    """
+    _SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
 
     @staticmethod
     def _cfg(**overrides):
@@ -2132,68 +2128,75 @@ class TestPipelineParallelCompat(CustomTestCase):
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
 
-    def _is_npu(self, value: bool):
-        return patch(
-            "sglang.srt.arg_groups.validation_hook.get_platform",
-            return_value=SimpleNamespace(is_npu=value),
-        )
-
     def test_overlap_schedule_must_be_off(self):
-        with self._is_npu(False):
-            with self.assertRaisesRegex(AssertionError, "overlap schedule"):
-                check_pipeline_parallel_compat(
-                    self._cfg(disable_overlap_schedule=False)
-                )
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
 
     def test_no_speculative_decoding_is_fine(self):
-        with self._is_npu(False):
-            check_pipeline_parallel_compat(self._cfg())
+        check_pipeline_parallel_compat(self._cfg())
 
-    def test_eagle_is_allowed_off_npu(self):
-        for mode in ("prefill", "decode", "null"):
-            with self.subTest(disaggregation_mode=mode), self._is_npu(False):
+    def test_eagle_is_allowed_on_prefill(self):
+        check_pipeline_parallel_compat(
+            self._cfg(speculative_algorithm="EAGLE"),
+            model_architecture=self._SUPPORTED_ARCH,
+        )
+
+    def test_eagle_is_rejected_outside_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(disaggregation_mode=mode):
+                with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="EAGLE", disaggregation_mode=mode
+                        ),
+                        model_architecture=self._SUPPORTED_ARCH,
+                    )
+
+    def test_eagle_is_rejected_for_unsupported_model(self):
+        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM models"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE"),
+                model_architecture="LlamaForCausalLM",
+            )
+
+    def test_supported_deepseek_architectures(self):
+        for architecture in (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
                 check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE", disaggregation_mode=mode)
+                    self._cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=architecture,
                 )
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
         validation hook runs, so the check only ever sees the resolved name."""
-        with self._is_npu(False):
-            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="eagle"))
+        check_pipeline_parallel_compat(
+            self._cfg(speculative_algorithm="eagle"),
+            model_architecture=self._SUPPORTED_ARCH,
+        )
 
     def test_non_eagle_speculative_algorithms_are_rejected(self):
-        with self._is_npu(False):
-            with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-                check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE3")
-                )
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE3"),
+                model_architecture=self._SUPPORTED_ARCH,
+            )
 
     def test_multi_layer_eagle_is_rejected(self):
-        with self._is_npu(False):
-            with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-                check_pipeline_parallel_compat(
-                    self._cfg(
-                        speculative_algorithm="EAGLE", enable_multi_layer_eagle=True
-                    )
-                )
-
-    def test_npu_still_restricts_speculative_decoding_to_prefill_nodes(self):
-        with self._is_npu(True):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
             check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE", disaggregation_mode="prefill")
+                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True),
+                model_architecture=self._SUPPORTED_ARCH,
             )
-            with self.assertRaisesRegex(AssertionError, "prefill nodes"):
-                check_pipeline_parallel_compat(
-                    self._cfg(
-                        speculative_algorithm="EAGLE", disaggregation_mode="decode"
-                    )
-                )
 
     def test_min_free_slots_delay_is_rejected(self):
-        with self._is_npu(False):
-            with self.assertRaisesRegex(AssertionError, "min-free-slots-delay"):
-                check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
+        with self.assertRaisesRegex(AssertionError, "min-free-slots-delay"):
+            check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
 
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
