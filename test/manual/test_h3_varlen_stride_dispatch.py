@@ -98,3 +98,33 @@ def test_only_supported_opted_in_gfx942_calls_receive_keyword(
 
 def test_no_global_stride_mutation():
     assert "mha_set_use_int64_strides" not in SOURCE.read_text()
+
+
+@pytest.mark.parametrize(
+    "platform", ["cuda", "rocm", "cpu", "mps", "npu", "xpu", "musa", "other"]
+)
+def test_h3_full_loop_accepts_rocm_and_preserves_platform_boundary(platform):
+    """The stride adapter must be reachable through the H3 ROCm pipeline."""
+    source = SOURCE.parents[3] / (
+        "pipelines_core/stages/model_specific_stages/minimax_h3/stages/denoising.py"
+    )
+    method = next(
+        n
+        for n in ast.walk(ast.parse(source.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_full_loop"
+    )
+    guard = next(n for n in method.body if isinstance(n, ast.If))
+    ns = {
+        "current_platform": SimpleNamespace(
+            is_cuda=lambda: platform == "cuda",
+            is_rocm=lambda: platform == "rocm",
+            is_cpu=lambda: platform == "cpu",
+            is_mps=lambda: platform == "mps",
+            is_npu=lambda: platform == "npu",
+            is_xpu=lambda: platform == "xpu",
+        )
+    }
+    rejects_platform = eval(
+        compile(ast.Expression(guard.test), str(source), "eval"), ns
+    )
+    assert rejects_platform == (platform in ("musa", "other"))
