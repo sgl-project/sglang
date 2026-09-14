@@ -261,7 +261,6 @@ def fp8_mqa_logits_make_fused_kv(
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
 
 
-# MQA-logits memory budget shared by the DSA and DSV4 indexers.
 MQA_LOGITS_BYTES_PER_ELEM = 4
 MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
 MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
