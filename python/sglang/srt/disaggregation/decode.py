@@ -966,7 +966,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            full_allocatable_tokens -= full_required
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                count_retracted=False,
+                extra_reserved_reqs=len(resumed_reqs),
+            )
             if swa_allocatable_tokens is not None:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                     count_retracted=False,
@@ -1843,8 +1846,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # pool) over-reserves SWA in steady state. Cap by the actual
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
-        swa_total = self.token_to_kv_pool_allocator.size_swa
-        swa_available = self.token_to_kv_pool_allocator.swa_available_size()
+        allocator = self.token_to_kv_pool_allocator
+        if self._supports_unified_swa_reservation():
+            _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
+                full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
+            )
+        else:
+            swa_total = allocator.size_swa
+            swa_available = allocator.swa_available_size()
         # Per-request SWA ring: cached prefixes still report swa_evictable, but
         # evicting them frees no ring space.
         swa_evictable = (
