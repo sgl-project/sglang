@@ -13,6 +13,9 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    page_interleave_shard_size,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -34,11 +37,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -86,11 +85,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import (
-    get_memory,
-    get_model,
-    get_observability,
-)
+from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -107,6 +102,21 @@ if TYPE_CHECKING:
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
+
+
+def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
+    num_pages = 0
+    for transfer in transfers:
+        if transfer.host_indices is None:
+            continue
+        num_slots = len(transfer.host_indices)
+        assert num_slots % page_size == 0, (
+            f"C128 load-back transfers must contain complete physical pages: "
+            f"{num_slots=}, {page_size=}"
+        )
+        num_pages += num_slots // page_size
+    return num_pages
+
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
@@ -199,6 +209,22 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        if (
+            page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
+            and not self.tree_core.supports_rotation_base
+        ):
+            # A core that does not model rotation_base would never decline a
+            # cross-base graft, and the resulting cached path's page owners are
+            # not one cyclic run: later readers take a negative allgather pad or
+            # silently read another rank's scratch rows. Fail at construction
+            # rather than corrupt reads at serve time.
+            raise ValueError(
+                "logical-page KV sharding requires a tree core that tracks "
+                "rotation bases; "
+                f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                "does not."
+            )
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -437,6 +463,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
         if self.host_memory_mode == "buffer_only":
+            self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
@@ -542,6 +569,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_chunk_cache(self) -> bool:
         return self.disable
 
+    @rank_consensus(
+        same_params=["len(params.key)"],
+        same_results=["result.prefix_len"],
+    )
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -561,9 +592,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # Drain still-pending actions so frees reach the allocator on abort.
             self._apply_cache_actions(self.tree_core.end_insert())
 
+    @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
+    @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 
@@ -577,11 +610,62 @@ class UnifiedRadixCache(BasePrefixCache):
 
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
-            ct: self._component_available_size(ct) + request_cnt
+            ct: (ct, self._component_available_size(ct) + request_cnt)
             for ct, request_cnt in request_by_type.items()
             if request_cnt > 0
         }
-        return self._evict(params, available_size_targets)
+        allocator = self.token_to_kv_pool_allocator
+        mamba_full_donor = allocator.mamba_full_cache_donor()
+        mamba_target = available_size_targets.get(ComponentType.MAMBA)
+        initial_params = params
+        if mamba_target is not None and mamba_full_donor is not None:
+            # Full KV can supply bytes but cannot recycle Mamba virtual IDs.
+            mamba_id_shortfall = max(
+                0,
+                mamba_target[1]
+                - self.req_to_token_pool.mamba_allocator.available_size(),
+            )
+            initial_params = EvictParams(
+                num_tokens=params.num_tokens,
+                swa_num_tokens=params.swa_num_tokens,
+                mamba_num=mamba_id_shortfall,
+            )
+        result = self._evict(initial_params, available_size_targets)
+
+        if mamba_target is not None and mamba_full_donor is not None:
+            mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
+            mamba_free_ids = self.req_to_token_pool.mamba_allocator.available_size()
+            mamba_capacity = self._component_available_size(ComponentType.MAMBA)
+
+            if mamba_free_ids >= mamba_target[1] and mamba_capacity < mamba_target[1]:
+                full_evictable = self.full_evictable_size()
+                if full_evictable > 0:
+                    donor_result = self._evict(
+                        EvictParams(num_tokens=full_evictable),
+                        {ComponentType.FULL: mamba_target},
+                    )
+                    result.num_tokens_evicted += donor_result.num_tokens_evicted
+                    result.swa_num_tokens_evicted += donor_result.swa_num_tokens_evicted
+                    result.mamba_num_evicted += donor_result.mamba_num_evicted
+
+                # Preserve Mamba-victim recovery if Full cannot fund the target.
+                if (
+                    self._component_available_size(ComponentType.MAMBA)
+                    < mamba_target[1]
+                ):
+                    mamba_evictable = self.mamba_evictable_size()
+                    if mamba_evictable > 0:
+                        fallback_result = self._evict(
+                            EvictParams(mamba_num=mamba_evictable),
+                            {ComponentType.MAMBA: mamba_target},
+                        )
+                        result.num_tokens_evicted += fallback_result.num_tokens_evicted
+                        result.swa_num_tokens_evicted += (
+                            fallback_result.swa_num_tokens_evicted
+                        )
+                        result.mamba_num_evicted += fallback_result.mamba_num_evicted
+
+        return result
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
@@ -611,7 +695,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict(
         self,
         params: EvictParams,
-        available_size_targets: Optional[dict[ComponentType, int]] = None,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -712,22 +798,45 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
-        available_size_targets: Optional[dict[ComponentType, int]] = None,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
+        last_mamba_donor_check = 0
+        mamba_donor_prepared = False
 
         def target_reached(component_type: ComponentType) -> bool:
+            nonlocal last_mamba_donor_check, mamba_donor_prepared
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
-            # Do not compact on every eviction step. Shared allocators include
-            # drainable peer holes here and flush the peer once in alloc().
-            return (
-                target is not None
-                and self._component_available_size(component_type) >= target
-            )
+            if target is None:
+                return False
+            target_component, target_size = target
+            # A Full-leaf cascade can release Mamba or SWA state directly.
+            if self._component_available_size(target_component) >= target_size:
+                return True
+            if (
+                component_type == ComponentType.FULL
+                and target_component == ComponentType.MAMBA
+            ):
+                donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
+                assert donor is not None, "Mamba target requires a Full donor"
+                recheck_after = (
+                    1
+                    if mamba_donor_prepared
+                    else donor.full_tokens_before_mamba_recheck(target_size)
+                )
+                if tracker[component_type] - last_mamba_donor_check < recheck_after:
+                    return False
+                donor.prepare_mamba_allocation(target_size)
+                last_mamba_donor_check = tracker[component_type]
+                mamba_donor_prepared = True
+            # Schedulable capacity includes donor holes that allocation can compact.
+            return self._component_available_size(target_component) >= target_size
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
@@ -737,16 +846,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
-                while not target_reached(ct):
+                while True:
                     node_id, made_progress = self._evict_device_next_node(ct, tracker)
                     if node_id is None:
-                        if made_progress:
-                            # Internal tombstone frees are now allocator-visible;
-                            # recheck the allocation target before walking again.
-                            continue
-                        break
-                    backup_kv = self._evict_device_leaf(node_id, tracker)
-                    if backup_kv is not None:
+                        if not made_progress:
+                            break
+                    else:
+                        backup_kv = self._evict_device_leaf(node_id, tracker)
+                    if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
@@ -768,6 +875,8 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
+                    if target_reached(ct):
+                        break
             finally:
                 self.tree_core.evict_device_end(ct)
 
@@ -802,7 +911,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node_id, params)
@@ -813,28 +922,18 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
-        """Release the tree lock a request holds on its last_node, honoring the
-        components it skipped locking so it never drops a lock it never took."""
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=req.swa_uuid_for_lock,
-                skip_lock_node_ids=req.skip_lock_node_ids,
-            ),
-            skip_swa=skip_swa,
-        )
+        """Release the tree lock a request holds on its last_node with the
+        receipt its acquire returned, so it never drops a lock it never took."""
+        self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int] = None,
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> None:
         if self.disable:
             return
-        result = self.tree_core.dec_swa_lock_only(
-            node_id, swa_uuid_for_lock, skip_lock_node_ids
-        )
+        result = self.tree_core.dec_swa_lock_only(node_id, params)
         self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -843,12 +942,13 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.inc_host_lock_ref(node_id)
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
@@ -873,6 +973,7 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                rotation_base=req.kv_rotation_base,
             )
 
             # components prepare insert data + return effective cache_len
@@ -909,8 +1010,55 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail (+ deferred truncation tail)
-            ranges = [(page_aligned_len, len(kv_indices))]
+            # Keep the prompt as an independent radix node. Finished requests
+            # append a short, request-specific output to a much longer prompt;
+            # without this split the prompt and output form one leaf and are
+            # evicted together. Re-inserting the prompt only changes topology:
+            # prev_prefix_len prevents the overlapping KV indices from being
+            # treated as duplicate allocations and freed. A declined rotation
+            # tail releases everything past the protected prefix below, so the
+            # split is skipped there rather than handing the tree rows that
+            # are about to be freed.
+            prompt_key = RadixKey(
+                req.origin_input_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if (
+                not result.rotation_tail_declined
+                and len(self._components_tuple) == 1
+                and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+                and 0 < len(prompt_key) < len(radix_key)
+            ):
+                self.insert(
+                    replace(
+                        insert_params,
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        prev_prefix_len=len(prompt_key),
+                        priority=insert_params.priority + 1,
+                        # Topology-only re-insert: the request itself created
+                        # these nodes moments ago, so counting it as a hit is
+                        # the same self-referencing inflation `chunked` exists
+                        # to suppress. hit_count drives eviction order, so an
+                        # extra bump here would silently promote every prompt
+                        # node into the protected segment.
+                        chunked=True,
+                    )
+                )
+
+            # Free unaligned tail (+ deferred truncation tail). A rotation
+            # decline inserted nothing, so the whole span past the protected
+            # prefix stayed request-owned and is released here instead.
+            free_from = (
+                # min(): the protected prefix can already run past a truncated
+                # cache_len, and free_kv_row takes ascending ranges only.
+                min(req.kv.cache_protected_len, len(kv_indices))
+                if result.rotation_tail_declined
+                else page_aligned_len
+            )
+            ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
                 ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
@@ -938,6 +1086,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -960,6 +1109,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1006,6 +1156,23 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
+        if result.rotation_tail_declined:
+            # Rotation-base discontinuity with the matched chain (pipelined
+            # batches raced this request's insert against another chain over
+            # the same prefix). Adopting the canonical locs would leave this
+            # request's row mixing two rotation runs, which the cyclic-owner
+            # gather contract forbids -- keep the request entirely on its own
+            # pages: no dedup free, no rebind, no protection change. The insert
+            # declined before its walk, so nothing was freed underneath us. The
+            # final cache_finished_req releases everything past the protected
+            # prefix.
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=insert_params
+                )
+            return
+
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
@@ -1023,20 +1190,20 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        self._dec_req_lock(req)
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
         # already COW'd to the request's own slot, never read from this node again).
         # Safe only because any future COW source is the COWing request's own
         # admission-locked last_node (recorded only if still present, locked before
         # the next alloc) -- not this evictable node. A scheduler that matched a
         # whole batch before locking would break that. Off = original full lock.
-        skip_lock_components = (
-            (ComponentType.MAMBA,)
-            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
-            else ()
-        )
         lock_result = self.inc_lock_ref(
-            new_last_node, skip_lock_components=skip_lock_components
+            new_last_node,
+            skip_lock_components=(
+                (ComponentType.MAMBA,)
+                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+                else ()
+            ),
         )
 
         # Update req fields
@@ -1048,9 +1215,8 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        # carry the skip set so this node's dec releases only what we locked
-        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+        # Carry the receipt so this node's dec releases only what we locked.
+        req.lock_receipt = lock_result.to_dec_params()
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
@@ -1529,11 +1695,26 @@ class UnifiedRadixCache(BasePrefixCache):
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
+            mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+
+        c128_allocator = getattr(
+            self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+        )
+        if c128_allocator is not None:
+            c128_num_pages = _c128_transfer_num_pages(
+                comp_xfers.get(ComponentType.C128, ()),
+                c128_allocator.page_size,
+            )
+            if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
+                self, c128_num_pages
+            ):
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
 
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
@@ -1624,6 +1805,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1668,14 +1850,21 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def rotation_base_of(self, node_id: Optional[NodeId]) -> Optional[int]:
+        if node_id is None:
+            return None
+        return self.tree_core.rotation_base_of(node_id)
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
-        """Synchronously probe L3 storage for the reusable prefix length."""
+        """Probe L3 with the request namespace."""
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -1683,7 +1872,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
@@ -1712,6 +1900,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    @rank_consensus(same_params=["req_id", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -2907,6 +3096,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    @rank_consensus(same_params=["params.host_hit_length"])
     def init_load_back(
         self,
         params: InitLoadBackParams,
