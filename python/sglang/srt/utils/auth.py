@@ -168,6 +168,23 @@ def add_api_key_middleware(
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
+                if scope["type"] == "websocket":
+                    headers = dict(scope.get("headers", []))
+                    authz = headers.get(b"authorization", b"").decode()
+                    level = _get_auth_level_from_app_and_scope(
+                        self.fastapi_app, scope
+                    )
+                    decision = decide_request_auth(
+                        method="GET",
+                        path=scope.get("path", ""),
+                        authorization_header=authz or None,
+                        api_key=self.api_key,
+                        admin_api_key=self.admin_api_key,
+                        auth_level=level,
+                    )
+                    if not decision.allowed:
+                        await send({"type": "websocket.close", "code": 4001})
+                        return
                 await self.app(scope, receive, send)
                 return
 
