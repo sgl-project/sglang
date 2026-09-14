@@ -1,7 +1,7 @@
 ---
 title: "Reasoning Parser"
 metatags:
-    description: "SGLang reasoning parser: separate thinking content from output for DeepSeek R1, Qwen3, Kimi K2, GPT-OSS, and Apertus reasoning models."
+    description: "SGLang reasoning parser: separate thinking content from output for DeepSeek R1, Qwen3, Kimi K2, GPT-OSS, LLM-jp-4, and Apertus reasoning models."
 ---
 SGLang supports parsing reasoning content out from "normal" content for reasoning models such as [DeepSeek R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
 
@@ -65,6 +65,12 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`gpt-oss`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>N/A</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[LLM-jp-4 thinking models](https://huggingface.co/llm-jp/llm-jp-4-8b-thinking)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`&lt;|channel|&gt;analysis&lt;|message|&gt;` … `&lt;|end|&gt;`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`gpt-oss`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Also use `--tool-call-parser gpt-oss` for tool use.</td>
+    </tr>
   </tbody>
 </table>
 ### Model-Specific Behaviors
@@ -89,6 +95,9 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
 
 **GPT OSS:**
 - GPT OSS: Uses special `<|channel|>analysis<|message|>` and `<|end|>` tags
+
+**LLM-jp-4:**
+- LLM-jp-4 thinking models use a Harmony-compatible output format. Specify `--reasoning-parser gpt-oss`; for tool use, also specify `--tool-call-parser gpt-oss`.
 
 
 ## Usage
