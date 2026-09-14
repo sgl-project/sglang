@@ -863,18 +863,15 @@ def flash_decode_with_topk_idx(
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
-    # Packed scoring (chain verify): ``packed_queries`` consecutive rows belong to
-    # one request and share its K cache, so score them in ONE pass as extra q
-    # heads against the request's longest causal length (K reads dominate the
-    # score kernel; the block max/lse over at most ``packed_queries - 1``
-    # not-yet-visible keys of the tail block only affects that block, and the
-    # per-row top-k below still bounds each row by its own length). The top-k
-    # then runs per original row. Score-only layers only (disable_index_value).
+    # packed rows of one request share its K cache, so score them as extra q heads in one pass
     pack = int(packed_queries) if packed_queries else 1
+    if pack > 1 and local_blocks <= 0:
+        # exactness needs the per-row local re-forcing below, so no local blocks means no packing
+        pack = 1
     if pack > 1:
         assert disable_index_value and not use_dense_main_attn
         assert batch_size % pack == 0
-        rows_seq_lens, rows_slot_ids, rows_batch, rows_heads = (
+        row_seq_lens, row_slot_ids, num_rows, heads_per_row = (
             seq_lens,
             slot_ids,
             batch_size,
@@ -883,8 +880,8 @@ def flash_decode_with_topk_idx(
         batch_size = batch_size // pack
         q = q.reshape(batch_size, pack * num_q_heads, head_dim)
         num_q_heads = pack * num_q_heads
-        seq_lens = rows_seq_lens.view(batch_size, pack)[:, -1].contiguous()
-        slot_ids = rows_slot_ids.view(batch_size, pack)[:, 0].contiguous()
+        seq_lens = row_seq_lens.view(batch_size, pack)[:, -1].contiguous()
+        slot_ids = row_slot_ids.view(batch_size, pack)[:, 0].contiguous()
     gqa_group_size = num_q_heads // num_kv_heads
     # sm scale
     if sm_scale is None:
@@ -1032,26 +1029,21 @@ def flash_decode_with_topk_idx(
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
     if pack > 1:
-        # [pack*H, bs, blocks] -> [H, bs*pack, blocks] with request-major rows.
-        H = rows_heads
+        # [pack*H, bs, blocks] -> [H, bs*pack, blocks], request-major rows
         score = (
-            score.view(pack, H, batch_size, score.shape[2])
+            score.view(pack, heads_per_row, batch_size, score.shape[2])
             .permute(1, 2, 0, 3)
-            .reshape(H, batch_size * pack, score.shape[2])
+            .reshape(heads_per_row, batch_size * pack, score.shape[2])
         )
-        batch_size, num_q_heads = rows_batch, rows_heads
-        seq_lens, slot_ids = rows_seq_lens, rows_slot_ids
-        if local_blocks > 0:
-            # The score kernel forced the local blocks of the request's longest
-            # row; rows that end in an earlier block need their own last
-            # block(s) forced (same 1e29 marker), or the boundary case would
-            # drop the local block from a shorter row's top-k.
-            num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
-            blocks = torch.arange(score.shape[2], device=score.device)
-            is_local = (
-                blocks[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
-            ) & (blocks[None, :] < num_blocks[:, None])
-            score = score.masked_fill(is_local[None], 1e29)
+        batch_size, num_q_heads = num_rows, heads_per_row
+        seq_lens, slot_ids = row_seq_lens, row_slot_ids
+        # the kernel forced only the longest row's local blocks, so re-force each row's own
+        num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
+        block_ids = torch.arange(score.shape[2], device=score.device)
+        is_local = (
+            block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
+        ) & (block_ids[None, :] < num_blocks[:, None])
+        score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (
