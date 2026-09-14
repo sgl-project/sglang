@@ -1976,9 +1976,11 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
       (``dsa_backend.dcp_localize_topk_slots`` / ``_forward_flashmla_kv``);
     * index_kpool == 1 (tail tokens are appended past the fixed top-k columns
       and would need their own owner filtering);
-    * no HiCache / LMCache / HiSparse yet (the DSA index-K stays replicated in
-      the virtual loc space; the host pools have no translation for that
-      layout);
+    * HiCache as the host (L2) tier only: the anchor MLA host pool stripes
+      per rank like the device pool and the DSA indexer host pool keeps the
+      replicated index-K in the logical slot space (pool_host/dsa.py); no L3
+      storage backend (page keys are not dcp_rank-scoped), no LMCache, no
+      HiSparse;
     * speculative decoding only as EAGLE chain drafting (``eagle_topk == 1``,
       the NextN/MTP head): the draft pool is owner-striped by the shared write
       kernel and every draft phase localizes + LSE-merges like the target. Tree
@@ -2025,8 +2027,13 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
         problems.append(
             f"num_attention_heads={num_heads} is not divisible by dcp_size={view.dcp_size}"
         )
+    if view.enable_hierarchical_cache and view.hicache_storage_backend is not None:
+        problems.append(
+            f"hicache_storage_backend={view.hicache_storage_backend!r} (HiCache "
+            "L3 storage page keys are not dcp_rank-scoped; only the host tier is "
+            "supported with DSA + DCP)"
+        )
     for attr, label in (
-        ("enable_hierarchical_cache", "--enable-hierarchical-cache (HiCache)"),
         ("enable_lmcache", "--enable-lmcache"),
         ("enable_hisparse", "--enable-hisparse"),
         ("enable_prefill_cp", "--enable-prefill-cp"),
@@ -2069,9 +2076,16 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
     logger.info(
         "WQ Hopper DCP enabled for DSA model: dcp_size=%d, comm=%s, "
         "flashmla_kv prefill+decode with owner-localized top-k and LSE merge; "
-        "index-K replicated over the virtual loc space; speculative=%s.",
+        "index-K replicated over the virtual loc space; speculative=%s; "
+        "hicache=%s.",
         view.dcp_size,
         view.dcp_comm_backend,
         spec_algo or "off",
+        (
+            f"host tier, write_policy={view.hicache_write_policy}, "
+            f"size_gb={view.hicache_size}"
+            if view.enable_hierarchical_cache
+            else "off"
+        ),
     )
     return {}

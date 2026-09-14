@@ -104,13 +104,25 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
-    )
+    if (
+        memory_config.enable_hisparse
+        or is_draft_worker
+        or memory_config.enable_unified_cache_external_linker
+        or get_disagg().disaggregation_mode != "null"
+    ):
+        return False
+    if memory_config.enable_hierarchical_cache:
+        # The DSA indexer host pool packs only layers that own a device index-K
+        # buffer (pool_host/dsa.py), so HiCache itself never needs the top-k
+        # reuse layers. Upstream still allocates all layers for the non-DCP
+        # path (its L3 storage page format is shared across instances); under
+        # DCP the index-K is virtual-sized (x dcp), where allocating every
+        # layer would cost ~4x the index memory on GLM-5.x, and L3 storage
+        # is rejected at server start.
+        return (
+            get_parallel().dcp_enabled and memory_config.hicache_storage_backend is None
+        )
+    return True
 
 
 _is_hip = is_hip()
