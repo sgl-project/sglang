@@ -338,6 +338,8 @@ pub enum PoolName {
     DeepseekV4C4Indexer,
     DeepseekV4C4IndexerScale,
     DeepseekV4C128,
+    DeepseekV4C4Rope,
+    DeepseekV4C128Rope,
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
     DeepseekV4C128State,
