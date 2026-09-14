@@ -5601,11 +5601,11 @@ class MiniMaxSparseKVPool(KVCache):
             self.use_minimax_fused_kv_index_store
             and (_is_cuda or _is_hip)
             and not main.is_quantized_kv_cache
-            and not getattr(index_pool, "is_quantized_kv_cache", False)
+            and not index_pool.is_quantized_kv_cache
             and main.kv_cache_layout == "nhd"
             and not main.use_hnd
-            and getattr(index_pool, "kv_cache_layout", "nhd") == "nhd"
-            and not getattr(index_pool, "use_hnd", False)
+            and index_pool.kv_cache_layout == "nhd"
+            and not index_pool.use_hnd
             and (cache_k.dtype != main.dtype or cache_idx_k.dtype != index_pool.dtype)
         )
 
@@ -5675,8 +5675,25 @@ class MiniMaxSparseKVPool(KVCache):
             else:
                 idx_k_cache, idx_v_cache = self.get_index_kv_buffer(layer.layer_id)
             if can_store_kv_index_quant(
-                cache_k, k_cache, cache_idx_k, idx_k_cache, idx_v_cache
+                cache_k,
+                cache_v,
+                k_cache,
+                v_cache,
+                cache_idx_k,
+                idx_k_cache,
+                cache_idx_v,
+                idx_v_cache,
             ):
+                # same slot-id guards as the unfused set_kv_buffer, under SGLANG_ENABLE_ASYNC_ASSERT
+                maybe_detect_oob(
+                    loc, 0, main.size + main.page_size, "set_fused_kv_index_buffer"
+                )
+                maybe_detect_kernel_facing_loc(
+                    loc,
+                    main.page_size,
+                    main.kernel_page_blocks,
+                    "set_fused_kv_index_buffer",
+                )
                 store_kv_index_quant(
                     cache_k,
                     cache_v,

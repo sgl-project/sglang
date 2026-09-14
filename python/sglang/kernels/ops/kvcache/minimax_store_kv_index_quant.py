@@ -1,14 +1,9 @@
-"""Fused MiniMax-M3 sparse-cache store with on-the-fly (fp8) quantization.
+"""Fused MiniMax-M3 sparse-cache store with the fp8 cast folded in.
 
-One Triton launch per layer writes the main K/V heads, the index-K head and the
-optional index-V head into their token-major caches, applying the per-tensor
-KV scales and the cache dtype cast in registers. It replaces the unfused
-sequence used when the pools are fp8 (``x.div_(scale)`` + ``.to(fp8)`` for K
-and V, the index ``k / scale`` + ``.to(fp8)`` and the index scatter, plus the
-main store kernel): 7-8 small launches per layer -> 1.
-
-Triton, so it runs on CUDA and ROCm alike; the CUDA raw-byte JIT kernel
-(``minimax_store_kv_index``) stays the fast path when no cast is needed.
+One Triton launch per layer scales, casts and scatters the main K/V heads, the
+index-K head and the optional index-V head into their token-major caches; it
+serves the fp8-pool case that the raw-byte CUDA store (`minimax_store_kv_index`)
+cannot, on CUDA and ROCm alike.
 """
 
 from __future__ import annotations
@@ -88,60 +83,79 @@ _SUPPORTED_CACHE_DTYPES = (
 
 def can_store_kv_index_quant(
     k: torch.Tensor,
+    v: torch.Tensor,
     k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
     idx_k: torch.Tensor,
     idx_k_cache: torch.Tensor,
+    idx_v: Optional[torch.Tensor],
     idx_v_cache: Optional[torch.Tensor],
 ) -> bool:
-    """Shapes/dtypes this kernel serves: token-major ``[slots, heads, dim]``
-    caches in a bf16/fp16/fp8 dtype, bf16/fp16 inputs, power-of-2 head dims."""
-    if k.dtype not in (torch.bfloat16, torch.float16):
+    """Whether every (input, cache) pair has a layout the kernel can address."""
+
+    def _pair_storable(x: torch.Tensor, cache: torch.Tensor) -> bool:
+        return (
+            x.dtype in (torch.bfloat16, torch.float16)
+            and cache.dtype in _SUPPORTED_CACHE_DTYPES
+            and x.dim() == 3
+            and cache.dim() == 3
+            and _is_pow2(cache.shape[2])
+            and x.shape[2] == cache.shape[2]
+            and x.stride(2) == 1
+            and cache.stride(2) == 1
+        )
+
+    if not (_pair_storable(k, k_cache) and _pair_storable(v, v_cache)):
         return False
-    if k_cache.dtype not in _SUPPORTED_CACHE_DTYPES:
+    if not _pair_storable(idx_k, idx_k_cache):
         return False
-    if idx_k_cache.dtype not in _SUPPORTED_CACHE_DTYPES:
+    if (idx_v is None) != (idx_v_cache is None):
         return False
-    if idx_v_cache is not None and idx_v_cache.dtype not in _SUPPORTED_CACHE_DTYPES:
-        return False
-    if k_cache.dim() != 3 or idx_k_cache.dim() != 3:
-        return False
-    if k.dim() != 3 or idx_k.dim() != 3:
-        return False
-    if not (_is_pow2(k_cache.shape[2]) and _is_pow2(idx_k_cache.shape[2])):
-        return False
-    # Contiguous within a head row (dim stride 1) on both sides.
-    if k.stride(2) != 1 or idx_k.stride(2) != 1:
-        return False
-    if k_cache.stride(2) != 1 or idx_k_cache.stride(2) != 1:
+    if idx_v is not None and not _pair_storable(idx_v, idx_v_cache):
         return False
     return True
 
 
 def store_kv_index_quant(
-    k: torch.Tensor,  # [T, H, D] bf16/fp16
-    v: torch.Tensor,  # [T, H, Dv]
-    k_cache: torch.Tensor,  # [slots, H, D] cache dtype
-    v_cache: torch.Tensor,  # [slots, H, Dv]
-    idx_k: torch.Tensor,  # [T, 1, Di]
-    idx_k_cache: torch.Tensor,  # [slots, 1, Di]
-    idx_v: Optional[torch.Tensor],  # [T, 1, Di] or None
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    idx_k: torch.Tensor,
+    idx_k_cache: torch.Tensor,
+    idx_v: Optional[torch.Tensor],
     idx_v_cache: Optional[torch.Tensor],
-    loc: torch.Tensor,  # [T] int32/int64 slot ids
+    loc: torch.Tensor,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
 ) -> None:
-    """``cache[loc] = (x / scale).to(cache.dtype)`` for K, V, index-K (and
-    index-V), one launch. ``None`` scale means unit scale."""
+    """`cache[loc] = (x / scale).to(cache.dtype)` for K, V, index-K and index-V in one launch.
+
+    Inputs are `[tokens, heads, dim]` (index tensors have one head), caches
+    `[slots, heads, dim]`, `loc` one slot per token. As in
+    `MHATokenToKVPool.set_kv_buffer`, a scale applies only where the store
+    casts; a `None` scale is unit.
+    """
     T, H, D = k.shape
     Dv = v.shape[2]
     Di = idx_k.shape[2]
     if T == 0:
         return
-    has_iv = idx_v is not None
-    if not has_iv:
+    has_idx_v = idx_v is not None
+    if not has_idx_v:
         idx_v, idx_v_cache = idx_k, idx_k_cache
+
+    def _scale_if_cast(scale: Optional[float], x: torch.Tensor, cache: torch.Tensor):
+        if scale is None or x.dtype == cache.dtype:
+            return 1.0
+        return float(scale)
+
+    k_scale = _scale_if_cast(k_scale, k, k_cache)
+    v_scale = _scale_if_cast(v_scale, v, v_cache)
+    idx_k_scale = _scale_if_cast(idx_k_scale, idx_k, idx_k_cache)
+    idx_v_scale = _scale_if_cast(idx_v_scale, idx_v, idx_v_cache)
     _store_kv_index_quant_kernel[(T,)](
         k,
         v,
@@ -152,10 +166,10 @@ def store_kv_index_quant(
         idx_v,
         idx_v_cache,
         loc,
-        float(1.0 if k_scale is None else k_scale),
-        float(1.0 if v_scale is None else v_scale),
-        float(1.0 if idx_k_scale is None else idx_k_scale),
-        float(1.0 if idx_v_scale is None else idx_v_scale),
+        k_scale,
+        v_scale,
+        idx_k_scale,
+        idx_v_scale,
         k.stride(0),
         k.stride(1),
         v.stride(0),
@@ -172,6 +186,7 @@ def store_kv_index_quant(
         HEAD_DIM=D,
         V_HEAD_DIM=Dv,
         IDX_DIM=Di,
-        HAS_IDX_V=has_iv,
+        HAS_IDX_V=has_idx_v,
+        # one program per token with a static head loop: sized for the few KV heads per rank
         num_warps=1,
     )
