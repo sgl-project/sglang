@@ -34,6 +34,12 @@ python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --
 ```
 The server will dump the requests into a pickle file for every 100 requests.
 
+On high-traffic servers, you can dump only a sample of requests with `--dump-requests-sample-fraction` (a value in `(0, 1]`, default `1.0`):
+```bash Command
+python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --dump-requests-folder /tmp/sglang_request_dump --dump-requests-threshold 100 --dump-requests-sample-fraction 0.1
+```
+Sampling hashes each request id deterministically, so a given request is kept or dropped consistently across retries and across workers sharing a dump folder.
+
 To replay the request dump, use `scripts/playground/replay_request_dump.py`.
 
 ## Crash Dump and Replay
