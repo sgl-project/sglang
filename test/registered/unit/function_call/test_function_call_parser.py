@@ -582,16 +582,14 @@ class TestPythonicDetector(unittest.TestCase):
         text = "[get_weather(location='Tokyo')] Here's the forecast:"
         result = self.detector.parse_streaming_increment(text, self.tools)
 
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.normal_text, " Here's the forecast:")
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            self.detector._buffer, " Here's the forecast:"
-        )  # Text after tool call remains in buffer
+        self.assertEqual(self.detector._buffer, "")
 
-        # Process the remaining text in buffer
+        # An extra increment must not duplicate the already-emitted text.
         result2 = self.detector.parse_streaming_increment("", self.tools)
-        self.assertEqual(result2.normal_text, " Here's the forecast:")
+        self.assertEqual(result2.normal_text, "")
         self.assertEqual(result2.calls, [])
         self.assertEqual(self.detector._buffer, "")  # Buffer should be cleared
 
@@ -599,17 +597,19 @@ class TestPythonicDetector(unittest.TestCase):
         """Test parsing multiple tool calls in sequence."""
         text = "[get_weather(location='Berlin')] and [search(query='restaurants')]"
 
-        # First tool call
+        # Every complete call must be emitted even if this is the final chunk.
         result1 = self.detector.parse_streaming_increment(text, self.tools)
-        self.assertEqual(len(result1.calls), 1)
+        self.assertEqual(result1.normal_text, " and ")
+        self.assertEqual(len(result1.calls), 2)
         self.assertEqual(result1.calls[0].name, "get_weather")
-        self.assertEqual(self.detector._buffer, " and [search(query='restaurants')]")
+        self.assertEqual(result1.calls[1].name, "search")
+        self.assertEqual([call.tool_index for call in result1.calls], [0, 1])
+        self.assertEqual(self.detector._buffer, "")
 
-        # Second tool call
+        # No additional call should be emitted on an empty increment.
         result2 = self.detector.parse_streaming_increment("", self.tools)
-        self.assertEqual(result2.normal_text, " and ")
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "search")
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(result2.calls, [])
         self.assertEqual(self.detector._buffer, "")
 
     def test_parse_streaming_opening_bracket_only(self):
