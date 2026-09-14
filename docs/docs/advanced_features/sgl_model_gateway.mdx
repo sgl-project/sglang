@@ -799,7 +799,7 @@ Response:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/engine_metrics`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Engine-level metrics from workers</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Aggregated engine metrics from all workers, labeled by `worker_addr` (workers need `--enable-metrics`)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
@@ -2098,6 +2098,26 @@ Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`
 #### Duration Buckets
 
 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 15s, 30s, 45s, 60s, 90s, 120s, 180s, 240s
+
+#### Aggregated Worker Engine Metrics (`/engine_metrics`)
+
+The `smg_*` metrics above describe the gateway itself (routing, workers' health, circuit breakers). Engine-level metrics (`sglang:*` — cache hit rate, generation throughput, queue depth, TTFT histograms) are produced by each SGLang worker and exposed on the worker's own `/metrics` endpoint.
+
+Instead of scraping every worker individually, you can query `GET /engine_metrics` on the gateway's main port. The gateway fans out to the `/metrics` endpoint of every registered worker, merges the responses, and labels each series with `worker_addr` so per-worker values remain distinguishable:
+
+```bash
+curl http://localhost:30080/engine_metrics
+```
+
+```text
+sglang:gen_throughput{model_name="...",worker_addr="http://127.0.0.1:30001"} 512.3
+sglang:gen_throughput{model_name="...",worker_addr="http://127.0.0.1:30002"} 498.7
+```
+
+Requirements and failure modes:
+
+- Workers must be launched with `--enable-metrics`; otherwise their `/metrics` endpoint does not exist and the fan-out fails.
+- If no workers are registered, or every worker request fails (for example, none has metrics enabled), the endpoint returns an error (`"All backend requests failed"`) rather than an empty result.
 
 ### OpenTelemetry Tracing
 
