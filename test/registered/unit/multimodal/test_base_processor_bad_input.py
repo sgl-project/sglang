@@ -18,7 +18,10 @@ import requests
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,6 +32,9 @@ class _StubProcessor(BaseMultimodalProcessor):
     # gpu_image_decode=False keeps the decode on PIL so the test needs no GPU. The
     # abstract methods are never called: only the _load_single_item classmethod is.
     gpu_image_decode = False
+
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 def _session_raising(exc):
@@ -125,6 +131,23 @@ class TestClientMediaExceptions(CustomTestCase):
         ):
             with self.subTest(exc_type=exc_type.__name__):
                 self.assertTrue(issubclass(exc_type, CLIENT_MEDIA_EXCEPTIONS))
+
+
+class TestMultimodalTokenDataMismatch(CustomTestCase):
+    def test_missing_image_data_is_a_client_error(self):
+        processor = _StubProcessor.__new__(_StubProcessor)
+        tokens = MultimodalSpecialTokens(image_token="<image>").build(processor)
+        data_iterators = MagicMock()
+        data_iterators.get.return_value = iter(())
+
+        with self.assertRaisesRegex(
+            ValueError, "More 'IMAGE' tokens found than corresponding data provided"
+        ):
+            processor.submit_data_loading_tasks(
+                ["", "<image>", ""],
+                tokens,
+                data_iterators,
+            )
 
 
 if __name__ == "__main__":
