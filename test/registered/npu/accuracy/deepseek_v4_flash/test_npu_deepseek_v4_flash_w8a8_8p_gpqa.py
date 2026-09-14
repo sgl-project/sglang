@@ -46,6 +46,13 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # Both default to True. With defaults, the CI image's sglang hits
+    # "Capture cuda graph failed: Expected all tensors to be on the same
+    # device" in ascend_backend._apply_cuda_graph_metadata on the FIRST
+    # decode shape (regardless of the bs list). The multi-stream path also
+    # caused the earlier DSPARK accept-rate collapse; keep both off for CI.
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
