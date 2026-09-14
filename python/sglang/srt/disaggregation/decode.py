@@ -84,7 +84,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
-    evict_from_tree_cache,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -511,7 +510,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._supports_unified_swa_reservation():
             full_required = ceil_align(full_len, page_size)
             swa_required = ceil_align(swa_tail_len, page_size)
-            evict_from_tree_cache(
+            allocator.evict_to_free_tokens(
                 self.tree_cache,
                 full_required,
                 swa_num_tokens=swa_required,
