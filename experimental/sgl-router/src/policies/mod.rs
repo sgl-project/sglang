@@ -239,7 +239,7 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Cache-Aware uses this binding before Top-K truncation so an
+    /// Cache-Aware applies Bucket constraints before Top-K truncation so an
     /// incompatible cache holder cannot displace a lower-ranked usable one.
     pub fn with_prefill_cache_bucket(
         mut self,
