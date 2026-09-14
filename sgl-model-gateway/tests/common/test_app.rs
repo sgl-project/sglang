@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use axum::Router;
 use data_connector::{
@@ -11,13 +14,31 @@ use smg::{
     core::{
         BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
-    middleware::{AuthConfig, TokenBucket},
+    middleware::{AuthConfig, ConcurrencyLimiter, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
     tokenizer::registry::TokenizerRegistry,
 };
 use smg_mcp::{McpConfig, McpManager};
+
+fn init_concurrency_queue(
+    rate_limiter: Option<Arc<TokenBucket>>,
+    queue_size: usize,
+    queue_timeout_secs: u64,
+) -> Option<tokio::sync::mpsc::Sender<QueuedRequest>> {
+    let (limiter, processor) = ConcurrencyLimiter::new(
+        rate_limiter,
+        queue_size,
+        Duration::from_secs(queue_timeout_secs),
+    );
+
+    if let Some(processor) = processor {
+        tokio::spawn(processor.run());
+    }
+
+    limiter.queue_tx
+}
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
@@ -30,16 +51,19 @@ pub fn create_test_app(
     let rate_limiter = match router_config.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
-            let rate_limit_tokens = router_config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
+            let rate_limit_tokens = router_config.rate_limit_tokens_per_second.unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
             )))
         }
     };
+
+    let concurrency_queue_tx = init_concurrency_queue(
+        rate_limiter.clone(),
+        router_config.queue_size,
+        router_config.queue_timeout_secs,
+    );
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -87,7 +111,7 @@ pub fn create_test_app(
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
-        concurrency_queue_tx: None,
+        concurrency_queue_tx,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
@@ -125,18 +149,22 @@ pub fn create_test_app_with_context(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
 ) -> Router {
+    let router_config = &app_context.router_config;
+    let concurrency_queue_tx = init_concurrency_queue(
+        app_context.rate_limiter.clone(),
+        router_config.queue_size,
+        router_config.queue_timeout_secs,
+    );
+
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
+        concurrency_queue_tx,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });
-
-    // Get config from the context
-    let router_config = &app_context.router_config;
 
     // Configure request ID headers (use defaults if not specified)
     let request_id_headers = router_config.request_id_headers.clone().unwrap_or_else(|| {
