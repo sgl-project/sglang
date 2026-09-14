@@ -43,9 +43,7 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         restored = pickle.loads(pickle.dumps(stats))
 
         self.assertTrue(restored.has_timing_data)
-        self.assertEqual(
-            restored.queue_reason_checks, {"awaiting_scheduler_check": 1}
-        )
+        self.assertEqual(restored.queue_reason_checks, {"awaiting_scheduler_check": 1})
 
     def test_two_hop_round_trip(self):
         src = rts.SchedulerReqTimeStats()
