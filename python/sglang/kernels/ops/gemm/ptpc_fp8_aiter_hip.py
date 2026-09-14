@@ -68,6 +68,39 @@ def pack(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     )
 
 
+def pack_prequantized(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pack an [out, in] FP8 weight that already carries [out] channel scales.
+
+    A Quark per-channel checkpoint stores what pack() would otherwise derive, so
+    reusing it keeps the GEMM bit-identical to the unfused linears. Padding rows
+    quantize to zero at any scale, so the pad scale is arbitrary.
+    """
+    ops = _ops()
+    if ops is None:
+        raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
+    fp8, _, _, shuffle = ops
+    if weight.ndim != 2 or not weight.is_cuda:
+        raise ValueError(f"expected a 2D CUDA weight, got {tuple(weight.shape)}")
+    if weight.dtype != fp8:
+        raise ValueError(f"expected {fp8} weight, got {weight.dtype}")
+    out_features, in_features = weight.shape
+    if scale.numel() != out_features:
+        raise ValueError(f"expected {out_features} channel scales, got {scale.numel()}")
+    padded = out_features + (-out_features) % _N_ALIGN
+    if padded != out_features:
+        weight = torch.cat(
+            [weight, weight.new_zeros((padded - out_features, in_features))]
+        )
+        scale = torch.cat([scale.reshape(-1), scale.new_ones(padded - out_features)])
+    return (
+        shuffle(weight.contiguous(), layout=_SHUFFLE_LAYOUT),
+        scale.reshape(padded, 1).contiguous().float(),
+        out_features,
+    )
+
+
 def covered(x: torch.Tensor, weight: torch.Tensor | None) -> bool:
     return (
         weight is not None
@@ -79,27 +112,50 @@ def covered(x: torch.Tensor, weight: torch.Tensor | None) -> bool:
     )
 
 
+def covered_prequant(
+    x_q: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor | None
+) -> bool:
+    ops = _ops()
+    if ops is None or weight is None:
+        return False
+    fp8 = ops[0]
+    return (
+        x_q.dim() == 2
+        and x_q.dtype == fp8
+        and x_q.is_contiguous()
+        and x_q.shape[0] > 0
+        and x_scale is not None
+        and x_scale.numel() >= x_q.shape[0]
+    )
+
+
 def run(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out_features: int,
     out: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """out[:, :out_features] = (x @ weight.T) with per-token / per-channel FP8."""
     ops = _ops()
     if ops is None:
         raise RuntimeError("aiter PTPC FP8 GEMM is unavailable")
     fp8, gemm, per_token_quant, _ = ops
-    xq, xs = per_token_quant(x, quant_dtype=fp8)
+    if x_scale is None:
+        xq, xs = per_token_quant(x, quant_dtype=fp8)
+        out_dtype = x.dtype
+    else:
+        xq, xs = x, x_scale
+        out_dtype = torch.bfloat16
     if out is not None and weight.shape[0] != out_features:
         raise ValueError("out= is unavailable when the packed weight has padded rows")
     result = gemm(
         xq,
         weight,
-        xs.view(x.shape[0], 1),
+        xs.view(xq.shape[0], 1),
         scale,
-        dtype=x.dtype,
+        dtype=out_dtype,
         out=out,
     )
     return result if result.shape[1] == out_features else result[:, :out_features]
