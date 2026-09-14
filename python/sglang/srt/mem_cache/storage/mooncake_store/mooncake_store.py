@@ -26,10 +26,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
-    __import__("os").environ.get(
-        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
-        16 * 1024 * 1024
-    )
+    __import__("os").environ.get("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", 16 * 1024 * 1024)
 )
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
@@ -1026,9 +1023,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
-                host_indices
-            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
