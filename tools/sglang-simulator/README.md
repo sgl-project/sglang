@@ -255,6 +255,29 @@ The model path only needs the DeepSeek-R1 `config.json`; weights are loaded in
 dummy mode. This runner disables radix caching and chunked prefill because
 InferCast does not yet model non-zero prefixes.
 
+### AgentX open-loop diagnostic
+
+`scripts/run_infercast_open_loop.py` accepts a fully materialized timestamped
+trace with one JSON object per line:
+
+```json
+{"timestamp_ms": 2614, "input_length": 35008, "output_length": 120}
+```
+
+It preserves arrival times and variable request shapes while flattening every
+request into an independent event. This is useful for scheduler-load diagnosis,
+but it is not canonical AgentX: response-driven turns, spawn/join dependencies,
+tool delays, session affinity, and prefix reuse are not modeled.
+
+```bash
+python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py \
+  --model-path /path/to/model-config \
+  --sim-config /path/to/infercast.json \
+  --trace /path/to/open-loop.jsonl \
+  --output-dir /tmp/agentx-open-loop \
+  --output /tmp/agentx-open-loop.json
+```
+
 ## Workload formats
 
 The Autobench trace format uses timestamps in milliseconds:
