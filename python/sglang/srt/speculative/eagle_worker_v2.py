@@ -6,6 +6,9 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_uniform_func,
+)
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -188,6 +191,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
+        # Per-step fence: whether the last dispatched step's draft_extend
+        # consumed staged reads inside its graph. False until a step runs.
+        self.last_draft_extend_staged = False
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -862,15 +868,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return False
-        # SWA metadata derives its prefix from num_accept_tokens (flashinfer
-        # update_sliding_window), a verify product that does not exist yet.
-        if self.draft_runner.sliding_window_size is not None:
+        if not self.draft_extend_attn_backend.supports_draft_extend_metadata_staging:
             return False
         # The DP-padded width would duplicate init_new's token-unit transform;
         # oversized batches would overflow the bucket pad.
         if runner.require_mlp_tp_gather or len(batch.seq_lens) > runner.max_bs:
             return False
         num_draft_tokens = self.speculative_num_draft_tokens
+        out_cache_loc = None
+        if self.draft_runner.sliding_window_size is not None:
+            # The init's SWA fill snapshots out_cache_loc by value; verify's
+            # out_cache_loc is itself gathered from req_to_token[seq : seq+draft),
+            # stable since prepare_for_draft, so the same gather reads the same
+            # slots. Slot gather is done inside the stage so it precedes the
+            # fill in one stream order.
+            out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=len(batch.seq_lens),
+                draft_token_num=num_draft_tokens,
+                device=batch.device,
+            )
         runner.stage_shared_reads(
             # Forward sees post-write length, matching prepare_for_draft_extend.
             seq_lens=batch.seq_lens + num_draft_tokens,
@@ -880,6 +899,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 else None
             ),
             req_pool_indices=batch.req_pool_indices,
+            out_cache_loc=out_cache_loc,
             out_cache_loc_dsv4=getattr(batch, "out_cache_loc_dsv4", None),
         )
         return True
@@ -966,6 +986,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
+
+        # Per-step fence truth: verify is the last shared reader iff
+        # draft_extend consumed staged reads inside its graph.
+        self.last_draft_extend_staged = bool(staged and can_run_decode_cuda_graph)
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -1090,8 +1114,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # Staged steps: verify is the last shared reader (#35059's decode
+        # publish covers it on the target runner). Un-staged / eager steps:
+        # draft_extend stays the last reader, keeping the pre-staging fence.
+        staged = getattr(self._draft_worker, "last_draft_extend_staged", False)
+        if staged:
+            return self.target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
