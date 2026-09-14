@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: CONC=24 TAG=baseline [DURATION=3600] [WARMUP_EXTRA=...] bash bench.sh
+# Usage: CONC=24 TAG=baseline [DURATION=3600 PORT=30000 AIPERF_BIN=... AIPERF_EXTRA=...] bash bench_any.sh
 : "${CONC:?}"; : "${TAG:?}"
 : "${DURATION:=3600}"
 : "${PORT:=30000}"
@@ -8,7 +8,7 @@
 RESULT_DIR=/scratch/results/aiperf_${TAG}_c${CONC}
 [ -d "$RESULT_DIR" ] && mv "$RESULT_DIR" "${RESULT_DIR}_prev_$(date -u +%H%M%S)"
 mkdir -p $RESULT_DIR
-# refuse to start if an AIPerf client for this PORT is still alive (orphans corrupt measurements)
+# an orphaned client on this port would corrupt the measurement, so refuse to start
 LOCK=/scratch/run/aiperf_port${PORT}.lock
 if [ -f "$LOCK" ] && kill -0 "$(cat $LOCK)" 2>/dev/null; then echo "ERROR: aiperf client pid $(cat $LOCK) for port $PORT still alive"; exit 2; fi
 echo $$ > $LOCK
@@ -16,10 +16,10 @@ trap 'rm -f $LOCK' EXIT
 URL=http://127.0.0.1:$PORT
 curl -s $URL/metrics > $RESULT_DIR/server_metrics_before.prom
 curl -s $URL/get_server_info > $RESULT_DIR/server_info.json
-# resource sampler (GPU util/mem, CPU) every 10s
+# GPU util/mem and CPU sampler every 10 s
 ( while true; do echo "$(date -u +%FT%TZ) $(rocm-smi --showuse --showmemuse --csv 2>/dev/null | grep -E '^card[0-3]' | tr '\n' ';') cpu=$(top -bn1 | grep 'Cpu(s)' | awk '{print $2}')"; sleep 10; done ) > $RESULT_DIR/resources.log 2>&1 &
 SAMPLER=$!
-# periodic metrics snapshots every 60s
+# server /metrics snapshot every 60 s
 ( while true; do sleep 60; curl -s $URL/metrics > $RESULT_DIR/server_metrics_$(date -u +%H%M%S).prom; done ) &
 SNAP=$!
 START=$(date -u +%FT%TZ)
