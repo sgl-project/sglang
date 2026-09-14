@@ -4610,8 +4610,6 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # req_to_token ids are widened unless resolved; a request's slots start
-        # page-aligned, so the strided view picks this rank's rows without a sync.
         span = self._write_loc_dcp_span
         if span > 1:
             indices = indices[get_parallel().attn_dcp_rank :: span] // span
