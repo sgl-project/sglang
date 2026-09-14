@@ -24,7 +24,7 @@ import time
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
-from functools import partial
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
@@ -419,6 +419,16 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+@lru_cache(maxsize=None)
+def _dataclass_field_names(cls: type) -> tuple[str, ...]:
+    """Field names of a dataclass, resolved once per class.
+
+    ScheduleBatch has ~90 fields and is snapshotted twice per forward; walking
+    ``dataclasses.fields`` each time is pure per-step host overhead.
+    """
+    return tuple(f.name for f in dataclasses.fields(cls))
 
 
 class Scheduler(
@@ -4158,7 +4168,7 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
         attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            getattr(batch, name, None) for name in _dataclass_field_names(type(batch))
         ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
@@ -4186,7 +4196,7 @@ class Scheduler(
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            {name: getattr(batch, name) for name in _dataclass_field_names(type(batch))}
             if snapshot_v2_full
             else None
         )
