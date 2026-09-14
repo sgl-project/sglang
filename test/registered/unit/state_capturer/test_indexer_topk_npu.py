@@ -75,14 +75,16 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
         self.assertIs(result, sentinel)
         self.assertEqual(create.call_args.kwargs["num_indexer_layers"], 2)
 
-    def test_non_indexer_npu_does_not_create_capturer(self):
+    def test_non_indexer_npu_is_disabled_by_zero_layer_count(self):
         config = _model_config("LlamaForCausalLM")
         with (
             mock.patch.object(
                 indexer_topk_mod, "get_exec", return_value=self._enabled_exec()
             ),
             mock.patch.object(
-                indexer_topk_mod, "_create_indexer_capturer_raw"
+                indexer_topk_mod,
+                "_create_indexer_capturer_raw",
+                wraps=indexer_topk_mod._create_indexer_capturer_raw,
             ) as create,
         ):
             result = indexer_topk_mod.create_indexer_capturer(
@@ -93,7 +95,8 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
             )
 
         self.assertIsNone(result)
-        create.assert_not_called()
+        create.assert_called_once()
+        self.assertEqual(create.call_args.kwargs["num_indexer_layers"], 0)
 
     def test_invalid_topk_disables_raw_capturer(self):
         self.assertIsNone(
