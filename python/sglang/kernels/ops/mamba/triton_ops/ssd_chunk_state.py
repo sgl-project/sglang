@@ -14,6 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles
 from .mamba_ssm import softplus
 
 
@@ -27,6 +28,10 @@ from .mamba_ssm import softplus
         triton.Config({"BLOCK_SIZE_H": 64}),
     ],
     key=["chunk_size", "nheads"],
+    prune_configs_by={
+        "early_config_prune": prune_oversized_tiles({"BLOCK_SIZE_H": ("nheads",)})
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _chunk_cumsum_fwd_kernel(
@@ -197,6 +202,16 @@ def _chunk_cumsum_fwd_kernel(
         ),
     ],
     key=["hdim", "dstate", "chunk_size"],
+    prune_configs_by={
+        "early_config_prune": prune_oversized_tiles(
+            {
+                "BLOCK_SIZE_M": ("hdim",),
+                "BLOCK_SIZE_N": ("dstate",),
+                "BLOCK_SIZE_K": ("chunk_size",),
+            }
+        )
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _chunk_state_fwd_kernel(
@@ -348,10 +363,6 @@ def _chunk_state_fwd_kernel(
     tl.store(states_ptrs, states, mask=c_mask)
 
 
-# Same tile shape family as _chunk_state_fwd_kernel above (hdim x dstate
-# tiles, K-loop over chunk_size), so it reuses that config list. vLLM has
-# no counterpart: its sequence-aligned chunks make the per-sequence final
-# state a plain gather, so this kernel only exists on the sglang side.
 @triton.autotune(
     configs=[
         # Small headdim/dstate configs (hdim<=64, dstate<=128) - increased parallelism
@@ -429,6 +440,16 @@ def _chunk_state_fwd_kernel(
         ),
     ],
     key=["hdim", "dstate", "chunk_size"],
+    prune_configs_by={
+        "early_config_prune": prune_oversized_tiles(
+            {
+                "BLOCK_SIZE_M": ("hdim",),
+                "BLOCK_SIZE_N": ("dstate",),
+                "BLOCK_SIZE_K": ("chunk_size",),
+            }
+        )
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _chunk_state_varlen_kernel(

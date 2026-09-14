@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 from packaging import version
 
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
@@ -145,6 +147,16 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
         ),
     ],
     key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+    prune_configs_by={
+        "early_config_prune": prune_oversized_tiles(
+            {
+                "BLOCK_SIZE_M": ("chunk_size",),
+                "BLOCK_SIZE_N": ("hdim",),
+                "BLOCK_SIZE_K": ("chunk_size", "dstate"),
+            }
+        )
+    },
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
