@@ -159,7 +159,7 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         next_token_ids=torch.tensor([3]),
     )
     payload = Scheduler._pp_prepare_tensor_dict(
-        SimpleNamespace(), result, SimpleNamespace(return_logprob=False)
+        object.__new__(Scheduler), result, SimpleNamespace(return_logprob=False)
     )
     output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
     for name in ("token_ids", "lengths", "selected_logprobs", "statuses"):
