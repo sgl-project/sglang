@@ -8,8 +8,7 @@ to reduce tokenization overhead when multiple requests arrive concurrently.
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -119,48 +118,79 @@ class AsyncDynamicbatchTokenizer:
         result_futures: List[asyncio.Future],
     ) -> None:
         """Process a dynamic batch of encode requests for single string prompts."""
-        # Check if all kwargs are identical for efficient batch processing
-        first_kw = kwargs_list[0]
-        can_batch = all(kw == first_kw for kw in kwargs_list[1:])
-        kwargs = first_kw if can_batch else None
+        can_batch = all(kw == kwargs_list[0] for kw in kwargs_list[1:])
+        if not can_batch and len(prompts) > 1:
+            logger.warning(
+                f"AsyncDynamicbatchTokenizer: Dynamic batching disabled for batch of "
+                f"{len(prompts)} requests due to differing kwargs. This reduces "
+                f"performance benefits. Consider using consistent tokenization "
+                f"parameters across requests."
+            )
 
+        encode_fn = self._build_encode_fn(prompts, kwargs_list, can_batch)
         try:
-            # If every request uses identical kwargs we can run a single
-            # batch tokenizer call for a big speed-up.
-            if can_batch and len(prompts) > 1:
-                encode_fn = partial(self.tokenizer, prompts, **kwargs)
-                results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, encode_fn
-                )
-
-                for i, fut in enumerate(result_futures):
-                    if not fut.done():
-                        data = {k: v[i] for k, v in results.items()}
-                        fut.set_result(data)
-            else:
-                # Process each request individually due to different kwargs
-                if len(prompts) > 1 and not can_batch:
-                    logger.warning(
-                        f"AsyncDynamicbatchTokenizer: Dynamic batching disabled for batch of {len(prompts)} "
-                        f"requests due to differing kwargs. This reduces performance benefits. "
-                        f"Consider using consistent tokenization parameters across requests."
-                    )
-
-                encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
-                ]
-                results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, encode_fn
-                )
-
-                for fut, res in zip(result_futures, results):
-                    if not fut.done():
-                        fut.set_result(res)
+            results = await asyncio.get_running_loop().run_in_executor(
+                self._executor, encode_fn
+            )
+            self._set_results(result_futures, results)
         except Exception as e:
             logger.error(f"Error in dynamic batch processing: {e}")
-            for fut in result_futures:
-                if not fut.done():
-                    fut.set_exception(e)
+            self._set_exception(result_futures, e)
+
+    def _build_encode_fn(
+        self,
+        prompts: List[str],
+        kwargs_list: List[Dict],
+        can_batch: bool,
+    ) -> Callable[[], List[Dict]]:
+        """Pick the encode strategy once and return a zero-arg callable that
+        produces one result dict per prompt. The callable runs in the executor,
+        keeping the strategy decision off the (blocking) tokenizer thread.
+
+        - Slow (non-fast) tokenizer with no kwargs: call ``encode()`` per prompt
+          instead of ``__call__``. ``__call__`` runs the slow Python ``_encode_plus``
+          -> ``convert_tokens_to_ids(tokenize(text))`` chain, whereas a slow
+          tokenizer's ``encode()`` typically returns ids straight from its fast
+          backend (e.g. Kimi's ``TikTokenTokenizer`` -> tiktoken/Rust). Mirrors the
+          regular-path fix in #25265, extended to the dynamic-batch path. The path
+          passes no kwargs (cross-encoder never reaches here), so nothing is dropped;
+          if any kwarg is present we fall through to ``__call__`` for exact semantics.
+        - Uniform kwargs across >1 prompt: one batched ``__call__`` (Rust
+          ``encode_batch``), then split per prompt (all keys preserved).
+        - Otherwise: per-item ``__call__`` honoring each request's kwargs.
+        """
+        is_slow = not getattr(self.tokenizer, "is_fast", False)
+        no_kwargs = all(not kw for kw in kwargs_list)
+        if is_slow and no_kwargs:
+            return lambda: [{"input_ids": self.tokenizer.encode(p)} for p in prompts]
+
+        if can_batch and len(prompts) > 1:
+            kwargs = kwargs_list[0]
+
+            def encode_batched():
+                encoded = self.tokenizer(prompts, **kwargs)
+                return [
+                    {k: v[i] for k, v in encoded.items()} for i in range(len(prompts))
+                ]
+
+            return encode_batched
+
+        return lambda: [self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)]
+
+    @staticmethod
+    def _set_results(result_futures: List[asyncio.Future], results: List[Dict]) -> None:
+        """Resolve each pending future with its result (skip already-done ones,
+        e.g. futures cancelled by a disconnected client)."""
+        for fut, result in zip(result_futures, results):
+            if not fut.done():
+                fut.set_result(result)
+
+    @staticmethod
+    def _set_exception(result_futures: List[asyncio.Future], exc: Exception) -> None:
+        """Fan a batch-level failure out to every pending future."""
+        for fut in result_futures:
+            if not fut.done():
+                fut.set_exception(exc)
 
     def __del__(self):
         """Clean up background tasks."""
