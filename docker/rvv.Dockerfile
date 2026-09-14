@@ -71,7 +71,6 @@ RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK after sgl-kernel 
 
 # 8. Install SGLang (GCC REQUIRED for XGrammar compatibility)
 ARG VER_GRPCIO=1.83.1
-ARG VER_HF_XET=1.6.0
 WORKDIR /sgl-workspace/sglang/python
 RUN cp pyproject_cpu.toml pyproject.toml && \
     # TODO: Remove these filters when riscv64 wheels become available.
@@ -83,7 +82,7 @@ RUN unset CC CXX && \
     # TODO: Remove these overrides when SpacemiT publishes wheels matching sglang's pinned versions.
     # RISE publishes CPython 3.13 riscv64 wheels for grpcio and hf-xet.
     printf "torch==${VER_TORCH}\ntorchvision==${VER_TORCHVISION}\ntriton==${VER_TRITON}\nxgrammar==${VER_XGRAMMAR}\ngrpcio==${VER_GRPCIO}\n" > /tmp/torch-override.txt && \
-    uv pip install . "hf-xet==${VER_HF_XET}" --override /tmp/torch-override.txt \
+    uv pip install . "hf-xet==1.6.0" --override /tmp/torch-override.txt \
         --only-binary grpcio --only-binary hf-xet \
         --extra-index-url https://pypi.riseproject.dev/simple/ \
         --index-strategy unsafe-best-match
