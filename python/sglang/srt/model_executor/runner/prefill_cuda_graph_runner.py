@@ -38,7 +38,7 @@ import copy
 import inspect
 import logging
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -110,6 +110,25 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _slice_output_rows(output: Any, num_tokens: int) -> Any:
+    """Slice every tensor leaf in a transformer-body output by token rows.
+
+    Full prefill graphs replay at a padded token bucket. Most models return a
+    single hidden-state tensor, while auxiliary-hidden-state models (for
+    example DFLASH targets) return nested tuple/list structures. Slicing the
+    outer sequence would change its structure instead of removing padded rows.
+    """
+    if output is None:
+        return None
+    if torch.is_tensor(output) or isinstance(output, PPProxyTensors):
+        return output[:num_tokens]
+    if isinstance(output, tuple):
+        return tuple(_slice_output_rows(item, num_tokens) for item in output)
+    if isinstance(output, list):
+        return [_slice_output_rows(item, num_tokens) for item in output]
+    raise TypeError(f"Unsupported full prefill CUDA graph output: {type(output)}")
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -1082,7 +1101,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                                 1, static_n
                             )[: ie.shape[0]].copy_(ie)
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
-                    return hs[:raw_num_tokens] if full_path else hs
+                    return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
