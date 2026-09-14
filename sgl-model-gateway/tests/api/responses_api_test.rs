@@ -15,8 +15,34 @@ use smg::{
 
 use crate::common::{
     mock_mcp_server::MockMCPServer,
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        start_response_request_capture, take_response_requests, HealthStatus, MockWorker,
+        MockWorkerConfig, WorkerType,
+    },
 };
+
+fn assert_mcp_tool_choice_sequence(requests: &[serde_json::Value]) {
+    assert_eq!(requests.len(), 2, "expected initial and follow-up requests");
+    assert_eq!(
+        requests[0].get("tool_choice").and_then(|v| v.as_str()),
+        Some("required"),
+        "initial request should preserve the client's tool_choice"
+    );
+    assert_eq!(
+        requests[1].get("tool_choice").and_then(|v| v.as_str()),
+        Some("auto"),
+        "post-MCP follow-up should allow the model to finish"
+    );
+    assert!(
+        requests[1]
+            .get("input")
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+            })),
+        "follow-up request should contain the MCP tool result"
+    );
+}
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -41,6 +67,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         fail_rate: 0.0,
     });
     let worker_url = worker.start().await.expect("start worker");
+    let worker_port = worker.port().await;
+    start_response_request_capture(worker_port);
 
     // Build router config (HTTP OpenAI mode)
     let router_cfg = RouterConfig::builder()
@@ -80,7 +108,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
         tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             function: None,
@@ -186,21 +214,11 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         .filter_map(|v| v.as_str())
         .next();
 
-    if let Some(text) = final_text {
-        assert_eq!(text, "Tool result consumed; here is the final answer.");
-    } else {
-        let call_entry = output.iter().find(|entry| {
-            entry.get("type") == Some(&serde_json::Value::String("function_tool_call".into()))
-        });
-        assert!(call_entry.is_some(), "missing function tool call entry");
-        if let Some(entry) = call_entry {
-            assert_eq!(
-                entry.get("status").and_then(|v| v.as_str()),
-                Some("in_progress"),
-                "function call should be in progress when no content is returned"
-            );
-        }
-    }
+    assert_eq!(
+        final_text,
+        Some("Tool result consumed; here is the final answer."),
+        "missing final assistant message"
+    );
 
     let tools = body_json
         .get("tools")
@@ -213,6 +231,9 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         tool.get("server_label").and_then(|v| v.as_str()),
         Some("mock")
     );
+
+    let upstream_requests = take_response_requests(worker_port);
+    assert_mcp_tool_choice_sequence(&upstream_requests);
 
     // Cleanup
     worker.stop().await;
@@ -874,6 +895,8 @@ async fn test_streaming_with_mcp_tool_calls() {
     // 6. Verify SSE events are properly formatted
 
     let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+    let worker_port = worker.port().await;
+    start_response_request_capture(worker_port);
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
@@ -892,7 +915,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         store: Some(true),
         stream: Some(true), // KEY: Enable streaming
         temperature: Some(0.7),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
         tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
@@ -1148,6 +1171,13 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Verify no error events
     let has_error = body_text.contains("event: error");
     assert!(!has_error, "Should not have error events");
+    assert!(
+        body_text.contains("Tool result consumed; here is the final answer."),
+        "stream should contain the final assistant message"
+    );
+
+    let upstream_requests = take_response_requests(worker_port);
+    assert_mcp_tool_choice_sequence(&upstream_requests);
 
     worker.stop().await;
     mcp.stop().await;
