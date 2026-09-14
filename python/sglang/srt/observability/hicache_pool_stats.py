@@ -6,6 +6,15 @@ one host pool. A hybrid model's host tier is a ``HostPoolGroup`` of several
 pools (kv, mamba, swa, indexer, ...), each with its own capacity and eviction
 pressure; these helpers walk the group so the scheduler can publish
 ``sglang:hicache_host_pool_used_tokens{pool}`` and friends next to them.
+
+Only pools that allocate their own host slots get a series. A sidecar pool
+whose host indices are borrowed from another pool (``SidecarPoolSpec``: the
+DeepSeek V4 C4 / indexer / state pools, the DSA indexer pool) has no occupancy
+of its own: its free list is never consumed, so ``used`` would read 0 while it
+holds data, and ``DeepSeekV4StateHostPool`` has no allocator at all and raises
+``NotImplementedError`` from ``available_size()``. Both are skipped rather than
+reported as 0 or NaN, matching how the rest of the scheduler stats leave an
+optional series absent instead of publishing a placeholder value.
 """
 
 from __future__ import annotations
@@ -19,6 +28,9 @@ DEFAULT_HOST_POOL_LABELS: Mapping[str, str] = {
     "full": "kv",
     "swa": "swa",
     "mamba": "mamba",
+    # NPU drives DeepSeek V4 C128 as its own tree component; its host pool is
+    # PoolName.DEEPSEEK_V4_C128, so the counter and the gauges share {pool}.
+    "c128": "deepseek_v4_c128",
 }
 
 
@@ -29,22 +41,38 @@ def pool_label(name: Any) -> str:
 
 def collect_host_pool_stats(
     host_pool_group: Any,
+    derived_pools: Iterable[Any] = (),
 ) -> Tuple[Dict[str, int], Dict[str, int]]:
     """Return ``({pool: used_tokens}, {pool: total_tokens})`` for a host pool group.
 
     ``total`` is the pool's ``logical_size``; ``used`` is that minus what
-    ``available_size()`` reports, floored at zero. For the mamba pool a token is one checkpoint
-    slot. ``None`` or a group without entries yields two empty dicts.
+    ``available_size()`` reports, floored at zero. For the mamba pool a token is
+    one checkpoint slot. ``None`` or a group without entries yields two empty
+    dicts.
+
+    ``derived_pools`` names the sidecar pools whose host indices come from
+    another pool (``SidecarPoolSpec.pool_name`` on the tree cache). They are
+    left out of both dicts: their occupancy is the source pool's, and their own
+    free list, if they have one, never moves. A pool whose ``available_size()``
+    raises ``NotImplementedError`` declares the same thing (no allocator) and
+    is skipped too; any other exception propagates.
     """
     used: Dict[str, int] = {}
     total: Dict[str, int] = {}
     if host_pool_group is None:
         return used, total
+    skip = {pool_label(name) for name in derived_pools}
     for entry in host_pool_group.entries:
-        host_pool = entry.host_pool
         label = pool_label(entry.name)
+        if label in skip:
+            continue
+        host_pool = entry.host_pool
+        try:
+            available = int(host_pool.available_size())
+        except NotImplementedError:
+            # No allocator of its own (DeepSeekV4StateHostPool): no occupancy.
+            continue
         capacity = int(host_pool.logical_size)
-        available = int(host_pool.available_size())
         used[label] = max(capacity - available, 0)
         total[label] = capacity
     return used, total

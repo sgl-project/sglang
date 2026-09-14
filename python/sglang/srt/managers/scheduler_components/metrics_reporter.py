@@ -1159,9 +1159,16 @@ class SchedulerMetricsReporter:
 
         # Per-pool occupancy of a hybrid model's host tier (UnifiedRadixCache
         # sets host_pool_group; other caches leave the dicts empty).
-        host_pool_group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
+        tree_cache = self.scheduler.tree_cache
+        host_pool_group = getattr(tree_cache, "host_pool_group", None)
         if host_pool_group is not None:
-            used, total = collect_host_pool_stats(host_pool_group)
+            # Sidecar pools reuse another pool's host indices; no series.
+            used, total = collect_host_pool_stats(
+                host_pool_group,
+                derived_pools=[
+                    spec.pool_name for spec in tree_cache.sidecar_pool_specs
+                ],
+            )
             self.stats.hicache_host_pool_used_tokens = used
             self.stats.hicache_host_pool_total_tokens = total
 

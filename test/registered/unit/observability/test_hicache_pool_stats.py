@@ -45,6 +45,8 @@ class _PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    C4 = "deepseek_v4_c4"
+    C4_STATE = "deepseek_v4_c4_state"
 
 
 class _HostPool:
@@ -55,6 +57,23 @@ class _HostPool:
 
     def available_size(self):
         return self._available
+
+
+class _NoAllocatorHostPool(_HostPool):
+    """Stand-in for DeepSeekV4StateHostPool: sized, but no allocator."""
+
+    def __init__(self, size):
+        super().__init__(size=size, available=None)
+
+    def available_size(self):
+        raise NotImplementedError(
+            "deepseek_v4_c4_state reuses SWA transfer indices and has no allocator"
+        )
+
+
+class _BrokenHostPool(_HostPool):
+    def available_size(self):
+        raise RuntimeError("free list corrupted")
 
 
 def _group(*entries):
@@ -100,6 +119,49 @@ class TestCollectHostPoolStats(unittest.TestCase):
         used, total = stats.collect_host_pool_stats(group)
         self.assertEqual((used, total), ({"indexer": 5}, {"indexer": 8}))
 
+    def test_pool_without_allocator_is_skipped(self):
+        # DeepSeekV4StateHostPool.available_size() raises NotImplementedError
+        # by design; the DeepSeek V4 stack registers it as a group entry, and
+        # the metrics tick must not take the scheduler down over it.
+        group = _group(
+            _entry(_PoolName("kv"), _HostPool(size=1000, available=250)),
+            _entry(_PoolName("deepseek_v4_c4_state"), _NoAllocatorHostPool(size=64)),
+            _entry(_PoolName("swa"), _HostPool(size=64, available=60)),
+        )
+        used, total = stats.collect_host_pool_stats(group)
+        self.assertEqual(used, {"kv": 750, "swa": 4})
+        self.assertEqual(total, {"kv": 1000, "swa": 64})
+
+    def test_derived_pools_are_skipped(self):
+        # A sidecar pool that follows KV indices owns a free list that never
+        # moves: available == size while it holds data. Naming it in
+        # derived_pools drops it instead of publishing used=0.
+        group = _group(
+            _entry(_PoolName("kv"), _HostPool(size=1000, available=250)),
+            _entry(_PoolName("deepseek_v4_c4"), _HostPool(size=1000, available=1000)),
+            _entry(_PoolName("deepseek_v4_c4_state"), _NoAllocatorHostPool(size=64)),
+        )
+        used, total = stats.collect_host_pool_stats(
+            group, derived_pools=[_PoolName.C4, _PoolName.C4_STATE]
+        )
+        self.assertEqual(used, {"kv": 750})
+        self.assertEqual(total, {"kv": 1000})
+
+    def test_derived_pools_accept_plain_strings(self):
+        group = _group(
+            _entry(_PoolName("kv"), _HostPool(size=10, available=1)),
+            _entry(_PoolName("indexer"), _HostPool(size=10, available=10)),
+        )
+        used, total = stats.collect_host_pool_stats(group, derived_pools=["indexer"])
+        self.assertEqual((used, total), ({"kv": 9}, {"kv": 10}))
+
+    def test_other_errors_propagate(self):
+        # Only NotImplementedError means "no allocator"; anything else is a bug
+        # and must surface.
+        group = _group(_entry(_PoolName("kv"), _BrokenHostPool(size=10, available=0)))
+        with self.assertRaises(RuntimeError):
+            stats.collect_host_pool_stats(group)
+
 
 class _Component:
     """Stand-in for ComponentType: str() is the lower-cased name."""
@@ -128,9 +190,17 @@ class TestHostPoolEvictionCounts(unittest.TestCase):
             stats.host_pool_eviction_counts(host_frees), {"kv": 4, "mamba": 2}
         )
 
-    def test_unmapped_component_keeps_its_name(self):
+    def test_c128_component_joins_the_occupancy_label(self):
+        # NPU C128 frees into PoolName.DEEPSEEK_V4_C128; the counter must carry
+        # the same {pool} label as the occupancy gauges.
         host_frees = {_Component("c128"): [[1, 2]]}
-        self.assertEqual(stats.host_pool_eviction_counts(host_frees), {"c128": 2})
+        self.assertEqual(
+            stats.host_pool_eviction_counts(host_frees), {"deepseek_v4_c128": 2}
+        )
+
+    def test_unmapped_component_keeps_its_name(self):
+        host_frees = {_Component("linear"): [[1, 2]]}
+        self.assertEqual(stats.host_pool_eviction_counts(host_frees), {"linear": 2})
 
     def test_empty(self):
         self.assertEqual(stats.host_pool_eviction_counts({}), {})
