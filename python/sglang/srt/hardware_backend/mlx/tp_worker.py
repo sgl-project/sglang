@@ -121,8 +121,9 @@ class MlxTpModelWorker(TpModelWorker):
         self._mlx_active_rids: set[str] = set()
         # Scheduler request identity plus its current request-pool registration.
         # Either changing means a same-RID request must start from fresh runner
-        # state; live requests may otherwise sit outside an extend/mixed batch.
-        self._mlx_active_reqs: dict[str, tuple[object, Optional[int]]] = {}
+        # state; the retraction epoch also catches reuse of the same pool row.
+        # Live requests may otherwise sit outside an extend/mixed batch.
+        self._mlx_active_reqs: dict[str, tuple[object, Optional[int], int]] = {}
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -165,6 +166,10 @@ class MlxTpModelWorker(TpModelWorker):
         return getattr(getattr(req, "kv", None), "req_pool_idx", None)
 
     @staticmethod
+    def _req_retraction_count(req) -> int:
+        return getattr(req, "retraction_count", 0)
+
+    @staticmethod
     def _req_is_retired(req) -> bool:
         finished = getattr(req, "finished", None)
         return bool(getattr(req, "is_retracted", False)) or (
@@ -200,11 +205,16 @@ class MlxTpModelWorker(TpModelWorker):
 
         current_reqs = {req.rid: req for req in reqs}
         stale_rids = set()
-        for rid, (tracked_req, tracked_pool_idx) in self._mlx_active_reqs.items():
+        for rid, (
+            tracked_req,
+            tracked_pool_idx,
+            tracked_retraction_count,
+        ) in self._mlx_active_reqs.items():
             current_req = current_reqs.get(rid)
             registration_changed = current_req is not None and (
                 current_req is not tracked_req
                 or self._req_pool_idx(current_req) != tracked_pool_idx
+                or self._req_retraction_count(current_req) != tracked_retraction_count
             )
             if self._req_is_retired(tracked_req) or registration_changed:
                 stale_rids.add(rid)
@@ -217,7 +227,11 @@ class MlxTpModelWorker(TpModelWorker):
 
         for rid, req in current_reqs.items():
             self._mlx_active_rids.add(rid)
-            self._mlx_active_reqs[rid] = (req, self._req_pool_idx(req))
+            self._mlx_active_reqs[rid] = (
+                req,
+                self._req_pool_idx(req),
+                self._req_retraction_count(req),
+            )
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point."""

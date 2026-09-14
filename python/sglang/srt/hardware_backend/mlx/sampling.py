@@ -164,23 +164,32 @@ def apply_token_penalties(
     if not any(p.has_penalties for p in params):
         return logits
 
-    frequency = mx.array(
-        [p.frequency_penalty for p in params], dtype=mx.float32
-    )[:, None]
-    presence = mx.array(
-        [p.presence_penalty for p in params], dtype=mx.float32
-    )[:, None]
-    repetition = mx.array(
-        [p.repetition_penalty for p in params], dtype=mx.float32
-    )[:, None]
-    seen = token_counts > 0
-    adjusted = (
-        logits.astype(mx.float32)
-        - token_counts.astype(mx.float32) * frequency
-        - seen * presence
-    )
-    scaled = mx.where(adjusted < 0, adjusted * repetition, adjusted / repetition)
-    return mx.where(seen, scaled, adjusted)
+    has_frequency = any(p.frequency_penalty != 0.0 for p in params)
+    has_presence = any(p.presence_penalty != 0.0 for p in params)
+    has_repetition = any(p.repetition_penalty != 1.0 for p in params)
+
+    adjusted = logits.astype(mx.float32)
+    if has_frequency:
+        frequency = mx.array([p.frequency_penalty for p in params], dtype=mx.float32)[
+            :, None
+        ]
+        adjusted = adjusted - token_counts.astype(mx.float32) * frequency
+
+    seen = token_counts > 0 if has_presence or has_repetition else None
+    if has_presence:
+        presence = mx.array([p.presence_penalty for p in params], dtype=mx.float32)[
+            :, None
+        ]
+        adjusted = adjusted - seen * presence
+
+    if has_repetition:
+        repetition = mx.array([p.repetition_penalty for p in params], dtype=mx.float32)[
+            :, None
+        ]
+        scaled = mx.where(adjusted < 0, adjusted * repetition, adjusted / repetition)
+        adjusted = mx.where(seen, scaled, adjusted)
+
+    return adjusted
 
 
 def increment_token_counts(token_counts: mx.array, tokens: mx.array) -> mx.array:

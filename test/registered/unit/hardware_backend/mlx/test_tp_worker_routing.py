@@ -70,6 +70,7 @@ class _FakeRunner:
         self._req_penalty_seed_ids = {rid: [7] for rid in known_rids}
         self.penalty_states: dict[tuple[str, str], object] = {}
         self.remove_sync_flags: dict[str, bool] = {}
+        self.prefill_inputs: dict[str, tuple[object, list[int]]] = {}
         self._counter = 0
 
     # --- shared ---
@@ -141,6 +142,7 @@ class _FakeRunner:
 
         self.calls.append(("prefill_start", req_id))
         self.logits_flags[("prefill_start", req_id)] = needs_logits
+        self.prefill_inputs[req_id] = (req, list(full_token_ids))
         self._known.add(req_id)
         penalty_state = mx.array([20 + self._counter], dtype=mx.uint32)
         self.penalty_states[("prefill_start", req_id)] = penalty_state
@@ -208,10 +210,11 @@ class _FakeRunner:
 
 
 class _FakeReq:
-    def __init__(self, rid, req_pool_idx=0):
+    def __init__(self, rid, req_pool_idx=0, *, fill_ids=None, output_ids=None):
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
-        self.fill_ids = [0]
+        self.fill_ids = list([0] if fill_ids is None else fill_ids)
+        self.output_ids = list(() if output_ids is None else output_ids)
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
@@ -219,6 +222,7 @@ class _FakeReq:
         self.extend_range = None
         self.full_untruncated_fill_ids = self.fill_ids
         self.is_retracted = False
+        self.retraction_count = 0
         self._finished = False
 
     def get_fill_ids(self):
@@ -433,13 +437,15 @@ class TestMlxExtendRouting(CustomTestCase):
         req = _FakeReq("old", req_pool_idx=21)
         worker = self._worker({"old"})
         worker._mlx_active_rids = {"old"}
-        worker._mlx_active_reqs = {"old": (req, 21)}
+        worker._mlx_active_reqs = {"old": (req, 21, 0)}
 
         worker.cleanup_idle_request_state()
 
         self.assertEqual(worker._mlx_active_rids, set())
+        self.assertEqual(worker._mlx_active_reqs, {})
         self.assertEqual(worker._mlx_runner._req_penalty_counts, {})
         self.assertEqual(worker._mlx_runner._req_penalty_seed_ids, {})
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["old"])
 
     def test_finished_prefill_is_retired_without_dropping_live_extend(self):
         finished = _FakeReq("finished", req_pool_idx=31)
@@ -447,8 +453,8 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker({"finished", "live"})
         worker._mlx_active_rids = {"finished", "live"}
         worker._mlx_active_reqs = {
-            "finished": (finished, 31),
-            "live": (live, 32),
+            "finished": (finished, 31, 0),
+            "live": (live, 32, 0),
         }
         finished._finished = True
 
@@ -460,12 +466,13 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertNotIn("finished", worker._mlx_runner._req_penalty_seed_ids)
         self.assertIn("live", worker._mlx_runner._req_penalty_counts)
         self.assertEqual(worker._mlx_runner.ops_for("live"), ["extend_start"])
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["finished"])
 
     def test_finished_decode_release_immediately_retires_worker_state(self):
         req = _FakeReq("finished", req_pool_idx=33)
         worker = self._worker({"finished"})
         worker._mlx_active_rids = {"finished"}
-        worker._mlx_active_reqs = {"finished": (req, 33)}
+        worker._mlx_active_reqs = {"finished": (req, 33, 0)}
 
         worker.prepare_for_kv_cache_release(req)
 
@@ -483,8 +490,8 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker({"aborted", "live"})
         worker._mlx_active_rids = {"aborted", "live"}
         worker._mlx_active_reqs = {
-            "aborted": (aborted, 34),
-            "live": (live, 35),
+            "aborted": (aborted, 34, 0),
+            "live": (live, 35, 0),
         }
         aborted.is_retracted = True
 
@@ -502,8 +509,8 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker({"current", "parked"})
         worker._mlx_active_rids = {"current", "parked"}
         worker._mlx_active_reqs = {
-            "current": (current, 36),
-            "parked": (parked, 37),
+            "current": (current, 36, 0),
+            "parked": (parked, 37, 0),
         }
 
         worker.async_forward_batch_generation_mlx(
@@ -512,12 +519,22 @@ class TestMlxExtendRouting(CustomTestCase):
 
         self.assertIn("parked", worker._mlx_runner._req_penalty_counts)
         self.assertNotIn(("remove_request", "parked"), worker._mlx_runner.calls)
+        self.assertEqual(worker._mlx_active_rids, {"current", "parked"})
+        self.assertEqual(
+            worker._mlx_active_reqs,
+            {"current": (current, 36, 0), "parked": (parked, 37, 0)},
+        )
 
     def test_retracted_request_reprefills_with_accepted_output_seed(self):
-        req = _FakeReq("same", req_pool_idx=41)
+        req = _FakeReq(
+            "same",
+            req_pool_idx=41,
+            fill_ids=[101, 102, 7, 8],
+            output_ids=[7, 8],
+        )
         worker = self._worker({"same"})
         worker._mlx_active_rids = {"same"}
-        worker._mlx_active_reqs = {"same": (req, 41)}
+        worker._mlx_active_reqs = {"same": (req, 41, 0)}
         old_count = worker._mlx_runner._req_penalty_counts["same"]
         old_seed = worker._mlx_runner._req_penalty_seed_ids["same"]
 
@@ -535,13 +552,21 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertNotIn(old_count, worker._mlx_runner._req_penalty_counts.values())
         self.assertNotIn(old_seed, worker._mlx_runner._req_penalty_seed_ids.values())
         self.assertFalse(worker._mlx_runner.remove_sync_flags["same"])
+        forwarded_req, forwarded_full_token_ids = worker._mlx_runner.prefill_inputs[
+            "same"
+        ]
+        self.assertIs(forwarded_req, req)
+        self.assertEqual(forwarded_req.output_ids, [7, 8])
+        self.assertEqual(forwarded_full_token_ids, [101, 102, 7, 8])
+        self.assertEqual(worker._mlx_active_rids, {"same"})
+        self.assertEqual(worker._mlx_active_reqs, {"same": (req, 42, 0)})
 
     def test_same_rid_reuse_drops_old_counts_and_seed_before_prefill(self):
         old_req = _FakeReq("same", req_pool_idx=51)
         new_req = _FakeReq("same", req_pool_idx=51)
         worker = self._worker({"same"})
         worker._mlx_active_rids = {"same"}
-        worker._mlx_active_reqs = {"same": (old_req, 51)}
+        worker._mlx_active_reqs = {"same": (old_req, 51, 0)}
         old_count = worker._mlx_runner._req_penalty_counts["same"]
         old_seed = worker._mlx_runner._req_penalty_seed_ids["same"]
 
@@ -556,6 +581,34 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertNotIn(old_count, worker._mlx_runner._req_penalty_counts.values())
         self.assertNotIn(old_seed, worker._mlx_runner._req_penalty_seed_ids.values())
         self.assertFalse(worker._mlx_runner.remove_sync_flags["same"])
+        self.assertEqual(worker._mlx_active_rids, {"same"})
+        self.assertEqual(worker._mlx_active_reqs, {"same": (new_req, 51, 0)})
+
+    def test_retraction_reuses_same_pool_row_before_reprefill(self):
+        """A retraction epoch change must retire stale runner state even if
+        the allocator gives the request its previous row back."""
+        req = _FakeReq("same", req_pool_idx=61)
+        worker = self._worker({"same"})
+        worker._mlx_active_rids = {"same"}
+        worker._mlx_active_reqs = {"same": (req, 61, 0)}
+        old_count = worker._mlx_runner._req_penalty_counts["same"]
+        old_seed = worker._mlx_runner._req_penalty_seed_ids["same"]
+
+        req.retraction_count = 1
+        req.is_retracted = False
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [req], [1])
+        )
+
+        self.assertEqual(
+            worker._mlx_runner.ops_for("same"),
+            ["remove_request", "prefill_start"],
+        )
+        self.assertNotIn(old_count, worker._mlx_runner._req_penalty_counts.values())
+        self.assertNotIn(old_seed, worker._mlx_runner._req_penalty_seed_ids.values())
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["same"])
+        self.assertEqual(worker._mlx_active_rids, {"same"})
+        self.assertEqual(worker._mlx_active_reqs, {"same": (req, 61, 1)})
 
 
 if __name__ == "__main__":

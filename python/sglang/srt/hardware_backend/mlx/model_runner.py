@@ -1867,7 +1867,13 @@ class MlxModelRunner:
         next_tokens = [int(t) for t in raw]
 
         for i, rid in enumerate(pending.req_ids):
-            self._req_token_ids[rid].append(next_tokens[i])
+            token_ids = self._req_token_ids.get(rid)
+            if token_ids is not None:
+                # A chained lookahead may still contain a request that finished
+                # while its predecessor was finalized.  Its token is
+                # provisional and the release hook has already removed the
+                # request-owned state, so do not resurrect it.
+                token_ids.append(next_tokens[i])
 
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:

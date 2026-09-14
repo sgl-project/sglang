@@ -978,6 +978,21 @@ class TestRunnerSelectTokens(CustomTestCase):
         self.assertEqual(runner._req_penalty_counts, {})
         self.assertEqual(runner._req_penalty_seed_ids, {})
 
+    def test_decode_finalize_skips_removed_lookahead_request(self):
+        """A finished request may be removed before its chained lookahead drains."""
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxPendingDecode
+
+        runner = self._runner(enable_sampling=True)
+        runner._req_token_ids = {"live": [7]}
+        pending = MlxPendingDecode(
+            lazy_tokens=mx.array([1, 2], dtype=mx.int32),
+            req_ids=["finished", "live"],
+            caches=[[], []],
+        )
+
+        self.assertEqual(runner.decode_batch_finalize(pending), [1, 2])
+        self.assertEqual(runner._req_token_ids["live"], [7, 2])
+
     def test_logit_edits_gate_greedy_and_sampled_and_logprobs(self):
         """An additive -inf edit row must exclude a token from greedy argmax,
         from sampling, AND from the reported logprob distribution — guards
