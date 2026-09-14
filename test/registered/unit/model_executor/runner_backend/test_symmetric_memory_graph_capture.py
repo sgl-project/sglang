@@ -9,10 +9,12 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import base_cuda_graph_backend as base
 from sglang.srt.model_executor.runner_backend import (
-    base_cuda_graph_backend as base,
     breakable_cuda_graph_backend as breakable,
-    full_cuda_graph_backend as full,
+)
+from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as full
+from sglang.srt.model_executor.runner_backend import (
     tc_piecewise_cuda_graph_backend as piecewise,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
