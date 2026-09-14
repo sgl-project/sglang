@@ -1953,9 +1953,12 @@ def biased_grouped_topk_gpu(
             and experts_per_group <= 32
             and is_power_of_two(num_experts)
         ):
-            from sgl_kernel import moe_fused_gate
+            # aliased: a plain `import moe_fused_gate` here makes the name local
+            # to the whole function, and the MUSA branch above, which reads the
+            # module-level mate import, raised UnboundLocalError (ruff F823)
+            from sgl_kernel import moe_fused_gate as _sgl_kernel_moe_fused_gate
 
-            return moe_fused_gate(
+            return _sgl_kernel_moe_fused_gate(
                 gating_output.to(torch.float32),
                 correction_bias.to(torch.float32),
                 num_expert_group,
