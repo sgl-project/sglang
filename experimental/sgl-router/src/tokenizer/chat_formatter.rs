@@ -49,7 +49,7 @@ impl ChatFormatter {
             // These require tokenization paths not yet supported by this adapter.
             Some("inkling_mm_model" | "kimi_k3") => return Ok(None),
             Some(t) if t.starts_with("deepseek_v4") => {
-                return Ok(Self::native(model_type.as_deref(), model_id));
+                return Ok(Self::deepseek_native(model_type.as_deref(), model_id));
             }
             _ => {}
         }
@@ -58,7 +58,7 @@ impl ChatFormatter {
             .unwrap_or_else(|| serde_json::json!({}));
         let jinja = files.text("chat_template.jinja")?;
         Ok(Self::from_tokenizer_config(cfg, jinja.as_deref())?
-            .or_else(|| Self::native(model_type.as_deref(), model_id)))
+            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id)))
     }
 
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
@@ -128,10 +128,11 @@ impl ChatFormatter {
         }))
     }
 
-    /// dynamo-render's DeepSeek encoders (V4 family, V3.2), the only built-in ones
-    /// verified against the engine. `model_type` (from `config.json`) is
-    /// authoritative; the model id's last path segment is the fallback.
-    pub fn native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
+    /// dynamo-render's code-based DeepSeek encoders, for V4 (including variants
+    /// such as V4.1) and V3.2 non-Exp: the only built-in formatters verified
+    /// against the engine. `model_type` (from `config.json`) is authoritative;
+    /// the model id's last path segment is the fallback.
+    pub fn deepseek_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
         let name = model_id
             .rsplit('/')
             .next()
@@ -230,10 +231,11 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .get("reasoning_effort")
             .map(Value::from_serialize)
     }
+    /// Withheld: the engine enforces `response_format` by constrained decoding
+    /// and never renders it, while dynamo-render's DeepSeek formatters would
+    /// append a "## Response Format" schema preamble to the system turn.
     fn response_format(&self) -> Option<Value> {
-        self.request
-            .get("response_format")
-            .map(Value::from_serialize)
+        None
     }
     fn should_add_generation_prompt(&self) -> bool {
         true
@@ -260,8 +262,8 @@ mod tests {
         json!({"model": "m", "messages": messages})
     }
 
-    fn v4() -> ChatFormatter {
-        ChatFormatter::native(Some("deepseek_v4"), "any").unwrap()
+    fn deepseek_v4() -> ChatFormatter {
+        ChatFormatter::deepseek_native(Some("deepseek_v4"), "any").unwrap()
     }
 
     #[test]
@@ -421,27 +423,27 @@ mod tests {
 
     #[test]
     fn missing_messages_is_an_error() {
-        assert!(v4().render(&json!({"model": "m"})).is_err());
+        assert!(deepseek_v4().render(&json!({"model": "m"})).is_err());
     }
 
     #[test]
-    fn native_detection() {
-        assert!(ChatFormatter::native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
-        assert!(ChatFormatter::native(None, "deepseek-v4-tiny").is_some());
-        assert!(ChatFormatter::native(Some("deepseek_v4"), "alias").is_some());
-        assert!(ChatFormatter::native(Some("deepseek_v41"), "alias").is_some());
-        assert!(ChatFormatter::native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
-        assert!(ChatFormatter::native(Some("inkling_mm_model"), "inkling").is_none());
-        assert!(ChatFormatter::native(Some("llama"), "deepseek-v4").is_none());
-        assert!(ChatFormatter::native(None, "deepseek-ai/DeepSeek-V3.2-Exp").is_none());
-        assert!(ChatFormatter::native(None, "Qwen/Qwen3-0.6B").is_none());
+    fn deepseek_native_detection() {
+        assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
+        assert!(ChatFormatter::deepseek_native(None, "deepseek-v4-tiny").is_some());
+        assert!(ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").is_some());
+        assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
+        assert!(ChatFormatter::deepseek_native(Some("inkling_mm_model"), "inkling").is_none());
+        assert!(ChatFormatter::deepseek_native(Some("llama"), "deepseek-v4").is_none());
+        assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V3.2-Exp").is_none());
+        assert!(ChatFormatter::deepseek_native(None, "Qwen/Qwen3-0.6B").is_none());
     }
 
     /// Byte-exact against the engine's `/tokenize` in its default chat mode:
     /// `[{user:"ABCD"}]` -> `[0, 128803, 51453, 128804, 128822]`.
     #[test]
     fn v4_single_user_turn() {
-        let out = v4()
+        let out = deepseek_v4()
             .render(&request(json!([{"role":"user","content":"ABCD"}])))
             .unwrap();
         assert_eq!(
@@ -452,7 +454,7 @@ mod tests {
 
     #[test]
     fn v4_system_then_multi_turn() {
-        let out = v4()
+        let out = deepseek_v4()
             .render(&request(json!([
                 {"role":"system","content":"SYS"},
                 {"role":"user","content":"U1"},
@@ -471,7 +473,16 @@ mod tests {
     fn v4_thinking_kwarg_overrides_chat_default() {
         let mut req = request(json!([{"role":"user","content":"ABCD"}]));
         req["chat_template_kwargs"] = json!({"thinking": true});
-        let out = v4().render(&req).unwrap();
+        let out = deepseek_v4().render(&req).unwrap();
         assert!(out.ends_with("<｜Assistant｜><think>"), "got: {out}");
+    }
+
+    /// The engine never renders `response_format` into the prompt.
+    #[test]
+    fn v4_ignores_response_format() {
+        let mut req = request(json!([{"role":"user","content":"ABCD"}]));
+        let plain = deepseek_v4().render(&req).unwrap();
+        req["response_format"] = json!({"type": "json_object"});
+        assert_eq!(deepseek_v4().render(&req).unwrap(), plain);
     }
 }

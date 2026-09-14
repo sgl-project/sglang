@@ -778,7 +778,7 @@ pub async fn chat_completions(
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
     // engine-equivalent (chat-formatter path) AND the request contains nothing
-    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
+    // the router's formatter didn't replicate (see `input_ids_safe_to_forward`).
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
@@ -1298,7 +1298,8 @@ fn build_outgoing_body(
 /// Exclude requests that may render differently with dynamo-render:
 /// - Non-leading system turns or consecutive users, which strict templates rewrite.
 /// - Historical `reasoning_content`, which may be injected into message content.
-/// - Tools/functions, whose schemas the engine normalizes before rendering.
+/// - Tools and tool-call history, which the engine merges and normalizes
+///   before rendering.
 /// - Non-string or missing content, which the engine flattens or blanks.
 /// - Template overrides, kwargs, reasoning controls, or task selection.
 /// - Assistant continuations, whose final turn the engine handles separately.
@@ -1369,16 +1370,32 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Tool schemas require engine normalization before rendering.
+/// Tool schemas and tool-call history require engine normalization before
+/// rendering: the engine merges message-level `tools` into the template's tools
+/// and parses `tool_calls` arguments; dynamo-render does neither the same way.
 fn request_has_tools(value: &serde_json::Value) -> bool {
-    let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        })
+    let nonempty = |v: &serde_json::Value| match v {
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
     };
-    nonempty("tools") || nonempty("functions")
+    if ["tools", "functions"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(nonempty))
+    {
+        return true;
+    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    || ["tools", "tool_calls", "function_call"]
+                        .iter()
+                        .any(|key| message.get(key).is_some_and(nonempty))
+            })
+        })
 }
 
 /// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
@@ -1667,8 +1684,8 @@ mod tests {
         );
     }
 
-    /// Tool / function requests are detected so the caller omits `input_ids`
-    /// (the router's formatter doesn't render tools).
+    /// Tool schemas and tool-call history are detected so the caller omits
+    /// `input_ids`; empty lists and nulls are not tools.
     #[test]
     fn request_has_tools_detects_tools_and_functions() {
         assert!(request_has_tools(
@@ -1679,6 +1696,14 @@ mod tests {
         ));
         assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+        for message in [
+            serde_json::json!({"role":"system","content":"s","tools":[{"type":"function"}]}),
+            serde_json::json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}),
+        ] {
+            assert!(request_has_tools(
+                &serde_json::json!({"messages":[message]})
+            ));
+        }
     }
 
     /// Arrays, nulls, and missing content block `input_ids` forwarding.
