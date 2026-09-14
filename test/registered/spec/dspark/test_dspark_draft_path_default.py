@@ -15,11 +15,22 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
+_K3_MODEL_PATH = "RadixArk/Kimi-K3"
 
 
 def _bundled_hf_config() -> SimpleNamespace:
     return SimpleNamespace(
         architectures=["DeepseekV4ForCausalLM"],
+        dspark_block_size=5,
+        dspark_markov_rank=256,
+        dspark_target_layer_ids=[40, 41, 42],
+        dspark_noise_token_id=128799,
+    )
+
+
+def _k3_bundled_hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        architectures=["KimiK3ForConditionalGeneration"],
         dspark_block_size=5,
         dspark_markov_rank=256,
         dspark_target_layer_ids=[40, 41, 42],
@@ -94,15 +105,34 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self,
+        *,
+        moe_a2a_backend: str,
+        model_path: str = _BUNDLED_MODEL_PATH,
+        hf_config: SimpleNamespace = None,
+    ) -> ServerArgs:
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=model_path,
+            hf_config=hf_config if hf_config is not None else _bundled_hf_config(),
         )
         server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
         server_args.dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
+        return server_args
+
+    def _k3_dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+        # Deployment-shaped topology: attention TP = tp/dp = 8, so the K3
+        # SP-MoE scatter divides the padded verify rows by 8 and the DeepEP
+        # capacity check passes with the default capacity.
+        server_args = self._dp_server_args(
+            moe_a2a_backend=moe_a2a_backend,
+            model_path=_K3_MODEL_PATH,
+            hf_config=_k3_bundled_hf_config(),
+        )
+        server_args.tp_size = 16
         return server_args
 
     def test_only_megamoe_is_admitted(self):
@@ -112,6 +142,56 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_deepep_is_admitted_for_kimi_k3_static(self):
+        """DeepEP + static passes the gate only for a Kimi-K3 target."""
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(self._k3_dp_server_args(moe_a2a_backend="deepep"))
+            # An explicit draft backend matching the target is also accepted.
+            server_args = self._k3_dp_server_args(moe_a2a_backend="deepep")
+            server_args.speculative_moe_a2a_backend = "deepep"
+            _handle_dspark(server_args)
+
+    def test_deepep_with_compact_verify_mode_raises(self):
+        server_args = self._k3_dp_server_args(moe_a2a_backend="deepep")
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            with self.assertRaisesRegex(ValueError, "static"):
+                _handle_dspark(server_args)
+
+    def test_deepep_without_dp_lm_head_raises(self):
+        server_args = self._k3_dp_server_args(moe_a2a_backend="deepep")
+        server_args.enable_dp_lm_head = False
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "dp-lm-head"):
+                _handle_dspark(server_args)
+
+    def test_deepep_with_mismatched_speculative_backend_raises(self):
+        server_args = self._k3_dp_server_args(moe_a2a_backend="deepep")
+        server_args.speculative_moe_a2a_backend = "megamoe"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "speculative-moe-a2a-backend"):
+                _handle_dspark(server_args)
+
+    def test_deepep_with_attn_cp_raises(self):
+        server_args = self._k3_dp_server_args(moe_a2a_backend="deepep")
+        server_args.attn_cp_size = 2
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "attn_cp_size"):
+                _handle_dspark(server_args)
+
+    def test_deepep_dispatch_capacity_boundary(self):
+        # K3 fixture: gamma=5 -> verify window 6, default max_running_requests
+        # 48 is a global budget -> dp-local bs 48//2=24 -> 24*6=144 rows;
+        # padded to 144 (attn_tp=8), scattered /8 -> 18 rows per EP rank.
+        # Capacity 18 passes, 16 raises.
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(18):
+                _handle_dspark(self._k3_dp_server_args(moe_a2a_backend="deepep"))
+            with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(16):
+                with self.assertRaisesRegex(
+                    ValueError, "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+                ):
+                    _handle_dspark(self._k3_dp_server_args(moe_a2a_backend="deepep"))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")
