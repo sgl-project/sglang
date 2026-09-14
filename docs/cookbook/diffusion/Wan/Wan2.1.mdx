@@ -27,7 +27,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
+The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2 Series/A3 Series NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
@@ -217,11 +217,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two A3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     sglang serve \
       --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
       --tp-size 2 \
@@ -321,11 +321,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two Atlas 3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \

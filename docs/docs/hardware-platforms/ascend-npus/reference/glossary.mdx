@@ -13,23 +13,23 @@ you will encounter throughout the Ascend NPU documentation. Refer back here when
 
 SGLang supports the following Ascend inference hardware:
 
-| Hardware           | Chip        | Devices | Dies per card | Memory configuration                 |
-| ------------------ | ----------- | ------- | ------------- | ------------------------------------ |
-| Atlas 800I A2 (A2) | Ascend 910B | 8       | 1             | 8(cards) × 1(die/card) × 64(GB/die)  |
-| Atlas 800I A3 (A3) | Ascend 910C | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die) |
+| Hardware                  | Devices | Dies per card | Memory configuration                 |
+| ------------------------- | ------- | ------------- | ------------------------------------ |
+| Ascend A2 Series Products | 8       | 1             | 8(cards) × 1(die/card) × 64(GB/die)  |
+| Ascend A3 Series Products | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die) |
 
 <Note>
-Throughout these docs, **A2** and **A3** are used as shorthand for the hardware above.
-Docker image tags use `910b` for A2 and `a3` for A3.
+Throughout these docs, **A2 Series** and **A3 Series** are used as shorthand for the hardware above.
+Docker image tags use `910b` for the A2 Series and `a3` for the A3 Series.
 For example, `cann9.0.0-910b-v0.5.16` and `cann9.0.0-a3-v0.5.16`.
 
-On A3, each card has 2 dies, giving 16 devices vs 8 on A2.
-Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on A3 means `--tp-size 8`.
+On the A3 Series, each card has 2 dies, giving 16 devices vs 8 on the A2 Series.
+Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 Series means `--tp-size 8`.
 
-From a deployment perspective, the two key differences between A2 and A3 are:
+From a deployment perspective, the two key differences between the A2 Series and the A3 Series are:
 
 1. dies per card — which drives both total memory and `--tp-size` configuration
-2. PD disaggregation — A2 requires setting `export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"`, while A3 uses the default protocol.
+2. PD disaggregation — the A2 Series requires setting `export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"`, while the A3 Series uses the default protocol.
 </Note>
 
 ### NPU
@@ -37,10 +37,10 @@ From a deployment perspective, the two key differences between A2 and A3 are:
 **NPU** stands for Neural Processing Unit. Each NPU device is a single `davinci` core.
 The terms "NPU" and "davinci" are used interchangeably in commands and error logs.
 
-On A2, devices are numbered `/dev/davinci0` through `/dev/davinci7` (8 devices).
-On A3, devices are numbered `/dev/davinci0` through `/dev/davinci15` (16 devices).
+On the A2 Series, devices are numbered `/dev/davinci0` through `/dev/davinci7` (8 devices).
+On the A3 Series, devices are numbered `/dev/davinci0` through `/dev/davinci15` (16 devices).
 
-On either an A2 or A3 server, run `npu-smi info` to view NPU information such as device
+On either an A2 Series or an A3 Series server, run `npu-smi info` to view NPU information such as device
 health, memory usage, and chip status. If the command is not found or reports no devices,
 the driver is likely not installed. Follow the
 [Ascend driver installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0005.html?OS=openEuler&InstallType=local)
@@ -63,7 +63,7 @@ to install it.
 | **W4A8**  | 4-bit weights, 8-bit activations                                   |
 | **W4A16** | 4-bit weights, 16-bit activations                                  |
 | **BF16**  | Brain Floating Point 16 — 16-bit format optimized for ML workloads |
-| **FP8**   | 8-bit Floating Point — not supported on A2/A3                       |
+| **FP8**   | 8-bit Floating Point — not supported on the A2 Series or the A3 Series |
 | **INT8**  | 8-bit Integer quantization                                         |
 
 To apply quantization, use `--quantization modelslim` for W8A8 INT8, or load a pre-quantized

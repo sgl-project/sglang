@@ -719,7 +719,7 @@ export const Playground = ({ config }) => {
           && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
         const backendIsMega = slotDisplay("backend") === "megamoe";
         // `ep.showWhen` (function of base) drops the whole EP select on bases
-        // where EP is not a supported lever (e.g. the single-shape A3 recipe).
+        // where EP is not a supported lever (e.g. the single-shape A3 Series recipe).
         const epShown = !!fc.ep
           && !(typeof fc.ep.showWhen === "function" && !fc.ep.showWhen(base));
         return (

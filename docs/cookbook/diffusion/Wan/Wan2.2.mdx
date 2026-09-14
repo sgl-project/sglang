@@ -35,7 +35,7 @@ This section provides deployment configurations optimized for different hardware
 
 The Wan2.2 series offers models in various sizes, architectures and input types, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200, AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200, AMD MI300X, MI325X, MI355X GPUs and Ascend A2 Series/A3 Series NPUs.
 
 <Wan22Deployment />
 
@@ -297,10 +297,10 @@ Test Environment:
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
     ```shell Command
-    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
+    #One A3 Series card has 2 npu chips. Using four A3 Series cards in benchmarking
     sglang serve \
       --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
       --tp-size 2 \
@@ -399,11 +399,11 @@ Test Environment:
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```shell Command
-    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
+    #One A3 Series card has 2 npu chips. Using four A3 Series cards in benchmarking
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \

@@ -1182,8 +1182,8 @@ sglang generate \
 ```
 
 The selected SRT backend must provide an MXFP8 kernel on NVIDIA or ROCm. On
-Ascend, the hardware requirement remains A5 series or newer;
-`npu_dynamic_mx_quant` is not available on A2/A3.
+Ascend, the hardware requirement remains 950PR/DT Series or newer;
+`npu_dynamic_mx_quant` is not available on A2 Series/A3 Series.
 
 ## MXFP8 Offline Quantization (msmodelslim)
 
@@ -1216,8 +1216,8 @@ sglang generate \
   --save-output
 ```
 
-> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_dual_level_mx_quant`
-> and `npu_dual_level_quant_matmul` are not available on A2/A3.
+> **Hardware requirement:** Ascend 950PR/DT Series or newer. `npu_dynamic_dual_level_mx_quant`
+> and `npu_dual_level_quant_matmul` are not available on A2 Series/A3 Series.
 >
 > **Note:** Online MXFP4 weight quantization is experimental. The offline msmodelslim
 > flow uses pre-quantized weights and may produce different numerical results.

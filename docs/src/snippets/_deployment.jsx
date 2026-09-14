@@ -134,10 +134,10 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "mi350x", label: "MI350X", vram: "288GB" },
       { id: "mi355x", label: "MI355X", vram: "288GB" },
     ],
-    // Atlas 800I A3 (910C): 1 card = 2 dies, so --tp-size is 2× the card
+    // Ascend A3 Series: 1 card = 2 dies, so --tp-size is 2× the card
     // count (32 cards -> --tp-size 64).
     npu: [
-      { id: "a3", label: "Atlas 800I A3", vram: "64GB/die" },
+      { id: "a3", label: "Ascend A3 Series", vram: "64GB/die" },
     ],
   };
 
@@ -826,7 +826,7 @@ export const Deployment = ({ config, benchmarks }) => {
         : vendorOf(sel.hw) === "npu"
         ? [
             // NPU: --privileged grants the davinci devices (16 dies on an
-            // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
+            // 8-card Ascend A3 Series node); the host CANN driver/firmware/state
             // must be mounted in.
             "docker run --privileged --shm-size=16g",
             "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",

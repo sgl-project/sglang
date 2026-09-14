@@ -30,7 +30,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <th>Method</th>
       <th>NVIDIA GPUs</th>
       <th>AMD GPUs (MI300X/MI325X/MI350X)</th>
-      <th>Ascend NPUs (A2/A3/A5)</th>
+      <th>Ascend NPUs (A2 Series, A3 Series, 950PR/DT Series)</th>
       <th>Notes</th>
     </tr>
   </thead>
@@ -46,22 +46,22 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><code>mxfp4</code></td>
       <td>Yes</td>
       <td>Yes</td>
-      <td>Yes (A5)</td>
-      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense and MoE LLMs (MXFP4 weights + activations) — dense models support online dual-level MXFP4; offline <code>W4A4_MXFP4</code> dense and MoE checkpoints (single-level) are auto-detected via <code>modelslim</code>. On Intel GPUs (XPU): W4A16 MoE experts on Xe2/BMG via <code>sgl-kernel-xpu</code>, enabled automatically with <code>--device xpu</code> (see <a href="../hardware-platforms/xpu">Intel GPUs (XPU)</a>)</td>
+      <td>Yes (950PR/DT Series)</td>
+      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (950PR/DT Series): W4A4 MXFP4 for Qwen3 dense and MoE LLMs (MXFP4 weights + activations) — dense models support online dual-level MXFP4; offline <code>W4A4_MXFP4</code> dense and MoE checkpoints (single-level) are auto-detected via <code>modelslim</code>. On Intel GPUs (XPU): W4A16 MoE experts on Xe2/BMG via <code>sgl-kernel-xpu</code>, enabled automatically with <code>--device xpu</code> (see <a href="../hardware-platforms/xpu">Intel GPUs (XPU)</a>)</td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>
       <td>No</td>
       <td>No</td>
-      <td>Yes (A5 for Diffusion, LLM Dense Linear and LLM MoE)</td>
-      <td>Ascend NPU only; online + offline MXFP8 for Diffusion models (e.g., Wan2.2), LLM Dense Linear, and LLM MoE (FusedMoE, e.g. Qwen3-30B-A3B) on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> (dense) and <code>npu_grouped_matmul_swiglu_quant_v2</code> / <code>npu_grouped_matmul</code> (MoE) kernels</td>
+      <td>Yes (950PR/DT Series for Diffusion, LLM Dense Linear and LLM MoE)</td>
+      <td>Ascend NPU only; online + offline MXFP8 for Diffusion models (e.g., Wan2.2), LLM Dense Linear, and LLM MoE (FusedMoE, e.g. Qwen3-30B-A3B) on 950PR/DT Series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> (dense) and <code>npu_grouped_matmul_swiglu_quant_v2</code> / <code>npu_grouped_matmul</code> (MoE) kernels</td>
     </tr>
     <tr>
       <td><code>mxfp_w4a8</code></td>
       <td>No</td>
       <td>No</td>
-      <td>Yes (A5)</td>
-      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> dense and MoE checkpoints are auto-detected via <code>modelslim</code></td>
+      <td>Yes (950PR/DT Series)</td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on 950PR/DT Series; offline <code>W4A8_MXFP</code> dense and MoE checkpoints are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -923,9 +923,9 @@ SGLang supports quantization methods based on the advanced algorithm [auto-round
 
 ## Diffusion Model Quantization on Ascend NPU
 
-SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.2) on Ascend A5 NPUs, in both online and offline (ModelSlim) modes. This is separate from the LLM serving path and uses the `sglang serve` / `sglang generate` CLI.
+SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.2) on Ascend 950PR/DT Series NPUs, in both online and offline (ModelSlim) modes. This is separate from the LLM serving path and uses the `sglang serve` / `sglang generate` CLI.
 
-**Requirements:** Ascend A5, CANN ≥ 8.0.RC3
+**Requirements:** Ascend 950PR/DT Series, CANN ≥ 8.0.RC3
 
 ### Online MXFP8
 

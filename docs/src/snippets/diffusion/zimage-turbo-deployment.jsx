@@ -13,8 +13,8 @@ export const ZImageTurboDeployment = () => {
           { id: 'b200', label: 'B200', default: true },
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
-          { id: 'a2', label: 'A2', default: false },
-          { id: 'a3', label: 'A3', default: false }
+          { id: 'a2', label: 'A2 Series', default: false },
+          { id: 'a3', label: 'A3 Series', default: false }
         ]
       }
     },
@@ -29,7 +29,7 @@ export const ZImageTurboDeployment = () => {
       }
 
       if (hardware === 'a3') {
-        return `#One A3 card has 2 npu chips
+        return `#One A3 Series card has 2 npu chips
 sglang serve \\
   --model-path Tongyi-MAI/Z-Image-Turbo \\
   --tp-size 2 \\
@@ -112,7 +112,7 @@ sglang serve \\
 
   useEffect(() => {
     const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
-    const targetTabName = isAscend ? 'Ascend A2 / A3' : 'AMD MI300X';
+    const targetTabName = isAscend ? 'Ascend A2 Series / A3 Series' : 'AMD MI300X';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
     allTabs.forEach((tab) => {
