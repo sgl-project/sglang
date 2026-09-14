@@ -736,6 +736,7 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        logits_capacity = indexer_metadata.max_c4_seq_len
         if use_fp4_indexer:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
@@ -760,6 +761,12 @@ class C4IndexerBackendMixin:
             fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
+
+            if self.dsa_topk_backend.uses_varlen():
+                # Expose DeepGEMM's full 256-float row pitch, including the last
+                # row's padding, so GVR need not copy a narrowly backed view.
+                # c4_seq_lens still bounds selection to real compressed tokens.
+                logits_capacity = (logits_capacity + 255) // 256 * 256
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
@@ -816,7 +823,7 @@ class C4IndexerBackendMixin:
                 _c4sl,
                 page_table,
                 indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
+                logits_capacity,
                 False,
             )
 

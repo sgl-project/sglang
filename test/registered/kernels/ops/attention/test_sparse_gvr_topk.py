@@ -67,6 +67,56 @@ def test_minimally_backed_strided_view(width):
     assert_raw(scores, lengths, result, 512)
 
 
+@pytest.mark.parametrize("width", [1088, 4160])
+def test_deepgemm_padded_capacity_graph(width):
+    deep_gemm = pytest.importorskip("deep_gemm")
+    torch.manual_seed(17)
+    batch, heads, dim, page = 2, 64, 128, 64
+    blocks = (width + page - 1) // page
+    q = (torch.randn(batch, 1, heads, dim, device="cuda") * 0.1).to(torch.float8_e4m3fn)
+    kv = torch.empty(blocks, page, 1, dim + 4, dtype=torch.uint8, device="cuda")
+    storage = kv.view(blocks, -1)
+    values = (torch.randn(blocks, page * dim, device="cuda") * 0.1).to(
+        torch.float8_e4m3fn
+    )
+    storage[:, : page * dim].copy_(values.view(torch.uint8))
+    storage[:, page * dim :].copy_(
+        torch.ones(blocks, page, device="cuda").view(torch.uint8)
+    )
+    weights = torch.rand(batch, heads, device="cuda")
+    lengths = torch.tensor([width, width - 3], dtype=torch.int32, device="cuda")
+    pages = torch.arange(blocks, dtype=torch.int32, device="cuda").repeat(batch, 1)
+    metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        lengths[:, None], page, deep_gemm.get_num_sms()
+    )
+
+    def produce(capacity):
+        return deep_gemm.fp8_paged_mqa_logits(
+            q, kv, weights, lengths[:, None], pages, metadata, capacity, False
+        )
+
+    narrow = produce(width)
+    capacity = (width + 255) // 256 * 256
+    scores = produce(capacity)
+    for row, length in enumerate(lengths.tolist()):
+        torch.testing.assert_close(
+            scores[row, :length], narrow[row, :length], rtol=0, atol=0
+        )
+    assert scores.is_contiguous()
+    assert scores.untyped_storage().nbytes() >= batch * scores.stride(0) * 4
+    flashinfer_sparse_topk(scores, lengths, 512, backend="gvr_2")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_scores = produce(capacity)
+        raw = flashinfer_sparse_topk(captured_scores, lengths, 512, backend="gvr_2")
+    graph.replay()
+    assert_raw(captured_scores, lengths, raw, 512)
+    # Padding must stay excluded when graph replay sees shorter live rows.
+    lengths.fill_(width - 64)
+    graph.replay()
+    assert_raw(captured_scores, lengths, raw, 512)
+
+
 @pytest.mark.parametrize("width", [4096, 4093])
 @pytest.mark.parametrize(
     "method", [TopkTransformMethod.PAGED, TopkTransformMethod.RAGGED]
