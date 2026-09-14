@@ -901,7 +901,6 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.SAGE_ATTN_3,
                 AttentionBackendEnum.SPARGE_ATTN,
             },
-            quant_config=quant_config,
         )
 
     def _get_added_qkv_projections(
@@ -1406,7 +1405,6 @@ class QwenImageTransformerBlock(nn.Module):
         self._fp8_txt_attn_norm_quant = False
         self._fp8_img_mlp_norm_quant = False
         self._fp8_txt_mlp_norm_quant = False
-
 
     @staticmethod
     def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:

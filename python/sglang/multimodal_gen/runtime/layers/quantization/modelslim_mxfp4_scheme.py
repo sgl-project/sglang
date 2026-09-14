@@ -34,6 +34,7 @@ MXFP4_BLOCK_SIZE = 32
 MXFP4_DUAL_LEVEL_RATIO = 16
 MXFP4_PACK_FACTOR = 2
 
+
 class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
     def __init__(
@@ -57,8 +58,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         self.single_level_kernel = None
         if not self.is_dual_scale:
             from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-                NPUSingleLevelMXFP4OfflineLinearMethod
+                NPUSingleLevelMXFP4OfflineLinearMethod,
             )
+
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
         else:
             if self.is_dual_scale_key not in self.quant_config:
@@ -85,7 +87,10 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         # (npu_dtype_cast → float4_e2m1fn_x2) happens in process_weights_after_loading.
         weight = ModelWeightParameter(
             data=torch.empty(
-                (output_size_per_partition, input_size_per_partition // MXFP4_PACK_FACTOR),
+                (
+                    output_size_per_partition,
+                    input_size_per_partition // MXFP4_PACK_FACTOR,
+                ),
                 dtype=torch.uint8,
             ),
             input_dim=1,
@@ -177,7 +182,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 weight_dual_scale = weight_dual_scale.to(
                     f"npu:{torch.npu.current_device()}"
                 )
-            weight_dual_scale = weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+            weight_dual_scale = (
+                weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+            )
             layer.weight_dual_scale = torch.nn.Parameter(
                 weight_dual_scale, requires_grad=False
             )

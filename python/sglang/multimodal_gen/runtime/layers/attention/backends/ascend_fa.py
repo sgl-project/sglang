@@ -287,9 +287,7 @@ class AscendFAImpl(AttentionImpl):
         )
         cls._rot_matrices[head_size] = rotation
 
-    def _get_rotation(
-        self, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
+    def _get_rotation(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if (
             self._rot_device is None
             or self._rot_device.device != device

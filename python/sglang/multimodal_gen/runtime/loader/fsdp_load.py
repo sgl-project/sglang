@@ -208,14 +208,9 @@ def _maybe_dequantize_fp8(
             and full_tensor.shape[-1] == scale_tensor.shape[-1] * 32
         ):
             scale = torch.exp2(scale_tensor.float() - 127.0)
-            blocked_shape = (
-                *full_tensor.shape[:-1],
-                scale_tensor.shape[-1],
-                32
-            )
+            blocked_shape = (*full_tensor.shape[:-1], scale_tensor.shape[-1], 32)
             full_tensor = (
-                full_tensor.float().reshape(blocked_shape)
-                * scale.unsqueeze(-1)
+                full_tensor.float().reshape(blocked_shape) * scale.unsqueeze(-1)
             ).reshape(full_tensor.shape)
         else:
             full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()

@@ -625,6 +625,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         # TODO Need to create mxfp8 attention scheme and port the code below
         from sglang.multimodal_gen import envs
+
         quant_description = getattr(quant_config, "quant_description", {})
         self.use_offline_qk_rotation = (
             quant_description.get(f"{prefix}.q_rot") == "FLOAT"

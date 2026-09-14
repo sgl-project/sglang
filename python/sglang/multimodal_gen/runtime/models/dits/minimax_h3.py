@@ -667,10 +667,7 @@ def _minimax_h3_attention_core_impl(
         return out
 
     if ring_active:
-        if (
-            attention._quant_attn_backend is not None
-            and current_platform.is_npu()
-        ):
+        if attention._quant_attn_backend is not None and current_platform.is_npu():
             raise NotImplementedError(
                 "MiniMax H3 MXFP8 attention does not support ring parallelism"
                 "FA-v2 does not return the softmax LSE used by ring merge"
