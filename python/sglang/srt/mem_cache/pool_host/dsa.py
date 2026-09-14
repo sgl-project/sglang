@@ -78,16 +78,18 @@ class DSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
+        # Match the materialized device layout: FP4 has packed keys and UE8M0
+        # scales, FP8 has FP32 scales, and BF16 has no scales. Transfer kernels
+        # take byte strides, while tensor allocations and reshapes take elements.
+        index_buffer = device_pool.index_k_with_scale_buffer[0]
+        self.indexer_dtype = index_buffer.dtype
+        self.indexer_page_elements = index_buffer.shape[1]
+        self.indexer_size_per_token = self.indexer_page_elements // self.page_size
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
+            self.indexer_page_elements * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
@@ -109,7 +111,9 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
+        buf_elem_size = (
+            self.indexer_page_num * self.layer_num * self.indexer_page_elements
+        )
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
@@ -162,7 +166,7 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
-                (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
+                (self.layer_num, self.indexer_page_num, self.indexer_page_elements),
                 dtype=self.indexer_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -182,7 +186,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     self.indexer_page_num,
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_elements,
                 ),
                 dtype=self.indexer_dtype,
                 device=self.device,
@@ -199,7 +203,7 @@ class DSAIndexerPoolHost(HostKVCache):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
-            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
+            element_size=self.indexer_page_stride_size,
         )
         staging_page_capacity = min(
             self.indexer_page_num, _WRITE_BACK_STAGING_PAGE_CHUNK
@@ -209,7 +213,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 staging_page_capacity,
                 self.layer_num,
                 1,
-                self.indexer_page_stride_size,
+                self.indexer_page_elements,
             ),
             dtype=self.indexer_dtype,
             device=self.device_pool.device,
@@ -451,7 +455,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
-            (self.layer_num, self.indexer_page_stride_size),
+            (self.layer_num, self.indexer_page_elements),
             dtype=self.indexer_dtype,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -464,7 +468,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 data_page.reshape(
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_elements,
                 )
             )
         elif self.layout in ["page_first", "page_first_direct"]:
@@ -473,7 +477,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     1,
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_elements,
                 )
             )
         else:
@@ -486,9 +490,7 @@ class DSAIndexerPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []
         indices = indices.tolist()
-        page_stride_bytes = (
-            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
+        page_stride_bytes = self.layer_num * self.indexer_page_stride_size
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
         for i in range(0, len(indices), self.page_size):
             page_index = int(indices[i]) // self.page_size
@@ -498,9 +500,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
-        page_stride_bytes = (
-            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
+        page_stride_bytes = self.layer_num * self.indexer_page_stride_size
         return (
             self.index_k_with_scale_buffer.data_ptr() % page_size_bytes == 0
             and page_stride_bytes % page_size_bytes == 0

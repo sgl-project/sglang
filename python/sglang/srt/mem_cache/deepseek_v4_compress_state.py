@@ -279,3 +279,20 @@ class CompressStatePool:
     def set_state_by_state_loc(self, state_loc: torch.Tensor, value: KVAndScore):
         self.kv_score_buffer[state_loc] = value
         self.kv_score_buffer[-1].clear()
+
+    def get_cpu_copy(self, state_locs: torch.Tensor) -> torch.Tensor:
+        # Duplicates in state_locs are fine: each row is independent of the
+        # request's token order, so writing the same value back is idempotent.
+        if state_locs.numel() == 0:
+            return None
+        return self.kv_score_buffer.kv_score[state_locs].detach().to("cpu", copy=True)
+
+    def load_cpu_copy(self, state_data: torch.Tensor, state_locs: torch.Tensor):
+        if state_data is None or state_locs.numel() == 0:
+            return
+        device_data = state_data.to(
+            self.kv_score_buffer.kv_score.device, non_blocking=True
+        )
+        self.kv_score_buffer.kv_score[state_locs] = device_data
+        if not self.online:
+            self.kv_score_buffer[-1].clear()
