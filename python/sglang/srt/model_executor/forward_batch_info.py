@@ -1400,7 +1400,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and self.forward_mode.is_idle()
         )
         if mega_moe_idle_materialize:
-            global_num_tokens = [1]
+            global_num_tokens = [1] * len(global_num_tokens)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 

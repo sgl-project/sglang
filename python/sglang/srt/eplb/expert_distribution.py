@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
+    get_server_args,
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
@@ -202,6 +203,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        self._server_args = get_server_args()
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)

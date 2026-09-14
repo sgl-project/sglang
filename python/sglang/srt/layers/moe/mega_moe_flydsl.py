@@ -53,75 +53,6 @@ def _mtpr() -> int:
     return mtpr
 
 
-def _sync_tokens(
-    forward_batch: ForwardBatch | None,
-    *,
-    local_tokens: int,
-    mtpr: int,
-) -> int:
-    if not envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
-        return local_tokens
-
-    if forward_batch is not None and (
-        forward_batch.forward_mode.is_idle()
-        or (
-            (original_mode := getattr(forward_batch, "_original_forward_mode", None))
-            is not None
-            and original_mode.is_idle()
-        )
-    ):
-        return local_tokens
-
-    if forward_batch is not None and forward_batch.is_extend_in_batch:
-        sync_tokens = mtpr
-    else:
-        sync_tokens = (
-            forward_batch.mega_moe_sync_tokens if forward_batch is not None else None
-        )
-    if sync_tokens is None:
-        global_tokens = get_dp_global_num_tokens()
-        sync_tokens = max(global_tokens) if global_tokens else local_tokens
-
-    sync_tokens = max(int(sync_tokens), local_tokens)
-    if sync_tokens > mtpr:
-        raise ValueError(f"Aiter MegaMoE sync_tokens={sync_tokens} exceeds MTPR={mtpr}")
-    return sync_tokens
-
-
-def _forward_with_sync_config(
-    mega,
-    x: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    config_tokens: int,
-):
-    required = (
-        "_select_config",
-        "quantize",
-        "_run_fused_stage1",
-        "_run_stage2",
-    )
-    missing = [name for name in required if not hasattr(mega, name)]
-    if missing:
-        raise RuntimeError(
-            "Aiter MegaMoE config contract changed; missing " + ", ".join(missing)
-        )
-
-    run_tokens = int(x.shape[0])
-    config = mega._select_config(config_tokens)
-    x_q, scales = mega.quantize(x)
-    mega._run_fused_stage1(
-        x_q,
-        topk_weights,
-        scales,
-        topk_ids,
-        stream=None,
-        config=config.stage1,
-    )
-    return mega._run_stage2(run_tokens, None, False, config)
-
-
 def _ep_rank_world():
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
@@ -361,11 +292,6 @@ def _run_mega_routed(
             topk_weights = hidden_states.new_zeros((1, topk), dtype=torch.float32)
 
     selected_mtpr = _mtpr()
-    sync_tokens = _sync_tokens(
-        forward_batch,
-        local_tokens=int(x_in.shape[0]),
-        mtpr=selected_mtpr,
-    )
     x_in = x_in.contiguous()
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
@@ -384,18 +310,7 @@ def _run_mega_routed(
     )
     _swap_layer_weights(mega, moe.experts)
 
-    if envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
-        output = _forward_with_sync_config(
-            mega,
-            x_in,
-            topk_weights,
-            topk_ids,
-            config_tokens=sync_tokens,
-        )[:num_tokens]
-    else:
-        output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[
-            :num_tokens
-        ]
+    output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
 
     from sglang.srt.models.deepseek_common.utils import _use_aiter
 

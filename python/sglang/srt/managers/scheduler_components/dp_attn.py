@@ -268,18 +268,6 @@ def _update_gather_batch(
     )
 
 
-def _should_defer_decode_for_mega_rank_sync(
-    local_batch: Optional[ScheduleBatch],
-    mlp_sync_info: MLPSyncBatchInfo,
-) -> bool:
-    return bool(
-        envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-        and mlp_sync_info.is_extend_in_batch
-        and local_batch is not None
-        and local_batch.forward_mode.is_decode()
-    )
-
-
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
     """Return whether scheduler metadata is already local and rank-invariant.
 
@@ -510,11 +498,6 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
-        if _should_defer_decode_for_mega_rank_sync(local_batch, mlp_sync_info):
-            local_batch = get_idle_batch()
-            mlp_sync_info.num_tokens = 0
-            mlp_sync_info.num_tokens_for_logprob = 0
-
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)

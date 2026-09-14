@@ -21,7 +21,12 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -45,6 +50,7 @@ class EPLBManager:
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
         self._model_config = model_config
+        self._server_args = get_server_args()
         self._ps = ps
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
