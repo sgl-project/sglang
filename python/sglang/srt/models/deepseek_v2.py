@@ -43,11 +43,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    dsa_layer_skips_topk,
-    get_dsa_index_head_dim,
-    get_dsa_index_kpool,
-    get_dsa_index_n_heads,
-    get_dsa_index_topk,
     is_deepseek_dsa,
     is_glm_moe_dsa,
 )
@@ -63,22 +58,15 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
-from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communicator import (
-    LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-)
-from sglang.srt.layers.communicator_dsa_cp import (
-    DSACPLayerCommunicator,
-    maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dcp.planner import (
@@ -184,6 +172,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.deepseek_common.v32_mixin import DeepseekV32Mixin
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
@@ -1713,6 +1702,7 @@ class DeepseekV2AttentionMLA(
     DeepseekMLARocmForwardMixin,
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
+    DeepseekV32Mixin,
 ):
     def __init__(
         self,
@@ -1748,7 +1738,6 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
-        self.use_dsa = is_deepseek_dsa(config)
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1798,47 +1787,21 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.skip_topk = None
-        self.next_skip_topk = None
-        self.indexer = None
-        if self.use_dsa:
-            # Refer: https://arxiv.org/abs/2603.12201 for more details.
-            # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
-            # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
-            if is_nextn:
-                self.skip_topk = True
-                self.next_skip_topk = True
-            else:
-                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
-
-            if not self.skip_topk or is_nextn:
-                is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-                indexer_cls = (
-                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
-                )
-                indexer_kwargs = dict(
-                    hidden_size=hidden_size,
-                    index_n_heads=get_dsa_index_n_heads(config),
-                    index_head_dim=get_dsa_index_head_dim(config),
-                    rope_head_dim=qk_rope_head_dim,
-                    index_topk=get_dsa_index_topk(config),
-                    q_lora_rank=q_lora_rank,
-                    max_position_embeddings=max_position_embeddings,
-                    rope_theta=rope_theta,
-                    scale_fmt="ue8m0",
-                    block_size=128,
-                    rope_scaling=rope_scaling,
-                    is_neox_style=is_neox_style,
-                    prefix=add_prefix("indexer", prefix),
-                    quant_config=quant_config,
-                    layer_id=layer_id,
-                    alt_stream=alt_stream,
-                    config=config,
-                )
-                if indexer_cls is IndexerKPool:
-                    indexer_kwargs["skip_rope"] = skip_rope
-                self.indexer = indexer_cls(**indexer_kwargs)
+        self.init_v32_attention(
+            config=config,
+            hidden_size=hidden_size,
+            qk_rope_head_dim=qk_rope_head_dim,
+            q_lora_rank=q_lora_rank,
+            max_position_embeddings=max_position_embeddings,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            quant_config=quant_config,
+            layer_id=layer_id,
+            alt_stream=alt_stream,
+            prefix=add_prefix("indexer", prefix),
+            is_nextn=is_nextn,
+            skip_rope=skip_rope,
+        )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -2260,7 +2223,7 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
-class DeepseekV2DecoderLayer(nn.Module):
+class DeepseekV2DecoderLayer(nn.Module, DeepseekV32Mixin):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2364,12 +2327,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        communicator_cls = (
-            DSACPLayerCommunicator
-            if get_parallel().enable_prefill_cp
-            else LayerCommunicator
-        )
-        self.layer_communicator = communicator_cls(
+        self.layer_communicator = self.create_layer_communicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
@@ -2459,7 +2417,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
-        maybe_prefetch_next_full_attention_kv(
+        self.maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
 
@@ -2573,7 +2531,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
-class DeepseekV2Model(nn.Module):
+class DeepseekV2Model(nn.Module, DeepseekV32Mixin):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -2713,13 +2671,6 @@ class DeepseekV2Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
-    def _dsa_forward_uses_topk(self) -> bool:
-        if not self.use_dsa:
-            return False
-        backend = get_attn_backend()
-        backend = getattr(backend, "primary", backend)
-        return not getattr(backend, "use_mha", False)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2729,7 +2680,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
-        dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        dsa_forward_uses_topk = self.dsa_forward_uses_topk()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -2749,7 +2700,7 @@ class DeepseekV2Model(nn.Module):
                 and hidden_states.shape[0] != 0
                 and self.use_dsa
                 and dsa_forward_uses_topk
-                and dsa_layer_skips_topk(self.config, self.start_layer)
+                and self.dsa_layer_skips_topk(self.start_layer)
                 and index_topk_share.topk_indices is None
             ), (
                 f"PP stage starting at layer {self.start_layer} requires DSA "
@@ -2851,7 +2802,7 @@ class DeepseekV2Model(nn.Module):
                 self.use_dsa
                 and dsa_forward_uses_topk
                 and self.end_layer < self.config.num_hidden_layers
-                and dsa_layer_skips_topk(self.config, self.end_layer)
+                and self.dsa_layer_skips_topk(self.end_layer)
             ):
                 topk_indices = index_topk_share.topk_indices
                 if (
@@ -2864,9 +2815,7 @@ class DeepseekV2Model(nn.Module):
                         "skip-topk layer."
                     )
                 if topk_indices is None:
-                    topk_indices = hidden_states.new_empty(
-                        (0, get_dsa_index_topk(self.config)), dtype=torch.int32
-                    )
+                    topk_indices = self.empty_dsa_topk_indices(hidden_states)
                 proxy_tensors["topk_indices"] = topk_indices
             return PPProxyTensors(proxy_tensors)
         else:
@@ -2881,7 +2830,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states.finalize()
 
 
-class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin, DeepseekV32Mixin):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -2945,8 +2894,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
         self.capture_aux_hidden_states = False
 
-        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
+        self.init_v32_attn_tp_context(config)
 
     @property
     def routed_experts_weights_of_layer(self):
