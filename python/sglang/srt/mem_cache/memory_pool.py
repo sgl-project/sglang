@@ -1812,6 +1812,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # Set by hoist_layer_transfer_wait(); see there.
+    _hoisted_layer_transfer_counter: Optional[LayerDoneCounter] = None
+    hoisted_layer_transfer: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -1914,7 +1917,32 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+        if self.hoisted_layer_transfer:
+            self._hoisted_layer_transfer_counter = layer_transfer_counter
+            return
         self.layer_transfer_counter = layer_transfer_counter
+
+    def hoist_layer_transfer_wait(self) -> None:
+        """Move HiCache's per-layer wait to the forward boundary.
+
+        The wait is `current_stream().wait_event(...)` on an event the cache
+        controller records on its own stream -- uncapturable, and traced as
+        `layer_transfer_counter is None` because the controller registers only
+        after capture, so every captured shape misses its guard on the first
+        real batch. Keeping the counter off `layer_transfer_counter` compiles
+        those waits away; `wait_all_layer_transfers` waits once outside the
+        graph instead. Costs the layer-wise overlap; ordering holds because the
+        controller records the per-layer events in order on one stream.
+        """
+        self.hoisted_layer_transfer = True
+        self._hoisted_layer_transfer_counter = self.layer_transfer_counter
+        self.layer_transfer_counter = None
+
+    def wait_all_layer_transfers(self) -> None:
+        """Wait for a hoisted HiCache load. No-op unless hoisted and loading."""
+        counter = self._hoisted_layer_transfer_counter
+        if counter is not None:
+            counter.wait_until(counter.num_layers - 1)
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
@@ -4015,10 +4043,20 @@ class HybridLinearKVPool(KVCache):
         return self.full_attention_layer_id_mapping[layer_id]
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+        super().register_layer_transfer_counter(layer_transfer_counter)
         # The layer-wise wait logic is executed at the Hybrid LinearPool level;
         # no additional wait is needed in the full_kv_pool
         self.full_kv_pool.register_layer_transfer_counter(None)
+
+    def hoist_layer_transfer_wait(self) -> None:
+        # HiCacheController unwraps this pool and registers on full_kv_pool, so
+        # that is where the hoisted counter has to land.
+        super().hoist_layer_transfer_wait()
+        self.full_kv_pool.hoist_layer_transfer_wait()
+
+    def wait_all_layer_transfers(self) -> None:
+        super().wait_all_layer_transfers()
+        self.full_kv_pool.wait_all_layer_transfers()
 
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -5283,7 +5321,7 @@ class MHATokenToKOnlyPool(KVCache):
     def register_layer_transfer_counter(
         self, layer_transfer_counter: LayerDoneCounter
     ) -> None:
-        self.layer_transfer_counter = layer_transfer_counter
+        super().register_layer_transfer_counter(layer_transfer_counter)
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -5451,7 +5489,7 @@ class MiniMaxSparseKVPool(KVCache):
     def register_layer_transfer_counter(
         self, layer_transfer_counter: LayerDoneCounter
     ) -> None:
-        self.layer_transfer_counter = layer_transfer_counter
+        super().register_layer_transfer_counter(layer_transfer_counter)
 
     def get_kv_cache_quant_method(self) -> Any:
         # The base unwrap chain only knows full_kv_pool/swa_kv_pool; the dense

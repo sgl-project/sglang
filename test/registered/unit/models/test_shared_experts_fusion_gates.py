@@ -209,6 +209,58 @@ class TestDeepseekV2Gate(_FusionGateCase):
             )
 
 
+class TestDeepseekSharedExpertExecution(CustomTestCase):
+    """A caller adding replicated shared output must get routed output only."""
+
+    def test_skip_shared_excludes_both_dual_stream_routes(self):
+        import torch
+
+        from sglang.srt.layers.moe import mega_moe
+        from sglang.srt.models import deepseek_v2
+
+        hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        for graph_eligible, capture_mode, ordinary_addend in (
+            (True, False, 1000),
+            (False, True, 100),
+        ):
+            model = SimpleNamespace(
+                _enable_a2a_moe=False,
+                _can_dual_stream_graph=lambda _: graph_eligible,
+                alt_stream=object(),
+                num_fused_shared_experts=0,
+                layer_id=0,
+                # These callbacks stand in for GPU execution branches. Their
+                # different outputs make an incorrect branch visible, rather
+                # than asserting only that a mock happened to be called.
+                forward_normal=lambda x, *_args, **kw: (
+                    x + (10 if kw["skip_shared_experts"] else 1)
+                ),
+                forward_normal_dual_stream=lambda x, *_args, **_kw: x + 100,
+            )
+            with (
+                self.subTest(graph_eligible=graph_eligible, capture_mode=capture_mode),
+                unittest.mock.patch.object(
+                    mega_moe, "should_use_mega_moe", return_value=False
+                ),
+                unittest.mock.patch.object(
+                    deepseek_v2, "get_is_capture_mode", return_value=capture_mode
+                ),
+                unittest.mock.patch.object(
+                    deepseek_v2,
+                    "dsv2_flashinfer_moe_dual_stream_graph",
+                    side_effect=lambda x, *_args: x + 1000,
+                ),
+            ):
+                routed_only = deepseek_v2.DeepseekV2MoE.forward(
+                    model, hidden, skip_shared_experts=True
+                )
+                ordinary = deepseek_v2.DeepseekV2MoE.forward(
+                    model, hidden, skip_shared_experts=False
+                )
+                torch.testing.assert_close(routed_only, hidden + 10)
+                torch.testing.assert_close(ordinary, hidden + ordinary_addend)
+
+
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):
         base = dict(architectures=["Glm4MoeLiteForCausalLM"], n_shared_experts=1)

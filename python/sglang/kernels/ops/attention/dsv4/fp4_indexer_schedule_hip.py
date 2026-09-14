@@ -104,12 +104,15 @@ def _prefill_schedule_prep_kernel(
         any_fits = tl.sum((chunks + (s_max - 1)) // s_max) <= P
         lo = 1
         hi = s_max
-        for _ in tl.static_range(32):
-            searching = lo < hi
-            mid = tl.where(searching, (lo + hi) // 2, lo)
+        # Keep one reduction/division body in the generated code and stop as
+        # soon as the search converges. Unrolling 32 rounds builds a large
+        # kernel and repeats reductions after lo == hi (typical windows need
+        # only 8-12 rounds).
+        while lo < hi:
+            mid = lo + (hi - lo) // 2
             fits = tl.sum((chunks + (mid - 1)) // mid) <= P
-            lo = tl.where(searching & (fits == 0), mid + 1, lo)
-            hi = tl.where(searching & fits, mid, hi)
+            lo = tl.where(fits, lo, mid + 1)
+            hi = tl.where(fits, mid, hi)
         # No s fits: give every row its own CTA and let the grid clip, matching
         # the reference's max_chunks fallback.
         safe = tl.where(any_fits, lo, tl.maximum(tl.max(chunks), 1)).to(tl.int32)

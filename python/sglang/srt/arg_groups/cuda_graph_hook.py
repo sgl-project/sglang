@@ -223,10 +223,9 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             ),
         ),
         ("DLLM (diffusion LLM)", lambda: cfg.dllm_algorithm is not None),
-        (
-            "CPU offload / hierarchical cache",
-            lambda: cfg.cpu_offload_gb > 0 or cfg.enable_hierarchical_cache,
-        ),
+        # Hierarchical cache used to be listed here too; its per-layer wait is
+        # now hoisted out of the traced region (KVCache.hoist_layer_transfer_wait).
+        ("CPU offload", lambda: cfg.cpu_offload_gb > 0),
         (
             "deterministic inference",
             lambda: cfg.enable_deterministic_inference,

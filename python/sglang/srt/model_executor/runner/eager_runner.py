@@ -346,10 +346,20 @@ class EagerRunner(BaseRunner):
                 and not isinstance(pcg_runner, EagerRunner)
                 and not cp_active
             ):
-                # HIP PCG eager fallback: enter the PCG context so Dynamo guards
-                # and PCG-specific MoE/attention paths stay consistent.
+                # HIP PCG eager fallback: set the PCG forward context so the
+                # PCG-specific MoE/attention paths stay consistent, but under
+                # TC_PIECEWISE skip enable_tc_piecewise_cuda_graph() -- it dispatches
+                # to the compiled forward, where a fallback batch's arbitrary shape
+                # would evict the captured buckets from the Dynamo cache.
+                _eager_use_compiled = (
+                    get_exec().graph.cuda_graph_config.prefill.backend != "tc_piecewise"
+                )
                 with (
-                    enable_tc_piecewise_cuda_graph(),
+                    (
+                        enable_tc_piecewise_cuda_graph()
+                        if _eager_use_compiled
+                        else contextlib.nullcontext()
+                    ),
                     set_tc_piecewise_forward_context(
                         forward_batch,
                         model_runner.attention_layers,

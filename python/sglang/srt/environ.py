@@ -47,6 +47,13 @@ class EnvField:
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
+        # get() is traced by Dynamo (models read envs in their forwards), which
+        # cannot trace `callable()`. Moving the check out of get() is not enough:
+        # Dynamo mis-models an lru_cache default as a bound method carrying `self`
+        # at the *attribute load*, so calling it fails too. functools.partial is safe.
+        self._default_factory = (
+            functools.partial(default) if callable(default) else None
+        )
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
@@ -62,7 +69,9 @@ class EnvField:
     def _resolve_default(self) -> Any:
         # Support a callable default for lazily/platform-computed defaults
         # (e.g. EnvBool(_default_hip)); evaluated only when the env is unset.
-        return self.default() if callable(self.default) else self.default
+        if self._default_factory is None:
+            return self.default
+        return self._default_factory()
 
     def get(self) -> Any:
         value = os.getenv(self.name)
@@ -1480,6 +1489,9 @@ class Envs:
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # Keep DSv4 prefill attention graphs while running TP8/DP8 MoE on the
+    # compact real-token union between captured pieces (ROCm, no A2A only).
+    SGLANG_DSV4_TC_COMPACT_MOE = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
