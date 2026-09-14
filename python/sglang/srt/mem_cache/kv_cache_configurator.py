@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedSWAAllocatorBase,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -544,7 +544,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool_allocator,
                 (
                     UnifiedMambaTokenToKVPoolAllocator,
-                    UnifiedSWATokenToKVPoolAllocator,
+                    UnifiedSWAAllocatorBase,
                 ),
             ):
                 draft_virtual_id_space = (
@@ -567,7 +567,7 @@ class KVCacheConfigurator:
                 if (
                     isinstance(
                         token_to_kv_pool_allocator,
-                        UnifiedSWATokenToKVPoolAllocator,
+                        UnifiedSWAAllocatorBase,
                     )
                     and self.is_hybrid_swa
                 ):
@@ -2153,7 +2153,7 @@ class KVCacheConfigurator:
                 else:
                     swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                    swa_allocator, UnifiedSWAAllocatorBase
                 )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
