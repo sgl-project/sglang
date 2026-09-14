@@ -156,5 +156,7 @@ class L2TransferEngine:
         # Keep temporary translated indices alive until the transfer completes.
         tensors.extend(resolved)
         for indices in tensors:
-            if indices is not None and indices.is_cuda:
+            if indices is not None and (
+                indices.is_cuda or indices.device.type == "xpu"
+            ):
                 indices.record_stream(stream)
