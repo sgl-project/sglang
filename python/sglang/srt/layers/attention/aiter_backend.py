@@ -233,6 +233,42 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+_varlen_fp8_gather_logged = False
+
+
+def _gather_varlen_kv(
+    cache: torch.Tensor,
+    tok_idx: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    out_dtype: torch.dtype,
+    descale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Gather paged KV rows into the contiguous buffer varlen prefill needs.
+
+    An fp8 cache is dequantized here rather than handed to the kernel as fp8, so
+    fp8_e4m3 stays a cache-format choice and prefill attention keeps running in the
+    input dtype. Feeding fp8 straight through would force q to fp8 as well -- the
+    triton varlen path rejects a mix of fp8 and non-fp8 inputs.
+
+    index_select has no fp8 kernel, hence the uint8 round-trip.
+    """
+    flat = cache.view(-1, num_heads * head_dim)
+    if flat.dtype == fp8_dtype:
+        global _varlen_fp8_gather_logged
+        if not _varlen_fp8_gather_logged:
+            _varlen_fp8_gather_logged = True
+            logger.info("aiter varlen prefill: dequantizing fp8 KV cache on gather")
+        gathered = (
+            flat.view(torch.uint8).index_select(0, tok_idx).view(fp8_dtype)
+        ).to(out_dtype)
+        if descale is not None:
+            gathered = gathered * descale.to(out_dtype)
+    else:
+        gathered = flat.index_select(0, tok_idx)
+    return gathered.view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -389,12 +425,11 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # Route no-prefix extend through flash_attn_varlen_func instead of the
-        # CK-tile mha_batch_prefill_func, which has no gfx12 kernels. fp8 KV is
-        # excluded because the varlen entry takes no q/k/v descale. Opt-in, so
+        # CK-tile mha_batch_prefill_func, which has no gfx12 kernels. An fp8 KV
+        # cache is allowed: _gather_varlen_kv dequantizes on the way into the
+        # varlen buffer, so the kernel still sees the input dtype. Opt-in, so
         # gfx942/gfx950 keep the batch_prefill path unless asked otherwise.
-        self.use_aiter_varlen_prefill = get_bool_env_var(
-            "SGLANG_AITER_VARLEN_PREFILL"
-        ) and not (self.kv_cache_dtype == fp8_dtype)
+        self.use_aiter_varlen_prefill = get_bool_env_var("SGLANG_AITER_VARLEN_PREFILL")
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
@@ -3110,15 +3145,29 @@ class AiterAttnBackend(AttentionBackend):
                         tok_idx = kv_slots[slot].to(torch.long)
                         varlen_ok = int(tok_idx.max().item()) < kc.shape[0]
                     if varlen_ok:
-                        k_in = (
-                            kc.view(-1, layer.tp_k_head_num * layer.qk_head_dim)
-                            .index_select(0, tok_idx)
-                            .view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                        k_in = _gather_varlen_kv(
+                            kc,
+                            tok_idx,
+                            layer.tp_k_head_num,
+                            layer.qk_head_dim,
+                            q.dtype,
+                            (
+                                layer.k_scale
+                                if layer.k_scale is not None
+                                else self.k_scale
+                            ),
                         )
-                        v_in = (
-                            vc.view(-1, layer.tp_v_head_num * layer.v_head_dim)
-                            .index_select(0, tok_idx)
-                            .view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                        v_in = _gather_varlen_kv(
+                            vc,
+                            tok_idx,
+                            layer.tp_v_head_num,
+                            layer.v_head_dim,
+                            q.dtype,
+                            (
+                                layer.v_scale
+                                if layer.v_scale is not None
+                                else self.v_scale
+                            ),
                         )
                         cu_seqlens_k = cu_k.to(torch.int32)
                         max_kv_len = int(self.forward_metadata.max_kv_len)
