@@ -289,6 +289,9 @@ class Envs:
     # Model configuration, discovery, and weight loading
     # ===================================================================
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    # Binary used to resolve `oci://` model references (CNCF ModelPack images).
+    # Looked up on PATH when left as the bare name.
+    SGLANG_LLMMAN_BIN = EnvStr("llmman")
     # Controls weight-file ordering for load-time I/O optimization.
     #   -1 : no sorting, no staggering; preserves original file order.
     #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
