@@ -206,6 +206,19 @@ class Router:
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'sglang.ai/bootstrap-port'
+        bootstrap_port_label_key: Optional label key for per-pod bootstrap port derivation
+            (prefill only). When set together with `bootstrap_port_label_base`, the router
+            computes each prefill pod's bootstrap port as `base + int(label value)`.
+            Empty disables the fallback. Default: ''
+        bootstrap_port_label_base: Base port added to the label-derived pod index (used with
+            `bootstrap_port_label_key`). Zero disables the fallback. Default: 0
+        http_port_annotation: Per-pod HTTP serving port override annotation. When a discovered
+            pod carries this annotation, the router uses its value in place of
+            `service_discovery_port`. Default: 'sglang.ai/http-port'
+        http_port_label_key: Optional label key for per-pod HTTP port derivation. Analogue of
+            `bootstrap_port_label_key` for the HTTP serving port. Default: ''
+        http_port_label_base: Base port added to the label-derived pod index (used with
+            `http_port_label_key`). Zero disables the fallback. Default: 0
         request_timeout_secs: Request timeout in seconds. Default: 600
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
