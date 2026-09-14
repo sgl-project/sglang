@@ -143,9 +143,9 @@ def _require_psum_layout() -> None:
     params = inspect.signature(deep_gemm.m_grouped_fp8_gemm_nt_contiguous).parameters
     if "use_psum_layout" not in params:
         raise RuntimeError(
-            "This MoE path hands DeepGEMM a prefix-sum grouped layout "
-            "(m_grouped_fp8_gemm_nt_contiguous(use_psum_layout=...)), which the "
-            "installed DeepGEMM does not accept. Install DeepGEMM >= 0.1.5."
+            "This MoE path hands DeepGEMM a prefix-sum grouped layout, but the "
+            "installed deep_gemm.m_grouped_fp8_gemm_nt_contiguous has no "
+            "use_psum_layout argument. Install a DeepGEMM build that accepts it "
         )
     _psum_layout_checked = True
 

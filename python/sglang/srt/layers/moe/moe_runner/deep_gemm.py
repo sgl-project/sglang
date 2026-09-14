@@ -1432,9 +1432,9 @@ def _moonep_situ_mul_quant_rows_kernel(
         up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
         y = gate * situ_linear_beta * up_t
         amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-        # Same quantization as _situ_mul_quant_contig_kernel followed by
-        # _cast_to_e8m0_with_rounding_up, fused: values scaled by 448/amax,
-        # scale byte the round-up exponent of amax/448.
+        # Must stay bit-compatible with _situ_mul_quant_contig_kernel +
+        # _cast_to_e8m0_with_rounding_up (unlike _moonep_quant_rows_kernel,
+        # which divides by the power-of-two scale).
         q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
         tl.store(q_ptr + r * N + offs, q, mask=mask)
         e8 = tl.reshape(_e8m0_round_up(amax / 448.0), [KG_POW2 // 4, 4])
@@ -1452,27 +1452,22 @@ def _moonep_finalize_shard_kernel(
     seg_len_ptr,  # [G] int32
     H,
     HAS_WEIGHTS: tl.constexpr,
-    ROWS: tl.constexpr,
+    ROW_PROGRAMS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     g = tl.program_id(0)
     seg_len = tl.load(seg_len_ptr + g)
-    row0 = tl.program_id(1) * ROWS
-    if row0 >= seg_len:
-        return
     seg_start = tl.load(seg_start_ptr + g)
     col = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
     cmask = col < H
-    for i in range(ROWS):
-        rr = row0 + i
-        if rr < seg_len:
-            dst = (seg_start + rr).to(tl.int64)
-            x = tl.load(down_ptr + dst * H + col, mask=cmask).to(tl.float32)
-            if HAS_WEIGHTS:
-                x = x * tl.load(w_ptr + dst)
-            tl.store(
-                shard_ptr + dst * H + col, x.to(shard_ptr.dtype.element_ty), mask=cmask
-            )
+    for rr in range(tl.program_id(1), seg_len, ROW_PROGRAMS):
+        dst = (seg_start + rr).to(tl.int64)
+        x = tl.load(down_ptr + dst * H + col, mask=cmask).to(tl.float32)
+        if HAS_WEIGHTS:
+            x = x * tl.load(w_ptr + dst)
+        tl.store(
+            shard_ptr + dst * H + col, x.to(shard_ptr.dtype.element_ty), mask=cmask
+        )
 
 
 def _moonep_quant_rows(
@@ -1555,15 +1550,10 @@ def _moonep_finalize_into_shard(
     route_weights_nvs: Optional[torch.Tensor],
     seg_start: torch.Tensor,
     seg_len: torch.Tensor,
-    max_rows_per_group: int,
 ) -> torch.Tensor:
     rows, hidden_size = down_output.shape
-    ROWS, BLOCK = 32, 1024
-    grid = (
-        seg_start.numel(),
-        triton.cdiv(max_rows_per_group, ROWS),
-        triton.cdiv(hidden_size, BLOCK),
-    )
+    ROW_PROGRAMS, BLOCK = 8, 1024
+    grid = (seg_start.numel(), ROW_PROGRAMS, triton.cdiv(hidden_size, BLOCK))
     _moonep_finalize_shard_kernel[grid](
         down_output,
         shard,
@@ -1572,7 +1562,7 @@ def _moonep_finalize_into_shard(
         seg_len,
         hidden_size,
         HAS_WEIGHTS=route_weights_nvs is not None,
-        ROWS=ROWS,
+        ROW_PROGRAMS=ROW_PROGRAMS,
         BLOCK=BLOCK,
         num_warps=4,
     )
@@ -1641,7 +1631,6 @@ def pre_permute_moonep_to_deep_gemm(
             seg_start,
             seg_len,
             dispatch_output.hidden_states,
-            int(dispatch_output.capacity) * runner_config.top_k,
         )
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
         running_state["mxfp8_act_gran_k"] = block_k
@@ -1690,14 +1679,9 @@ def post_permute_deep_gemm_to_moonep(
     route_weights_nvs = running_state["route_weights_nvs"]
     segments = running_state.get("moonep_segments")
     if segments is not None:
-        seg_start, seg_len, shard, max_rows_per_group = segments
+        seg_start, seg_len, shard = segments
         hidden_states = _moonep_finalize_into_shard(
-            hidden_states,
-            shard,
-            route_weights_nvs,
-            seg_start,
-            seg_len,
-            max_rows_per_group,
+            hidden_states, shard, route_weights_nvs, seg_start, seg_len
         )
     else:
         _moonep_finalize_rows(

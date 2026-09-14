@@ -44,7 +44,6 @@ class MoonEPDispatchOutput(NamedTuple):
     plan: Any
     expert_ids: torch.Tensor
     num_tokens: int
-    capacity: Optional[int] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -563,6 +562,7 @@ class MoonEPDispatcher(BaseDispatcher):
             self.num_max_dispatch_tokens_per_rank
         )
         self._active_capacity = self.num_max_dispatch_tokens_per_rank
+        self._decode_buffers_built = False
         self.num_prefetch_slots = None
 
     @staticmethod
@@ -598,6 +598,21 @@ class MoonEPDispatcher(BaseDispatcher):
         except (AssertionError, RuntimeError, TypeError, ValueError):
             return 0
 
+    def _first_home_expert(self) -> int:
+        assert self.num_experts is not None
+        num_ep_ranks = MoonEPBuffer._resolve_num_ep_ranks(self.group)
+        return self._get_rank() * (self.num_experts // num_ep_ranks)
+
+    def _prebuild_decode_buffers(self) -> None:
+        decode_cap = self.decode_max_dispatch_tokens_per_rank
+        if decode_cap is not None:
+            rung = _MIN_CAPACITY_RUNG
+            while rung < decode_cap:
+                self._get_buffer(rung)
+                rung *= 2
+            self._get_buffer(decode_cap)
+        self._decode_buffers_built = True
+
     def _pad_to_capacity(
         self,
         hidden_states: torch.Tensor,
@@ -622,16 +637,17 @@ class MoonEPDispatcher(BaseDispatcher):
         pad_tokens = capacity - num_tokens
         top_k = topk_ids.shape[1]
         hidden_pad = hidden_states.new_zeros(pad_tokens, hidden_states.shape[1])
-        assert self.num_experts is not None
-        id_pad = (
-            torch.arange(
-                num_tokens * top_k,
-                capacity * top_k,
+        if num_tokens > 0:
+            id_pad = topk_ids[
+                torch.arange(pad_tokens, device=topk_ids.device) % num_tokens
+            ]
+        else:
+            id_pad = torch.full(
+                (pad_tokens, top_k),
+                self._first_home_expert(),
                 device=topk_ids.device,
                 dtype=torch.int32,
             )
-            % self.num_experts
-        ).view(pad_tokens, top_k)
         weight_pad = topk_weights.new_zeros(pad_tokens, topk_weights.shape[1])
         return (
             torch.cat((hidden_states, hidden_pad), dim=0).contiguous(),
@@ -693,6 +709,8 @@ class MoonEPDispatcher(BaseDispatcher):
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
 
+        if not self._decode_buffers_built:
+            self._prebuild_decode_buffers()
         capacity = self._phase_capacity(int(hidden_states.shape[0]))
         self._active_capacity = capacity
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
@@ -711,6 +729,8 @@ class MoonEPDispatcher(BaseDispatcher):
             async_finish=False,
             zero_copy=True,
         )
+        # A new Tensor object: the BF16 runner set_()s its input away
+        # (dispose_tensor), which must not empty MoonEP's own buffer view.
         hidden_nvsh = hidden_nvsh.view(hidden_nvsh.shape)
         return MoonEPDispatchOutput(
             hidden_states=hidden_nvsh,
@@ -719,7 +739,6 @@ class MoonEPDispatcher(BaseDispatcher):
             plan=plan,
             expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
             num_tokens=num_tokens,
-            capacity=capacity,
         )
 
     def dispatch_a(
@@ -742,7 +761,7 @@ class MoonEPDispatcher(BaseDispatcher):
                 f"{combine_input.format}"
             )
         buffer = self._get_buffer()
-        shard = buffer._require_ctx()["hidden_buf_local"]
+        shard = buffer.hidden_nvsh_buffer_view
         hidden_states, _route_weights_sk, _event = buffer.combine(
             plan=combine_input.plan,
             hidden_nvsh=combine_input.hidden_states,
