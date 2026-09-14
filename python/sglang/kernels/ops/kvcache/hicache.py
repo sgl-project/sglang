@@ -131,11 +131,7 @@ def can_use_write_back_jit_kernel(
 
 def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
     """Mirror of pick_group_bytes() in kvcacheio/hicache.cuh."""
-    if (
-        unroll <= 0
-        or unroll > COPY_GROUP_THREADS
-        or COPY_GROUP_THREADS % unroll != 0
-    ):
+    if unroll <= 0 or unroll > COPY_GROUP_THREADS or COPY_GROUP_THREADS % unroll != 0:
         return False
 
     lanes_per_worker = COPY_GROUP_THREADS // unroll
