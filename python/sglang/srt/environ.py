@@ -548,7 +548,6 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
@@ -1464,9 +1463,6 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
-    # Compensated mHC caches FP32 weight splits; online weight updates must be
-    # disabled while this explicitly selected serving optimization is active.
-    SGLANG_DSV41_COMPENSATED_MHC = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
@@ -1483,16 +1479,6 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
-    # DeepSeek-V4.1 two-level indexer on DeepGEMM's paged sparse MQA logits for the
-    # index-source layers after the candidate source (decode). Needs a DeepGEMM
-    # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
-    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
-    # use multistream to overlap the publish-side with other computation
-    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
-    # Compute FlashMLA's split-KV tile-scheduler metadata with the wide DSV4
-    # kernel instead of FlashMLA's one-warp one, which walks num_sm_parts
-    # serially on a single thread inside the decode graph. Off = FlashMLA's.
-    SGLANG_DSV41_FAST_FLASHMLA_SCHED = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

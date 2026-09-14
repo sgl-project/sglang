@@ -239,7 +239,7 @@ def _maybe_precompute_flashmla_sched_meta(
     Only fires where FlashMLA would have computed -- when the scheduler holds no
     buffers yet -- so this does not add work to the calls that already reuse one.
     """
-    if flashmla_metadata is None or not envs.SGLANG_DSV41_FAST_FLASHMLA_SCHED.get():
+    if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
         return
@@ -694,7 +694,9 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
+    def init_compression_metadata(
+        self, num_tokens: Optional[int] = None, low_ratio_buffers=None
+    ) -> None:
         assert self.page_table.dim() == 2
         # CP pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
@@ -739,6 +741,10 @@ class DSV4AttnMetadata:
 
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
+        if low_ratio_buffers is not None:
+            self.c1_out_loc, self.c1_topk_lengths_clamp1 = low_ratio_buffers[:2]
+            self.c2_out_loc, self.c2_topk_lengths_clamp1 = low_ratio_buffers[4:6]
+            return
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
                 _low_ratio_compression_metadata(
@@ -827,7 +833,7 @@ class DSV4AttnMetadata:
                 f"!= num_tokens={num_tokens} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self, is_prefill: bool = False):
+    def init_flashmla_related(self, is_prefill: bool = False, low_ratio_buffers=None):
         assert self.index_topk in (512, 1024), (
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
@@ -857,6 +863,17 @@ class DSV4AttnMetadata:
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata() if has_c4 else None
         self.c128_flashmla_metadata = _create_flashmla_metadata() if has_c128 else None
+        if low_ratio_buffers is not None:
+            assert not is_prefill and self.low_ratios == (1, 2)
+            self.c1_sparse_topk_lengths, self.c1_sparse_page_indices = (
+                low_ratio_buffers[2:4]
+            )
+            self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
+                low_ratio_buffers[6:8]
+            )
+            self.c1_flashmla_metadata = _create_flashmla_metadata()
+            self.c2_flashmla_metadata = _create_flashmla_metadata()
+            return
         if 1 in self.low_ratios:
             (
                 self.c1_sparse_topk_lengths,
@@ -1873,7 +1890,9 @@ class DeepseekV4AttnBackend(
         )
         extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
+            # DSpark draft blocks are SWA-only, like draft extend. Their full
+            # context page table is unused; retain only its 2-D placeholder.
+            max_seq_len=self.page_size,
             req_pool_indices=req_pool_indices,
             seq_lens=lengths.seq_lens_extended,
             seq_lens_cpu=lengths.seq_lens_cpu_extended,
@@ -4308,7 +4327,25 @@ class DeepseekV4AttnBackend(
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
-        prep = BuildPageTablePositions.execute(
+        small_metadata = (
+            not is_prefill
+            and seq_lens_casual.is_cuda
+            and 0 < seq_lens_casual.numel() <= 8
+            and out_loc.numel() == seq_lens_casual.numel()
+            and self.low_ratios == (1, 2)
+            and set(self.present_ratios) == {1, 2}
+            and get_parallel().attn_cp_size == 1
+            and self.token_to_kv_pool.request_window is None
+        )
+        build_pages = BuildPageTablePositions.execute
+        if small_metadata:
+            from sglang.kernels.ops.attention.dsv41_small_metadata import (
+                low_ratio_metadata,
+                page_table_positions_small,
+            )
+
+            build_pages = page_table_positions_small
+        prep = build_pages(
             req_to_token=req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
@@ -4403,8 +4440,15 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata(num_tokens)
-            core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
+            low_ratio_buffers = (
+                low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                if small_metadata
+                else None
+            )
+            core_attn_metadata.init_compression_metadata(num_tokens, low_ratio_buffers)
+            core_attn_metadata.init_flashmla_related(
+                is_prefill=is_prefill, low_ratio_buffers=low_ratio_buffers
+            )
             if self.trtllm_attn:
                 core_attn_metadata.init_trtllm_sparse_buffers()
         else:

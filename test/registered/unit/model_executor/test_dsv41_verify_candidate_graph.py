@@ -21,6 +21,58 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestVerifyCandidateGraph(CustomTestCase):
+    def test_sharded_greedy_default_and_sampling_override(self):
+        from sglang.srt.environ import DsparkFoldedSampling, envs
+        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+            _resolve_folded_sampling,
+        )
+
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
+            markov_head=SimpleNamespace(supports_sharded_greedy=True),
+        )
+        args = dict(
+            model=model,
+            gamma=5,
+            max_bs=64,
+            device="cpu",
+            tp_rank=0,
+            available_memory_gb=16,
+        )
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(DsparkFoldedSampling.AUTO):
+            self.assertFalse(_resolve_folded_sampling(**args))
+            model.markov_head.supports_sharded_greedy = False
+            self.assertTrue(_resolve_folded_sampling(**args))
+        model.markov_head.supports_sharded_greedy = True
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(DsparkFoldedSampling.FORCE):
+            self.assertTrue(_resolve_folded_sampling(**args))
+
+    def test_candidate_backend_falls_back_for_unsupported_models(self):
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+            make_candidate_indexer,
+        )
+        from sglang.srt.layers.attention.dsv4.candidate_torch import (
+            TorchCandidateIndexer,
+        )
+
+        with patch(
+            "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_SPARSE_INDEXER",
+            True,
+        ):
+            # The backend also initializes for V4 models without a candidate source.
+            for budget, block in ((0, 0), (2048, 16)):
+                with self.subTest(budget=budget, block=block):
+                    self.assertIsInstance(
+                        make_candidate_indexer(budget, block), TorchCandidateIndexer
+                    )
+        with patch(
+            "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_SPARSE_INDEXER",
+            False,
+        ):
+            self.assertIsInstance(
+                make_candidate_indexer(2048, 8), TorchCandidateIndexer
+            )
+
     def make_policy(self, width=6):
         return Dsv41CandidateGraphVariants(
             graph_limits=(("candidate_unfiltered", 16384),),

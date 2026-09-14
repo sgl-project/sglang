@@ -99,9 +99,11 @@ def resolve_compressed_kv_layout(
     """
     if option is not None:
         option = option.lower()
-        assert option in ("auto", "fp8", "fp4"), (
-            f"unknown compressed KV layout {option!r}"
-        )
+        assert option in (
+            "auto",
+            "fp8",
+            "fp4",
+        ), f"unknown compressed KV layout {option!r}"
         if option == "auto":
             option = None
     if kv_layout is KVLayout.V4:
@@ -458,7 +460,11 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 # Low-ratio indexer-K pool page, in compressed slots: the DeepGEMM indexer reads
 # K in blocks of at most 128 and sglang's JIT metadata builder asserts 64.
 def dsv41_index_page_size() -> int:
-    if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+        DEEPGEMM_SPARSE_INDEXER,
+    )
+
+    if DEEPGEMM_SPARSE_INDEXER:
         return 128
     return 64
 
@@ -821,9 +827,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # resolve_compressed_kv_layout, so every (main, extra) pair the decode
         # kernel accepts is formed here and nowhere else.
         self.kv_layout = KVLayout.parse(kv_layout)
-        assert self.kv_layout in (KVLayout.V4, KVLayout.V41), (
-            f"{self.kv_layout} is only valid for a compressed (extra) cache"
-        )
+        assert self.kv_layout in (
+            KVLayout.V4,
+            KVLayout.V41,
+        ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
 

@@ -2210,7 +2210,30 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        o, _ = self.wo_b(o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1))
+        from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
+
+        mhc = current_mhc_post_fusion()
+        o, _ = self.wo_b(
+            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+            skip_all_reduce=mhc is not None,
+        )
+        if mhc is not None:
+            from sglang.kernels.ops.communication.all_reduce_mhc import (
+                all_reduce_mhc_norm,
+            )
+
+            if mhc.stats_stream is not None:
+                torch.cuda.current_stream().wait_stream(mhc.stats_stream)
+            o, mhc.output, mhc.normalized = all_reduce_mhc_norm(
+                o,
+                mhc.residual,
+                mhc.post,
+                mhc.comb,
+                mhc.pre,
+                mhc.norm_weight,
+                mhc.norm_eps,
+                world_size=self.attn_tp_size,
+            )
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -2367,39 +2390,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._post_attention_layernorm_weight_bf16 = (
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
-        # Rebuilt after weight loading, like the norm cache above. Keep the
-        # original FP32 parameters intact for small rows and invariant mode.
-        self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
-        self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
-        if (
-            self.hc_pre_from_prev_sublayer
-            and get_platform().is_sm100
-            and self.hc_attn_fn.shape == (24, 20480)
-            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-            and envs.SGLANG_DSV41_COMPENSATED_MHC.get()
-        ):
-            from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
-                split_tf32_hc_weight,
-            )
-            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-                ENABLE_JIT_DEEPGEMM,
-            )
-
-            if ENABLE_JIT_DEEPGEMM:
-                self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
-                self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
-                if (
-                    getattr(getattr(self, "config", None), "model_type", None)
-                    == "deepseek_v41"
-                ):
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
-                        split_bf16_hc_weight,
-                    )
-
-                    self._hc_attn_bf16_parts = split_bf16_hc_weight(
-                        self.hc_attn_fn.data
-                    )
-                    self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
 
     def hc_pre(
         self,
@@ -2568,7 +2558,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
@@ -2841,6 +2830,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
         quantized: Optional[list] = None,
+        normalized: Optional[torch.Tensor] = None,
+        precomputed: Optional[tuple] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
         apply_pre (None selects copy 0), then RMS-normalized.
@@ -2860,6 +2851,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         x_flat = x.flatten(1)
 
         def combine_and_norm():
+            if precomputed is not None:
+                assert quantized is not None
+                quantized.append(precomputed[1])
+                return precomputed[0]
+            if normalized is not None:
+                assert not quantize
+                return normalized
             if apply_pre is None:
                 return norm(x[:, 0, :].contiguous())
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
@@ -2929,63 +2927,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if stats_stream is not None
                 else nullcontext()
             ):
-                from sglang.srt.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
+                pre, post, comb = hc_mix_stats_sinkhorn(
+                    x_flat,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.hc_mult,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
                 )
-
-                parts = bf16_parts = None
-                if (
-                    x_flat.shape[0] >= 128
-                    and x_flat.is_contiguous()
-                    and get_platform().is_sm100
-                    and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-                    and not is_batch_invariant_mode_enabled()
-                ):
-                    if hc_fn is self.hc_attn_fn:
-                        parts = getattr(self, "_hc_attn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
-                    elif hc_fn is self.hc_ffn_fn:
-                        parts = getattr(self, "_hc_ffn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
-                if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
-                        hc_mix_stats_sinkhorn_bf16x3,
-                    )
-
-                    pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
-                        x_flat,
-                        bf16_parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                elif parts is not None:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
-                        hc_mix_stats_sinkhorn_deepgemm,
-                    )
-
-                    pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
-                        x_flat,
-                        parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                else:
-                    pre, post, comb = hc_mix_stats_sinkhorn(
-                        x_flat,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        self.hc_mult,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
             if stats_stream is not None:
                 # These allocations originate on the side stream and are read
                 # after the caller joins it, on the main stream.
@@ -3039,6 +2990,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         prev_pre: Optional[torch.Tensor],
+        precomputed_attn: Optional[tuple] = None,
+        next_norm: Optional[RMSNorm] = None,
+        next_input: Optional[list] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
@@ -3056,17 +3010,68 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.input_layernorm,
             stats_stream=stats_stream,
             quantized=attn_quantized,
+            precomputed=precomputed_attn,
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        attn_mhc = None
+        if (
+            self.config.model_type == "deepseek_v41"
+            and x.is_cuda
+            and get_platform().is_blackwell
+            and 0 < x.shape[0] <= 8
+            and x.shape[1] == 5120
+            and self.hc_mult == 4
+            and x.dtype == residual.dtype == torch.bfloat16
+            and attn_pre.dtype == attn_post.dtype == attn_comb.dtype == torch.float32
+            and all(
+                t.is_contiguous() for t in (residual, attn_pre, attn_post, attn_comb)
+            )
+            and get_parallel().attn_dp_size == 1
+            and get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            and self.self_attn.wo_b.reduce_results
+            and not get_forward().sp_active
+            and not self.dsa_enable_prefill_cp
+            and not self.post_attention_layernorm.cast_x_before_out_mul
+            and self.post_attention_layernorm.variance_size_override is None
+            and self.post_attention_layernorm.weight.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.communication.all_reduce_fusion import (
+                get_registered_comm,
+            )
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.layers.moe.mhc_post_fusion import (
+                MhcPostFusion,
+                use_mhc_post_fusion,
+            )
+
+            if (
+                not is_batch_invariant_mode_enabled()
+                and get_registered_comm(self.self_attn.attn_tp_size) is not None
+            ):
+                attn_mhc = MhcPostFusion(
+                    residual,
+                    attn_post,
+                    attn_comb,
+                    stats_stream,
+                    pre=attn_pre,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    norm_eps=self.post_attention_layernorm.variance_epsilon,
+                )
+        context = (
+            use_mhc_post_fusion(attn_mhc) if attn_mhc is not None else nullcontext()
+        )
+        with context, self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
                 x=x,
                 positions=positions,
                 forward_batch=forward_batch,
                 x_quant=attn_quantized[0] if attn_quantized else None,
             )
-        if stats_stream is not None:
-            torch.cuda.current_stream().wait_stream(stats_stream)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+        if attn_mhc is not None:
+            hidden_states = attn_mhc.output
+        else:
+            if stats_stream is not None:
+                torch.cuda.current_stream().wait_stream(stats_stream)
+            hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
         x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
@@ -3077,13 +3082,54 @@ class DeepseekV4DecoderLayer(nn.Module):
             apply_pre=attn_pre,
             norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
+            normalized=attn_mhc.normalized if attn_mhc is not None else None,
         )
-        x = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
-        )
-        if stats_stream is not None:
-            torch.cuda.current_stream().wait_stream(stats_stream)
-        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        mhc = None
+        if (
+            self.config.model_type == "deepseek_v41"
+            and x.is_cuda
+            and get_platform().is_blackwell
+            and 0 < x.shape[0] <= 8
+            and x.shape[1] == 5120
+            and self.hc_mult == 4
+            and x.dtype == residual.dtype == torch.bfloat16
+            and ffn_post.dtype == ffn_comb.dtype == torch.float32
+            and all(t.is_contiguous() for t in (residual, ffn_post, ffn_comb))
+            and get_parallel().attn_dp_size == 1
+            and get_moe_a2a_backend().is_none()
+            and not self.dsa_enable_prefill_cp
+            and not self.mlp._shared_expert_tp1
+            and self.mlp.tp_size == 4
+        ):
+            from sglang.srt.layers.moe.mhc_post_fusion import (
+                MhcPostFusion,
+                use_mhc_post_fusion,
+            )
+
+            mhc = MhcPostFusion(residual, ffn_post, ffn_comb, stats_stream)
+            if (
+                next_norm is not None
+                and ffn_pre.dtype == torch.float32
+                and ffn_pre.is_contiguous()
+            ):
+                mhc.pre = ffn_pre
+                mhc.norm_weight = next_norm.weight
+                mhc.norm_eps = next_norm.variance_epsilon
+            context = use_mhc_post_fusion(mhc)
+        else:
+            context = nullcontext()
+        with context:
+            x = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+            )
+        if mhc is not None and mhc.output is not None:
+            hidden_states = mhc.output
+            if next_input is not None and mhc.quantized is not None:
+                next_input.append((mhc.normalized, Mxfp8SwizzledInput(*mhc.quantized)))
+        else:
+            if stats_stream is not None:
+                torch.cuda.current_stream().wait_stream(stats_stream)
+            hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
     def _run_moe_ffn_dp_sync(
@@ -3671,9 +3717,10 @@ class DeepseekV4Model(nn.Module):
             late_ratios = set(
                 config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
             )
-            assert late_ratios <= {0, 1}, (
-                f"late layers must not compress on their own, got ratios {late_ratios}"
-            )
+            assert late_ratios <= {
+                0,
+                1,
+            }, f"late layers must not compress on their own, got ratios {late_ratios}"
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3798,6 +3845,7 @@ class DeepseekV4Model(nn.Module):
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
         prev_pre = None
+        precomputed_attn = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
@@ -3814,6 +3862,7 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
             if engram is not None:
+                precomputed_attn = None
                 before_engram = hidden_states
                 if i == 14 and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
@@ -3850,6 +3899,37 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            next_norm = None
+            next_input = []
+            if (
+                self.config.model_type == "deepseek_v41"
+                and i + 1 < self.end_layer
+                and tail is None
+                and hidden_states.is_cuda
+                and get_platform().is_blackwell
+                and 0 < hidden_states.shape[0] <= 8
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+                and not get_forward().sp_active
+                and self.layers[i + 1].engram is None
+                and self.layers[i + 1].self_attn.accepts_mxfp8_swizzled_input()
+            ):
+                from sglang.srt.batch_invariant_ops import (
+                    is_batch_invariant_mode_enabled,
+                )
+
+                norm = self.layers[i + 1].input_layernorm
+                if (
+                    not norm.cast_x_before_out_mul
+                    and norm.variance_size_override is None
+                    and norm.weight.dtype == torch.bfloat16
+                    and norm.weight.shape == (5120,)
+                    and norm.weight.is_contiguous()
+                    and not is_batch_invariant_mode_enabled()
+                ):
+                    next_norm = norm
             with ctx:
                 hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
@@ -3858,7 +3938,11 @@ class DeepseekV4Model(nn.Module):
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                     prev_pre=prev_pre,
+                    precomputed_attn=precomputed_attn,
+                    next_norm=next_norm,
+                    next_input=next_input,
                 )
+            precomputed_attn = next_input[0] if next_input else None
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return hidden_states, prev_pre, tail
@@ -4284,7 +4368,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def pad_input_ids(self, input_ids, mm_inputs):
-
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )
@@ -4318,7 +4401,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return spans
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
-
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
         input_embeds, _ = embed_mm_inputs(
             mm_inputs_list=[

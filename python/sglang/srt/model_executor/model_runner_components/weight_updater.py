@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -42,14 +41,6 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
-    if envs.SGLANG_DSV41_COMPENSATED_MHC.get():
-        return (
-            "Online weight updates are not supported with "
-            "SGLANG_DSV41_COMPENSATED_MHC=1: captured CUDA graphs retain the "
-            "derived mHC weight splits. Restart with this flag disabled to "
-            "use online weight updates."
-        )
-
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():

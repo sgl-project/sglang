@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=180, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-gb300")
 
 HIDDEN = 5120  # DeepSeek-V4 hidden size, the width the fused path is used at
 TOP_K = 6
@@ -185,6 +185,122 @@ def test_moe_finalize_all_reduce_fp32_weights(num_tokens, use_shared):
     torch.testing.assert_close(out, ref, atol=0.125, rtol=0.01)
     out_bf16_weights = _fused(comm, gemm2, idx, weights.to(torch.bfloat16), shared)
     assert not torch.equal(out, out_bf16_weights)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 6, 8])
+@pytest.mark.parametrize("weight_dtype", WEIGHT_DTYPES, ids=["bf16", "fp32"])
+@pytest.mark.parametrize("epilogue", ["post", "norm", "quant"])
+@pytest.mark.parametrize("use_shared", [False, True])
+@pytest.mark.parametrize("seed", [0, 13])
+@torch.inference_mode()
+def test_mhc_epilogue_graph(num_tokens, weight_dtype, epilogue, use_shared, seed):
+    from sglang.kernels.ops.communication import all_reduce_mhc
+    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+    from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+
+    comm = _init_comm()
+    gemm2, idx, weights, shared = _make_inputs(
+        num_tokens, weight_dtype, exact=False, seed=31
+    )
+    shared = shared if use_shared else None
+    top_k = TOP_K
+    # The attention epilogue uses the same reduction with one contribution.
+    if epilogue == "norm" and not use_shared:
+        top_k = 1
+        gemm2 = gemm2[:num_tokens].contiguous()
+        idx = torch.arange(num_tokens, device=_device(), dtype=torch.int32)
+        weights = torch.ones(num_tokens, 1, device=_device(), dtype=weight_dtype)
+    residual = torch.randn(
+        num_tokens, 4, HIDDEN, device=_device(), dtype=torch.bfloat16
+    )
+    post = torch.randn(num_tokens, 4, device=_device())
+    comb = torch.randn(num_tokens, 4, 4, device=_device())
+    pre = torch.rand(num_tokens, 4, device=_device())
+    nw = torch.randn(HIDDEN, device=_device(), dtype=torch.bfloat16)
+    torch.manual_seed(seed * 7919 + dist.get_rank())
+    residual.normal_()
+    post.normal_()
+    comb.normal_()
+    pre.uniform_()
+    nw.normal_()
+    kernel = {
+        "post": all_reduce_mhc.moe_finalize_all_reduce_mhc,
+        "norm": all_reduce_mhc.moe_finalize_all_reduce_mhc_norm,
+        "quant": all_reduce_mhc.moe_finalize_all_reduce_mhc_quant,
+    }[epilogue]
+
+    def chain():
+        old = all_reduce_fusion.moe_finalize_all_reduce(
+            gemm2,
+            idx,
+            weights,
+            top_k,
+            shared,
+            world_size=comm.world_size,
+            hidden_dim=HIDDEN,
+        )
+        ref_post = mhc_post_split_h(old, residual, post, comb)
+        ref_norm = hc_combine_norm(ref_post.flatten(1), pre, nw, 1e-6)
+        args = [gemm2, idx, weights, top_k, shared, residual, post, comb]
+        if epilogue != "post":
+            args.extend((pre, nw, 1e-6))
+        outputs = kernel(*args, world_size=comm.world_size)
+        # Exercise the shared counters between generic push and row-cluster AR.
+        comm.custom_all_reduce(outputs[0])
+        return old, ref_post, ref_norm, outputs
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with comm.capture(), torch.cuda.graph(graph):
+        old, ref_post, ref_norm, outputs = chain()
+
+    def check_outputs():
+        reduced, actual_post = outputs[:2]
+        assert torch.equal(old.view(torch.int16), reduced.view(torch.int16))
+        assert torch.equal(ref_post.view(torch.int16), actual_post.view(torch.int16))
+        if epilogue == "post":
+            return
+        actual_norm = outputs[2]
+        # The cluster and Triton RMS reductions have different addition orders.
+        torch.testing.assert_close(actual_norm, ref_norm, rtol=0.008, atol=0.0001)
+        # Different reduction trees can land on opposite sides of BF16 ties.
+        # Bound each value, rather than a data-dependent bit-identical fraction.
+        ulp = (
+            actual_norm.view(torch.int16).int() - ref_norm.view(torch.int16).int()
+        ).abs()
+        ulp.masked_fill_(actual_norm == ref_norm, 0)  # Treat signed zeros equally.
+        assert ulp.max() <= 1
+        if epilogue == "quant":
+            q, sf = outputs[3:]
+            for backend in ("cuda", "cute-dsl"):
+                ref_q, ref_sf = flashinfer_mxfp8_quantize(
+                    actual_norm, True, 32, backend
+                )
+                assert torch.equal(
+                    q.view(torch.uint8).flatten(), ref_q.view(torch.uint8).flatten()
+                )
+                assert torch.equal(sf, ref_sf.flatten())
+
+    for replay, magnitude in enumerate((1e-3, 1.0, 1e3, 0.0, 1.0, 0.0, 1e-2)):
+        residual.normal_().mul_(magnitude)
+        gemm2.normal_().mul_(magnitude)
+        if epilogue == "quant":
+            outputs[4].fill_(0xAB)  # Also require rewriting the padded scale rows.
+        if dist.get_rank() == replay % dist.get_world_size():
+            torch.cuda._sleep(100000)
+        graph.replay()
+        torch.cuda.synchronize()
+        error = None
+        try:
+            check_outputs()
+        except AssertionError as exc:
+            error = f"rank={dist.get_rank()}, replay={replay}, scale={magnitude}: {exc}"
+        errors = [None] * dist.get_world_size()
+        # A failed assertion must stop all ranks before the next collective.
+        dist.all_gather_object(errors, error)
+        assert not any(errors), "\n".join(e for e in errors if e)
 
 
 if __name__ == "__main__":

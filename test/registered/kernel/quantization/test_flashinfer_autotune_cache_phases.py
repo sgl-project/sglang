@@ -1,4 +1,4 @@
-"""A cached target warmup must survive a subsequent draft warmup."""
+"""Loaded target tactics survive draft warmup, unless cache reuse is disabled."""
 
 import json
 import tempfile
@@ -18,7 +18,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
 class TestAutotuneCachePhases(CustomTestCase):
-    def test_disabling_cache_reuse_drops_file_loaded_tactics(self):
+    def test_target_and_draft_cache_reuse(self):
         from flashinfer.autotuner import AutoTuner, _collect_metadata
 
         tuner = AutoTuner.get()
@@ -30,75 +30,34 @@ class TestAutotuneCachePhases(CustomTestCase):
             tp_group=SimpleNamespace(world_size=1),
         )
         with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "cached.json"
-            cache.write_text(
-                json.dumps(
-                    {
-                        "_metadata": _collect_metadata(),
-                        "old_tactic": ["TestRunner", 7],
-                    }
-                )
+            target, draft = (
+                Path(directory) / name for name in ("target.json", "draft.json")
             )
-            tuner.load_configs(str(cache))
-            self.assertIn("old_tactic", tuner._file_configs)
-            with (
-                patch.object(
-                    warmup, "flashinfer_autotune_cache_path", return_value=cache
-                ),
-                patch.object(
-                    warmup, "get_flashinfer_autotune_skip_ops", return_value=set()
-                ),
-                patch.object(
-                    warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE,
-                    "get",
-                    return_value=False,
-                ),
-                warmup.flashinfer_autotune_context(runner, run_lm_head=False),
+            for path, key, tactic in (
+                (target, "target_prefill", 7),
+                (draft, "draft_decode", 3),
             ):
-                self.assertNotIn("old_tactic", tuner._file_configs)
-
-    def test_loaded_target_tactics_survive_draft_cache(self):
-        from flashinfer.autotuner import AutoTuner, _collect_metadata
-
-        tuner = AutoTuner.get()
-        tuner.clear_cache()
-        self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(
-            device="cuda",
-            forward_stream=torch.cuda.Stream(),
-            tp_group=SimpleNamespace(world_size=1),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "target.json"
-            draft = Path(directory) / "draft.json"
-            metadata = _collect_metadata()
-            target.write_text(
-                json.dumps({"_metadata": metadata, "target_prefill": ["TestRunner", 7]})
-            )
-            draft.write_text(
-                json.dumps({"_metadata": metadata, "draft_decode": ["TestRunner", 3]})
-            )
+                path.write_text(
+                    json.dumps(
+                        {"_metadata": _collect_metadata(), key: ["TestRunner", tactic]}
+                    )
+                )
             with (
                 patch.object(
                     warmup,
                     "flashinfer_autotune_cache_path",
-                    side_effect=[target, draft],
+                    side_effect=[target, draft, draft],
                 ),
                 patch.object(
                     warmup, "get_flashinfer_autotune_skip_ops", return_value=set()
                 ),
-                patch.object(
-                    warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE,
-                    "get",
-                    return_value=True,
-                ),
+                warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
             ):
                 with warmup.flashinfer_autotune_context(runner, run_lm_head=False):
                     self.assertEqual(
                         tuner._file_configs["target_prefill"], ("TestRunner", 7)
                     )
-                # No operation was profiled: this simulates a restart where all
-                # target tactics came from disk, not the in-memory profile cache.
+                # No profiling: this models a restart that loads tactics from disk.
                 self.assertFalse(tuner.profiling_cache)
                 with warmup.flashinfer_autotune_context(runner, run_lm_head=False):
                     self.assertEqual(
@@ -107,9 +66,15 @@ class TestAutotuneCachePhases(CustomTestCase):
                     self.assertEqual(
                         tuner._file_configs["draft_decode"], ("TestRunner", 3)
                     )
-            saved = json.loads(draft.read_text())
-            self.assertEqual(saved["target_prefill"], ["TestRunner", 7])
-            self.assertEqual(saved["draft_decode"], ["TestRunner", 3])
+                saved = json.loads(draft.read_text())
+                self.assertEqual(saved["target_prefill"], ["TestRunner", 7])
+                self.assertEqual(saved["draft_decode"], ["TestRunner", 3])
+                with (
+                    warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(False),
+                    warmup.flashinfer_autotune_context(runner, run_lm_head=False),
+                ):
+                    self.assertNotIn("target_prefill", tuner._file_configs)
+                    self.assertNotIn("draft_decode", tuner._file_configs)
 
 
 if __name__ == "__main__":
