@@ -35,13 +35,18 @@ def propose_lilicorr_block(
     embed_tokens,
     anchor: Optional[torch.Tensor],
     sampling_info=None,
+    sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Reranked draft block in place of the per-slot greedy argmax.
 
     ``draft_hidden`` is ``[bs, block_size, hidden]``, where slot 0 is the anchor
     position and slots 1.. are the candidate positions. Returns ``(tokens [bs,
     block_size - 1], candidate_tokens, q_rows)``; the latter two are ``None`` unless
-    ``LILICORR_SAMPLING`` is on, and the worker publishes them for the verify.
+    ``sampling_enabled``, and the worker publishes them for the verify.
+
+    ``sampling_enabled`` is the worker's device gate, not the module constant, for the
+    same reason the folded sampler takes it: this path publishes into the selector's
+    accept kernel, which does not run everywhere ``LILICORR_SAMPLING`` can be set.
 
     Unlike the folded path there are no static buffers to stage into, so the sampling
     tensors are built per call -- which is also why this path exists: it serves the
@@ -86,7 +91,7 @@ def propose_lilicorr_block(
         anchor_hidden=anchor_hidden,
         anchor_valid=anchor_valid,
     )
-    if not SAMPLING_ENABLED:
+    if not sampling_enabled:
         return head.select(**common).to(torch.long), None, None
 
     device = draft_hidden.device

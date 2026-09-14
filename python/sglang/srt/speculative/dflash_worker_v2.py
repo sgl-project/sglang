@@ -2665,6 +2665,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ),
                         anchor=self._lilicorr_anchor,
                         sampling_info=batch.sampling_info,
+                        sampling_enabled=self._lilicorr_sampling_enabled,
                     )
                 )
             if lilicorr_q_rows is not None and not _is_all_greedy(batch.sampling_info):

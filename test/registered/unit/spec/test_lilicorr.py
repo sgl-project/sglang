@@ -777,3 +777,51 @@ def test_a_sampling_row_leaves_a_greedy_row_in_the_same_batch_unchanged():
     )
     assert torch.equal(mixed_tokens[:1], alone_tokens)
     torch.testing.assert_close(mixed_q[:1], alone_q)
+
+
+def test_the_eager_seam_obeys_the_device_gate_and_not_the_module_flag(monkeypatch):
+    """The worker's gate has to reach the eager seam, not only the folded sampler.
+
+    A decode step lands here whenever the draft graph cannot run the batch, and a
+    proposal published from here goes to the same accept kernel the folded path was
+    gated away from. So the module constant must not be what decides it: the flag is
+    forced on below and the gate still has to win."""
+    from sglang.srt.speculative.lilicorr_components import lilicorr_select
+
+    monkeypatch.setattr(lilicorr_select, "SAMPLING_ENABLED", True)
+    monkeypatch.setattr(
+        lilicorr_select, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    head = _head()
+    bs = 2
+    torch.manual_seed(0)
+    lm_head = _FakeShardedHead(num_org=64, start=0)
+    lm_head.weight = torch.randn(64, 16)
+    call = dict(
+        head=head,
+        draft_hidden=torch.randn(bs, head.num_candidate_slots + 1, 16),
+        lm_head=lm_head,
+        embed_tokens=nn.Embedding(64, 16),
+        anchor=None,
+        sampling_info=SimpleNamespace(
+            temperatures=torch.full((bs, 1), 1.5),
+            top_ks=torch.full((bs,), 50),
+            is_all_greedy=False,
+        ),
+    )
+
+    gated_off = lilicorr_select.propose_lilicorr_block(**call, sampling_enabled=False)
+    tokens, candidate_tokens, q_rows = gated_off
+    assert candidate_tokens is None and q_rows is None
+    # The argmax commit is deterministic where the sampled one is not, which is what
+    # makes "it took the other body" observable without reconstructing the lattice.
+    assert torch.equal(
+        tokens,
+        lilicorr_select.propose_lilicorr_block(**call, sampling_enabled=False)[0],
+    )
+
+    _, gated_candidates, gated_q = lilicorr_select.propose_lilicorr_block(
+        **call, sampling_enabled=True
+    )
+    assert gated_candidates.shape == (bs, head.num_candidate_slots, head.candidate_topk)
+    assert gated_q.shape == gated_candidates.shape
