@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import (
+    _build_speculative_multi_request_warmup,
     _send_disaggregation_warmup_requests,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -82,6 +83,50 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
+
+
+def make_server_args(**overrides):
+    values = {
+        "max_running_requests": None,
+        "skip_tokenizer_init": False,
+        "speculative_algorithm": "EAGLE",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestSpeculativeMultiRequestWarmup(unittest.TestCase):
+    def build(self, server_args=None, *, dp_size=1, is_generation=True):
+        return _build_speculative_multi_request_warmup(
+            server_args or make_server_args(),
+            dp_size=dp_size,
+            is_generation=is_generation,
+            max_new_tokens=8,
+        )
+
+    def test_text_warmup_has_two_requests_per_dp_rank(self):
+        payload = self.build(dp_size=2)
+
+        self.assertEqual(payload["text"], ["The capital city of France is"] * 4)
+        self.assertEqual(
+            payload["sampling_params"],
+            {"temperature": 0, "max_new_tokens": 8},
+        )
+
+    def test_skip_tokenizer_init_uses_input_ids(self):
+        payload = self.build(make_server_args(skip_tokenizer_init=True))
+
+        self.assertNotIn("text", payload)
+        self.assertEqual(payload["input_ids"], [[10, 11, 12], [10, 11, 12]])
+
+    def test_non_speculative_server_is_unchanged(self):
+        self.assertIsNone(self.build(make_server_args(speculative_algorithm=None)))
+
+    def test_single_request_server_skips_multi_request_warmup(self):
+        self.assertIsNone(self.build(make_server_args(max_running_requests=1)))
+
+    def test_non_generation_server_skips_warmup(self):
+        self.assertIsNone(self.build(is_generation=False))
 
 
 if __name__ == "__main__":
