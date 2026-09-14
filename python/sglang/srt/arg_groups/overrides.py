@@ -1962,8 +1962,10 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
 def _wq_dsa_dcp_validation(view: Any) -> dict:
     """WQ Hopper DCP for DSA models (DeepSeek-V3.2 / GLM-5.x on SM90).
 
-    Registered last so it reads the RESOLVED DSA split backends and kv-cache
-    dtype. Without this pass a DSA model accepts ``--dcp-size > 1`` (no rule
+    Invoked from ``ServerArgs._set_default_dsa_backends`` right after
+    ``_dsa_split_backend_resolution`` (passes run at explicit slots;
+    ``POST_PROCESS_PASSES`` is only a registry), so it reads the RESOLVED DSA
+    split backends and kv-cache dtype. Without this pass a DSA model accepts ``--dcp-size > 1`` (no rule
     rejects it), boots, and then either crashes in the first decode (the
     ``flashmla_kv`` wrapper used to discard the LSE the DCP merge needs) or
     silently reads the wrong KV rows (top-k slots are VIRTUAL under DCP).
