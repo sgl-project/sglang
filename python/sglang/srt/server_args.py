@@ -32,6 +32,9 @@ from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
     record_fields,
+    redacted_argv,
+    redacted_value,
+    secret_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
@@ -263,12 +266,21 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def resolved_dict(self) -> dict[str, Any]:
-        """Serialize resolved field values, expanding nested records and excluding bookkeeping."""
+        """Serialize resolved fields, expanding records and redacting credentials.
 
-        return {
-            field.name: _plain(resolution_result(self, field.name))
-            for field in record_fields(type(self))
-        }
+        Credential markers retain the configured value count; unset credentials
+        stay None. The raw fields remain available to authentication and SSL.
+        """
+
+        secrets = secret_fields(type(self))
+        dump: dict[str, Any] = {}
+        for field in record_fields(type(self)):
+            value = resolution_result(self, field.name)
+            if field.name in secrets and value is not None:
+                dump[field.name] = redacted_value(value)
+            else:
+                dump[field.name] = _plain(value)
+        return dump
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "MuseGlimmerForConditionalGeneration",
@@ -634,8 +646,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     server_args = ServerArgs.from_cli_args(raw_args)
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
-    # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # subprocess copy can answer the same question the launcher can. The
+    # credentials are redacted here, once, because every reader of this string
+    # (`/server_info`, its gRPC and in-process twins) publishes it. The record
+    # goes along so the values the parse produced are hidden under any
+    # spelling, abbreviated flags included.
+    server_args._launch_command = " ".join(redacted_argv(ServerArgs, argv, server_args))
     return server_args
 
 
