@@ -13,7 +13,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
     is_batch_invariant,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
