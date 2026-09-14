@@ -76,6 +76,7 @@ def _make_daemon(**overrides) -> WeightCacheDaemon:
         "_mismatch_count": 0,
         "_last_served_at": None,
         "_served_client_pids": set(),
+        "_status_lock": threading.Lock(),
         **overrides,
     }.items():
         setattr(daemon, key, value)
