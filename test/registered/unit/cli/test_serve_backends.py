@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
+
+import sglang
 
 from sglang.cli.serve import serve
 from sglang.cli.serve_backends import (
@@ -243,6 +247,39 @@ class TestServeBackendDispatch(unittest.TestCase):
         self.assertIsNone(request.model_path)
         mock_load_plugins.assert_not_called()
         mock_kill.assert_not_called()
+
+
+class TestDiffusionImportIsolation(unittest.TestCase):
+    def test_multimodal_package_does_not_eagerly_import_generator_runtime(self):
+        script = """
+import importlib
+import sys
+import types
+
+sglang = types.ModuleType("sglang")
+sglang.__path__ = [sys.argv[1]]
+sys.modules["sglang"] = sglang
+multimodal_gen = importlib.import_module("sglang.multimodal_gen")
+assert "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator" not in sys.modules
+
+module_name = "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator"
+generator_module = types.ModuleType(module_name)
+generator_module.DiffGenerator = type("DiffGenerator", (), {})
+sys.modules[module_name] = generator_module
+assert multimodal_gen.DiffGenerator is generator_module.DiffGenerator
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script, next(iter(sglang.__path__))],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
 
 
 if __name__ == "__main__":
