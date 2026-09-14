@@ -510,12 +510,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._supports_unified_swa_reservation():
             full_required = ceil_align(full_len, page_size)
             swa_required = ceil_align(swa_tail_len, page_size)
-            allocator.evict_to_free_tokens(
+            capacity_ready = allocator.evict_to_free_tokens(
                 self.tree_cache,
                 full_required,
                 swa_num_tokens=swa_required,
             )
-            if allocator.ensure_capacity(full_required, swa_required):
+            if capacity_ready is None:
+                capacity_ready = allocator.ensure_capacity(full_required, swa_required)
+            if capacity_ready:
                 return None
             return (
                 "Unified FULL/SWA byte reclamation insufficient: "
@@ -852,12 +854,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        # HiSparse admits up to the host-backed logical capacity.
-        if self.scheduler.enable_hisparse:
-            capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
-        else:
-            capacity = self.max_total_num_tokens
-        input_len = self._rebootstrap_prefill_len(req)
+        message = None
         if self._supports_unified_swa_reservation():
             full_required, swa_required = self._prealloc_required_tokens(req)
             if not self._uses_swa_tail_prealloc():
@@ -869,29 +866,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
                     f"budget: full={full_required}, swa={swa_required}"
                 )
-                logger.error(message)
-                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-                return True
-            return False
-        if input_len > capacity:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
+        else:
+            # HiSparse admits up to the host-backed logical capacity.
+            capacity = (
+                self.scheduler.tp_worker.model_runner.max_token_pool_size
+                if self.scheduler.enable_hisparse
+                else self.max_total_num_tokens
+            )
+            input_len = self._rebootstrap_prefill_len(req)
+            if input_len > capacity:
+                message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
+            elif self._uses_swa_tail_prealloc():
+                _, swa_required = self._prealloc_required_tokens(req)
+                swa_capacity = self.token_to_kv_pool_allocator.size_swa
+                if swa_required > swa_capacity:
+                    message = (
+                        f"Request {req.rid} requires too many SWA KV tokens for "
+                        f"decode preallocation: {swa_required} > {swa_capacity}"
+                    )
+        if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
-        if self._uses_swa_tail_prealloc():
-            _, swa_required = self._prealloc_required_tokens(req)
-            swa_capacity = self.token_to_kv_pool_allocator.size_swa
-            if swa_required > swa_capacity:
-                message = (
-                    f"Request {req.rid} requires too many SWA KV tokens for "
-                    f"decode preallocation: {swa_required} > {swa_capacity}"
-                )
-                logger.error(message)
-                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-                return True
         return False
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
@@ -1603,15 +1600,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
-            draft_page_indices = None
-            if self.kv_manager.uses_separate_draft_kv_indices:
-                if self.scheduler.enable_hisparse:
-                    raise NotImplementedError(
-                        "separate draft KV indices are not supported with HiSparse"
-                    )
-                draft_page_indices = kv_to_page_indices(
-                    raw_kv_indices, page_size
-                ).astype(np.int32)
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1648,21 +1636,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            if draft_page_indices is not None:
-                decode_req.kv_receiver.send_metadata_with_draft_indices(
-                    page_indices,
-                    draft_page_indices,
-                    decode_req.metadata_buffer_index,
-                    state_indices,
-                    **metadata_kwargs,
-                )
-            else:
-                decode_req.kv_receiver.send_metadata(
-                    page_indices,
-                    decode_req.metadata_buffer_index,
-                    state_indices,
-                    **metadata_kwargs,
-                )
+            decode_req.kv_receiver.send_metadata(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                **metadata_kwargs,
+            )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,

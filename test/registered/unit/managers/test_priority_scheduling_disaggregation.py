@@ -162,7 +162,6 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[]),
-            uses_separate_draft_kv_indices=False,
         )
         queue.tree_cache = MagicMock()
 

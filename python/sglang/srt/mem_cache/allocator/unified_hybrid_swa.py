@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+from abc import abstractmethod
 from typing import Callable, Hashable, List, Optional, Sequence, Tuple, TypeGuard
 
 import torch
@@ -46,22 +47,14 @@ def supports_swa_byte_budget(
     allocator: BaseTokenToKVPoolAllocator | None,
 ) -> TypeGuard[UnifiedSWATokenToKVPoolAllocator]:
     """Whether FULL/SWA demand can be checked against a two-pool byte budget."""
-    return (
-        isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-        and allocator.supports_asymmetric_reservation
-    )
+    return isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
 
 
-class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
-    """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools).
+class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
+    """Shared FULL/SWA virtual IDs, allocation lifecycle, and index translation.
 
-    One alloc(N) binds N pages on BOTH sides under the same virtual id, so
-    `available_size()` (joint bytes, in TOKENS) is the only safe alloc pre-check.
+    Concrete allocators define the two-ended or Mamba/SWA/FULL capacity policy.
     """
-
-    # Unequal FULL/SWA reservations share one byte budget. The tri-pool opts
-    # out because its Mamba state competes for those same bytes.
-    supports_asymmetric_reservation = True
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
     # the no-op setter below absorbs that write.
@@ -191,18 +184,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- construction hooks (the tri-pool subclass overrides both) --
 
-    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
-        """The swa sub-allocator: an END pool in the 2-pool pair."""
-        return MultiEndedAllocator(
-            sub_pool_name="swa",
-            is_id_owner=False,  # non-owner; consumes virtuals minted by full
-            **kwargs,
-        )
-
-    def _wire_peers(self) -> None:
-        self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
-        self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
-
     # -- capacity reporting (three-way split) --
 
     def available_size(self) -> int:
@@ -212,46 +193,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self._joint_avail_memo_tokens = self._compute_available_size()
             self._joint_avail_memo_epoch = epoch
         return self._joint_avail_memo_tokens
-
-    def _compute_available_size(self) -> int:
-        """Joint byte budget in TOKENS: each composite alloc(1) consumes one
-        full-side AND one swa-side page under the same virtual id."""
-        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
-        e_f = fa.entry_bytes_per_page
-        e_s = sa.entry_bytes_per_page
-        # Direction-agnostic shared gap: the free byte band between the two pools.
-        if fa.grow_direction == "up":
-            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
-        else:
-            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
-        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        if not self.lazy_compaction:
-            pages_by_bytes = gap_bytes // (e_f + e_s)
-            return min(pages_by_bytes, R_f, R_s) * self.page_size
-
-        H_f = len(fa._free_phys_pages)
-        H_s = len(sa._free_phys_pages)
-
-        K1 = min(H_f, H_s)  # Phase 1: both drain
-
-        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
-        if H_f <= H_s:
-            e_phase2 = e_f
-            K_phase2_max = H_s
-        else:
-            e_phase2 = e_s
-            K_phase2_max = H_f
-        K2_room = K_phase2_max - K1
-        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
-        gap_bytes -= K2 * e_phase2
-
-        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
-
-        K_total = K1 + K2 + K3
-        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
-        return K_total * self.page_size
 
     # Slot-conservation views for the leak invariant only; the byte-coordinated
     # value would flag spurious leaks. `allocated_count()` is in TOKENS.
@@ -295,15 +236,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def schedulable_swa_available_size(self) -> int:
         return self.swa_attn_allocator.schedulable_available_size()
 
-    def _flush_targets(self):
-        """Flush ALL members, including ones that are not short themselves: a
-        one-sided hole is unusable, and compacting it yields SHARED gap."""
-        return (self.full_attn_allocator, self.swa_attn_allocator)
-
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """No float in a two-END chain -- nothing can slide."""
-        return None
-
     # `size_full` / `size_swa` bound each side independently; current capacities
     # also account for the peer's live byte usage.
 
@@ -314,6 +246,498 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     @property
     def current_swa_capacity(self) -> int:
         return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
+
+    @property
+    def draft_virtual_id_space(self) -> int:
+        return self.full_attn_allocator.max_slots - 1
+
+    def debug_print(self) -> str:
+        return (
+            f"#full-available={self.full_attn_allocator.available_size()}, "
+            f"#swa-available={self.swa_attn_allocator.available_size()}, "
+            f"#joint-available={self.available_size()}"
+        )
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def translate_kv_loc(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full-layer read path: virtual TOKEN ids -> full-physical TOKEN ids.
+        ``out=`` writes in place, for cuda-graph buffer stability."""
+        result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        return result
+
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Translate virtual token ids to raw full-pool physical token ids."""
+        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual token ids -> physical, not kernel-facing, SWA ids for PD."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the PD compaction gate on both physical sub-allocators."""
+        assert self.lazy_compaction, (
+            "PD disaggregation with the unified memory pool requires lazy "
+            "compaction (eager free-path compaction moves pages under "
+            "in-flight transfers)."
+        )
+        self.full_attn_allocator.disagg_move_gate = gate
+        self.swa_attn_allocator.disagg_move_gate = gate
+
+    def translate_loc_from_full_to_swa(
+        self,
+        kv_indices: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
+        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
+
+    @property
+    def kernel_page_multiplier(self) -> int:
+        return self.full_attn_allocator.kernel_page_multiplier
+
+    @property
+    def full_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the full sub-pool."""
+        return self.full_attn_allocator.virtual_to_physical
+
+    @property
+    def full_p2v_page_table(self) -> torch.Tensor:
+        """Page-level physical->virtual table of the full sub-pool."""
+        return self.full_attn_allocator.physical_to_virtual
+
+    def translate_kv_loc_for_kernel(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
+        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
+
+    def translate_write_loc_for_kernel(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Widened virtual WRITE loc -> kernel-facing id. DCP is rejected for this
+        composite at argument validation, so it coincides with the read translate."""
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
+
+    @property
+    def swa_kernel_page_multiplier(self) -> int:
+        return self.swa_attn_allocator.kernel_page_multiplier
+
+    @property
+    def swa_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the SWA sub-pool."""
+        return self.swa_attn_allocator.virtual_to_physical
+
+    # -- alloc --
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        with record_function("UnifiedSWAAlloc.alloc"):
+            if not self.ensure_capacity(need_size, need_size):
+                return None
+            # Snapshot the virtual PAGES full will consume, to bind them on swa too.
+            num_pages = need_size // self.page_size
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_pages].clone()
+
+            v_tokens = fa.alloc(need_size)
+            # Post-pre-check failure can only be internal-state inconsistency.
+            assert v_tokens is not None, (
+                "UnifiedSWA.alloc: full.alloc returned None after joint "
+                "pre-check passed — internal-state inconsistency"
+            )
+            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            return v_tokens
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """Paged extend; returns virtual TOKEN ids. The same virtual page maps to
+        full- and swa-physical, so swa binds exactly what the full kernel consumed."""
+        with record_function("UnifiedSWAAlloc.alloc_extend"):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            need_tokens = num_new_pages * self.page_size
+            if not self.ensure_capacity(need_tokens, need_tokens):
+                return None
+
+            # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
+            # its view after the slice is consumed.
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+
+            out_indices = fa.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
+            assert out_indices is not None, (
+                "UnifiedSWA.alloc_extend: full.alloc_extend returned None "
+                "after joint pre-check passed — internal-state inconsistency"
+            )
+            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            return out_indices  # virtual TOKEN ids
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Paged decode: one new token per request, consuming a page only when the
+        decode wraps."""
+        with record_function("UnifiedSWAAlloc.alloc_decode"):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+            )
+            need_tokens = num_new_pages * self.page_size
+            if not self.ensure_capacity(need_tokens, need_tokens):
+                return None
+
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+
+            out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+            assert out_indices is not None, (
+                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
+                "after joint pre-check passed — internal-state inconsistency"
+            )
+
+            if new_virtual_pages.numel() > 0:
+                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+
+            return out_indices  # virtual TOKEN ids
+
+    def is_slot_allocated(self, slot: int) -> bool:
+        """Token-slot surface = the full side (which owns the virtual ids)."""
+        return self.full_attn_allocator.is_slot_allocated(slot)
+
+    def allocator_state_str(self) -> str:
+        return self.full_attn_allocator.allocator_state_str()
+
+    # -- free --
+
+    def free(self, free_index: torch.Tensor) -> None:
+        with record_function("UnifiedSWAAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if self.free_group is not None:
+                self.free_group.append(self._copy_for_free_group(free_index))
+                return
+            # Order is not load-bearing: the per-sub-pool v2p IS the mapping. Only
+            # swa needs the tombstone filter; full owns the ids, so all are bound.
+            v = free_index.detach().to(torch.int64)
+            v_pages = v // self.page_size
+            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+            # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
+            live_token_mask = swa_v2p_pages > 0
+            live_tokens = v[live_token_mask]
+            if live_tokens.numel() > 0:
+                self.swa_attn_allocator.free(live_tokens)
+            self.full_attn_allocator.free(v)
+            self.full_attn_allocator.clear_inverse_history()
+            self.swa_attn_allocator.clear_inverse_history()
+
+    def free_swa(self, free_index: torch.Tensor) -> None:
+        """SWA tombstone path: release swa-physical, keep the virtual id and
+        full-physical live; `swa.v2p_page[v_page] = -1` IS the tombstone."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        v = free_index.detach().to(torch.int64)
+        ps = self.page_size
+        v_pages = v // ps
+        # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+        live = v[swa_v2p_pages > 0]
+        if live.numel() == 0:
+            return
+        if ps == 1:
+            # token == page and the live filter just deduped against the v2p
+            # table, so these ARE unique page ids -- same skip as `_free_lazy`.
+            self.swa_attn_allocator.free(live, _pages=live)
+        else:
+            self.swa_attn_allocator.free(live)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """free_swa() for a kv-row segment: `start_pos` promises a contiguous
+        ascending range, so page reps come from stride arithmetic, not `torch.unique`."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free_swa(free_index)
+            return
+        ps = self.page_size
+        reps = self.swa_attn_allocator._page_reps(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        # Keep only pages still bound on swa; freeing a tombstoned one would
+        # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
+        rep_pages = reps // ps
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
+        live_reps = reps[swa_v2p_pages > 0]
+        if live_reps.numel() == 0:
+            return
+        self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_full(self, free_index: torch.Tensor) -> None:
+        """Release the full-physical page and the virtual id, leaving the swa
+        side alone -- the caller already tombstoned it (`swa.v2p_page == -1`)."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.free_group is not None:
+            self.full_free_group.append(self._copy_for_free_group(free_index))
+            return
+        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
+        self.full_attn_allocator.clear_inverse_history()
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            # token == page: free_full already frees by exact ids, no dedup.
+            self.free_full(free_index)
+            return
+        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
+        # two-sided segment path by itself; full-only is the same call.
+        self.free_segment(free_index, start_pos=start_pos)
+
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        if full_indices.numel() == 0:
+            return
+        full_pages = torch.unique(full_indices.to(torch.int64) // self.page_size)
+        swa = self.swa_attn_allocator
+        physical_pages = swa.virtual_to_physical[full_pages].clone()
+        swa.virtual_to_physical.index_fill_(0, full_pages, -1)
+        live = physical_pages > 0
+        physical_pages = physical_pages[live]
+        full_pages = full_pages[live]
+        still_owned = swa.physical_to_virtual[physical_pages] == full_pages
+        swa.physical_to_virtual.index_fill_(0, physical_pages[still_owned], -1)
+
+    # -- free-group --
+
+    # Not the SWA parent's hooks: those open the parent's paged full allocator
+    # as a free group, and this composite's sub-pools defer on their own.
+    def free_group_begin(self) -> None:
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
+        self.free_page_reps_group = []
+        self.full_free_group = []
+
+    def free_group_end(self) -> None:
+        pending, self.free_page_reps_group = self.free_page_reps_group, None
+        full_free_group, self.full_free_group = self.full_free_group, []
+        BaseTokenToKVPoolAllocator.free_group_end(self)
+        if full_free_group:
+            self.full_attn_allocator.free(torch.cat(full_free_group))
+            self.full_attn_allocator.clear_inverse_history()
+        if pending:
+            self._release_page_reps(pending)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Fixed-shape counterpart of `free()`; see `MultiEndedAllocator._page_reps`.
+        Both sides share one page-rep derivation instead of dedup'ing twice."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free(free_index)
+            return
+        reps = self.full_attn_allocator._page_reps(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        if self.free_page_reps_group is None:
+            self._release_page_reps((reps,))
+        else:
+            self.free_page_reps_group.append(reps)
+
+    def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
+        reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
+        v_pages = reps // self.page_size
+        # Same tombstone filter as `free`, but at PAGE granularity (page_size
+        # times smaller): `> 0` strict -- -1 = tombstoned, 0 = padding sink.
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+        live_pages = v_pages[swa_v2p_pages > 0]
+        if live_pages.numel() > 0:
+            self.swa_attn_allocator.free(live_pages * self.page_size, _pages=live_pages)
+        self.full_attn_allocator.free(reps, _pages=v_pages)
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def _joint_capacity_memo_violations(self) -> List[str]:
+        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
+        for the composite joint view. Empty == healthy."""
+        if (
+            self._joint_avail_memo_epoch
+            != self.full_attn_allocator._chain_capacity_epoch()
+        ):
+            return []
+        actual = self._compute_available_size()
+        if self._joint_avail_memo_tokens == actual:
+            return []
+        return [
+            f"[joint] stale available_size memo: "
+            f"cached={self._joint_avail_memo_tokens}, actual={actual}"
+        ]
+
+    def clear(self) -> None:
+        self.full_attn_allocator.clear()
+        self.swa_attn_allocator.clear()
+        self.free_group = None
+        self.free_page_reps_group = None
+        self.full_free_group = []
+
+    # -- Lazy compaction hooks --
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+
+    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
+        """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
+        with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
+            self.full_attn_allocator.set_latest_forward_done_event(event)
+            self.swa_attn_allocator.set_latest_forward_done_event(event)
+
+    def set_inflight_forward(
+        self,
+        forward_done: torch.cuda.Event,
+        out_cache_loc_virtual: Optional[torch.Tensor],
+    ) -> None:
+        """Hand the forward's metadata to BOTH sub-pools; each materializes its own
+        write-set via its OWN v2p, and the forward writes both sides per token."""
+        with record_function("UnifiedSWAAlloc.set_inflight_forward"):
+            self.full_attn_allocator.set_inflight_forward(
+                forward_done, out_cache_loc_virtual
+            )
+            self.swa_attn_allocator.set_inflight_forward(
+                forward_done, out_cache_loc_virtual
+            )
+
+    @abstractmethod
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator: ...
+
+    @abstractmethod
+    def _wire_peers(self) -> None: ...
+
+    @abstractmethod
+    def _compute_available_size(self) -> int: ...
+
+    @abstractmethod
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool: ...
+
+    @abstractmethod
+    def _flush_targets(self): ...
+
+    @abstractmethod
+    def _ask_float_for_room(self, need_tokens: int) -> None: ...
+
+
+class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
+    """Two-ended FULL/SWA allocator with asymmetric shared-byte reservations."""
+
+    def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
+        """The swa sub-allocator: an END pool in the 2-pool pair."""
+        return MultiEndedAllocator(
+            sub_pool_name="swa",
+            is_id_owner=False,  # non-owner; consumes virtuals minted by full
+            **kwargs,
+        )
+
+    def _wire_peers(self) -> None:
+        self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
+        self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
+
+    def _compute_available_size(self) -> int:
+        """Joint byte budget in TOKENS: each composite alloc(1) consumes one
+        full-side AND one swa-side page under the same virtual id."""
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        e_f = fa.entry_bytes_per_page
+        e_s = sa.entry_bytes_per_page
+        # Direction-agnostic shared gap: the free byte band between the two pools.
+        if fa.grow_direction == "up":
+            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
+        else:
+            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
+        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
+
+        if not self.lazy_compaction:
+            pages_by_bytes = gap_bytes // (e_f + e_s)
+            return min(pages_by_bytes, R_f, R_s) * self.page_size
+
+        H_f = len(fa._free_phys_pages)
+        H_s = len(sa._free_phys_pages)
+
+        K1 = min(H_f, H_s)  # Phase 1: both drain
+
+        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
+        if H_f <= H_s:
+            e_phase2 = e_f
+            K_phase2_max = H_s
+        else:
+            e_phase2 = e_s
+            K_phase2_max = H_f
+        K2_room = K_phase2_max - K1
+        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
+        gap_bytes -= K2 * e_phase2
+
+        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
+
+        K_total = K1 + K2 + K3
+        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
+        return K_total * self.page_size
+
+    def _flush_targets(self):
+        """Flush ALL members, including ones that are not short themselves: a
+        one-sided hole is unusable, and compacting it yields SHARED gap."""
+        return (self.full_attn_allocator, self.swa_attn_allocator)
+
+    def _ask_float_for_room(self, need_tokens: int) -> None:
+        """No float in a two-END chain -- nothing can slide."""
+        return None
 
     def reclaim_plan(
         self,
@@ -585,7 +1009,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def evict_to_free_tokens(
         self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
-    ) -> None:
+    ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         if tree_cache is None or tree_cache.is_chunk_cache():
@@ -605,170 +1029,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
-        self.ensure_capacity(num_tokens, required_swa)
-
-    @property
-    def draft_virtual_id_space(self) -> int:
-        return self.full_attn_allocator.max_slots - 1
-
-    def debug_print(self) -> str:
-        return (
-            f"#full-available={self.full_attn_allocator.available_size()}, "
-            f"#swa-available={self.swa_attn_allocator.available_size()}, "
-            f"#joint-available={self.available_size()}"
-        )
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def translate_kv_loc(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-layer read path: virtual TOKEN ids -> full-physical TOKEN ids.
-        ``out=`` writes in place, for cuda-graph buffer stability."""
-        result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
-        return result
-
-    def translate_kv_indices_for_transfer(
-        self, kv_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """Translate virtual token ids to raw full-pool physical token ids."""
-        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
-
-    def translate_swa_indices_for_transfer(
-        self, kv_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """Virtual token ids -> physical, not kernel-facing, SWA ids for PD."""
-        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
-
-    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Install the PD compaction gate on both physical sub-allocators."""
-        assert self.lazy_compaction, (
-            "PD disaggregation with the unified memory pool requires lazy "
-            "compaction (eager free-path compaction moves pages under "
-            "in-flight transfers)."
-        )
-        self.full_attn_allocator.disagg_move_gate = gate
-        self.swa_attn_allocator.disagg_move_gate = gate
-
-    def translate_loc_from_full_to_swa(
-        self,
-        kv_indices: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
-        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
-
-    @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
-
-    @property
-    def full_v2p_page_table(self) -> torch.Tensor:
-        """Page-level virtual->physical table of the full sub-pool."""
-        return self.full_attn_allocator.virtual_to_physical
-
-    @property
-    def full_p2v_page_table(self) -> torch.Tensor:
-        """Page-level physical->virtual table of the full sub-pool."""
-        return self.full_attn_allocator.physical_to_virtual
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
-
-    def translate_write_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-        out_width: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> kernel-facing id. DCP is rejected for this
-        composite at argument validation, so it coincides with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
-            loc, out=out, out_width=out_width
-        )
-
-    @property
-    def swa_kernel_page_multiplier(self) -> int:
-        return self.swa_attn_allocator.kernel_page_multiplier
-
-    @property
-    def swa_v2p_page_table(self) -> torch.Tensor:
-        """Page-level virtual->physical table of the SWA sub-pool."""
-        return self.swa_attn_allocator.virtual_to_physical
-
-    # -- alloc --
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        with record_function("UnifiedSWAAlloc.alloc"):
-            if not self.ensure_capacity(need_size, need_size):
-                return None
-            # Snapshot the virtual PAGES full will consume, to bind them on swa too.
-            num_pages = need_size // self.page_size
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_pages].clone()
-
-            v_tokens = fa.alloc(need_size)
-            # Post-pre-check failure can only be internal-state inconsistency.
-            assert v_tokens is not None, (
-                "UnifiedSWA.alloc: full.alloc returned None after joint "
-                "pre-check passed — internal-state inconsistency"
-            )
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-            return v_tokens
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ) -> Optional[torch.Tensor]:
-        """Paged extend; returns virtual TOKEN ids. The same virtual page maps to
-        full- and swa-physical, so swa binds exactly what the full kernel consumed."""
-        with record_function("UnifiedSWAAlloc.alloc_extend"):
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-            need_tokens = num_new_pages * self.page_size
-            if not self.ensure_capacity(need_tokens, need_tokens):
-                return None
-
-            # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
-            # its view after the slice is consumed.
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_new_pages=num_new_pages,
-            )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_extend: full.alloc_extend returned None "
-                "after joint pre-check passed — internal-state inconsistency"
-            )
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-            return out_indices  # virtual TOKEN ids
+        return self.ensure_capacity(num_tokens, required_swa)
 
     def alloc_extend_swa_tail(
         self,
@@ -832,202 +1093,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
             return out_indices
 
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Paged decode: one new token per request, consuming a page only when the
-        decode wraps."""
-        with record_function("UnifiedSWAAlloc.alloc_decode"):
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-            )
-            need_tokens = num_new_pages * self.page_size
-            if not self.ensure_capacity(need_tokens, need_tokens):
-                return None
-
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
-                "after joint pre-check passed — internal-state inconsistency"
-            )
-
-            if new_virtual_pages.numel() > 0:
-                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-
-            return out_indices  # virtual TOKEN ids
-
-    def is_slot_allocated(self, slot: int) -> bool:
-        """Token-slot surface = the full side (which owns the virtual ids)."""
-        return self.full_attn_allocator.is_slot_allocated(slot)
-
-    def allocator_state_str(self) -> str:
-        return self.full_attn_allocator.allocator_state_str()
-
-    # -- free --
-
-    def free(self, free_index: torch.Tensor) -> None:
-        with record_function("UnifiedSWAAlloc.free"):
-            if free_index is None or free_index.numel() == 0:
-                return
-            if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
-                return
-            # Order is not load-bearing: the per-sub-pool v2p IS the mapping. Only
-            # swa needs the tombstone filter; full owns the ids, so all are bound.
-            v = free_index.detach().to(torch.int64)
-            v_pages = v // self.page_size
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-            # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
-            live_token_mask = swa_v2p_pages > 0
-            live_tokens = v[live_token_mask]
-            if live_tokens.numel() > 0:
-                self.swa_attn_allocator.free(live_tokens)
-            self.full_attn_allocator.free(v)
-            self.full_attn_allocator.clear_inverse_history()
-            self.swa_attn_allocator.clear_inverse_history()
-
-    def free_swa(self, free_index: torch.Tensor) -> None:
-        """SWA tombstone path: release swa-physical, keep the virtual id and
-        full-physical live; `swa.v2p_page[v_page] = -1` IS the tombstone."""
-        if free_index is None or free_index.numel() == 0:
-            return
-        v = free_index.detach().to(torch.int64)
-        ps = self.page_size
-        v_pages = v // ps
-        # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        live = v[swa_v2p_pages > 0]
-        if live.numel() == 0:
-            return
-        if ps == 1:
-            # token == page and the live filter just deduped against the v2p
-            # table, so these ARE unique page ids -- same skip as `_free_lazy`.
-            self.swa_attn_allocator.free(live, _pages=live)
-        else:
-            self.swa_attn_allocator.free(live)
-        self.swa_attn_allocator.clear_inverse_history()
-
-    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """free_swa() for a kv-row segment: `start_pos` promises a contiguous
-        ascending range, so page reps come from stride arithmetic, not `torch.unique`."""
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.page_size == 1:
-            self.free_swa(free_index)
-            return
-        ps = self.page_size
-        reps = self.swa_attn_allocator._page_reps(
-            free_index.detach().to(torch.int64), start_pos
-        )
-        # Keep only pages still bound on swa; freeing a tombstoned one would
-        # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
-        rep_pages = reps // ps
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
-        live_reps = reps[swa_v2p_pages > 0]
-        if live_reps.numel() == 0:
-            return
-        self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
-        self.swa_attn_allocator.clear_inverse_history()
-
-    def free_full(self, free_index: torch.Tensor) -> None:
-        """Release the full-physical page and the virtual id, leaving the swa
-        side alone -- the caller already tombstoned it (`swa.v2p_page == -1`)."""
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.free_group is not None:
-            self.full_free_group.append(self._copy_for_free_group(free_index))
-            return
-        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
-        self.full_attn_allocator.clear_inverse_history()
-
-    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.page_size == 1:
-            # token == page: free_full already frees by exact ids, no dedup.
-            self.free_full(free_index)
-            return
-        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
-        # two-sided segment path by itself; full-only is the same call.
-        self.free_segment(free_index, start_pos=start_pos)
-
-    def set_full_to_swa_mapping(
-        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
-    ) -> None:
-        if full_indices.numel() == 0:
-            return
-        assert full_indices.numel() == swa_indices.numel()
-        full_pages = full_indices.to(torch.int64) // self.page_size
-        swa_pages = swa_indices.to(torch.int64) // self.page_size
-        self.swa_attn_allocator.bind(full_pages, swa_pages)
-
-    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
-        if full_indices.numel() == 0:
-            return
-        full_pages = torch.unique(full_indices.to(torch.int64) // self.page_size)
-        swa = self.swa_attn_allocator
-        physical_pages = swa.virtual_to_physical[full_pages].clone()
-        swa.virtual_to_physical.index_fill_(0, full_pages, -1)
-        live = physical_pages > 0
-        physical_pages = physical_pages[live]
-        full_pages = full_pages[live]
-        still_owned = swa.physical_to_virtual[physical_pages] == full_pages
-        swa.physical_to_virtual.index_fill_(0, physical_pages[still_owned], -1)
-
-    # -- free-group --
-
-    # Not the SWA parent's hooks: those open the parent's paged full allocator
-    # as a free group, and this composite's sub-pools defer on their own.
-    def free_group_begin(self) -> None:
-        BaseTokenToKVPoolAllocator.free_group_begin(self)
-        self.free_page_reps_group = []
-        self.full_free_group = []
-
-    def free_group_end(self) -> None:
-        pending, self.free_page_reps_group = self.free_page_reps_group, None
-        full_free_group, self.full_free_group = self.full_free_group, []
-        BaseTokenToKVPoolAllocator.free_group_end(self)
-        if full_free_group:
-            self.full_attn_allocator.free(torch.cat(full_free_group))
-            self.full_attn_allocator.clear_inverse_history()
-        if pending:
-            self._release_page_reps(pending)
-
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Fixed-shape counterpart of `free()`; see `MultiEndedAllocator._page_reps`.
-        Both sides share one page-rep derivation instead of dedup'ing twice."""
-        if free_index is None or free_index.numel() == 0:
-            return
-        if self.page_size == 1:
-            self.free(free_index)
-            return
-        reps = self.full_attn_allocator._page_reps(
-            free_index.detach().to(torch.int64), start_pos
-        )
-        if self.free_page_reps_group is None:
-            self._release_page_reps((reps,))
-        else:
-            self.free_page_reps_group.append(reps)
-
-    def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
-        reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
-        v_pages = reps // self.page_size
-        # Same tombstone filter as `free`, but at PAGE granularity (page_size
-        # times smaller): `> 0` strict -- -1 = tombstoned, 0 = padding sink.
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        live_pages = v_pages[swa_v2p_pages > 0]
-        if live_pages.numel() > 0:
-            self.swa_attn_allocator.free(live_pages * self.page_size, _pages=live_pages)
-        self.full_attn_allocator.free(reps, _pages=v_pages)
-        self.full_attn_allocator.clear_inverse_history()
-        self.swa_attn_allocator.clear_inverse_history()
-
     def verify_byte_accounting(self) -> List[str]:
         return (
             _chain_byte_accounting_violations(
@@ -1035,56 +1100,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             + self._joint_capacity_memo_violations()
         )
-
-    def _joint_capacity_memo_violations(self) -> List[str]:
-        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
-        for the composite joint view. Empty == healthy."""
-        if (
-            self._joint_avail_memo_epoch
-            != self.full_attn_allocator._chain_capacity_epoch()
-        ):
-            return []
-        actual = self._compute_available_size()
-        if self._joint_avail_memo_tokens == actual:
-            return []
-        return [
-            f"[joint] stale available_size memo: "
-            f"cached={self._joint_avail_memo_tokens}, actual={actual}"
-        ]
-
-    def clear(self) -> None:
-        self.full_attn_allocator.clear()
-        self.swa_attn_allocator.clear()
-        self.free_group = None
-        self.free_page_reps_group = None
-        self.full_free_group = []
-
-    # -- Lazy compaction hooks --
-
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
-        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
-
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
-        with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
-            self.full_attn_allocator.set_latest_forward_done_event(event)
-            self.swa_attn_allocator.set_latest_forward_done_event(event)
-
-    def set_inflight_forward(
-        self,
-        forward_done: torch.cuda.Event,
-        out_cache_loc_virtual: Optional[torch.Tensor],
-    ) -> None:
-        """Hand the forward's metadata to BOTH sub-pools; each materializes its own
-        write-set via its OWN v2p, and the forward writes both sides per token."""
-        with record_function("UnifiedSWAAlloc.set_inflight_forward"):
-            self.full_attn_allocator.set_inflight_forward(
-                forward_done, out_cache_loc_virtual
-            )
-            self.swa_attn_allocator.set_inflight_forward(
-                forward_done, out_cache_loc_virtual
-            )
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free."""
@@ -1101,7 +1116,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return fa.flush_opportunistic() + sa.flush_opportunistic()
 
 
-class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
+class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     """Tri-pool composite for models with full KV + SWA KV + mamba/conv state
     (both `mambaish_config` and `is_hybrid_swa`).
 
@@ -1115,8 +1130,6 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
     Per-request state is served through `mamba_allocator`, wrapped by
     `UnifiedMambaSlotAllocator`.
     """
-
-    supports_asymmetric_reservation = False
 
     def __init__(
         self,

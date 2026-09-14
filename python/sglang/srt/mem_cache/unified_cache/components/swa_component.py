@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -213,11 +213,11 @@ class SWAComponent(TreeComponent):
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedSWAAllocatorBase,
         )
 
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedSWAAllocatorBase):
             return allocator
         return None
 
@@ -1026,10 +1026,7 @@ class SWAComponent(TreeComponent):
             # device-guaranteed, require a full window.
             return PreparePrefetchResult()
         num_tokens = num_pages * self.cache.page_size
-        if (
-            isinstance(self._swa_kv_pool_host, HostKVCache)
-            and self._swa_kv_pool_host.shared_allocation_domain is not None
-        ):
+        if uses_shared_host_layout(self._swa_kv_pool_host):
             return PreparePrefetchResult(deferred_host_allocation=True)
         host_indices = self.cache.host_pool_group.alloc(
             num_tokens,
@@ -1147,10 +1144,9 @@ class SWAComponent(TreeComponent):
             # Keys are unknowable at build time; placeholders carry the
             # count, _sync_trailing_keys fills the real trailing hashes.
             if host_indices is None:
-                assert (
-                    isinstance(self._swa_kv_pool_host, HostKVCache)
-                    and self._swa_kv_pool_host.shared_allocation_domain is not None
-                ), "deferred SWA prefetch allocation requires a shared host arena"
+                assert uses_shared_host_layout(self._swa_kv_pool_host), (
+                    "deferred SWA prefetch allocation requires a shared host arena"
+                )
                 num_pages = min(
                     self.full_window_pages,
                     prefetch_tokens // self.tree_core.page_size,

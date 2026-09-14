@@ -308,6 +308,42 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    def allocate_host_transfers(
+        self,
+        device_indices: torch.Tensor,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        reclaim: Optional[Callable[[int], Any]] = None,
+    ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+        if self._uses_shared_host_domain(extra_pools):
+            allocation = self.allocate_shared_host_transfers(
+                device_indices, extra_pools
+            )
+            anchor = self.mem_pool_host.anchor_entry
+            if (
+                allocation is None
+                and reclaim is not None
+                and anchor.host_evict_fn is None
+            ):
+                reclaim(len(device_indices))
+                allocation = self.allocate_shared_host_transfers(
+                    device_indices, extra_pools
+                )
+            return allocation
+
+        host_indices = self.mem_pool_host.alloc(len(device_indices), reclaim=reclaim)
+        if host_indices is None:
+            return None
+        pool_transfers = self.mem_pool_host.resolve_host_transfers(
+            extra_pools,
+            primary_device_indices=device_indices,
+            primary_host_indices=host_indices,
+        )
+        if pool_transfers is None and extra_pools:
+            self.mem_pool_host.free(host_indices)
+            return None
+        return host_indices, pool_transfers
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -315,25 +351,10 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        if self._uses_shared_host_domain(extra_pools):
-            allocation = self.allocate_shared_host_transfers(
-                device_indices, extra_pools
-            )
-            if allocation is None:
-                return None
-            host_indices, pool_transfers = allocation
-        else:
-            host_indices = self.mem_pool_host.alloc(len(device_indices))
-            if host_indices is None:
-                return None
-            pool_transfers = self.mem_pool_host.resolve_host_transfers(
-                extra_pools,
-                primary_device_indices=device_indices,
-                primary_host_indices=host_indices,
-            )
-            if pool_transfers is None and extra_pools:
-                self.mem_pool_host.free(host_indices)
-                return None
+        allocation = self.allocate_host_transfers(device_indices, extra_pools)
+        if allocation is None:
+            return None
+        host_indices, pool_transfers = allocation
 
         self.write_queue.append(
             CacheOperation(

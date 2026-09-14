@@ -929,20 +929,14 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
                 page_size=1,
             )
 
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        if not self._has_transfer_indices(host_indices, device_indices):
-            return
+    @contextmanager
+    def _direct_transfer(self, host_indices, device_indices, io_backend):
         self._shared_backing.acquire_layout()
         finish_event = None
         transfer_key = None
         try:
-            host_indices, device_indices = self.prepare_transfer_indices(
+            yield self.prepare_transfer_indices(
                 host_indices, device_indices, io_backend
-            )
-            self.backup_from_device_all_layer_physical(
-                device_pool, host_indices, device_indices, io_backend
             )
             if self._device_page_buffer.device.type != "cpu":
                 finish_event = torch.cuda.Event()
@@ -957,6 +951,19 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             raise
         finally:
             self._shared_backing.release_layout(finish_event, transfer_key)
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        with self._direct_transfer(host_indices, device_indices, io_backend) as (
+            host_indices,
+            device_indices,
+        ):
+            self.backup_from_device_all_layer_physical(
+                device_pool, host_indices, device_indices, io_backend
+            )
 
     def backup_from_device_all_layer_physical(
         self, device_pool, host_indices, device_indices, io_backend
@@ -989,13 +996,10 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             host_indices, device_indices
         ):
             return
-        self._shared_backing.acquire_layout()
-        finish_event = None
-        transfer_key = None
-        try:
-            host_indices, device_indices = self.prepare_transfer_indices(
-                host_indices, device_indices, io_backend
-            )
+        with self._direct_transfer(host_indices, device_indices, io_backend) as (
+            host_indices,
+            device_indices,
+        ):
             self.load_to_device_per_layer_physical(
                 device_pool,
                 host_indices,
@@ -1004,19 +1008,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
                 io_backend,
                 is_draft=is_draft,
             )
-            if self._device_page_buffer.device.type != "cpu":
-                finish_event = torch.cuda.Event()
-                finish_event.record()
-                transfer_key = (
-                    "direct",
-                    int(torch.cuda.current_stream().cuda_stream),
-                )
-        except Exception:
-            if self._device_page_buffer.device.type != "cpu":
-                torch.cuda.current_stream().synchronize()
-            raise
-        finally:
-            self._shared_backing.release_layout(finish_event, transfer_key)
 
     def load_to_device_per_layer_physical(
         self,
