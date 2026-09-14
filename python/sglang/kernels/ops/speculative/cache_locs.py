@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -488,7 +490,15 @@ def assign_extend_cache_locs_func(
     batch_size: int,
     draft_token_num: int,
     device,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Compute per-draft-token KV cache locations.
+
+    When ``out`` is provided (contiguous, matching numel and a dtype the
+    platform path emits -- int32 on NPU), the result is written in place and
+    ``out`` itself is returned; otherwise a fresh tensor is allocated and
+    returned, and the caller must copy it if a persistent buffer is needed.
+    """
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
@@ -508,6 +518,20 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
+        if (
+            out is not None
+            and out.dtype == torch.int32
+            and out.numel() == batch_size * draft_token_num
+            and out.is_contiguous()
+        ):
+            torch.ops.npu.cache_loc_update(
+                req_pool_indices,
+                req_to_token,
+                start_offset,
+                end_offset,
+                out,
+            )
+            return out
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
