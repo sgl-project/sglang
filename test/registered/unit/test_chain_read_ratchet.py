@@ -25,7 +25,7 @@ import sglang
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=28, suite="base-a-test-cpu")
 
 _PACKAGE = pathlib.Path(sglang.__file__).resolve().parent
 _SRT = _PACKAGE / "srt"
@@ -40,7 +40,7 @@ _OWNERS = ("server_args.py", "runtime_context.py", "arg_groups/")
 # startup default wherever it is written, and `benchmark/` ships too.
 _READS_SCANNED = _PACKAGE
 
-_DECLARERS = ("declare_resolution", "declare_late_resolution")
+_DECLARERS = ("declare_resolution",)
 
 
 def _declared_by_keyword():
@@ -78,15 +78,39 @@ def _returned_field_names(function):
     returned literal, assignments (annotated or not) to a returned name, a
     literal-key subscript write on it, and `.update(field=...)` on it. A
     spelling this cannot see raises instead of skipping.
+
+    ``overrides[name]`` is also accepted when ``name`` comes from
+    ``for name in ("a", "b", ...)`` -- the keys stay statically enumerable.
     """
     names = set()
     returned = set()
+    # for x in ("a", "b"): ...  ->  {"x": {"a", "b"}}
+    loop_keys = {
+        node.target.id: {elt.value for elt in node.iter.elts}
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and isinstance(node.iter, (ast.Tuple, ast.List))
+        and node.iter.elts
+        and all(
+            isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            for elt in node.iter.elts
+        )
+    }
 
     def top_level_keys(mapping):
         for key in mapping.keys:
             if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
                 raise AssertionError(f"non-literal key in {function.name}")
             names.add(key.value)
+
+    def add_subscript_key(key):
+        if isinstance(key, ast.Constant):
+            names.add(key.value)
+        elif isinstance(key, ast.Name) and key.id in loop_keys:
+            names.update(loop_keys[key.id])
+        else:
+            raise AssertionError(f"non-literal key in {function.name}")
 
     for node in ast.walk(function):
         if isinstance(node, ast.Return) and node.value is not None:
@@ -114,9 +138,7 @@ def _returned_field_names(function):
                 if isinstance(target, ast.Subscript) and (
                     isinstance(target.value, ast.Name) and target.value.id in returned
                 ):
-                    if not isinstance(target.slice, ast.Constant):
-                        raise AssertionError(f"non-literal key in {function.name}")
-                    names.add(target.slice.value)
+                    add_subscript_key(target.slice)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -217,27 +239,6 @@ def _declared_by_registry_and_passes():
     return fields
 
 
-def _declared_by_late_resolution():
-    """Keywords of `declare_late_resolution(record, ...)`, the late spelling.
-
-    The fields sit at the call sites rather than in the declarer, so a scan
-    that only knew the declarer's own definition would find none of them.
-    """
-    # The record plus `arg_groups/`: a hook calls it on the record it was
-    # handed, so scanning the record's file alone finds nothing.
-    sources = [_SRT / "server_args.py", *sorted((_SRT / "arg_groups").rglob("*.py"))]
-    fields = set()
-    for source in sources:
-        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "declare_late_resolution"
-            ):
-                fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
-    return fields
-
-
 def _written_after_publish():
     """Fields the runtime overrides once the bags exist.
 
@@ -264,7 +265,6 @@ def _resolution_written():
     return (
         _declared_by_keyword()
         | _declared_by_registry_and_passes()
-        | _declared_by_late_resolution()
         | _written_after_publish()
     )
 
@@ -539,7 +539,6 @@ class TestNoChainReadsOfResolvedConfig(CustomTestCase):
 
         by_keyword = _declared_by_keyword()
         by_data = _declared_by_registry_and_passes()
-        by_late = _declared_by_late_resolution()
 
         self.assertGreater(
             len(by_keyword),
@@ -564,24 +563,10 @@ class TestNoChainReadsOfResolvedConfig(CustomTestCase):
             f"{len(overrides.POST_PROCESS_PASSES)} passes; the scan of the "
             "dict-key channel broke",
         )
-        self.assertGreaterEqual(
-            len(by_late),
-            3,
-            f"only {len(by_late)} fields are declared late; the "
-            "`declare_late_resolution` keyword scan broke",
-        )
         # The data channel is not the keyword scan's subset: if it became one,
         # that scan would be doing all the work and a regression here would be
-        # invisible. The late channel *is* a subset, and deliberately so --
-        # `declare_late_resolution` is a keyword declarer like the others now
-        # that the record hosts no forwarding member, so its own floor above is
-        # what pins it.
+        # invisible.
         self.assertTrue(by_data - by_keyword, "the data channel adds nothing")
-        self.assertTrue(
-            by_late <= by_keyword,
-            "late resolution declares outside the keyword channel; it is the "
-            "same spelling, so the two cannot disagree",
-        )
 
     def test_nothing_reads_a_resolved_field_off_a_borrowed_record(self):
         found = _chain_reads(_resolution_written())

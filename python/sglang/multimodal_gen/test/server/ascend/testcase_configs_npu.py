@@ -176,6 +176,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
             },
         ),
         DiffusionSamplingParams(
@@ -227,6 +228,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "96",
+            },
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,

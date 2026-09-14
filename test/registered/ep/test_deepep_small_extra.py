@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=210, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=283, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestHybridDPTP(CustomTestCase):

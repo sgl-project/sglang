@@ -103,7 +103,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 120 \
     --max-mamba-cache-size 120 \
     --mem-fraction-static 0.85 \
-    --cuda-graph-bs 4 16 32 48 64 110 165 \
+    --cuda-graph-bs-decode 4 16 32 48 64 110 165 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -205,7 +205,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 42 \
     --max-mamba-cache-size 42 \
     --mem-fraction-static 0.75 \
-    --cuda-graph-bs 4 8 16 24 48 64 80 \
+    --cuda-graph-bs-decode 4 8 16 24 48 64 80 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -308,7 +308,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 3 \
     --max-mamba-cache-size 3 \
     --mem-fraction-static 0.9 \
-    --cuda-graph-bs 1 2 3 \
+    --cuda-graph-bs-decode 1 2 3 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -402,11 +402,11 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
     --enable-prefill-delayer \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests 103 \
     --max-mamba-cache-size 85 \
     --mem-fraction-static 0.85 \
-    --cuda-graph-bs 2 4 8 16 32 48 64 80 96 103 \
+    --cuda-graph-bs-decode 2 4 8 16 32 48 64 80 96 103 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -507,7 +507,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 1 \
     --max-mamba-cache-size 6 \
     --mem-fraction-static 0.65 \
-    --cuda-graph-bs 1 \
+    --cuda-graph-bs-decode 1 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -606,7 +606,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 122 \
     --max-mamba-cache-size 122 \
     --mem-fraction-static 0.9 \
-    --cuda-graph-bs 4 16 32 64 96 116 120 122 \
+    --cuda-graph-bs-decode 4 16 32 64 96 116 120 122 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -705,7 +705,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 10 \
     --max-mamba-cache-size 20 \
     --mem-fraction-static 0.65 \
-    --cuda-graph-bs 2 4 8 12 14 16 \
+    --cuda-graph-bs-decode 2 4 8 12 14 16 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -800,11 +800,11 @@ python3 -m sglang.launch_server \
     --max-total-tokens 470784 \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --max-running-requests 40 \
     --max-mamba-cache-size 200 \
     --mem-fraction-static 0.9 \
-    --cuda-graph-bs 2 8 16 24 32 36 40 \
+    --cuda-graph-bs-decode 2 8 16 24 32 36 40 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -906,7 +906,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 1 \
     --max-mamba-cache-size 6 \
     --mem-fraction-static 0.68 \
-    --cuda-graph-bs 1 \
+    --cuda-graph-bs-decode 1 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \

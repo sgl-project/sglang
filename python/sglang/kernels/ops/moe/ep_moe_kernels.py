@@ -1155,9 +1155,12 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
+    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]

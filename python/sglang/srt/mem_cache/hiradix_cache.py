@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -1488,15 +1489,17 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
             return 0
 
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1509,8 +1512,13 @@ class HiRadixCache(RadixCache):
         extra_kwargs = {}
         if prefetch_op_cls is HybridPrefetchOperation:
             extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
+        request = (
+            CacheRequestHandle("__storage_hit_query__", 0)
+            if prefetch_op_cls is HybridPrefetchOperation
+            else "__storage_hit_query__"
+        )
         operation = prefetch_op_cls(
-            "__storage_hit_query__",
+            request,
             prefetch_key,
             last_hash,
             prefix_keys,
@@ -1624,7 +1632,11 @@ class HiRadixCache(RadixCache):
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
         )
 
-    def check_prefetch_progress(self, req_id: str) -> bool:
+    def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
+        return handle.rid in self.ongoing_prefetch
+
+    def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
+        req_id = handle.rid
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
@@ -1718,15 +1730,15 @@ class HiRadixCache(RadixCache):
             usable_pages = min(usable_pages, *pool_hit_pages)
         return usable_pages * self.page_size
 
-    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+    def pop_prefetch_loaded_tokens(self, handle: CacheRequestHandle) -> int:
         """
         Pop and return the number of tokens loaded from storage for a request.
         Returns 0 if no prefetch was done or was revoked.
         This should be called after check_prefetch_progress() returns True.
         """
-        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+        return self.prefetch_loaded_tokens_by_reqid.pop(handle.rid, 0)
 
-    def pop_storage_prefetch_miss(self, req_id: str) -> bool:
+    def pop_storage_prefetch_miss(self, handle: CacheRequestHandle) -> bool:
         """Storage prefetch miss markers are not tracked on the dense path;
         the scheduler's paced availability-check retry is inert here."""
         return False
@@ -1766,23 +1778,22 @@ class HiRadixCache(RadixCache):
 
     def prefetch_from_storage(
         self,
-        req_id: str,
+        handle: CacheRequestHandle,
         last_host_node: TreeNode,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
-        # Cache mode write-through keeps the anchor on the request's own path,
-        # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
+        req_id = handle.rid
         prefetch_key = RadixKey(
             new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
+            extra_key=extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=last_host_node.key.cache_salt,
+            cache_salt=cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
@@ -1798,8 +1809,13 @@ class HiRadixCache(RadixCache):
         # NOTE: host_indices is no longer pre-allocated here. It is allocated
         # lazily in _drain_and_alloc_storage_hit() once the L3 storage hit count is known,
         # so we only reserve host memory for pages that actually hit.
+        request = (
+            handle
+            if isinstance(self.cache_controller, HybridCacheController)
+            else req_id
+        )
         operation = self.cache_controller.prefetch(
-            req_id,
+            request,
             prefetch_key,
             last_hash,
             prefix_keys,
@@ -1999,7 +2015,8 @@ class HiRadixCache(RadixCache):
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
 
-    def release_aborted_request(self, rid: str):
+    def release_aborted_request(self, handle: CacheRequestHandle):
+        rid = handle.rid
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 

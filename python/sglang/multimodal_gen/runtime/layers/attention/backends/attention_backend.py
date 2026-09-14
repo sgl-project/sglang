@@ -23,6 +23,20 @@ class AttentionRequirements:
     packed_varlen: bool = False
 
 
+def trailing_padding_used_len(
+    total_tokens: int,
+    max_seqlen: int,
+    bounds: tuple[int, ...],
+) -> int | None:
+    """Return the live prefix length for a packed, padded single sequence."""
+    if len(bounds) != 3:
+        return None
+    start, used, total = bounds
+    if start != 0 or used >= total or total != total_tokens or used != max_seqlen:
+        return None
+    return used
+
+
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
