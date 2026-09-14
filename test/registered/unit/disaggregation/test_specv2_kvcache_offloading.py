@@ -138,8 +138,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
         ]:
             with self.subTest(extra_key=extra_key, cache_salt=cache_salt):
                 namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
-                prefix = manager._compute_prefix_hash(tokens[:4], **namespace)
-                tail = manager._compute_prefix_hash(tokens[4:], prefix[-1], **namespace)
+                req = SimpleNamespace(**namespace)
+                prefix = manager._compute_prefix_hash(req, tokens[:4])
+                tail = manager._compute_prefix_hash(req, tokens[4:], prefix[-1])
                 self.assertEqual(
                     prefix + tail,
                     get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),
