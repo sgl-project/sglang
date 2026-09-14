@@ -237,7 +237,7 @@ pub async fn chat_completions(
     // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * `has_chat_formatter` → a chat request on this model yields
+    //   * `has_chat_formatter` -> a chat request on this model yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
@@ -778,7 +778,7 @@ pub async fn chat_completions(
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
     // engine-equivalent (chat-formatter path) AND the request contains nothing
-    // the router's formatter didn't replicate (see `input_ids_safe_to_forward`).
+    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
@@ -1298,45 +1298,50 @@ fn build_outgoing_body(
 /// SAME prompt the router tokenized. When `input_ids` is present the engine
 /// uses it verbatim and ignores everything that would otherwise steer its
 /// `messages`-side tokenization (only stop tokens / tool-call constraint are
-/// still taken from `messages`). So any request field that changes that
-/// tokenization but which the router's chat formatter does not replicate makes
-/// the forwarded ids wrong. This predicate is conservative by construction —
-/// any such signal returns `false` and the engine tokenizes from `messages`
-/// (always correct).
+/// still taken from `messages`). The router renders with Dynamo, which does
+/// not replicate the engine's request normalization, so any field that
+/// changes the engine's rendering and whose Dynamo rendering has not been
+/// verified identical makes the forwarded ids wrong. This predicate is
+/// conservative by construction: any such signal returns `false` and the
+/// engine tokenizes from `messages` (always correct).
 ///
-/// Replicated-and-safe: plain text `messages` with a string `content`.
-/// Not replicated → omit:
-///   * `tools` / `functions` — the formatter doesn't render tool schemas.
-///   * non-string or missing `content` (arrays, `null`): the engine normalizes
-///     these before rendering; the router's formatter renders them verbatim.
-///   * `chat_template` — an OpenAI-compatible per-request template override
+/// Verified-and-safe: plain text `messages` with a string `content`.
+/// Not verified -> omit:
+///   * historical `reasoning_content`: Dynamo may inject it into message content.
+///   * `tools` / `functions`: the engine serializes tool schemas through its
+///     own model dump; Dynamo renders the caller's JSON.
+///   * non-string or missing `content` (arrays, `null`):
+///     the engine flattens or blanks these before rendering; Dynamo does not.
+///   * `chat_template`: an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
 ///     custom one would diverge. (SGLang ignores it today, but block it so the
 ///     offload stays correct across engines / future versions.)
 ///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
-///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
-///     formatter renders in the engine's default mode only.
-///   * `continue_final_message: true`, or a trailing `assistant` message — the
-///     engine rewrites/strips the final assistant turn; the formatter renders it
+///     `reasoning` / `reasoning_effort`, `task`: thinking/mode toggles the
+///     engine normalizes differently from Dynamo.
+///   * `continue_final_message: true`, or a trailing `assistant` message: the
+///     engine rewrites/strips the final assistant turn; Dynamo renders it
 ///     verbatim.
 ///
-/// NOTE: the router's chat formatter renders in the engine's default
-/// (non-thinking) mode. Current sglang derives thinking from the request
-/// (`chat_template_kwargs`), which this guard already omits, so a plain request
-/// the router rendered matches the engine. The only way to diverge is an engine
-/// build that applies a non-default thinking mode the router can't observe from
-/// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on. The same assumption covers
+/// NOTE: the router renders in the engine's default (non-thinking) mode. The
+/// only way a plain request diverges is an engine build that applies a
+/// non-default mode the router can't observe from the request
+/// (`SGLANG_DEFAULT_THINKING`, `--chat-template`, default template kwargs):
+/// the same router/engine tokenization-parity assumption that cache-aware
+/// routing already depends on. The same assumption covers
 /// `add_special_tokens`: the router renders specials via the chat template, which
 /// matches the engine on tokenizers that auto-add them (the common case); a
 /// tokenizer that does not would diverge by a leading special, again undetectable
 /// from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_has_non_text_content(value) {
+    if request_has_tools(value)
+        || request_has_non_text_content(value)
+        || request_has_reasoning_content(value)
+    {
         return false;
     }
-    // Fields that steer the engine's template tokenization but which the
-    // router's formatter does not thread through.
+    // Fields that steer the engine's template tokenization and whose Dynamo
+    // rendering is not verified identical.
     for key in [
         "chat_template",
         "chat_template_kwargs",
@@ -1392,10 +1397,10 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Whether the request carries tool / function definitions. The router's chat
-/// formatter renders only `messages`, so its `input_ids` would omit the tool
-/// schemas the engine's template injects into the prompt — the caller must let
-/// the engine tokenize these itself.
+/// Whether the request carries tool / function definitions. Dynamo renders
+/// the caller's tool JSON while the engine renders its own model dump of it,
+/// so the router's `input_ids` would differ; the caller must let the engine
+/// tokenize these itself.
 fn request_has_tools(value: &serde_json::Value) -> bool {
     let nonempty = |key: &str| {
         value.get(key).is_some_and(|v| match v {
@@ -1407,8 +1412,22 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
+/// Dynamo may inject historical reasoning into content the engine leaves unchanged.
+fn request_has_reasoning_content(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null())
+            })
+        })
+}
+
 /// Detect non-string or missing content, which requires engine tokenization:
-/// the engine normalizes arrays and nulls differently from the router's formatter.
+/// the engine normalizes arrays and nulls differently from Dynamo.
 fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
@@ -1713,6 +1732,24 @@ mod tests {
         })));
     }
 
+    #[test]
+    fn reasoning_history_is_an_expected_forwarding_omission() {
+        let mut value = serde_json::json!({"messages": [
+            {"role":"user", "content":"hi"},
+            {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+            {"role":"user", "content":"next"}
+        ]});
+        assert!(!input_ids_safe_to_forward(&value));
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        value["messages"][1]["reasoning_content"] = serde_json::Value::Null;
+        assert!(input_ids_safe_to_forward(&value));
+        value["messages"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        assert!(input_ids_safe_to_forward(&value));
+    }
+
     /// Every field the engine honors on the `messages` path but which the
     /// router's formatter does not replicate must block forwarding — otherwise
     /// the engine uses the router's ids verbatim and silently runs a different
@@ -1820,7 +1857,7 @@ mod tests {
         ));
     }
 
-    /// Non-chat-formatter models never expected the offload → not a failure even
+    /// Non-chat-formatter models never expected the offload -> not a failure even
     /// with no tokens.
     #[test]
     fn offload_failed_false_without_chat_formatter() {
@@ -1828,7 +1865,7 @@ mod tests {
         assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
     }
 
-    /// A non-chat (no `messages`) request on a chat-formatter model — e.g.
+    /// A non-chat (no `messages`) request on a chat-formatter model, e.g.
     /// `/v1/completions` `prompt` — never expected the chat-encode offload, so
     /// the absence of engine-equivalent ids is not a failure.
     #[test]

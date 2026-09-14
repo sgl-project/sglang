@@ -51,14 +51,14 @@ pub fn request_tokens_for(
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_formatter(&model_id.0) {
-        if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
-                return Some(RequestTokens {
-                    ids,
-                    rendered_from_chat: true,
-                });
-            }
+    if tokenizers.has_chat_formatter(&model_id.0)
+        && value.get("messages").is_some_and(|m| m.is_array())
+    {
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                rendered_from_chat: true,
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;
