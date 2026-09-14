@@ -9,7 +9,7 @@ from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="jit-kernel-unit-test-amd")
 
 H_Q, H_KV, D = 16, 1, 128
 

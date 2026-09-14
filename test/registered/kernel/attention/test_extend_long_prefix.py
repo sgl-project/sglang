@@ -12,8 +12,8 @@ from sglang.kernels.ops.attention.extend_attention import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=40, suite="jit-kernel-unit-test-amd")
 
 # observed on gfx950: ~5e-4 (bf16 KV), ~7e-3 (fp8 KV, the P.V rounding both kernels share)
 ATOL = {torch.bfloat16: 1e-2, torch.float8_e4m3fn: 3e-2}
