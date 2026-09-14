@@ -1099,11 +1099,6 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, new_input_tokens, last_hash, prefix_keys
         )
-        # Create the opt-in hicache "Prefetch" root span (exported when tracing
-        # on + 'hicache' in --trace-modules; else TraceNullContext) and stash its
-        # trace_id/span_id on the op so the storage threads forward them to
-        # Mooncake (see plan.md §4/§6).
-        self._init_op_trace(operation, rid=request_id, role="Prefetch")
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1355,6 +1350,11 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # Create the opt-in hicache "Prefetch" root span here, off the
+                # scheduler hot path, so trace_id/span_id are ready before
+                # _storage_hit_query forwards them to Mooncake. The span start
+                # reflects dequeue, not enqueue (plan.md §4/§6).
+                self._init_op_trace(operation, rid=operation.request_id, role="Prefetch")
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
@@ -1393,9 +1393,6 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
-        # Create the opt-in hicache "Backup" root span (backup is per-node, so the
-        # rid is the operation id, not a request id -- see plan.md §6/§8.1).
-        self._init_op_trace(operation, rid=operation.id, role="Backup")
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1461,6 +1458,10 @@ class HiCacheController:
                 if operation is None:
                     continue
 
+                # Create the opt-in hicache "Backup" root span here, off the
+                # scheduler hot path, so trace_id/span_id are ready before
+                # _page_backup forwards them to Mooncake (plan.md §6/§8.1).
+                self._init_op_trace(operation, rid=operation.id, role="Backup")
                 if not self.backup_skip:
                     self._page_backup(operation)
                 # Retire the op's hicache root span once the backup op completes
