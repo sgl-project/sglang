@@ -153,20 +153,15 @@ def topk_transform_paged_v2(
     * Both outputs given -- ``out_page_indices`` receives the page-table
       transform and ``out_raw_indices`` receives the selected raw indices.
 
-    ``row_starts`` and ``row_to_batch`` are both ``(rows,)`` int32 and both
-    optional; omitting them gives the decode layout this kernel was written for
-    (row ``i`` selects over ``scores[i, :seq_lens[i]]`` and maps through
-    ``page_tables[i]``). Supplying them describes DSA extend's packed scores:
-    row ``i`` selects over ``scores[i, row_starts[i] : row_starts[i] +
-    seq_lens[i]]`` and maps through ``page_tables[row_to_batch[i]]``. Selected
-    indices stay row-local either way, so the output meaning is unchanged.
-    ``row_to_batch`` entries are not range-checked against ``page_tables``.
+    ``row_starts`` / ``row_to_batch`` (optional, ``(rows,)`` int32) describe DSA
+    extend's packed scores: row ``i`` selects over ``scores[i, row_starts[i] :
+    row_starts[i] + seq_lens[i]]`` and maps through ``page_tables[row_to_batch[i]]``;
+    omitting both gives the decode layout (column 0, one table row per score row).
+    Selected indices stay row-local either way. ``row_to_batch`` is not range-checked.
 
-    Passing ``row_starts`` makes this call MODIFY ``scores`` IN PLACE. The
-    kernel rounds each row's read window down to a 16-byte boundary and masks
-    the columns it pulls in that way (at most three, and always inside the same
-    row, before ``row_starts[i]``) to ``-inf``. Callers must therefore not reuse
-    ``scores`` afterwards, and must not pass a view whose rows overlap.
+    NOTE: ``row_starts`` makes this call MODIFY ``scores`` IN PLACE -- it masks the
+    at most three columns its 16-byte-aligned read base pulls in ahead of each
+    window. Do not reuse ``scores`` afterwards, or pass a view with overlapping rows.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -178,18 +173,14 @@ def topk_transform_paged_v2(
     the output is all -1.
     """
     if row_starts is not None or row_to_batch is not None:
-        # Packed rows are compiled into the paged kernel only under USE_ROCM
-        # (CUDA reaches the same shape through topk_transform_ragged_v2, XPU
-        # has no such op at all), and every caller of them is ROCm-gated, so
-        # this is an invariant rather than a fallback.
+        # Packed rows are compiled into the paged kernel under USE_ROCM only;
+        # every caller of them is ROCm-gated, so this is an invariant.
         assert is_hip(), (
             "topk_transform_paged_v2 packed rows (row_starts / row_to_batch) "
             "are only supported on ROCm"
         )
-        # The raw output is written straight from the kernel's index register,
-        # bypassing the residue correction the packed path carries in `bias`,
-        # so it would be short by up to 3. The C++ side rejects this too; it is
-        # repeated here to fail before the JIT module is built.
+        # The raw output bypasses the packed path's residue correction. Rejected
+        # in C++ too; repeated here to fail before the JIT module is built.
         assert out_raw_indices is None, (
             "topk_transform_paged_v2: row_starts is incompatible with out_raw_indices"
         )

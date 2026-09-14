@@ -151,25 +151,11 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (GLM DSA prefill: `dsa_prefill_backend` outside the
-        # flashmla_sparse family makes `get_topk_transform_method` return PAGED for
-        # EXTEND). It fails the decode test above on two counts -- rows carry a
-        # per-row score offset `ks`, and there are many rows per request rather
-        # than one -- but the v2 kernel absorbs both through row_starts /
-        # row_to_batch, so the only real requirement left is that the plan was
-        # built over exactly these rows. That excludes the chunked extend path,
-        # whose plan covers the whole forward while each call sees one chunk;
-        # those fall through to the legacy transform below.
-        #
-        # The score layout is checked here rather than left to the helper's
-        # assertions: decode scores come from a producer that guarantees the
-        # kernel's 16B-aligned row stride, but an extend row stride is the batch's
-        # total KV length, which is only a multiple of 4 by luck. A row stride
-        # that does not fit the vectorized load must fall back, not raise.
-        #
-        # ROCm-only: the packed-row addressing this relies on is compiled into
-        # the paged v2 kernel under USE_ROCM. CUDA gets the same fusion from the
-        # RAGGED branch above, so it keeps its existing route.
+        # Packed PAGED extend (GLM DSA prefill, ROCm-only -- CUDA gets the same
+        # fusion from the RAGGED branch above): row_starts / row_to_batch absorb the
+        # per-row score offset and the many-rows-per-request page-table mapping. The
+        # conditions fall back (not raise) on shapes the kernel cannot take, notably
+        # a chunked-extend plan or a row stride that is not 16B-aligned.
         if (
             _is_hip
             and self.should_use_topk_v2()
@@ -339,12 +325,10 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
-    ``row_starts`` / ``row_to_batch`` (both optional, both ``(num_rows,)`` int32)
-    serve DSA extend, whose scores are packed batch-global: row ``i`` owns the
-    window starting at ``row_starts[i]`` and maps through the page-table row of
-    its request, ``row_to_batch[i]``. Omitting both gives the decode layout
-    (column 0, one table row per score row). The kernel makes selected indices
-    row-local in both cases, so the return value means the same thing.
+    ``row_starts`` / ``row_to_batch`` (optional, ``(num_rows,)`` int32) serve DSA
+    extend's packed batch-global scores: row ``i`` owns the window at
+    ``row_starts[i]`` and maps through page-table row ``row_to_batch[i]``. Omitting
+    both gives the decode layout; indices stay row-local either way.
 
     This is a committed contract, not a best-effort path: ``topk_transform``
     routes here only for shapes it has already validated, and for the decode case

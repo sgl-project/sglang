@@ -21,9 +21,8 @@ the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
 (8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
 included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 
-The row layout is covered on top of that: rows normally start at column 0 and
-own one page-table row each, while DSA extend packs all requests into one score
-buffer and shares a table row per request (``test_topk_v2_packed_rows``).
+``test_topk_v2_packed_rows`` covers the DSA extend layout on top of that: all
+requests packed into one score buffer, sharing a table row per request.
 """
 
 from __future__ import annotations
@@ -435,22 +434,14 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
 def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
     """DSA extend layout: batch-global packed scores + shared page-table rows.
 
-    Every request's scores live side by side in one buffer, so a row's window
-    starts at ``row_starts[row]`` instead of column 0, and all rows of a request
-    map through that request's single page-table row (``row_to_batch``). Rows are
-    causal, so lengths grow by one within a request. This is the shape
-    ``dsa_topk_backend`` routes to v2 for PAGED extend; a distinct page-table
-    permutation per request catches any row/request index mix-up.
-
-    The ragged case below also leaves most window starts off the 16-byte load
-    boundary, which is the general case in production -- a window start is a
-    running KV length, aligned only by luck.
+    Rows are causal within a request; a distinct page-table permutation per request
+    catches row/request index mix-ups, and the ragged case leaves most window starts
+    off the 16-byte load boundary (the production case).
     """
     torch.manual_seed(4242 + k + len(extend_lens))
     device = "cuda"
 
-    # Keep every row longer than k so no row takes the trivial path, which would
-    # pass regardless of the offsets.
+    # Keep every row longer than k so no row takes the trivial path.
     prefix = k + 1024
     kv_lens = [prefix + e for e in extend_lens]
     k_offsets = [0]
@@ -479,8 +470,7 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
 
     out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
     metadata = plan_topk_v2(lengths_t)
-    # The kernel masks the <= 3 columns its aligned read base pulls in ahead of
-    # each window, so reference values have to be read before the call.
+    # The kernel masks in place, so reference values must be read before the call.
     scores_cpu = scores.cpu()
     topk_transform_paged_v2(
         scores,

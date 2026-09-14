@@ -194,11 +194,8 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
-  // Correction added to every selected position by `emit`. Ragged mode uses it
-  // for the row's offset into the flattened output; the ROCm packed-row path
-  // uses it to undo the 16-byte round-down of `in` (a negative shift). The two
-  // never coexist: paged callers have no output offset, and ragged never
-  // rounds down, so one field carries both.
+  // Added to every selected position by `emit`: the row's output offset in ragged
+  // mode, or the ROCm packed-row undo of the round-down of `in`. Never both.
   int32_t bias = 0;
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
