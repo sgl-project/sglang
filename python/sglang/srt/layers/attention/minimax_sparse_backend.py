@@ -1430,9 +1430,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and forward_batch.req_pool_indices is not None
         )
 
-    def _small_extend_row_meta_for(
-        self, forward_batch: ForwardBatch, disable_value: bool
-    ):
+    def _small_extend_row_meta_for(self, forward_batch: ForwardBatch):
         """Per-row metadata for a small extend, built once per forward batch."""
         cached = self._small_extend_row_meta
         if cached is not None and cached[0] == id(forward_batch):
@@ -1486,7 +1484,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             minimax_sparse_decode,
         )
 
-        row_meta = self._small_extend_row_meta_for(forward_batch, disable_value)
+        row_meta = self._small_extend_row_meta_for(forward_batch)
         rows = row_meta.rows
         reuse_topk = self.index_cache_enabled and disable_value
         topk_buf = None
