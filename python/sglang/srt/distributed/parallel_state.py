@@ -513,6 +513,23 @@ class GroupCoordinator:
                 device=self.device,
             )
 
+        # Two GPUs without peer access: large all-reduces (prefill) staged
+        # through pinned host memory with the copy engines instead of NCCL's
+        # SHM transport (1.9 GB/s here). See host_staged_allreduce.py.
+        self.host_staged_comm = None
+        if (
+            os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE") == "1"
+            and self.world_size == 2
+            and is_cuda_alike()
+        ):
+            from sglang.srt.distributed.device_communicators.host_staged_allreduce import (
+                HostStagedAllReduce,
+            )
+
+            self.host_staged_comm = HostStagedAllReduce(
+                self.cpu_group, self.rank_in_group, self.world_size, self.device
+            )
+
         # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -680,6 +697,9 @@ class GroupCoordinator:
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
+
+        if self.host_staged_comm is not None and self.host_staged_comm.should_use(input_):
+            return self.host_staged_comm.all_reduce(input_)
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
