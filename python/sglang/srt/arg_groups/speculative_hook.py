@@ -51,9 +51,27 @@ def _resolve_speculative_algorithm_alias(
     if speculative_draft_model_path:
         from sglang.srt.utils.hf_transformers_utils import get_config
 
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
-        )
+        try:
+            cfg = get_config(
+                speculative_draft_model_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+        except Exception as e:
+            # The generic AutoConfig path requires a ``model_type`` key, which
+            # speculators-style draft configs (e.g. DFLASH's
+            # ``DFlashSpeculatorConfig`` with no ``model_type``) do not carry.
+            # This call exists only to detect Gemma4 assistant drafts; such a
+            # draft is never Gemma4, so a parse failure simply means "not a
+            # Gemma4 draft" and resolution proceeds.
+            logger.info(
+                "Could not parse draft config at %s for Gemma4-draft detection "
+                "(expected for speculators-style drafts without model_type); "
+                "treating as non-Gemma4. Error: %s",
+                speculative_draft_model_path,
+                e,
+            )
+            cfg = None
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
             arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
