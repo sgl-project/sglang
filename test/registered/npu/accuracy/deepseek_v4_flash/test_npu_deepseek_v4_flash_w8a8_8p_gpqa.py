@@ -46,8 +46,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
@@ -71,23 +69,19 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.72,
+    0.68,
     "--prefill-max-requests",
-    32,
+    160,
     "--max-prefill-tokens",
-    131072,
+    80000,
     "--chunked-prefill-size",
     131072,
+    # 160 mirrors the validated stable config (local 16-rank run: 198/198 in
+    # ~30min, accept rate 0.40-0.54, score 0.8535 >= 0.8487 threshold).
+    # Values <= 96 trigger a DSPARK accept-rate collapse to ~0.01; reported
+    # to Ascend for investigation of the scheduler/DSPARK race.
     "--max-running-requests",
-    # Experiment B: 160 = 10 * dp_size(16), mirrors the local stable config
-    # exactly (160 cap + 120k tokens + same eval params) to isolate whether
-    # the mrr value itself or a CI-only environmental factor drives the
-    # DSPARK accept-rate collapse. Previous experiments: 96/80 both collapsed.
     160,
-    # Experiment A (superseded): MinFreeSlotsDelayer burst admission was NOT
-    # the root cause -- collapse still occurred with the delayer disabled.
-    "--min-free-slots-delay",
-    1,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -117,8 +111,8 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     1,
     2,
     4,
-    5,
-    6,
+    8,
+    10,
 ]
 
 
