@@ -55,5 +55,23 @@ def test_hc_combine_strided_pre():
     assert (got.float() - ref.float()).abs().max() / scale < 5e-2
 
 
+@pytest.mark.parametrize("m", [8, 9, 48, 49, 96])
+@pytest.mark.parametrize("scale", [0.0, 0.001, 1000.0])
+def test_hc_combine_norm_wide(m: int, scale: float):
+    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+    from sglang.srt.layers.layernorm import rmsnorm
+
+    torch.manual_seed(730)
+    # Cover row strides and each partition boundary against the unfused kernels.
+    x = (torch.randn(m, 20496, device="cuda", dtype=torch.bfloat16) * scale)[:, :20480]
+    pre = torch.rand(m, 24, device="cuda")[:, :4]
+    weight = (1 + 0.1 * torch.randn(5120, device="cuda")).bfloat16()
+    expected = rmsnorm(hc_combine(x, pre, 4, torch.bfloat16), weight, 1e-6)
+    actual = hc_combine_norm(x, pre, weight, 1e-6)
+    assert torch.isfinite(actual).all()
+    ulp = (actual.view(torch.int16).int() - expected.view(torch.int16).int()).abs()
+    assert ulp.max().item() <= 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
