@@ -2,9 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     kpool_assemble_softmax_rotate_write_cache,
@@ -207,6 +209,90 @@ class TestDsaKpoolMultiPool(CustomTestCase):
 
     def test_effective_n_only_compresses_accepted_pools(self):
         self._run_compress_case(effective_n=2, expected_closed_pools=1)
+
+    def _run_padded_indexer_write(self, plan_rows):
+        # Target verify plans four complete groups after padding; draft extend
+        # plans three real groups before padding. Both must match the same
+        # unpadded write, including the compressed cache and untouched dummy tail.
+        torch.manual_seed(42)
+        width = self.NUM_DRAFT_TOKENS
+        logical, physical = 3 * width, 4 * width
+        pool = self._pool()
+        key = torch.randn(physical, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        score = torch.randn_like(key)
+        ape = torch.randn(self.POOL_SIZE, INDEX_HEAD_DIM, device="cuda")
+        initial_k = torch.randn(
+            4,
+            self.POOL_SIZE + width,
+            INDEX_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        initial_score = torch.randn_like(initial_k)
+        expected_k, expected_score = initial_k.clone(), initial_score.clone()
+        actual_k, actual_score = initial_k.clone(), initial_score.clone()
+        expected_cache, actual_cache = self._empty_cache(), self._empty_cache()
+        out_cache_loc = torch.arange(1, physical + 1, device="cuda")
+        out_cache_loc[logical:] = 0
+        plan = SimpleNamespace(
+            num_draft_tokens=width,
+            req=torch.arange(plan_rows, device="cuda"),
+            write_start=torch.full((plan_rows,), 3, dtype=torch.int32, device="cuda"),
+            tail_logical_start=torch.zeros(plan_rows, dtype=torch.int32, device="cuda"),
+            write_loc=torch.arange(plan_rows * 2, device="cuda").view(plan_rows, 2),
+            effective_n_per_batch=None,
+        )
+        kpool_write_tail_and_maybe_compress(
+            pool=pool,
+            buf=expected_cache,
+            key=key[:logical],
+            score=score[:logical],
+            tail_k=expected_k,
+            tail_score=expected_score,
+            ape=ape,
+            req_pool_indices=plan.req[:3],
+            write_start=plan.write_start[:3],
+            tail_logical_start=plan.tail_logical_start[:3],
+            write_loc=plan.write_loc[:3],
+            out_cache_loc=out_cache_loc[:logical],
+            num_draft_tokens=width,
+            round_scale=False,
+        )
+        pool.get_compress_tail_buffers = lambda layer_id: (actual_k, actual_score)
+        pool.get_index_k_with_scale_buffer = lambda layer_id: actual_cache
+        indexer = object.__new__(dsa_indexer_kpool.IndexerKPool)
+        indexer.index_kpool_compress_ape = ape
+        indexer.scale_fmt = None
+        indexer._get_q_k_bf16 = lambda *args, **kwargs: (None, key, score)
+        indexer._compute_gate_score_if_missing = lambda *args: score
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=logical,
+            out_cache_loc=out_cache_loc,
+        )
+        metadata = SimpleNamespace(attn_metadata=SimpleNamespace(kpool_write_plan=plan))
+        with patch.object(dsa_indexer_kpool, "get_token_to_kv_pool", return_value=pool):
+            indexer._forward_cuda_target_verify(
+                x=key,
+                q_lora=key,
+                positions=torch.arange(physical, device="cuda"),
+                forward_batch=batch,
+                layer_id=0,
+                act_quant=None,
+                metadata=metadata,
+                enable_dual_stream=False,
+                return_indices=False,
+            )
+        torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+        torch.testing.assert_close(actual_score, expected_score, atol=0, rtol=0)
+        torch.testing.assert_close(actual_cache, expected_cache, atol=0, rtol=0)
+        torch.testing.assert_close(actual_k[3], initial_k[3], atol=0, rtol=0)
+        torch.testing.assert_close(actual_score[3], initial_score[3], atol=0, rtol=0)
+
+    def test_target_verify_complete_groups_preserve_dummy_state(self):
+        self._run_padded_indexer_write(plan_rows=4)
+
+    def test_draft_extend_pre_padding_plan_matches_unpadded_write(self):
+        self._run_padded_indexer_write(plan_rows=3)
 
 
 if __name__ == "__main__":
