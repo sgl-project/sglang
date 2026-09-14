@@ -1097,6 +1097,78 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestDcpAttentionCompatibility(CustomTestCase):
+    """Reject unsupported DCP layouts before KV-cache writes fail."""
+
+    @override_platform(is_cuda=True, is_hip=False, is_sm90=True, is_sm100=False)
+    def _resolve(
+        self, model_arch="Qwen3_5ForConditionalGeneration", mla=False, **fields
+    ):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        args = ServerArgs(model_path="dummy", tp_size=2, **fields)
+        args._model_config = MagicMock()
+        args._model_config.hf_config.architectures = [model_arch]
+        args._model_config.hf_config.dual_chunk_attention_config = None
+        args._model_config.attention_arch = (
+            AttentionArch.MLA if mla else AttentionArch.MHA
+        )
+        handle_attention_backend_compatibility(args)
+
+    def test_qwen3_rejects_dcp_with_fa3_or_triton(self):
+        for backend in ("fa3", "triton"):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "Qwen3ForCausalLM.*K/V projections"),
+            ):
+                self._resolve(
+                    model_arch="Qwen3ForCausalLM", dcp_size=2, attention_backend=backend
+                )
+
+    def test_non_mla_rejects_fa3_in_either_phase(self):
+        for fields in (
+            {"attention_backend": "fa3"},
+            {"attention_backend": "triton", "prefill_attention_backend": "fa3"},
+            {"attention_backend": "triton", "decode_attention_backend": "fa3"},
+        ):
+            with (
+                self.subTest(**fields),
+                self.assertRaisesRegex(ValueError, "fa3.*non-MLA"),
+            ):
+                self._resolve(dcp_size=2, **fields)
+
+    def test_dcp_disabled_allows_qwen3_fa3(self):
+        self._resolve(
+            model_arch="Qwen3ForCausalLM", dcp_size=1, attention_backend="fa3"
+        )
+
+    @patch(
+        "sglang.srt.arg_groups.overrides.get_default_attn_backend", return_value="fa3"
+    )
+    def test_non_mla_rejects_default_fa3(self, _mock_default):
+        with self.assertRaisesRegex(ValueError, "fa3.*non-MLA"):
+            self._resolve(dcp_size=2)
+
+    def test_qwen3_5_triton_dcp_is_unchanged(self):
+        self._resolve(dcp_size=2, attention_backend="triton")
+        self._resolve(
+            dcp_size=2,
+            attention_backend="fa3",
+            prefill_attention_backend="triton",
+            decode_attention_backend="triton",
+        )
+
+    def test_mla_split_backend_is_unchanged(self):
+        self._resolve(
+            model_arch="DeepseekV3ForCausalLM",
+            mla=True,
+            dcp_size=2,
+            attention_backend="flashinfer",
+            prefill_attention_backend="fa3",
+            decode_attention_backend="flashinfer",
+        )
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()

@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
+    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -207,6 +208,22 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
+
+    if cfg.dcp_size > 1:
+        # Qwen3's TP-only K/V projections do not match the DCP cache layout.
+        if "Qwen3ForCausalLM" in (model_config.hf_config.architectures or []):
+            raise ValueError(
+                "--dcp-size > 1 is not supported for Qwen3ForCausalLM: "
+                "its K/V projections do not replicate across DCP ranks. "
+                "Use --dcp-size 1."
+            )
+        backends = attention_backends_of(resolved_view(server_args))
+        # MLA handles DCP in its model attention path, including FA3 prefill.
+        if "fa3" in backends and not use_mla_backend(server_args):
+            raise ValueError(
+                "--dcp-size > 1 is not supported with the fa3 attention "
+                "backend for non-MLA models. Use --dcp-size 1."
+            )
 
 
 def handle_linear_attn_backend(server_args: Any):
