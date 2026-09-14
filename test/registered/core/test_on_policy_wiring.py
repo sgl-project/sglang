@@ -3,6 +3,7 @@ import os
 import subprocess
 import textwrap
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from sglang.srt.true_on_policy import (
     is_true_on_policy_enabled,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
+    should_disable_fused_qk_norm_mrope,
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
     should_use_deterministic_moe_combine,
@@ -651,6 +653,173 @@ class TestOnPolicyHelpers(unittest.TestCase):
         attn_tree_reduce.assert_called_once()
         torch.testing.assert_close(output, hidden_states + 10.0 + residual)
         torch.testing.assert_close(output_residual, residual)
+
+    def test_dp_attention_gather_uses_post_norm_dtype(self):
+        from sglang.srt.layers.communicator import (
+            CommunicateWithAllReduceAndLayerNormFn,
+        )
+
+        hidden_states = torch.ones(2, 4, dtype=torch.bfloat16)
+        residual = torch.full((2, 4), 3.0, dtype=torch.bfloat16)
+        captured_dtype = None
+
+        class FakeNorm:
+            def __call__(self, x, residual):
+                x = x.float() + residual.float()
+                return x, x
+
+        def fake_global_dp_buffer(group=None, dtype=None):
+            nonlocal captured_dtype
+            captured_dtype = dtype
+            return torch.empty(8, 4, dtype=dtype or torch.bfloat16)
+
+        def fake_dp_gather_partial(global_tokens, local_tokens, forward_batch):
+            self.assertEqual(global_tokens.dtype, local_tokens.dtype)
+            global_tokens[: local_tokens.shape[0]].copy_(local_tokens)
+
+        with (
+            patch(
+                "sglang.srt.layers.communicator.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.use_symmetric_memory",
+                side_effect=lambda *args, **kwargs: nullcontext(),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.get_tp_group",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.is_allocation_symmetric",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.get_global_dp_buffer",
+                side_effect=fake_global_dp_buffer,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.dp_gather_partial",
+                side_effect=fake_dp_gather_partial,
+            ),
+        ):
+            output, output_residual = (
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                    hidden_states,
+                    residual,
+                    forward_batch=None,
+                    layernorm=FakeNorm(),
+                    context=SimpleNamespace(
+                        attn_dp_size=4,
+                        attn_tp_size=1,
+                        attn_tp_rank=0,
+                        cache=None,
+                    ),
+                    residual_input_mode=None,
+                )
+            )
+
+        self.assertEqual(captured_dtype, torch.float32)
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertEqual(output_residual.dtype, torch.float32)
+
+    def test_row_linear_k_alignment_edge_cases(self):
+        server_args = self._contract_args(tp_size=2)
+
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                64,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(
+                128,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                300,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(
+                3584,
+                server_args=server_args,
+                row_linear_enable_inv=True,
+            ),
+        )
+
+    def test_row_linear_explicit_override_can_disable(self):
+        server_args = self._contract_args(tp_size=2)
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=server_args,
+                row_linear_enable_inv=False,
+            )
+        )
+
+    def test_flashinfer_allreduce_fusion_helpers(self):
+        self.assertTrue(
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=2))
+        )
+        self.assertFalse(
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=1))
+        )
+        self.assertFalse(
+            should_disable_flashinfer_allreduce_fusion(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
+
+    def test_fused_qk_norm_mrope_helper_follows_true_on_policy_contract(self):
+        self.assertTrue(
+            should_disable_fused_qk_norm_mrope(self._contract_args(tp_size=1))
+        )
+        self.assertFalse(
+            should_disable_fused_qk_norm_mrope(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
+
+    def test_is_true_on_policy_enabled_for_both_targets(self):
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=1)))
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=2)))
+        self.assertFalse(
+            is_true_on_policy_enabled(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
+
+    def test_is_tp_invariant_target_only_fsdp_tp(self):
+        self.assertTrue(is_tp_invariant_target(self._contract_args(tp_size=2)))
+        self.assertFalse(is_tp_invariant_target(self._contract_args(tp_size=1)))
+        self.assertFalse(
+            is_tp_invariant_target(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
+
+    def test_tp_invariant_ops_import_is_available(self):
+        import sglang.srt.tp_invariant_ops as tp_invariant_ops
+
+        self.assertTrue(hasattr(tp_invariant_ops, "matmul_tp_inv"))
+
+    def test_legacy_on_policy_utils_import_matches_true_on_policy_namespace(self):
+        from sglang.srt import true_on_policy
+        from sglang.srt.layers import on_policy_utils as legacy
+
+        self.assertIs(
+            legacy.should_use_tp_invariant_row_linear,
+            true_on_policy.should_use_tp_invariant_row_linear,
+        )
+        self.assertTrue(hasattr(torch.ops, "tp_inv_ops"))
 
 
 if __name__ == "__main__":
