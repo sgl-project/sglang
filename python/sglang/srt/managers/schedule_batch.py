@@ -2111,17 +2111,21 @@ def mamba_lazy_spec_in_window(
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
 
-def set_mamba_track_indices_from_reqs(
-    batch, track_positions: Optional[List[int]] = None
-):
-    """Build mamba_track_indices from req objects (authoritative source).
+def mamba_track_indices_from_reqs(
+    *,
+    req_to_token_pool: HybridReqToTokenPool,
+    req_pool_indices: torch.Tensor,
+    reqs: List[Req],
+    track_positions: Optional[List[int]] = None,
+) -> Tuple[List[int], torch.Tensor]:
+    """Per-req ping-pong slot ids for this forward, from the req objects
+    (authoritative source): ``(track_positions, mamba_track_indices)``.
 
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare).
     """
-    req_to_token_pool = batch.req_to_token_pool
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
+        req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
@@ -2133,20 +2137,32 @@ def set_mamba_track_indices_from_reqs(
                 if req.kv.mamba_next_track_idx is not None
                 else 0
             )
-            for req in batch.reqs
+            for req in reqs
         ]
-    batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
             track_positions,
             dtype=torch.int64,
-            pin_memory=True,
+            pin_memory=is_pin_memory_available(all_buffers.device),
         )
         .unsqueeze(1)
         .to(device=all_buffers.device, non_blocking=True)
     )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    track_indices = torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    return list(track_positions), track_indices
+
+
+def set_mamba_track_indices_from_reqs(
+    batch, track_positions: Optional[List[int]] = None
+):
+    """Build mamba_track_indices from req objects (authoritative source)."""
+    batch.mamba_track_buffer_indices, batch.mamba_track_indices = (
+        mamba_track_indices_from_reqs(
+            req_to_token_pool=batch.req_to_token_pool,
+            req_pool_indices=batch.req_pool_indices,
+            reqs=batch.reqs,
+            track_positions=track_positions,
+        )
     )
 
 
@@ -3054,9 +3070,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             running_out_cache_loc = running_batch.out_cache_loc
             merged_seq_lens_cpu = None
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
+        mamba_track = self._mamba_track_for_mixed(running_batch)
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if mamba_track is not None:
+            (
+                self.mamba_track_indices,
+                self.mamba_track_mask,
+                self.mamba_track_seqlens,
+            ) = mamba_track
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
@@ -3075,6 +3098,42 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+
+    def _mamba_track_for_mixed(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if self.mamba_track_mask is None:
+            return None
+        running_bs = running_batch.batch_size()
+        device = self.mamba_track_mask.device
+        running_track_indices = running_batch.mamba_track_indices
+        if running_track_indices is None:
+            # Spec decode prepares its track indices inside the forward.
+            _, running_track_indices = mamba_track_indices_from_reqs(
+                req_to_token_pool=self.req_to_token_pool,
+                req_pool_indices=running_batch.req_pool_indices,
+                reqs=running_batch.reqs,
+            )
+        # prepare_for_extend already claimed the tracked extend rows' slots and
+        # stamped their donate depth, so this forward must still write them.
+        # The decode tails take no checkpoint here: masked off with the -1
+        # seqlen of an untracked extend row, but with a real slot id because
+        # index translation and the graph track buffers read every row.
+        return (
+            torch.cat([self.mamba_track_indices, running_track_indices]),
+            torch.cat(
+                [
+                    self.mamba_track_mask,
+                    torch.zeros(running_bs, dtype=torch.bool, device=device),
+                ]
+            ),
+            torch.cat(
+                [
+                    self.mamba_track_seqlens,
+                    torch.full((running_bs,), -1, dtype=torch.int64, device=device),
+                ]
+            ),
+        )
 
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
