@@ -25,7 +25,6 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -35,7 +34,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
@@ -654,7 +653,7 @@ def bench_lock_unlock(
         lr = env.tree.inc_lock_ref(node)
         env.tree.dec_lock_ref(
             node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
+            lr.to_dec_params(),
         )
 
     warmup = min(20, num_pairs // 10)
@@ -699,9 +698,7 @@ def bench_cache_finished(
             if v is None:
                 env.tree.dec_lock_ref(
                     node,
-                    DecLockRefParams(
-                        swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)
-                    ),
+                    lr.to_dec_params(),
                 )
                 continue
             kv_indices = torch.cat([mr.device_indices, v])
@@ -718,8 +715,8 @@ def bench_cache_finished(
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
-        if hasattr(lr, "swa_uuid_for_lock"):
-            req.swa_uuid_for_lock = lr.swa_uuid_for_lock
+        if hasattr(lr, "to_dec_params"):
+            req.lock_receipt = lr.to_dec_params()
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
