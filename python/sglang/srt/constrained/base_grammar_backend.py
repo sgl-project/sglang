@@ -145,6 +145,26 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
+class PlaceholderGrammarObject(BaseGrammarObject):
+    """Grammar placeholder carried by non-entry TP ranks.
+
+    With TP > 1 (and no speculative decoding), only the entry rank of the
+    DP/TP group compiles grammars and applies the vocab mask; the sampled
+    token ids are broadcast in the sampler. The other ranks carry this
+    placeholder so per-batch checks such as ``any(req.grammar)`` stay
+    identical across ranks, while grammar state tracking stays on the entry
+    rank. Requests finish via token-based checks (grammar backends force EOS
+    at termination), so the always-False ``is_terminated`` is consistent with
+    the entry rank's grammar-driven finish.
+    """
+
+    def accept_token(self, token: int) -> None:
+        pass
+
+    def rollback(self, k: int) -> None:
+        pass
+
+
 class GrammarMask(NamedTuple):
     """A filled vocab_mask plus the backend that applies it.
 

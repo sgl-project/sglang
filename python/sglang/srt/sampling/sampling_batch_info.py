@@ -11,6 +11,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
     GrammarRow,
+    PlaceholderGrammarObject,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
@@ -258,8 +259,19 @@ class SamplingBatchInfo:
             self.grammar_mask = None
             return
 
-        # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
+        # Find a grammar from the list. With entry-only grammar compilation,
+        # non-entry TP ranks only carry PlaceholderGrammarObject entries.
+        first_grammar = next(
+            (
+                grammar
+                for grammar in self.grammars
+                if grammar and not isinstance(grammar, PlaceholderGrammarObject)
+            ),
+            None,
+        )
+        if first_grammar is None:
+            self.grammar_mask = None
+            return
 
         vocab_mask = first_grammar.allocate_vocab_mask(
             vocab_size=self.vocab_size,
@@ -272,7 +284,10 @@ class SamplingBatchInfo:
         entries = [
             GrammarRow(row=row, grammar=grammar)
             for row, grammar in enumerate(self.grammars)
-            if grammar and not grammar.finished and not grammar.is_terminated()
+            if grammar
+            and not isinstance(grammar, PlaceholderGrammarObject)
+            and not grammar.finished
+            and not grammar.is_terminated()
         ]
         first_grammar.fill_vocab_mask_batched(entries, vocab_mask)
 

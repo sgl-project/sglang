@@ -1876,7 +1876,17 @@ class ModelRunner:
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
+        if (
+            sampling_info.grammars
+            and self.sampler.tp_grammar_entry_only
+            and not self.sampler.is_tp_grammar_entry
+        ):
+            # With entry-only grammar compilation, non-entry TP ranks skip the
+            # vocab mask entirely; the entry rank's sampled token ids are
+            # broadcast in the sampler.
+            sampling_info.grammar_mask = None
+        else:
+            sampling_info.update_regex_vocab_mask()
         observer_state = None
         if observer is not None:
             observer_state = sampling_info.apply_logits_bias_with_observer(
