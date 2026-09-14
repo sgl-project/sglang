@@ -907,7 +907,7 @@ class HiCacheController:
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and self.mem_pool_host.can_use_write_back_jit
         ):
             return op.host_indices, op.device_indices, op.pool_transfers
         return self._move_op_indices(op)

@@ -653,7 +653,7 @@ class UMBPStore(HiCacheStorage):
                 if (
                     not self.is_mla_backend
                     and storage_config is not None
-                    and getattr(storage_config, "should_split_heads", False)
+                    and storage_config.should_split_heads
                 ):
                     split_factor = storage_config.tp_lcm_size // storage_config.tp_size
                 page_byte_size = mem_pool_host.get_page_buffer_element_size(
@@ -681,7 +681,7 @@ class UMBPStore(HiCacheStorage):
                         if (
                             mem_pool_host is not None
                             and storage_config is not None
-                            and getattr(storage_config, "should_split_heads", False)
+                            and storage_config.should_split_heads
                         )
                         else ""
                     ),

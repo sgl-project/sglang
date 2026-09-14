@@ -509,8 +509,8 @@ class HybridCacheController(BaseHiCacheController):
         host_group = self.mem_pool_host
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
-        if not getattr(host_group, "supports_per_pool_backup_indices", False):
-            if not getattr(host_group, "can_use_write_back_jit", False):
+        if not host_group.supports_per_pool_backup_indices:
+            if not host_group.can_use_write_back_jit:
                 return self.move_hybrid_indices(op)
             return op.host_indices, op.device_indices, op.pool_transfers
 
@@ -741,7 +741,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
-        if write_back_jit and getattr(host_pool, "can_use_write_back_jit", False):
+        if write_back_jit and host_pool.can_use_write_back_jit:
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
             return host_indices, device_indices
