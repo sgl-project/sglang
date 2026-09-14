@@ -2985,8 +2985,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
-        # FlashInfer TRTLLM FP4 path
-        if moe_runner_backend.is_flashinfer_trtllm() and hasattr(layer, "g1_scale_c"):
+        # FlashInfer TRTLLM FP4 path (routed shares the weight prep and the runner)
+        if (
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
