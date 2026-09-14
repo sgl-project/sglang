@@ -168,6 +168,8 @@ test = [
   "diff-cover",
   "expecttest",
   "granian>=2.6.0",
+  # Keep dynamically generated test stubs compatible with Protobuf 6.
+  "grpcio-tools>=1.78.0,<1.82",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
