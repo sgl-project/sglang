@@ -79,6 +79,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1876,11 +1877,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
-
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        # Same admission path as the colocated scheduler: on hybrid SSM pools
+        # this evicts cached mamba checkpoints before taking a fresh slot. The
+        # pool stamps req.kv.req_pool_idx; the call raises if it cannot.
+        alloc_req_slots(self.req_to_token_pool, [req], self.tree_cache)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
