@@ -383,7 +383,7 @@ def select_target_predict(
     sampling_info: SamplingBatchInfo,
     draft_token_num: int,
 ) -> torch.Tensor:
-    if not _SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY or sampling_info.is_all_greedy:
+    if not _SPEC_TEMPERATURE_SAMPLING_TARGET_VERIFY:
         return torch.argmax(next_token_logits, dim=-1)
 
     if sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling:
@@ -807,10 +807,14 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_xpu:
+        target_predict = torch.argmax(next_token_logits, dim=-1)
+    elif _is_hip:
         target_predict = select_target_predict(
             next_token_logits, sampling_info, verify_input.draft_token_num
         )
+
+    if target_predict is not None:
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
