@@ -29,7 +29,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
@@ -95,16 +95,19 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             is_extend_in_batch=False,
             local_can_run_tbo=True,
             local_forward_mode=ForwardMode.DECODE.value,
+            prefill_cuda_graph_max_prefix_len=128,
         )
 
         local = sync_info._get_local_tensor(device="cpu")
         fallback = sync_info._get_fallback_tensor(device="cpu")
 
         self.assertEqual(local[2].item(), 1)
-        self.assertEqual(local[7].item(), 0)
+        self.assertEqual(local[7].item(), 128)
+        self.assertEqual(local[8].item(), 0)
         # Idle/inactive ranks stay permissive; an active incompatible rank wins
         # through the all-gathered min reduction.
-        self.assertEqual(fallback[7].item(), 1)
+        self.assertEqual(fallback[7].item(), 0)
+        self.assertEqual(fallback[8].item(), 1)
 
     def test_draft_only_gate_does_not_disable_draft_extend_graph(self):
         draft_runner = object.__new__(EAGLEDraftCudaGraphRunner)

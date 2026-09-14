@@ -228,7 +228,7 @@ impl PdPoolResolver {
 ///
 /// The current `Policy` trait carries `(workers, ctx)`; adding an
 /// `affinity_hint` argument would touch every policy implementation
-/// (`round_robin`, `random`, `power_of_two`, `cache_aware_zmq`).
+/// (`round_robin`, `random`, `power_of_two`, `cache_aware`).
 /// Affinity is a PD-routing concern — orthogonal to the in-pool
 /// scoring the trait abstracts — so keeping it as a sibling helper
 /// keeps the trait's responsibility narrow.

@@ -73,11 +73,17 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    swa_branching_seqlen: Optional[int] = None
 
     # General
     chunked: bool = False
     priority: int = 0
     track_adopted_ranges: bool = False
+
+    # Logical-page KV sharding: rotation base of the chain the inserted
+    # values belong to (stamped onto new tree nodes; None when sharding is
+    # off). See UnifiedTreeNode.rotation_base.
+    rotation_base: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -88,6 +94,14 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+    swa_branch_inserted: bool = False
+
+    # Logical-page KV sharding: the un-matched tail was NOT inserted because
+    # its rotation base disagrees with the matched chain's (a cross-chain
+    # graft would break the cyclic-owner gather contract). The tail's pages
+    # stay owned by the inserting request; callers must not dedup/rebind
+    # past prefix_len.
+    rotation_tail_declined: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
@@ -129,39 +143,44 @@ class EvictResult:
 
 @dataclasses.dataclass
 class IncLockRefResult:
-    """Result of an inc_lock_ref operation."""
+    """Receipt returned by ``inc_lock_ref``.
+
+    ``node_id`` is the anchor the lock was taken on; a release replays the
+    receipt on that node only. The SWA UUID marks the segment boundary;
+    ``None`` means root. ``skipped_lock_components`` records the components
+    the acquire left untaken, so the release leaves them untouched.
+    """
 
     delta: Optional[int] = None
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    # Component nodes that were tombstones at acquire time. Replaying this set
-    # at release prevents a short-lived lock from consuming a later load-back or
-    # request lock after that tombstone becomes a valid device value.
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
+            node_id=self.node_id,
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
-            skip_lock_node_ids={
-                component_type: set(node_ids)
-                for component_type, node_ids in self.skip_lock_node_ids.items()
-            },
+            skipped_lock_components=tuple(self.skipped_lock_components),
         )
 
 
 @dataclasses.dataclass
 class DecLockRefParams:
-    """Parameters for dec_lock_ref operation."""
+    """Receipt required by unified-tree ``dec_lock_ref``.
 
+    Fields default to nothing-acquired, so a lost receipt under-releases (a
+    leak the sanity checks report) instead of releasing another holder's
+    lock. ``node_id`` is ``None`` only for receipts that never came from a
+    unified-tree acquire (legacy caches, session sentinels).
+    """
+
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
 
 @dataclasses.dataclass
@@ -201,6 +220,9 @@ class MatchResult(NamedTuple):
                             loaded back to device. Pure-KV cache semantics;
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
+        swa_branching_seqlen: The SWA radix cache branching point, which is the longest
+                              page-aligned position that could've been cache hit if there
+                              exists an SWA window.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -216,6 +238,7 @@ class MatchResult(NamedTuple):
     best_match_node: Any
     host_hit_length: int = 0
     swa_host_hit_length: int = 0
+    swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
@@ -240,6 +263,7 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
     )
@@ -259,25 +283,32 @@ def _dfs_weight_order(
         node: len(indices) for node, indices in last_node_to_indices.items()
     }
 
-    def calc_weight(node: Any) -> None:
-        for child in node.children.values():
-            calc_weight(child)
-            node_to_weight[node] = node_to_weight.get(node, 0) + node_to_weight.get(
-                child, 0
-            )
-
-    calc_weight(root_node)
+    stack: list[tuple[Any, bool]] = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            weight = node_to_weight.get(node, 0)
+            for child in node.children.values():
+                weight += node_to_weight.get(child, 0)
+            node_to_weight[node] = weight
+            continue
+        stack.append((node, True))
+        for child in reversed(list(node.children.values())):
+            stack.append((child, False))
 
     order: list[int] = []
 
-    def append_dfs(node: Any) -> None:
+    stack = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            order.extend(last_node_to_indices.get(node, ()))
+            continue
         children = list(node.children.values())
         children.sort(key=lambda child: -node_to_weight.get(child, 0))
-        for child in children:
-            append_dfs(child)
-        order.extend(last_node_to_indices.get(node, ()))
-
-    append_dfs(root_node)
+        stack.append((node, True))
+        for child in reversed(children):
+            stack.append((child, False))
     return order
 
 
@@ -360,6 +391,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def get_prefix_hash_values(self, node: Any) -> list[str]:
         """The hash chain of the node's ancestors, in root-to-parent order."""
         return node.get_prefix_hash_values(node.parent)
+
+    def rotation_base_of(self, node: Any) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base stamped on ``node``.
+
+        ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
+        for the unified tree, None for caches without tree nodes). None means
+        "no base available here", which sends the alloc path to the base the
+        request recorded at its previous alloc. Tree caches that keep the
+        per-chain base override this. See UnifiedTreeNode.rotation_base.
+        """
+        return None
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):

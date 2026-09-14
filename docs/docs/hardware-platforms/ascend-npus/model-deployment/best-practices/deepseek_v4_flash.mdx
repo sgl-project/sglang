@@ -185,7 +185,7 @@ do
         --quantization modelslim \
         --enable-dp-lm-head \
         --kv-cache-dtype bfloat16 \
-        --cuda-graph-bs 1 2 4 8 16 24 36 40 48 56 \
+        --cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56 \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 2 \
         --speculative-eagle-topk 1 \
@@ -329,7 +329,7 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --kv-cache-dtype auto \
     --skip-server-warmup \
-    --cuda-graph-bs 1 2 4 8 \
+    --cuda-graph-bs-decode 1 2 4 8 \
     --speculative-algorithm EAGLE \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \
@@ -455,7 +455,7 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --kv-cache-dtype auto \
     --skip-server-warmup \
-    --cuda-graph-bs 1 2 4 8 10 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
     --speculative-algorithm EAGLE \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \

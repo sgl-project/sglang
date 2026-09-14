@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.http_request_decompression import (
     RequestDecompressionMiddleware,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 
@@ -47,7 +48,7 @@ def _drive(scope, body_chunks):
     return (seen or None), sent
 
 
-class TestRequestDecompressionMiddleware(unittest.TestCase):
+class TestRequestDecompressionMiddleware(CustomTestCase):
     def test_passthrough_when_header_absent(self):
         scope = {"type": "http", "headers": [(b"content-length", b"4")]}
         seen, sent = _drive(scope, [(b"abcd", False)])

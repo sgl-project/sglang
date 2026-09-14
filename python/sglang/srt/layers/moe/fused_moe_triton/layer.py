@@ -83,7 +83,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
-    print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -165,11 +164,14 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
         # StandardDispatcher is created but never invoked.
+        # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
+        # dispatcher stays a pure noop passthrough.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -474,7 +476,7 @@ class FusedMoE(torch.nn.Module):
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
-            logging.getLogger(__name__).info(
+            logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
                 f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
@@ -516,10 +518,6 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
-            if self.moe_runner_config.inplace:
-                print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
-                )
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
