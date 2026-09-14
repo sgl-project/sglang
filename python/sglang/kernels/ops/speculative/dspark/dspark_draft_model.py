@@ -496,6 +496,11 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
         return True
     if weight.dtype != torch.float8_e4m3fn:
         return False
+    # Per-channel FP8 (e.g. W8A8Fp8LinearMethod) uses weight_scale, not the
+    # 128x128 block scale weight_scale_inv. The fused dequant path only
+    # handles block scales, so fall back to the per-linear torch path.
+    if not hasattr(linear, "weight_scale_inv"):
+        return False
     block = 128
     out_dim, in_dim = weight.shape
     expected_scale_shape = (

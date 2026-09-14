@@ -898,33 +898,38 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if quantize_wo_a:
-            assert hasattr(self.wo_a, "weight_scale_inv"), (
-                "FP8 quant_config must create weight_scale_inv"
-            )
         if self.use_npu_arch35_mxfp8_wo_a:
             # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
-        elif fp8:
-            self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
-            # wo_a is quantized but never *applied* through its quant method:
-            # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
-            # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
-            # [G, R, D] weight. Opt out of any backend-private weight layout the
-            # linear method would otherwise install for its own GEMM -- on ROCm
-            # that is aiter's B-preshuffle, which silently permutes the weight
-            # in place (same shape, dtype and strides) and makes this GEMM
-            # return noise.
-            self.wo_a.keep_plain_weight_layout = True
-        elif _FP8_WO_A_GEMM:
-            # channelwise
-            assert hasattr(self.wo_a, "weight_scale"), (
-                "FP8 quant_config must create weight_scale"
-            )
+        elif fp8 and wo_a_quant_config is not None:
+            # Gate on this instance's quantization, never on the process-wide
+            # _FP8_WO_A_GEMM: the DSpark draft builds wo_a unquantized
+            # (wo_a_fp8=False, wo_a_keeps_quant_config=False) and its forward
+            # runs its own bf16 einsum, so it must skip these asserts entirely.
+            if isinstance(wo_a_quant_config, Fp8Config):
+                assert hasattr(self.wo_a, "weight_scale_inv"), (
+                    "FP8 quant_config must create weight_scale_inv"
+                )
+                self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
+                # wo_a is quantized but never *applied* through its quant method:
+                # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
+                # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
+                # mxscale BMM on gfx950), both of which want the plain row-major
+                # [G, R, D] weight. Opt out of any backend-private weight layout the
+                # linear method would otherwise install for its own GEMM -- on ROCm
+                # that is aiter's B-preshuffle, which silently permutes the weight
+                # in place (same shape, dtype and strides) and makes this GEMM
+                # return noise.
+                self.wo_a.keep_plain_weight_layout = True
+            else:
+                # channelwise (W8A8 int8 / fp8): those linear methods register
+                # only `weight_scale`, never `weight_scale_inv`.
+                assert hasattr(self.wo_a, "weight_scale"), (
+                    "FP8 quant_config must create weight_scale"
+                )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
