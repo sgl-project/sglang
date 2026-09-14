@@ -5599,11 +5599,12 @@ class MiniMaxSparseKVPool(KVCache):
             self.use_minimax_fused_kv_index_store
             and (_is_cuda or _is_hip)
             and not main.is_quantized_kv_cache
-            and not index_pool.is_quantized_kv_cache
+            # the K-only index pool has no quant method or layout knobs: plain NHD, never quantized
+            and not getattr(index_pool, "is_quantized_kv_cache", False)
             and main.kv_cache_layout == "nhd"
             and not main.use_hnd
-            and index_pool.kv_cache_layout == "nhd"
-            and not index_pool.use_hnd
+            and getattr(index_pool, "kv_cache_layout", "nhd") == "nhd"
+            and not getattr(index_pool, "use_hnd", False)
             and (cache_k.dtype != main.dtype or cache_idx_k.dtype != index_pool.dtype)
         )
 
