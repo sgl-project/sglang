@@ -1,7 +1,6 @@
-"""FPM-only iteration ownership and publication over existing timing intervals."""
+"""Result-owned FPM spans over existing GPU timing intervals."""
 
 import logging
-from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Optional
 
@@ -13,11 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class FpmTiming:
-    """First-start to last-end span on one stream, not full iteration latency.
-
-    No events are added or moved. Completion follows the timer's ready-interval
-    notifications; a frozen FPM snapshot can attach before or after completion.
-    """
+    """First-start to last-end GPU span on one stream, including segment gaps."""
 
     def __init__(self):
         self.num_intervals = 0
@@ -78,16 +73,6 @@ class FpmTiming:
         self.when_ready(publish)
 
 
-@contextmanager
-def capture_fpm_timing(timer: DeviceTimer):
-    timing = FpmTiming()
-    try:
-        with timer.capture(timing):
-            yield timing
-    finally:
-        timing.seal()
-
-
 def wrap_forward_with_fpm(forward: Callable, timer: DeviceTimer) -> Callable:
     """Installed on the scheduler instance only when that rank enables FPM."""
 
@@ -97,8 +82,12 @@ def wrap_forward_with_fpm(forward: Callable, timer: DeviceTimer) -> Callable:
         # synchronization. Let that real forward own the capture and result.
         if batch.forward_mode.is_prebuilt():
             return forward(batch, *args, **kwargs)
-        with capture_fpm_timing(timer) as timing:
-            result = forward(batch, *args, **kwargs)
+        timing = FpmTiming()
+        try:
+            with timer.capture(timing):
+                result = forward(batch, *args, **kwargs)
+        finally:
+            timing.seal()
         result.fpm_timing = timing
         return result
 
