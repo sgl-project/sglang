@@ -191,6 +191,11 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
         )
         super().load_weights(weights, is_nextn=True)
 
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # The generic loader invokes this hook without model-specific arguments.
+        # A NextN instance must never fall back to the target-model layer walk.
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
+
     def set_embed_and_head(self, embed, head):
         # Preserve a checkpoint-provided MTP embedding; share the output head.
         if not self._mtp_loaded_embed:
