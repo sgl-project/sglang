@@ -77,7 +77,9 @@ class TestStep3p7Flash(CustomTestCase):
         # and scorer. Sharing this object guarantees identical samples.
         evaluator = MMMUVLMEval(num_examples=100, num_threads=64)
         self.assertEqual(len(evaluator.samples), 100)
-        args = SimpleNamespace(model=self.model, max_tokens=1024, temperature=0)
+        # Use run_eval_once's shared generation-length default instead of
+        # imposing a Step3.7-specific 1024-token cap.
+        args = SimpleNamespace(model=self.model, temperature=0)
         report_dir = Path(tempfile.mkdtemp(prefix="step3p7_mmmu_"))
         print(f"Step3.7 MMMU reports: {report_dir}")
         scores = {}
@@ -130,10 +132,13 @@ class TestStep3p7Flash(CustomTestCase):
         print(summary)
         if is_in_ci():
             write_github_step_summary(summary + "\n")
-        # No measured Step3.7 absolute threshold exists yet. Require no score
-        # regression relative to the same-checkpoint serialized control;
-        # inspect the paired reports if batch-dependent numerics change it.
-        self.assertGreaterEqual(scores["concurrent"], scores["serial"], summary)
+        # The fixed 100-sample subset has roughly one-point answer granularity,
+        # and batch-dependent GPU numerics can flip a small number of answers.
+        # Reject a material regression while allowing up to two percentage
+        # points of absolute score difference from the serialized control.
+        self.assertGreaterEqual(
+            scores["concurrent"], scores["serial"] - 0.02, summary
+        )
 
 
 if __name__ == "__main__":
