@@ -3,7 +3,7 @@ import os
 import re
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -131,6 +131,59 @@ def _run_negotiate_test(rank, test_cases):
                 )
 
         override.restore()
+
+
+def _run_tp_queue_timeout_uniformity_test(rank):
+    world_size = torch.distributed.get_world_size()
+    cpu_group = torch.distributed.new_group(backend="gloo")
+    delayer = PrefillDelayer(
+        dp_size=1,
+        attn_tp_size=world_size,
+        cpu_group=cpu_group,
+        server_args=SimpleNamespace(
+            enable_dp_attention=False,
+            disaggregation_mode="null",
+            disable_overlap_schedule=False,
+            prefill_delayer_queue_min_ratio=0.5,
+            prefill_delayer_max_delay_ms=1000,
+        ),
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+    )
+    delayer.skip_first_delayer = False
+
+    negotiate_kwargs = dict(
+        local_prefillable=True,
+        token_usage=0.9,
+        running_batch=100,
+        max_prefill_bs=80,
+        max_running_requests=1024,
+        waiting_queue_len=10,
+    )
+    first_result = delayer._negotiate_should_allow_prefill(**negotiate_kwargs)
+    assert not first_result.output_allow
+    assert delayer._curr_state is not None
+
+    # Reproduce ranks straddling the wall-clock deadline on the same scheduler
+    # pass. Without a collective timeout decision, the last rank admits a
+    # prefill while its peer continues decoding.
+    delayer._curr_state = replace(
+        delayer._curr_state,
+        start_time=time.perf_counter() - (2.0 if rank == world_size - 1 else 0.0),
+    )
+    result = delayer._negotiate_should_allow_prefill(**negotiate_kwargs)
+
+    outcomes = [None] * world_size
+    torch.distributed.all_gather_object(
+        outcomes,
+        (
+            result.output_allow,
+            result.output_reason,
+            delayer._curr_state is None,
+        ),
+        group=cpu_group,
+    )
+    assert outcomes == [(True, "wait_success", True)] * world_size
 
 
 _NEGOTIATE_TEST_CASES = [
@@ -461,6 +514,13 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
             world_size=4,
             backend="gloo",
             test_cases=_NEGOTIATE_TEST_CASES,
+        )
+
+    def test_tp_queue_timeout_is_rank_uniform(self):
+        run_distributed_test(
+            _run_tp_queue_timeout_uniformity_test,
+            world_size=2,
+            backend="gloo",
         )
 
 

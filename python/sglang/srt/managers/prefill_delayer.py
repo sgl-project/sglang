@@ -129,9 +129,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, queue_timeout_expired.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -178,25 +178,37 @@ class PrefillDelayer:
         waiting_queue_len: int = 0,
     ) -> _NegotiateOutput:
         # Compute local states
+        now = time.perf_counter()
         local_token_watermark_force_allow = (
             local_prefillable
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
+        local_queue_timeout_expired = (
+            self._queue_trigger_enabled
+            and prev_state is not None
+            and (now - prev_state.start_time) * 1000.0 >= self._max_delay_ms
+        )
 
         # Gather global states
-        tp0_info = self._gather_info(
+        global_info = self._gather_info(
             local_prefillable=local_prefillable,
             local_token_watermark_force_allow=local_token_watermark_force_allow,
+            local_queue_timeout_expired=local_queue_timeout_expired,
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
         )
+        tp0_info = global_info[:, 0, :]
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        # Each rank creates start_time independently. Reduce the deadline
+        # decision across every participant so TP ranks cannot straddle it and
+        # choose prefill versus decode on the same scheduler pass.
+        global_queue_timeout_expired = global_info[:, :, 5].max() > 0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -219,9 +231,7 @@ class PrefillDelayer:
         # the defaults (0) since the wait isn't finished and isn't observed.
         wait_info = dict(
             wait_forward_passes=prev_state.delayed_count if prev_state else 0,
-            wait_seconds=(
-                (time.perf_counter() - prev_state.start_time) if prev_state else 0.0
-            ),
+            wait_seconds=((now - prev_state.start_time) if prev_state else 0.0),
         )
 
         # Compute outputs
@@ -266,10 +276,8 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                if queue_condition and global_queue_timeout_expired:
+                    queue_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -355,6 +363,7 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         local_token_watermark_force_allow: bool,
+        local_queue_timeout_expired: bool,
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
@@ -366,6 +375,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                int(local_queue_timeout_expired),
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -375,8 +385,7 @@ class PrefillDelayer:
             local_info,
             group=self._gather_group,
         )
-        tp0_info = self._global_info_buffer[:, 0, :]
-        return tp0_info
+        return self._global_info_buffer
 
 
 class PrefillDelayerSinglePassExecutor:
