@@ -1,13 +1,4 @@
-"""Parity tests for the split-prefix Triton extend attention
-(``extend_attention_fwd_long_prefix``): an EXTEND over a long cached prefix is
-swept with larger query tiles and in parallel prefix slices (one fp32 partial
-O/LSE each, combined in one launch) instead of one serial pass per (query
-tile, head). It must match ``extend_attention_fwd`` up to reduction order on
-ragged batches, GQA ratios, bf16 and fp8 KV caches, KV scales, and any split
-count including a single split (4-D partial layout with one slice).
-
-GPU + Triton required. Runs on the CUDA PR lane and the AMD MI35x lane.
-"""
+"""The split-prefix extend sweep must match the single-pass `extend_attention_fwd`."""
 
 import unittest
 
@@ -52,6 +43,8 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestExtendLongPrefix(CustomTestCase):
+    """A slice boundary, partial stride or combine weight error shows as a mismatch."""
+
     def _run(
         self,
         prefix_lens,
@@ -73,13 +66,42 @@ class TestExtendLongPrefix(CustomTestCase):
         sm_scale = 1.0 / (d**0.5)
         o_ref = torch.empty_like(q)
         extend_attention_fwd(
-            q, k, v, o_ref, kb, vb, qo, kvp, kvi, None, True, None, mle,
-            k_scale, v_scale, sm_scale=sm_scale, extend_seq_lens_cpu=extend_lens,
+            q,
+            k,
+            v,
+            o_ref,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            None,
+            True,
+            None,
+            mle,
+            k_scale,
+            v_scale,
+            sm_scale=sm_scale,
+            extend_seq_lens_cpu=extend_lens,
         )
         o = torch.empty_like(q)
         extend_attention_fwd_long_prefix(
-            q, k, v, o, kb, vb, qo, kvp, kvi, True, mle, k_scale, v_scale,
-            sm_scale=sm_scale, extend_seq_lens_cpu=extend_lens, num_splits=num_splits,
+            q,
+            k,
+            v,
+            o,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            True,
+            mle,
+            k_scale,
+            v_scale,
+            sm_scale=sm_scale,
+            extend_seq_lens_cpu=extend_lens,
+            num_splits=num_splits,
         )
         torch.cuda.synchronize()
         self.assertFalse(torch.isnan(o).any().item())

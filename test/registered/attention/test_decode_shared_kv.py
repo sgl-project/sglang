@@ -1,6 +1,4 @@
-"""Decode attention served by the grouped-head verify kernel (one extend row per
-request, prefix trimmed by one so the freshly written token is attended to
-exactly once). Reference: decode_attention_fwd over the full page table."""
+"""Decode through the grouped-head verify kernel must match `decode_attention_fwd`."""
 
 import unittest
 
@@ -44,7 +42,9 @@ def _run_case(seq_lens, cache_dtype, k_scale=1.0):
 
     o_ref = torch.empty(bs, H_Q, D, dtype=torch.bfloat16, device=device)
     max_splits = 32
-    attn_logits = torch.empty(bs, H_Q, max_splits, D, dtype=torch.float32, device=device)
+    attn_logits = torch.empty(
+        bs, H_Q, max_splits, D, dtype=torch.float32, device=device
+    )
     attn_lse = torch.empty(bs, H_Q, max_splits, dtype=torch.float32, device=device)
     num_kv_splits = torch.full((bs,), max_splits, dtype=torch.int32, device=device)
     decode_attention_fwd(
@@ -99,10 +99,14 @@ class TestDecodeSharedKV(CustomTestCase):
         self._check([1, 5, 2048, 20001], torch.bfloat16, 2e-2, 1e-2)
 
     def test_fp8_cache_many_requests(self):
-        self._check([3000 + 37 * i for i in range(24)], torch.float8_e4m3fnuz, 8e-2, 2e-2)
+        self._check(
+            [3000 + 37 * i for i in range(24)], torch.float8_e4m3fnuz, 8e-2, 2e-2
+        )
 
     def test_fp8_cache_scaled_long(self):
-        self._check([100_000, 8, 65_537], torch.float8_e4m3fnuz, 8e-2, 2e-2, k_scale=2.0)
+        self._check(
+            [100_000, 8, 65_537], torch.float8_e4m3fnuz, 8e-2, 2e-2, k_scale=2.0
+        )
 
 
 if __name__ == "__main__":

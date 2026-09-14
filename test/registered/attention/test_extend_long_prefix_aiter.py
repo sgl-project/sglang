@@ -1,13 +1,4 @@
-"""Parity tests for the aiter CK paged batch-prefill route of the long-prefix
-EXTEND path (``extend_attention_fwd_aiter_paged``): the chunk's causal
-attention over prefix + chunk is one paged-prefill call with page indices =
-prefix indices followed by the chunk's cache locations. Both it and
-``extend_attention_fwd`` are checked against an fp32 reference (on the last
-rows of each request) on ragged batches, fp8 KV with per-tensor scales, and
-bf16 KV, for the one-TP-local-KV-head shape the backend routes to it.
-
-ROCm + aiter required. Runs on the AMD MI35x lane.
-"""
+"""aiter's paged batch-prefill over prefix + chunk must match an fp32 reference."""
 
 import unittest
 
@@ -65,21 +56,45 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
 @unittest.skipIf(not torch.cuda.is_available() or not is_hip(), "ROCm GPU required")
 @unittest.skipIf(not _AITER_OK, "aiter mha_batch_prefill required")
 class TestExtendLongPrefixAiter(CustomTestCase):
+    """A wrong page table, descale or causal offset shows as a mismatch on the last rows."""
+
     def _run(self, prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, kv_scale):
         device = "cuda"
         torch.manual_seed(0)
-        (q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices, out_cache_loc) = (
-            _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device)
-        )
+        (
+            q,
+            k,
+            v,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            out_cache_loc,
+        ) = _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device)
         B = len(prefix_lens)
         max_ext = max(extend_lens)
         sm_scale = d**-0.5
-        k_scale = v_scale = (kv_scale if kv_dtype != torch.bfloat16 else 1.0)
+        k_scale = v_scale = kv_scale if kv_dtype != torch.bfloat16 else 1.0
 
         o_ref = torch.empty_like(q)
         extend_attention_fwd(
-            q, k, v, o_ref, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
-            None, True, None, max_ext, k_scale, v_scale, sm_scale=sm_scale,
+            q,
+            k,
+            v,
+            o_ref,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            None,
+            True,
+            None,
+            max_ext,
+            k_scale,
+            v_scale,
+            sm_scale=sm_scale,
             extend_seq_lens_cpu=list(extend_lens),
         )
 
@@ -104,8 +119,16 @@ class TestExtendLongPrefixAiter(CustomTestCase):
 
         o = torch.empty_like(q)
         extend_attention_fwd_aiter_paged(
-            q, o, k_buffer, v_buffer, qo_indptr, paged_indptr, pages, max_ext,
-            max(p + e for p, e in zip(prefix_lens, extend_lens)), sm_scale,
+            q,
+            o,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            paged_indptr,
+            pages,
+            max_ext,
+            max(p + e for p, e in zip(prefix_lens, extend_lens)),
+            sm_scale,
             k_scale=None if kv_dtype == torch.bfloat16 else k_scale,
             v_scale=None if kv_dtype == torch.bfloat16 else v_scale,
         )
@@ -116,18 +139,24 @@ class TestExtendLongPrefixAiter(CustomTestCase):
             P, E = prefix_lens[i], extend_lens[i]
             r0 = max(0, E - REF_ROWS)
             rows = slice(int(qo_indptr[i]) + r0, int(qo_indptr[i + 1]))
-            K = torch.cat(
-                [
-                    k_buffer[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
-                    k_buffer[out_cache_loc[qo_indptr[i] : qo_indptr[i + 1]]],
-                ]
-            ).float() * k_scale
-            V = torch.cat(
-                [
-                    v_buffer[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
-                    v_buffer[out_cache_loc[qo_indptr[i] : qo_indptr[i + 1]]],
-                ]
-            ).float() * v_scale
+            K = (
+                torch.cat(
+                    [
+                        k_buffer[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
+                        k_buffer[out_cache_loc[qo_indptr[i] : qo_indptr[i + 1]]],
+                    ]
+                ).float()
+                * k_scale
+            )
+            V = (
+                torch.cat(
+                    [
+                        v_buffer[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
+                        v_buffer[out_cache_loc[qo_indptr[i] : qo_indptr[i + 1]]],
+                    ]
+                ).float()
+                * v_scale
+            )
             qs = q[rows].float()
             if kv_dtype != torch.bfloat16:
                 qs = qs.to(kv_dtype).float()  # both kernels feed fp8 q to the fp8 dot
@@ -146,7 +175,9 @@ class TestExtendLongPrefixAiter(CustomTestCase):
         )
 
     def test_fp8_gqa16_ragged(self):
-        self._run([4096, 12000, 300], [2048, 1500, 7], 16, 1, 128, torch.float8_e4m3fn, 1.0)
+        self._run(
+            [4096, 12000, 300], [2048, 1500, 7], 16, 1, 128, torch.float8_e4m3fn, 1.0
+        )
 
     def test_fp8_scaled(self):
         self._run([9000], [3000], 16, 1, 128, torch.float8_e4m3fn, 0.7)
