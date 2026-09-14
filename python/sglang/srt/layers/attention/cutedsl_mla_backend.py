@@ -63,8 +63,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
     # rank-local LSE, so it verifies under DCP (`_run_decode_kernel`).
     supports_dcp_target_verify = True
 
-    # This kernel does not support varlen queries.
-    supports_varlen_absorbed_mla = False
+    # SGLang uses this class for decode only. Its prefill side is trtllm_mla,
+    # whose variable-Q call may auto-dispatch to FlashInfer CuTeDSL.
+    owns_varlen_absorbed_extend = False
 
     def __init__(
         self,
