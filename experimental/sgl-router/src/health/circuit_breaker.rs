@@ -172,6 +172,35 @@ impl CircuitBreaker {
             }
         }
     }
+
+    /// Record a backpressure response (HTTP 503 / 429): the worker answered, so
+    /// it is responsive — busy, not faulty.
+    ///
+    /// - **Closed:** no-op. A busy worker must not open the breaker, and —
+    ///   unlike [`record_success`](Self::record_success) — backpressure must
+    ///   NOT reset an in-progress failure streak, so a worker interleaving real
+    ///   5xx faults with 503s still trips.
+    /// - **HalfOpen:** close. Any response observed here proves the worker is
+    ///   answering, which is what the probe exists to find out. Leaving HalfOpen
+    ///   unresolved would wedge the breaker permanently — the probe slot is
+    ///   released only by a success or failure, and backpressure is neither —
+    ///   shutting a recovered-but-busy worker out forever (a worse false-shed
+    ///   than the one ignoring 503 removes). The responder is not necessarily
+    ///   the probe: [`allow`](Self::allow) gates admission, not completion, so a
+    ///   request admitted while Closed can land here. [`record_success`] has the
+    ///   same property.
+    /// - **Open:** no-op, and reachable — `allow` gates admission, not
+    ///   completion, so a request admitted while Closed can return after
+    ///   concurrent failures have opened the breaker. A late backpressure answer
+    ///   must not reset a breaker that has already tripped, exactly as
+    ///   [`record_failure`](Self::record_failure) ignores failures while Open.
+    pub fn record_backpressure(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if matches!(g.state, State::HalfOpen { .. }) {
+            g.consecutive_failures = 0;
+            g.state = State::Closed;
+        }
+    }
 }
 
 impl Default for CircuitBreaker {
@@ -244,5 +273,68 @@ mod tests {
         let s = b.snapshot();
         assert!(s.admit, "open past cooldown admits a probe");
         assert_eq!(s.state_code, 1, "...but is still reported as open");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backpressure_resolves_half_open_probe() {
+        // Regression guard: a backpressure (503/429) answer to a half-open
+        // probe must RESOLVE the probe, not wedge the breaker. The probe slot
+        // is otherwise released only by success/failure; without
+        // record_backpressure handling HalfOpen, a recovered-but-busy worker
+        // would be shut out forever.
+        let b = cb(1, 10);
+        b.record_failure(); // Open
+        assert_eq!(b.snapshot().state_code, 1);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            b.allow(),
+            "cooldown elapsed → claims the probe slot (HalfOpen)"
+        );
+        assert_eq!(b.snapshot().state_code, 2);
+
+        b.record_backpressure();
+        assert_eq!(
+            b.snapshot().state_code,
+            0,
+            "a 503 probe answer must close the breaker, not leave it wedged half-open",
+        );
+        assert!(
+            b.would_allow(),
+            "worker must admit again after the probe resolves"
+        );
+    }
+
+    #[test]
+    fn backpressure_in_closed_state_preserves_failure_streak() {
+        // Unlike record_success, record_backpressure must NOT reset an
+        // in-progress streak: 2 faults + a 503 + 1 fault still hits threshold 3.
+        let b = cb(3, 30);
+        b.record_failure();
+        b.record_failure();
+        b.record_backpressure();
+        assert_eq!(
+            b.snapshot().state_code,
+            0,
+            "2 faults < threshold 3, still closed"
+        );
+        b.record_failure();
+        assert_eq!(
+            b.snapshot().state_code,
+            1,
+            "the 503 must not have reset the streak; the 3rd fault opens the breaker",
+        );
+    }
+
+    #[test]
+    fn backpressure_alone_never_opens_a_closed_breaker() {
+        let b = cb(3, 30);
+        for _ in 0..10 {
+            b.record_backpressure();
+        }
+        assert_eq!(
+            b.snapshot().state_code,
+            0,
+            "backpressure alone must never open the breaker, regardless of volume",
+        );
     }
 }
