@@ -13,7 +13,7 @@
 //! affinity. It fails open on a missing sample — see [`queue_gate_admits`].
 
 use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad, NativeCacheWorkerLoad};
-use crate::policies::power_of_two::select_with_snapshot;
+use crate::policies::power_of_two::select_k_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -320,6 +320,7 @@ pub fn resolve_prefill(
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
     queue_limit: Option<u64>,
+    min_load_choices: usize,
 ) -> Option<FinalDecision> {
     resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot, queue_limit).or_else(
         || {
@@ -332,7 +333,8 @@ pub fn resolve_prefill(
                 .filter(|worker| contains_worker(range, worker))
                 .cloned();
             let legal = legal_prefill_candidates(range, proposal);
-            let selected = select_with_snapshot(&legal, Some(snapshot))?;
+            let selected =
+                select_k_with_snapshot(&legal, Some(snapshot), min_load_choices, queue_limit)?;
             Some(FinalDecision {
                 selected,
                 primary: Arc::clone(&proposal.primary),
@@ -965,6 +967,7 @@ fn pressure_guard_prefers_backup(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::power_of_two::select_k_with_snapshot;
     use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -1017,13 +1020,21 @@ mod tests {
             20,
             &loads,
             None,
+            2,
         )
         .is_some());
         assert_eq!(
-            resolve_prefill(&range, &SelectionProposal::primary(full), 20, &loads, None)
-                .expect("fallback selects the admitted worker")
-                .selected
-                .id,
+            resolve_prefill(
+                &range,
+                &SelectionProposal::primary(full),
+                20,
+                &loads,
+                None,
+                2
+            )
+            .expect("fallback selects the admitted worker")
+            .selected
+            .id,
             unknown.id
         );
     }
@@ -1052,6 +1063,7 @@ mod tests {
             32,
             &loads,
             None,
+            2,
         )
         .expect("capacity exhaustion must degrade within the legal domain");
 
@@ -1070,7 +1082,7 @@ mod tests {
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
         let explicit = snapshot(&[(&primary, 0, 0, 100, 100), (&backup, 0, 10, 100, 100)]);
         let opposite = snapshot(&[(&primary, 0, 10, 100, 100), (&backup, 0, 0, 100, 100)]);
-        let opposite_decision = select_with_snapshot(&workers, Some(&opposite))
+        let opposite_decision = select_k_with_snapshot(&workers, Some(&opposite), 2, None)
             .expect("the opposite snapshot has the same legal workers");
         assert_eq!(opposite_decision.id, backup.id);
 
@@ -1080,6 +1092,7 @@ mod tests {
             32,
             &explicit,
             None,
+            2,
         )
         .expect("capacity exhaustion must degrade to Power-of-Two");
 
@@ -1413,6 +1426,7 @@ mod tests {
             32,
             &loads,
             Some(4),
+            2,
         )
         .expect("an admitted worker exists");
 
@@ -1507,6 +1521,7 @@ mod tests {
             32,
             &loads,
             Some(4),
+            2,
         )
         .expect("an all-queueing fleet must still route");
 

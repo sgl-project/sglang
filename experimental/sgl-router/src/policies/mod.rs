@@ -787,6 +787,7 @@ mod tests {
             32,
             &loads,
             None,
+            2,
         )
         .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
@@ -1581,7 +1582,7 @@ mod tests {
         let range = CandidateRange::global(&workers);
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
-        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None)
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None, 2)
             .expect("an admitted backup must be selected");
 
         assert_eq!(decision.selected.id, backup.id);
@@ -1600,6 +1601,7 @@ mod tests {
             1_000_000,
             &snapshot,
             None,
+            2,
         )
         .expect("disabled reporting must preserve the healthy registry candidate");
 
@@ -1638,6 +1640,7 @@ mod tests {
             80,
             &snapshot,
             None,
+            2,
         )
         .expect("both candidates fit capacity");
 
@@ -1688,6 +1691,7 @@ mod tests {
             32,
             &snapshot,
             None,
+            2,
         )
         .expect("an admitted range fallback must be selected");
 
