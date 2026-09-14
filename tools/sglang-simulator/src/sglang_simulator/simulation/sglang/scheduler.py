@@ -89,7 +89,13 @@ def build_predictor_batch(batch) -> SimulationScheduleBatch:
                 batch_size=batch_size,
             )
         reqs = [
-            ScheduleRequest(extend_length=1, past_kv_length=_host_int(seq_len))
+            ScheduleRequest(
+                extend_length=1,
+                # prepare_for_decode increments seq_lens_cpu for the token
+                # entering this forward. InferCast history is the KV length
+                # before that token.
+                past_kv_length=_host_int(seq_len) - 1,
+            )
             for seq_len in seq_lens
         ]
     elif mode == "IDLE":
@@ -133,6 +139,21 @@ def block_on_l2_load(mode: SimulationMode, delay: float) -> float:
     start = time.perf_counter()
     time.sleep(delay)
     return time.perf_counter() - start
+
+
+def effective_cpu_overhead(
+    *,
+    now: float,
+    last_real_time: float,
+    blocked_l2_wall_duration: float,
+    predictor_wall_duration: float,
+    mode: SimulationMode,
+) -> float:
+    """Exclude modeled waits and OFFLINE predictor queries from host overhead."""
+    excluded = blocked_l2_wall_duration
+    if mode == SimulationMode.OFFLINE:
+        excluded += predictor_wall_duration
+    return max(now - last_real_time - excluded, 0.0)
 
 
 class C_SglangPrefillAdderHook(BaseHook):
@@ -353,6 +374,7 @@ class C_SchedulerHook(BaseHook):
 
     ITERATION_STATS: list[dict] = []
     TOTAL_PREDICTOR_TIME_COST = 0
+    CURRENT_PREDICTOR_TIME_COST = 0
     GET_NEW_BATCH_PREFILL_TIME_COST = 0
 
     SIMULATION_BATCH: SimulationScheduleBatch = None
@@ -491,6 +513,7 @@ class C_SchedulerHook(BaseHook):
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
             ret = original_run_batch(self, *args, **kwargs)
 
             batch = get_obj_from_args(
@@ -508,15 +531,17 @@ class C_SchedulerHook(BaseHook):
                             simulation_batch,
                         )
                     finally:
-                        C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                            time.perf_counter() - pred_start
+                        predictor_time_cost = time.perf_counter() - pred_start
+                        C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = (
+                            predictor_time_cost
                         )
+                        C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_time_cost
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                         time.sleep(predicted_latency)
                         now = time.time()
-                        forward_latency = now - StateManager.get_last_real_time_ts()
+                        forward_latency = predicted_latency
                         StateManager.set_last_real_time_ts(now)
                     else:
                         forward_latency = predicted_latency
@@ -558,9 +583,14 @@ class C_SchedulerHook(BaseHook):
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
-                    0.0,
+                cpu_overhead = effective_cpu_overhead(
+                    now=now,
+                    last_real_time=StateManager.get_last_real_time_ts(),
+                    blocked_l2_wall_duration=blocked_l2_wall_dur,
+                    predictor_wall_duration=(
+                        C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST
+                    ),
+                    mode=C_SchedulerHook.SIM_MODE,
                 )
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
@@ -668,6 +698,7 @@ class C_SchedulerHook(BaseHook):
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
             C_SchedulerHook.REQ_DISPATCHER.reset()
             C_SchedulerHook.REQ_DISPATCHER.profile_active = is_start_profile
             C_SchedulerHook.INFERENCE_PREDICTOR.reset_metrics()

@@ -1,0 +1,32 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "mi350x",
+      "vendor": "AMD",
+      "hbm_capacity_gb": 288
+    },
+    "num_device_per_node": 8
+  },
+  "predictor": {
+    "name": "infercast",
+    "model_id": "deepseek-ai/DeepSeek-R1",
+    "systems_root": "/path/to/perfdb",
+    "database_mode": "SILICON",
+    "attn_kernel_impl": "cuda_graph",
+    "attn_dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "provider_revision": "<full InferCast commit>"
+  },
+  "scheduler": {
+    "tp_size": 4,
+    "ep_size": 2,
+    "dp_size": 1,
+    "pp_size": 1,
+    "cp_size": 1,
+    "data_type": "BF16",
+    "kv_cache_data_type": "BF16",
+    "backend_name": "sglang",
+    "backend_version": "0.5.17",
+    "max_total_tokens": 65536
+  }
+}
