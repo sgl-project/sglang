@@ -56,6 +56,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        scheduler.token_to_kv_pool_allocator = None
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
