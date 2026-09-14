@@ -1,5 +1,24 @@
 use std::num::NonZeroU32;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
 /// [`Config::validate`]. The router serves exactly one model.
@@ -86,7 +105,7 @@ pub enum PolicyKind {
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq")]
+    #[value(name = "cache_aware_zmq", alias = "cache_aware")]
     CacheAwareZmq,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
@@ -101,6 +120,9 @@ pub enum PolicyKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Exact Bearer secret for the PD runtime control plane. `None` remains a
+    /// valid process configuration, but the protected endpoints fail closed.
+    pub pd_flip_router_admin_api_key: Option<SecretString>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +166,13 @@ pub struct ModelConfig {
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
+    /// Policy used for the Prefill pool (and for plain workers). Kept under
+    /// the legacy `policy` field so existing callers and `--policy` configs
+    /// remain source-compatible.
     pub policy: PolicyKind,
+    /// Optional policy used only for Decode selection in PD mode. `None`
+    /// preserves the historical same-host Decode affinity path.
+    pub decode_policy: Option<PolicyKind>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Tuning for the cache-aware ZMQ policy. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at

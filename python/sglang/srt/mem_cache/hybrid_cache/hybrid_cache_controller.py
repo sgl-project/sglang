@@ -462,7 +462,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
-    def start_loading(self) -> int:
+    def start_loading(self, *, return_ticket: bool = False) -> int:
         if not self.load_queue:
             return -1
         producer_id = self.layer_done_counter.update_producer()
@@ -498,6 +498,8 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
             )
         )
+        if return_ticket:
+            return self.layer_done_counter.producer_ticket(producer_id)
         return producer_id
 
     def _record_transfer_indices_on_stream(

@@ -221,6 +221,12 @@ def _handle_output_by_index(output, i):
                 output, "customized_info", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            pd_flip_output_seqs=_extract_field_by_index(
+                output, "pd_flip_output_seqs", i
+            ),
+            pd_flip_session_ids=_extract_field_by_index(
+                output, "pd_flip_session_ids", i
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -310,6 +316,12 @@ def _handle_output_by_index(output, i):
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
+            ),
+            pd_flip_output_seqs=_extract_field_by_index(
+                output, "pd_flip_output_seqs", i
+            ),
+            pd_flip_session_ids=_extract_field_by_index(
+                output, "pd_flip_session_ids", i
             ),
         )
     else:

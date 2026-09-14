@@ -34,6 +34,46 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
+def _log_pd_flip_kv_ownership(req, phase, kv_indices, release_indices, **fields):
+    if not (
+        getattr(req, "pd_flip_migration_session_id", None)
+        or getattr(req, "hicache_restore_ownership_failure", False)
+    ):
+        return
+    protected_len = int(getattr(req, "cache_protected_len", 0) or 0)
+    prefix_indices = getattr(req, "prefix_indices", None)
+    protected = kv_indices[:protected_len]
+    release_unique = torch.unique(release_indices)
+    protected_unique = torch.unique(protected)
+    overlap = (
+        torch.isin(release_unique, protected_unique).sum().item()
+        if release_unique.numel() and protected_unique.numel()
+        else 0
+    )
+    boundary_start = max(0, protected_len - 2)
+    boundary_end = min(kv_indices.numel(), protected_len + 3)
+    logger.warning(
+        "[PD_FLIP_KV_OWNERSHIP] phase=%s rid=%s committed=%s allocated=%s "
+        "cache_protected=%s prefix_indices=%s kv_count=%s kv_unique=%s "
+        "release_count=%s release_unique=%s release_protected_overlap=%s "
+        "boundary_indices=%s tail_indices=%s %s",
+        phase,
+        req.rid,
+        getattr(req, "kv_committed_len", None),
+        getattr(req, "kv_allocated_len", None),
+        protected_len,
+        len(prefix_indices) if prefix_indices is not None else 0,
+        kv_indices.numel(),
+        torch.unique(kv_indices).numel(),
+        release_indices.numel(),
+        release_unique.numel(),
+        overlap,
+        kv_indices[boundary_start:boundary_end].cpu().tolist(),
+        kv_indices[-5:].cpu().tolist(),
+        " ".join(f"{key}={value}" for key, value in sorted(fields.items())),
+    )
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -420,6 +460,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
+        pd_flip_stats_before = None
+        if getattr(req, "pd_flip_migration_session_id", None) or getattr(
+            req, "hicache_restore_ownership_failure", False
+        ):
+            pd_flip_stats_before = (
+                self.token_to_kv_pool_allocator.available_size(),
+                self.evictable_size(),
+                self.protected_size(),
+                self._total_size_helper(),
+            )
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -445,11 +495,26 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            _log_pd_flip_kv_ownership(
+                req,
+                "finished",
+                kv_indices,
+                kv_indices[req.cache_protected_len : result.prefix_len],
+                insert_prefix_len=result.prefix_len,
+                key_len=key_len,
+            )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
+            _log_pd_flip_kv_ownership(
+                req,
+                "finished_no_insert",
+                kv_indices,
+                kv_indices[req.cache_protected_len : key_len],
+                key_len=key_len,
+            )
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
@@ -460,12 +525,34 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+        if pd_flip_stats_before is not None:
+            _log_pd_flip_kv_ownership(
+                req,
+                "finished_after",
+                kv_indices,
+                kv_indices[:0],
+                stats_before=pd_flip_stats_before,
+                stats_after=(
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.evictable_size(),
+                    self.protected_size(),
+                    self._total_size_helper(),
+                ),
+            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
+        pd_flip_stats_before = None
+        if getattr(req, "pd_flip_migration_session_id", None):
+            pd_flip_stats_before = (
+                self.token_to_kv_pool_allocator.available_size(),
+                self.evictable_size(),
+                self.protected_size(),
+                self._total_size_helper(),
+            )
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -486,6 +573,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         )
         new_prefix_len = result.prefix_len
+
+        _log_pd_flip_kv_ownership(
+            req,
+            "unfinished",
+            kv_indices,
+            kv_indices[req.cache_protected_len : new_prefix_len],
+            insert_prefix_len=new_prefix_len,
+            key_len=len(radix_key),
+        )
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
@@ -514,6 +610,21 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
+
+        if pd_flip_stats_before is not None:
+            _log_pd_flip_kv_ownership(
+                req,
+                "unfinished_after",
+                kv_indices,
+                kv_indices[:0],
+                stats_before=pd_flip_stats_before,
+                stats_after=(
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.evictable_size(),
+                    self.protected_size(),
+                    self._total_size_helper(),
+                ),
+            )
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices

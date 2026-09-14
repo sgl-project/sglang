@@ -699,6 +699,66 @@ class CommonKVManager(BaseKVManager):
             f"{len(affected_rooms)} requests affected"
         )
 
+    def invalidate_prefill_peer_cache(self, bootstrap_addr: str) -> Dict[str, int]:
+        """Forget cached rank endpoints for one re-created Prefill peer.
+
+        A runtime D->P cache reconfiguration creates new manager-local ZMQ PULL
+        sockets and therefore new ``rank_port`` values while keeping the public
+        bootstrap address stable.  Decode workers must discard the old route
+        entries before the re-created Prefill is admitted, otherwise PUSH
+        sockets can continue sending request metadata to the dead ports.
+
+        The controller calls this while the Prefill peer is still drained.  Be
+        deliberately fail-closed if a non-terminal request for that peer is
+        still visible so an in-flight transfer is never disconnected.
+        """
+
+        if not hasattr(self, "connection_pool"):
+            raise RuntimeError("prefill peer cache exists only on Decode managers")
+
+        bootstrap_addr = str(bootstrap_addr)
+        stale_endpoints = set()
+        with self.connection_lock:
+            tracked_rooms = set(self.addr_to_rooms_tracker.get(bootstrap_addr, ()))
+            active_rooms = [
+                room
+                for room in tracked_rooms
+                if self.request_status.get(room)
+                not in (None, KVPoll.Success, KVPoll.Failed)
+            ]
+            if active_rooms:
+                raise RuntimeError(
+                    "cannot invalidate Prefill peer cache with active rooms: "
+                    f"bootstrap_addr={bootstrap_addr}, rooms={sorted(active_rooms)}"
+                )
+
+            keys_to_remove = [
+                key
+                for key in self.connection_pool
+                if key.startswith(f"{bootstrap_addr}_")
+            ]
+            for key in keys_to_remove:
+                for info in self.connection_pool.get(key, ()):
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        stale_endpoints.add(
+                            NetworkAddress(ip, int(port)).to_tcp()
+                        )
+                self.connection_pool.pop(key, None)
+            self.prefill_info_table.pop(bootstrap_addr, None)
+            getattr(self, "heartbeat_failures", {}).pop(bootstrap_addr, None)
+            self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
+
+        return {
+            "connection_keys_removed": len(keys_to_remove),
+            "endpoints_disconnected": len(stale_endpoints),
+            "terminal_rooms_removed": len(tracked_rooms),
+        }
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -1043,6 +1103,19 @@ class CommonKVReceiver(BaseKVReceiver):
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
+        if sock:
+            if lock:
+                with lock:
+                    sock.close(linger=0)
+            else:
+                sock.close(linger=0)
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):

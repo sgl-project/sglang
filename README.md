@@ -12,6 +12,12 @@
 
 --------------------------------------------------------------------------------
 
+> **PD Flip fork:** this branch adds live Prefill/Decode role switching,
+> active-request migration, router coordination, and an operational controller
+> as one commit on top of the official SGLang `v0.5.13` tag
+> (`28b095c010`). See
+> [docs/pd_flip.md](docs/pd_flip.md) for build and deployment instructions.
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |

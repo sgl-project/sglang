@@ -836,6 +836,27 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
+    enable_pd_flip_state_machine: bool = False
+    enable_pd_flip_hicache_stitch: bool = False
+    enable_pd_flip_prefill_donor: bool = False
+    pd_flip_window_seconds: float = 1.0
+    pd_flip_slo_threshold: float = 0.9
+    pd_flip_prefill_nodes: Optional[int] = None
+    pd_flip_decode_nodes: Optional[int] = None
+    pd_flip_prefill_slo_attainment: Optional[float] = None
+    pd_flip_decode_slo_attainment: Optional[float] = None
+    pd_flip_prepare_ack: bool = False
+    pd_flip_commit_ack: bool = False
+    pd_flip_abort: bool = False
+    enable_pd_runtime_role_switch: bool = False
+    pd_runtime_initial_role: Optional[Literal["prefill", "decode"]] = None
+    enable_pd_runtime_cache_hot_reconfigure: bool = False
+    enable_pd_runtime_shared_hicache: bool = False
+    enable_pd_runtime_resident_decode_cuda_graph: bool = False
+    pd_runtime_prefill_mamba_scheduler_strategy: Literal[
+        "extra_buffer", "extra_buffer_lazy"
+    ] = "extra_buffer"
+    pd_runtime_decode_mamba_scheduler_strategy: Literal["no_buffer"] = "no_buffer"
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -896,6 +917,7 @@ class ServerArgs:
         """
 
         self._maybe_download_model_for_runai()
+        self._handle_pd_runtime_role_switch()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
@@ -1035,6 +1057,8 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+        self._validate_pd_flip_hicache_stitch()
+        self._validate_pd_flip_prefill_donor()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1076,6 +1100,60 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_pd_runtime_role_switch(self):
+        if (
+            self.enable_pd_runtime_cache_hot_reconfigure
+            and not self.enable_pd_runtime_role_switch
+        ):
+            raise ValueError(
+                "--enable-pd-runtime-cache-hot-reconfigure requires "
+                "--enable-pd-runtime-role-switch"
+            )
+        if self.enable_pd_runtime_resident_decode_cuda_graph:
+            if not self.enable_pd_runtime_cache_hot_reconfigure:
+                raise ValueError(
+                    "--enable-pd-runtime-resident-decode-cuda-graph requires "
+                    "--enable-pd-runtime-cache-hot-reconfigure"
+                )
+            if not self.enable_pd_runtime_shared_hicache:
+                raise ValueError(
+                    "--enable-pd-runtime-resident-decode-cuda-graph currently "
+                    "requires --enable-pd-runtime-shared-hicache so role changes "
+                    "reuse the registered request/KV/attention objects in place"
+                )
+            if self.disable_cuda_graph:
+                raise ValueError(
+                    "--enable-pd-runtime-resident-decode-cuda-graph requires "
+                    "Decode CUDA Graph to be enabled"
+                )
+        if not self.enable_pd_runtime_role_switch:
+            return
+
+        initial_role = self.pd_runtime_initial_role or self.disaggregation_mode
+        if initial_role not in ("prefill", "decode"):
+            raise ValueError(
+                "--enable-pd-runtime-role-switch requires --disaggregation-mode "
+                "prefill/decode or --pd-runtime-initial-role"
+            )
+        self.disaggregation_mode = initial_role
+
+        if self.enable_pd_runtime_shared_hicache:
+            if not self.enable_pd_runtime_cache_hot_reconfigure:
+                raise ValueError(
+                    "--enable-pd-runtime-shared-hicache requires "
+                    "--enable-pd-runtime-cache-hot-reconfigure"
+                )
+            if self.hicache_storage_backend is None:
+                raise ValueError(
+                    "--enable-pd-runtime-shared-hicache requires "
+                    "--hicache-storage-backend"
+                )
+            # Decode keeps the page-size=64 no_buffer/chunk-cache profile.  A
+            # worker that has already served as Prefill may retain its empty,
+            # quiesced Host backing buffers while Decode is active; radix/request
+            # metadata is always reset and Decode never accesses that plane.
+            self.enable_hierarchical_cache = initial_role == "prefill"
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -4196,6 +4274,39 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+    def _validate_pd_flip_hicache_stitch(self):
+        if not self.enable_pd_flip_hicache_stitch:
+            return
+        donor_with_role_aware_hicache = (
+            self.enable_pd_flip_prefill_donor
+            and self.enable_pd_runtime_shared_hicache
+        )
+        if not (
+            self.enable_pd_runtime_role_switch
+            and (
+                self.disaggregation_decode_enable_radix_cache
+                or donor_with_role_aware_hicache
+            )
+            and self.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "--enable-pd-flip-hicache-stitch requires "
+                "--enable-pd-runtime-role-switch, "
+                "either --disaggregation-decode-enable-radix-cache or "
+                "--enable-pd-flip-prefill-donor with "
+                "--enable-pd-runtime-shared-hicache, and "
+                "--hicache-storage-backend"
+            )
+
+    def _validate_pd_flip_prefill_donor(self):
+        if not self.enable_pd_flip_prefill_donor:
+            return
+        if not self.enable_pd_flip_hicache_stitch:
+            raise ValueError(
+                "--enable-pd-flip-prefill-donor requires "
+                "--enable-pd-flip-hicache-stitch"
+            )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -7035,6 +7146,119 @@ class ServerArgs:
             type=int,
             default=ServerArgs.optimistic_prefill_retries,
             help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        )
+        parser.add_argument(
+            "--enable-pd-flip-state-machine",
+            action="store_true",
+            default=ServerArgs.enable_pd_flip_state_machine,
+            help="Enable the experimental Janus-style PD flip state machine. "
+            "The first implementation observes local scheduler state and emits "
+            "safe/preparing/flipping transitions; real request/KV migration is "
+            "provided by the flip callbacks.",
+        )
+        parser.add_argument(
+            "--enable-pd-flip-hicache-stitch",
+            action="store_true",
+            default=ServerArgs.enable_pd_flip_hicache_stitch,
+            help="Stitch a target HiCache prefix with the source decode KV suffix during PD flip migration.",
+        )
+        parser.add_argument(
+            "--enable-pd-flip-prefill-donor",
+            action="store_true",
+            default=ServerArgs.enable_pd_flip_prefill_donor,
+            help="Use the request's original prefill worker as the donor for complete prompt pages during PD flip migration.",
+        )
+        parser.add_argument(
+            "--enable-pd-runtime-role-switch",
+            action="store_true",
+            default=ServerArgs.enable_pd_runtime_role_switch,
+            help="Enable in-process PD role switching. The initial role is taken "
+            "from --disaggregation-mode unless --pd-runtime-initial-role is set.",
+        )
+        parser.add_argument(
+            "--pd-runtime-initial-role",
+            type=str,
+            choices=["prefill", "decode"],
+            default=ServerArgs.pd_runtime_initial_role,
+            help="Initial active PD role for runtime role switch workers.",
+        )
+        parser.add_argument(
+            "--enable-pd-runtime-cache-hot-reconfigure",
+            action="store_true",
+            default=ServerArgs.enable_pd_runtime_cache_hot_reconfigure,
+            help="Experimental: keep model weights and process state resident, but "
+            "rebuild role-specific request/KV/radix caches when a fully idle PD "
+            "runtime worker changes role.",
+        )
+        parser.add_argument(
+            "--enable-pd-runtime-shared-hicache",
+            action="store_true",
+            default=ServerArgs.enable_pd_runtime_shared_hicache,
+            help="Keep Decode on its page-size-preserving chunk-cache profile, "
+            "but attach the active Prefill role to the configured shared "
+            "HiCache storage backend. Runtime role switches drain writes, "
+            "tear down the old cache controller, and rebuild the target role "
+            "against the same L3 namespace.",
+        )
+        parser.add_argument(
+            "--enable-pd-runtime-resident-decode-cuda-graph",
+            action="store_true",
+            default=ServerArgs.enable_pd_runtime_resident_decode_cuda_graph,
+            help="Capture Decode CUDA Graph once per worker, retain its device "
+            "allocations while Prefill is active, and reactivate it only after "
+            "the registered cache-plane dependency addresses are revalidated.",
+        )
+        parser.add_argument(
+            "--pd-runtime-prefill-mamba-scheduler-strategy",
+            type=str,
+            choices=["extra_buffer", "extra_buffer_lazy"],
+            default=ServerArgs.pd_runtime_prefill_mamba_scheduler_strategy,
+            help="Mamba scheduler profile rebuilt when a runtime worker becomes Prefill.",
+        )
+        parser.add_argument(
+            "--pd-runtime-decode-mamba-scheduler-strategy",
+            type=str,
+            choices=["no_buffer"],
+            default=ServerArgs.pd_runtime_decode_mamba_scheduler_strategy,
+            help="Mamba scheduler profile rebuilt when a runtime worker becomes Decode.",
+        )
+        parser.add_argument(
+            "--pd-flip-window-seconds",
+            type=float,
+            default=ServerArgs.pd_flip_window_seconds,
+            help="Minimum seconds between PD flip SLO evaluations.",
+        )
+        parser.add_argument(
+            "--pd-flip-slo-threshold",
+            type=float,
+            default=ServerArgs.pd_flip_slo_threshold,
+            help="SLO attainment threshold used by the experimental PD flip evaluator.",
+        )
+        parser.add_argument(
+            "--pd-flip-prefill-nodes",
+            type=int,
+            default=ServerArgs.pd_flip_prefill_nodes,
+            help="Optional cluster prefill node count for PD flip what-if snapshots. "
+            "If unset, the local role contributes one node.",
+        )
+        parser.add_argument(
+            "--pd-flip-decode-nodes",
+            type=int,
+            default=ServerArgs.pd_flip_decode_nodes,
+            help="Optional cluster decode node count for PD flip what-if snapshots. "
+            "If unset, the local role contributes one node.",
+        )
+        parser.add_argument(
+            "--pd-flip-prefill-slo-attainment",
+            type=float,
+            default=ServerArgs.pd_flip_prefill_slo_attainment,
+            help="Optional prefill SLO attainment signal for the experimental PD flip evaluator.",
+        )
+        parser.add_argument(
+            "--pd-flip-decode-slo-attainment",
+            type=float,
+            default=ServerArgs.pd_flip_decode_slo_attainment,
+            help="Optional decode SLO attainment signal for the experimental PD flip evaluator.",
         )
 
         # Encode prefill disaggregation

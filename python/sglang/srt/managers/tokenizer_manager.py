@@ -27,13 +27,15 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import fastapi
 import pybase64
@@ -68,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    PDFlipMigrationOutputRelayReq,
     PauseGenerationReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
@@ -401,6 +404,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.pd_flip_output_relay_targets: Dict[Tuple[str, str], str] = {}
+        self.pd_flip_output_relay_baseline: Dict[Tuple[str, str], int] = {}
+        self.pd_flip_output_relay_outbox: Dict[
+            Tuple[str, str], Dict[int, Dict[str, Any]]
+        ] = {}
+        self.pd_flip_output_relay_retry_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self.pd_flip_output_relay_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        self.pd_flip_last_relay_seq_by_key: Dict[Tuple[str, str], int] = {}
+        self.pd_flip_relay_session_by_rid: Dict[str, str] = {}
+        # A P->D bootstrap handoff relays exactly one Prefill completion back
+        # to the original Prefill HTTP request.  Unlike a Decode completion,
+        # that response has no public finish reason, so remember the exact
+        # session/rid pairs whose first accepted relay is terminal for the
+        # source-side TokenizerManager request state.
+        self.pd_flip_prefill_handoff_receive_keys: Set[Tuple[str, str]] = set()
+        self.pd_flip_terminal_relay_tombstones: Dict[
+            Tuple[str, str], Tuple[int, float]
+        ] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -1803,6 +1824,679 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    @staticmethod
+    def _pd_flip_is_internal_migration_finish(finish_reason: Any) -> bool:
+        if hasattr(finish_reason, "to_json"):
+            finish_reason = finish_reason.to_json()
+        return (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "pd_flip_migrated"
+        )
+
+    @staticmethod
+    def _pd_flip_output_item(values: Any, index: int, default: Any = None) -> Any:
+        if values is None:
+            return default
+        try:
+            return values[index]
+        except (IndexError, KeyError, TypeError):
+            return default
+
+    @classmethod
+    def _pd_flip_json_safe(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "to_json"):
+            return cls._pd_flip_json_safe(value.to_json())
+        if isinstance(value, array):
+            return list(value)
+        if isinstance(value, torch.Tensor):
+            return pybase64.b64encode(
+                value.detach().cpu().numpy().tobytes()
+            ).decode("utf-8")
+        if isinstance(value, bytes):
+            return pybase64.b64encode(value).decode("utf-8")
+        if isinstance(value, tuple):
+            return [cls._pd_flip_json_safe(v) for v in value]
+        if isinstance(value, list):
+            return [cls._pd_flip_json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): cls._pd_flip_json_safe(v) for k, v in value.items()}
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        try:
+            json.dumps(value)
+            return value
+        except TypeError:
+            return str(value)
+
+    def _pd_flip_batch_output_payload(
+        self,
+        recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
+        index: int,
+        rid: str,
+    ) -> Dict[str, Any]:
+        if isinstance(recv_obj, BatchStrOutput):
+            kind = "BatchStrOutput"
+            defaults = {
+                "finished_reasons": None,
+                "output_strs": "",
+                "output_ids": [],
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "input_token_logprobs_val": [],
+                "input_token_logprobs_idx": [],
+                "output_token_logprobs_val": [],
+                "output_token_logprobs_idx": [],
+                "input_top_logprobs_val": [],
+                "input_top_logprobs_idx": [],
+                "output_top_logprobs_val": [],
+                "output_top_logprobs_idx": [],
+                "input_token_ids_logprobs_val": [],
+                "input_token_ids_logprobs_idx": [],
+                "output_token_ids_logprobs_val": [],
+                "output_token_ids_logprobs_idx": [],
+                "output_token_entropy_val": [],
+                "output_hidden_states": None,
+                "routed_experts": None,
+                "indexer_topk": None,
+                "placeholder_tokens_idx": None,
+                "placeholder_tokens_val": None,
+                "retraction_counts": 0,
+                "spec_verify_ct": 0,
+                "spec_num_correct_drafts": 0,
+                "spec_correct_drafts_histogram": [],
+                "token_steps": None,
+                "cached_tokens_details": None,
+                "dp_ranks": None,
+            }
+        else:
+            kind = "BatchTokenIDOutput"
+            defaults = {
+                "finished_reasons": None,
+                "decoded_texts": "",
+                "decode_ids": [],
+                "read_offsets": 0,
+                "output_ids": [],
+                "skip_special_tokens": True,
+                "spaces_between_special_tokens": True,
+                "no_stop_trim": False,
+                "prompt_tokens": 0,
+                "reasoning_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "input_token_logprobs_val": [],
+                "input_token_logprobs_idx": [],
+                "output_token_logprobs_val": [],
+                "output_token_logprobs_idx": [],
+                "input_top_logprobs_val": [],
+                "input_top_logprobs_idx": [],
+                "output_top_logprobs_val": [],
+                "output_top_logprobs_idx": [],
+                "input_token_ids_logprobs_val": [],
+                "input_token_ids_logprobs_idx": [],
+                "output_token_ids_logprobs_val": [],
+                "output_token_ids_logprobs_idx": [],
+                "output_token_entropy_val": [],
+                "output_hidden_states": None,
+                "routed_experts": None,
+                "indexer_topk": None,
+                "placeholder_tokens_idx": None,
+                "placeholder_tokens_val": None,
+                "retraction_counts": 0,
+                "spec_verify_ct": 0,
+                "spec_num_correct_drafts": 0,
+                "spec_correct_drafts_histogram": [],
+                "token_steps": None,
+                "cached_tokens_details": None,
+                "dp_ranks": None,
+            }
+
+        fields = {
+            name: self._pd_flip_json_safe(
+                self._pd_flip_output_item(getattr(recv_obj, name, None), index, default)
+            )
+            for name, default in defaults.items()
+        }
+        customized_info = getattr(recv_obj, "customized_info", None)
+        if customized_info is not None:
+            fields["customized_info"] = {
+                str(k): self._pd_flip_json_safe(
+                    self._pd_flip_output_item(v, index, [])
+                )
+                for k, v in customized_info.items()
+            }
+        else:
+            fields["customized_info"] = None
+
+        return {"kind": kind, "rid": rid, "fields": fields}
+
+    @staticmethod
+    def _pd_flip_wrap_required(fields: Dict[str, Any], name: str) -> List[Any]:
+        return [fields.get(name)]
+
+    @staticmethod
+    def _pd_flip_wrap_optional(fields: Dict[str, Any], name: str) -> Optional[List[Any]]:
+        value = fields.get(name)
+        if value is None:
+            return None
+        return [value]
+
+    def _pd_flip_batch_output_from_payload(
+        self, rid: str, payload: Dict[str, Any]
+    ) -> Union[BatchStrOutput, BatchTokenIDOutput]:
+        fields = payload.get("fields") or {}
+        customized_info = fields.get("customized_info")
+        if customized_info is not None:
+            customized_info = {k: [v] for k, v in customized_info.items()}
+
+        if payload.get("kind") == "BatchStrOutput":
+            return BatchStrOutput(
+                rids=[rid],
+                http_worker_ipcs=[None],
+                finished_reasons=self._pd_flip_wrap_required(
+                    fields, "finished_reasons"
+                ),
+                output_strs=self._pd_flip_wrap_required(fields, "output_strs"),
+                output_ids=self._pd_flip_wrap_required(fields, "output_ids"),
+                prompt_tokens=self._pd_flip_wrap_required(fields, "prompt_tokens"),
+                completion_tokens=self._pd_flip_wrap_required(
+                    fields, "completion_tokens"
+                ),
+                reasoning_tokens=self._pd_flip_wrap_required(
+                    fields, "reasoning_tokens"
+                ),
+                cached_tokens=self._pd_flip_wrap_required(fields, "cached_tokens"),
+                input_token_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_token_logprobs_val"
+                ),
+                input_token_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_token_logprobs_idx"
+                ),
+                output_token_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_token_logprobs_val"
+                ),
+                output_token_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_token_logprobs_idx"
+                ),
+                input_top_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_top_logprobs_val"
+                ),
+                input_top_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_top_logprobs_idx"
+                ),
+                output_top_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_top_logprobs_val"
+                ),
+                output_top_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_top_logprobs_idx"
+                ),
+                input_token_ids_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_token_ids_logprobs_val"
+                ),
+                input_token_ids_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_token_ids_logprobs_idx"
+                ),
+                output_token_ids_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_token_ids_logprobs_val"
+                ),
+                output_token_ids_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_token_ids_logprobs_idx"
+                ),
+                output_token_entropy_val=self._pd_flip_wrap_required(
+                    fields, "output_token_entropy_val"
+                ),
+                output_hidden_states=self._pd_flip_wrap_optional(
+                    fields, "output_hidden_states"
+                ),
+                routed_experts=self._pd_flip_wrap_optional(fields, "routed_experts"),
+                indexer_topk=self._pd_flip_wrap_optional(fields, "indexer_topk"),
+                placeholder_tokens_idx=self._pd_flip_wrap_optional(
+                    fields, "placeholder_tokens_idx"
+                ),
+                placeholder_tokens_val=self._pd_flip_wrap_optional(
+                    fields, "placeholder_tokens_val"
+                ),
+                retraction_counts=self._pd_flip_wrap_required(
+                    fields, "retraction_counts"
+                ),
+                spec_verify_ct=self._pd_flip_wrap_required(fields, "spec_verify_ct"),
+                spec_num_correct_drafts=self._pd_flip_wrap_required(
+                    fields, "spec_num_correct_drafts"
+                ),
+                spec_correct_drafts_histogram=self._pd_flip_wrap_required(
+                    fields, "spec_correct_drafts_histogram"
+                ),
+                token_steps=self._pd_flip_wrap_optional(fields, "token_steps"),
+                load=None,
+                customized_info=customized_info,
+                cached_tokens_details=self._pd_flip_wrap_optional(
+                    fields, "cached_tokens_details"
+                ),
+                dp_ranks=self._pd_flip_wrap_optional(fields, "dp_ranks"),
+                time_stats=None,
+            )
+
+        if payload.get("kind") == "BatchTokenIDOutput":
+            return BatchTokenIDOutput(
+                rids=[rid],
+                http_worker_ipcs=[None],
+                finished_reasons=self._pd_flip_wrap_required(
+                    fields, "finished_reasons"
+                ),
+                decoded_texts=self._pd_flip_wrap_required(fields, "decoded_texts"),
+                decode_ids=self._pd_flip_wrap_required(fields, "decode_ids"),
+                read_offsets=self._pd_flip_wrap_required(fields, "read_offsets"),
+                output_ids=self._pd_flip_wrap_optional(fields, "output_ids"),
+                skip_special_tokens=self._pd_flip_wrap_required(
+                    fields, "skip_special_tokens"
+                ),
+                spaces_between_special_tokens=self._pd_flip_wrap_required(
+                    fields, "spaces_between_special_tokens"
+                ),
+                no_stop_trim=self._pd_flip_wrap_required(fields, "no_stop_trim"),
+                prompt_tokens=self._pd_flip_wrap_required(fields, "prompt_tokens"),
+                reasoning_tokens=self._pd_flip_wrap_required(
+                    fields, "reasoning_tokens"
+                ),
+                completion_tokens=self._pd_flip_wrap_required(
+                    fields, "completion_tokens"
+                ),
+                cached_tokens=self._pd_flip_wrap_required(fields, "cached_tokens"),
+                input_token_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_token_logprobs_val"
+                ),
+                input_token_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_token_logprobs_idx"
+                ),
+                output_token_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_token_logprobs_val"
+                ),
+                output_token_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_token_logprobs_idx"
+                ),
+                input_top_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_top_logprobs_val"
+                ),
+                input_top_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_top_logprobs_idx"
+                ),
+                output_top_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_top_logprobs_val"
+                ),
+                output_top_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_top_logprobs_idx"
+                ),
+                input_token_ids_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "input_token_ids_logprobs_val"
+                ),
+                input_token_ids_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "input_token_ids_logprobs_idx"
+                ),
+                output_token_ids_logprobs_val=self._pd_flip_wrap_required(
+                    fields, "output_token_ids_logprobs_val"
+                ),
+                output_token_ids_logprobs_idx=self._pd_flip_wrap_required(
+                    fields, "output_token_ids_logprobs_idx"
+                ),
+                output_token_entropy_val=self._pd_flip_wrap_required(
+                    fields, "output_token_entropy_val"
+                ),
+                output_hidden_states=self._pd_flip_wrap_optional(
+                    fields, "output_hidden_states"
+                ),
+                routed_experts=self._pd_flip_wrap_optional(fields, "routed_experts"),
+                indexer_topk=self._pd_flip_wrap_optional(fields, "indexer_topk"),
+                placeholder_tokens_idx=self._pd_flip_wrap_optional(
+                    fields, "placeholder_tokens_idx"
+                ),
+                placeholder_tokens_val=self._pd_flip_wrap_optional(
+                    fields, "placeholder_tokens_val"
+                ),
+                retraction_counts=self._pd_flip_wrap_required(
+                    fields, "retraction_counts"
+                ),
+                spec_verify_ct=self._pd_flip_wrap_required(fields, "spec_verify_ct"),
+                spec_num_correct_drafts=self._pd_flip_wrap_required(
+                    fields, "spec_num_correct_drafts"
+                ),
+                spec_correct_drafts_histogram=self._pd_flip_wrap_required(
+                    fields, "spec_correct_drafts_histogram"
+                ),
+                token_steps=self._pd_flip_wrap_optional(fields, "token_steps"),
+                load=None,
+                customized_info=customized_info,
+                cached_tokens_details=self._pd_flip_wrap_optional(
+                    fields, "cached_tokens_details"
+                ),
+                dp_ranks=self._pd_flip_wrap_optional(fields, "dp_ranks"),
+                time_stats=None,
+            )
+
+        raise ValueError(f"Unsupported PD flip relay output kind: {payload.get('kind')}")
+
+    def _pd_flip_post_relay_output(
+        self,
+        source_url: str,
+        session_id: str,
+        rid: str,
+        output_seq: int,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        admin_api_key = getattr(self.server_args, "admin_api_key", None)
+        if not admin_api_key:
+            return {
+                "success": False,
+                "message": "PD flip relay requires a configured admin_api_key",
+            }
+        url = source_url.rstrip("/") + "/pd_flip/migration/output/relay"
+        data = json.dumps(
+            {
+                "rid": rid,
+                "session_id": session_id,
+                "output_seq": output_seq,
+                "output": payload,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {admin_api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8")
+                if not body:
+                    return {"success": True}
+                return json.loads(body)
+        except (
+            OSError,
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as exc:
+            return {"success": False, "message": str(exc)}
+
+    async def _pd_flip_flush_relay_key(self, relay_key: Tuple[str, str]) -> bool:
+        locks = getattr(self, "pd_flip_output_relay_locks", None)
+        if locks is None:
+            locks = {}
+            self.pd_flip_output_relay_locks = locks
+        lock = locks.setdefault(relay_key, asyncio.Lock())
+        async with lock:
+            return await self._pd_flip_flush_relay_key_locked(relay_key)
+
+    async def _pd_flip_flush_relay_key_locked(
+        self, relay_key: Tuple[str, str]
+    ) -> bool:
+        outboxes = getattr(self, "pd_flip_output_relay_outbox", {})
+        outbox = outboxes.get(relay_key)
+        if not outbox:
+            outboxes.pop(relay_key, None)
+            return True
+        for output_seq in sorted(outbox):
+            entry = outbox[output_seq]
+            result = await asyncio.to_thread(
+                self._pd_flip_post_relay_output,
+                entry["source_url"],
+                relay_key[0],
+                relay_key[1],
+                output_seq,
+                entry["payload"],
+            )
+            if not result.get("success"):
+                logger.error(
+                    "Failed to relay PD flip migrated output for %s to %s: %s",
+                    relay_key[1],
+                    entry["source_url"],
+                    result.get("message", result),
+                )
+                return False
+            self.pd_flip_output_relay_baseline[relay_key] = output_seq
+            outbox.pop(output_seq, None)
+            if entry["finished"]:
+                self.pd_flip_output_relay_targets.pop(relay_key, None)
+                self.pd_flip_output_relay_baseline.pop(relay_key, None)
+        if not outbox:
+            outboxes.pop(relay_key, None)
+        return True
+
+    def _pd_flip_ensure_relay_retry(self, relay_key: Tuple[str, str]) -> None:
+        tasks = getattr(self, "pd_flip_output_relay_retry_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self.pd_flip_output_relay_retry_tasks = tasks
+        task = tasks.get(relay_key)
+        if task is not None and not task.done():
+            return
+
+        async def retry_until_ack() -> None:
+            delay = 0.05
+            try:
+                while relay_key in self.pd_flip_output_relay_outbox:
+                    await asyncio.sleep(delay)
+                    if await self._pd_flip_flush_relay_key(relay_key):
+                        return
+                    delay = min(delay * 2, 5.0)
+            finally:
+                self.pd_flip_output_relay_retry_tasks.pop(relay_key, None)
+
+        task = asyncio.create_task(retry_until_ack())
+        tasks[relay_key] = task
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
+
+    async def _pd_flip_maybe_relay_output(
+        self,
+        recv_obj: Union[
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchTokenIDOutput,
+        ],
+        index: int,
+        rid: str,
+    ) -> bool:
+        session_id = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_session_ids", None), index, None
+        )
+        output_seq = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_output_seqs", None), index, None
+        )
+        if session_id is None or output_seq is None:
+            return False
+        session_id = str(session_id)
+        output_seq = int(output_seq)
+        relay_key = (session_id, rid)
+        source_url = self.pd_flip_output_relay_targets.get(relay_key)
+        if not source_url:
+            return False
+        if output_seq <= int(self.pd_flip_output_relay_baseline.get(relay_key, 0)):
+            return True
+        if isinstance(recv_obj, BatchEmbeddingOutput):
+            logger.warning(
+                "PD flip output relay does not support embedding output for %s", rid
+            )
+            return True
+
+        payload = self._pd_flip_batch_output_payload(recv_obj, index, rid)
+        outboxes = getattr(self, "pd_flip_output_relay_outbox", None)
+        if outboxes is None:
+            outboxes = {}
+            self.pd_flip_output_relay_outbox = outboxes
+        outbox = outboxes.setdefault(relay_key, {})
+        outbox.setdefault(
+            output_seq,
+            {
+                "source_url": source_url,
+                "payload": payload,
+                "finished": self._pd_flip_output_item(
+                    getattr(recv_obj, "finished_reasons", None), index
+                )
+                is not None,
+            },
+        )
+        if not await self._pd_flip_flush_relay_key(relay_key):
+            self._pd_flip_ensure_relay_retry(relay_key)
+        return True
+
+    async def relay_pd_flip_migration_output(self, obj: PDFlipMigrationOutputRelayReq):
+        rid = obj.rid or (obj.output or {}).get("rid")
+        if isinstance(rid, list):
+            rid = rid[0] if rid else None
+        if not rid:
+            return {"success": False, "message": "missing migrated rid"}
+        rid = str(rid)
+        if not obj.session_id:
+            return {"success": False, "message": "missing migration session_id"}
+        relay_key = (str(obj.session_id), rid)
+        try:
+            output_seq = int(obj.output_seq)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "missing migrated output_seq"}
+        self._pd_flip_prune_terminal_relay_tombstones()
+        tombstone = getattr(self, "pd_flip_terminal_relay_tombstones", {}).get(
+            relay_key
+        )
+        if tombstone is not None and output_seq <= tombstone[0]:
+            return {"success": True, "duplicate_terminal": True}
+        if (
+            relay_key not in self.pd_flip_last_relay_seq_by_key
+            or self.pd_flip_relay_session_by_rid.get(rid) != str(obj.session_id)
+        ):
+            return {"success": False, "message": "unknown migration session/rid"}
+        if rid not in self.rid_to_state:
+            return {"success": False, "message": "unknown migrated rid"}
+        try:
+            output = self._pd_flip_batch_output_from_payload(rid, obj.output or {})
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+        output.pd_flip_session_ids = [str(obj.session_id)]
+        output.pd_flip_output_seqs = [output_seq]
+        force_terminal_rids = None
+        if relay_key in getattr(self, "pd_flip_prefill_handoff_receive_keys", set()):
+            force_terminal_rids = {rid}
+        if force_terminal_rids:
+            await self._handle_batch_output(
+                output,
+                pd_flip_force_terminal_rids=force_terminal_rids,
+            )
+        else:
+            await self._handle_batch_output(output)
+        if rid not in self.rid_to_state:
+            if force_terminal_rids:
+                logger.info(
+                    "Finalized PD flip Prefill handoff relay state for rid=%s "
+                    "session_id=%s output_seq=%s",
+                    rid,
+                    obj.session_id,
+                    output_seq,
+                )
+            getattr(self, "pd_flip_prefill_handoff_receive_keys", set()).discard(
+                relay_key
+            )
+            self._pd_flip_record_terminal_relay_tombstone(relay_key, output_seq)
+        return {"success": True}
+
+    def _pd_flip_prune_terminal_relay_tombstones(self) -> None:
+        tombstones = getattr(self, "pd_flip_terminal_relay_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self.pd_flip_terminal_relay_tombstones = tombstones
+        cutoff = time.monotonic() - 600.0
+        for key, (_, created) in list(tombstones.items()):
+            if created < cutoff:
+                tombstones.pop(key, None)
+        while len(tombstones) > 4096:
+            tombstones.pop(next(iter(tombstones)))
+
+    def _pd_flip_record_terminal_relay_tombstone(
+        self, relay_key: Tuple[str, str], output_seq: int
+    ) -> None:
+        tombstones = getattr(self, "pd_flip_terminal_relay_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self.pd_flip_terminal_relay_tombstones = tombstones
+        tombstones.pop(relay_key, None)
+        tombstones[relay_key] = (int(output_seq), time.monotonic())
+        self._pd_flip_prune_terminal_relay_tombstones()
+
+    def _pd_flip_drop_or_record_output_seq(
+        self, recv_obj, index: int, rid: str
+    ) -> bool:
+        session_id = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_session_ids", None), index, None
+        )
+        output_seq = self._pd_flip_output_item(
+            getattr(recv_obj, "pd_flip_output_seqs", None), index, None
+        )
+        if session_id is None or output_seq is None:
+            return False
+        relay_key = (str(session_id), str(rid))
+        if relay_key not in self.pd_flip_last_relay_seq_by_key:
+            return False
+        output_seq = int(output_seq)
+        if output_seq <= int(self.pd_flip_last_relay_seq_by_key[relay_key]):
+            return True
+        self.pd_flip_last_relay_seq_by_key[relay_key] = output_seq
+        return False
+
+    def _pd_flip_clear_session_relay_state(
+        self, session_id: Optional[str], *, keep_receive: bool = False
+    ) -> None:
+        if not session_id:
+            return
+        session_id = str(session_id)
+        receive_keys = getattr(self, "pd_flip_prefill_handoff_receive_keys", set())
+        for key in [key for key in receive_keys if key[0] == session_id]:
+            receive_keys.discard(key)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_terminal_relay_tombstones", {})
+            if key[0] == session_id
+        ]:
+            self.pd_flip_terminal_relay_tombstones.pop(key, None)
+        for mapping in (
+            self.pd_flip_output_relay_targets,
+            self.pd_flip_output_relay_baseline,
+            getattr(self, "pd_flip_output_relay_outbox", {}),
+        ):
+            for key in [key for key in mapping if key[0] == session_id]:
+                mapping.pop(key, None)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_output_relay_locks", {})
+            if key[0] == session_id
+        ]:
+            self.pd_flip_output_relay_locks.pop(key, None)
+        for key in [
+            key
+            for key in getattr(self, "pd_flip_output_relay_retry_tasks", {})
+            if key[0] == session_id
+        ]:
+            task = self.pd_flip_output_relay_retry_tasks.pop(key)
+            task.cancel()
+        if not keep_receive:
+            for key in [
+                key
+                for key in self.pd_flip_last_relay_seq_by_key
+                if key[0] == session_id
+            ]:
+                self.pd_flip_last_relay_seq_by_key.pop(key, None)
+            for rid, bound_session_id in list(
+                self.pd_flip_relay_session_by_rid.items()
+            ):
+                if bound_session_id == session_id:
+                    self.pd_flip_relay_session_by_rid.pop(rid, None)
+
     async def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -1810,12 +2504,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
         ],
+        pd_flip_force_terminal_rids: Optional[Set[str]] = None,
     ):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            # FINISH_MIGRATED is a source-local ownership marker emitted after
+            # the handoff manifest captured last_emitted_output_seq.  It must
+            # not advance the receiver-side relay baseline: the target resumes
+            # from the manifest boundary and its first real output otherwise
+            # collides with this internal marker's sequence number.
+            is_internal_migration_finish = self._pd_flip_is_internal_migration_finish(
+                self._pd_flip_output_item(
+                    getattr(recv_obj, "finished_reasons", None), i, None
+                )
+            )
+            if (
+                not is_internal_migration_finish
+                and self._pd_flip_drop_or_record_output_seq(recv_obj, i, rid)
+            ):
+                continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                if await self._pd_flip_maybe_relay_output(recv_obj, i, rid):
+                    continue
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
@@ -1907,7 +2619,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
-            state.finished = recv_obj.finished_reasons[i] is not None
+            if is_internal_migration_finish:
+                state.obj.pd_flip_waiting_for_relay_output = True
+                continue
+
+            state.finished = (
+                recv_obj.finished_reasons[i] is not None
+                or (
+                    pd_flip_force_terminal_rids is not None
+                    and str(rid) in pd_flip_force_terminal_rids
+                )
+            )
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
@@ -2045,6 +2767,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                session_id = self._pd_flip_output_item(
+                    getattr(recv_obj, "pd_flip_session_ids", None), i, None
+                )
+                if session_id is not None:
+                    self.pd_flip_last_relay_seq_by_key.pop(
+                        (str(session_id), str(rid)), None
+                    )
+                    if self.pd_flip_relay_session_by_rid.get(str(rid)) == str(
+                        session_id
+                    ):
+                        self.pd_flip_relay_session_by_rid.pop(str(rid), None)
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:

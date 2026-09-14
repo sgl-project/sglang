@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FAKE_BOOTSTRAP_HOST,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -522,22 +523,270 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return None
 
     def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
-        backend = (
-            TransferBackend.FAKE
-            if _is_fake_transfer(req, self.scheduler.server_args)
-            else self.transfer_backend
-        )
-        kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
-
-        kv_receiver = kv_receiver_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
-            bootstrap_room=req.bootstrap_room,
-        )
+        kv_receiver = self._create_receiver(req)
 
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
         self.queue.append(decode_req)
         return decode_req
+
+    def _create_receiver(self, req: Req):
+        is_fake_transfer = _is_fake_transfer(req, self.scheduler.server_args)
+        backend = TransferBackend.FAKE if is_fake_transfer else self.transfer_backend
+        kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
+        bootstrap_addr = (
+            f"{FAKE_BOOTSTRAP_HOST}:0" if is_fake_transfer else _bootstrap_addr(req)
+        )
+
+        return kv_receiver_class(
+            mgr=self.kv_manager,
+            bootstrap_addr=bootstrap_addr,
+            bootstrap_room=req.bootstrap_room,
+        )
+
+    def rebind_bootstrap(
+        self,
+        *,
+        rid: str,
+        original_bootstrap_room: int,
+        target_prefill_host: str,
+        target_bootstrap_port: int,
+        migration_bootstrap_room: int,
+        session_id: Optional[str] = None,
+    ) -> DecodeRequest:
+        """Rebind a bootstrap request that has not received transfer metadata.
+
+        Requests can move from DecodePreallocQueue to DecodeTransferQueue while
+        they are still waiting for their Prefill sender. They remain safe to
+        rebind even after destination KV and transfer metadata are allocated:
+        commit rolls those resources back while the old Prefill sender is
+        frozen. Compute requests are never visible here and are deliberately
+        not preempted by a P->D role flip.
+        """
+        self.validate_rebind_bootstrap(
+            rid=rid,
+            original_bootstrap_room=original_bootstrap_room,
+            migration_bootstrap_room=migration_bootstrap_room,
+            session_id=session_id,
+        )
+        matches = self._rebind_bootstrap_matches(
+            rid=rid,
+            original_bootstrap_room=original_bootstrap_room,
+            migration_bootstrap_room=migration_bootstrap_room,
+        )
+
+        decode_req = matches[0]
+        req = decode_req.req
+        handoff_timing = getattr(req, "pd_flip_prefill_handoff_timing", None)
+        if not isinstance(handoff_timing, dict):
+            handoff_timing = {}
+            req.pd_flip_prefill_handoff_timing = handoff_timing
+        handoff_timing.setdefault(
+            "decode_receiver_rebind_started_mono", time.monotonic()
+        )
+        handoff_timing.setdefault(
+            "decode_receiver_rebind_started_epoch", time.time()
+        )
+        if (
+            int(req.bootstrap_room) == int(migration_bootstrap_room)
+            and str(req.bootstrap_host) == str(target_prefill_host)
+            and int(req.bootstrap_port) == int(target_bootstrap_port)
+        ):
+            return decode_req
+
+        in_transfer_queue = decode_req in self.transfer_queue.queue
+        if in_transfer_queue:
+            # The old Prefill sender is frozen before Decode commit, so a
+            # transfer-queue request cannot receive valid KV data. Roll back
+            # its destination allocation and metadata slot, then let normal
+            # preallocation rebuild both for the new Prefill receiver.
+            self.transfer_queue.queue.remove(decode_req)
+            if (
+                self.transfer_queue.enable_staging
+                and self.transfer_queue.staging_handler is not None
+                and self.transfer_queue.staging_handler.is_staging_room(
+                    req.bootstrap_room
+                )
+            ):
+                self.transfer_queue.staging_handler.unregister_decode_req(
+                    req.bootstrap_room
+                )
+            metadata_index = int(
+                getattr(decode_req, "metadata_buffer_index", -1)
+            )
+            if metadata_index >= 0:
+                self.transfer_queue.metadata_buffers.bootstrap_room[
+                    metadata_index
+                ] = 0
+                self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+                decode_req.metadata_buffer_index = -1
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            # ``release_kv_cache`` marks the request's committed and
+            # overallocated KV ranges as freed.  This request is about to be
+            # preallocated again for the replacement Prefill sender, so reset
+            # all allocation bookkeeping before reusing it.  Preserve the
+            # compute-retraction fields: moving a request that has not started
+            # Decode compute is a bootstrap rebind, not a scheduler preemption.
+            retraction_count = req.retraction_count
+            is_retracted = req.is_retracted
+            retracted_stain = req.retracted_stain
+            req.reset_for_retract()
+            req.retraction_count = retraction_count
+            req.is_retracted = is_retracted
+            req.retracted_stain = retracted_stain
+            decode_req.prefix_match = None
+            self.queue.append(decode_req)
+            in_transfer_queue = False
+        if not in_transfer_queue:
+            self.pending_reqs = [
+                item for item in self.pending_reqs if item is not decode_req
+            ]
+        decode_req.kv_receiver.abort()
+        decode_req.kv_receiver.clear()
+        handoff_timing.setdefault(
+            "decode_old_receiver_cleared_mono", time.monotonic()
+        )
+        handoff_timing.setdefault(
+            "decode_old_receiver_cleared_epoch", time.time()
+        )
+
+        req.bootstrap_host = str(target_prefill_host)
+        req.bootstrap_port = int(target_bootstrap_port)
+        req.bootstrap_room = int(migration_bootstrap_room)
+        req.disagg_prefill_dp_rank = None
+        decode_req.kv_receiver = self._create_receiver(req)
+        handoff_timing.setdefault(
+            "decode_receiver_created_mono", time.monotonic()
+        )
+        handoff_timing.setdefault(
+            "decode_receiver_created_epoch", time.time()
+        )
+        decode_req.waiting_for_input = False
+        req.pd_flip_prefill_handoff_reserved_session_id = None
+
+        if _is_fake_transfer(req, self.scheduler.server_args):
+            decode_req.kv_receiver.init(0)
+            handoff_timing.setdefault(
+                "decode_receiver_initialized_mono", time.monotonic()
+            )
+            handoff_timing.setdefault(
+                "decode_receiver_initialized_epoch", time.time()
+            )
+        else:
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is None:
+                handoff_timing.setdefault(
+                    "decode_parallel_info_wait_started_mono", time.monotonic()
+                )
+                handoff_timing.setdefault(
+                    "decode_parallel_info_wait_started_epoch", time.time()
+                )
+                if in_transfer_queue:
+                    raise ValueError(
+                        f"cannot resolve target prefill DP rank for transfer request {rid}"
+                    )
+                self.pending_reqs.append(decode_req)
+            else:
+                decode_req.kv_receiver.init(prefill_dp_rank)
+                handoff_timing.setdefault(
+                    "decode_receiver_initialized_mono", time.monotonic()
+                )
+                handoff_timing.setdefault(
+                    "decode_receiver_initialized_epoch", time.time()
+                )
+        return decode_req
+
+    def _rebind_bootstrap_matches(
+        self,
+        *,
+        rid: str,
+        original_bootstrap_room: int,
+        migration_bootstrap_room: int,
+    ) -> List[DecodeRequest]:
+        prealloc_matches = [
+            decode_req
+            for decode_req in self.queue
+            if str(decode_req.req.rid) == str(rid)
+            and int(decode_req.req.bootstrap_room)
+            in {int(original_bootstrap_room), int(migration_bootstrap_room)}
+        ]
+        transfer_matches = [
+            decode_req
+            for decode_req in self.transfer_queue.queue
+            if str(decode_req.req.rid) == str(rid)
+            and int(decode_req.req.bootstrap_room)
+            in {int(original_bootstrap_room), int(migration_bootstrap_room)}
+        ]
+        return prealloc_matches + transfer_matches
+
+    def validate_rebind_bootstrap(
+        self,
+        *,
+        rid: str,
+        original_bootstrap_room: int,
+        migration_bootstrap_room: int,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Validate a rebind without mutating receiver or queue state."""
+        matches = self._rebind_bootstrap_matches(
+            rid=rid,
+            original_bootstrap_room=original_bootstrap_room,
+            migration_bootstrap_room=migration_bootstrap_room,
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "expected exactly one decode bootstrap request for "
+                f"rid={rid} room={original_bootstrap_room}, found {len(matches)}"
+            )
+
+        decode_req = matches[0]
+        req = decode_req.req
+        reservation = getattr(
+            req, "pd_flip_prefill_handoff_reserved_session_id", None
+        )
+        if reservation is not None and str(reservation) != str(session_id):
+            raise ValueError(
+                f"decode request {rid} is reserved by another handoff session"
+            )
+        # Running requests are never visible in either queue. A request in
+        # DecodeTransferQueue may already own destination KV and a metadata
+        # slot, but it is still safe to reserve because the matching Prefill
+        # sender has been frozen before this prepare. Commit rolls that
+        # preallocation back before constructing the new receiver.
+
+    def reserve_rebind_bootstrap(
+        self,
+        *,
+        session_id: str,
+        rid: str,
+        original_bootstrap_room: int,
+        migration_bootstrap_room: int,
+    ) -> DecodeRequest:
+        """Reserve one bootstrap receiver after a read-only prepare check."""
+        self.validate_rebind_bootstrap(
+            rid=rid,
+            original_bootstrap_room=original_bootstrap_room,
+            migration_bootstrap_room=migration_bootstrap_room,
+            session_id=session_id,
+        )
+        decode_req = self._rebind_bootstrap_matches(
+            rid=rid,
+            original_bootstrap_room=original_bootstrap_room,
+            migration_bootstrap_room=migration_bootstrap_room,
+        )[0]
+        decode_req.req.pd_flip_prefill_handoff_reserved_session_id = str(
+            session_id
+        )
+        return decode_req
+
+    @staticmethod
+    def release_rebind_bootstrap_reservation(
+        decode_req: DecodeRequest, session_id: str
+    ) -> None:
+        req = decode_req.req
+        if str(
+            getattr(req, "pd_flip_prefill_handoff_reserved_session_id", None)
+        ) == str(session_id):
+            req.pd_flip_prefill_handoff_reserved_session_id = None
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -564,6 +813,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
+
+    def release_memory_occupation(self, preserve_registered_buffers=False):
+        self.queue.clear()
+        self.retracted_queue.clear()
+        if preserve_registered_buffers and hasattr(
+            self.kv_manager, "preserve_buffer_registration_for_reuse"
+        ):
+            self.kv_manager.preserve_buffer_registration_for_reuse()
+            if hasattr(self.kv_manager, "close_for_hot_reconfigure"):
+                self.kv_manager.close_for_hot_reconfigure()
+        elif hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
@@ -640,6 +905,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                handoff_timing = getattr(
+                    decode_req.req, "pd_flip_prefill_handoff_timing", None
+                )
+                if isinstance(handoff_timing, dict):
+                    handoff_timing.setdefault(
+                        "decode_handshake_ready_mono", time.monotonic()
+                    )
+                    handoff_timing.setdefault(
+                        "decode_handshake_ready_epoch", time.time()
+                    )
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -749,6 +1024,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
+            handoff_timing = getattr(
+                decode_req.req, "pd_flip_prefill_handoff_timing", None
+            )
+            if isinstance(handoff_timing, dict):
+                handoff_timing.setdefault(
+                    "decode_parallel_info_ready_mono", time.monotonic()
+                )
+                handoff_timing.setdefault(
+                    "decode_parallel_info_ready_epoch", time.time()
+                )
+                handoff_timing.setdefault(
+                    "decode_receiver_initialized_mono", time.monotonic()
+                )
+                handoff_timing.setdefault(
+                    "decode_receiver_initialized_epoch", time.time()
+                )
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -829,6 +1120,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if i in indices_to_remove:
+                continue
+
+            # A prepared P->D handoff owns this receiver until every Decode
+            # owner has prepared and the controller commits or aborts.  Do not
+            # allocate transfer metadata in between those two phases.
+            if getattr(
+                decode_req.req,
+                "pd_flip_prefill_handoff_reserved_session_id",
+                None,
+            ) is not None:
                 continue
 
             if not decode_req.waiting_for_input:
@@ -1245,6 +1546,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        fill_len_override: Optional[int] = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -1252,7 +1554,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         backed by ``prefix_indices``). ``total_prefix_len`` is the full
         prefix committed to prefill as ``decode_prefix_len`` (L1 + L2 + L3);
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
-        loadback.
+        loadback. ``fill_len_override`` preserves an authoritative migration
+        snapshot boundary when output_ids trails committed KV by one token.
         """
         if prefix_len is None:
             prefix_len = 0
@@ -1265,7 +1568,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        fill_len = (
+            int(fill_len_override)
+            if fill_len_override is not None
+            else len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        )
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
@@ -1698,17 +2005,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         return transferred_reqs
 
+    def release_memory_occupation(self, preserve_registered_buffers=False):
+        """Clean up in-flight transfers before releasing GPU memory."""
+        self.queue.clear()
+
+    def resume_memory_occupation(self):
+        """Queues are already cleared on release; new transfers can be accepted."""
+        pass
+
 
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        self.active_pd_event_loop_role = "decode"
+        try:
+            self._event_loop_normal_disagg_decode_impl()
+        finally:
+            if self.active_pd_event_loop_role == "decode":
+                self.active_pd_event_loop_role = None
 
+    def _event_loop_normal_disagg_decode_impl(self: Scheduler):
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            if self._pd_flip_maybe_enter_batch_quiesce():
+                continue
             if self._engine_paused:
                 continue
 
@@ -1729,14 +2055,42 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        self.active_pd_event_loop_role = "decode"
+        try:
+            self._event_loop_overlap_disagg_decode_impl()
+        finally:
+            if self.active_pd_event_loop_role == "decode":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_overlap_disagg_decode_impl(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.DECODE):
+                if self.result_queue:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                    continue
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+
+            # A cutover request must observe the last launched result before it
+            # freezes scheduling.  Control requests continue to be polled by
+            # the outer loop while the batch is quiesced.
+            if getattr(self, "pd_flip_quiesce_requested", False):
+                if self.result_queue:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                self._pd_flip_maybe_enter_batch_quiesce()
+                continue
             if self._engine_paused:
                 continue
 
@@ -1845,11 +2199,21 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if self.server_args.disaggregation_decode_enable_radix_cache:
+                pd_flip_prebuilt_kv_ready = bool(
+                    getattr(req, "pd_flip_prebuilt_kv_ready", False)
+                )
+                if pd_flip_prebuilt_kv_ready:
+                    # PD-flip migration already populated req_to_token and its
+                    # prefix ownership fields.  A fresh radix match would only
+                    # change the ownership metadata, not the received mapping.
+                    tree_cache = None
+                elif self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
+                if pd_flip_prebuilt_kv_ready:
+                    req.pd_flip_prebuilt_kv_ready = False
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).

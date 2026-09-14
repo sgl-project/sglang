@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+SGLANG_PD_FLIP_BATCH_PROFILE = get_bool_env_var(
+    "SGLANG_PD_FLIP_BATCH_PROFILE"
+)
 
 
 logger = logging.getLogger(__name__)
@@ -995,7 +999,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
-
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
                     queue_duration >= 0 and forward_duration >= 0
@@ -1003,6 +1006,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
+            pending_duration = self.duration_between(
+                self.prefill_bootstrap_queue_entry_time, self.forward_entry_time
+            )
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
@@ -1012,14 +1018,41 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
+            prefill_compute_duration = self.duration_between(
+                self.forward_entry_time, self.prefill_finished_time
+            )
+            transfer_prepare_duration = self.duration_between(
+                self.prefill_finished_time, self.prefill_transfer_queue_entry_time
+            )
+            transfer_duration = self.duration_between(
+                self.prefill_transfer_queue_entry_time,
+                self.prefill_kv_transfer_finish_time,
+            )
+            completion_duration = self.duration_between(
+                self.prefill_kv_transfer_finish_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
                     assert (
                         bootstrap_queue_duration >= 0
+                        and pending_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                        and prefill_compute_duration >= 0
+                        and transfer_prepare_duration >= 0
+                        and transfer_duration >= 0
+                        and completion_duration >= 0
+                    ), (
+                        f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or "
+                        f"pending_duration={pending_duration} < 0 or "
+                        f"queue_duration={queue_duration} < 0 or "
+                        f"forward_duration={forward_duration} < 0 or "
+                        f"prefill_compute_duration={prefill_compute_duration} < 0 or "
+                        f"transfer_prepare_duration={transfer_prepare_duration} < 0 or "
+                        f"transfer_duration={transfer_duration} < 0 or "
+                        f"completion_duration={completion_duration} < 0"
+                    )
 
             if (
                 self.bootstrap_done_time > 0
@@ -1042,7 +1075,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return (
                 f"{bootstrap_fields}"
+                f"pending_duration={self.format_duration(pending_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
+                f"prefill_compute_duration={self.format_duration(prefill_compute_duration)}, "
+                f"transfer_prepare_duration={self.format_duration(transfer_prepare_duration)}, "
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"completion_duration={self.format_duration(completion_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
@@ -1136,8 +1174,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):
-    # only for tracing
-    if not get_global_tracing_enabled():
+    tracing_enabled = get_global_tracing_enabled()
+    if not tracing_enabled and not SGLANG_PD_FLIP_BATCH_PROFILE:
         return
 
     ts = time.perf_counter()
@@ -1149,6 +1187,24 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         _attrs["forward_mode"] = "prefill"
     elif batch.forward_mode.is_prebuilt():
         _attrs["forward_mode"] = "prebuilt"
+
+    if SGLANG_PD_FLIP_BATCH_PROFILE:
+        logger.info(
+            "PD_FLIP_BATCH_PROFILE %s",
+            json.dumps(
+                {
+                    "batch_id": bid,
+                    "batch_size": len(batch.reqs),
+                    "event_time": convert_time_to_realtime(ts),
+                    "forward_mode": _attrs.get("forward_mode", "other"),
+                    "request_ids": [
+                        str(getattr(req, "rid", "")) for req in batch.reqs
+                    ],
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
 
     for req in batch.reqs:
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)

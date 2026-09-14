@@ -293,12 +293,14 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                pd_flip_router_admin_api_key: None,
             },
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy: PolicyKind::RoundRobin,
+                decode_policy: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,

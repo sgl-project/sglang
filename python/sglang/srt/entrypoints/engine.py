@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import dataclasses
 import logging
 import multiprocessing as mp
@@ -114,6 +115,21 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
+
+_SERVER_ARGS_LOG_SECRET_FIELDS = (
+    "api_key",
+    "admin_api_key",
+    "ssl_keyfile_password",
+)
+
+
+def _redact_server_args_for_logging(server_args: ServerArgs) -> ServerArgs:
+    """Return a shallow copy whose credential fields are safe to log."""
+    redacted_args = copy.copy(server_args)
+    for field_name in _SERVER_ARGS_LOG_SECRET_FIELDS:
+        if getattr(redacted_args, field_name, None) is not None:
+            setattr(redacted_args, field_name, "<redacted>")
+    return redacted_args
 
 
 @dataclasses.dataclass
@@ -217,7 +233,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
-        logger.info(f"{server_args=}")
+        logger.info(
+            "server_args=%r", _redact_server_args_for_logging(server_args)
+        )
 
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
@@ -784,7 +802,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # Allocate ports for inter-process communications
         if port_args is None:
             port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+        logger.info(
+            "server_args=%r", _redact_server_args_for_logging(server_args)
+        )
 
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None

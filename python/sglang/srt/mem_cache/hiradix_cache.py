@@ -960,14 +960,19 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(end_node)
             finish_count -= 1
 
-    def is_load_back_event_done(self, consumer_index: int) -> bool:
+    def is_load_back_event_done(self, consumer_ticket: int) -> bool:
         """Return True after the local load-back event is complete."""
-        if consumer_index < 0:
+        if consumer_ticket < 0:
             return True
 
-        finish_event = self.cache_controller.layer_done_counter.events[
-            consumer_index
-        ].finish_event
+        counter = self.cache_controller.layer_done_counter
+        if counter.is_ticket_superseded(consumer_ticket):
+            # Reusing a ring slot requires its previous finish event to be
+            # complete, so an older generation is necessarily done.
+            self.loading_check()
+            return True
+        consumer_index = counter.ticket_index(consumer_ticket)
+        finish_event = counter.events[consumer_index].finish_event
         if not finish_event.query():
             return False
 
@@ -1274,6 +1279,10 @@ class HiRadixCache(RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         return self.cache_controller.start_loading()
+
+    def ready_to_load_host_cache_with_ticket(self) -> int:
+        """Start loading and return a generation-stamped completion ticket."""
+        return self.cache_controller.start_loading(return_ticket=True)
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()

@@ -103,12 +103,14 @@ impl AppContext {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
+                    pd_flip_router_admin_api_key: None,
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
                     tokenizer_path: "stub".into(),
                     policy: crate::config::PolicyKind::RoundRobin,
+                    decode_policy: None,
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,

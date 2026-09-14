@@ -75,6 +75,26 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    route_completions(ctx, headers, body, "/v1/chat/completions").await
+}
+
+/// POST /v1/completions -- route a raw-completions request through the same
+/// worker selection and PD bootstrap path without applying a chat template or
+/// changing the request body.
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    route_completions(ctx, headers, body, "/v1/completions").await
+}
+
+async fn route_completions(
+    ctx: Arc<AppContext>,
+    headers: HeaderMap,
+    body: Bytes,
+    upstream_path: &'static str,
+) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
@@ -127,10 +147,10 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             })?;
 
-    // PD-mode decoder affinity. When the selected prefill worker is
-    // part of a PD-disagg deployment, also resolve the matching decode
-    // peer (same host where possible, falling back to min-load via
-    // `select_decode_with_affinity`). Both workers receive the SAME
+    // PD-mode Decode selection. An explicitly configured Decode policy is
+    // applied to the healthy Decode pool independently of the Prefill policy.
+    // Without one, preserve the historical same-host affinity fallback.
+    // Both workers receive the SAME
     // request body — augmented with the three flat `bootstrap_*`
     // fields below — so the SGLang engine can match incoming KV
     // transfers via `bootstrap_room`.
@@ -140,7 +160,24 @@ pub async fn chat_completions(
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        Some(
+        let decode = if let Some(decode_policy) = ctx.policies.get_decode(&model_id) {
+            let candidates = resolver.decode_candidates(&model_id).map_err(|e| match e {
+                PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                    model: model_str.clone(),
+                },
+                PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                    model: model_str.clone(),
+                },
+                PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                    model: model_str.clone(),
+                },
+            })?;
+            decode_policy
+                .select(&candidates, &selection_ctx)
+                .ok_or_else(|| ApiError::PolicySelectionFailed {
+                    model: model_str.clone(),
+                })?
+        } else {
             resolver
                 .decode_with_affinity(&model_id, &worker.url)
                 .map_err(|e| match e {
@@ -157,8 +194,9 @@ pub async fn chat_completions(
                             model: model_str.clone(),
                         }
                     }
-                })?,
-        )
+                })?
+        };
+        Some(decode)
     } else {
         None
     };
@@ -194,10 +232,10 @@ pub async fn chat_completions(
     // ends, the client disconnects, or the handler returns an error. In
     // PD mode the pair moves into the spawned prefill task so prefill
     // load is tracked for the full duration of the KV transfer; in plain
-    // mode the pair stays in this handler. Decode-load contribution is
-    // 0 here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler — current decode selection is
-    // host-affinity only.
+    // mode the pair stays in this handler. Decode selection uses the
+    // Decode worker's `active_requests` counter below when an independent
+    // load-based Decode policy is configured; the token-weighted active-load
+    // registry remains a Prefill-side signal here.
     let guard = worker.load_guard();
     let prefill_load = estimate_prefill_tokens(&body);
     let active_guard =
@@ -284,7 +322,7 @@ pub async fn chat_completions(
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
-                    "/v1/chat/completions",
+                    upstream_path,
                     &prefill_headers,
                     prefill_body,
                 )
@@ -314,7 +352,7 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                "/v1/chat/completions",
+                upstream_path,
                 &headers,
                 injected_body,
                 Some(stream_guards),
@@ -329,7 +367,7 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                "/v1/chat/completions",
+                upstream_path,
                 &headers,
                 injected_body,
             );
@@ -347,7 +385,7 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            "/v1/chat/completions",
+            upstream_path,
             &headers,
             body,
             Some(stream_guards),
@@ -371,13 +409,9 @@ pub async fn chat_completions(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds: (LoadGuard, _) = (guard, active_guard);
-        let fetch = ctx.proxy.forward_json_to(
-            &worker.url,
-            &worker.breaker,
-            "/v1/chat/completions",
-            &headers,
-            body,
-        );
+        let fetch =
+            ctx.proxy
+                .forward_json_to(&worker.url, &worker.breaker, upstream_path, &headers, body);
         // Same `biased` order as the streaming arm.
         tokio::select! {
             biased;
@@ -431,14 +465,14 @@ pub async fn chat_completions(
     tracing::info!(
         request_id = %request_id,
         method = "POST",
-        path = "/v1/chat/completions",
+        path = upstream_path,
         model = %metrics_model,
         worker = %metrics_worker_url,
         outcome = outcome_str,
         http_status,
         stream = streaming,
         latency_ms = start.elapsed().as_millis() as u64,
-        "chat_completions",
+        "completions_request",
     );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so

@@ -36,12 +36,14 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::Sticky,
+            decode_policy: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: Some(StickyConfig {

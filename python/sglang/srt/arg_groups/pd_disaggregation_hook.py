@@ -66,7 +66,15 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
-        server_args.disable_cuda_graph = True
+        # A cache-hot-reconfigurable worker may later become Decode without
+        # reloading its weights.  Keep the decode graph configuration intact;
+        # the normal per-phase compatibility pass still disables Prefill
+        # graphs for PD disaggregation. ModelRunner normally captures only the
+        # active-role graph; the explicit resident-Decode option captures the
+        # Decode graph during pre-measurement role warmup and keeps it dormant
+        # while Prefill is active.
+        if not server_args.enable_pd_runtime_cache_hot_reconfigure:
+            server_args.disable_cuda_graph = True
 
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (

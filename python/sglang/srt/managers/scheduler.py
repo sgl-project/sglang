@@ -15,7 +15,10 @@
 
 import dataclasses
 import faulthandler
+import hashlib
+import json
 import logging
+import numbers
 import os
 import signal
 import sys
@@ -25,7 +28,9 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -43,14 +48,26 @@ from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.flip_state_machine import (
+    ClusterSnapshot,
+    FlipDecision,
+    FlipDirection,
+    FlipEvent,
+    FlipState,
+    FlipStateMachine,
+    FlipTransition,
+    SLOThresholdFlipEvaluator,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -58,9 +75,12 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_kv_class,
+    is_mla_backend,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -124,6 +144,34 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetActivateReq,
+    PDFlipMigrationTargetAbortReq,
+    PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
+    PDFlipMigrationTargetPrepareReq,
+    PDFlipPrefillHandoffAbortReq,
+    PDFlipPrefillHandoffDecodeRebindReq,
+    PDFlipPrefillHandoffSourceFinishReq,
+    PDFlipPrefillHandoffSourceStartReq,
+    PDFlipPrefillHandoffStatusReq,
+    PDFlipPrefillHandoffTargetActivateReq,
+    PDFlipPrefillHandoffTargetPrepareReq,
+    PDFlipPrefillDonorAbortReq,
+    PDFlipPrefillDonorStartReq,
+    PDFlipPrefillDonorStatusReq,
+    PDRuntimePrefillPeerInvalidateReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleReqOutput,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -158,6 +206,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_MIGRATED,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -218,7 +267,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -232,6 +285,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -274,6 +328,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+PD_FLIP_MIN_METADATA_BUFFER_SIZE = 1024
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -338,7 +393,10 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hicache_storage = bool(
+            self.enable_hierarchical_cache
+            and server_args.hicache_storage_backend is not None
+        )
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -525,6 +583,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_pd_flip_state_machine()
 
         # Init overlap schedule
         self.init_overlap()
@@ -915,6 +974,10 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self.pd_flip_quiesce_requested = False
+        self.pd_flip_batch_quiesced = False
+        self.pd_flip_quiesce_rids: Tuple[str, ...] = ()
+        self.pd_flip_quiesce_session_id: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1031,6 +1094,11 @@ class Scheduler(
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
+        self._pd_runtime_cache_reconfigure_state = "idle"
+        self._pd_runtime_cache_last_result = None
+        self._pd_runtime_cache_last_error = None
+        self._pd_runtime_dormant_prefill_cache_plane = None
+        self._init_pd_flip_policy_metrics()
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
@@ -1041,107 +1109,21 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
         )
+        self.disagg_draft_token_to_kv_pool = draft_token_to_kv_pool
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
         # when this node runs a spec module.
         if model_config is None:
             model_config = self.model_config
 
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.is_eagle()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.is_eagle()
-                    else torch.float32
-                ),
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-            )
-
-            # The decode requests polling kv cache
-            self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                tp_rank=self.ps.tp_rank,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                tree_cache=self.tree_cache,
-            )
-
-            # The decode requests pending for pre-allocation
-            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                transfer_queue=self.disagg_decode_transfer_queue,
-                tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
-                tp_rank=self.ps.tp_rank,
-                tp_size=self.ps.tp_size,
-                dp_size=self.server_args.dp_size,
-                gpu_id=self.ps.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                max_total_num_tokens=self.max_total_num_tokens,
-                pp_rank=self.ps.pp_rank,
-                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
-                transfer_backend=self.transfer_backend,
-            )
-
+        if self.pd_runtime_role_switch_enabled():
+            self._init_hybrid_disaggregation_metadata(model_config)
+            self._init_decode_disaggregation(draft_token_to_kv_pool, model_config)
+            self._init_prefill_disaggregation(draft_token_to_kv_pool, model_config)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._init_decode_disaggregation(draft_token_to_kv_pool, model_config)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.is_eagle()
-                    or self.spec_algorithm.is_standalone()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.is_eagle()
-                    or self.spec_algorithm.is_standalone()
-                    else torch.float32
-                ),
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-            )
-
-            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
-                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=self.disagg_metadata_buffers,
-                tp_rank=self.ps.tp_rank,
-                tp_size=self.ps.tp_size,
-                gpu_id=self.ps.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
-                max_total_num_tokens=self.max_total_num_tokens,
-                scheduler=self,
-                pp_rank=self.ps.pp_rank,
-                pp_size=self.ps.pp_size,
-                transfer_backend=self.transfer_backend,
-            )
-            # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_inflight_queue: List[Req] = []
+            self._init_prefill_disaggregation(draft_token_to_kv_pool, model_config)
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1158,6 +1140,7921 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def _init_pd_metadata_buffers(
+        self, buffer_size: int, hidden_size: int, hidden_states_dtype
+    ) -> None:
+        current_allocator = getattr(self, "req_to_metadata_buffer_idx_allocator", None)
+        current_size = int(getattr(current_allocator, "size", 0) or 0)
+        if current_allocator is not None:
+            if current_size >= buffer_size:
+                return
+            available_size = (
+                current_allocator.available_size()
+                if hasattr(current_allocator, "available_size")
+                else current_size
+            )
+            if available_size != current_size:
+                raise RuntimeError(
+                    "cannot grow PD metadata buffers while metadata entries are allocated"
+                )
+
+        self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            buffer_size
+        )
+        custom_mem_pool = None
+        kv_pool_allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if kv_pool_allocator is not None:
+            custom_mem_pool = (
+                kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool()
+            )
+        self.disagg_metadata_buffers = MetadataBuffers(
+            buffer_size,
+            hidden_size=hidden_size,
+            hidden_states_dtype=hidden_states_dtype,
+            custom_mem_pool=custom_mem_pool,
+        )
+
+    def _init_hybrid_disaggregation_metadata(self, model_config) -> None:
+        buffer_size = max(
+            max(self.req_to_token_pool.size, self.max_running_requests) * 2,
+            PD_FLIP_MIN_METADATA_BUFFER_SIZE,
+        )
+        hidden_size = (
+            model_config.spec_hidden_size
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else 16  # minimal padding size for RDMA
+        )
+        hidden_states_dtype = (
+            model_config.dtype
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else torch.float32
+        )
+        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+
+    def _init_decode_disaggregation(self, draft_token_to_kv_pool, model_config) -> None:
+        buffer_size = self.req_to_token_pool.size * 2
+        hidden_size = (
+            model_config.spec_hidden_size
+            if self.spec_algorithm.is_eagle()
+            else 16  # minimal padding size for RDMA
+        )
+        hidden_states_dtype = (
+            model_config.dtype if self.spec_algorithm.is_eagle() else torch.float32
+        )
+        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+
+        # The decode requests polling kv cache
+        self.disagg_decode_transfer_queue = DecodeTransferQueue(
+            gloo_group=self.attn_tp_cpu_group,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            tp_rank=self.ps.tp_rank,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            tree_cache=self.tree_cache,
+        )
+
+        # The decode requests pending for pre-allocation
+        self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            transfer_queue=self.disagg_decode_transfer_queue,
+            tree_cache=self.tree_cache,
+            gloo_group=self.attn_tp_cpu_group,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            dp_size=self.server_args.dp_size,
+            gpu_id=self.ps.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            max_total_num_tokens=self.max_total_num_tokens,
+            pp_rank=self.ps.pp_rank,
+            num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+            transfer_backend=self.transfer_backend,
+        )
+
+    def _init_prefill_disaggregation(
+        self, draft_token_to_kv_pool, model_config
+    ) -> None:
+        buffer_size = self.max_running_requests * 2
+        hidden_size = (
+            model_config.spec_hidden_size
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else 16  # minimal padding size for RDMA
+        )
+        hidden_states_dtype = (
+            model_config.dtype
+            if self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            else torch.float32
+        )
+        self._init_pd_metadata_buffers(buffer_size, hidden_size, hidden_states_dtype)
+
+        self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+            token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            metadata_buffers=self.disagg_metadata_buffers,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            gpu_id=self.ps.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            gloo_group=self.attn_tp_cpu_group,
+            max_total_num_tokens=self.max_total_num_tokens,
+            scheduler=self,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            transfer_backend=self.transfer_backend,
+        )
+        # The prefill requests that are in the middle of kv sending
+        self.disagg_prefill_inflight_queue: List[Req] = []
+
+    def pd_runtime_role(self) -> str:
+        return DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+
+    def _init_pd_flip_policy_metrics(self) -> None:
+        now = time.perf_counter()
+        self._pd_flip_policy_wall_timer_enabled = os.environ.get(
+            "PD_FLIP_ENABLE_PREFILL_WALL_TIMER", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._pd_flip_process_started_at = now
+        self._pd_flip_process_started_wall = time.time()
+        self._pd_flip_role_epoch = 0
+        self._pd_flip_role_started_at = now
+        self._pd_flip_role_started_wall = self._pd_flip_process_started_wall
+        self._pd_flip_prefill_busy_seconds = 0.0
+        self._pd_flip_prefill_busy_seconds_lifetime = 0.0
+        self._pd_flip_prefill_busy_accounted_through = now
+        self._pd_flip_prefill_batch_starts = {}
+        self._pd_flip_prefill_queue_sample_seq = 0
+        try:
+            sample_capacity = int(
+                os.environ.get("PD_FLIP_QUEUE_SAMPLE_BUFFER_SIZE", "1024")
+            )
+        except ValueError:
+            sample_capacity = 1024
+        self._pd_flip_prefill_queue_samples = deque(
+            maxlen=max(50, min(sample_capacity, 100000))
+        )
+
+    def _pd_flip_begin_role_epoch(self) -> None:
+        now = time.perf_counter()
+        self._pd_flip_role_epoch += 1
+        self._pd_flip_role_started_at = now
+        self._pd_flip_role_started_wall = time.time()
+        self._pd_flip_prefill_busy_seconds = 0.0
+        self._pd_flip_prefill_busy_accounted_through = now
+        self._pd_flip_prefill_batch_starts.clear()
+        self._pd_flip_prefill_queue_samples.clear()
+
+    def _pd_flip_begin_prefill_batch_wall_interval(self) -> Optional[Tuple[float, int]]:
+        if (
+            not self._pd_flip_policy_wall_timer_enabled
+            or self.pd_runtime_role() != "prefill"
+        ):
+            return None
+        return time.perf_counter(), self._pd_flip_role_epoch
+
+    def _pd_flip_attach_prefill_batch_wall_interval(
+        self,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        interval: Optional[Tuple[float, int]],
+    ) -> None:
+        if interval is not None:
+            self._pd_flip_prefill_batch_starts[id(result)] = interval
+
+    def _pd_flip_finish_prefill_batch_wall_interval(
+        self, result: Union[GenerationBatchResult, EmbeddingBatchResult]
+    ) -> None:
+        interval = self._pd_flip_prefill_batch_starts.pop(id(result), None)
+        if interval is None:
+            return
+        started_at, role_epoch = interval
+        if (
+            role_epoch != self._pd_flip_role_epoch
+            or self.pd_runtime_role() != "prefill"
+        ):
+            return
+        ended_at = time.perf_counter()
+        # With overlap scheduling, adjacent dispatch-to-result intervals can
+        # overlap. Account only their union so one wall-clock second can never
+        # contribute more than one busy second.
+        accounted_from = max(
+            float(started_at), self._pd_flip_prefill_busy_accounted_through
+        )
+        seconds = max(0.0, ended_at - accounted_from)
+        self._pd_flip_prefill_busy_accounted_through = max(
+            self._pd_flip_prefill_busy_accounted_through, ended_at
+        )
+        self._pd_flip_prefill_busy_seconds += seconds
+        self._pd_flip_prefill_busy_seconds_lifetime += seconds
+
+    def _pd_flip_record_prefill_queue_samples(self, reqs: List[Req]) -> None:
+        if self.pd_runtime_role() != "prefill":
+            return
+        for req in reqs:
+            if getattr(req, "_pd_flip_prefill_queue_sampled", False):
+                continue
+            entry_time = float(req.time_stats.wait_queue_entry_time or 0.0)
+            forward_time = float(req.time_stats.forward_entry_time or 0.0)
+            if entry_time <= 0.0 or forward_time <= 0.0 or forward_time < entry_time:
+                continue
+            req._pd_flip_prefill_queue_sampled = True
+            self._pd_flip_prefill_queue_sample_seq += 1
+            custom_params = getattr(req.sampling_params, "custom_params", None)
+            trace_request_id = (
+                custom_params.get("trace_request_id")
+                if isinstance(custom_params, dict)
+                else None
+            )
+            self._pd_flip_prefill_queue_samples.append(
+                {
+                    "seq": self._pd_flip_prefill_queue_sample_seq,
+                    "role_epoch": self._pd_flip_role_epoch,
+                    "rid": str(req.rid),
+                    "request_id": (
+                        str(trace_request_id)
+                        if trace_request_id is not None
+                        else str(req.rid)
+                    ),
+                    "queue_seconds": forward_time - entry_time,
+                    "event_time": time.time(),
+                }
+            )
+
+    def _pd_flip_policy_metrics_status(self) -> Dict[str, Any]:
+        now = time.perf_counter()
+        process_seconds = max(0.0, now - self._pd_flip_process_started_at)
+        role_seconds = max(0.0, now - self._pd_flip_role_started_at)
+        current_prefill = self.pd_runtime_role() == "prefill"
+        return {
+            "pd_flip_policy_metrics_available": (
+                self._pd_flip_policy_wall_timer_enabled
+            ),
+            "pd_flip_policy_busy_time_boundary": (
+                "scheduler_batch_dispatch_to_result_processing_wall_clock_union"
+            ),
+            "pd_flip_process_started_wall": self._pd_flip_process_started_wall,
+            "pd_flip_process_uptime_seconds": process_seconds,
+            "pd_flip_role_epoch": self._pd_flip_role_epoch,
+            "pd_flip_role_started_wall": self._pd_flip_role_started_wall,
+            "pd_flip_role_uptime_seconds": role_seconds,
+            "prefill_busy_seconds": (
+                self._pd_flip_prefill_busy_seconds if current_prefill else None
+            ),
+            "prefill_busy_ratio": (
+                min(1.0, self._pd_flip_prefill_busy_seconds / role_seconds)
+                if current_prefill and role_seconds > 0.0
+                else None
+            ),
+            "prefill_busy_seconds_lifetime": (
+                self._pd_flip_prefill_busy_seconds_lifetime
+            ),
+            "prefill_busy_ratio_process_lifetime": (
+                min(
+                    1.0,
+                    self._pd_flip_prefill_busy_seconds_lifetime / process_seconds,
+                )
+                if process_seconds > 0.0
+                else None
+            ),
+            "prefill_queue_sample_capacity": self._pd_flip_prefill_queue_samples.maxlen,
+            "prefill_queue_samples": list(self._pd_flip_prefill_queue_samples),
+        }
+
+    def _pd_role_loop_should_exit(self, expected: DisaggregationMode) -> bool:
+        return self.disaggregation_mode != expected or bool(
+            getattr(self, "_shutdown_requested", False)
+        )
+
+    def pd_runtime_role_switch_enabled(self) -> bool:
+        server_args = getattr(self, "server_args", None)
+        return bool(getattr(server_args, "enable_pd_runtime_role_switch", False))
+
+    def pd_runtime_cache_hot_reconfigure_enabled(self) -> bool:
+        server_args = getattr(self, "server_args", None)
+        return bool(
+            getattr(
+                server_args,
+                "enable_pd_runtime_cache_hot_reconfigure",
+                False,
+            )
+        )
+
+    def _pd_runtime_disagg_queues_are_empty(self) -> bool:
+        session_controller = getattr(self, "session_controller", None)
+        if session_controller is not None and session_controller.sessions:
+            return False
+        migration_session = getattr(self, "pd_flip_migration_session", None)
+        if (
+            migration_session
+            and not self._pd_flip_can_rollover_session(
+                migration_session, str(migration_session.get("role"))
+            )
+        ):
+            return False
+        handoff_session = getattr(self, "pd_flip_prefill_handoff_session", None)
+        if handoff_session:
+            self._pd_flip_prefill_handoff_status_dict()
+        if (
+            handoff_session
+            and not self._pd_flip_prefill_handoff_session_is_terminal(
+                handoff_session
+            )
+        ):
+            return False
+        for name in (
+            "disagg_prefill_bootstrap_queue",
+            "disagg_decode_prealloc_queue",
+            "disagg_decode_transfer_queue",
+        ):
+            queue = getattr(getattr(self, name, None), "queue", ())
+            if len(queue) != 0:
+                return False
+        return len(getattr(self, "disagg_prefill_inflight_queue", ())) == 0
+
+    def _pd_runtime_release_terminal_flip_session_references(self) -> None:
+        """Keep forensic summaries, but drop objects that retain old GPU pools."""
+        migration_session = getattr(self, "pd_flip_migration_session", None)
+        if (
+            migration_session
+            and self._pd_flip_can_rollover_session(
+                migration_session, str(migration_session.get("role"))
+            )
+        ):
+            self._pd_flip_archive_rollover_session(migration_session)
+            migration_session["source_entries"] = {}
+            migration_session["target_entries"] = {}
+
+        handoff_session = getattr(self, "pd_flip_prefill_handoff_session", None)
+        if (
+            handoff_session
+            and self._pd_flip_prefill_handoff_session_is_terminal(
+                handoff_session
+            )
+        ):
+            archive = list(
+                getattr(self, "pd_flip_prefill_handoff_session_archive", [])
+            )
+            archive.append(
+                {
+                    "session_id": handoff_session.get("session_id"),
+                    "role": handoff_session.get("role"),
+                    "state": handoff_session.get("state"),
+                    "rids": sorted(
+                        str(rid)
+                        for rid in (handoff_session.get("entries") or {})
+                    ),
+                    "timing_debug": self._pd_flip_json_safe_timing(
+                        handoff_session.get("timing_debug") or {}
+                    ),
+                }
+            )
+            self.pd_flip_prefill_handoff_session_archive = archive[-16:]
+            handoff_session["entries"] = {}
+
+    def _pd_runtime_suspend_prefill_cache_plane(self) -> Optional[Dict[str, Any]]:
+        """Preserve only an empty Prefill HiCache backing allocation."""
+        if not bool(
+            getattr(self.server_args, "enable_pd_runtime_shared_hicache", False)
+        ):
+            return None
+        tree_cache = getattr(self, "tree_cache", None)
+        suspend = getattr(tree_cache, "suspend_pd_runtime_storage", None)
+        if tree_cache is None or not callable(suspend):
+            return None
+        if self._pd_runtime_dormant_prefill_cache_plane is not None:
+            raise RuntimeError("a dormant Prefill cache plane already exists")
+
+        req_pool = self.req_to_token_pool
+        kv_allocator = self.token_to_kv_pool_allocator
+        suspend_result = suspend()
+        record = {
+            "tree_cache": tree_cache,
+            "req_pool_id": id(req_pool),
+            "kv_allocator_id": id(kv_allocator),
+            "is_hybrid_swa": self.is_hybrid_swa,
+            "is_hybrid_ssm": self.is_hybrid_ssm,
+            "sliding_window_size": self.sliding_window_size,
+            "full_tokens_per_layer": self.full_tokens_per_layer,
+            "swa_tokens_per_layer": self.swa_tokens_per_layer,
+            "suspend_result": suspend_result,
+        }
+        self._pd_runtime_dormant_prefill_cache_plane = record
+        # Prevent the normal detach path from closing the retained backend.
+        self.tree_cache = None
+        return suspend_result
+
+    def _pd_runtime_resume_prefill_cache_plane(
+        self,
+    ) -> Tuple[Optional[kv_cache_builder.KVCacheBuildResult], Dict[str, Any]]:
+        record = self._pd_runtime_dormant_prefill_cache_plane
+        if record is None:
+            return None, {"host_cache_backing_reused": False}
+
+        req_pool, kv_allocator = self.tp_worker.get_memory_pool()
+        tree_cache = record["tree_cache"]
+        if (
+            id(req_pool) != record["req_pool_id"]
+            or id(kv_allocator) != record["kv_allocator_id"]
+            or id(getattr(tree_cache, "req_to_token_pool", None))
+            != record["req_pool_id"]
+            or id(getattr(tree_cache, "token_to_kv_pool_allocator", None))
+            != record["kv_allocator_id"]
+        ):
+            raise RuntimeError(
+                "refusing dormant Prefill cache reuse because GPU pool identity changed"
+            )
+
+        resume = getattr(tree_cache, "resume_pd_runtime_storage", None)
+        if not callable(resume):
+            raise RuntimeError("dormant Prefill cache cannot resume storage")
+        resume_result = resume()
+        if resume_result != record["suspend_result"]:
+            raise RuntimeError(
+                "refusing dormant Prefill cache reuse because Host pool identity changed"
+            )
+
+        result = kv_cache_builder.KVCacheBuildResult(
+            is_hybrid_swa=record["is_hybrid_swa"],
+            is_hybrid_ssm=record["is_hybrid_ssm"],
+            sliding_window_size=record["sliding_window_size"],
+            full_tokens_per_layer=record["full_tokens_per_layer"],
+            swa_tokens_per_layer=record["swa_tokens_per_layer"],
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=kv_allocator,
+            disable_radix_cache=False,
+            tree_cache=tree_cache,
+        )
+        self._pd_runtime_dormant_prefill_cache_plane = None
+        return result, {
+            "host_cache_backing_reused": True,
+            "host_pool_group_id": resume_result["host_pool_group_id"],
+            "storage_backend_id": resume_result["storage_backend_id"],
+        }
+
+    def _pd_runtime_detach_cache_plane(self) -> None:
+        """Detach scheduler-side owners before ModelRunner frees pool tensors."""
+        tree_cache = getattr(self, "tree_cache", None)
+        if tree_cache is not None:
+            storage_enabled = bool(getattr(tree_cache, "enable_storage", False))
+            detach_storage = getattr(tree_cache, "detach_storage_backend", None)
+            if storage_enabled and callable(detach_storage):
+                outcome = detach_storage()
+                if (
+                    isinstance(outcome, tuple)
+                    and outcome
+                    and outcome[0] is not True
+                ):
+                    raise RuntimeError(
+                        "failed to detach HiCache storage backend during cache-plane "
+                        "swap: {}".format(outcome[1] if len(outcome) > 1 else outcome)
+                    )
+            else:
+                shutdown = getattr(tree_cache, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+        released_kv_managers = set()
+        for name in (
+            "disagg_prefill_bootstrap_queue",
+            "disagg_decode_prealloc_queue",
+            "disagg_decode_transfer_queue",
+        ):
+            queue = getattr(self, name, None)
+            if queue is not None:
+                kv_manager = getattr(queue, "kv_manager", None)
+                manager_id = id(kv_manager) if kv_manager is not None else None
+                if manager_id is None or manager_id not in released_kv_managers:
+                    queue.release_memory_occupation(
+                        preserve_registered_buffers=True
+                    )
+                    if manager_id is not None:
+                        released_kv_managers.add(manager_id)
+            setattr(self, name, None)
+        self.disagg_prefill_inflight_queue = []
+        self.req_to_metadata_buffer_idx_allocator = None
+        self.disagg_metadata_buffers = None
+
+        # An empty ScheduleBatch still retains its req/token pools.  The
+        # launch-time disaggregation warmup leaves such a batch behind, which
+        # previously kept the entire old KV plane alive while ModelRunner tried
+        # to profile the target role.  Drop every completed/empty batch owner
+        # after the idle+flush gates and replace running_batch with the same
+        # pool-free sentinel used at Scheduler construction.
+        self.cur_batch = None
+        self.last_batch = None
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        if hasattr(self, "result_queue"):
+            self.result_queue.clear()
+        self.pd_flip_source_kv_manager = None
+
+        # These helpers retain direct references to the old pools/cache.  The
+        # scheduler control request is synchronous and admission is paused, so
+        # they can be absent during the bounded reconstruction interval.
+        for name in (
+            "session_controller",
+            "policy",
+            "dp_attn_adapter",
+            "pool_stats_observer",
+            "invariant_checker",
+            "load_inquirer",
+            "output_streamer",
+            "batch_result_processor",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        if getattr(self, "kv_events_publisher", None) is not None:
+            self.kv_events_publisher.tree_cache = None
+        self.tree_cache = None
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+
+    def _pd_runtime_install_cache_plane(
+        self, target_mode: DisaggregationMode
+    ) -> Dict[str, Any]:
+        """Build and bind every scheduler helper against ModelRunner's new pools."""
+        self.tp_worker.refresh_worker_info_after_cache_reconfigure()
+        self.enable_hierarchical_cache = bool(
+            self.server_args.enable_hierarchical_cache
+        )
+        self.enable_hicache_storage = bool(
+            self.enable_hierarchical_cache
+            and self.server_args.hicache_storage_backend is not None
+        )
+        self.enable_decode_hicache = bool(
+            self.server_args.disaggregation_decode_enable_radix_cache
+            and self.enable_hierarchical_cache
+        )
+        (
+            self.max_total_num_tokens,
+            self.max_prefill_tokens,
+            self.max_running_requests,
+            self.max_queued_requests,
+            self.max_req_len,
+            self.max_req_input_len,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = self.tp_worker.get_worker_info()
+
+        install_result = {"host_cache_backing_reused": False}
+        result = None
+        if target_mode == DisaggregationMode.PREFILL:
+            result, install_result = self._pd_runtime_resume_prefill_cache_plane()
+        if result is None:
+            result = kv_cache_builder.build_kv_cache(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                tp_worker=self.tp_worker,
+                page_size=self.page_size,
+                spec_algorithm=self.spec_algorithm,
+                attn_tp_cpu_group=self.attn_tp_cpu_group,
+                tp_cpu_group=self.tp_cpu_group,
+                attn_cp_cpu_group=self.attn_cp_cpu_group,
+                enable_metrics=self.server_args.enable_metrics,
+                enable_kv_cache_events=bool(
+                    self.server_args.kv_events_config
+                    and self.ps.attn_tp_rank == 0
+                    and self.ps.attn_cp_rank == 0
+                ),
+                ps=self.ps,
+                tp_group=self.tp_group,
+                pp_group=self.pp_group,
+                enable_hierarchical_cache=self.enable_hierarchical_cache,
+            )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(self.tree_cache)
+
+        self.disaggregation_mode = target_mode
+        self.session_controller = SessionController(self.tree_cache)
+        self.init_schedule_policy()
+        self._init_hybrid_disaggregation_metadata(self.model_config)
+        self._init_decode_disaggregation(None, self.model_config)
+        self._init_prefill_disaggregation(None, self.model_config)
+        self.decode_offload_manager = None
+        self.init_dp_attn_adapter()
+        self.init_pool_stats_observer()
+        self.init_invariant_checker()
+        if getattr(self, "kv_events_publisher", None) is None:
+            self.init_kv_events_publisher()
+        else:
+            self.kv_events_publisher.tree_cache = self.tree_cache
+            self.kv_events_publisher.max_running_requests = self.max_running_requests
+            self.kv_events_publisher.max_total_num_tokens = self.max_total_num_tokens
+        self.init_load_inquirer()
+        self.init_output_streamer()
+        self.init_batch_result_processor()
+        self.new_token_ratio_tracker.reset()
+        return install_result
+
+    def _pd_runtime_hot_reconfigure_cache(
+        self,
+        current_mode: DisaggregationMode,
+        target_mode: DisaggregationMode,
+    ) -> Tuple[bool, str]:
+        if not bool(getattr(self, "pd_runtime_admission_paused", False)):
+            return False, "cache hot-reconfigure requires paused worker admission"
+        if not self.is_fully_idle() or not self._pd_runtime_disagg_queues_are_empty():
+            return (
+                False,
+                "cache hot-reconfigure requires all compute/transfer queues and sessions to be empty",
+            )
+        hicache_drain_started = time.perf_counter()
+        tree_cache = getattr(self, "tree_cache", None)
+        writing_check = getattr(tree_cache, "writing_check", None)
+        if callable(writing_check):
+            try:
+                writing_check(write_back=True)
+            except Exception as exc:
+                logger.exception("PD runtime HiCache write-through drain failed")
+                return False, f"cache hot-reconfigure HiCache drain failed: {exc}"
+        if not self.flush_cache(empty_cache=False):
+            return False, "cache hot-reconfigure failed to flush the current role"
+        self._pd_runtime_release_terminal_flip_session_references()
+
+        suspend_result = None
+        if (
+            current_mode == DisaggregationMode.PREFILL
+            and target_mode == DisaggregationMode.DECODE
+        ):
+            suspend_result = self._pd_runtime_suspend_prefill_cache_plane()
+
+        self._pd_runtime_cache_reconfigure_state = "reconfiguring"
+        self._pd_runtime_cache_last_error = None
+        started = time.perf_counter()
+        old_role = current_mode.value
+        target_role = target_mode.value
+        scheduler_stage_timings = {}
+        scheduler_stage_timings["hicache_write_through_drain_seconds"] = (
+            time.perf_counter() - hicache_drain_started
+        )
+
+        def collect_rank_errors(stage: str, error: Optional[BaseException]):
+            local = (
+                None
+                if error is None
+                else {
+                    "stage": stage,
+                    "tp_rank": int(self.ps.tp_rank),
+                    "error": repr(error),
+                }
+            )
+            if not torch.distributed.is_initialized():
+                return [] if local is None else [local]
+            gathered = [
+                None
+                for _ in range(
+                    torch.distributed.get_world_size(group=self.tp_cpu_group)
+                )
+            ]
+            torch.distributed.all_gather_object(
+                gathered, local, group=self.tp_cpu_group
+            )
+            return [item for item in gathered if item is not None]
+
+        def rollback_all_ranks(trigger_errors):
+            local_rollback_error = None
+            try:
+                self._pd_runtime_detach_cache_plane()
+                if self.server_args.disaggregation_mode != old_role:
+                    self.tp_worker.reconfigure_pd_runtime_cache(old_role)
+            except Exception as exc:
+                local_rollback_error = exc
+                logger.exception("PD runtime ModelRunner cache rollback failed")
+            rollback_errors = collect_rank_errors(
+                "model_runner_rollback", local_rollback_error
+            )
+            if rollback_errors:
+                return trigger_errors + rollback_errors
+
+            local_install_error = None
+            try:
+                self._pd_runtime_install_cache_plane(current_mode)
+                self.disaggregation_mode = current_mode
+            except Exception as exc:
+                local_install_error = exc
+                logger.exception("PD runtime Scheduler cache rollback install failed")
+            install_errors = collect_rank_errors(
+                "scheduler_rollback_install", local_install_error
+            )
+            return trigger_errors + install_errors
+
+        local_detach_error = None
+        stage_started = time.perf_counter()
+        try:
+            self._pd_runtime_detach_cache_plane()
+        except Exception as exc:
+            local_detach_error = exc
+            logger.exception("PD runtime Scheduler source cache detach failed")
+        scheduler_stage_timings["detach_source_cache_plane_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        detach_errors = collect_rank_errors(
+            "scheduler_source_detach", local_detach_error
+        )
+        if detach_errors:
+            all_errors = rollback_all_ranks(detach_errors)
+            self._pd_runtime_cache_reconfigure_state = (
+                "failed" if len(all_errors) == len(detach_errors) else "fatal"
+            )
+            self._pd_runtime_cache_last_error = {"rank_errors": all_errors}
+            return False, "cache hot-reconfigure source detach failed"
+        stage_started = time.perf_counter()
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        scheduler_stage_timings["source_detached_barrier_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+
+        model_result = None
+        local_target_error = None
+        stage_started = time.perf_counter()
+        try:
+            model_result = self.tp_worker.reconfigure_pd_runtime_cache(target_role)
+        except Exception as exc:
+            local_target_error = exc
+            logger.exception("PD runtime ModelRunner target cache build failed")
+        scheduler_stage_timings["model_runner_reconfigure_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        target_errors = collect_rank_errors(
+            "model_runner_target", local_target_error
+        )
+        if target_errors:
+            all_errors = rollback_all_ranks(target_errors)
+            self._pd_runtime_cache_reconfigure_state = (
+                "failed" if len(all_errors) == len(target_errors) else "fatal"
+            )
+            self._pd_runtime_cache_last_error = {"rank_errors": all_errors}
+            return False, "cache hot-reconfigure target build failed"
+
+        local_install_error = None
+        stage_started = time.perf_counter()
+        install_result = None
+        try:
+            install_result = self._pd_runtime_install_cache_plane(target_mode)
+        except Exception as exc:
+            local_install_error = exc
+            logger.exception("PD runtime Scheduler target cache install failed")
+        scheduler_stage_timings["install_scheduler_cache_plane_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        install_errors = collect_rank_errors(
+            "scheduler_target_install", local_install_error
+        )
+        if install_errors:
+            all_errors = rollback_all_ranks(install_errors)
+            self._pd_runtime_cache_reconfigure_state = (
+                "failed" if len(all_errors) == len(install_errors) else "fatal"
+            )
+            self._pd_runtime_cache_last_error = {"rank_errors": all_errors}
+            return False, "cache hot-reconfigure scheduler install failed"
+
+        stage_started = time.perf_counter()
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        scheduler_stage_timings["target_installed_barrier_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        assert model_result is not None
+
+        self._pd_runtime_cache_reconfigure_state = "ready"
+        self._pd_runtime_cache_last_result = dict(model_result)
+        self._pd_runtime_cache_last_result.update(
+            {
+                "source_role": old_role,
+                "target_role": target_role,
+                "scheduler_reconfigure_elapsed_seconds": time.perf_counter()
+                - started,
+                "scheduler_stage_timings": scheduler_stage_timings,
+                "prefill_cache_suspend": suspend_result,
+                **(install_result or {}),
+            }
+        )
+        return True, "cache hot-reconfigure complete"
+
+    def _pd_flip_capacity_status(self) -> Dict[str, Any]:
+        running = list(getattr(getattr(self, "running_batch", None), "reqs", []))
+
+        def trace_request_id(req: Req) -> str:
+            custom_params = getattr(req.sampling_params, "custom_params", None)
+            value = (
+                custom_params.get("trace_request_id")
+                if isinstance(custom_params, dict)
+                else None
+            )
+            return str(value if value is not None else req.rid)
+
+        batch_sample_event_time = time.time()
+        decode_batch_size = (
+            len([req for req in running if not req.finished()])
+            if self.pd_runtime_role() == "decode"
+            else None
+        )
+        prefill_bootstrap_queue = getattr(
+            getattr(self, "disagg_prefill_bootstrap_queue", None), "queue", []
+        )
+        decode_prealloc_queue = getattr(
+            getattr(self, "disagg_decode_prealloc_queue", None), "queue", []
+        )
+        decode_transfer_queue = getattr(
+            getattr(self, "disagg_decode_transfer_queue", None), "queue", []
+        )
+        page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+        kv_allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        req_pool = getattr(self, "req_to_token_pool", None)
+        available_kv_tokens = (
+            int(kv_allocator.available_size()) if kv_allocator is not None else 0
+        )
+        free_slots = min(
+            max(0, self.max_running_requests - len(running)),
+            int(req_pool.available_size()) if req_pool is not None else 0,
+        )
+        return {
+            "free_request_slots": free_slots,
+            "available_kv_tokens": available_kv_tokens,
+            "page_size": page_size,
+            "free_kv_pages": available_kv_tokens // page_size,
+            "max_running_requests_per_dp": int(self.max_running_requests),
+            "reserved_decode_tokens_per_req": int(
+                self.server_args.num_reserved_decode_tokens
+            ),
+            "running_requests": [
+                {
+                    "rid": str(req.rid),
+                    "kv_committed_len": int(req.kv_committed_len),
+                    "request_id": trace_request_id(req),
+                    "decode_batch_size": decode_batch_size,
+                    "batch_sample_event_time": batch_sample_event_time,
+                }
+                for req in running
+                if not req.finished()
+            ],
+            "waiting_requests": [
+                {
+                    "rid": str(req.rid),
+                    "kv_committed_len": int(req.kv_committed_len),
+                }
+                for req in getattr(self, "waiting_queue", [])
+                if not req.finished()
+            ],
+            # These two lists are intentionally request-level.  The P->D
+            # controller uses the bootstrap room to pair the prefill-side
+            # sender with the decode-side receiver.  Decode transfer-queue
+            # entries are still bootstrap-waiting and are therefore visible;
+            # running/waiting compute requests remain excluded.
+            "prefill_bootstrap_requests": [
+                {
+                    "rid": str(req.rid),
+                    "bootstrap_room": int(req.bootstrap_room),
+                    "pending_bootstrap": bool(req.pending_bootstrap),
+                }
+                for req in prefill_bootstrap_queue
+                if not req.finished()
+            ],
+            "decode_bootstrap_requests": [
+                {
+                    "rid": str(decode_req.req.rid),
+                    "bootstrap_room": int(decode_req.req.bootstrap_room),
+                    "waiting_for_input": bool(decode_req.waiting_for_input),
+                    "metadata_buffer_index": int(
+                        getattr(decode_req, "metadata_buffer_index", -1)
+                    ),
+                }
+                for decode_req in list(decode_prealloc_queue)
+                + list(decode_transfer_queue)
+                if not decode_req.req.finished()
+            ],
+        }
+
+    def _pd_runtime_role_status_dict(self) -> Dict[str, Any]:
+        is_idle = False
+        try:
+            is_idle = bool(self.is_fully_idle())
+        except Exception:
+            logger.exception("Failed to compute PD runtime role idle status.")
+
+        # A drained Prefill can have no request objects left while HiCache is
+        # still completing asynchronous GPU/host/storage operations.  Those
+        # operations intentionally keep is_fully_idle() false because cache
+        # hot-reconfiguration would otherwise detach live buffers.  Surface
+        # the exact blocker counts so controller timeouts remain diagnosable.
+        hicache_pending_operations = {
+            "write_through": 0,
+            "load_back": 0,
+            "prefetch": 0,
+            "backup": 0,
+        }
+        if getattr(self, "enable_hierarchical_cache", False):
+            tree_cache = self.tree_cache
+            hicache_pending_operations = {
+                name.removeprefix("ongoing_"): len(
+                    getattr(tree_cache, name, ())
+                )
+                for name in (
+                    "ongoing_write_through",
+                    "ongoing_load_back",
+                    "ongoing_prefetch",
+                    "ongoing_backup",
+                )
+            }
+
+        dp_rank = getattr(self.ps, "attn_dp_rank", None)
+        if dp_rank is None:
+            dp_rank = getattr(self.ps, "dp_rank", 0) or 0
+        status = {
+            "dp_rank": int(dp_rank),
+            "tp_rank": self.ps.tp_rank,
+            "role": self.pd_runtime_role(),
+            "active_event_loop_role": getattr(
+                self, "active_pd_event_loop_role", None
+            ),
+            "runtime_role_switch_enabled": self.pd_runtime_role_switch_enabled(),
+            "cache_hot_reconfigure_enabled": bool(
+                getattr(
+                    self,
+                    "pd_runtime_cache_hot_reconfigure_enabled",
+                    lambda: False,
+                )()
+            ),
+            "cache_reconfigure_state": getattr(
+                self, "_pd_runtime_cache_reconfigure_state", "uninitialized"
+            ),
+            "cache_reconfigure_last_result": getattr(
+                self, "_pd_runtime_cache_last_result", None
+            ),
+            "cache_reconfigure_last_error": getattr(
+                self, "_pd_runtime_cache_last_error", None
+            ),
+            "admission_paused": bool(
+                getattr(self, "pd_runtime_admission_paused", False)
+            ),
+            "pd_flip_admission_paused": self.pd_flip_should_reject_new_work(),
+            "is_idle": is_idle,
+            "hicache_pending_operations": hicache_pending_operations,
+            "dual_queues_initialized": bool(
+                getattr(self, "disagg_decode_prealloc_queue", None) is not None
+                and getattr(self, "disagg_decode_transfer_queue", None) is not None
+                and getattr(self, "disagg_prefill_bootstrap_queue", None) is not None
+            ),
+            "radix_cache_disabled": bool(
+                getattr(
+                    self.tree_cache,
+                    "disable",
+                    self.server_args.disable_radix_cache,
+                )
+            ),
+            "hierarchical_cache_enabled": bool(
+                getattr(self, "enable_hierarchical_cache", False)
+            ),
+            "hicache_storage_enabled": bool(
+                getattr(self, "enable_hicache_storage", False)
+            ),
+            "hicache_storage_backend": (
+                self.server_args.hicache_storage_backend
+                if getattr(self, "enable_hicache_storage", False)
+                else None
+            ),
+            "event_loop_dynamic": True,
+        }
+        status.update(self._pd_flip_policy_metrics_status())
+        status.update(self._pd_flip_capacity_status())
+        return status
+
+    def get_pd_runtime_role_status(
+        self, recv_req: PDRuntimeRoleStatusReq
+    ) -> PDRuntimeRoleReqOutput:
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message="ok",
+            role=status["role"],
+            status=status,
+        )
+
+    def set_pd_runtime_admission(
+        self, recv_req: PDRuntimeRoleAdmissionReq
+    ) -> PDRuntimeRoleReqOutput:
+        if (
+            not recv_req.paused
+            and getattr(self, "_pd_runtime_cache_reconfigure_state", None) == "fatal"
+        ):
+            self.pd_runtime_admission_paused = True
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="cannot resume admission after fatal cache reconstruction failure",
+                role=status["role"],
+                status=status,
+            )
+        self.pd_runtime_admission_paused = bool(recv_req.paused)
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message=(
+                "PD runtime admission paused"
+                if recv_req.paused
+                else "PD runtime admission resumed"
+            ),
+            role=status["role"],
+            status=status,
+        )
+
+    def set_pd_runtime_role(
+        self, recv_req: PDRuntimeRoleSetReq
+    ) -> PDRuntimeRoleReqOutput:
+        target_mode = DisaggregationMode(recv_req.role)
+        current_mode = self.disaggregation_mode
+        if target_mode not in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message=f"Invalid PD runtime role: {recv_req.role}",
+                role=status["role"],
+                status=status,
+            )
+
+        if not self.pd_runtime_role_switch_enabled():
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="PD runtime role switch is disabled.",
+                role=status["role"],
+                status=status,
+            )
+
+        status = self._pd_runtime_role_status_dict()
+        if not recv_req.force and not status["is_idle"]:
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="PD runtime role switch requires an idle scheduler.",
+                role=status["role"],
+                status=status,
+            )
+
+        if (
+            target_mode != current_mode
+            and self.pd_runtime_cache_hot_reconfigure_enabled()
+        ):
+            success, message = self._pd_runtime_hot_reconfigure_cache(
+                current_mode, target_mode
+            )
+            if not success:
+                status = self._pd_runtime_role_status_dict()
+                return PDRuntimeRoleReqOutput(
+                    success=False,
+                    message=message,
+                    role=status["role"],
+                    status=status,
+                )
+        elif (
+            current_mode == DisaggregationMode.PREFILL
+            and target_mode == DisaggregationMode.DECODE
+        ):
+            # A hot-switched Decode worker retains the Prefill worker's
+            # MambaRadixCache object. Decode requests are prebuilt from remote
+            # KV and do not take a radix-node lock, so letting their finish
+            # path insert into that cache ends in an unmatched dec_lock_ref.
+            # Admission is paused and the controller has already waited for
+            # full scheduler idleness here, which makes it safe to discard the
+            # old Prefill cache before accepting Decode work.
+            if not self.flush_cache(empty_cache=False):
+                status = self._pd_runtime_role_status_dict()
+                return PDRuntimeRoleReqOutput(
+                    success=False,
+                    message="P->D runtime role switch failed to flush Prefill cache.",
+                    role=status["role"],
+                    status=status,
+                )
+            # ChunkCache exposes a read-only ``disable=True`` property, while
+            # radix caches keep a mutable flag. Avoid assigning through the
+            # read-only property when an initial Decode worker is restored
+            # after being warmed temporarily as a Prefill candidate.
+            if not bool(getattr(self.tree_cache, "disable", False)):
+                self.tree_cache.disable = True
+            self.server_args.disable_radix_cache = True
+            get_global_server_args().disable_radix_cache = True
+
+        self.disaggregation_mode = target_mode
+        self.server_args.disaggregation_mode = target_mode.value
+        get_global_server_args().disaggregation_mode = target_mode.value
+        if target_mode != current_mode:
+            self._pd_flip_begin_role_epoch()
+        if hasattr(self, "output_streamer"):
+            self.output_streamer.disaggregation_mode = target_mode
+        # These scheduler components snapshot the disaggregation role at
+        # construction time.  A P->D hot switch must refresh them before the
+        # Decode event loop processes its first prebuilt batch; otherwise the
+        # batch result processor still asserts that it is a Prefill worker.
+        if hasattr(self, "batch_result_processor"):
+            self.init_batch_result_processor()
+        if hasattr(self, "invariant_checker"):
+            self.invariant_checker.disaggregation_mode = target_mode
+
+        status = self._pd_runtime_role_status_dict()
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message=f"PD runtime role switched to {target_mode.value}.",
+            role=status["role"],
+            status=status,
+        )
+
+    def init_pd_flip_state_machine(self):
+        if not self.server_args.enable_pd_flip_state_machine:
+            self.pd_flip_state_machine: Optional[FlipStateMachine] = None
+            return
+
+        self.pd_flip_state_machine = FlipStateMachine(
+            evaluator=SLOThresholdFlipEvaluator(
+                slo_threshold=self.server_args.pd_flip_slo_threshold
+            ),
+            prepare_flip=self.prepare_pd_flip,
+            commit_flip=self.commit_pd_flip,
+            min_window_seconds=self.server_args.pd_flip_window_seconds,
+        )
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "PD flip state machine enabled: window=%.3fs, slo_threshold=%.3f, role=%s",
+                self.server_args.pd_flip_window_seconds,
+                self.server_args.pd_flip_slo_threshold,
+                DisaggregationMode.to_engine_type(self.disaggregation_mode.value),
+            )
+
+    def maybe_tick_pd_flip_state_machine(self):
+        if self.pd_flip_state_machine is None:
+            return
+
+        self.refresh_pd_flip_runtime_config()
+        snapshot = self.build_pd_flip_snapshot()
+        server_args = get_global_server_args()
+        if getattr(server_args, "pd_flip_abort", False):
+            event = self.pd_flip_state_machine.abort("external orchestrator abort")
+            setattr(server_args, "pd_flip_abort", False)
+        else:
+            event = self.pd_flip_state_machine.tick(snapshot)
+        self.log_pd_flip_event(event, snapshot)
+
+    def refresh_pd_flip_runtime_config(self):
+        server_args = get_global_server_args()
+        self.pd_flip_state_machine.min_window_seconds = (
+            server_args.pd_flip_window_seconds
+        )
+        evaluator = self.pd_flip_state_machine.evaluator
+        if hasattr(evaluator, "slo_threshold"):
+            evaluator.slo_threshold = server_args.pd_flip_slo_threshold
+
+    def pd_flip_should_reject_new_work(self) -> bool:
+        if getattr(self, "pd_runtime_admission_paused", False):
+            return True
+        machine = getattr(self, "pd_flip_state_machine", None)
+        return machine is not None and machine.state in (
+            FlipState.PREPARING,
+            FlipState.FLIPPING,
+        )
+
+    def reject_pd_flip_admission(self, req: Req):
+        error_message = (
+            "PD role flip is draining this worker; retry through the router "
+            "or another worker."
+        )
+        prepare_abort(
+            req,
+            error_message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.output_streamer.stream_output(
+            [req], getattr(req, "return_logprob", False)
+        )
+
+    def pd_flip_is_idle_for_commit(self, snapshot: ClusterSnapshot) -> bool:
+        if self._pd_flip_source_migration_blocks_idle():
+            return False
+        snapshot_idle = (
+            snapshot.waiting_reqs == 0
+            and snapshot.running_reqs == 0
+            and snapshot.prefill_bootstrap_reqs == 0
+            and snapshot.prefill_inflight_reqs == 0
+            and snapshot.decode_prealloc_reqs == 0
+            and snapshot.decode_transfer_reqs == 0
+        )
+        if not snapshot_idle:
+            return False
+
+        is_fully_idle = getattr(self, "is_fully_idle", None)
+        if not callable(is_fully_idle):
+            return True
+        return bool(is_fully_idle())
+
+    def get_pd_flip_internal_state(self) -> Dict[str, Any]:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if self.pd_flip_state_machine is None:
+            return {
+                "enabled": False,
+                "current_role": role,
+                "can_hot_switch_in_process": False,
+            }
+
+        status = self.pd_flip_state_machine.status()
+        status["enabled"] = True
+        status["current_role"] = role
+        status["implementation_stage"] = "decision_and_observability"
+        status["role_mutation_wired"] = False
+        status["active_decode_migration_wired"] = False
+        status["requires_process_restart"] = status["direction"] != "none"
+        status["drain_to_idle_required"] = status["direction"] != "none"
+        status["admission_paused"] = self.pd_flip_should_reject_new_work()
+        try:
+            snapshot = self.pd_flip_state_machine.last_snapshot
+            if snapshot is None:
+                snapshot = self.build_pd_flip_snapshot()
+            status["is_idle_for_flip"] = self.pd_flip_is_idle_for_commit(snapshot)
+        except Exception:
+            status["is_idle_for_flip"] = False
+        server_args = get_global_server_args()
+        status["external_prepare_ack"] = getattr(
+            server_args, "pd_flip_prepare_ack", False
+        )
+        status["external_commit_ack"] = getattr(server_args, "pd_flip_commit_ack", False)
+        status["external_abort_requested"] = getattr(server_args, "pd_flip_abort", False)
+        migration_status = self._pd_flip_migration_status_dict()
+        status["migration_enabled"] = migration_status["enabled"]
+        status["migration_role"] = migration_status["role"]
+        status["migration_state"] = migration_status["state"]
+        status["migration_session_id"] = migration_status["session_id"]
+        status["migration_pending_reqs"] = migration_status["pending_reqs"]
+        status["migration_transferred_reqs"] = migration_status["transferred_reqs"]
+        status["migration_released_reqs"] = migration_status["released_reqs"]
+        status["migration_failed_reqs"] = migration_status["failed_reqs"]
+        status["migration_held_reqs"] = migration_status["held_reqs"]
+        status["migration_last_error"] = migration_status["last_error"]
+        status["migration_dry_run"] = migration_status["dry_run"]
+        status["migration_prepare_only"] = migration_status["prepare_only"]
+        if migration_status["enabled"] and status.get("direction") == "d_to_p":
+            status["active_request_migration_strategy"] = (
+                "decode_to_decode_kv_transfer"
+            )
+        return status
+
+    def build_pd_flip_snapshot(self) -> ClusterSnapshot:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        server_args = get_global_server_args()
+        prefill_nodes = server_args.pd_flip_prefill_nodes
+        decode_nodes = server_args.pd_flip_decode_nodes
+        if prefill_nodes is None:
+            prefill_nodes = 1 if role == "prefill" else 0
+        if decode_nodes is None:
+            decode_nodes = 1 if role == "decode" else 0
+
+        kv_total_tokens = getattr(self, "max_total_num_tokens", None)
+        kv_used_tokens = None
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if kv_total_tokens is not None and allocator is not None:
+            try:
+                kv_used_tokens = kv_total_tokens - allocator.available_size()
+            except Exception:
+                kv_used_tokens = None
+
+        return ClusterSnapshot(
+            timestamp=time.monotonic(),
+            role=role,
+            prefill_nodes=prefill_nodes,
+            decode_nodes=decode_nodes,
+            waiting_reqs=len(self.waiting_queue),
+            running_reqs=len(getattr(self.running_batch, "reqs", [])),
+            prefill_bootstrap_reqs=self._pd_flip_queue_len(
+                self.disagg_prefill_bootstrap_queue
+            ),
+            prefill_inflight_reqs=len(self.disagg_prefill_inflight_queue or []),
+            decode_prealloc_reqs=self._pd_flip_queue_len(
+                self.disagg_decode_prealloc_queue
+            ),
+            decode_transfer_reqs=self._pd_flip_queue_len(
+                self.disagg_decode_transfer_queue
+            ),
+            kv_used_tokens=kv_used_tokens,
+            kv_total_tokens=kv_total_tokens,
+            prefill_slo_attainment=server_args.pd_flip_prefill_slo_attainment,
+            decode_slo_attainment=server_args.pd_flip_decode_slo_attainment,
+        )
+
+    def prepare_pd_flip(
+        self, snapshot: ClusterSnapshot, decision: FlipDecision
+    ) -> bool:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "PD flip preparing waits for migration: direction=%s reason=%s "
+                "role=%s waiting=%d running=%d prefill_bootstrap=%d "
+                "prefill_inflight=%d decode_prealloc=%d decode_transfer=%d",
+                decision.direction.value,
+                decision.reason,
+                snapshot.role,
+                snapshot.waiting_reqs,
+                snapshot.running_reqs,
+                snapshot.prefill_bootstrap_reqs,
+                snapshot.prefill_inflight_reqs,
+                snapshot.decode_prealloc_reqs,
+                snapshot.decode_transfer_reqs,
+            )
+        if (
+            decision.direction == FlipDirection.D_TO_P
+            and self._pd_flip_migration_is_active()
+            and not self._pd_flip_migration_is_released()
+        ):
+            return False
+
+        if not self.pd_flip_is_idle_for_commit(snapshot):
+            return False
+
+        if self.pd_runtime_role_switch_enabled():
+            return True
+
+        server_args = get_global_server_args()
+        ready = bool(getattr(server_args, "pd_flip_prepare_ack", False))
+        if ready:
+            setattr(server_args, "pd_flip_prepare_ack", False)
+        return ready
+
+    def commit_pd_flip(self, snapshot: ClusterSnapshot, decision: FlipDecision) -> bool:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "PD flip commit waits for role mutation: direction=%s "
+                "target_prefill_nodes=%s target_decode_nodes=%s.",
+                decision.direction.value,
+                decision.target_prefill_nodes,
+                decision.target_decode_nodes,
+            )
+        if not self.pd_flip_is_idle_for_commit(snapshot):
+            return False
+
+        if self.pd_runtime_role_switch_enabled():
+            target = (
+                "prefill"
+                if decision.direction == FlipDirection.D_TO_P
+                else "decode"
+            )
+            out = self.set_pd_runtime_role(PDRuntimeRoleSetReq(role=target))
+            return out.success
+
+        server_args = get_global_server_args()
+        ready = bool(getattr(server_args, "pd_flip_commit_ack", False))
+        if ready:
+            setattr(server_args, "pd_flip_commit_ack", False)
+        return ready
+
+    def log_pd_flip_event(self, event: FlipEvent, snapshot: ClusterSnapshot):
+        if self.ps.tp_rank != 0 or event.transition == FlipTransition.NONE:
+            return
+        log_fn = (
+            logger.debug
+            if event.transition
+            in (FlipTransition.PREPARING_NOT_READY, FlipTransition.FLIPPING_NOT_READY)
+            else logger.info
+        )
+        log_fn(
+            "PD flip state transition: %s -> %s transition=%s direction=%s "
+            "reason=%s role=%s prefill_nodes=%d decode_nodes=%d kv=%s/%s",
+            event.from_state.value,
+            event.to_state.value,
+            event.transition.value,
+            event.direction.value,
+            event.reason,
+            snapshot.role,
+            snapshot.prefill_nodes,
+            snapshot.decode_nodes,
+            snapshot.kv_used_tokens,
+            snapshot.kv_total_tokens,
+        )
+
+    @staticmethod
+    def _pd_flip_queue_len(queue) -> int:
+        if queue is None:
+            return 0
+        inner_queue = getattr(queue, "queue", None)
+        if inner_queue is not None:
+            return len(inner_queue)
+        try:
+            return len(queue)
+        except TypeError:
+            return 0
+
+    def _pd_flip_waiting_req_skip_reason(self, req: Req) -> str:
+        finished = getattr(req, "finished", None)
+        if callable(finished) and finished():
+            return "finished"
+        if getattr(req, "req_pool_idx", None) is None:
+            return "missing_req_pool_idx"
+        kv_committed_len = getattr(req, "kv_committed_len", None)
+        if kv_committed_len is None:
+            kv_committed_len = len(getattr(req, "origin_input_ids", []) or []) + max(
+                0, len(getattr(req, "output_ids", []) or []) - 1
+            )
+        try:
+            committed_len = int(kv_committed_len or 0)
+        except (TypeError, ValueError):
+            committed_len = 0
+        if committed_len <= 0:
+            return "missing_committed_kv"
+        return ""
+
+    def _pd_flip_classify_waiting_reqs(
+        self, waiting_reqs: List[Req]
+    ) -> Tuple[List[Tuple[int, Req]], List[Dict[str, Any]]]:
+        selected: List[Tuple[int, Req]] = []
+        skipped: List[Dict[str, Any]] = []
+        for index, req in enumerate(waiting_reqs):
+            reason = self._pd_flip_waiting_req_skip_reason(req)
+            if reason:
+                skipped.append(
+                    {
+                        "rid": getattr(req, "rid", ""),
+                        "queue_index": index,
+                        "reason": reason,
+                    }
+                )
+                continue
+            selected.append((index, req))
+        return selected, skipped
+
+    def _pd_flip_select_source_batch(
+        self,
+        recv_req: PDFlipMigrationSourceStartReq,
+        waiting_reqs: Optional[List[Req]] = None,
+        waiting_skipped_out: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Req]:
+        def raise_for_duplicate_rid(rids: List[str]) -> None:
+            seen = set()
+            for rid in rids:
+                if rid in seen:
+                    raise ValueError(f"duplicate rid in source selection: {rid}")
+                seen.add(rid)
+
+        running_reqs = [
+            req
+            for req in getattr(getattr(self, "running_batch", None), "reqs", [])
+            if not req.finished()
+        ]
+        if recv_req.rids is None:
+            selected = list(running_reqs)
+        else:
+            requested_rids = [str(rid) for rid in recv_req.rids]
+            raise_for_duplicate_rid(requested_rids)
+            selected = running_reqs[: len(requested_rids)]
+            if [str(req.rid) for req in selected] != requested_rids:
+                raise ValueError("selected rids must be a running-batch prefix")
+
+        if recv_req.include_waiting:
+            if waiting_reqs is None:
+                waiting_reqs = list(getattr(self, "waiting_queue", []))
+            waiting_selected, waiting_skipped = self._pd_flip_classify_waiting_reqs(
+                waiting_reqs
+            )
+            if waiting_skipped_out is not None:
+                waiting_skipped_out.extend(waiting_skipped)
+            live_waiting_skipped = [
+                item for item in waiting_skipped if item.get("reason") != "finished"
+            ]
+            if live_waiting_skipped:
+                skipped_summary = ", ".join(
+                    f"{item.get('rid', '')}:{item.get('reason', '')}"
+                    for item in live_waiting_skipped
+                )
+                raise ValueError(
+                    "remaining waiting requests are not migratable: "
+                    f"{skipped_summary}"
+                )
+            selected.extend(req for _, req in waiting_selected)
+
+        raise_for_duplicate_rid([str(req.rid) for req in selected])
+        return selected
+
+    @staticmethod
+    def _pd_flip_rollover_blockers(
+        session: Dict[str, Any], next_role: str
+    ) -> List[Dict[str, Any]]:
+        def bounded(values: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            limit = 32
+            if len(values) <= limit:
+                return values
+            return values[:limit] + [
+                {
+                    "code": "rollover_blockers_truncated",
+                    "omitted": len(values) - limit,
+                }
+            ]
+
+        blockers = []
+        if next_role not in {"source", "target"}:
+            blockers.append(
+                {"code": "unsupported_next_role", "observed": next_role}
+            )
+        session_role = session.get("role")
+        if session_role not in {"source", "target"}:
+            blockers.append(
+                {"code": "unsupported_session_role", "observed": session_role}
+            )
+        if session.get("pending_reqs") != 0:
+            blockers.append(
+                {
+                    "code": "session_pending_reqs",
+                    "observed": session.get("pending_reqs"),
+                }
+            )
+        if session.get("failed_reqs") != 0:
+            blockers.append(
+                {
+                    "code": "session_failed_reqs",
+                    "observed": session.get("failed_reqs"),
+                }
+            )
+        # Validate the session that is being retired according to its existing
+        # role, not according to the role of the next session.  A terminal
+        # target may safely become the source of a later migration (and vice
+        # versa); alternating PD flips otherwise eventually exhaust every
+        # Decode worker even though all old sessions are terminal.
+        if session_role == "source":
+            state = session.get("state")
+            if state not in {"source_released", "source_aborted"}:
+                blockers.append(
+                    {"code": "source_state_not_terminal", "observed": state}
+                )
+            source_entries = session.get("source_entries") or {}
+            for rid in sorted(source_entries, key=str):
+                entry = source_entries[rid]
+                rid = str(rid)
+                if not entry.get("metadata_freed"):
+                    blockers.append(
+                        {"code": "source_entry_metadata_not_freed", "rid": rid}
+                    )
+                if state == "source_released":
+                    if not entry.get("transferred"):
+                        blockers.append(
+                            {"code": "source_entry_not_transferred", "rid": rid}
+                        )
+                    if entry.get("final_owner") != "target":
+                        blockers.append(
+                            {
+                                "code": "source_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+                elif (
+                    state == "source_aborted"
+                    and entry.get("final_owner") != "source"
+                ):
+                    blockers.append(
+                        {
+                            "code": "source_entry_final_owner_mismatch",
+                            "rid": rid,
+                            "observed": entry.get("final_owner"),
+                        }
+                    )
+                delta = entry.get("delta")
+                if isinstance(delta, dict) and not delta.get("noop"):
+                    if not delta.get("transferred"):
+                        blockers.append(
+                            {"code": "source_delta_not_transferred", "rid": rid}
+                        )
+                    if not delta.get("metadata_freed"):
+                        blockers.append(
+                            {
+                                "code": "source_delta_metadata_not_freed",
+                                "rid": rid,
+                            }
+                        )
+            return bounded(blockers)
+        if session_role == "target":
+            state = session.get("state")
+            if state not in {"active", "target_aborted"}:
+                blockers.append(
+                    {"code": "target_state_not_terminal", "observed": state}
+                )
+            if session.get("held_reqs") != 0:
+                blockers.append(
+                    {
+                        "code": "target_held_reqs",
+                        "observed": session.get("held_reqs"),
+                    }
+                )
+            target_entries = session.get("target_entries") or {}
+            for rid in sorted(target_entries, key=str):
+                entry = target_entries[rid]
+                rid = str(rid)
+                if entry.get("held") is not False:
+                    blockers.append(
+                        {
+                            "code": "target_entry_still_held",
+                            "rid": rid,
+                            "observed": entry.get("held"),
+                        }
+                    )
+                if state == "active":
+                    owned = entry.get("request_adopted") or entry.get(
+                        "request_released"
+                    ) or entry.get("drop_on_commit")
+                    if entry.get("phase") != "active":
+                        blockers.append(
+                            {
+                                "code": "target_entry_phase_not_active",
+                                "rid": rid,
+                                "observed": entry.get("phase"),
+                            }
+                        )
+                    if not owned:
+                        blockers.append(
+                            {"code": "target_entry_request_not_owned", "rid": rid}
+                        )
+                    if entry.get("final_owner") != "target":
+                        blockers.append(
+                            {
+                                "code": "target_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+                elif state == "target_aborted":
+                    if entry.get("phase") != "aborted":
+                        blockers.append(
+                            {
+                                "code": "target_entry_phase_not_aborted",
+                                "rid": rid,
+                                "observed": entry.get("phase"),
+                            }
+                        )
+                    if not entry.get("request_released"):
+                        blockers.append(
+                            {
+                                "code": "target_entry_request_not_released",
+                                "rid": rid,
+                            }
+                        )
+                    if entry.get("final_owner") != "source":
+                        blockers.append(
+                            {
+                                "code": "target_entry_final_owner_mismatch",
+                                "rid": rid,
+                                "observed": entry.get("final_owner"),
+                            }
+                        )
+            return bounded(blockers)
+        return bounded(blockers)
+
+    @staticmethod
+    def _pd_flip_can_rollover_session(
+        session: Dict[str, Any], next_role: str
+    ) -> bool:
+        return not Scheduler._pd_flip_rollover_blockers(session, next_role)
+
+    def _pd_flip_archive_rollover_session(self, session: Dict[str, Any]) -> None:
+        archive = list(getattr(self, "pd_flip_migration_session_archive", []))
+        archive.append(
+            {
+                "session_id": session.get("session_id"),
+                "role": session.get("role"),
+                "state": session.get("state"),
+                "timing_debug": self._pd_flip_migration_timing_debug(session),
+                "request_measurements": self._pd_flip_migration_request_measurements(
+                    session
+                ),
+            }
+        )
+        self.pd_flip_migration_session_archive = archive[-16:]
+
+    def _pd_flip_prefill_handoff_status_dict(self) -> Dict[str, Any]:
+        session = getattr(self, "pd_flip_prefill_handoff_session", None) or {}
+        if session.get("role") == "target" and session.get("state") == "target_active":
+            queue = getattr(
+                getattr(self, "disagg_prefill_bootstrap_queue", None), "queue", []
+            )
+            if all(
+                entry.get("req") not in queue
+                for entry in (session.get("entries") or {}).values()
+            ):
+                session["state"] = "target_complete"
+                self._pd_flip_note_timing(session, "target_complete_observed")
+        elif session.get("role") == "decode" and session.get("state") == "decode_rebound":
+            queue = getattr(
+                getattr(self, "disagg_decode_prealloc_queue", None), "queue", []
+            )
+            if all(
+                entry.get("decode_req") not in queue
+                for entry in (session.get("entries") or {}).values()
+            ):
+                session["state"] = "decode_complete"
+                self._pd_flip_note_timing(session, "decode_complete_observed")
+        entries = session.get("entries") or {}
+        ps = getattr(self, "ps", None)
+        dp_rank = getattr(ps, "attn_dp_rank", None)
+        if dp_rank is None:
+            dp_rank = getattr(ps, "dp_rank", 0) or 0
+        tp_rank = getattr(ps, "tp_rank", 0) or 0
+        entry_timing = []
+        for rid, entry in entries.items():
+            req = entry.get("req")
+            if req is None and entry.get("decode_req") is not None:
+                req = entry["decode_req"].req
+            timing = getattr(req, "pd_flip_prefill_handoff_timing", None)
+            if not isinstance(timing, dict):
+                timing = entry.get("timing_debug") or {}
+            manifest = entry.get("manifest") or {}
+            entry_timing.append(
+                {
+                    "rid": str(rid),
+                    "original_bootstrap_room": manifest.get(
+                        "original_bootstrap_room"
+                    ),
+                    "migration_bootstrap_room": manifest.get(
+                        "migration_bootstrap_room"
+                    ),
+                    "target_prefill_host": manifest.get("target_prefill_host"),
+                    "target_bootstrap_port": manifest.get(
+                        "source_bootstrap_port"
+                    ),
+                    "timing": self._pd_flip_json_safe_timing(timing),
+                }
+            )
+        return {
+            "session_id": session.get("session_id"),
+            "role": session.get("role"),
+            "state": session.get("state", "idle"),
+            "dp_rank": int(dp_rank),
+            "tp_rank": int(tp_rank),
+            "request_count": len(entries),
+            "rids": sorted(str(rid) for rid in entries),
+            "last_error": session.get("last_error"),
+            "timing_debug": {
+                "session": self._pd_flip_json_safe_timing(
+                    session.get("timing_debug") or {}
+                ),
+                "entries": entry_timing,
+            },
+        }
+
+    @staticmethod
+    def _pd_flip_prefill_handoff_session_is_terminal(session: Dict[str, Any]) -> bool:
+        """Return whether a completed handoff record can be replaced.
+
+        A worker can participate in consecutive attempts under different
+        handoff roles.  Terminality therefore depends on the state, not on the
+        role of the next attempt.
+        """
+        return session.get("state") in {
+            "source_released",
+            "source_aborted",
+            "target_complete",
+            "target_aborted",
+            "decode_complete",
+            "decode_aborted",
+        }
+
+    @staticmethod
+    def _pd_flip_prefill_handoff_room(session_id: str, rid: str) -> int:
+        digest = hashlib.sha256(
+            f"pd-flip-prefill-handoff:{session_id}:{rid}".encode("utf-8")
+        ).digest()
+        # Common bootstrap backends use signed 64-bit room identifiers.
+        return max(1, int.from_bytes(digest[:8], "big") & ((1 << 63) - 1))
+
+    @staticmethod
+    def _pd_flip_prefill_handoff_clear_sender(req: Req) -> None:
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is None:
+            return
+        if hasattr(sender, "abort"):
+            sender.abort()
+        if hasattr(sender, "clear"):
+            sender.clear()
+
+    @staticmethod
+    def _pd_flip_prefill_handoff_is_supported(req: Req) -> bool:
+        # The migration manifest is intentionally text-only for the first
+        # implementation.  Reject request features whose state is not fully
+        # serialized instead of silently changing their semantics.
+        return not any(
+            (
+                getattr(req, "multimodal_inputs", None) is not None,
+                getattr(req, "input_embeds", None) is not None,
+                getattr(req, "session", None) is not None,
+                getattr(req, "positional_embed_overrides", None) is not None,
+                getattr(req, "grammar", None) is not None,
+            )
+        )
+
+    def invalidate_pd_runtime_prefill_peer(
+        self, recv_req: PDRuntimePrefillPeerInvalidateReq
+    ) -> PDRuntimeRoleReqOutput:
+        decode_queue = getattr(self, "disagg_decode_prealloc_queue", None)
+        kv_manager = getattr(decode_queue, "kv_manager", None)
+        if kv_manager is None or not hasattr(
+            kv_manager, "invalidate_prefill_peer_cache"
+        ):
+            status = self._pd_runtime_role_status_dict()
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message="Decode Prefill peer cache is unavailable.",
+                role=status["role"],
+                status=status,
+            )
+        try:
+            invalidation = kv_manager.invalidate_prefill_peer_cache(
+                recv_req.bootstrap_addr
+            )
+        except Exception as exc:
+            status = self._pd_runtime_role_status_dict()
+            status["prefill_peer_cache_invalidation"] = {
+                "bootstrap_addr": recv_req.bootstrap_addr,
+                "error": repr(exc),
+            }
+            return PDRuntimeRoleReqOutput(
+                success=False,
+                message=str(exc),
+                role=status["role"],
+                status=status,
+            )
+        status = self._pd_runtime_role_status_dict()
+        status["prefill_peer_cache_invalidation"] = dict(invalidation)
+        status["prefill_peer_cache_invalidation"]["bootstrap_addr"] = (
+            recv_req.bootstrap_addr
+        )
+        return PDRuntimeRoleReqOutput(
+            success=True,
+            message="Prefill peer cache invalidated.",
+            role=status["role"],
+            status=status,
+        )
+
+    def _pd_flip_capture_armed_prefill_bootstrap(
+        self, *, finalize: bool = False
+    ) -> List[str]:
+        """Capture queued bootstrap work for an armed P->D handoff.
+
+        An armed session deliberately leaves admission open while the Router
+        drains.  This hook runs in the Scheduler loop before bootstrap polling,
+        so requests already assigned by the Router are moved into the handoff
+        session instead of racing through Prefill.  Finalization happens only
+        after the Controller has proved Router dispatch quiescence.
+        """
+        session = getattr(self, "pd_flip_prefill_handoff_session", None) or {}
+        if session.get("role") != "source" or session.get("state") != "source_armed":
+            return []
+        queue = self.disagg_prefill_bootstrap_queue.queue
+        requested_rids = session.get("requested_rids")
+        hold_all_eligible = bool(session.get("hold_all_eligible"))
+        max_requests = (
+            len(queue) + len(session.get("entries") or {})
+            if hold_all_eligible
+            else int(session.get("max_requests") or 0)
+        )
+        selected = []
+        ignored_rids = []
+        for index, req in enumerate(list(queue)):
+            rid = str(req.rid)
+            if rid in (session.get("entries") or {}):
+                continue
+            if requested_rids is not None and rid not in requested_rids:
+                continue
+            eligible = (
+                bool(getattr(req, "pending_bootstrap", False))
+                and int(getattr(req, "metadata_buffer_index", -1)) < 0
+                and self._pd_flip_prefill_handoff_is_supported(req)
+            )
+            if not eligible:
+                ignored_rids.append(rid)
+                continue
+            if len(session.get("entries") or {}) + len(selected) >= max_requests:
+                break
+            selected.append((index, req))
+
+        selected_ids = {id(req) for _, req in selected}
+        queue[:] = [req for req in queue if id(req) not in selected_ids]
+        entries = session.setdefault("entries", {})
+        manifests = session.setdefault("manifests", [])
+        capture_base = int(session.get("capture_count") or 0)
+        for offset, (index, req) in enumerate(selected):
+            rid = str(req.rid)
+            room = self._pd_flip_prefill_handoff_room(session["session_id"], rid)
+            manifest = self._pd_flip_build_migration_manifest(req)
+            manifest.update(
+                {
+                    "pd_flip_session_id": session["session_id"],
+                    "pd_flip_source_queue": "prefill_bootstrap",
+                    "original_bootstrap_room": int(req.bootstrap_room),
+                    "original_decode_host": str(req.bootstrap_host),
+                    "original_bootstrap_port": int(req.bootstrap_port),
+                    "migration_bootstrap_room": room,
+                    "target_prefill_host": session["target_host"],
+                    "source_bootstrap_port": int(session["target_bootstrap_port"]),
+                }
+            )
+            req.pd_flip_migration_session_id = session["session_id"]
+            entries[rid] = {
+                "req": req,
+                "queue_index": index,
+                "capture_order": capture_base + offset,
+                "manifest": manifest,
+            }
+            manifests.append(manifest)
+        session["capture_count"] = capture_base + len(selected)
+        session["ignored_rids"] = sorted(
+            set(session.get("ignored_rids") or []).union(ignored_rids)
+        )
+        if selected:
+            self._pd_flip_note_timing(session, "source_capture_completed")
+        if finalize:
+            self.pd_runtime_admission_paused = True
+            session["state"] = "source_held"
+            self._pd_flip_note_timing(session, "source_hold_completed")
+        return [str(req.rid) for _, req in selected]
+
+    def start_pd_flip_prefill_handoff_source(
+        self, recv_req: PDFlipPrefillHandoffSourceStartReq
+    ) -> PDFlipMigrationReqOutput:
+        handler_started = time.monotonic()
+        handler_started_epoch = time.time()
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "prefill":
+            return PDFlipMigrationReqOutput(
+                False,
+                f"prefill handoff source requires prefill role, got {role}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        existing = getattr(self, "pd_flip_prefill_handoff_session", None)
+        self._pd_flip_prefill_handoff_status_dict()
+        if existing:
+            if (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "source"
+            ):
+                if existing.get("state") == "source_armed":
+                    handled_rids = self._pd_flip_capture_armed_prefill_bootstrap(
+                        finalize=bool(recv_req.pause_admission)
+                    )
+                    return PDFlipMigrationReqOutput(
+                        True,
+                        (
+                            "finalized armed prefill handoff source"
+                            if recv_req.pause_admission
+                            else "prefill handoff source remains armed"
+                        ),
+                        status=self._pd_flip_prefill_handoff_status_dict(),
+                        manifests=list(existing.get("manifests", [])),
+                        handled_rids=sorted(handled_rids),
+                        ignored_rids=list(existing.get("ignored_rids", [])),
+                    )
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "prefill handoff source session already exists",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if not self._pd_flip_prefill_handoff_session_is_terminal(existing):
+                return PDFlipMigrationReqOutput(
+                    False,
+                    "conflicting prefill handoff session already exists",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+
+        if not recv_req.target_url or recv_req.target_bootstrap_port is None:
+            return PDFlipMigrationReqOutput(
+                False,
+                "target_url and target_bootstrap_port are required",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        session_id = recv_req.session_id or (
+            f"pd-flip-prefill-handoff-{int(time.time() * 1000)}"
+        )
+        target_host = self._pd_flip_source_host_from_url(recv_req.target_url)
+        hold_all_eligible = bool(recv_req.hold_all_eligible)
+        requested_rids = (
+            None
+            if hold_all_eligible
+            else (
+                {str(rid) for rid in recv_req.rids}
+                if recv_req.rids is not None
+                else None
+            )
+        )
+        self.pd_flip_prefill_handoff_session = {
+            "session_id": session_id,
+            "role": "source",
+            "state": "source_armed",
+            "entries": {},
+            "manifests": [],
+            "target_host": target_host,
+            "target_bootstrap_port": int(recv_req.target_bootstrap_port),
+            "hold_all_eligible": hold_all_eligible,
+            "requested_rids": requested_rids,
+            "max_requests": max(0, int(recv_req.max_requests or 0)),
+            "capture_count": 0,
+            "timing_debug": {
+                "source_arm_received_mono": handler_started,
+                "source_arm_received_epoch": handler_started_epoch,
+            },
+        }
+        handled_rids = self._pd_flip_capture_armed_prefill_bootstrap(
+            finalize=bool(recv_req.pause_admission)
+        )
+        session = self.pd_flip_prefill_handoff_session
+        return PDFlipMigrationReqOutput(
+            True,
+            (
+                "held eligible prefill bootstrap requests"
+                if recv_req.pause_admission
+                else "armed prefill bootstrap handoff"
+            ),
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=list(session.get("manifests", [])),
+            handled_rids=sorted(handled_rids),
+            ignored_rids=list(session.get("ignored_rids", [])),
+        )
+
+    def prepare_pd_flip_prefill_handoff_target(
+        self, recv_req: PDFlipPrefillHandoffTargetPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        handler_started = time.monotonic()
+        handler_started_epoch = time.time()
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "prefill":
+            return PDFlipMigrationReqOutput(
+                False,
+                f"prefill handoff target requires prefill role, got {role}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        existing = getattr(self, "pd_flip_prefill_handoff_session", None)
+        self._pd_flip_prefill_handoff_status_dict()
+        if existing:
+            if (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "target"
+            ):
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "prefill handoff target session already exists",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if not self._pd_flip_prefill_handoff_session_is_terminal(existing):
+                return PDFlipMigrationReqOutput(
+                    False,
+                    "conflicting prefill handoff session already exists",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                )
+
+        session_id = recv_req.session_id or (
+            f"pd-flip-prefill-handoff-target-{int(time.time() * 1000)}"
+        )
+        manifests = list(recv_req.manifests or [])
+        entries = {}
+        try:
+            for manifest in manifests:
+                if str(manifest.get("pd_flip_session_id")) != str(session_id):
+                    raise ValueError("prefill handoff manifest session id mismatch")
+                target_prefill_host = manifest.get("target_prefill_host")
+                if not target_prefill_host:
+                    raise ValueError(
+                        "prefill handoff manifest lacks target prefill host"
+                    )
+                # A Prefill sender bootstraps through its own host.  Reusing
+                # the old Source request's bootstrap host only works by
+                # accident when Source and Target share a physical node.
+                req = self._pd_flip_manifest_to_req(
+                    manifest, str(target_prefill_host)
+                )
+                req.pd_flip_migration_session_id = session_id
+                req.pd_flip_prefill_handoff_timing = {}
+                entries[str(req.rid)] = {
+                    "req": req,
+                    "manifest": manifest,
+                    "timing_debug": req.pd_flip_prefill_handoff_timing,
+                }
+        except Exception as exc:
+            return PDFlipMigrationReqOutput(
+                False,
+                f"failed to prepare prefill handoff target: {exc}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=manifests,
+            )
+
+        self.pd_flip_prefill_handoff_session = {
+            "session_id": session_id,
+            "role": "target",
+            "state": "target_prepared",
+            "entries": entries,
+            "manifests": manifests,
+            "timing_debug": {
+                "target_prepare_received_mono": handler_started,
+                "target_prepare_received_epoch": handler_started_epoch,
+            },
+        }
+        self._pd_flip_note_timing(
+            self.pd_flip_prefill_handoff_session,
+            "target_prepare_completed",
+            handler_started,
+        )
+        return PDFlipMigrationReqOutput(
+            True,
+            "prefill handoff target prepared",
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=manifests,
+            handled_rids=sorted(entries),
+        )
+
+    def activate_pd_flip_prefill_handoff_target(
+        self, recv_req: PDFlipPrefillHandoffTargetActivateReq
+    ) -> PDFlipMigrationReqOutput:
+        handler_started = time.monotonic()
+        session = getattr(self, "pd_flip_prefill_handoff_session", None)
+        if not session or session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                False,
+                "no prefill handoff target session exists",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        if recv_req.session_id and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill handoff target session id does not match",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        if session.get("state") in {"target_active", "target_complete"}:
+            return PDFlipMigrationReqOutput(
+                True,
+                "prefill handoff target already activated",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") != "target_prepared":
+            return PDFlipMigrationReqOutput(
+                False,
+                f"prefill handoff target cannot activate from {session.get('state')}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        selected = (
+            {str(rid) for rid in recv_req.rids}
+            if recv_req.rids is not None
+            else set(session.get("entries", {}))
+        )
+        activated = []
+        self._pd_flip_note_timing(session, "target_activate_received")
+        try:
+            for rid, entry in session.get("entries", {}).items():
+                if rid not in selected:
+                    continue
+                req = entry["req"]
+                timing = entry.setdefault("timing_debug", {})
+                req.pd_flip_prefill_handoff_timing = timing
+                self._pd_flip_note_timing(entry, "target_enqueue_started")
+                self._add_request_to_queue(req)
+                if req not in self.disagg_prefill_bootstrap_queue.queue:
+                    raise RuntimeError(f"target rejected bootstrap request {rid}")
+                activated.append(rid)
+                self._pd_flip_note_timing(entry, "target_enqueued")
+        except Exception as exc:
+            # Decode may already be rebound, so activation is forward-only.
+            # Preserve successfully enqueued requests and report the exact set
+            # for controller reconciliation.
+            session["state"] = "target_activation_failed"
+            session["last_error"] = str(exc)
+            return PDFlipMigrationReqOutput(
+                False,
+                f"failed to activate prefill handoff target: {exc}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=list(session.get("manifests", [])),
+                handled_rids=sorted(activated),
+            )
+        session["state"] = "target_active"
+        self._pd_flip_note_timing(session, "target_activate_completed", handler_started)
+        return PDFlipMigrationReqOutput(
+            True,
+            "prefill handoff target activated",
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=list(session.get("manifests", [])),
+            handled_rids=sorted(activated),
+        )
+
+    def rebind_pd_flip_prefill_handoff_decode(
+        self, recv_req: PDFlipPrefillHandoffDecodeRebindReq
+    ) -> PDFlipMigrationReqOutput:
+        handler_started = time.monotonic()
+        handler_started_epoch = time.time()
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "decode":
+            return PDFlipMigrationReqOutput(
+                False,
+                f"prefill handoff rebind requires decode role, got {role}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        session_id = recv_req.session_id or (
+            f"pd-flip-prefill-handoff-decode-{int(time.time() * 1000)}"
+        )
+        prepare_only = bool(recv_req.prepare_only)
+        commit_prepared = bool(recv_req.commit_prepared)
+        if prepare_only and commit_prepared:
+            return PDFlipMigrationReqOutput(
+                False,
+                "decode rebind cannot prepare and commit in one phased request",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        existing = getattr(self, "pd_flip_prefill_handoff_session", None)
+        self._pd_flip_prefill_handoff_status_dict()
+        same_session = bool(
+            existing and str(existing.get("session_id")) == str(session_id)
+        )
+        if same_session:
+            if existing.get("state") == "decode_rebound":
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "decode bootstrap requests already rebound",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if prepare_only and existing.get("state") == "decode_prepared":
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "decode bootstrap requests already prepared",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                    handled_rids=sorted(existing.get("entries", {})),
+                )
+        elif existing and not self._pd_flip_prefill_handoff_session_is_terminal(
+            existing
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "conflicting prefill handoff session already exists",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+
+        if commit_prepared:
+            if not same_session or existing.get("state") != "decode_prepared":
+                return PDFlipMigrationReqOutput(
+                    False,
+                    "decode rebind commit requires a matching prepared session",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                )
+            manifests = list(existing.get("manifests", []))
+        else:
+            manifests = list(recv_req.manifests or [])
+        entries = {}
+        try:
+            # Validate the whole local group before either reserving or
+            # mutating.  The prepare phase then prevents normal Decode
+            # preallocation from allocating transfer metadata until every
+            # Decode owner has acknowledged the same distributed handoff.
+            for manifest in manifests:
+                self.disagg_decode_prealloc_queue.validate_rebind_bootstrap(
+                    rid=str(
+                        manifest.get("original_decode_rid")
+                        or manifest.get("rid")
+                    ),
+                    original_bootstrap_room=int(
+                        manifest.get("original_bootstrap_room")
+                    ),
+                    migration_bootstrap_room=int(
+                        manifest.get("migration_bootstrap_room")
+                    ),
+                    session_id=str(session_id),
+                )
+            if prepare_only:
+                for manifest in manifests:
+                    decode_req = (
+                        self.disagg_decode_prealloc_queue.reserve_rebind_bootstrap(
+                            session_id=str(session_id),
+                            rid=str(
+                                manifest.get("original_decode_rid")
+                                or manifest.get("rid")
+                            ),
+                            original_bootstrap_room=int(
+                                manifest.get("original_bootstrap_room")
+                            ),
+                            migration_bootstrap_room=int(
+                                manifest.get("migration_bootstrap_room")
+                            ),
+                        )
+                    )
+                    entries[str(decode_req.req.rid)] = {
+                        "decode_req": decode_req,
+                        "manifest": manifest,
+                    }
+                self.pd_flip_prefill_handoff_session = {
+                    "session_id": session_id,
+                    "role": "decode",
+                    "state": "decode_prepared",
+                    "entries": entries,
+                    "manifests": manifests,
+                    "timing_debug": {
+                        "decode_prepare_received_mono": handler_started,
+                        "decode_prepare_received_epoch": handler_started_epoch,
+                    },
+                }
+                self._pd_flip_note_timing(
+                    self.pd_flip_prefill_handoff_session,
+                    "decode_prepare_completed",
+                    handler_started,
+                )
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "decode bootstrap requests prepared",
+                    status=self._pd_flip_prefill_handoff_status_dict(),
+                    manifests=manifests,
+                    handled_rids=sorted(entries),
+                )
+            for manifest in manifests:
+                decode_req = self.disagg_decode_prealloc_queue.rebind_bootstrap(
+                    rid=str(
+                        manifest.get("original_decode_rid")
+                        or manifest.get("rid")
+                    ),
+                    original_bootstrap_room=int(
+                        manifest.get("original_bootstrap_room")
+                    ),
+                    target_prefill_host=str(manifest.get("target_prefill_host")),
+                    target_bootstrap_port=int(manifest.get("source_bootstrap_port")),
+                    migration_bootstrap_room=int(
+                        manifest.get("migration_bootstrap_room")
+                    ),
+                    session_id=str(session_id),
+                )
+                entries[str(decode_req.req.rid)] = {
+                    "decode_req": decode_req,
+                    "manifest": manifest,
+                }
+        except Exception as exc:
+            # A prepare failure must not strand reservations that were made
+            # earlier in this local batch. No receiver ownership has changed
+            # yet, so releasing them restores the exact pre-prepare state.
+            if prepare_only:
+                for entry in entries.values():
+                    self.disagg_decode_prealloc_queue.release_rebind_bootstrap_reservation(
+                        entry["decode_req"], str(session_id)
+                    )
+            return PDFlipMigrationReqOutput(
+                False,
+                f"failed to rebind decode bootstrap request: {exc}",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=manifests,
+                handled_rids=sorted(entries),
+            )
+
+        self.pd_flip_prefill_handoff_session = {
+            "session_id": session_id,
+            "role": "decode",
+            "state": "decode_rebound",
+            "entries": entries,
+            "manifests": manifests,
+            "timing_debug": {
+                "decode_rebind_received_mono": handler_started,
+                "decode_rebind_received_epoch": handler_started_epoch,
+            },
+        }
+        self._pd_flip_note_timing(
+            self.pd_flip_prefill_handoff_session,
+            "decode_rebind_completed",
+            handler_started,
+        )
+        return PDFlipMigrationReqOutput(
+            True,
+            "decode bootstrap requests rebound",
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=manifests,
+            handled_rids=sorted(entries),
+        )
+
+    def finish_pd_flip_prefill_handoff_source(
+        self, recv_req: PDFlipPrefillHandoffSourceFinishReq
+    ) -> PDFlipMigrationReqOutput:
+        handler_started = time.monotonic()
+        session = getattr(self, "pd_flip_prefill_handoff_session", None)
+        if not session or session.get("role") != "source":
+            return PDFlipMigrationReqOutput(
+                False,
+                "no prefill handoff source session exists",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        if recv_req.session_id and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill handoff source session id does not match",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        if session.get("state") == "source_released":
+            return PDFlipMigrationReqOutput(
+                True,
+                "prefill handoff source already released",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        released = (
+            {str(rid) for rid in recv_req.released_rids}
+            if recv_req.released_rids is not None
+            else set(session.get("entries", {}))
+        )
+        handled = []
+        for rid, entry in session.get("entries", {}).items():
+            if rid not in released:
+                continue
+            req = entry["req"]
+            self._pd_flip_prefill_handoff_clear_sender(req)
+            if self.enable_hicache_storage:
+                # The request can be captured from the bootstrap queue after its
+                # asynchronous storage prefetch has started.  Handoff makes the
+                # source request terminal without passing through the ordinary
+                # abort path, so explicitly release that prefetch here; otherwise
+                # it remains in tree_cache.ongoing_prefetch and keeps the source
+                # permanently non-idle during the following role switch.
+                self.tree_cache.release_aborted_request(req.rid)
+            maybe_release_metadata_buffer(
+                req,
+                self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator,
+            )
+            req.pd_flip_migrated_to_target = True
+            req.pd_flip_waiting_for_relay_output = True
+            req.finished_reason = FINISH_MIGRATED()
+            self.output_streamer.stream_output([req], req.return_logprob)
+            handled.append(rid)
+        # Discovery may hold a small batch to find one request whose Decode
+        # preallocation is visible. Return every unselected request to its
+        # original queue position before the source is allowed to drain.
+        requeued = []
+        queue = self.disagg_prefill_bootstrap_queue.queue
+        unselected = [
+            entry
+            for rid, entry in session.get("entries", {}).items()
+            if rid not in released
+        ]
+        for entry in sorted(
+            unselected, key=lambda value: int(value["queue_index"])
+        ):
+            req = entry["req"]
+            if req not in queue:
+                index = min(int(entry["queue_index"]), len(queue))
+                queue.insert(index, req)
+            requeued.append(str(req.rid))
+        session["state"] = "source_released"
+        self._pd_flip_note_timing(session, "source_release_completed", handler_started)
+        session["requeued_rids"] = sorted(requeued)
+        return PDFlipMigrationReqOutput(
+            True,
+            "prefill handoff source released",
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=list(session.get("manifests", [])),
+            handled_rids=sorted(handled),
+            ignored_rids=sorted(requeued),
+        )
+
+    def abort_pd_flip_prefill_handoff(
+        self, recv_req: PDFlipPrefillHandoffAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_prefill_handoff_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                True, "no prefill handoff session exists", status={"state": "idle"}
+            )
+        if recv_req.session_id and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill handoff session id does not match",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        role = session.get("role")
+        state = session.get("state")
+        if role == "decode" and state == "decode_rebound":
+            return PDFlipMigrationReqOutput(
+                False,
+                "decode rebind is forward-only; finish the source handoff",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if role == "decode" and state == "decode_prepared":
+            for entry in session.get("entries", {}).values():
+                self.disagg_decode_prealloc_queue.release_rebind_bootstrap_reservation(
+                    entry["decode_req"], str(session.get("session_id"))
+                )
+            session["state"] = "decode_aborted"
+        elif role == "source" and state in {"source_armed", "source_held"}:
+            queue = self.disagg_prefill_bootstrap_queue.queue
+            requeue_offset = 0
+            for entry in sorted(
+                session.get("entries", {}).values(),
+                key=lambda value: value.get("capture_order", value["queue_index"]),
+            ):
+                entry["req"].pd_flip_migration_session_id = None
+                index = min(
+                    int(entry["queue_index"]) + requeue_offset, len(queue)
+                )
+                queue.insert(index, entry["req"])
+                requeue_offset += 1
+            session["state"] = "source_aborted"
+        elif role == "target" and state == "target_prepared":
+            session["state"] = "target_aborted"
+        elif role == "target" and state == "target_active":
+            queue = self.disagg_prefill_bootstrap_queue.queue
+            for entry in session.get("entries", {}).values():
+                req = entry["req"]
+                if req not in queue:
+                    return PDFlipMigrationReqOutput(
+                        False,
+                        "target request already left bootstrap queue; handoff is forward-only",
+                        status=self._pd_flip_prefill_handoff_status_dict(),
+                        manifests=list(session.get("manifests", [])),
+                    )
+            for entry in session.get("entries", {}).values():
+                req = entry["req"]
+                queue.remove(req)
+                self._pd_flip_prefill_handoff_clear_sender(req)
+                maybe_release_metadata_buffer(
+                    req,
+                    self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator,
+                )
+            session["state"] = "target_aborted"
+        return PDFlipMigrationReqOutput(
+            True,
+            recv_req.reason or "prefill handoff aborted",
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def get_pd_flip_prefill_handoff_status(
+        self, recv_req: PDFlipPrefillHandoffStatusReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_prefill_handoff_session", None) or {}
+        if recv_req.session_id and session and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill handoff session id does not match",
+                status=self._pd_flip_prefill_handoff_status_dict(),
+            )
+        return PDFlipMigrationReqOutput(
+            True,
+            status=self._pd_flip_prefill_handoff_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def start_pd_flip_migration_source(
+        self, recv_req: PDFlipMigrationSourceStartReq
+    ) -> PDFlipMigrationReqOutput:
+        ps = getattr(self, "ps", None)
+        local_dp_rank = getattr(ps, "attn_dp_rank", None)
+        if local_dp_rank is None:
+            local_dp_rank = getattr(ps, "dp_rank", 0) or 0
+        local_dp_rank = int(local_dp_rank)
+        prefill_donor_mode = bool(
+            getattr(recv_req, "prefill_donor_mode", False)
+        )
+        existing = getattr(self, "pd_flip_migration_session", None)
+        if existing:
+            matches = (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "source"
+            )
+            if matches:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="source migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            blockers = self._pd_flip_rollover_blockers(existing, "source")
+            if blockers:
+                status = self._pd_flip_migration_status_dict()
+                status["rollover_blockers"] = blockers
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message=(
+                        "conflicting migration session already exists: "
+                        "rollover_blockers="
+                        f"{json.dumps(blockers, sort_keys=True, separators=(',', ':'))}"
+                    ),
+                    status=status,
+                    manifests=list(existing.get("manifests", [])),
+                )
+            self._pd_flip_archive_rollover_session(existing)
+        timing_debug = {}
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "decode":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"source migration requires decode role, got {role}",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if prefill_donor_mode and not getattr(
+            self.server_args, "enable_pd_flip_prefill_donor", False
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="prefill donor migration is not enabled on source",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        waiting_scan_started = time.monotonic()
+        waiting_reqs = list(getattr(self, "waiting_queue", []))
+        waiting_skipped = []
+        scan_started = time.monotonic()
+        source_start_req = recv_req
+        source_rid_partition = {
+            "dp_rank": local_dp_rank,
+            "handled_rids": [],
+            "ignored_rids": [],
+        }
+        dp_size = int(getattr(getattr(self, "server_args", None), "dp_size", 1) or 1)
+        if recv_req.rids is not None and dp_size > 1:
+            local_running_rids = [
+                str(req.rid)
+                for req in getattr(getattr(self, "running_batch", None), "reqs", [])
+                if not req.finished()
+            ]
+            source_rid_partition = self._pd_flip_partition_rids(
+                recv_req.rids, local_running_rids
+            )
+            source_start_req = dataclasses.replace(
+                recv_req, rids=source_rid_partition["handled_rids"]
+            )
+        try:
+            selected_reqs = self._pd_flip_select_source_batch(
+                source_start_req,
+                waiting_reqs=waiting_reqs,
+                waiting_skipped_out=waiting_skipped,
+            )
+        except ValueError as exc:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=str(exc),
+                status=self._pd_flip_migration_status_dict(),
+            )
+        running_candidates = [
+            req
+            for req in getattr(getattr(self, "running_batch", None), "reqs", [])
+            if not req.finished()
+        ]
+        running_count = (
+            len(running_candidates)
+            if source_start_req.rids is None
+            else len(source_start_req.rids)
+        )
+        running_reqs = selected_reqs[:running_count]
+        timing_debug["scan_running_reqs_s"] = time.monotonic() - scan_started
+        timing_debug["running_reqs"] = len(running_reqs)
+
+        if source_start_req.include_waiting:
+            waiting_indexes = {id(req): index for index, req in enumerate(waiting_reqs)}
+            waiting_selected = [
+                (waiting_indexes[id(req)], req)
+                for req in selected_reqs[running_count:]
+            ]
+        else:
+            waiting_selected = []
+        timing_debug["scan_waiting_reqs_s"] = time.monotonic() - waiting_scan_started
+        timing_debug["waiting_reqs"] = len(waiting_reqs)
+        timing_debug["waiting_skipped_count"] = len(waiting_skipped)
+        timing_debug["waiting_skipped"] = waiting_skipped
+
+        session_id = recv_req.session_id or f"pd-flip-{int(time.time() * 1000)}"
+        target_decode_dp_rank = getattr(recv_req, "target_decode_dp_rank", None)
+        target_decode_dp_ranks = getattr(recv_req, "target_decode_dp_ranks", None) or {}
+        if not isinstance(target_decode_dp_ranks, dict):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target_decode_dp_ranks must be an object",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        target_decode_dp_ranks = {
+            str(rid): int(rank) for rid, rank in target_decode_dp_ranks.items()
+        }
+        manifest_started = time.monotonic()
+        manifests = []
+        migration_reqs = []
+        source_waiting_reqs = []
+        for req in running_reqs:
+            req.pd_flip_migration_session_id = session_id
+            req_target_rank = target_decode_dp_ranks.get(
+                str(req.rid), target_decode_dp_rank
+            )
+            if req_target_rank is not None:
+                req.pd_flip_target_decode_dp_rank = int(req_target_rank)
+            manifest = self._pd_flip_build_migration_manifest(req)
+            manifest["pd_flip_source_queue"] = "running"
+            manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
+                req
+            )
+            manifest["source_bootstrap_port"] = (
+                getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                )
+            )
+            if prefill_donor_mode:
+                self._pd_flip_apply_prefill_donor_manifest(req, manifest)
+            manifests.append(manifest)
+            migration_reqs.append(req)
+        timing_debug["running_manifest_count"] = len(manifests)
+        waiting_manifest_started = time.monotonic()
+        for queue_index, req in waiting_selected:
+            req.pd_flip_migration_session_id = session_id
+            req_target_rank = target_decode_dp_ranks.get(
+                str(req.rid), target_decode_dp_rank
+            )
+            if req_target_rank is not None:
+                req.pd_flip_target_decode_dp_rank = int(req_target_rank)
+            manifest = self._pd_flip_build_migration_manifest(req)
+            manifest["pd_flip_source_queue"] = "waiting"
+            manifest["pd_flip_waiting_queue_index"] = queue_index
+            manifest["migration_bootstrap_room"] = self._pd_flip_migration_room_for_req(
+                req
+            )
+            manifest["source_bootstrap_port"] = (
+                getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                )
+            )
+            if prefill_donor_mode:
+                self._pd_flip_apply_prefill_donor_manifest(req, manifest)
+            manifests.append(manifest)
+            migration_reqs.append(req)
+            source_waiting_reqs.append(
+                {
+                    "rid": str(manifest.get("rid") or getattr(req, "rid", "")),
+                    "req": req,
+                    "original_index": queue_index,
+                }
+            )
+        timing_debug["build_waiting_manifests_s"] = (
+            time.monotonic() - waiting_manifest_started
+        )
+        timing_debug["waiting_manifest_count"] = len(source_waiting_reqs)
+        timing_debug["build_manifests_s"] = time.monotonic() - manifest_started
+        timing_debug["manifest_count"] = len(manifests)
+        entry_started = time.monotonic()
+        real_entries, real_error = self._pd_flip_start_source_entries(
+            migration_reqs, manifests
+        )
+        timing_debug["start_source_entries_s"] = time.monotonic() - entry_started
+        session = {
+            "session_id": session_id,
+            "role": "source",
+            "dp_rank": local_dp_rank,
+            "state": "source_started" if not real_error else "source_failed",
+            "target_url": recv_req.target_url,
+            "manifests": manifests,
+            "pending_reqs": len(manifests),
+            "transferred_reqs": 0,
+            "released_reqs": 0,
+            "failed_reqs": len(manifests) if real_error else 0,
+            "last_error": real_error,
+            "dry_run": not bool(real_entries),
+            "source_entries": real_entries,
+            "source_waiting_reqs": source_waiting_reqs,
+            "timing_debug": timing_debug,
+            "prefill_donor_mode": prefill_donor_mode,
+            "handled_rids": [str(manifest.get("rid") or "") for manifest in manifests],
+            "ignored_rids": list(source_rid_partition["ignored_rids"]),
+        }
+        self.pd_flip_migration_session = session
+        if real_entries:
+            freeze_started = time.monotonic()
+            self._pd_flip_freeze_waiting_source_requests(session)
+            timing_debug["freeze_waiting_reqs_s"] = time.monotonic() - freeze_started
+            self._pd_flip_source_pump_transfer(self.pd_flip_migration_session)
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "source migration session started",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+            dp_rank=local_dp_rank,
+            handled_rids=list(session["handled_rids"]),
+            ignored_rids=list(session["ignored_rids"]),
+        )
+
+    def prepare_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        prefill_donor_mode = bool(
+            getattr(recv_req, "prefill_donor_mode", False)
+        )
+        existing = getattr(self, "pd_flip_migration_session", None)
+        if existing:
+            matches = (
+                recv_req.session_id is not None
+                and str(recv_req.session_id) == str(existing.get("session_id"))
+                and existing.get("role") == "target"
+            )
+            if matches:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="target migration session already exists",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            blockers = self._pd_flip_rollover_blockers(existing, "target")
+            if blockers:
+                status = self._pd_flip_migration_status_dict()
+                status["rollover_blockers"] = blockers
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message=(
+                        "conflicting migration session already exists: "
+                        "rollover_blockers="
+                        f"{json.dumps(blockers, sort_keys=True, separators=(',', ':'))}"
+                    ),
+                    status=status,
+                    manifests=list(existing.get("manifests", [])),
+                )
+            self._pd_flip_archive_rollover_session(existing)
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if role != "decode":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"target migration requires decode role, got {role}",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if prefill_donor_mode and not getattr(
+            self.server_args, "enable_pd_flip_prefill_donor", False
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="prefill donor migration is not enabled on target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        session_id = recv_req.session_id or f"pd-flip-target-{int(time.time() * 1000)}"
+        all_manifests = list(recv_req.manifests or [])
+        try:
+            partition = self._pd_flip_partition_manifests(
+                all_manifests, "target_decode_dp_rank"
+            )
+        except ValueError as exc:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=str(exc),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=all_manifests,
+                dp_rank=self._pd_flip_attn_dp_rank(),
+            )
+        manifests = partition["manifests"]
+        for manifest in manifests:
+            manifest_session_id = manifest.get("pd_flip_session_id")
+            if manifest_session_id is not None and str(manifest_session_id) != str(
+                session_id
+            ):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target manifest session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=manifests,
+                )
+            manifest["pd_flip_session_id"] = session_id
+        timing_debug = {"manifest_count": len(manifests)}
+        entry_started = time.monotonic()
+        if prefill_donor_mode:
+            target_entries, real_error = self._pd_flip_prepare_target_entries(
+                manifests,
+                recv_req.source_url,
+                prefill_donor_mode=True,
+            )
+        else:
+            target_entries, real_error = self._pd_flip_prepare_target_entries(
+                manifests, recv_req.source_url
+            )
+        timing_debug["prepare_target_entries_s"] = time.monotonic() - entry_started
+        self.pd_flip_migration_session = {
+            "session_id": session_id,
+            "role": "target",
+            "dp_rank": partition["dp_rank"],
+            "state": "target_prepared" if not real_error else "target_failed",
+            "source_url": recv_req.source_url,
+            "manifests": manifests,
+            "pending_reqs": len(manifests),
+            "transferred_reqs": 0,
+            "released_reqs": 0,
+            "failed_reqs": len(manifests) if real_error else 0,
+            "last_error": real_error,
+            "dry_run": not bool(target_entries),
+            "adopt_on_success": recv_req.adopt_on_success,
+            "prepare_only": recv_req.prepare_only,
+            "adopt_on_commit": recv_req.adopt_on_commit,
+            "held_reqs": 0,
+            "target_entries": target_entries,
+            "timing_debug": timing_debug,
+            "prefill_donor_mode": prefill_donor_mode,
+            "handled_rids": partition["handled_rids"],
+            "ignored_rids": partition["ignored_rids"],
+        }
+        if target_entries:
+            self._pd_flip_target_pump_transfer(self.pd_flip_migration_session)
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "target migration session prepared",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+            dp_rank=partition["dp_rank"],
+            handled_rids=partition["handled_rids"],
+            ignored_rids=partition["ignored_rids"],
+        )
+
+    def _pd_flip_pump_prefill_donor_session(
+        self, session: Dict[str, Any]
+    ) -> None:
+        entries = session.get("entries") or {}
+        for entry in entries.values():
+            self._pd_flip_pump_prefill_donor_entry(entry)
+        transferred = {
+            rid for rid, entry in entries.items() if entry.get("phase") == "transferred"
+        }
+        failed = {
+            rid for rid, entry in entries.items() if entry.get("phase") == "failed"
+        }
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(entries) - len(transferred) - len(failed)
+        )
+        if failed:
+            session["state"] = "prefill_donor_failed"
+            first_failed = entries[next(iter(failed))]
+            session["last_error"] = first_failed.get("error", "")
+        elif session["pending_reqs"] == 0:
+            session["state"] = "prefill_donor_transferred"
+
+    def _pd_flip_prefill_donor_status_dict(self) -> Dict[str, Any]:
+        session = getattr(self, "pd_flip_prefill_donor_session", None)
+        if not session:
+            return {
+                "state": "idle",
+                "role": "prefill_donor",
+                "dp_rank": self._pd_flip_attn_dp_rank(),
+                "handled_rids": [],
+                "ignored_rids": [],
+            }
+        entries = session.get("entries") or {}
+
+        def elapsed(entry: Dict[str, Any], start: str, end: str):
+            timing = entry.get("timing_debug") or {}
+            started = timing.get(f"{start}_mono")
+            completed = timing.get(f"{end}_mono")
+            if not isinstance(started, (int, float)) or not isinstance(
+                completed, (int, float)
+            ):
+                return None
+            return max(0.0, completed - started)
+
+        def ranked_measurement(rid: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+            measure = getattr(self, "_pd_flip_migration_request_measurements", None)
+            if not callable(measure):
+                return {}
+            rows = measure(
+                {
+                    "session_id": session.get("session_id"),
+                    "role": "prefill_donor",
+                    "dp_rank": session.get("dp_rank", self._pd_flip_attn_dp_rank()),
+                    "source_entries": {rid: entry},
+                    "timing_debug": {},
+                }
+            )
+            if not rows:
+                return {}
+            row = rows[0]
+            return {
+                key: row.get(key)
+                for key in (
+                    "request_id",
+                    "session_id",
+                    "worker",
+                    "dp_rank",
+                    "source_decode_dp_rank",
+                    "prefill_donor_dp_rank",
+                    "target_decode_dp_rank",
+                    "model_fingerprint",
+                    "page_size",
+                    "phase_events",
+                )
+            }
+
+        return {
+            "session_id": session.get("session_id"),
+            "role": "prefill_donor",
+            "state": session.get("state"),
+            "pending_reqs": int(session.get("pending_reqs", 0) or 0),
+            "transferred_reqs": int(session.get("transferred_reqs", 0) or 0),
+            "failed_reqs": int(session.get("failed_reqs", 0) or 0),
+            "last_error": session.get("last_error", ""),
+            "dp_rank": self._pd_flip_attn_dp_rank(),
+            "handled_rids": list(session.get("handled_rids") or entries.keys()),
+            "ignored_rids": list(session.get("ignored_rids") or []),
+            "entries": {
+                rid: dict(
+                    {
+                        key: entry.get(key)
+                        for key in (
+                        "phase",
+                        "error",
+                        "error_type",
+                        "prefill_donor_end",
+                        "prefill_donor_restore_hit_len",
+                        "expected_restore_len",
+                        "prefill_donor_transfer_start",
+                        "prefill_donor_transfer_end",
+                        "prefill_donor_pages",
+                        "prefill_donor_transfer_bytes",
+                        "prefill_donor_transfer_duration_s",
+                        )
+                        if entry.get(key) is not None
+                    },
+                    **ranked_measurement(rid, entry),
+                    prompt_len=(entry.get("manifest") or {}).get("prompt_len"),
+                    source_decode_start=(entry.get("manifest") or {}).get(
+                        "source_decode_start"
+                    ),
+                    prefill_donor_host=(entry.get("manifest") or {}).get(
+                        "prefill_donor_host"
+                    ),
+                    prefill_donor_restore_seconds=elapsed(
+                        entry,
+                        "prefill_donor_restore_started",
+                        "prefill_donor_restore_completed",
+                    ),
+                    prefill_donor_transfer_seconds=entry.get(
+                        "prefill_donor_transfer_duration_s"
+                    )
+                    or elapsed(
+                        entry,
+                        "prefill_donor_transfer_started",
+                        "prefill_donor_transfer_completed",
+                    ),
+                    provenance_mode="prefill_donor_and_source_decode",
+                )
+                for rid, entry in entries.items()
+            },
+        }
+
+    def start_pd_flip_prefill_donor(
+        self, recv_req: PDFlipPrefillDonorStartReq
+    ) -> PDFlipMigrationReqOutput:
+        if not getattr(self.server_args, "enable_pd_flip_prefill_donor", False):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill donor migration is not enabled",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        session_id = recv_req.session_id or f"pd-flip-donor-{int(time.time() * 1000)}"
+        existing = getattr(self, "pd_flip_prefill_donor_session", None)
+        if existing:
+            if str(existing.get("session_id")) == str(session_id):
+                self._pd_flip_pump_prefill_donor_session(existing)
+                return PDFlipMigrationReqOutput(
+                    True,
+                    "prefill donor session already exists",
+                    status=self._pd_flip_prefill_donor_status_dict(),
+                    manifests=list(existing.get("manifests", [])),
+                )
+            if existing.get("state") not in {
+                "prefill_donor_transferred",
+                "prefill_donor_failed",
+                "prefill_donor_aborted",
+            }:
+                return PDFlipMigrationReqOutput(
+                    False,
+                    "conflicting prefill donor session already exists",
+                    status=self._pd_flip_prefill_donor_status_dict(),
+                )
+
+        all_manifests = list(recv_req.manifests or [])
+        if not all_manifests:
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill donor manifests are empty",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        try:
+            partition = self._pd_flip_partition_manifests(
+                all_manifests, "prefill_donor_dp_rank"
+            )
+        except ValueError as exc:
+            return PDFlipMigrationReqOutput(
+                False,
+                str(exc),
+                status=self._pd_flip_prefill_donor_status_dict(),
+                manifests=all_manifests,
+                dp_rank=self._pd_flip_attn_dp_rank(),
+            )
+        manifests = partition["manifests"]
+        entries = {}
+        try:
+            kv_manager = self._pd_flip_get_source_kv_manager()
+            sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+            for manifest in manifests:
+                donor_end = int(manifest.get("prefill_donor_end") or 0)
+                rid = str(manifest.get("rid") or "")
+                if not rid:
+                    raise RuntimeError("prefill donor manifest has empty rid")
+                if donor_end == 0:
+                    entries[rid] = {
+                        "phase": "transferred",
+                        "manifest": manifest,
+                        "prefill_donor_end": 0,
+                        "prefill_donor_transfer_start": 0,
+                        "prefill_donor_transfer_end": 0,
+                    }
+                    continue
+                entries[rid] = self._pd_flip_prepare_prefill_donor_entry(
+                    manifest,
+                    sender_class,
+                    kv_manager,
+                    bootstrap_addr,
+                )
+        except Exception as exc:
+            for entry in entries.values():
+                sender = entry.get("sender")
+                if sender is not None and hasattr(sender, "abort"):
+                    sender.abort()
+                if entry.get("req") is not None:
+                    self._pd_flip_cleanup_prefill_donor_entry(entry)
+            return PDFlipMigrationReqOutput(
+                False,
+                str(exc),
+                status={
+                    "session_id": session_id,
+                    "role": "prefill_donor",
+                    "state": "prefill_donor_failed",
+                    "last_error": str(exc),
+                },
+                manifests=manifests,
+            )
+
+        self.pd_flip_prefill_donor_session = {
+            "session_id": session_id,
+            "role": "prefill_donor",
+            "dp_rank": partition["dp_rank"],
+            "state": "prefill_donor_started",
+            "manifests": manifests,
+            "entries": entries,
+            "pending_reqs": len(entries),
+            "transferred_reqs": 0,
+            "failed_reqs": 0,
+            "last_error": "",
+            "handled_rids": partition["handled_rids"],
+            "ignored_rids": partition["ignored_rids"],
+        }
+        self._pd_flip_pump_prefill_donor_session(
+            self.pd_flip_prefill_donor_session
+        )
+        status = self._pd_flip_prefill_donor_status_dict()
+        failed = status.get("state") == "prefill_donor_failed"
+        return PDFlipMigrationReqOutput(
+            not failed,
+            (
+                str(status.get("last_error") or "prefill donor session failed")
+                if failed
+                else "prefill donor session started"
+            ),
+            status=status,
+            manifests=manifests,
+            dp_rank=partition["dp_rank"],
+            handled_rids=partition["handled_rids"],
+            ignored_rids=partition["ignored_rids"],
+        )
+
+    def get_pd_flip_prefill_donor_status(
+        self, recv_req: PDFlipPrefillDonorStatusReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_prefill_donor_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill donor session not found",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        if recv_req.session_id and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill donor session id does not match",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        self._pd_flip_pump_prefill_donor_session(session)
+        status = self._pd_flip_prefill_donor_status_dict()
+        return PDFlipMigrationReqOutput(
+            status.get("state") != "prefill_donor_failed",
+            status=status,
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def abort_pd_flip_prefill_donor(
+        self, recv_req: PDFlipPrefillDonorAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_prefill_donor_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                True,
+                "prefill donor session is already absent",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        if recv_req.session_id and str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                False,
+                "prefill donor session id does not match",
+                status=self._pd_flip_prefill_donor_status_dict(),
+            )
+        for entry in (session.get("entries") or {}).values():
+            if entry.get("phase") in {"transferred", "failed", "aborted"}:
+                continue
+            entry["phase"] = "aborted"
+            entry["error"] = recv_req.reason or "prefill donor aborted"
+            sender = entry.get("sender")
+            if sender is not None and hasattr(sender, "abort"):
+                sender.abort()
+            self._pd_flip_cleanup_prefill_donor_entry(entry)
+        session["state"] = "prefill_donor_aborted"
+        session["last_error"] = recv_req.reason or "prefill donor aborted"
+        session["pending_reqs"] = 0
+        return PDFlipMigrationReqOutput(
+            True,
+            "prefill donor session aborted",
+            status=self._pd_flip_prefill_donor_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def prepare_pd_flip_migration_target_delta(
+        self, recv_req: PDFlipMigrationTargetDeltaPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if recv_req.session_id is None or str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        manifests = []
+        for item in recv_req.manifests or []:
+            if not isinstance(item, dict):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target delta manifest is not an object",
+                    status=self._pd_flip_migration_status_dict(),
+                )
+            manifest = dict(item)
+            manifest_session_id = manifest.get("pd_flip_session_id")
+            if manifest_session_id is not None and str(manifest_session_id) != str(
+                session.get("session_id")
+            ):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="target delta manifest session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                )
+            manifest["pd_flip_session_id"] = session.get("session_id")
+            manifests.append(manifest)
+        try:
+            partition = self._pd_flip_partition_manifests(
+                manifests, "target_decode_dp_rank"
+            )
+        except ValueError as exc:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=str(exc),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=manifests,
+                dp_rank=self._pd_flip_attn_dp_rank(),
+            )
+        manifests = partition["manifests"]
+        session["ignored_rids"] = sorted(
+            set(session.get("ignored_rids") or []).union(partition["ignored_rids"])
+        )
+        signature = self._pd_flip_delta_manifest_signature(manifests)
+        existing_signature = session.get("target_delta_manifest_signature")
+        if existing_signature is not None:
+            matches = signature == existing_signature
+            repeatable = session.get("state") in {
+                "target_delta_started",
+                "target_delta_transferred",
+                "ready_to_activate",
+                "active",
+            }
+            return PDFlipMigrationReqOutput(
+                success=matches and repeatable,
+                message=(
+                    "target migration delta already prepared"
+                    if matches and repeatable
+                    else "target migration delta conflicts with existing preparation"
+                ),
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("delta_manifests") or []),
+            )
+
+        self._pd_flip_target_pump_transfer(session)
+        entries = session.get("target_entries") or {}
+        real_error = ""
+        delta_entries = 0
+        for manifest in manifests:
+            rid = str(manifest.get("rid", ""))
+            entry = entries.get(rid)
+            if entry is None:
+                real_error = f"target delta references unknown rid={rid}"
+                break
+            if entry.get("phase") != "transferred_held":
+                real_error = f"target delta requires held base transfer for rid={rid}"
+                break
+            try:
+                if manifest.get("pd_flip_drop_target"):
+                    entry["drop_on_commit"] = True
+                    # Release while the request still describes the received C0
+                    # mapping.  Applying the terminal C1 manifest first would
+                    # make release_kv_cache walk unallocated C0:C1 positions and
+                    # can double-free arbitrary pool slots.
+                    self._pd_flip_release_target_request(entry)
+                    self._pd_flip_apply_delta_manifest_to_target(entry, manifest)
+                    entry["held"] = False
+                    continue
+                if manifest.get("delta_noop"):
+                    self._pd_flip_apply_delta_manifest_to_target(entry, manifest)
+                    continue
+                self._pd_flip_start_target_delta_entry(
+                    entry, manifest, recv_req.source_url
+                )
+                delta_entries += 1
+            except Exception as exc:
+                real_error = str(exc)
+                entry["phase"] = "failed"
+                break
+
+        session["delta_manifests"] = manifests
+        session["target_delta_manifest_signature"] = signature
+        session["delta_pending_reqs"] = delta_entries
+        session["pending_reqs"] = delta_entries
+        if real_error:
+            session["state"] = "target_failed"
+            session["last_error"] = real_error
+            session["failed_reqs"] = int(session.get("failed_reqs", 0)) + 1
+        else:
+            session["state"] = (
+                "target_delta_started" if delta_entries else "target_delta_transferred"
+            )
+        if delta_entries:
+            self._pd_flip_target_pump_transfer(session)
+
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "target migration delta prepared",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+            dp_rank=partition["dp_rank"],
+            handled_rids=partition["handled_rids"],
+            ignored_rids=partition["ignored_rids"],
+        )
+
+    @staticmethod
+    def _pd_flip_delta_manifest_signature(manifests: List[Dict[str, Any]]) -> str:
+        return json.dumps(manifests, sort_keys=True, separators=(",", ":"))
+
+    def commit_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetCommitReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if recv_req.session_id and recv_req.session_id != session.get("session_id"):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("state") in {"ready_to_activate", "active"}:
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration commit already complete",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"target_aborted", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        self._pd_flip_note_timing(session, "commit_received")
+        self._pd_flip_target_pump_transfer(session)
+        entries = session.get("target_entries") or {}
+        rid_partition = self._pd_flip_partition_rids(recv_req.rids, entries.keys())
+        requested_rids = rid_partition["handled_rids"]
+        if not entries:
+            session["state"] = "ready_to_activate"
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target rank has no local requests to commit",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+                dp_rank=rid_partition["dp_rank"],
+                handled_rids=[],
+                ignored_rids=rid_partition["ignored_rids"],
+            )
+        requested = set(requested_rids)
+        if (
+            not requested_rids
+            or len(requested) != len(requested_rids)
+            or requested != set(entries)
+            or any(entries[rid].get("phase") != "transferred_held" for rid in requested)
+        ):
+            message = "target migration batch is not atomically ready"
+            self._pd_flip_abort_target_session(session, message)
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=message,
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        try:
+            for rid in requested_rids:
+                entry = entries[rid]
+                if entry.get("drop_on_commit"):
+                    # The source may finish a request while the migration batch is
+                    # quiesced.  Its delta manifest then explicitly tells the
+                    # target to discard the already-received base request.  There
+                    # is no live target request or delta KV ownership left to
+                    # validate/publish in that terminal branch.
+                    continue
+                validate_commit = getattr(
+                    self, "_pd_flip_validate_commit_entry", None
+                )
+                if callable(validate_commit):
+                    validate_commit(entry, session)
+                self._pd_flip_target_commit_hicache_restore(entry["decode_req"])
+                self._pd_flip_target_committed_mapping_ready(entry)
+        except Exception as exc:
+            message = f"target migration commit failed: {exc}"
+            self._pd_flip_abort_target_session(session, message)
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=message,
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        for rid in requested_rids:
+            entries[rid]["phase"] = "ready_to_activate"
+            self._pd_flip_note_timing(entries[rid], "target_commit_ready")
+        session["state"] = "ready_to_activate"
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="target batch ready to activate",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+            dp_rank=rid_partition["dp_rank"],
+            handled_rids=rid_partition["handled_rids"],
+            ignored_rids=rid_partition["ignored_rids"],
+        )
+
+    def activate_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetActivateReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if recv_req.session_id and recv_req.session_id != session.get("session_id"):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("state") == "active":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration session already active",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"target_aborted", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        entries = session.get("target_entries") or {}
+        rid_partition = self._pd_flip_partition_rids(recv_req.rids, entries.keys())
+        requested_rids = rid_partition["handled_rids"]
+        if not entries:
+            session["state"] = "active"
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target rank has no local requests to activate",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+                dp_rank=rid_partition["dp_rank"],
+                handled_rids=[],
+                ignored_rids=rid_partition["ignored_rids"],
+            )
+        requested = set(requested_rids)
+        if (
+            not requested_rids
+            or len(requested) != len(requested_rids)
+            or requested != set(entries)
+            or any(entries[rid].get("phase") != "ready_to_activate" for rid in requested)
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target batch is not committed",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        adopt_entries = [
+            entries[rid]
+            for rid in requested_rids
+            if not entries[rid].get("drop_on_commit")
+        ]
+        requests = [
+            getattr(entry.get("decode_req"), "req", None) for entry in adopt_entries
+        ]
+        if any(
+            req is None
+            or entry.get("request_released")
+            or entry.get("request_adopted")
+            or any(req is queued for queued in self.waiting_queue)
+            for entry, req in zip(adopt_entries, requests)
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target batch activation preflight failed",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        previous_waiting_queue = self.waiting_queue
+        previous_request_adoption_state = [
+            (
+                req,
+                req.last_node,
+                hasattr(req, "pd_flip_prebuilt_kv_ready"),
+                getattr(req, "pd_flip_prebuilt_kv_ready", None),
+            )
+            for req in requests
+        ]
+        previous_entry_state = {
+            rid: (
+                entries[rid].get("phase"),
+                entries[rid].get("held"),
+                entries[rid].get("request_adopted"),
+                "final_owner" in entries[rid],
+                entries[rid].get("final_owner"),
+            )
+            for rid in requested_rids
+        }
+        try:
+            for req in requests:
+                self._pd_flip_prepare_target_request_for_adoption(req)
+            self.waiting_queue = [*previous_waiting_queue, *requests]
+            for rid in requested_rids:
+                entry = entries[rid]
+                if not entry.get("drop_on_commit"):
+                    entry["request_adopted"] = True
+                    self._pd_flip_note_timing(entry, "target_adopted")
+                entry["held"] = False
+                entry["phase"] = "active"
+                entry["final_owner"] = "target"
+        except Exception as exc:
+            self.waiting_queue = previous_waiting_queue
+            for req, last_node, had_ready, ready in previous_request_adoption_state:
+                req.last_node = last_node
+                if had_ready:
+                    req.pd_flip_prebuilt_kv_ready = ready
+                elif hasattr(req, "pd_flip_prebuilt_kv_ready"):
+                    del req.pd_flip_prebuilt_kv_ready
+            for rid, (
+                phase,
+                held,
+                request_adopted,
+                had_final_owner,
+                final_owner,
+            ) in previous_entry_state.items():
+                entry = entries[rid]
+                entry["phase"] = phase
+                entry["held"] = held
+                if request_adopted is None:
+                    entry.pop("request_adopted", None)
+                else:
+                    entry["request_adopted"] = request_adopted
+                if had_final_owner:
+                    entry["final_owner"] = final_owner
+                else:
+                    entry.pop("final_owner", None)
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"target batch activation failed: {exc}",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        session["state"] = "active"
+        session["held_reqs"] = 0
+        session["released_reqs"] = int(session.get("released_reqs", 0)) + len(
+            requested_rids
+        )
+        for req in requests:
+            try:
+                if hasattr(req, "time_stats") and hasattr(
+                    req.time_stats, "set_wait_queue_entry_time"
+                ):
+                    req.time_stats.set_wait_queue_entry_time()
+            except Exception:
+                logger.warning(
+                    "Failed to record target activation wait-queue timing for %s",
+                    getattr(req, "rid", ""),
+                    exc_info=True,
+                )
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="target batch activated",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+            dp_rank=rid_partition["dp_rank"],
+            handled_rids=rid_partition["handled_rids"],
+            ignored_rids=rid_partition["ignored_rids"],
+        )
+
+    def abort_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if recv_req.session_id is None or str(recv_req.session_id) != str(
+            session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") == "target_aborted":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="target migration session already aborted",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"active", "target_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="target migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        self._pd_flip_abort_target_session(
+            session, recv_req.reason or "target migration aborted"
+        )
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="target migration session aborted",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def get_pd_flip_migration_status(
+        self, recv_req: PDFlipMigrationStatusReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None) or {}
+        if session and (
+            recv_req.session_id is not None
+            and str(recv_req.session_id) != str(session.get("session_id"))
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("role") == "source":
+            self._pd_flip_source_pump_transfer(session)
+        elif session.get("role") == "target":
+            self._pd_flip_target_pump_transfer(session)
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def finish_pd_flip_migration_source(
+        self, recv_req: PDFlipMigrationSourceFinishReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no source migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "source":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not source",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if (
+            recv_req.session_id
+            and session.get("session_id") is not None
+            and recv_req.session_id != session.get("session_id")
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("state") == "source_released":
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="source migration session already released",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+        if session.get("state") in {"source_aborted", "source_failed"}:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source migration session is already terminal",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        self._pd_flip_note_timing(session, "finish_received")
+        self._pd_flip_source_pump_transfer(session)
+
+        manifests = list(session.get("manifests", []))
+        released_rids = recv_req.released_rids
+        local_manifest_rids = [
+            str(manifest.get("rid"))
+            for manifest in manifests
+            if manifest.get("rid") is not None
+        ]
+        rid_partition = self._pd_flip_partition_rids(
+            released_rids, local_manifest_rids
+        )
+        if released_rids is not None:
+            released = set(rid_partition["handled_rids"])
+        else:
+            released = {manifest.get("rid") for manifest in manifests}
+        transferred = set(session.get("transferred_rids", set()))
+        not_ready = sorted(rid for rid in released if rid not in transferred)
+        if not_ready and not session.get("dry_run", False):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"migration transfer still pending for rids={not_ready}",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=manifests,
+            )
+
+        entries = session.get("source_entries") or {}
+        advanced_snapshots = []
+        for rid in released:
+            entry = entries.get(rid)
+            if not entry:
+                continue
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue != "running":
+                continue
+            try:
+                snapshot_len = int(entry.get("committed_len") or 0)
+                current_len = int(
+                    getattr(entry.get("req"), "kv_committed_len", snapshot_len) or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            if current_len > snapshot_len:
+                advanced_snapshots.append(f"{rid}: {snapshot_len}->{current_len}")
+        if advanced_snapshots and not session.get("dry_run", False):
+            message = (
+                "running requests advanced after migration snapshot; "
+                "delta KV transfer is required before source release: "
+                + ", ".join(sorted(advanced_snapshots))
+            )
+            session["state"] = "source_failed"
+            session["last_error"] = message
+            session["failed_reqs"] = len(advanced_snapshots)
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=message,
+                status=self._pd_flip_migration_status_dict(),
+                manifests=manifests,
+            )
+
+        self._pd_flip_release_source_requests(session, released)
+        running_released = {
+            rid
+            for rid in released
+            if (
+                (entries.get(rid) or {}).get("source_queue")
+                or ((entries.get(rid) or {}).get("manifest") or {}).get(
+                    "pd_flip_source_queue"
+                )
+            )
+            == "running"
+        }
+        running_batch = getattr(self, "running_batch", None)
+        if running_released and running_batch is not None:
+            running_batch.filter_batch()
+        self._pd_flip_resume_batch_after_cutover()
+        session["state"] = "source_released"
+        session["pending_reqs"] = max(0, len(manifests) - len(released))
+        session["released_reqs"] = len(released)
+        session["transferred_reqs"] = len(released)
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="source migration session released",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=manifests,
+            dp_rank=rid_partition["dp_rank"],
+            handled_rids=rid_partition["handled_rids"],
+            ignored_rids=rid_partition["ignored_rids"],
+        )
+
+    def start_pd_flip_migration_source_delta(
+        self, recv_req: PDFlipMigrationSourceDeltaReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no source migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "source":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not source",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if recv_req.session_id and recv_req.session_id != session.get("session_id"):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source migration session id does not match",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_source_pump_transfer(session)
+        entries = session.get("source_entries") or {}
+        rid_partition = self._pd_flip_partition_rids(recv_req.rids, entries.keys())
+        requested_rids = rid_partition["handled_rids"]
+        if not entries:
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="no local source delta requests",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+                dp_rank=rid_partition["dp_rank"],
+                handled_rids=[],
+                ignored_rids=rid_partition["ignored_rids"],
+            )
+        requested = set(requested_rids)
+        if (
+            not requested_rids
+            or len(requested) != len(requested_rids)
+            or not requested.issubset(entries)
+        ):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source delta batch is empty, duplicated, or unknown",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+            )
+        requested_key = tuple(sorted(requested))
+        captured_rids = set(session.get("delta_request_rids") or ())
+        if captured_rids:
+            if requested != captured_rids:
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="source delta rids do not match the captured batch",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=[],
+                )
+            return PDFlipMigrationReqOutput(
+                success=session.get("state") != "source_failed",
+                message=session.get("last_error")
+                or "source migration delta already captured",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("delta_manifests") or []),
+            )
+        if not getattr(self, "pd_flip_batch_quiesced", False):
+            resolved_session_id = str(session.get("session_id") or "")
+            frozen_session_id = getattr(self, "pd_flip_quiesce_session_id", None)
+            frozen_rids = tuple(getattr(self, "pd_flip_quiesce_rids", ()))
+            if getattr(self, "pd_flip_quiesce_requested", False):
+                if (
+                    frozen_session_id != resolved_session_id
+                    or frozen_rids != requested_key
+                ):
+                    return PDFlipMigrationReqOutput(
+                        success=False,
+                        message="source batch quiesce key does not match pending request",
+                        status=self._pd_flip_migration_status_dict(),
+                        manifests=[],
+                    )
+            else:
+                self._pd_flip_request_batch_quiesce(resolved_session_id, requested_key)
+            session["state"] = "source_quiesce_requested"
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source batch quiesce pending; retry delta after quiesce",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+            )
+        if str(session.get("session_id") or "") != getattr(
+            self, "pd_flip_quiesce_session_id", None
+        ) or requested_key != tuple(getattr(self, "pd_flip_quiesce_rids", ())):
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="source delta rids do not match the quiesced batch",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=[],
+            )
+        delta_index = int(session.get("delta_generation", 0)) + 1
+        session["delta_generation"] = delta_index
+        session["delta_request_rids"] = tuple(sorted(requested))
+        delta_manifests: List[Dict[str, Any]] = []
+        delta_entries = 0
+        real_error = ""
+
+        for rid in sorted(requested):
+            entry = entries.get(rid)
+            if not entry:
+                continue
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue != "running":
+                continue
+            manifest = self._pd_flip_build_delta_manifest(entry, delta_index)
+            delta_manifests.append(manifest)
+            if manifest.get("pd_flip_drop_target") or manifest.get("delta_noop"):
+                self._pd_flip_mark_source_delta_applied(entry, manifest)
+                continue
+            try:
+                self._pd_flip_start_source_delta_entry(entry, manifest)
+                delta_entries += 1
+            except Exception as exc:
+                real_error = str(exc)
+                entry["failed"] = True
+                session.setdefault("failed_rids", set()).add(rid)
+                break
+
+        session["delta_manifests"] = delta_manifests
+        session["delta_pending_reqs"] = delta_entries
+        session["pending_reqs"] = delta_entries
+        session["failed_reqs"] = int(session.get("failed_reqs", 0)) + (
+            1 if real_error else 0
+        )
+        session["state"] = (
+            "source_delta_started" if delta_entries else "source_delta_transferred"
+        )
+        if real_error:
+            session["state"] = "source_failed"
+            session["last_error"] = real_error
+        if delta_entries:
+            self._pd_flip_source_pump_transfer(session)
+
+        return PDFlipMigrationReqOutput(
+            success=not bool(real_error),
+            message=real_error or "source migration delta started",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=delta_manifests,
+            dp_rank=rid_partition["dp_rank"],
+            handled_rids=rid_partition["handled_rids"],
+            ignored_rids=rid_partition["ignored_rids"],
+        )
+
+    def _pd_flip_request_batch_quiesce(self, session_id: str, rids) -> None:
+        self.pd_flip_quiesce_session_id = session_id
+        self.pd_flip_quiesce_rids = tuple(str(rid) for rid in rids)
+        self.pd_flip_quiesce_requested = True
+        self.pd_flip_batch_quiesced = False
+
+    def _pd_flip_maybe_enter_batch_quiesce(self) -> bool:
+        if not getattr(self, "pd_flip_quiesce_requested", False):
+            return False
+        if getattr(self, "result_queue", None):
+            return False
+        self.pd_flip_batch_quiesced = True
+        return True
+
+    def _pd_flip_resume_batch_after_cutover(self) -> None:
+        self.pd_flip_quiesce_requested = False
+        self.pd_flip_batch_quiesced = False
+        self.pd_flip_quiesce_rids = ()
+        self.pd_flip_quiesce_session_id = None
+
+    def abort_pd_flip_migration(
+        self, recv_req: PDFlipMigrationAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if session:
+            if recv_req.session_id is None or str(recv_req.session_id) != str(
+                session.get("session_id")
+            ):
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="migration session id does not match",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
+            if session.get("state") in {"source_aborted", "target_aborted"}:
+                return PDFlipMigrationReqOutput(
+                    success=True,
+                    message="migration session already aborted",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
+            if session.get("state") in {"source_released", "active"}:
+                return PDFlipMigrationReqOutput(
+                    success=False,
+                    message="migration session ownership is already terminal",
+                    status=self._pd_flip_migration_status_dict(),
+                    manifests=list(session.get("manifests", [])),
+                )
+            reason = recv_req.reason or "migration aborted"
+            if session.get("role") == "target":
+                self._pd_flip_abort_target_session(session, reason)
+            elif session.get("role") == "source":
+                self._pd_flip_abort_source_session(session, reason)
+            else:
+                session["state"] = "aborted"
+                session["last_error"] = reason
+                session["pending_reqs"] = 0
+                session["failed_reqs"] = len(session.get("manifests", []))
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="migration aborted",
+            status=self._pd_flip_migration_status_dict(),
+        )
+
+    def _pd_flip_abort_source_session(
+        self, session: Dict[str, Any], reason: str
+    ) -> None:
+        for entry in (session.get("source_entries") or {}).values():
+            sender = entry.get("sender")
+            if sender is not None and hasattr(sender, "abort"):
+                try:
+                    sender.abort()
+                except Exception:
+                    pass
+            delta = entry.get("delta")
+            if isinstance(delta, dict):
+                delta_sender = delta.get("sender")
+                if delta_sender is not None and hasattr(delta_sender, "abort"):
+                    try:
+                        delta_sender.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_free_source_delta_metadata(delta)
+            self._pd_flip_finish_source_kv_release_defer(entry)
+            self._pd_flip_free_source_metadata(entry)
+            entry["final_owner"] = "source"
+            entry["rollback_reason"] = reason
+        restore_started = time.monotonic()
+        self._pd_flip_restore_waiting_source_requests(session)
+        self._pd_flip_resume_batch_after_cutover()
+        session.setdefault("timing_debug", {})["restore_waiting_reqs_s"] = (
+            time.monotonic() - restore_started
+        )
+        session["state"] = "source_aborted"
+        session["last_error"] = reason
+        session["pending_reqs"] = 0
+        session["failed_reqs"] = 0
+
+    def _pd_flip_abort_target_session(
+        self, session: Dict[str, Any], reason: str
+    ) -> None:
+        released = 0
+        for entry in (session.get("target_entries") or {}).values():
+            decode_req = entry.get("decode_req")
+            receiver = getattr(decode_req, "kv_receiver", None)
+            if receiver is not None and hasattr(receiver, "abort"):
+                try:
+                    receiver.abort()
+                except Exception:
+                    pass
+            if not entry.get("request_adopted"):
+                self._pd_flip_release_target_request(entry)
+                released += 1
+            self._pd_flip_free_target_metadata(entry)
+            entry["phase"] = "aborted"
+            entry["held"] = False
+            entry["final_owner"] = "source"
+            entry["rollback_reason"] = reason
+        session["state"] = "target_aborted"
+        session["last_error"] = reason
+        session["pending_reqs"] = 0
+        session["held_reqs"] = 0
+        session["released_reqs"] = int(session.get("released_reqs", 0)) + released
+        session["failed_reqs"] = 0
+
+    def _pd_flip_can_use_real_migration(self) -> bool:
+        return (
+            getattr(self, "disaggregation_mode", None) == DisaggregationMode.DECODE
+            and getattr(self, "disagg_decode_prealloc_queue", None) is not None
+            and getattr(self, "disagg_metadata_buffers", None) is not None
+            and getattr(self, "req_to_metadata_buffer_idx_allocator", None) is not None
+            and getattr(self, "req_to_token_pool", None) is not None
+            and getattr(self, "token_to_kv_pool_allocator", None) is not None
+        )
+
+    def _pd_flip_attn_dp_rank(self) -> int:
+        ps = getattr(self, "ps", None)
+        rank = getattr(ps, "attn_dp_rank", None)
+        if rank is None:
+            rank = getattr(ps, "dp_rank", 0)
+        return int(rank or 0)
+
+    def _pd_flip_partition_manifests(
+        self, manifests: List[Dict[str, Any]], field: str
+    ) -> Dict[str, Any]:
+        local_rank = self._pd_flip_attn_dp_rank()
+        dp_size = int(
+            getattr(getattr(self, "server_args", None), "dp_size", 1) or 1
+        )
+        selected = []
+        handled_rids = []
+        ignored_rids = []
+        for manifest in manifests:
+            rank = manifest.get(field)
+            if rank is None:
+                if dp_size != 1:
+                    raise ValueError(f"{field} is required when dp_size={dp_size}")
+                rank = 0
+            if not isinstance(rank, int) or not 0 <= rank < dp_size:
+                raise ValueError(
+                    f"{field} must be in [0, {dp_size}), got {rank!r}"
+                )
+            rid = str(manifest.get("rid") or "")
+            if rank == local_rank:
+                selected.append(manifest)
+                handled_rids.append(rid)
+            else:
+                ignored_rids.append(rid)
+        return {
+            "dp_rank": local_rank,
+            "manifests": selected,
+            "handled_rids": handled_rids,
+            "ignored_rids": ignored_rids,
+        }
+
+    def _pd_flip_manifests_for_rank(
+        self, manifests: List[Dict[str, Any]], field: str
+    ) -> List[Dict[str, Any]]:
+        return self._pd_flip_partition_manifests(manifests, field)["manifests"]
+
+    def _pd_flip_partition_rids(self, rids, local_rids) -> Dict[str, Any]:
+        local = {str(rid) for rid in local_rids}
+        requested = (
+            sorted(local) if rids is None else [str(rid) for rid in rids]
+        )
+        return {
+            "dp_rank": self._pd_flip_attn_dp_rank(),
+            "handled_rids": [rid for rid in requested if rid in local],
+            "ignored_rids": [rid for rid in requested if rid not in local],
+        }
+
+    def _pd_flip_dest_ranks(self, manifest: Dict[str, Any]) -> List[int]:
+        rank = manifest.get("target_decode_dp_rank")
+        dp_size = int(
+            getattr(getattr(self, "server_args", None), "dp_size", 1) or 1
+        )
+        if rank is None:
+            if dp_size == 1:
+                return [int(getattr(getattr(self, "ps", None), "tp_rank", 0))]
+            raise ValueError(
+                "target_decode_dp_rank is required for DP Attention migration"
+            )
+        if not isinstance(rank, int) or not 0 <= rank < dp_size:
+            raise ValueError(
+                f"target_decode_dp_rank must be in [0, {dp_size}), got {rank!r}"
+            )
+        return [rank]
+
+    def _pd_flip_model_fingerprint(self, kv_pool=None) -> str:
+        model_config = getattr(self, "model_config", None)
+        server_args = getattr(self, "server_args", None)
+        if kv_pool is None:
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            get_kvcache = getattr(allocator, "get_kvcache", None)
+            kv_pool = get_kvcache() if callable(get_kvcache) else None
+        fingerprint_values = {
+            "model_path": str(getattr(model_config, "model_path", "") or ""),
+            "model_dtype": str(getattr(model_config, "dtype", "") or ""),
+            "num_hidden_layers": getattr(model_config, "num_hidden_layers", None),
+            "kv_lora_rank": getattr(model_config, "kv_lora_rank", None),
+            "qk_rope_head_dim": getattr(model_config, "qk_rope_head_dim", None),
+            "tp_size": getattr(server_args, "tp_size", None),
+            "kv_pool_class": type(kv_pool).__name__ if kv_pool is not None else None,
+            "kv_dtype": str(getattr(kv_pool, "dtype", "") or ""),
+            "kv_store_dtype": str(getattr(kv_pool, "store_dtype", "") or ""),
+            "kv_layer_num": getattr(kv_pool, "layer_num", None),
+            "kv_cache_dim": getattr(kv_pool, "kv_cache_dim", None),
+            "kv_head_num": getattr(kv_pool, "head_num", None),
+            "kv_head_dim": getattr(kv_pool, "head_dim", None),
+        }
+        payload = json.dumps(
+            fingerprint_values,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _pd_flip_state_type_names(self) -> List[str]:
+        for queue_name in (
+            "disagg_decode_prealloc_queue",
+            "disagg_prefill_bootstrap_queue",
+        ):
+            queue = getattr(self, queue_name, None)
+            kv_manager = getattr(queue, "kv_manager", None)
+            kv_args = getattr(kv_manager, "kv_args", None)
+            state_types = getattr(kv_args, "state_types", None)
+            if state_types:
+                return [
+                    str(getattr(state_type, "value", state_type)).lower()
+                    for state_type in state_types
+                ]
+        return []
+
+    def _pd_flip_kv_layout_metadata(self) -> Dict[str, Any]:
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        kv_pool = get_kvcache() if callable(get_kvcache) else None
+        pool_class = type(kv_pool).__name__ if kv_pool is not None else "unknown"
+        layout = "mla" if "MLA" in pool_class.upper() else "mha"
+        store_dtype = getattr(kv_pool, "store_dtype", None)
+        element_size = getattr(store_dtype, "itemsize", None)
+        if callable(element_size):
+            element_size = element_size()
+        per_token_shape = None
+        if layout == "mla" and getattr(kv_pool, "kv_cache_dim", None) is not None:
+            per_token_shape = [1, int(kv_pool.kv_cache_dim)]
+        elif getattr(kv_pool, "head_num", None) is not None:
+            per_token_shape = [
+                int(kv_pool.head_num),
+                int(getattr(kv_pool, "head_dim", 0) or 0),
+            ]
+        return {
+            "page_size": int(getattr(allocator, "page_size", 1) or 1),
+            "kv_layout": layout,
+            "kv_pool_class": pool_class,
+            "kv_dtype": str(getattr(kv_pool, "dtype", "") or ""),
+            "kv_store_dtype": str(store_dtype or ""),
+            "kv_element_size": (
+                int(element_size) if element_size is not None else None
+            ),
+            "kv_layer_count": getattr(kv_pool, "layer_num", None),
+            "kv_per_token_shape": per_token_shape,
+            "model_fingerprint": self._pd_flip_model_fingerprint(kv_pool),
+            "state_types": self._pd_flip_state_type_names(),
+        }
+
+    def _pd_flip_validate_layout(self, manifest: Dict[str, Any]) -> None:
+        required_keys = (
+            "page_size",
+            "kv_layout",
+            "kv_pool_class",
+            "model_fingerprint",
+        )
+        dp_size = int(
+            getattr(getattr(self, "server_args", None), "dp_size", 1) or 1
+        )
+        if not any(key in manifest for key in required_keys):
+            if dp_size > 1:
+                raise ValueError(
+                    "PD Flip KV layout metadata is required when dp_size="
+                    f"{dp_size}"
+                )
+            return
+        local = self._pd_flip_kv_layout_metadata()
+        for key in required_keys + (
+            "kv_dtype",
+            "kv_store_dtype",
+            "kv_element_size",
+            "kv_layer_count",
+            "kv_per_token_shape",
+            "state_types",
+        ):
+            if key in manifest and manifest.get(key) != local.get(key):
+                raise ValueError(
+                    f"PD Flip KV layout mismatch for {key}: "
+                    f"source={manifest.get(key)!r} target={local.get(key)!r}"
+                )
+
+    def _pd_flip_migration_room_for_req(self, req: Req) -> int:
+        server_args = getattr(self, "server_args", None)
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1)))
+        ps = getattr(self, "ps", None)
+        dp_rank = getattr(ps, "attn_dp_rank", None)
+        if dp_rank is None:
+            dp_rank = getattr(ps, "dp_rank", 0) or 0
+        digest = hashlib.sha256(str(getattr(req, "rid", "")).encode()).digest()
+        base = int.from_bytes(digest[:8], "big") % (2**30)
+        return (base // dp_size) * dp_size + int(dp_rank)
+
+    def _pd_flip_delta_room_for_req(self, req: Req, delta_index: int) -> int:
+        server_args = getattr(self, "server_args", None)
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1)))
+        return self._pd_flip_migration_room_for_req(req) + dp_size * max(
+            1, int(delta_index)
+        )
+
+    def _pd_flip_prefill_donor_room_for_req(self, req: Req) -> int:
+        server_args = getattr(self, "server_args", None)
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1)))
+        return self._pd_flip_migration_room_for_req(req) + dp_size * (1 << 30)
+
+    def _pd_flip_delta_page_start(self, committed_len: int) -> int:
+        page_size = int(getattr(self.token_to_kv_pool_allocator, "page_size", 1) or 1)
+        return (max(0, int(committed_len)) // page_size) * page_size
+
+    @staticmethod
+    def _pd_flip_stitch_boundary(
+        storage_hit: int, prompt_len: int, page_size: int
+    ) -> Tuple[int, str]:
+        page_size = max(1, int(page_size))
+        page_aligned_prompt = (max(0, int(prompt_len)) // page_size) * page_size
+        hit_len = min(max(0, int(storage_hit)), page_aligned_prompt)
+        if hit_len == 0:
+            return 0, "source_decode_full_fallback"
+        if hit_len == page_aligned_prompt:
+            return hit_len, "full_prefix_stitch"
+        return hit_len, "partial_prefix_stitch"
+
+    @staticmethod
+    def _pd_flip_prefill_donor_boundary(prompt_len: int, page_size: int) -> int:
+        page_size = max(1, int(page_size))
+        return (max(0, int(prompt_len)) // page_size) * page_size
+
+    def _pd_flip_apply_prefill_donor_manifest(
+        self, req: Req, manifest: Dict[str, Any]
+    ) -> None:
+        prompt_len = len(getattr(req, "origin_input_ids", []) or [])
+        page_size = int(self.token_to_kv_pool_allocator.page_size)
+        donor_end = self._pd_flip_prefill_donor_boundary(prompt_len, page_size)
+        # bootstrap_host is rewritten to the previous Decode when a migrated
+        # request is reconstructed.  Preserve the original Prefill identity so
+        # later flips still use the real L3 donor and HTTP stream owner.
+        donor_host = getattr(req, "pd_flip_prefill_donor_host", None) or getattr(
+            req, "bootstrap_host", None
+        )
+        donor_port = getattr(req, "pd_flip_prefill_donor_port", None) or getattr(
+            req, "bootstrap_port", None
+        )
+        req.pd_flip_prefill_donor_host = donor_host
+        req.pd_flip_prefill_donor_port = donor_port
+        manifest.update(
+            prefill_donor_host=donor_host,
+            prefill_donor_port=donor_port,
+            prompt_len=prompt_len,
+            prefill_donor_end=donor_end,
+            source_decode_start=donor_end,
+            prefill_donor_bootstrap_room=self._pd_flip_prefill_donor_room_for_req(
+                req
+            ),
+        )
+
+    def _pd_flip_source_page_indices_range(
+        self, req: Req, start_len: int, end_len: int
+    ):
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration delta transfer"
+            )
+        if hasattr(req_pool_idx, "item"):
+            req_pool_idx = req_pool_idx.item()
+        page_start = self._pd_flip_delta_page_start(start_len)
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[int(req_pool_idx), page_start:end_len]
+            .cpu()
+            .numpy()
+        )
+        if kv_indices.ndim != 1:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} produced non-1D delta KV indices "
+                f"shape={kv_indices.shape}"
+            )
+        return kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+
+    def _pd_flip_stitch_page_indices_range(
+        self, req: Req, hit_len: int, committed_len: int
+    ):
+        hit_len = int(hit_len)
+        committed_len = int(committed_len)
+        if not 0 <= hit_len <= committed_len:
+            raise ValueError(
+                f"invalid PD flip stitch page range H={hit_len}, C0={committed_len}"
+            )
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration stitch transfer"
+            )
+        if hasattr(req_pool_idx, "item"):
+            req_pool_idx = req_pool_idx.item()
+        page_size = int(self.token_to_kv_pool_allocator.page_size)
+        mapping_start = (hit_len // page_size) * page_size
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[
+                int(req_pool_idx), mapping_start:committed_len
+            ]
+            .cpu()
+            .numpy()
+        )
+        expected_mapping_len = committed_len - mapping_start
+        if kv_indices.ndim != 1 or len(kv_indices) != expected_mapping_len:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} has incomplete stitch KV "
+                f"mapping shape={kv_indices.shape}, expected_tokens={expected_mapping_len}"
+            )
+        return kv_to_page_indices(kv_indices, page_size)
+
+    def _pd_flip_build_delta_manifest(
+        self, entry: Dict[str, Any], delta_index: int
+    ) -> Dict[str, Any]:
+        req = entry.get("req")
+        base_manifest = dict(entry.get("manifest") or {})
+        if req is None:
+            manifest = base_manifest
+            manifest["pd_flip_drop_target"] = True
+            manifest["delta_noop"] = True
+            return manifest
+
+        old_len = int(entry.get("committed_len") or 0)
+        current_len = int(getattr(req, "kv_committed_len", old_len) or old_len)
+        manifest = self._pd_flip_build_migration_manifest(req)
+        migration_room = self._pd_flip_delta_room_for_req(req, delta_index)
+        manifest.update(
+            {
+                "pd_flip_delta": True,
+                "pd_flip_source_queue": "running",
+                "delta_from_len": old_len,
+                "delta_page_start_len": self._pd_flip_delta_page_start(old_len),
+                "migration_bootstrap_room": migration_room,
+                "source_bootstrap_port": getattr(
+                    getattr(self, "server_args", None),
+                    "disaggregation_bootstrap_port",
+                    8998,
+                ),
+            }
+        )
+        if req.finished():
+            manifest["pd_flip_drop_target"] = True
+            manifest["delta_noop"] = True
+        elif current_len <= old_len:
+            manifest["delta_noop"] = True
+        else:
+            manifest["delta_noop"] = False
+        return manifest
+
+    def _pd_flip_mark_source_delta_applied(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        self._pd_flip_preserve_base_measurement(entry)
+        entry["committed_len"] = int(
+            manifest.get("kv_committed_len") or entry.get("committed_len") or 0
+        )
+        entry["manifest"] = manifest
+        entry["delta"] = {
+            "phase": "transferred",
+            "from_len": int(manifest.get("delta_from_len") or 0),
+            "to_len": int(manifest.get("kv_committed_len") or 0),
+            "noop": True,
+            "drop_target": bool(manifest.get("pd_flip_drop_target")),
+        }
+
+    @staticmethod
+    def _pd_flip_preserve_base_measurement(entry: Dict[str, Any]) -> None:
+        if "base_manifest" in entry and "base_committed_len" in entry:
+            return
+        manifest = entry.get("manifest") or {}
+        if "base_manifest" not in entry:
+            entry["base_manifest"] = dict(manifest)
+        if "base_committed_len" not in entry:
+            committed_len = manifest.get("kv_committed_len")
+            if committed_len is None:
+                committed_len = entry.get("committed_len")
+            entry["base_committed_len"] = int(committed_len or 0)
+
+    def _pd_flip_start_source_entries(
+        self, running_reqs: List[Req], manifests: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        if not self._pd_flip_can_use_real_migration():
+            return {}, ""
+        if getattr(self, "enable_hisparse", False):
+            return {}, "PD flip migration does not support HiSparse decode yet"
+
+        try:
+            manager_started = time.monotonic()
+            kv_manager = self._pd_flip_get_source_kv_manager()
+            manager_s = time.monotonic() - manager_started
+            sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+            entries: Dict[str, Dict[str, Any]] = {}
+
+            def fail(message: str) -> Tuple[Dict[str, Dict[str, Any]], str]:
+                for entry in entries.values():
+                    sender = entry.get("sender")
+                    if hasattr(sender, "abort"):
+                        try:
+                            sender.abort()
+                        except Exception:
+                            pass
+                    self._pd_flip_clear_source_kv_release_defer(entry.get("req"))
+                    self._pd_flip_free_source_metadata(entry)
+                return {}, message
+
+            for req, manifest in zip(running_reqs, manifests):
+                entry_started = time.monotonic()
+                timing_debug = {"get_source_kv_manager_s": manager_s}
+                rid = str(manifest.get("rid") or getattr(req, "rid", ""))
+                committed_len = int(manifest.get("kv_committed_len") or 0)
+                if committed_len <= 0:
+                    return fail(f"request {rid} has no committed KV to migrate")
+                if getattr(req, "req_pool_idx", None) is None:
+                    return fail(f"request {rid} has no req_pool_idx")
+
+                alloc_started = time.monotonic()
+                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                timing_debug["metadata_alloc_s"] = time.monotonic() - alloc_started
+                if metadata_index is None:
+                    return fail("no metadata buffer available for source migration")
+
+                migration_room = int(manifest["migration_bootstrap_room"])
+                sender_started = time.monotonic()
+                sender = sender_class(
+                    mgr=kv_manager,
+                    bootstrap_addr=bootstrap_addr,
+                    bootstrap_room=migration_room,
+                    dest_tp_ranks=self._pd_flip_dest_ranks(manifest),
+                    pp_rank=self.ps.pp_rank,
+                )
+                timing_debug["sender_create_s"] = time.monotonic() - sender_started
+                self._pd_flip_defer_source_kv_release(req)
+                entries[rid] = {
+                    "req": req,
+                    "sender": sender,
+                    "manifest": manifest,
+                    "source_queue": manifest.get("pd_flip_source_queue", "running"),
+                    "metadata_index": metadata_index,
+                    "migration_bootstrap_room": migration_room,
+                    "committed_len": committed_len,
+                    "sent": False,
+                    "transferred": False,
+                    "failed": False,
+                    "timing_debug": timing_debug,
+                }
+                timing_debug["source_entry_init_total_s"] = (
+                    time.monotonic() - entry_started
+                )
+            return entries, ""
+        except Exception as exc:
+            try:
+                return fail(str(exc))
+            except Exception:
+                return {}, str(exc)
+
+    def _pd_flip_start_source_delta_entry(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        if not self._pd_flip_can_use_real_migration():
+            self._pd_flip_mark_source_delta_applied(entry, manifest)
+            return
+        req = entry.get("req")
+        if req is None:
+            raise ValueError("source delta entry has no request")
+        if getattr(req, "req_pool_idx", None) is None:
+            raise ValueError(f"request {getattr(req, 'rid', '')} has no req_pool_idx")
+
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for source delta migration")
+
+        kv_manager = self._pd_flip_get_source_kv_manager()
+        sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        migration_room = int(manifest["migration_bootstrap_room"])
+        sender = sender_class(
+            mgr=kv_manager,
+            bootstrap_addr=self._pd_flip_local_bootstrap_addr(kv_manager),
+            bootstrap_room=migration_room,
+            dest_tp_ranks=self._pd_flip_dest_ranks(manifest),
+            pp_rank=self.ps.pp_rank,
+        )
+        from_len = int(manifest.get("delta_from_len") or entry.get("committed_len") or 0)
+        to_len = int(manifest.get("kv_committed_len") or from_len)
+        page_indices = self._pd_flip_source_page_indices_range(req, from_len, to_len)
+        sender.init(len(page_indices), metadata_index)
+        entry["delta"] = {
+            "phase": "new",
+            "sender": sender,
+            "metadata_index": metadata_index,
+            "migration_bootstrap_room": migration_room,
+            "from_len": from_len,
+            "to_len": to_len,
+            "page_start_len": int(
+                manifest.get("delta_page_start_len")
+                or self._pd_flip_delta_page_start(from_len)
+            ),
+            "sent": False,
+            "transferred": False,
+            "failed": False,
+            "manifest": manifest,
+        }
+        entry["manifest"] = manifest
+
+    def _pd_flip_freeze_waiting_source_requests(
+        self, session: Dict[str, Any]
+    ) -> None:
+        waiting_specs = session.get("source_waiting_reqs") or []
+        if not waiting_specs:
+            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
+            return
+
+        by_id = {
+            id(spec.get("req")): spec
+            for spec in waiting_specs
+            if spec.get("req") is not None
+        }
+        if not by_id:
+            session.setdefault("timing_debug", {})["waiting_frozen_count"] = 0
+            return
+
+        new_queue = []
+        frozen_count = 0
+        entries = session.get("source_entries") or {}
+        for index, req in enumerate(getattr(self, "waiting_queue", [])):
+            spec = by_id.get(id(req))
+            if spec is None:
+                new_queue.append(req)
+                continue
+            spec.setdefault("original_index", index)
+            spec["frozen"] = True
+            spec["restored"] = False
+            frozen_count += 1
+            rid = str(spec.get("rid") or getattr(req, "rid", ""))
+            entry = entries.get(rid)
+            if entry is not None:
+                self._pd_flip_note_timing(entry, "source_waiting_frozen")
+
+        self.waiting_queue = new_queue
+        session.setdefault("timing_debug", {})["waiting_frozen_count"] = frozen_count
+
+    def _pd_flip_restore_waiting_source_requests(
+        self, session: Dict[str, Any]
+    ) -> None:
+        waiting_specs = [
+            spec
+            for spec in (session.get("source_waiting_reqs") or [])
+            if spec.get("frozen") and not spec.get("restored")
+        ]
+        if not waiting_specs:
+            session.setdefault("timing_debug", {})["waiting_restored_count"] = 0
+            return
+
+        entries = session.get("source_entries") or {}
+        restored_count = 0
+        for spec in sorted(
+            waiting_specs, key=lambda item: int(item.get("original_index", 0))
+        ):
+            req = spec.get("req")
+            if req is None:
+                continue
+            if any(existing is req for existing in self.waiting_queue):
+                spec["restored"] = True
+                continue
+            insert_at = min(
+                max(0, int(spec.get("original_index", len(self.waiting_queue)))),
+                len(self.waiting_queue),
+            )
+            self.waiting_queue.insert(insert_at, req)
+            spec["restored"] = True
+            restored_count += 1
+            rid = str(spec.get("rid") or getattr(req, "rid", ""))
+            entry = entries.get(rid)
+            if entry is not None:
+                self._pd_flip_note_timing(entry, "source_waiting_restored")
+
+        session.setdefault("timing_debug", {})[
+            "waiting_restored_count"
+        ] = restored_count
+
+    def _pd_flip_get_source_kv_manager(self):
+        prefill_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        manager = getattr(prefill_queue, "kv_manager", None)
+        if manager is not None:
+            self.pd_flip_source_kv_manager = manager
+            return manager
+
+        manager = getattr(self, "pd_flip_source_kv_manager", None)
+        if manager is not None:
+            return manager
+
+        base_manager = self.disagg_decode_prealloc_queue.kv_manager
+        kv_args = base_manager.kv_args
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_args.prefill_start_layer = getattr(kv_pool, "start_layer", 0)
+        kv_args.prefill_end_layer = getattr(kv_pool, "end_layer", None)
+        kv_args.page_size = getattr(kv_pool, "page_size", kv_args.page_size)
+        kv_args.ib_device = self.server_args.disaggregation_ib_device
+        kv_args.gpu_id = self.ps.gpu_id
+        if getattr(kv_pool, "compression_ratios", None) is not None:
+            kv_args.mla_compression_ratios = list(kv_pool.compression_ratios)
+        is_mla = is_mla_backend(kv_pool)
+        if not is_mla:
+            if hasattr(kv_pool, "head_num"):
+                kv_args.kv_head_num = kv_pool.head_num
+            kv_args.total_kv_head_num = self.model_config.get_total_num_kv_heads()
+
+        manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        manager = manager_class(
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.server_args,
+            is_mla,
+        )
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and hasattr(manager, "set_kv_buffer_tensors")
+            and not is_mla
+        ):
+            kv_pool_for_tensors = kv_pool.full_kv_pool if hasattr(kv_pool, "full_kv_pool") else kv_pool
+            if hasattr(kv_pool_for_tensors, "k_buffer") and hasattr(
+                kv_pool_for_tensors, "v_buffer"
+            ):
+                manager.set_kv_buffer_tensors(
+                    kv_pool_for_tensors.k_buffer,
+                    kv_pool_for_tensors.v_buffer,
+                    kv_pool_for_tensors.page_size,
+                )
+        self.pd_flip_source_kv_manager = manager
+        return manager
+
+    def _pd_flip_local_bootstrap_addr(self, kv_manager) -> str:
+        host = getattr(self.server_args, "host", "127.0.0.1")
+        if host in ("0.0.0.0", "::"):
+            host = getattr(kv_manager, "local_ip", "127.0.0.1")
+        return f"{host}:{self.server_args.disaggregation_bootstrap_port}"
+
+    def _pd_flip_source_page_indices(self, req: Req, committed_len: int):
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} req_pool_idx was released "
+                "before migration transfer"
+            )
+        non_scalar_error = (
+            f"request {getattr(req, 'rid', '')} has non-scalar req_pool_idx "
+            f"{req_pool_idx!r}"
+        )
+        if hasattr(req_pool_idx, "numel") and req_pool_idx.numel() != 1:
+            raise ValueError(non_scalar_error)
+        if hasattr(req_pool_idx, "item"):
+            try:
+                req_pool_idx = req_pool_idx.item()
+            except (RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError(non_scalar_error) from exc
+        if not isinstance(req_pool_idx, numbers.Integral):
+            raise ValueError(non_scalar_error)
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[
+                int(req_pool_idx), :committed_len
+            ]
+            .cpu()
+            .numpy()
+        )
+        if kv_indices.ndim != 1:
+            raise ValueError(
+                f"request {getattr(req, 'rid', '')} produced non-1D KV indices "
+                f"shape={kv_indices.shape}"
+            )
+        return kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+
+    def _pd_flip_source_state_indices(
+        self, req: Req, committed_len: int, kv_manager
+    ) -> Optional[List]:
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.sliding_window_size
+            window_start = max(0, committed_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:committed_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+        state_indices: Optional[List] = []
+        for st in getattr(kv_manager.kv_args, "state_types", []):
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _pd_flip_source_send_initial(self, entry: Dict[str, Any]) -> None:
+        sender = entry["sender"]
+        req = entry["req"]
+        committed_len = int(entry["committed_len"])
+        if getattr(
+            getattr(self, "server_args", None),
+            "enable_pd_flip_hicache_stitch",
+            False,
+        ):
+            hit_len = int(sender.pop_decode_prefix_len())
+        else:
+            hit_len = 0
+        if not 0 <= hit_len <= committed_len:
+            raise ValueError(
+                f"invalid PD flip stitch boundary H={hit_len}, C0={committed_len}"
+            )
+        page_indices = self._pd_flip_stitch_page_indices_range(
+            req, hit_len, committed_len
+        )
+        sender.init(len(page_indices), entry["metadata_index"])
+        sender.send(
+            page_indices,
+            self._pd_flip_source_state_indices(req, committed_len, sender.kv_mgr),
+        )
+        entry.update(
+            mooncake_hit_len=hit_len,
+            source_transfer_start=hit_len,
+            source_transfer_end=committed_len,
+            stitch_mode=(
+                "source_decode_full_fallback" if hit_len == 0 else "prefix_stitch"
+            ),
+            source_index_shape=list(page_indices.shape)
+            if hasattr(page_indices, "shape")
+            else [len(page_indices)],
+            source_index_size=int(page_indices.size)
+            if hasattr(page_indices, "size")
+            else len(page_indices),
+            source_contiguous_run_count=(
+                0
+                if len(page_indices) == 0
+                else 1
+                + sum(
+                    int(current) != int(previous) + 1
+                    for previous, current in zip(page_indices, page_indices[1:])
+                )
+            ),
+        )
+
+    def _pd_flip_source_send_full_fallback(
+        self, entry: Dict[str, Any], reason: str
+    ) -> None:
+        """Retry one source entry without relying on a remote prefix restore."""
+        sender = entry["sender"]
+        req = entry["req"]
+        committed_len = int(entry["committed_len"])
+        page_indices = self._pd_flip_stitch_page_indices_range(req, 0, committed_len)
+        sender.init(len(page_indices), entry["metadata_index"])
+        sender.send(
+            page_indices,
+            self._pd_flip_source_state_indices(req, committed_len, sender.kv_mgr),
+        )
+        entry.update(
+            mooncake_hit_len=0,
+            source_transfer_start=0,
+            source_transfer_end=committed_len,
+            stitch_mode="source_decode_full_fallback",
+            fallback_reason=str(reason),
+            fallback_attempted=True,
+            fallback_source_bytes=None,
+            fallback_duration_seconds=None,
+            source_index_shape=list(page_indices.shape)
+            if hasattr(page_indices, "shape")
+            else [len(page_indices)],
+            source_index_size=int(page_indices.size)
+            if hasattr(page_indices, "size")
+            else len(page_indices),
+            source_contiguous_run_count=(
+                0
+                if len(page_indices) == 0
+                else 1
+                + sum(
+                    int(current) != int(previous) + 1
+                    for previous, current in zip(page_indices, page_indices[1:])
+                )
+            ),
+        )
+
+    def _pd_flip_source_rebuild_full_fallback(
+        self, session: Dict[str, Any], rids: List[str], reason: str
+    ) -> None:
+        """Install fresh senders for a selective full-copy fallback retry."""
+        entries = session.get("source_entries") or {}
+        kv_manager = self._pd_flip_get_source_kv_manager()
+        sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        bootstrap_addr = self._pd_flip_local_bootstrap_addr(kv_manager)
+        rebuilt = []
+        touched = []
+        try:
+            for rid in rids:
+                entry = entries[str(rid)]
+                touched.append(entry)
+                if entry.get("fallback_attempted"):
+                    raise RuntimeError(f"fallback already attempted for request {rid}")
+                old_sender = entry.get("sender")
+                if old_sender is not None and hasattr(old_sender, "abort"):
+                    old_sender.abort()
+                entry["sender"] = None
+                self._pd_flip_free_source_metadata(entry)
+                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                if metadata_index is None:
+                    raise RuntimeError("no metadata buffer available for fallback source")
+                entry.update(
+                    metadata_index=metadata_index,
+                    metadata_freed=False,
+                )
+                sender = sender_class(
+                    mgr=kv_manager,
+                    bootstrap_addr=bootstrap_addr,
+                    bootstrap_room=int(entry["migration_bootstrap_room"]),
+                    dest_tp_ranks=self._pd_flip_dest_ranks(entry["manifest"]),
+                    pp_rank=self.ps.pp_rank,
+                )
+                entry.update(
+                    sender=sender,
+                    sent=False,
+                    transferred=False,
+                    failed=False,
+                    fallback_attempted=True,
+                    fallback_reason=str(reason),
+                    stitch_mode="source_decode_full_fallback",
+                )
+                self._pd_flip_note_timing(entry, "source_fallback_command_received")
+                rebuilt.append(entry)
+            session.get("transferred_rids", set()).difference_update(map(str, rids))
+            session.get("failed_rids", set()).difference_update(map(str, rids))
+            session["state"] = "source_fallback_started"
+        except Exception as exc:
+            for entry in touched:
+                sender = entry.get("sender")
+                if sender is not None and hasattr(sender, "abort"):
+                    try:
+                        sender.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_free_source_metadata(entry)
+                entry["failed"] = True
+                entry["rollback_reason"] = str(exc)
+            session["state"] = "source_failed"
+            session["last_error"] = str(exc)
+            raise
+
+    def start_pd_flip_migration_source_fallback(
+        self, recv_req: PDFlipMigrationSourceFallbackReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("session_id") != recv_req.session_id:
+            return PDFlipMigrationReqOutput(False, "migration session not found")
+        rids = [str(rid).strip() for rid in recv_req.rids]
+        if not rids or any(not rid for rid in rids) or len(set(rids)) != len(rids):
+            return PDFlipMigrationReqOutput(False, "fallback RIDs must be nonempty and unique")
+        unknown = set(rids).difference((session.get("source_entries") or {}).keys())
+        if unknown:
+            return PDFlipMigrationReqOutput(False, f"fallback RIDs not in source session: {sorted(unknown)}")
+        try:
+            self._pd_flip_source_rebuild_full_fallback(
+                session, rids, recv_req.reason
+            )
+            return PDFlipMigrationReqOutput(
+                True, status=self._pd_flip_migration_status_dict()
+            )
+        except Exception as exc:
+            return PDFlipMigrationReqOutput(
+                False, str(exc), status=self._pd_flip_migration_status_dict()
+            )
+
+    def _pd_flip_set_source_metadata(
+        self, req: Req, metadata_index: int, migration_room: int
+    ) -> None:
+        buffers = self.disagg_metadata_buffers
+        buffers.output_ids[metadata_index].zero_()
+        buffers.cached_tokens[metadata_index].zero_()
+        buffers.output_token_logprobs_val[metadata_index].zero_()
+        buffers.output_token_logprobs_idx[metadata_index].zero_()
+        buffers.output_top_logprobs_val[metadata_index].zero_()
+        buffers.output_top_logprobs_idx[metadata_index].zero_()
+        buffers.output_topk_p[metadata_index].zero_()
+        buffers.output_topk_index[metadata_index].zero_()
+        buffers.output_hidden_states[metadata_index].zero_()
+        buffers.bootstrap_room[metadata_index].zero_()
+
+        output_ids = list(getattr(req, "output_ids", []) or [])
+        if output_ids:
+            buffers.output_ids[metadata_index][0] = output_ids[-1]
+        buffers.cached_tokens[metadata_index][0] = getattr(req, "cached_tokens", 0)
+        buffers.cached_tokens[metadata_index][1] = getattr(
+            req, "cached_tokens_device", 0
+        )
+        buffers.cached_tokens[metadata_index][2] = getattr(req, "cached_tokens_host", 0)
+        buffers.cached_tokens[metadata_index][3] = getattr(
+            req, "cached_tokens_storage", 0
+        )
+        if getattr(req, "return_logprob", False):
+            vals = getattr(req.logprob, "output_token_logprobs_val", None)
+            idxs = getattr(req.logprob, "output_token_logprobs_idx", None)
+            top_vals = getattr(req.logprob, "output_top_logprobs_val", None)
+            top_idxs = getattr(req.logprob, "output_top_logprobs_idx", None)
+            if vals:
+                buffers.output_token_logprobs_val[metadata_index][0] = vals[-1]
+            if idxs:
+                buffers.output_token_logprobs_idx[metadata_index][0] = idxs[-1]
+            if top_vals:
+                buffers.output_top_logprobs_val[metadata_index][
+                    : len(top_vals[-1])
+                ] = torch.tensor(top_vals[-1], dtype=torch.float32, device="cpu")
+            if top_idxs:
+                buffers.output_top_logprobs_idx[metadata_index][
+                    : len(top_idxs[-1])
+                ] = torch.tensor(top_idxs[-1], dtype=torch.int32, device="cpu")
+        if getattr(req, "hidden_states_tensor", None) is not None:
+            topk = req.output_topk_p.size(0)
+            buffers.output_topk_p[metadata_index, :topk].copy_(req.output_topk_p)
+            buffers.output_topk_index[metadata_index, :topk].copy_(
+                req.output_topk_index
+            )
+            buffers.output_hidden_states[metadata_index].copy_(
+                req.hidden_states_tensor
+            )
+        buffers.bootstrap_room[metadata_index, 0] = migration_room
+
+    def _pd_flip_source_pump_transfer(self, session: Dict[str, Any]) -> None:
+        if session.get("state") in {"source_released", "source_aborted"}:
+            return
+        entries = session.get("source_entries") or {}
+        if not entries:
+            return
+
+        transferred = set(session.get("transferred_rids", set()))
+        failed = set(session.get("failed_rids", set()))
+        for rid, entry in entries.items():
+            if entry.get("transferred") or entry.get("failed"):
+                continue
+            sender = entry["sender"]
+            poll = sender.poll()
+            if poll == KVPoll.Failed:
+                entry["failed"] = True
+                failed.add(rid)
+                try:
+                    sender.failure_exception()
+                except Exception as exc:
+                    session["last_error"] = str(exc)
+                continue
+            if poll == KVPoll.WaitingForInput and not entry.get("sent"):
+                self._pd_flip_note_timing(entry, "source_waiting_for_input")
+                req = entry["req"]
+                old_metadata_index = getattr(req, "metadata_buffer_index", -1)
+                old_bootstrap_room = getattr(req, "bootstrap_room", None)
+                old_sender = getattr(req, "disagg_kv_sender", None)
+                try:
+                    req.metadata_buffer_index = entry["metadata_index"]
+                    req.bootstrap_room = entry["migration_bootstrap_room"]
+                    req.disagg_kv_sender = sender
+                    metadata_started = time.monotonic()
+                    self._pd_flip_set_source_metadata(
+                        req,
+                        entry["metadata_index"],
+                        entry["migration_bootstrap_room"],
+                    )
+                    self._pd_flip_note_timing(
+                        entry, "source_set_metadata", metadata_started
+                    )
+                    send_started = time.monotonic()
+                    self._pd_flip_note_timing(entry, "source_transfer_started")
+                    if entry.get("fallback_attempted"):
+                        self._pd_flip_note_timing(
+                            entry, "source_fallback_transfer_started"
+                        )
+                        self._pd_flip_source_send_full_fallback(
+                            entry, entry.get("fallback_reason", "")
+                        )
+                    else:
+                        self._pd_flip_source_send_initial(entry)
+                    self._pd_flip_note_timing(entry, "source_send", send_started)
+                    self._pd_flip_note_timing(entry, "source_sent")
+                    entry["sent"] = True
+                except Exception as exc:
+                    entry["failed"] = True
+                    failed.add(rid)
+                    session["last_error"] = str(exc)
+                    if hasattr(sender, "abort"):
+                        sender.abort()
+                finally:
+                    req.metadata_buffer_index = old_metadata_index
+                    req.bootstrap_room = old_bootstrap_room
+                    req.disagg_kv_sender = old_sender
+            poll = sender.poll()
+            if poll == KVPoll.Success:
+                entry["transferred"] = True
+                transferred.add(rid)
+                self._pd_flip_note_timing(entry, "source_transfer_completed")
+                self._pd_flip_record_sender_metric(entry, sender, "source")
+                if entry.get("fallback_attempted"):
+                    self._pd_flip_note_timing(
+                        entry, "source_fallback_transfer_completed"
+                    )
+                    entry["fallback_source_bytes"] = entry.get(
+                        "source_transfer_bytes"
+                    )
+                    entry["fallback_duration_seconds"] = entry.get(
+                        "source_transfer_duration_s"
+                    )
+                self._pd_flip_note_timing(entry, "source_transferred")
+                self._pd_flip_free_source_metadata(entry)
+
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(session.get("manifests", [])) - len(transferred) - len(failed)
+        )
+        if failed:
+            session["state"] = "source_failed"
+        elif session["pending_reqs"] == 0 and session.get("state") == "source_started":
+            session["state"] = "source_transferred"
+        self._pd_flip_source_pump_delta_transfer(session)
+
+    def _pd_flip_free_source_delta_metadata(self, delta: Dict[str, Any]) -> None:
+        if delta.get("metadata_freed"):
+            return
+        metadata_index = delta.get("metadata_index")
+        if metadata_index is not None and metadata_index >= 0:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+        delta["metadata_freed"] = True
+
+    def _pd_flip_source_pump_delta_transfer(self, session: Dict[str, Any]) -> None:
+        if session.get("state") in {"source_released", "source_aborted"}:
+            return
+        entries = session.get("source_entries") or {}
+        delta_entries = {
+            rid: entry
+            for rid, entry in entries.items()
+            if isinstance(entry.get("delta"), dict)
+            and not entry["delta"].get("noop")
+        }
+        if not delta_entries:
+            return
+
+        transferred = set(session.get("delta_transferred_rids", set()))
+        failed = set(session.get("delta_failed_rids", set()))
+        for rid, entry in delta_entries.items():
+            delta = entry["delta"]
+            if delta.get("transferred") or delta.get("failed"):
+                continue
+            sender = delta["sender"]
+            poll = sender.poll()
+            if poll == KVPoll.Failed:
+                delta["failed"] = True
+                failed.add(rid)
+                try:
+                    sender.failure_exception()
+                except Exception as exc:
+                    session["last_error"] = str(exc)
+                continue
+            if poll == KVPoll.WaitingForInput and not delta.get("sent"):
+                req = entry["req"]
+                old_metadata_index = getattr(req, "metadata_buffer_index", -1)
+                old_bootstrap_room = getattr(req, "bootstrap_room", None)
+                old_sender = getattr(req, "disagg_kv_sender", None)
+                try:
+                    req.metadata_buffer_index = delta["metadata_index"]
+                    req.bootstrap_room = delta["migration_bootstrap_room"]
+                    req.disagg_kv_sender = sender
+                    self._pd_flip_set_source_metadata(
+                        req,
+                        delta["metadata_index"],
+                        delta["migration_bootstrap_room"],
+                    )
+                    page_indices = self._pd_flip_source_page_indices_range(
+                        req, delta["from_len"], delta["to_len"]
+                    )
+                    delta["source_index_shape"] = list(page_indices.shape)
+                    delta["source_index_size"] = int(page_indices.size)
+                    state_indices = self._pd_flip_source_state_indices(
+                        req, delta["to_len"], sender.kv_mgr
+                    )
+                    self._pd_flip_note_timing(entry, "delta_transfer_started")
+                    sender.send(page_indices, state_indices)
+                    delta["sent"] = True
+                    self._pd_flip_note_timing(entry, "source_delta_sent")
+                except Exception as exc:
+                    delta["failed"] = True
+                    failed.add(rid)
+                    session["last_error"] = str(exc)
+                    if hasattr(sender, "abort"):
+                        sender.abort()
+                finally:
+                    req.metadata_buffer_index = old_metadata_index
+                    req.bootstrap_room = old_bootstrap_room
+                    req.disagg_kv_sender = old_sender
+            poll = sender.poll()
+            if poll == KVPoll.Success:
+                delta["transferred"] = True
+                transferred.add(rid)
+                self._pd_flip_note_timing(entry, "delta_transfer_completed")
+                self._pd_flip_record_sender_metric(entry, sender, "delta")
+                self._pd_flip_preserve_base_measurement(entry)
+                entry["committed_len"] = int(delta["to_len"])
+                entry["manifest"] = delta.get("manifest") or entry.get("manifest")
+                self._pd_flip_note_timing(entry, "source_delta_transferred")
+                self._pd_flip_free_source_delta_metadata(delta)
+
+        session["delta_transferred_rids"] = transferred
+        session["delta_failed_rids"] = failed
+        session["delta_transferred_reqs"] = len(transferred)
+        session["delta_failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(delta_entries) - len(transferred) - len(failed)
+        )
+        session["delta_pending_reqs"] = session["pending_reqs"]
+        terminal = session.get("state") in {"source_released", "source_aborted"}
+        if failed:
+            if not terminal:
+                session["state"] = "source_failed"
+            session["failed_reqs"] = max(
+                int(session.get("failed_reqs", 0) or 0), len(failed)
+            )
+        elif session["pending_reqs"] == 0 and not terminal:
+            session["state"] = "source_delta_transferred"
+
+    def _pd_flip_free_source_metadata(self, entry: Dict[str, Any]) -> None:
+        if entry.get("metadata_freed"):
+            return
+        metadata_index = entry.get("metadata_index")
+        if metadata_index is not None and metadata_index >= 0:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+        entry["metadata_freed"] = True
+
+    @staticmethod
+    def _pd_flip_defer_source_kv_release(req: Req) -> None:
+        req.pd_flip_defer_kv_release = True
+        req.pd_flip_force_kv_release = False
+        req.pd_flip_kv_release_deferred = False
+        req.pd_flip_deferred_kv_release_is_insert = False
+
+    @staticmethod
+    def _pd_flip_clear_source_kv_release_defer(req: Optional[Req]) -> None:
+        if req is None:
+            return
+        req.pd_flip_defer_kv_release = False
+        req.pd_flip_force_kv_release = False
+
+    def _pd_flip_finish_source_kv_release_defer(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        req = entry.get("req")
+        if req is None:
+            return
+        was_deferred = bool(getattr(req, "pd_flip_kv_release_deferred", False))
+        is_insert = bool(getattr(req, "pd_flip_deferred_kv_release_is_insert", False))
+        self._pd_flip_clear_source_kv_release_defer(req)
+        if was_deferred and getattr(req, "req_pool_idx", None) is not None:
+            req.pd_flip_force_kv_release = True
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            finally:
+                req.pd_flip_force_kv_release = False
+        req.pd_flip_kv_release_deferred = False
+        req.pd_flip_deferred_kv_release_is_insert = False
+
+    def _pd_flip_release_source_requests(
+        self, session: Dict[str, Any], released_rids: set
+    ) -> None:
+        for rid in released_rids:
+            entry = (session.get("source_entries") or {}).get(rid)
+            if not entry:
+                continue
+            req = entry.get("req")
+            source_queue = entry.get("source_queue") or (
+                entry.get("manifest") or {}
+            ).get("pd_flip_source_queue")
+            if source_queue == "waiting":
+                if req is not None:
+                    self._pd_flip_clear_source_kv_release_defer(req)
+                    req.pd_flip_force_kv_release = True
+                    try:
+                        release_kv_cache(req, self.tree_cache)
+                    finally:
+                        req.pd_flip_force_kv_release = False
+                    req.pd_flip_kv_release_deferred = False
+                    req.pd_flip_deferred_kv_release_is_insert = False
+                entry["request_released"] = True
+                entry["final_owner"] = "target"
+                self._pd_flip_note_timing(entry, "source_waiting_released")
+                self._pd_flip_free_source_metadata(entry)
+                continue
+            if req is not None and not req.finished():
+                self._pd_flip_clear_source_kv_release_defer(req)
+                req.pd_flip_migrated_to_target = True
+                req.pd_flip_waiting_for_relay_output = True
+                req.to_finish = FINISH_MIGRATED()
+                self._pd_flip_note_timing(entry, "source_finish_migrated")
+            else:
+                self._pd_flip_finish_source_kv_release_defer(entry)
+                self._pd_flip_note_timing(entry, "source_finish_released")
+            entry["final_owner"] = "target"
+            self._pd_flip_free_source_metadata(entry)
+
+    def _pd_flip_prepare_target_donor_entry(
+        self,
+        manifest: Dict[str, Any],
+        source_host: str,
+        receiver_class,
+        kv_manager,
+    ) -> Dict[str, Any]:
+        req = self._pd_flip_manifest_to_req(manifest, source_host)
+        receiver = receiver_class(
+            mgr=kv_manager,
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_room=req.bootstrap_room,
+        )
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+
+        donor_end = int(manifest.get("prefill_donor_end") or 0)
+        prefill_decode_req = None
+        if donor_end > 0:
+            donor_host = str(manifest.get("prefill_donor_host") or "").strip()
+            donor_port = int(manifest.get("prefill_donor_port") or 0)
+            donor_room = int(manifest.get("prefill_donor_bootstrap_room") or 0)
+            if not donor_host or donor_port <= 0 or donor_room <= 0:
+                raise RuntimeError(
+                    "prefill donor manifest is missing bootstrap identity"
+                )
+            donor_manifest = dict(manifest)
+            donor_manifest.update(
+                source_bootstrap_port=donor_port,
+                migration_bootstrap_room=donor_room,
+                kv_committed_len=donor_end,
+            )
+            donor_req = self._pd_flip_manifest_to_req(donor_manifest, donor_host)
+            donor_receiver = receiver_class(
+                mgr=kv_manager,
+                bootstrap_addr=(
+                    f"{donor_req.bootstrap_host}:{donor_req.bootstrap_port}"
+                ),
+                bootstrap_room=donor_req.bootstrap_room,
+            )
+            prefill_decode_req = DecodeRequest(
+                req=donor_req, kv_receiver=donor_receiver
+            )
+
+        return {
+            "decode_req": decode_req,
+            "prefill_decode_req": prefill_decode_req,
+            "phase": "new",
+            "manifest": manifest,
+            "source_queue": manifest.get("pd_flip_source_queue", "running"),
+            "metadata_index": -1,
+            "prefill_metadata_index": -1,
+            "timing_debug": {},
+        }
+
+    def _pd_flip_prepare_target_entries(
+        self,
+        manifests: List[Dict[str, Any]],
+        source_url: Optional[str],
+        prefill_donor_mode: bool = False,
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+        if not self._pd_flip_can_use_real_migration():
+            return {}, ""
+        if getattr(self, "enable_hisparse", False):
+            return {}, "PD flip migration does not support HiSparse decode yet"
+        try:
+            source_host = self._pd_flip_source_host_from_url(source_url)
+            entries: Dict[str, Dict[str, Any]] = {}
+            receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+            for manifest in manifests:
+                entry_started = time.monotonic()
+                timing_debug = {}
+                self._pd_flip_validate_layout(manifest)
+                if prefill_donor_mode:
+                    entry = self._pd_flip_prepare_target_donor_entry(
+                        manifest, source_host, receiver_class, kv_manager
+                    )
+                    req = entry["decode_req"].req
+                    entry["timing_debug"] = timing_debug
+                else:
+                    req_started = time.monotonic()
+                    req = self._pd_flip_manifest_to_req(manifest, source_host)
+                    timing_debug["manifest_to_req_s"] = (
+                        time.monotonic() - req_started
+                    )
+                    receiver_started = time.monotonic()
+                    receiver = receiver_class(
+                        mgr=kv_manager,
+                        bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                        bootstrap_room=req.bootstrap_room,
+                    )
+                    timing_debug["receiver_create_s"] = (
+                        time.monotonic() - receiver_started
+                    )
+                    decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                    entry = {
+                        "decode_req": decode_req,
+                        "phase": "new",
+                        "manifest": manifest,
+                        "source_queue": manifest.get(
+                            "pd_flip_source_queue", "running"
+                        ),
+                        "metadata_index": -1,
+                        "timing_debug": timing_debug,
+                    }
+                entries[req.rid] = entry
+                timing_debug["target_entry_prepare_total_s"] = (
+                    time.monotonic() - entry_started
+                )
+            return entries, ""
+        except Exception as exc:
+            return {}, str(exc)
+
+    def _pd_flip_target_reprepare_full_fallback(
+        self, session: Dict[str, Any], rids: List[str]
+    ) -> None:
+        """Recreate cleaned target entries with prefix restoration disabled."""
+        entries = session.get("target_entries") or {}
+        replacements = {}
+        try:
+            for rid in rids:
+                rid = str(rid)
+                old_entry = entries[rid]
+                manifest = old_entry.get("manifest") or {}
+                prepared, error = self._pd_flip_prepare_target_entries(
+                    [manifest], session.get("source_url")
+                )
+                if error or rid not in prepared:
+                    raise RuntimeError(error or f"failed to reprepare fallback {rid}")
+                replacement = prepared[rid]
+                replacement["timing_debug"] = dict(
+                    old_entry.get("timing_debug") or {}
+                )
+                replacement.update(
+                    fallback_attempted=True,
+                    fallback_reason=old_entry.get("fallback_reason"),
+                    force_source_full_fallback=True,
+                    stitch_mode="source_decode_full_fallback",
+                    original_stitch_mode=old_entry.get("stitch_mode"),
+                    original_mooncake_hit_len=old_entry.get("mooncake_hit_len"),
+                    target_hicache_l1_prefix_len=old_entry.get(
+                        "target_hicache_l1_prefix_len"
+                    ),
+                    target_hicache_l2_prefix_len=old_entry.get(
+                        "target_hicache_l2_prefix_len"
+                    ),
+                    target_hicache_l3_prefix_len=old_entry.get(
+                        "target_hicache_l3_prefix_len"
+                    ),
+                )
+                self._pd_flip_note_timing(
+                    replacement, "target_fallback_prepare_received"
+                )
+                replacements[rid] = replacement
+            entries.update(replacements)
+            required = set(session.get("fallback_required_rids", set()))
+            required.difference_update(replacements)
+            session["fallback_required_rids"] = required
+            session["state"] = "target_fallback_prepared"
+        except Exception as exc:
+            for replacement in replacements.values():
+                decode_req = replacement.get("decode_req")
+                receiver = getattr(decode_req, "kv_receiver", None)
+                if receiver is not None and hasattr(receiver, "abort"):
+                    try:
+                        receiver.abort()
+                    except Exception:
+                        pass
+                self._pd_flip_release_target_request(replacement)
+                self._pd_flip_free_target_metadata(replacement)
+                replacement["rollback_reason"] = str(exc)
+            session["state"] = "target_failed"
+            session["last_error"] = str(exc)
+            raise
+
+    def prepare_pd_flip_migration_target_fallback(
+        self, recv_req: PDFlipMigrationTargetFallbackPrepareReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("session_id") != recv_req.session_id:
+            return PDFlipMigrationReqOutput(False, "migration session not found")
+        rids = [str(rid).strip() for rid in recv_req.rids]
+        if not rids or any(not rid for rid in rids) or len(set(rids)) != len(rids):
+            return PDFlipMigrationReqOutput(False, "fallback RIDs must be nonempty and unique")
+        required = set(session.get("fallback_required_rids") or set())
+        if not set(rids) <= required:
+            return PDFlipMigrationReqOutput(False, "fallback RIDs were not requested by target")
+        try:
+            self._pd_flip_target_reprepare_full_fallback(
+                session, rids
+            )
+            return PDFlipMigrationReqOutput(
+                True, status=self._pd_flip_migration_status_dict()
+            )
+        except Exception as exc:
+            return PDFlipMigrationReqOutput(
+                False, str(exc), status=self._pd_flip_migration_status_dict()
+            )
+
+    def _pd_flip_source_host_from_url(self, source_url: Optional[str]) -> str:
+        if not source_url:
+            raise ValueError("source_url is required for real migration target prepare")
+        parsed = urlparse(source_url)
+        if parsed.hostname:
+            return parsed.hostname
+        return parsed.path.split(":", 1)[0]
+
+    def _pd_flip_manifest_to_req(
+        self, manifest: Dict[str, Any], source_host: str
+    ) -> Req:
+        sampling_values = manifest.get("sampling_params") or {}
+        custom_params = sampling_values.get("custom_params")
+        if isinstance(custom_params, dict) and "forced_token_id" in custom_params:
+            custom_logit_processor = manifest.get("custom_logit_processor")
+            if (
+                not isinstance(custom_logit_processor, str)
+                or not custom_logit_processor
+            ):
+                raise ValueError(
+                    "forced sampling manifest requires custom_logit_processor"
+                )
+
+            forced_token_id = custom_params["forced_token_id"]
+            if not isinstance(forced_token_id, int) or not (
+                0 <= forced_token_id < self.model_config.vocab_size
+            ):
+                raise ValueError(
+                    f"forced_token_id {forced_token_id!r} is outside vocab_size "
+                    f"{self.model_config.vocab_size}"
+                )
+
+        sampling_params = self._pd_flip_deserialize_sampling_params(sampling_values)
+        try:
+            sampling_params.normalize(getattr(self, "tokenizer", None))
+            sampling_params.verify(self.model_config.vocab_size)
+        except Exception:
+            logger.debug(
+                "Skipping sampling param normalize/verify for migration", exc_info=True
+            )
+
+        req = Req(
+            str(manifest.get("rid", "")),
+            "",
+            array("q", list(manifest.get("origin_input_ids") or [])),
+            sampling_params,
+            return_logprob=bool(manifest.get("return_logprob", False)),
+            stream=bool(manifest.get("stream", False)),
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            bootstrap_host=source_host,
+            bootstrap_port=int(
+                manifest.get("source_bootstrap_port")
+                or getattr(self.server_args, "disaggregation_bootstrap_port", 8998)
+            ),
+            bootstrap_room=int(
+                manifest.get("migration_bootstrap_room")
+                or manifest.get("bootstrap_room")
+                or 0
+            ),
+            disagg_mode=self.disaggregation_mode,
+            vocab_size=self.model_config.vocab_size,
+            priority=manifest.get("priority"),
+            custom_logit_processor=manifest.get("custom_logit_processor"),
+            metrics_collector=(
+                self.metrics_collector
+                if getattr(self.metrics_reporter, "enable_metrics", False)
+                else None
+            ),
+            routing_key=manifest.get("routing_key"),
+            extra_key=manifest.get("extra_key"),
+            http_worker_ipc=manifest.get("http_worker_ipc"),
+            time_stats=self._pd_flip_deserialize_time_stats(
+                manifest.get("time_stats")
+            ),
+        )
+        # The manifest intentionally carries only serializable request state.
+        # Reattach the target Scheduler's process-local tokenizer before this
+        # request can enter either Prefill or Decode sampling.  In particular,
+        # min_new_tokens penalization dereferences req.tokenizer while building
+        # SamplingBatchInfo, before the first model forward.
+        req.tokenizer = self.tokenizer
+        req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.send_token_offset = len(req.output_ids)
+        req.send_decode_id_offset = len(req.output_ids)
+        req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
+        req.kv_committed_len = int(
+            manifest.get("kv_committed_len")
+            or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        )
+        req.pd_flip_migration_session_id = manifest.get("pd_flip_session_id")
+        req.pd_flip_last_emitted_output_seq = int(
+            manifest.get("last_emitted_output_seq", 0) or 0
+        )
+        req.pd_flip_output_relay_url = manifest.get("pd_flip_output_relay_url")
+        req.pd_flip_prefill_donor_host = manifest.get("prefill_donor_host")
+        req.pd_flip_prefill_donor_port = manifest.get("prefill_donor_port")
+        return req
+
+    @staticmethod
+    def _pd_flip_serialize_time_stats(time_stats) -> Dict[str, Any]:
+        if time_stats is None:
+            return {}
+        values = getattr(time_stats, "__dict__", {})
+        return {
+            key: value
+            for key, value in values.items()
+            if key not in ("metrics_collector", "trace_ctx", "disagg_mode")
+            and (
+                isinstance(value, (str, int, float, bool))
+                or value is None
+                or (
+                    isinstance(value, (list, tuple))
+                    and all(
+                        isinstance(item, (str, int, float, bool)) or item is None
+                        for item in value
+                    )
+                )
+            )
+        }
+
+    @staticmethod
+    def _pd_flip_deserialize_time_stats(values: Optional[Dict[str, Any]]):
+        if not values or not isinstance(values, dict):
+            return None
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _pd_flip_deserialize_sampling_params(values: Dict[str, Any]) -> SamplingParams:
+        allowed = set(SamplingParams.__init__.__code__.co_varnames)
+        allowed.discard("self")
+        kwargs = {key: value for key, value in dict(values).items() if key in allowed}
+        return SamplingParams(**kwargs)
+
+    def _pd_flip_apply_delta_manifest_to_target(
+        self, entry: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> None:
+        self._pd_flip_preserve_base_measurement(entry)
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            return
+        req.output_ids = array("q", list(manifest.get("output_ids") or []))
+        req.send_token_offset = len(req.output_ids)
+        req.send_decode_id_offset = len(req.output_ids)
+        req.logprob_start_len = int(manifest.get("logprob_start_len", -1))
+        committed_len = int(
+            manifest.get("kv_committed_len")
+            or len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        )
+        req.kv_committed_len = committed_len
+        req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), committed_len)
+        req.pd_flip_migration_session_id = manifest.get("pd_flip_session_id")
+        req.pd_flip_last_emitted_output_seq = int(
+            manifest.get("last_emitted_output_seq", 0) or 0
+        )
+        entry["committed_len"] = committed_len
+        entry["target_committed_len"] = committed_len
+        entry["manifest"] = manifest
+        self._pd_flip_note_timing(entry, "target_delta_state_applied")
+
+    def _pd_flip_start_target_delta_entry(
+        self,
+        entry: Dict[str, Any],
+        manifest: Dict[str, Any],
+        source_url: Optional[str],
+    ) -> None:
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            raise ValueError("target delta entry has no request")
+        receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        source_host = self._pd_flip_source_host_from_url(
+            source_url or (entry.get("manifest") or {}).get("source_url") or ""
+        )
+        migration_room = int(manifest["migration_bootstrap_room"])
+        receiver = receiver_class(
+            mgr=self.disagg_decode_prealloc_queue.kv_manager,
+            bootstrap_addr=f"{source_host}:{int(manifest.get('source_bootstrap_port') or getattr(self.server_args, 'disaggregation_bootstrap_port', 8998))}",
+            bootstrap_room=migration_room,
+        )
+        req.bootstrap_host = source_host
+        req.bootstrap_port = int(
+            manifest.get("source_bootstrap_port")
+            or getattr(self.server_args, "disaggregation_bootstrap_port", 8998)
+        )
+        req.bootstrap_room = migration_room
+        decode_req.kv_receiver = receiver
+        entry["delta"] = {
+            "phase": "new",
+            "manifest": manifest,
+            "from_len": int(manifest.get("delta_from_len") or entry.get("committed_len") or 0),
+            "to_len": int(manifest.get("kv_committed_len") or 0),
+            "metadata_index": -1,
+            "transferred": False,
+            "failed": False,
+        }
+
+    def _pd_flip_target_delta_prealloc_and_send_metadata(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        delta = entry["delta"]
+        manifest = delta["manifest"]
+        decode_req: DecodeRequest = entry["decode_req"]
+        req = decode_req.req
+        from_len = int(delta["from_len"])
+        to_len = int(delta["to_len"])
+        if to_len < from_len:
+            raise RuntimeError(
+                f"target delta regressed committed length for {req.rid}: {from_len}->{to_len}"
+            )
+
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for target delta migration")
+        delta["metadata_index"] = metadata_index
+        entry["metadata_index"] = metadata_index
+        decode_req.metadata_buffer_index = metadata_index
+
+        delta_len = to_len - from_len
+        if delta_len > 0:
+            device = self.token_to_kv_pool_allocator.device
+            if from_len > 0:
+                last_loc = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, from_len - 1
+                ].reshape(1).to(dtype=torch.int64, device=device)
+            else:
+                last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor([from_len], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([from_len], dtype=torch.int64),
+                    seq_lens=torch.tensor([to_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([to_len], dtype=torch.int64),
+                    last_loc=last_loc,
+                    extend_num_tokens=delta_len,
+                )
+            if kv_loc is None:
+                raise RuntimeError("KV cache is full during target delta migration")
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(from_len, from_len + len(kv_loc))),
+                kv_loc,
+            )
+
+        req.kv_committed_len = to_len
+        req.kv_allocated_len = max(int(getattr(req, "kv_allocated_len", 0) or 0), to_len)
+        page_start = int(
+            manifest.get("delta_page_start_len")
+            or self._pd_flip_delta_page_start(from_len)
+        )
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, page_start:to_len]
+            .cpu()
+            .numpy()
+        )
+        page_indices = kv_to_page_indices(
+            kv_indices,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+        delta["target_index_shape"] = list(page_indices.shape)
+        delta["target_index_size"] = int(page_indices.size)
+        state_indices = self._pd_flip_target_state_indices(req, to_len)
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            metadata_index,
+            state_indices,
+            decode_prefix_len=page_start,
+        )
+        if self.transfer_backend == TransferBackend.FAKE:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
+                req.bootstrap_room
+            )
+
+    def _pd_flip_target_pump_delta_transfer(self, session: Dict[str, Any]) -> None:
+        if session.get("state") in {"active", "target_aborted"}:
+            return
+        entries = session.get("target_entries") or {}
+        delta_entries = {
+            rid: entry
+            for rid, entry in entries.items()
+            if isinstance(entry.get("delta"), dict)
+            and not entry["delta"].get("noop")
+        }
+        if not delta_entries:
+            return
+
+        transferred = set(session.get("delta_transferred_rids", set()))
+        failed = set(session.get("delta_failed_rids", set()))
+        for rid, entry in delta_entries.items():
+            delta = entry["delta"]
+            if delta.get("transferred") or delta.get("failed"):
+                continue
+            decode_req = entry["decode_req"]
+            try:
+                if delta.get("phase") == "new":
+                    if not self._pd_flip_target_init_receiver(decode_req):
+                        continue
+                    delta["phase"] = "waiting_for_input"
+
+                if delta.get("phase") == "waiting_for_input":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target delta bootstrap failed")
+                    if poll != KVPoll.WaitingForInput:
+                        continue
+                    self._pd_flip_target_delta_prealloc_and_send_metadata(entry)
+                    delta["phase"] = "transferring"
+
+                if delta.get("phase") == "transferring":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target delta transfer failed")
+                    if poll == KVPoll.Success and self._pd_flip_target_metadata_ready(
+                        entry
+                    ):
+                        self._pd_flip_apply_delta_manifest_to_target(
+                            entry, delta["manifest"]
+                        )
+                        transferred.add(rid)
+                        delta["transferred"] = True
+                        delta["phase"] = "transferred"
+                        entry["phase"] = "transferred_held"
+                        entry["held"] = not bool(entry.get("drop_on_commit"))
+                        if getattr(decode_req, "kv_receiver", None) is not None:
+                            decode_req.kv_receiver.clear()
+                            decode_req.kv_receiver = None
+                        self._pd_flip_free_target_metadata(entry)
+            except Exception as exc:
+                failed.add(rid)
+                delta["failed"] = True
+                delta["phase"] = "failed"
+                entry["phase"] = "failed"
+                session["last_error"] = str(exc)
+                if getattr(decode_req, "kv_receiver", None) is not None:
+                    decode_req.kv_receiver.abort()
+                self._pd_flip_free_target_metadata(entry)
+
+        session["delta_transferred_rids"] = transferred
+        session["delta_failed_rids"] = failed
+        session["delta_transferred_reqs"] = len(transferred)
+        session["delta_failed_reqs"] = len(failed)
+        session["pending_reqs"] = max(
+            0, len(delta_entries) - len(transferred) - len(failed)
+        )
+        session["delta_pending_reqs"] = session["pending_reqs"]
+        terminal = session.get("state") in {"active", "target_aborted"}
+        if failed:
+            if not terminal:
+                session["state"] = "target_failed"
+            session["failed_reqs"] = max(
+                int(session.get("failed_reqs", 0) or 0), len(failed)
+            )
+        elif session["pending_reqs"] == 0 and not terminal:
+            session["state"] = "target_delta_transferred"
+
+    def _pd_flip_target_pump_donor_transfer(
+        self, session: Dict[str, Any]
+    ) -> None:
+        if session.get("state") in {"active", "target_aborted"}:
+            return
+        entries = session.get("target_entries") or {}
+        if not entries:
+            return
+
+        transferred = set(session.get("transferred_rids", set()))
+        failed = set(session.get("failed_rids", set()))
+        for rid, entry in entries.items():
+            if rid in transferred or rid in failed:
+                continue
+            decode_req = entry["decode_req"]
+            prefill_decode_req = entry.get("prefill_decode_req")
+            try:
+                if entry.get("phase") == "new":
+                    if not self._pd_flip_target_init_receiver(decode_req):
+                        continue
+                    if prefill_decode_req is not None and not self._pd_flip_target_init_receiver(
+                        prefill_decode_req
+                    ):
+                        continue
+                    entry["phase"] = "waiting_for_input"
+                    self._pd_flip_note_timing(entry, "target_donor_waiting_for_input")
+
+                if entry.get("phase") == "waiting_for_input":
+                    source_poll = decode_req.kv_receiver.poll()
+                    prefill_poll = (
+                        prefill_decode_req.kv_receiver.poll()
+                        if prefill_decode_req is not None
+                        else KVPoll.WaitingForInput
+                    )
+                    if source_poll == KVPoll.Failed or prefill_poll == KVPoll.Failed:
+                        raise RuntimeError("migration target donor bootstrap failed")
+                    if (
+                        source_poll != KVPoll.WaitingForInput
+                        or prefill_poll != KVPoll.WaitingForInput
+                    ):
+                        continue
+                    self._pd_flip_target_prealloc_donor_ranges(entry)
+                    entry["phase"] = "transferring"
+                    self._pd_flip_note_timing(entry, "target_donor_transferring")
+
+                if entry.get("phase") == "transferring":
+                    source_poll = decode_req.kv_receiver.poll()
+                    prefill_poll = (
+                        prefill_decode_req.kv_receiver.poll()
+                        if prefill_decode_req is not None
+                        else KVPoll.Success
+                    )
+                    if source_poll == KVPoll.Failed or prefill_poll == KVPoll.Failed:
+                        raise RuntimeError("migration target donor transfer failed")
+                    if (
+                        source_poll == KVPoll.Success
+                        and prefill_poll == KVPoll.Success
+                        and self._pd_flip_target_metadata_ready_for(
+                            entry, "metadata_index", decode_req
+                        )
+                        and (
+                            prefill_decode_req is None
+                            or self._pd_flip_target_metadata_ready_for(
+                                entry,
+                                "prefill_metadata_index",
+                                prefill_decode_req,
+                            )
+                        )
+                        and self._pd_flip_target_donor_ranges_ready(entry)
+                    ):
+                        transferred.add(rid)
+                        entry["phase"] = (
+                            "transferred_held"
+                            if session.get("prepare_only", False)
+                            else "transferred"
+                        )
+                        for receiver_req in (decode_req, prefill_decode_req):
+                            if receiver_req is None:
+                                continue
+                            receiver = getattr(receiver_req, "kv_receiver", None)
+                            if receiver is not None:
+                                receiver.clear()
+                                receiver_req.kv_receiver = None
+                        if session.get("prepare_only", False):
+                            entry["held"] = True
+                            self._pd_flip_note_timing(entry, "target_held")
+                        elif session.get("adopt_on_success", False):
+                            self._pd_flip_adopt_target_request(entry)
+                        else:
+                            self._pd_flip_release_target_request(entry)
+                        self._pd_flip_free_target_metadata(entry)
+            except Exception as exc:
+                failed.add(rid)
+                entry["phase"] = "failed"
+                session["last_error"] = str(exc)
+                for receiver_req in (decode_req, prefill_decode_req):
+                    if receiver_req is None:
+                        continue
+                    receiver = getattr(receiver_req, "kv_receiver", None)
+                    if receiver is not None:
+                        receiver.abort()
+                        receiver_req.kv_receiver = None
+                self._pd_flip_release_target_request(entry)
+                self._pd_flip_free_target_metadata(entry)
+
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["held_reqs"] = sum(
+            1
+            for entry in entries.values()
+            if entry.get("phase") == "transferred_held" and entry.get("held")
+        )
+        session["pending_reqs"] = max(
+            0, len(session.get("manifests", [])) - len(transferred) - len(failed)
+        )
+        terminal = session.get("state") in {"active", "target_aborted"}
+        if not terminal:
+            if failed:
+                session["state"] = "target_failed"
+            elif session.get("held_reqs", 0) > 0:
+                session["state"] = "target_transferred_held"
+            elif session["pending_reqs"] == 0:
+                session["state"] = "target_transferred"
+        self._pd_flip_target_pump_delta_transfer(session)
+
+    def _pd_flip_target_pump_transfer(self, session: Dict[str, Any]) -> None:
+        if session.get("state") in {"active", "target_aborted"}:
+            return
+        if session.get("prefill_donor_mode", False):
+            self._pd_flip_target_pump_donor_transfer(session)
+            return
+        entries = session.get("target_entries") or {}
+        if not entries:
+            return
+
+        transferred = set(session.get("transferred_rids", set()))
+        failed = set(session.get("failed_rids", set()))
+        fallback_required = set(session.get("fallback_required_rids", set()))
+        for rid, entry in entries.items():
+            if rid in transferred or rid in failed:
+                continue
+            decode_req = entry["decode_req"]
+            phase = entry.get("phase")
+            try:
+                if phase == "new":
+                    init_started = time.monotonic()
+                    if not self._pd_flip_target_init_receiver(decode_req):
+                        continue
+                    self._pd_flip_note_timing(entry, "target_init_receiver", init_started)
+                    entry["phase"] = "waiting_for_input"
+                    self._pd_flip_note_timing(entry, "target_waiting_for_input")
+                    phase = "waiting_for_input"
+
+                if phase == "waiting_for_input":
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target bootstrap failed")
+                    if poll != KVPoll.WaitingForInput:
+                        continue
+                    metadata_started = time.monotonic()
+                    self._pd_flip_target_prealloc_and_send_metadata(entry)
+                    self._pd_flip_note_timing(
+                        entry, "target_prealloc_send_metadata", metadata_started
+                    )
+                    entry["phase"] = "transferring"
+                    self._pd_flip_note_timing(entry, "target_transferring")
+
+                if entry.get("phase") == "transferring":
+                    if self._pd_flip_target_hicache_restore_pending(entry):
+                        continue
+                    poll = decode_req.kv_receiver.poll()
+                    if poll == KVPoll.Failed:
+                        raise RuntimeError("migration target transfer failed")
+                    if (
+                        poll == KVPoll.Success
+                        and self._pd_flip_target_metadata_ready(entry)
+                        and self._pd_flip_target_stitch_ready(entry)
+                    ):
+                        if not session.get("prepare_only", False):
+                            self._pd_flip_target_commit_hicache_restore(decode_req)
+                            self._pd_flip_target_committed_mapping_ready(entry)
+                        self._pd_flip_note_timing(entry, "target_transfer_success")
+                        if entry.get("fallback_attempted"):
+                            self._pd_flip_note_timing(
+                                entry, "target_fallback_receive_completed"
+                            )
+                        transferred.add(rid)
+                        entry["phase"] = (
+                            "transferred_held"
+                            if session.get("prepare_only", False)
+                            else "transferred"
+                        )
+                        if getattr(decode_req, "kv_receiver", None) is not None:
+                            decode_req.kv_receiver.clear()
+                            decode_req.kv_receiver = None
+                        if session.get("prepare_only", False):
+                            entry["held"] = True
+                            self._pd_flip_note_timing(entry, "target_held")
+                        elif session.get("adopt_on_success", False):
+                            self._pd_flip_adopt_target_request(entry)
+                        else:
+                            self._pd_flip_release_target_request(entry)
+                        self._pd_flip_free_target_metadata(entry)
+            except Exception as exc:
+                hit_len = int(entry.get("mooncake_hit_len") or 0)
+                restore_failed = (
+                    hit_len > 0
+                    and "HiCache restore failed" in str(exc)
+                    and not entry.get("fallback_attempted", False)
+                )
+                if restore_failed:
+                    self._pd_flip_note_timing(entry, "target_fallback_required")
+                    fallback_required.add(rid)
+                    entry["phase"] = "fallback_required"
+                    entry["fallback_reason"] = str(exc)
+                    entry["fallback_attempted"] = False
+                    session["fallback_reason"] = str(exc)
+                    if getattr(decode_req, "kv_receiver", None) is not None:
+                        decode_req.kv_receiver.abort()
+                        decode_req.kv_receiver = None
+                    self._pd_flip_release_target_request(entry)
+                    self._pd_flip_free_target_metadata(entry)
+                    continue
+                failed.add(rid)
+                entry["phase"] = "failed"
+                session["last_error"] = str(exc)
+                if getattr(decode_req, "kv_receiver", None) is not None:
+                    decode_req.kv_receiver.abort()
+                self._pd_flip_release_target_request(entry)
+                self._pd_flip_free_target_metadata(entry)
+
+        session["transferred_rids"] = transferred
+        session["failed_rids"] = failed
+        session["fallback_required_rids"] = fallback_required
+        session["transferred_reqs"] = len(transferred)
+        session["failed_reqs"] = len(failed)
+        session["held_reqs"] = sum(
+            1
+            for entry in entries.values()
+            if entry.get("phase") == "transferred_held" and entry.get("held")
+        )
+        session["pending_reqs"] = max(
+            0, len(session.get("manifests", [])) - len(transferred) - len(failed)
+        )
+        terminal = session.get("state") in {"active", "target_aborted"}
+        if not terminal:
+            if failed:
+                session["state"] = "target_failed"
+            elif fallback_required:
+                session["state"] = "target_fallback_required"
+            elif session.get("held_reqs", 0) > 0:
+                session["state"] = "target_transferred_held"
+            elif session["pending_reqs"] == 0:
+                session["state"] = "target_transferred"
+        self._pd_flip_target_pump_delta_transfer(session)
+
+    def _pd_flip_target_hicache_restore_pending(
+        self, entry: Dict[str, Any]
+    ) -> bool:
+        decode_req: DecodeRequest = entry["decode_req"]
+        prefix_match = getattr(decode_req, "prefix_match", None)
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return False
+
+        if not getattr(self, "enable_decode_hicache", False):
+            raise RuntimeError(
+                "migration target requires HiCache restore but decode HiCache is disabled"
+            )
+
+        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer_queue is None or not hasattr(
+            transfer_queue, "_process_hicache_local_restores"
+        ):
+            raise RuntimeError(
+                "migration target requires HiCache restore but no restore processor is available"
+            )
+        self._pd_flip_note_timing(entry, "target_hicache_restore_started")
+        transfer_queue._process_hicache_local_restores([decode_req])
+        status_value = getattr(
+            getattr(decode_req, "hicache_restore_status", None), "value", None
+        )
+        if status_value == "failed":
+            self._pd_flip_note_timing(entry, "target_hicache_restore_failed")
+            raise RuntimeError("migration target HiCache restore failed")
+        if status_value == "pending":
+            return True
+        if status_value == "ready":
+            timing = entry.setdefault("timing_debug", {})
+            started = timing.get("target_hicache_restore_started_mono")
+            if isinstance(started, (int, float)):
+                self._pd_flip_note_timing(
+                    entry, "target_hicache_restore_duration", started
+                )
+            return False
+        raise RuntimeError(
+            f"migration target HiCache restore returned invalid status {status_value!r}"
+        )
+
+    def _pd_flip_start_prefill_donor_restore(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        note_timing = getattr(self, "_pd_flip_note_timing", None)
+        if callable(note_timing):
+            note_timing(entry, "prefill_donor_restore_started")
+        req = entry["req"]
+        donor_end = int(entry["prefill_donor_end"])
+        queue = self.disagg_decode_prealloc_queue
+        capacity_check = getattr(
+            self, "_pd_flip_prefill_donor_restore_capacity_available", None
+        )
+        if callable(capacity_check) and not capacity_check(entry):
+            entry["phase"] = "waiting_for_capacity"
+            return
+        prefix_match = queue._match_prefix_and_lock(req)
+        entry["decode_prefix_match"] = prefix_match
+        raw_hit_len = int(prefix_match.decode_prefix_len)
+        entry["prefill_donor_restore_hit_len"] = raw_hit_len
+        entry["expected_restore_len"] = donor_end
+        if raw_hit_len < donor_end:
+            raise RuntimeError(
+                "prefill_donor_incomplete: "
+                f"rid={req.rid}, expected={donor_end}, hit={raw_hit_len}"
+            )
+
+        prefix_len = min(int(prefix_match.l1_prefix_len), donor_end)
+        prefix_match.prefix_indices = prefix_match.prefix_indices[:prefix_len]
+        remaining = donor_end - prefix_len
+        prefix_match.l2_host_hit_length = min(
+            int(prefix_match.l2_host_hit_length), remaining
+        )
+        remaining -= int(prefix_match.l2_host_hit_length)
+        prefix_match.l3_storage_hit_length = min(
+            int(prefix_match.l3_storage_hit_length), remaining
+        )
+
+        queue._pre_alloc(
+            req,
+            prefix_indices=prefix_match.prefix_indices,
+            prefix_len=prefix_len,
+            total_prefix_len=donor_end,
+            fill_len_override=donor_end,
+        )
+        # HiCache restoration installs the full donor range into the radix
+        # cache's ownership accounting. Keep the synthetic request aligned
+        # with that ownership so the idle invariant does not count the same
+        # pages again as request-owned uncached KV.
+        req.cache_protected_len = donor_end
+        decode_req = DecodeRequest(req=req, kv_receiver=None)
+        decode_req.prefix_match = prefix_match
+        entry["decode_req"] = decode_req
+        if prefix_match.needs_local_restore:
+            queue._start_hicache_prefetch(req, prefix_match)
+            entry["phase"] = "restoring"
+        else:
+            entry["phase"] = "ready_to_send"
+            if callable(note_timing):
+                note_timing(entry, "prefill_donor_restore_completed")
+
+    def _pd_flip_prefill_donor_restore_capacity_available(
+        self, entry: Dict[str, Any]
+    ) -> bool:
+        req = entry["req"]
+        pool = self.req_to_token_pool
+        req_slots_available = int(pool.available_size())
+        required_mamba_slots = 0
+        mamba_slots_available = None
+        required_fn = getattr(pool, "mamba_slots_required_for_alloc", None)
+        mamba_allocator = getattr(pool, "mamba_allocator", None)
+        if callable(required_fn) and mamba_allocator is not None:
+            required_mamba_slots = int(required_fn([req]))
+            mamba_slots_available = int(mamba_allocator.available_size())
+        available = req_slots_available >= int(req.req_pool_idx is None)
+        if mamba_slots_available is not None:
+            available = available and mamba_slots_available >= required_mamba_slots
+        entry["prefill_donor_capacity"] = {
+            "req_slots_available": req_slots_available,
+            "required_req_slots": int(req.req_pool_idx is None),
+            "mamba_slots_available": mamba_slots_available,
+            "required_mamba_slots": required_mamba_slots,
+        }
+        return bool(available)
+
+    def _pd_flip_prepare_prefill_donor_entry(
+        self,
+        manifest: Dict[str, Any],
+        sender_class,
+        kv_manager,
+        bootstrap_addr: str,
+    ) -> Dict[str, Any]:
+        donor_end = int(manifest.get("prefill_donor_end") or 0)
+        donor_room = int(manifest.get("prefill_donor_bootstrap_room") or 0)
+        donor_host = str(manifest.get("prefill_donor_host") or "").strip()
+        donor_port = int(manifest.get("prefill_donor_port") or 0)
+        origin_input_ids = list(manifest.get("origin_input_ids") or [])
+        if not 0 < donor_end <= len(origin_input_ids):
+            raise RuntimeError(
+                "prefill donor manifest has invalid prompt boundary: "
+                f"B={donor_end}, P={len(origin_input_ids)}"
+            )
+        if not donor_host or donor_port <= 0 or donor_room <= 0:
+            raise RuntimeError("prefill donor manifest is missing bootstrap identity")
+
+        donor_manifest = dict(manifest)
+        donor_manifest.update(
+            origin_input_ids=origin_input_ids[:donor_end],
+            output_ids=[],
+            kv_committed_len=donor_end,
+            source_bootstrap_port=donor_port,
+            migration_bootstrap_room=donor_room,
+        )
+        req = self._pd_flip_manifest_to_req(donor_manifest, donor_host)
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for Prefill donor")
+        try:
+            sender = sender_class(
+                mgr=kv_manager,
+                bootstrap_addr=bootstrap_addr,
+                bootstrap_room=donor_room,
+                dest_tp_ranks=self._pd_flip_dest_ranks(manifest),
+                pp_rank=self.ps.pp_rank,
+            )
+        except Exception:
+            self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+            raise
+        return {
+            "req": req,
+            "sender": sender,
+            "phase": "new",
+            "manifest": manifest,
+            "prefill_donor_end": donor_end,
+            "prefill_donor_bootstrap_room": donor_room,
+            "metadata_index": metadata_index,
+            "metadata_freed": False,
+            "timing_debug": {},
+        }
+
+    def _pd_flip_prefill_donor_restore_pending(
+        self, entry: Dict[str, Any]
+    ) -> bool:
+        decode_req = entry["decode_req"]
+        prefix_match = decode_req.prefix_match
+        if not prefix_match.needs_local_restore:
+            return False
+        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer_queue is None or not hasattr(
+            transfer_queue, "_process_hicache_local_restores"
+        ):
+            raise RuntimeError("prefill donor has no HiCache restore processor")
+        transfer_queue._process_hicache_local_restores([decode_req])
+        status_value = getattr(
+            getattr(decode_req, "hicache_restore_status", None), "value", None
+        )
+        if status_value == "pending":
+            return True
+        if status_value == "failed":
+            raise RuntimeError("prefill donor HiCache restore failed")
+        if status_value != "ready":
+            raise RuntimeError(
+                f"prefill donor HiCache restore returned {status_value!r}"
+            )
+        if not hasattr(
+            transfer_queue, "_commit_hicache_local_restore_to_req"
+        ):
+            raise RuntimeError("prefill donor HiCache restore cannot be committed")
+        transfer_queue._commit_hicache_local_restore_to_req(decode_req)
+        donor_end = int(entry["prefill_donor_end"])
+        formal_indices = self.req_to_token_pool.req_to_token[
+            entry["req"].req_pool_idx, :donor_end
+        ]
+        invalid_positions = self._pd_flip_invalid_kv_positions(formal_indices)
+        if invalid_positions:
+            raise RuntimeError(
+                "prefill donor HiCache restore committed invalid KV indices: "
+                f"positions={invalid_positions[:16]}"
+            )
+        note_timing = getattr(self, "_pd_flip_note_timing", None)
+        if callable(note_timing):
+            note_timing(entry, "prefill_donor_restore_completed")
+        return False
+
+    def _pd_flip_send_prefill_donor_pages(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        req = entry["req"]
+        sender = entry["sender"]
+        donor_end = int(entry["prefill_donor_end"])
+        decode_prefix_len = int(sender.pop_decode_prefix_len())
+        if decode_prefix_len != 0:
+            raise RuntimeError(
+                "prefill donor target requested an invalid source offset: "
+                f"{decode_prefix_len}"
+            )
+        self._pd_flip_set_source_metadata(
+            req, entry["metadata_index"], entry["prefill_donor_bootstrap_room"]
+        )
+        page_indices = self._pd_flip_source_page_indices(req, donor_end)
+        # Hybrid Mamba/SSM state is not a token-page prefix and therefore
+        # cannot be stitched from two writers. The source Decode owns the
+        # authoritative recurrent state at C0/C1; the Prefill donor supplies
+        # only page-addressed Prompt KV in [0, H).
+        donor_state_indices = [
+            None
+            for _ in getattr(sender.kv_mgr.kv_args, "state_types", [])
+        ]
+        sender.init(len(page_indices), entry["metadata_index"])
+        sender.send(page_indices, donor_state_indices)
+        entry["prefill_donor_pages"] = int(
+            page_indices.size if hasattr(page_indices, "size") else len(page_indices)
+        )
+        entry["prefill_donor_aux_state_skipped"] = bool(donor_state_indices)
+
+    def _pd_flip_cleanup_prefill_donor_entry(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        if entry.get("cleanup_complete"):
+            return
+        sender = entry.get("sender")
+        if entry.get("phase") == "transferred" and sender is not None and hasattr(
+            sender, "clear"
+        ):
+            sender.clear()
+        req = entry.get("req")
+        if req is not None and getattr(req, "req_pool_idx", None) is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        elif req is not None:
+            prefix_match = entry.get("decode_prefix_match")
+            last_device_node = getattr(prefix_match, "last_device_node", None)
+            if last_device_node is not None:
+                self.tree_cache.dec_lock_ref(last_device_node)
+        self._pd_flip_free_source_metadata(entry)
+        entry["cleanup_complete"] = True
+
+    def _pd_flip_pump_prefill_donor_entry(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        if entry.get("phase") in {"transferred", "failed", "aborted"}:
+            return
+        sender = entry["sender"]
+        try:
+            if entry.get("phase") in {"new", "waiting_for_capacity"}:
+                self._pd_flip_start_prefill_donor_restore(entry)
+                if entry.get("phase") == "waiting_for_capacity":
+                    return
+            if entry.get("phase") == "restoring":
+                if self._pd_flip_prefill_donor_restore_pending(entry):
+                    return
+                entry["phase"] = "ready_to_send"
+            if entry.get("phase") == "ready_to_send":
+                poll = sender.poll()
+                if poll == KVPoll.Failed:
+                    raise RuntimeError("prefill donor bootstrap failed")
+                if poll != KVPoll.WaitingForInput:
+                    return
+                entry["prefill_donor_transfer_start"] = 0
+                entry["prefill_donor_transfer_end"] = int(
+                    entry["prefill_donor_end"]
+                )
+                note_timing = getattr(self, "_pd_flip_note_timing", None)
+                if callable(note_timing):
+                    note_timing(entry, "prefill_donor_transfer_started")
+                self._pd_flip_send_prefill_donor_pages(entry)
+                entry["phase"] = "transferring"
+            if entry.get("phase") == "transferring":
+                poll = sender.poll()
+                if poll == KVPoll.Failed:
+                    raise RuntimeError("prefill donor transfer failed")
+                if poll == KVPoll.Success:
+                    entry["phase"] = "transferred"
+                    note_timing = getattr(self, "_pd_flip_note_timing", None)
+                    if callable(note_timing):
+                        note_timing(entry, "prefill_donor_transfer_completed")
+                    self._pd_flip_record_sender_metric(entry, sender, "prefill_donor")
+                    self._pd_flip_cleanup_prefill_donor_entry(entry)
+        except Exception as exc:
+            entry["phase"] = "failed"
+            entry["error"] = str(exc)
+            entry["error_type"] = (
+                "prefill_donor_incomplete"
+                if "prefill_donor_incomplete" in str(exc)
+                else "prefill_donor_failed"
+            )
+            if sender is not None and hasattr(sender, "abort"):
+                sender.abort()
+            self._pd_flip_cleanup_prefill_donor_entry(entry)
+
+    def _pd_flip_invalid_kv_positions(self, kv_indices) -> List[int]:
+        index_values = kv_indices
+        if hasattr(index_values, "detach"):
+            index_values = index_values.detach()
+        if hasattr(index_values, "cpu"):
+            index_values = index_values.cpu()
+        index_values = index_values.tolist()
+        return [
+            index
+            for index, value in enumerate(index_values)
+            if int(value) <= 0
+        ]
+
+    def _pd_flip_target_committed_mapping_ready(self, entry: Dict[str, Any]) -> bool:
+        try:
+            committed_len = int(entry["target_committed_len"])
+            req = entry["decode_req"].req
+            formal_kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            actual_len = len(formal_kv_indices)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target committed KV mapping is incomplete: "
+                "mapping metadata is missing or invalid"
+            ) from exc
+
+        invalid_positions = self._pd_flip_invalid_kv_positions(formal_kv_indices)
+        if actual_len != committed_len or invalid_positions:
+            position_sample = invalid_positions[:16]
+            if actual_len < committed_len and len(position_sample) < 16:
+                missing_sample_len = min(
+                    16 - len(position_sample), committed_len - actual_len
+                )
+                position_sample.extend(
+                    range(actual_len, actual_len + missing_sample_len)
+                )
+            entry["target_invalid_kv_position_sample"] = position_sample
+            raise RuntimeError(
+                "migration target committed KV mapping is incomplete: "
+                f"expected={committed_len}, actual={actual_len}, "
+                f"rid={req.rid}, positions={position_sample}"
+            )
+        return True
+
+    def _pd_flip_validate_commit_entry(
+        self, entry: Dict[str, Any], session: Dict[str, Any]
+    ) -> bool:
+        """Validate ownership, layout, and final C1 before publishing mappings."""
+
+        base_manifest = entry.get("base_manifest") or entry.get("manifest") or {}
+        manifest = entry.get("manifest") or base_manifest
+        try:
+            donor_end = int(base_manifest.get("prefill_donor_end") or 0)
+            prompt_len = int(
+                base_manifest.get("prompt_len")
+                or len(base_manifest.get("origin_input_ids") or [])
+            )
+            c0 = int(
+                entry.get("base_committed_len")
+                if entry.get("base_committed_len") is not None
+                else base_manifest["kv_committed_len"]
+            )
+            c1 = int(entry["target_committed_len"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target commit boundary metadata is missing or invalid"
+            ) from exc
+        if not 0 <= donor_end <= prompt_len <= c0 <= c1:
+            raise RuntimeError(
+                "migration target commit boundary is invalid: "
+                f"B={donor_end}, P={prompt_len}, C0={c0}, C1={c1}"
+            )
+        if entry.get("phase") != "transferred_held":
+            raise RuntimeError(
+                "migration target commit receiver is not transferred and held"
+            )
+
+        local_rank_value = session.get("dp_rank")
+        if local_rank_value is None:
+            local_rank_value = self._pd_flip_attn_dp_rank()
+        local_rank = int(local_rank_value or 0)
+        declared_rank = manifest.get(
+            "target_decode_dp_rank", base_manifest.get("target_decode_dp_rank")
+        )
+        dp_size = int(
+            getattr(getattr(self, "server_args", None), "dp_size", 1) or 1
+        )
+        if declared_rank is None and dp_size > 1:
+            raise RuntimeError("migration target DP rank is missing at commit")
+        if declared_rank is not None and int(declared_rank) != local_rank:
+            raise RuntimeError(
+                "migration target DP rank mismatch at commit: "
+                f"declared={declared_rank}, local={local_rank}"
+            )
+
+        base_fingerprint = base_manifest.get("model_fingerprint")
+        final_fingerprint = manifest.get("model_fingerprint")
+        if dp_size > 1 and (not base_fingerprint or not final_fingerprint):
+            raise RuntimeError("migration target layout fingerprint is missing")
+        if (
+            base_fingerprint is not None
+            and final_fingerprint is not None
+            and base_fingerprint != final_fingerprint
+        ):
+            raise RuntimeError(
+                "migration target layout fingerprint changed between base and delta"
+            )
+
+        donor_full_fallback = bool(
+            base_manifest.get("pd_flip_prefill_donor_fallback", False)
+        )
+        if donor_full_fallback:
+            fallback_coverage = (
+                int(entry.get("mooncake_hit_len", -1)),
+                int(entry.get("target_received_suffix_start", -1)),
+                int(entry.get("target_received_suffix_end", -1)),
+                str(entry.get("stitch_mode") or ""),
+            )
+            expected_fallback_coverage = (
+                0,
+                0,
+                c0,
+                "source_decode_full_fallback",
+            )
+            if fallback_coverage != expected_fallback_coverage:
+                raise RuntimeError(
+                    "migration target donor-miss fallback ownership mismatch: "
+                    f"observed={fallback_coverage}, "
+                    f"expected={expected_fallback_coverage}"
+                )
+        elif base_manifest.get("prefill_donor_host") or donor_end > 0:
+            coverage = (
+                int(entry.get("prefill_received_start", -1)),
+                int(entry.get("prefill_received_end", -1)),
+                int(entry.get("source_transfer_start", -1)),
+                int(entry.get("source_transfer_end", -1)),
+            )
+            if coverage != (0, donor_end, donor_end, c0):
+                raise RuntimeError(
+                    "migration target donor/source logical ownership mismatch: "
+                    f"observed={coverage}, expected={(0, donor_end, donor_end, c0)}"
+                )
+
+        delta = entry.get("delta") or {}
+        if c1 > c0:
+            try:
+                delta_coverage = (
+                    int(delta["from_len"]),
+                    int(delta["to_len"]),
+                    str(delta["phase"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "migration target delta ownership is missing or invalid"
+                ) from exc
+            if delta_coverage != (c0, c1, "transferred"):
+                raise RuntimeError(
+                    "migration target delta logical ownership mismatch: "
+                    f"observed={delta_coverage}, expected={(c0, c1, 'transferred')}"
+                )
+        return True
+
+    def _pd_flip_target_stitch_ready(self, entry: Dict[str, Any]) -> bool:
+        if not getattr(
+            getattr(self, "server_args", None),
+            "enable_pd_flip_hicache_stitch",
+            False,
+        ):
+            return True
+        try:
+            hit_len = int(entry["mooncake_hit_len"])
+            prompt_len = int(entry["target_prompt_len"])
+            committed_len = int(entry["target_committed_len"])
+            suffix_start = int(entry["target_received_suffix_start"])
+            suffix_end = int(entry["target_received_suffix_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target stitch metadata H/P/C0/coverage is missing or invalid"
+            ) from exc
+        if not 0 <= hit_len <= prompt_len <= committed_len:
+            raise RuntimeError(
+                f"migration target stitch boundary is invalid: "
+                f"H={hit_len}, P={prompt_len}, C0={committed_len}"
+            )
+        if suffix_start != hit_len or suffix_end != committed_len:
+            raise RuntimeError(
+                f"migration target suffix coverage mismatch: "
+                f"received=[{suffix_start},{suffix_end}), "
+                f"expected=[{hit_len},{committed_len})"
+            )
+        req = entry["decode_req"].req
+        formal_kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :committed_len
+        ]
+        if hit_len == 0:
+            actual_source_len = len(formal_kv_indices)
+            if actual_source_len != committed_len:
+                raise RuntimeError(
+                    "migration target source fallback coverage failed: "
+                    f"formal mapping length mismatch: "
+                    f"expected={committed_len}, actual={actual_source_len}"
+                )
+            invalid_positions = self._pd_flip_invalid_kv_positions(
+                formal_kv_indices
+            )
+            if invalid_positions:
+                entry["target_invalid_kv_position_sample"] = invalid_positions[:16]
+                raise RuntimeError(
+                    "migration target source fallback coverage failed: "
+                    f"{len(invalid_positions)} uninitialized KV indices "
+                    f"for rid={req.rid}, positions={invalid_positions[:16]}"
+                )
+            return True
+
+        decode_req = entry["decode_req"]
+        prefix_match = getattr(decode_req, "prefix_match", None)
+        try:
+            l1_prefix_len = int(prefix_match.l1_prefix_len)
+            prefix_indices = prefix_match.prefix_indices
+            actual_l1_len = len(prefix_indices)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                "L1 staged coverage is missing or invalid"
+            ) from exc
+        if not 0 <= l1_prefix_len <= hit_len or actual_l1_len != l1_prefix_len:
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"L1 staged coverage length mismatch: "
+                f"expected={l1_prefix_len}, actual={actual_l1_len}"
+            )
+        invalid_positions = self._pd_flip_invalid_kv_positions(prefix_indices)
+        if invalid_positions:
+            entry["target_invalid_kv_position_sample"] = invalid_positions[:16]
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"{len(invalid_positions)} uninitialized L1 KV indices "
+                f"for rid={req.rid}, positions={invalid_positions[:16]}"
+            )
+
+        restored_indices = getattr(decode_req, "hicache_restored_kv_indices", None)
+        expected_restored_len = hit_len - l1_prefix_len
+        if expected_restored_len == 0 and restored_indices is None:
+            actual_restored_len = 0
+        else:
+            try:
+                actual_restored_len = len(restored_indices)
+            except TypeError as exc:
+                raise RuntimeError(
+                    "migration target HiCache restore failed: "
+                    "restored staged coverage is missing or invalid"
+                ) from exc
+        if actual_restored_len != expected_restored_len:
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"restored staged coverage length mismatch: "
+                f"expected={expected_restored_len}, actual={actual_restored_len}"
+            )
+        invalid_positions = (
+            []
+            if expected_restored_len == 0
+            else [
+                l1_prefix_len + position
+                for position in self._pd_flip_invalid_kv_positions(restored_indices)
+            ]
+        )
+        if invalid_positions:
+            entry["target_invalid_kv_position_sample"] = invalid_positions[:16]
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"{len(invalid_positions)} uninitialized restored KV indices "
+                f"for rid={req.rid}, positions={invalid_positions[:16]}"
+            )
+
+        suffix_indices = formal_kv_indices[hit_len:committed_len]
+        expected_suffix_len = committed_len - hit_len
+        actual_suffix_len = len(suffix_indices)
+        if actual_suffix_len != expected_suffix_len:
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"source suffix mapping length mismatch: "
+                f"expected={expected_suffix_len}, actual={actual_suffix_len}"
+            )
+        invalid_positions = [
+            hit_len + position
+            for position in self._pd_flip_invalid_kv_positions(suffix_indices)
+        ]
+        if invalid_positions:
+            entry["target_invalid_kv_position_sample"] = invalid_positions[:16]
+            raise RuntimeError(
+                "migration target HiCache restore failed: "
+                f"{len(invalid_positions)} uninitialized source suffix KV indices "
+                f"for rid={req.rid}, positions={invalid_positions[:16]}"
+            )
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return True
+        status_value = getattr(
+            getattr(entry["decode_req"], "hicache_restore_status", None),
+            "value",
+            None,
+        )
+        if status_value != "ready":
+            raise RuntimeError(
+                f"migration target HiCache restore is not ready: {status_value!r}"
+            )
+        return True
+
+    def _pd_flip_target_commit_hicache_restore(self, decode_req: DecodeRequest) -> None:
+        if not getattr(self, "enable_decode_hicache", False):
+            return
+        prefix_match = getattr(decode_req, "prefix_match", None)
+        if prefix_match is None or not getattr(
+            prefix_match, "needs_local_restore", False
+        ):
+            return
+
+        status_value = getattr(
+            getattr(decode_req, "hicache_restore_status", None), "value", None
+        )
+        if status_value == "failed":
+            raise RuntimeError("migration target HiCache restore failed")
+        if status_value == "pending":
+            raise RuntimeError("migration target HiCache restore is still pending")
+
+        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer_queue is None or not hasattr(
+            transfer_queue, "_commit_hicache_local_restore_to_req"
+        ):
+            raise RuntimeError("migration target HiCache restore cannot be committed")
+        transfer_queue._commit_hicache_local_restore_to_req(decode_req)
+
+    def _pd_flip_target_init_receiver(self, decode_req: DecodeRequest) -> bool:
+        queue = self.disagg_decode_prealloc_queue
+        if self.transfer_backend == TransferBackend.FAKE:
+            decode_req.kv_receiver.init(0)
+            return True
+
+        addr = f"{decode_req.req.bootstrap_host}:{decode_req.req.bootstrap_port}"
+        if not queue.kv_manager.try_ensure_parallel_info(addr):
+            return False
+        prefill_dp_rank = queue._resolve_prefill_dp_rank(decode_req.req)
+        if prefill_dp_rank is None:
+            room_to_rank = decode_req.kv_receiver.query_prefill_dp_ranks(
+                addr, [decode_req.req.bootstrap_room]
+            )
+            prefill_dp_rank = room_to_rank.get(str(decode_req.req.bootstrap_room))
+        if prefill_dp_rank is None:
+            return False
+        decode_req.kv_receiver.init(int(prefill_dp_rank))
+        return True
+
+    def _pd_flip_target_prealloc_and_send_metadata(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        decode_req: DecodeRequest = entry["decode_req"]
+        req = decode_req.req
+        queue = self.disagg_decode_prealloc_queue
+        metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if metadata_index is None:
+            raise RuntimeError("no metadata buffer available for target migration")
+        entry["metadata_index"] = metadata_index
+        decode_req.metadata_buffer_index = metadata_index
+
+        committed_len = int(req.kv_committed_len)
+        entry["target_committed_len"] = committed_len
+        prefix_match = None
+        prefix_indices = None
+        prefix_len = 0
+        total_prefix_len = 0
+        force_full_fallback = bool(entry.get("force_source_full_fallback", False))
+        if (
+            getattr(self.server_args, "enable_pd_flip_hicache_stitch", False)
+            and not force_full_fallback
+        ):
+            prefix_started = time.monotonic()
+            self._pd_flip_note_timing(entry, "target_prefix_query_started")
+            prefix_match = queue._match_prefix_and_lock(req)
+            raw_prefix_len = int(prefix_match.decode_prefix_len)
+            prompt_len = len(req.origin_input_ids)
+            total_prefix_len, stitch_mode = self._pd_flip_stitch_boundary(
+                raw_prefix_len,
+                prompt_len,
+                self.token_to_kv_pool_allocator.page_size,
+            )
+            prefix_len = min(int(prefix_match.l1_prefix_len), total_prefix_len)
+            prefix_match.prefix_indices = prefix_match.prefix_indices[:prefix_len]
+            remaining_prefix = total_prefix_len - prefix_len
+            if hasattr(prefix_match, "l2_host_hit_length"):
+                prefix_match.l2_host_hit_length = min(
+                    int(prefix_match.l2_host_hit_length), remaining_prefix
+                )
+                remaining_prefix -= prefix_match.l2_host_hit_length
+            if hasattr(prefix_match, "l3_storage_hit_length"):
+                prefix_match.l3_storage_hit_length = min(
+                    int(prefix_match.l3_storage_hit_length), remaining_prefix
+                )
+            prefix_indices = prefix_match.prefix_indices
+            entry["target_hicache_prefix_match_s"] = time.monotonic() - prefix_started
+            self._pd_flip_note_timing(entry, "target_prefix_query_completed")
+            entry["target_hicache_l1_prefix_len"] = prefix_len
+            entry["target_hicache_l2_prefix_len"] = int(
+                getattr(prefix_match, "l2_host_hit_length", 0) or 0
+            )
+            entry["target_hicache_l3_prefix_len"] = int(
+                getattr(prefix_match, "l3_storage_hit_length", 0) or 0
+            )
+            entry["target_hicache_prefix_len"] = total_prefix_len
+            entry["target_hicache_restore_tokens"] = max(
+                0, total_prefix_len - prefix_len
+            )
+            decode_req.prefix_match = prefix_match
+            entry.update(
+                mooncake_hit_len=total_prefix_len,
+                target_prompt_len=prompt_len,
+                target_received_suffix_start=total_prefix_len,
+                target_received_suffix_end=committed_len,
+                stitch_mode=stitch_mode,
+            )
+        elif force_full_fallback:
+            entry.update(
+                mooncake_hit_len=0,
+                target_prompt_len=len(req.origin_input_ids),
+                target_received_suffix_start=0,
+                target_received_suffix_end=committed_len,
+                stitch_mode="source_decode_full_fallback",
+            )
+
+        if prefix_indices is None:
+            dst_kv_indices = queue._pre_alloc(
+                req,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                fill_len_override=committed_len,
+            )
+        else:
+            dst_kv_indices = queue._pre_alloc(
+                req,
+                prefix_indices=prefix_indices,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                fill_len_override=committed_len,
+            )
+        req.cache_protected_len = total_prefix_len
+        if prefix_match is not None and getattr(self, "enable_decode_hicache", False):
+            if int(getattr(prefix_match, "l3_storage_hit_length", 0) or 0) > 0:
+                entry.setdefault("timing_debug", {}).setdefault(
+                    "target_hicache_restore_started_mono", time.monotonic()
+                )
+            queue._start_hicache_prefetch(req, prefix_match)
+
+        if getattr(self.server_args, "enable_pd_flip_hicache_stitch", False):
+            page_indices = self._pd_flip_stitch_page_indices_range(
+                req, total_prefix_len, committed_len
+            )
+        elif self.server_args.disaggregation_decode_enable_radix_cache:
+            kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                total_prefix_len:committed_len
+            ].cpu().numpy()
+            page_indices = kv_to_page_indices(
+                kv_indices,
+                self.token_to_kv_pool_allocator.page_size,
+            )
+        else:
+            kv_indices = dst_kv_indices.cpu().numpy()
+            page_indices = kv_to_page_indices(
+                kv_indices,
+                self.token_to_kv_pool_allocator.page_size,
+            )
+        entry["target_index_shape"] = list(page_indices.shape)
+        entry["target_index_size"] = int(page_indices.size)
+        entry["target_contiguous_run_count"] = (
+            0
+            if len(page_indices) == 0
+            else 1
+            + sum(
+                int(current) != int(previous) + 1
+                for previous, current in zip(page_indices, page_indices[1:])
+            )
+        )
+        state_indices = self._pd_flip_target_state_indices(req, committed_len)
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            metadata_index,
+            state_indices,
+            decode_prefix_len=total_prefix_len,
+        )
+        if self.transfer_backend == TransferBackend.FAKE:
+            self.disagg_metadata_buffers.bootstrap_room[metadata_index, 0] = (
+                req.bootstrap_room
+            )
+
+    def _pd_flip_target_prealloc_donor_ranges(
+        self, entry: Dict[str, Any]
+    ) -> None:
+        decode_req: DecodeRequest = entry["decode_req"]
+        req = decode_req.req
+        manifest = entry.get("manifest") or {}
+        prompt_len = int(manifest.get("prompt_len") or len(req.origin_input_ids))
+        donor_end = int(manifest.get("prefill_donor_end") or 0)
+        source_start = int(manifest.get("source_decode_start") or 0)
+        committed_len = int(manifest.get("kv_committed_len") or req.kv_committed_len)
+        if not 0 <= donor_end == source_start <= prompt_len <= committed_len:
+            raise RuntimeError(
+                "migration target donor boundary is invalid: "
+                f"B={donor_end}, P={prompt_len}, C0={committed_len}"
+            )
+
+        source_metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        if source_metadata_index is None:
+            raise RuntimeError("no metadata buffer available for source donor range")
+        entry["metadata_index"] = source_metadata_index
+        decode_req.metadata_buffer_index = source_metadata_index
+
+        prefill_decode_req = entry.get("prefill_decode_req")
+        prefill_metadata_index = -1
+        if donor_end > 0:
+            if prefill_decode_req is None:
+                raise RuntimeError("missing original Prefill donor receiver")
+            prefill_metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+            if prefill_metadata_index is None:
+                self.req_to_metadata_buffer_idx_allocator.free(source_metadata_index)
+                entry["metadata_index"] = -1
+                raise RuntimeError(
+                    "no metadata buffer available for Prefill donor range"
+                )
+            entry["prefill_metadata_index"] = prefill_metadata_index
+            prefill_decode_req.metadata_buffer_index = prefill_metadata_index
+
+        queue = self.disagg_decode_prealloc_queue
+        queue._pre_alloc(
+            req,
+            prefix_len=0,
+            total_prefix_len=0,
+            fill_len_override=committed_len,
+        )
+        req.cache_protected_len = 0
+        page_size = int(self.token_to_kv_pool_allocator.page_size)
+        formal_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :committed_len
+        ]
+        prefill_pages = kv_to_page_indices(
+            formal_indices[:donor_end].cpu().numpy(), page_size
+        )
+        source_pages = kv_to_page_indices(
+            formal_indices[source_start:committed_len].cpu().numpy(), page_size
+        )
+        state_indices = self._pd_flip_target_state_indices(req, committed_len)
+        donor_state_indices = [None for _ in state_indices]
+        if donor_end > 0:
+            prefill_decode_req.kv_receiver.send_metadata(
+                prefill_pages,
+                prefill_metadata_index,
+                donor_state_indices,
+                decode_prefix_len=0,
+            )
+        decode_req.kv_receiver.send_metadata(
+            source_pages,
+            source_metadata_index,
+            state_indices,
+            decode_prefix_len=source_start,
+        )
+        entry.update(
+            target_prefix_match_skipped=True,
+            target_prompt_len=prompt_len,
+            target_committed_len=committed_len,
+            prefill_received_start=0,
+            prefill_received_end=donor_end,
+            source_transfer_start=source_start,
+            source_transfer_end=committed_len,
+            prefill_index_size=int(getattr(prefill_pages, "size", len(prefill_pages))),
+            source_index_size=int(getattr(source_pages, "size", len(source_pages))),
+            stitch_mode="prefill_donor_pages",
+            prefill_donor_aux_state_skipped=bool(donor_state_indices),
+            auxiliary_state_owner="source_decode",
+        )
+
+    def _pd_flip_target_donor_ranges_ready(self, entry: Dict[str, Any]) -> bool:
+        try:
+            donor_end = int(entry["prefill_received_end"])
+            prompt_len = int(entry["target_prompt_len"])
+            committed_len = int(entry["target_committed_len"])
+            prefill_start = int(entry["prefill_received_start"])
+            source_start = int(entry["source_transfer_start"])
+            source_end = int(entry["source_transfer_end"])
+            req = entry["decode_req"].req
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "migration target donor coverage metadata is missing or invalid"
+            ) from exc
+        if not (
+            prefill_start == 0
+            and 0 <= donor_end == source_start <= prompt_len <= committed_len
+            and source_end == committed_len
+        ):
+            raise RuntimeError(
+                "migration target donor coverage mismatch: "
+                f"prefill=[{prefill_start},{donor_end}), "
+                f"source=[{source_start},{source_end}), "
+                f"P={prompt_len}, C0={committed_len}"
+            )
+        formal_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :committed_len
+        ]
+        invalid_positions = self._pd_flip_invalid_kv_positions(formal_indices)
+        if invalid_positions:
+            entry["target_invalid_kv_position_sample"] = invalid_positions[:16]
+            raise RuntimeError(
+                "migration target donor coverage failed: "
+                f"{len(invalid_positions)} uninitialized KV indices "
+                f"for rid={req.rid}, positions={invalid_positions[:16]}"
+            )
+        return True
+
+    def _pd_flip_target_state_indices(self, req: Req, committed_len: int) -> List:
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.sliding_window_size
+            window_start = max(0, committed_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:committed_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :committed_len
+            ]
+            return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+        state_indices: List = []
+        for st in getattr(
+            self.disagg_decode_prealloc_queue.kv_manager.kv_args, "state_types", []
+        ):
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _pd_flip_target_metadata_ready_for(
+        self,
+        entry: Dict[str, Any],
+        metadata_key: str,
+        decode_req,
+    ) -> bool:
+        metadata_index = entry.get(metadata_key, -1)
+        if metadata_index is None or metadata_index < 0:
+            return True
+        expected_room = decode_req.req.bootstrap_room
+        actual_room = self.disagg_metadata_buffers.bootstrap_room[
+            metadata_index, 0
+        ].item()
+        if actual_room == 0:
+            return False
+        if actual_room != expected_room:
+            raise RuntimeError(
+                f"migration metadata room mismatch: expected {expected_room}, got {actual_room}"
+            )
+        return True
+
+    def _pd_flip_target_metadata_ready(self, entry: Dict[str, Any]) -> bool:
+        return self._pd_flip_target_metadata_ready_for(
+            entry, "metadata_index", entry["decode_req"]
+        )
+
+    def _pd_flip_free_target_metadata(self, entry: Dict[str, Any]) -> None:
+        for metadata_key in ("metadata_index", "prefill_metadata_index"):
+            metadata_index = entry.get(metadata_key, -1)
+            if metadata_index is not None and metadata_index >= 0:
+                self.disagg_metadata_buffers.bootstrap_room[metadata_index] = 0
+                self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
+                entry[metadata_key] = -1
+
+    def _pd_flip_release_target_request(self, entry: Dict[str, Any]) -> None:
+        if entry.get("request_released"):
+            return
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None or getattr(req, "req_pool_idx", None) is None:
+            entry["request_released"] = True
+            self._pd_flip_note_timing(entry, "target_released")
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        entry["request_released"] = True
+        self._pd_flip_note_timing(entry, "target_released")
+
+    def _pd_flip_prepare_target_request_for_adoption(self, req: Req) -> None:
+        # Migration reconstructs the request from serialized scheduler state, so
+        # process-local objects such as the tokenizer are intentionally absent.
+        # Reattach the target scheduler's tokenizer before the request reaches
+        # sampling: min_new_tokens and other stop-token logic consult it while
+        # building SamplingBatchInfo.
+        req.tokenizer = self.tokenizer
+        # The request already owns a complete req_to_token mapping populated by
+        # the migration receiver.  Re-matching the radix tree here can replace
+        # cache_protected_len/prefix_indices without replacing that mapping,
+        # causing migrated KV indices to be mistaken for cache-owned indices at
+        # final release.  Let the prebuilt admission path initialize the input
+        # once while explicitly preserving the received KV ownership.
+        if req.last_node is None and not self.tree_cache.is_chunk_cache():
+            # Full-source fallback deliberately uses a zero-length target
+            # prefix, so it has no radix match/lock.  The unfinished-cache path
+            # still expects a valid lock owner; the root is the canonical
+            # zero-prefix owner and dec_lock_ref(root) is a no-op.
+            req.last_node = self.tree_cache.root_node
+        # ChunkCache deliberately has no radix root. Its unfinished-request and
+        # lock-ref methods accept a None last_node, so preserve that sentinel.
+        req.pd_flip_prebuilt_kv_ready = True
+
+    def _pd_flip_adopt_target_request(self, entry: Dict[str, Any]) -> None:
+        if entry.get("request_adopted"):
+            return
+        decode_req = entry.get("decode_req")
+        req = getattr(decode_req, "req", None)
+        if req is None:
+            entry["request_adopted"] = True
+            self._pd_flip_note_timing(entry, "target_adopted")
+            return
+        self._pd_flip_prepare_target_request_for_adoption(req)
+        if hasattr(req, "time_stats") and hasattr(
+            req.time_stats, "set_wait_queue_entry_time"
+        ):
+            req.time_stats.set_wait_queue_entry_time()
+        self.waiting_queue.append(req)
+        entry["request_adopted"] = True
+        self._pd_flip_note_timing(entry, "target_adopted")
+
+    def _pd_flip_build_migration_manifest(self, req: Req) -> Dict[str, Any]:
+        origin_input_ids = list(getattr(req, "origin_input_ids", []) or [])
+        output_ids = list(getattr(req, "output_ids", []) or [])
+        kv_committed_len = getattr(req, "kv_committed_len", None)
+        if kv_committed_len is None:
+            kv_committed_len = len(origin_input_ids) + max(0, len(output_ids) - 1)
+        manifest = {
+            "rid": getattr(req, "rid", ""),
+            "origin_input_ids": origin_input_ids,
+            "output_ids": output_ids,
+            "bootstrap_room": getattr(req, "bootstrap_room", None),
+            "priority": getattr(req, "priority", None),
+            "routing_key": getattr(req, "routing_key", None),
+            "extra_key": getattr(req, "extra_key", None),
+            "http_worker_ipc": getattr(req, "http_worker_ipc", None),
+            "pd_flip_output_relay_url": getattr(
+                req, "pd_flip_output_relay_url", None
+            ),
+            "stream": bool(getattr(req, "stream", False)),
+            "return_logprob": bool(getattr(req, "return_logprob", False)),
+            "logprob_start_len": getattr(req, "logprob_start_len", -1),
+            "time_stats": self._pd_flip_serialize_time_stats(
+                getattr(req, "time_stats", None)
+            ),
+            "req_pool_idx": getattr(req, "req_pool_idx", None),
+            "kv_committed_len": int(kv_committed_len),
+            "sampling_params": self._pd_flip_serialize_sampling_params(
+                getattr(req, "sampling_params", None)
+            ),
+            "custom_logit_processor": getattr(req, "custom_logit_processor", None),
+            "last_emitted_output_seq": int(
+                getattr(req, "pd_flip_last_emitted_output_seq", 0) or 0
+            ),
+            "pd_flip_session_id": getattr(req, "pd_flip_migration_session_id", None),
+            "source_decode_dp_rank": int(
+                getattr(req, "routed_dp_rank", None)
+                if getattr(req, "routed_dp_rank", None) is not None
+                else self._pd_flip_attn_dp_rank()
+            ),
+            "prefill_donor_dp_rank": getattr(req, "disagg_prefill_dp_rank", None),
+            "target_decode_dp_rank": getattr(
+                req, "pd_flip_target_decode_dp_rank", None
+            ),
+            "source_tp_rank": int(getattr(getattr(self, "ps", None), "tp_rank", 0)),
+        }
+        manifest.update(self._pd_flip_kv_layout_metadata())
+        return manifest
+
+    @staticmethod
+    def _pd_flip_serialize_sampling_params(sampling_params) -> Dict[str, Any]:
+        if sampling_params is None:
+            return {}
+        for method_name in ("to_json", "to_dict"):
+            method = getattr(sampling_params, method_name, None)
+            if callable(method):
+                value = method()
+                if isinstance(value, dict):
+                    return Scheduler._pd_flip_json_safe_dict(value)
+        return Scheduler._pd_flip_json_safe_dict(
+            getattr(sampling_params, "__dict__", {})
+        )
+
+    @staticmethod
+    def _pd_flip_json_safe_dict(values: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
+        for key, value in dict(values).items():
+            if str(key) == "__req__":
+                continue
+            try:
+                safe[key] = Scheduler._pd_flip_json_safe_value(value)
+            except TypeError:
+                continue
+        return safe
+
+    @staticmethod
+    def _pd_flip_json_safe_value(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            return [Scheduler._pd_flip_json_safe_value(item) for item in value]
+        if isinstance(value, set):
+            return [Scheduler._pd_flip_json_safe_value(item) for item in sorted(value)]
+        if isinstance(value, dict):
+            return Scheduler._pd_flip_json_safe_dict(value)
+        raise TypeError(f"unsupported PD Flip manifest value: {type(value).__name__}")
+
+    def _pd_flip_migration_status_dict(self) -> Dict[str, Any]:
+        ps = getattr(self, "ps", None)
+        local_dp_rank = getattr(ps, "attn_dp_rank", None)
+        if local_dp_rank is None:
+            local_dp_rank = getattr(ps, "dp_rank", 0) or 0
+        local_dp_rank = int(local_dp_rank)
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return {
+                "enabled": False,
+                "role": "none",
+                "state": "none",
+                "session_id": None,
+                "pending_reqs": 0,
+                "transferred_reqs": 0,
+                "released_reqs": 0,
+                "failed_reqs": 0,
+                "held_reqs": 0,
+                "last_error": "",
+                "dry_run": False,
+                "prepare_only": False,
+                "waiting_reqs": 0,
+                "waiting_manifest_count": 0,
+                "waiting_skipped_count": 0,
+                "waiting_skipped": [],
+                "delta_pending_reqs": 0,
+                "delta_transferred_reqs": 0,
+                "delta_failed_reqs": 0,
+                "fallback_required_rids": [],
+                "fallback_reason": "",
+                "rollover_blockers": [],
+                "request_measurements": [],
+                "dp_rank": local_dp_rank,
+                "handled_rids": [],
+                "ignored_rids": [],
+                "session_archive": list(
+                    getattr(self, "pd_flip_migration_session_archive", [])
+                ),
+            }
+        session_timing = session.get("timing_debug") or {}
+        return {
+            "enabled": True,
+            "role": session.get("role", "none"),
+            "state": session.get("state", "none"),
+            "session_id": session.get("session_id"),
+            "pending_reqs": int(session.get("pending_reqs", 0)),
+            "transferred_reqs": int(session.get("transferred_reqs", 0)),
+            "released_reqs": int(session.get("released_reqs", 0)),
+            "failed_reqs": int(session.get("failed_reqs", 0)),
+            "held_reqs": int(session.get("held_reqs", 0)),
+            "last_error": session.get("last_error", ""),
+            "dry_run": bool(session.get("dry_run", False)),
+            "prepare_only": bool(session.get("prepare_only", False)),
+            "dp_rank": local_dp_rank,
+            "handled_rids": list(session.get("handled_rids") or []),
+            "ignored_rids": list(session.get("ignored_rids") or []),
+            "waiting_reqs": int(session_timing.get("waiting_reqs", 0) or 0),
+            "waiting_manifest_count": int(
+                session_timing.get("waiting_manifest_count", 0) or 0
+            ),
+            "waiting_skipped_count": int(
+                session_timing.get("waiting_skipped_count", 0) or 0
+            ),
+            "waiting_skipped": list(session_timing.get("waiting_skipped") or []),
+            "delta_pending_reqs": int(session.get("delta_pending_reqs", 0) or 0),
+            "delta_transferred_reqs": int(
+                session.get("delta_transferred_reqs", 0) or 0
+            ),
+            "delta_failed_reqs": int(session.get("delta_failed_reqs", 0) or 0),
+            "fallback_required_rids": sorted(
+                str(rid) for rid in session.get("fallback_required_rids", set())
+            ),
+            "fallback_reason": session.get("fallback_reason", ""),
+            "rollover_blockers": self._pd_flip_rollover_blockers(
+                session, session.get("role")
+            ),
+            "index_debug": self._pd_flip_migration_index_debug(session),
+            "timing_debug": self._pd_flip_migration_timing_debug(session),
+            "request_measurements": self._pd_flip_migration_request_measurements(
+                session
+            ),
+            "session_archive": list(
+                getattr(self, "pd_flip_migration_session_archive", [])
+            ),
+        }
+
+    @staticmethod
+    def _pd_flip_migration_request_measurements(
+        session: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        def elapsed(timing: Dict[str, Any], start: str, end: str) -> Any:
+            start_value = timing.get(f"{start}_mono")
+            end_value = timing.get(f"{end}_mono")
+            if not isinstance(start_value, (int, float)) or not isinstance(
+                end_value, (int, float)
+            ):
+                return None
+            return max(0.0, end_value - start_value)
+
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        session_timing = session.get("timing_debug") or {}
+        session_id = session.get("session_id")
+        worker_role = session.get("role", "unknown")
+        dp_rank = int(session.get("dp_rank", 0) or 0)
+        rows = []
+        for rid, entry in entries.items():
+            manifest = entry.get("manifest") or {}
+            base_manifest = entry.get("base_manifest") or manifest
+            timing = entry.get("timing_debug") or {}
+            c0 = entry.get("base_committed_len")
+            if c0 is None:
+                c0 = base_manifest.get("kv_committed_len")
+            c1 = entry.get("committed_len")
+            if c1 is None:
+                c1 = entry.get("target_committed_len", c0)
+            c0_value = int(c0 or 0)
+            c1_value = int(c1 or 0)
+            donor_end = int(base_manifest.get("prefill_donor_end") or 0)
+            source_start = int(
+                base_manifest.get("source_decode_start") or donor_end or 0
+            )
+            page_size = max(1, int(base_manifest.get("page_size") or 1))
+            state_types = [
+                str(getattr(state_type, "value", state_type)).lower()
+                for state_type in (base_manifest.get("state_types") or [])
+            ]
+            includes_mamba_state = "mamba" in state_types
+            combined_transfer_values = [
+                entry.get("source_transfer_bytes"),
+                entry.get("delta_transfer_bytes"),
+            ]
+            combined_transfer_bytes = sum(
+                int(value)
+                for value in combined_transfer_values
+                if value is not None
+            )
+
+            phase_events = []
+            for key, mono_value in sorted(timing.items()):
+                if not key.endswith("_mono") or not isinstance(
+                    mono_value, (int, float)
+                ):
+                    continue
+                phase = key[: -len("_mono")]
+                if "delta" in phase:
+                    logical_start, logical_end = c0_value, c1_value
+                    transfer_bytes = entry.get("delta_transfer_bytes")
+                elif "prefill_donor" in phase:
+                    logical_start, logical_end = 0, donor_end
+                    transfer_bytes = entry.get("prefill_donor_transfer_bytes")
+                elif "hicache" in phase or "mooncake" in phase:
+                    logical_start, logical_end = 0, source_start
+                    transfer_bytes = entry.get("mooncake_bytes")
+                elif "source" in phase:
+                    logical_start, logical_end = source_start, c0_value
+                    transfer_bytes = entry.get("source_transfer_bytes")
+                else:
+                    logical_start, logical_end = 0, c1_value
+                    transfer_bytes = 0
+                epoch_value = timing.get(f"{phase}_epoch")
+                phase_events.append(
+                    {
+                        "request_id": str(rid),
+                        "session_id": session_id,
+                        "worker": worker_role,
+                        "dp_rank": dp_rank,
+                        "phase": phase,
+                        "epoch_ns": (
+                            int(round(float(epoch_value) * 1_000_000_000))
+                            if isinstance(epoch_value, (int, float))
+                            else None
+                        ),
+                        "mono_ns": int(
+                            round(float(mono_value) * 1_000_000_000)
+                        ),
+                        "source_decode_dp_rank": base_manifest.get(
+                            "source_decode_dp_rank"
+                        ),
+                        "prefill_donor_dp_rank": base_manifest.get(
+                            "prefill_donor_dp_rank"
+                        ),
+                        "target_decode_dp_rank": base_manifest.get(
+                            "target_decode_dp_rank"
+                        ),
+                        "logical_start": logical_start,
+                        "logical_end": logical_end,
+                        "actual_slot_count": max(
+                            0, logical_end - logical_start
+                        ),
+                        "page_size": page_size,
+                        "page_count": (
+                            max(0, logical_end - logical_start) + page_size - 1
+                        )
+                        // page_size,
+                        "bytes": (
+                            int(transfer_bytes)
+                            if transfer_bytes is not None
+                            else None
+                        ),
+                        "model_fingerprint": base_manifest.get(
+                            "model_fingerprint"
+                        ),
+                    }
+                )
+            rows.append(
+                {
+                    "rid": str(rid),
+                    "request_id": str(rid),
+                    "session_id": session_id,
+                    "worker": worker_role,
+                    "dp_rank": dp_rank,
+                    "source_decode_dp_rank": base_manifest.get(
+                        "source_decode_dp_rank"
+                    ),
+                    "prefill_donor_dp_rank": base_manifest.get(
+                        "prefill_donor_dp_rank"
+                    ),
+                    "target_decode_dp_rank": base_manifest.get(
+                        "target_decode_dp_rank"
+                    ),
+                    "model_fingerprint": base_manifest.get("model_fingerprint"),
+                    "state_types": state_types,
+                    "includes_mamba_state": includes_mamba_state,
+                    "combined_transfer_bytes": combined_transfer_bytes,
+                    "kv_component_bytes": None,
+                    "mamba_component_bytes": None,
+                    "byte_breakdown_available": False,
+                    "page_size": page_size,
+                    "phase_events": phase_events,
+                    "p_tokens": len(base_manifest.get("origin_input_ids") or []),
+                    "h_tokens": entry.get("original_mooncake_hit_len")
+                    if entry.get("original_mooncake_hit_len") is not None
+                    else entry.get("mooncake_hit_len"),
+                    "c0_tokens": c0_value,
+                    "c1_tokens": c1_value,
+                    "prompt_len": base_manifest.get("prompt_len")
+                    or len(base_manifest.get("origin_input_ids") or []),
+                    "prefill_donor_end": base_manifest.get("prefill_donor_end"),
+                    "source_decode_start": base_manifest.get(
+                        "source_decode_start"
+                    ),
+                    "prefill_donor_host": base_manifest.get("prefill_donor_host"),
+                    "prefill_donor_restore_hit_len": entry.get(
+                        "prefill_donor_restore_hit_len"
+                    ),
+                    "prefill_donor_pages": entry.get("prefill_donor_pages"),
+                    "prefill_donor_aux_state_skipped": entry.get(
+                        "prefill_donor_aux_state_skipped"
+                    ),
+                    "auxiliary_state_owner": entry.get(
+                        "auxiliary_state_owner"
+                    ),
+                    "prefill_donor_transfer_bytes": entry.get(
+                        "prefill_donor_transfer_bytes"
+                    ),
+                    "prefill_donor_restore_seconds": entry.get(
+                        "prefill_donor_restore_seconds"
+                    ),
+                    "prefill_donor_transfer_seconds": entry.get(
+                        "prefill_donor_transfer_duration_s"
+                    ),
+                    "source_base_pages": entry.get("source_index_size"),
+                    "source_contiguous_run_count": entry.get(
+                        "source_contiguous_run_count"
+                    ),
+                    "target_contiguous_run_count": entry.get(
+                        "target_contiguous_run_count"
+                    ),
+                    "source_base_transfer_bytes": entry.get(
+                        "source_transfer_bytes"
+                    ),
+                    "target_prefix_match_skipped": entry.get(
+                        "target_prefix_match_skipped"
+                    ),
+                    "provenance_mode": (
+                        "prefill_donor_and_source_decode"
+                        if base_manifest.get("prefill_donor_host")
+                        else (
+                            "source_decode_full_state"
+                            if state_types
+                            else "target_hicache_or_source_decode"
+                        )
+                    ),
+                    "stitch_mode": entry.get("stitch_mode"),
+                    "original_stitch_mode": entry.get("original_stitch_mode"),
+                    "l1_hit_tokens": entry.get("target_hicache_l1_prefix_len"),
+                    "l2_hit_tokens": entry.get("target_hicache_l2_prefix_len"),
+                    "l3_hit_tokens": entry.get("target_hicache_l3_prefix_len"),
+                    "mooncake_bytes": entry.get("mooncake_bytes"),
+                    "mooncake_bytes_available": entry.get("mooncake_bytes")
+                    is not None,
+                    "source_bytes": entry.get("source_transfer_bytes"),
+                    "delta_bytes": entry.get("delta_transfer_bytes"),
+                    "mooncake_restore_tokens": int(
+                        entry.get("target_hicache_restore_tokens") or 0
+                    ),
+                    "mooncake_duration_seconds": timing.get(
+                        "target_hicache_restore_duration_s"
+                    ),
+                    "source_duration_seconds": entry.get(
+                        "source_transfer_duration_s"
+                    ),
+                    "delta_duration_seconds": entry.get(
+                        "delta_transfer_duration_s"
+                    ),
+                    "held_at_mono": timing.get("target_held_mono"),
+                    "freeze_at_mono": timing.get("source_waiting_frozen_mono"),
+                    "commit_at_mono": timing.get("target_commit_ready_mono")
+                    or session_timing.get("commit_received_mono"),
+                    "activate_at_mono": timing.get("target_adopted_mono"),
+                    "source_queue": entry.get("source_queue")
+                    or base_manifest.get("pd_flip_source_queue"),
+                    "final_owner": entry.get("final_owner"),
+                    "output_boundary": manifest.get("last_emitted_output_seq"),
+                    "rollback_reason": entry.get("rollback_reason"),
+                    "fallback_reason": entry.get("fallback_reason"),
+                    "fallback_attempted": bool(
+                        entry.get("fallback_attempted", False)
+                    ),
+                    "fallback_source_bytes": entry.get("fallback_source_bytes"),
+                    "fallback_duration_seconds": entry.get(
+                        "fallback_duration_seconds"
+                    ),
+                    "stitch_attempt_seconds": elapsed(
+                        timing,
+                        "target_prefix_query_started",
+                        "target_fallback_required",
+                    ),
+                    "stitch_failure_detection_seconds": elapsed(
+                        timing,
+                        "target_hicache_restore_started",
+                        "target_hicache_restore_failed",
+                    ),
+                    "fallback_transfer_seconds": elapsed(
+                        timing,
+                        "target_fallback_prepare_received",
+                        "target_fallback_receive_completed",
+                    )
+                    or entry.get("fallback_duration_seconds"),
+                    "stitch_failure_to_fallback_complete_seconds": elapsed(
+                        timing,
+                        "target_fallback_required",
+                        "target_fallback_receive_completed",
+                    ),
+                    "failed_stitch_added_cost_seconds": elapsed(
+                        timing,
+                        "target_prefix_query_started",
+                        "target_fallback_required",
+                    ),
+                    "timing_measurement_kind": "exact_process",
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _pd_flip_record_sender_metric(
+        entry: Dict[str, Any], sender: Any, segment: str
+    ) -> None:
+        get_metric = getattr(sender, "get_transfer_metric", None)
+        metric = get_metric() if callable(get_metric) else None
+        transfer_bytes = getattr(metric, "transfer_total_bytes", None)
+        entry[f"{segment}_transfer_bytes"] = (
+            int(transfer_bytes) if transfer_bytes is not None else None
+        )
+        duration = getattr(metric, "transfer_latency_s", None)
+        if duration is None:
+            timing = entry.get("timing_debug") or {}
+            started = timing.get(f"{segment}_transfer_started_mono")
+            completed = timing.get(f"{segment}_transfer_completed_mono")
+            if isinstance(started, (int, float)) and isinstance(
+                completed, (int, float)
+            ):
+                duration = max(0.0, completed - started)
+        entry[f"{segment}_transfer_duration_s"] = duration
+
+    @staticmethod
+    def _pd_flip_note_timing(
+        container: Dict[str, Any], name: str, started: Optional[float] = None
+    ) -> None:
+        timing = container.setdefault("timing_debug", {})
+        now = time.monotonic()
+        epoch_now = time.time()
+        if started is None:
+            timing.setdefault(f"{name}_mono", now)
+            timing.setdefault(f"{name}_epoch", epoch_now)
+        else:
+            timing[f"{name}_s"] = now - started
+            timing.setdefault(f"{name}_mono", now)
+            timing.setdefault(f"{name}_epoch", epoch_now)
+
+    @staticmethod
+    def _pd_flip_json_safe_timing(values: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
+        for key, value in dict(values or {}).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[key] = value
+        return safe
+
+    def _pd_flip_migration_timing_debug(
+        self, session: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        return {
+            "session": self._pd_flip_json_safe_timing(
+                session.get("timing_debug") or {}
+            ),
+            "entries": [
+                {
+                    "rid": rid,
+                    "phase": entry.get("phase"),
+                    "source_queue": entry.get("source_queue")
+                    or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
+                    "timing": self._pd_flip_json_safe_timing(
+                        entry.get("timing_debug") or {}
+                    ),
+                }
+                for rid, entry in entries.items()
+            ],
+        }
+
+    @staticmethod
+    def _pd_flip_migration_index_debug(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+        entries = session.get("source_entries") or session.get("target_entries") or {}
+        debug = []
+        for rid, entry in entries.items():
+            item = {
+                "rid": rid,
+                "phase": entry.get("phase"),
+                "source_queue": entry.get("source_queue")
+                or (entry.get("manifest") or {}).get("pd_flip_source_queue"),
+                "source_index_shape": entry.get("source_index_shape"),
+                "source_index_size": entry.get("source_index_size"),
+                "source_contiguous_run_count": entry.get(
+                    "source_contiguous_run_count"
+                ),
+                "target_index_shape": entry.get("target_index_shape"),
+                "target_index_size": entry.get("target_index_size"),
+                "target_contiguous_run_count": entry.get(
+                    "target_contiguous_run_count"
+                ),
+            }
+            delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+            if delta:
+                item["delta_source_index_shape"] = delta.get("source_index_shape")
+                item["delta_source_index_size"] = delta.get("source_index_size")
+                item["delta_target_index_shape"] = delta.get("target_index_shape")
+                item["delta_target_index_size"] = delta.get("target_index_size")
+            if any(value is not None for key, value in item.items() if key != "rid"):
+                debug.append(item)
+        return debug
+
+    def _pd_flip_migration_is_active(self) -> bool:
+        return self._pd_flip_migration_status_dict()["enabled"]
+
+    def _pd_flip_source_migration_blocks_idle(self) -> bool:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("role") != "source":
+            return False
+        if session.get("state") in ("source_released", "source_aborted"):
+            return False
+        return bool(session.get("manifests") or session.get("source_entries"))
+
+    def _pd_flip_migration_is_released(self) -> bool:
+        status = self._pd_flip_migration_status_dict()
+        return (
+            status["state"] == "source_released"
+            and status["pending_reqs"] == 0
+            and status["failed_reqs"] == 0
+        )
+
+    def _pd_flip_target_held_reqs(self) -> List[Req]:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session or session.get("role") != "target":
+            return []
+
+        held_reqs = []
+        for entry in (session.get("target_entries") or {}).values():
+            phase = entry.get("phase")
+            if (
+                phase not in ("transferring", "transferred_held", "ready_to_activate")
+                or entry.get("request_released")
+                or entry.get("request_adopted")
+            ):
+                continue
+            decode_req = entry.get("decode_req")
+            req = getattr(decode_req, "req", None)
+            if req is not None and getattr(req, "req_pool_idx", None) is not None:
+                held_reqs.append(req)
+        return held_reqs
+
+    def _pd_flip_invariant_held_reqs(self) -> List[Req]:
+        held_reqs = self._pd_flip_target_held_reqs()
+        donor_session = getattr(self, "pd_flip_prefill_donor_session", None)
+        for entry in (donor_session or {}).get("entries", {}).values():
+            if entry.get("cleanup_complete"):
+                continue
+            req = entry.get("req")
+            if req is not None and getattr(req, "req_pool_idx", None) is not None:
+                held_reqs.append(req)
+        return held_reqs
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -1342,6 +9239,95 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (
+                    PDFlipMigrationSourceStartReq,
+                    self.start_pd_flip_migration_source,
+                ),
+                (
+                    PDFlipMigrationTargetPrepareReq,
+                    self.prepare_pd_flip_migration_target,
+                ),
+                (
+                    PDFlipPrefillHandoffSourceStartReq,
+                    self.start_pd_flip_prefill_handoff_source,
+                ),
+                (
+                    PDFlipPrefillHandoffTargetPrepareReq,
+                    self.prepare_pd_flip_prefill_handoff_target,
+                ),
+                (
+                    PDFlipPrefillHandoffTargetActivateReq,
+                    self.activate_pd_flip_prefill_handoff_target,
+                ),
+                (
+                    PDFlipPrefillHandoffDecodeRebindReq,
+                    self.rebind_pd_flip_prefill_handoff_decode,
+                ),
+                (
+                    PDFlipPrefillHandoffSourceFinishReq,
+                    self.finish_pd_flip_prefill_handoff_source,
+                ),
+                (
+                    PDFlipPrefillHandoffAbortReq,
+                    self.abort_pd_flip_prefill_handoff,
+                ),
+                (
+                    PDFlipPrefillHandoffStatusReq,
+                    self.get_pd_flip_prefill_handoff_status,
+                ),
+                (
+                    PDFlipPrefillDonorStartReq,
+                    self.start_pd_flip_prefill_donor,
+                ),
+                (
+                    PDFlipPrefillDonorStatusReq,
+                    self.get_pd_flip_prefill_donor_status,
+                ),
+                (
+                    PDFlipPrefillDonorAbortReq,
+                    self.abort_pd_flip_prefill_donor,
+                ),
+                (
+                    PDFlipMigrationTargetCommitReq,
+                    self.commit_pd_flip_migration_target,
+                ),
+                (
+                    PDFlipMigrationTargetActivateReq,
+                    self.activate_pd_flip_migration_target,
+                ),
+                (
+                    PDFlipMigrationTargetAbortReq,
+                    self.abort_pd_flip_migration_target,
+                ),
+                (PDFlipMigrationStatusReq, self.get_pd_flip_migration_status),
+                (
+                    PDFlipMigrationSourceFinishReq,
+                    self.finish_pd_flip_migration_source,
+                ),
+                (
+                    PDFlipMigrationSourceDeltaReq,
+                    self.start_pd_flip_migration_source_delta,
+                ),
+                (
+                    PDFlipMigrationSourceFallbackReq,
+                    self.start_pd_flip_migration_source_fallback,
+                ),
+                (
+                    PDFlipMigrationTargetFallbackPrepareReq,
+                    self.prepare_pd_flip_migration_target_fallback,
+                ),
+                (
+                    PDFlipMigrationTargetDeltaPrepareReq,
+                    self.prepare_pd_flip_migration_target_delta,
+                ),
+                (PDFlipMigrationAbortReq, self.abort_pd_flip_migration),
+                (PDRuntimeRoleSetReq, self.set_pd_runtime_role),
+                (
+                    PDRuntimePrefillPeerInvalidateReq,
+                    self.invalidate_pd_runtime_prefill_peer,
+                ),
+                (PDRuntimeRoleStatusReq, self.get_pd_runtime_role_status),
+                (PDRuntimeRoleAdmissionReq, self.set_pd_runtime_admission),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1403,10 +9389,15 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
+        self._shutdown_requested = False
+        self.active_pd_event_loop_role = None
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
-            dispatch_event_loop(self)
+            if self.pd_runtime_role_switch_enabled():
+                self._run_pd_dispatch_loop()
+            else:
+                dispatch_event_loop(self)
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
@@ -1415,6 +9406,13 @@ class Scheduler(
         # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
         self._war_barrier_enabled = is_cuda()
         with self.device_module.StreamContext(self.schedule_stream):
+            if self.pd_runtime_role_switch_enabled():
+                self._run_pd_dispatch_loop()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_pd_dispatch_loop(self) -> None:
+        while not getattr(self, "_shutdown_requested", False):
             dispatch_event_loop(self)
 
     @DynamicGradMode()
@@ -1539,6 +9537,7 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        self.maybe_tick_pd_flip_state_machine()
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1683,6 +9682,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_pd_flip_held_reqs=self._pd_flip_invariant_held_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -1702,7 +9702,6 @@ class Scheduler(
 
     def init_load_inquirer(self) -> None:
         self.load_inquirer = SchedulerLoadInquirer(
-            disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
             max_total_num_tokens=self.max_total_num_tokens,
@@ -1711,6 +9710,7 @@ class Scheduler(
             tp_worker=self.tp_worker,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             spec_algorithm=self.spec_algorithm,
+            get_disaggregation_mode=lambda: self.disaggregation_mode,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
@@ -2028,6 +10028,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self.pd_flip_should_reject_new_work():
+            self.reject_pd_flip_admission(req)
+            return
+
         if self.spec_algorithm.is_dflash():
             error_msg = validate_dflash_request(req)
             if error_msg is not None:
@@ -2313,6 +10317,10 @@ class Scheduler(
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
+
+        if self.pd_flip_should_reject_new_work():
+            self.reject_pd_flip_admission(req)
+            return
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -2742,7 +10750,14 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
+        new_prefill_queue_reqs = [
+            req
+            for req in can_run_list
+            if req.time_stats.forward_entry_time == 0.0
+            and not getattr(req, "_pd_flip_prefill_queue_sampled", False)
+        ]
         set_time_batch(can_run_list, "set_forward_entry_time")
+        self._pd_flip_record_prefill_queue_samples(new_prefill_queue_reqs)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2988,6 +11003,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        pd_flip_wall_interval = self._pd_flip_begin_prefill_batch_wall_interval()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -3161,6 +11177,10 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        self._pd_flip_attach_prefill_batch_wall_interval(
+            ret, pd_flip_wall_interval
+        )
+
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3214,6 +11234,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self._pd_flip_finish_prefill_batch_wall_interval(result)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
@@ -3283,9 +11304,11 @@ class Scheduler(
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
-            self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
-            if_success = True
+            if_success = bool(self.tree_cache.clear_storage_backend())
+            if if_success:
+                logger.info("Hierarchical cache cleared successfully!")
+            else:
+                logger.error("Failed to clear hierarchical cache storage backend.")
         else:
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
@@ -3348,6 +11371,8 @@ class Scheduler(
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
+            idle &= not self._pd_flip_source_migration_blocks_idle()
+
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -3523,6 +11548,7 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret["pd_flip"] = self.get_pd_flip_internal_state()
 
         if (
             not self.spec_algorithm.is_none()
@@ -3548,6 +11574,15 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "pd_flip_prefill_slo_attainment",
+                "pd_flip_decode_slo_attainment",
+                "pd_flip_prefill_nodes",
+                "pd_flip_decode_nodes",
+                "pd_flip_slo_threshold",
+                "pd_flip_window_seconds",
+                "pd_flip_prepare_ack",
+                "pd_flip_commit_ack",
+                "pd_flip_abort",
             ]
         )
 

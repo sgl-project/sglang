@@ -29,12 +29,14 @@ async fn failover_when_one_worker_dies() {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: Default::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: None,
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,

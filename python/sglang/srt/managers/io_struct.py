@@ -1174,6 +1174,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    pd_flip_output_seqs: Optional[List[int]] = None
+    pd_flip_session_ids: Optional[List[Optional[str]]] = None
 
 
 @dataclass
@@ -1240,6 +1242,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    pd_flip_output_seqs: Optional[List[int]] = None
+    pd_flip_session_ids: Optional[List[Optional[str]]] = None
 
 
 @dataclass
@@ -1733,6 +1737,202 @@ class SetInternalStateReq(BaseReq):
 class SetInternalStateReqOutput(BaseReq):
     updated: bool
     server_args: Dict[str, Any]
+
+
+@dataclass
+class PDFlipMigrationSourceStartReq(BaseReq):
+    session_id: Optional[str] = None
+    target_url: Optional[str] = None
+    rids: Optional[List[str]] = None
+    include_waiting: bool = False
+    prefill_donor_mode: bool = False
+    target_decode_dp_rank: Optional[int] = None
+    target_decode_dp_ranks: Optional[dict] = None
+
+
+@dataclass
+class PDFlipMigrationTargetPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    source_url: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+    adopt_on_success: bool = False
+    prepare_only: bool = False
+    adopt_on_commit: bool = True
+    prefill_donor_mode: bool = False
+
+
+@dataclass
+class PDFlipPrefillDonorStartReq(BaseReq):
+    session_id: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PDFlipPrefillDonorStatusReq(BaseReq):
+    session_id: Optional[str] = None
+
+
+@dataclass
+class PDFlipPrefillDonorAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PDFlipPrefillHandoffSourceStartReq(BaseReq):
+    session_id: Optional[str] = None
+    target_url: Optional[str] = None
+    target_bootstrap_port: Optional[int] = None
+    rids: Optional[List[str]] = None
+    max_requests: int = 1
+    hold_all_eligible: bool = False
+    pause_admission: bool = False
+
+
+@dataclass
+class PDFlipPrefillHandoffTargetPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    source_url: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PDFlipPrefillHandoffTargetActivateReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipPrefillHandoffDecodeRebindReq(BaseReq):
+    session_id: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+    prepare_only: bool = False
+    commit_prepared: bool = False
+
+
+@dataclass
+class PDFlipPrefillHandoffSourceFinishReq(BaseReq):
+    session_id: Optional[str] = None
+    released_rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipPrefillHandoffAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PDFlipPrefillHandoffStatusReq(BaseReq):
+    session_id: Optional[str] = None
+
+
+@dataclass
+class PDFlipMigrationStatusReq(BaseReq):
+    session_id: Optional[str] = None
+
+
+@dataclass
+class PDFlipMigrationSourceFinishReq(BaseReq):
+    session_id: Optional[str] = None
+    released_rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationSourceDeltaReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationSourceFallbackReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: List[str] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationTargetFallbackPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PDFlipMigrationTargetDeltaPrepareReq(BaseReq):
+    session_id: Optional[str] = None
+    source_url: Optional[str] = None
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PDFlipMigrationTargetCommitReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationTargetActivateReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationTargetAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class PDFlipMigrationOutputRelayReq(BaseReq):
+    session_id: Optional[str] = None
+    output_seq: Optional[int] = None
+    output: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PDFlipMigrationReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+    manifests: List[Dict[str, Any]] = field(default_factory=list)
+    dp_rank: Optional[int] = None
+    handled_rids: List[str] = field(default_factory=list)
+    ignored_rids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PDRuntimeRoleSetReq(BaseReq):
+    role: Literal["prefill", "decode"]
+    force: bool = False
+
+
+@dataclass
+class PDRuntimeRoleStatusReq(BaseReq):
+    pass
+
+
+@dataclass
+class PDRuntimePrefillPeerInvalidateReq(BaseReq):
+    bootstrap_addr: str
+
+
+@dataclass
+class PDRuntimeRoleAdmissionReq(BaseReq):
+    paused: bool
+
+
+@dataclass
+class PDRuntimeRoleReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    role: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

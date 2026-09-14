@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -39,6 +40,14 @@ if TYPE_CHECKING:
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
+
+
+# Prometheus metric families are registered process-wide, while PD runtime
+# role switching intentionally replaces HiCache objects in the same process.
+# Keep the registered Storage metric families alive across cache generations;
+# each StorageMetricsCollector instance still owns its own label values.
+_STORAGE_METRIC_FAMILIES = {}
+_STORAGE_METRIC_FAMILIES_LOCK = threading.Lock()
 
 
 @dataclass
@@ -1738,65 +1747,61 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         Counter = self._counter_cls or _PromCounter
         Histogram = self._histogram_cls or _PromHistogram
 
-        self.labels = labels
+        self.labels = dict(labels)
+        labelnames = tuple(sorted(str(name) for name in labels))
+        family_key = (Counter, Histogram, labelnames)
 
-        self.prefetched_tokens_total = Counter(
-            name="sglang:prefetched_tokens_total",
-            documentation="Number of prefetched prompt tokens.",
-            labelnames=labels.keys(),
-        )
+        with _STORAGE_METRIC_FAMILIES_LOCK:
+            families = _STORAGE_METRIC_FAMILIES.get(family_key)
+            if families is None:
+                families = {
+                    "prefetched_tokens_total": Counter(
+                        name="sglang:prefetched_tokens_total",
+                        documentation="Number of prefetched prompt tokens.",
+                        labelnames=labelnames,
+                    ),
+                    "backuped_tokens_total": Counter(
+                        name="sglang:backuped_tokens_total",
+                        documentation="Number of backuped tokens.",
+                        labelnames=labelnames,
+                    ),
+                    "histogram_prefetch_pgs": Histogram(
+                        name="sglang:prefetch_pgs",
+                        documentation="Histogram of prefetch pages of batches.",
+                        labelnames=labelnames,
+                        buckets=[1, 5, 10, 50, 100],
+                    ),
+                    "histogram_backup_pgs": Histogram(
+                        name="sglang:backup_pgs",
+                        documentation="Histogram of backup pages of batches.",
+                        labelnames=labelnames,
+                        buckets=[1, 5, 10, 50, 100],
+                    ),
+                    "histogram_prefetch_bandwidth": Histogram(
+                        name="sglang:prefetch_bandwidth",
+                        documentation="Histogram of prefetch bandwidth in GB/s.",
+                        labelnames=labelnames,
+                        buckets=[0.1, 0.5, 1, 5, 10, 50, 100],
+                    ),
+                    "histogram_backup_bandwidth": Histogram(
+                        name="sglang:backup_bandwidth",
+                        documentation="Histogram of backup bandwidth in GB/s.",
+                        labelnames=labelnames,
+                        buckets=[0.1, 0.5, 1, 5, 10, 50, 100],
+                    ),
+                }
+                _STORAGE_METRIC_FAMILIES[family_key] = families
 
-        self.backuped_tokens_total = Counter(
-            name="sglang:backuped_tokens_total",
-            documentation="Number of backuped tokens.",
-            labelnames=labels.keys(),
-        )
-
-        bucket_io = [
-            1,
-            5,
-            10,
-            50,
-            100,
+        self.prefetched_tokens_total = families["prefetched_tokens_total"]
+        self.backuped_tokens_total = families["backuped_tokens_total"]
+        self.histogram_prefetch_pgs = families["histogram_prefetch_pgs"]
+        self.histogram_backup_pgs = families["histogram_backup_pgs"]
+        self.histogram_prefetch_bandwidth = families[
+            "histogram_prefetch_bandwidth"
         ]
-
-        bucket_bandwidth = [
-            0.1,
-            0.5,
-            1,
-            5,
-            10,
-            50,
-            100,
+        self.histogram_backup_bandwidth = families[
+            "histogram_backup_bandwidth"
         ]
-
-        self.histogram_prefetch_pgs = Histogram(
-            name="sglang:prefetch_pgs",
-            documentation="Histogram of prefetch pages of batches.",
-            labelnames=labels.keys(),
-            buckets=bucket_io,
-        )
-
-        self.histogram_backup_pgs = Histogram(
-            name="sglang:backup_pgs",
-            documentation="Histogram of backup pages of batches.",
-            labelnames=labels.keys(),
-            buckets=bucket_io,
-        )
-
-        self.histogram_prefetch_bandwidth = Histogram(
-            name="sglang:prefetch_bandwidth",
-            documentation="Histogram of prefetch bandwidth in GB/s.",
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth,
-        )
-
-        self.histogram_backup_bandwidth = Histogram(
-            name="sglang:backup_bandwidth",
-            documentation="Histogram of backup bandwidth in GB/s.",
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth,
-        )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:

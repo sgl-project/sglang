@@ -39,12 +39,14 @@ fn config() -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
