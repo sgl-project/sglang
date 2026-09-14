@@ -1978,7 +1978,13 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
       and would need their own owner filtering);
     * no HiCache / LMCache / HiSparse yet (the DSA index-K stays replicated in
       the virtual loc space; the host pools have no translation for that
-      layout) and no speculative decoding yet (milestone 2);
+      layout);
+    * speculative decoding only as EAGLE chain drafting (``eagle_topk == 1``,
+      the NextN/MTP head): the draft pool is owner-striped by the shared write
+      kernel and every draft phase localizes + LSE-merges like the target. Tree
+      drafting (``eagle_topk > 1``) relocates accepted KV with
+      ``move_kv_cache``, which is not DCP-aware; DSPARK has no GLM-5.3
+      speculator and is untested here;
     * no prefill CP, no mixed chunk (DSA EXTEND rides the decode LSE-merge
       path, which assumes pure EXTEND batches), no PD disaggregation;
     * gathered Q (``--no-dcp-replicate-q-proj``: the fp8 q_b_proj has no
@@ -2029,11 +2035,23 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
     ):
         if getattr(view, attr):
             problems.append(f"{label} is not supported with DSA + DCP yet")
-    if view.speculative_algorithm is not None:
-        problems.append(
-            f"speculative_algorithm={view.speculative_algorithm!r} "
-            "(DSA + DCP speculative decoding is milestone 2)"
-        )
+    spec_algo = view.speculative_algorithm
+    if spec_algo is not None:
+        # This pass runs before handle_speculative_decoding collapses the NEXTN
+        # alias onto EAGLE, so accept both spellings of the packed MTP draft.
+        if str(spec_algo).upper() not in ("EAGLE", "NEXTN"):
+            problems.append(
+                f"speculative_algorithm={spec_algo!r} (only EAGLE/NEXTN chain "
+                "drafting is supported with DSA + DCP)"
+            )
+        else:
+            topk = view.speculative_eagle_topk
+            if topk is not None and int(topk) > 1:
+                problems.append(
+                    f"speculative_eagle_topk={topk} (tree drafting relocates "
+                    "accepted KV via move_kv_cache, which is not DCP-aware; "
+                    "use --speculative-eagle-topk 1)"
+                )
     if view.disaggregation_mode != "null":
         problems.append("PD disaggregation is not supported with DSA + DCP")
     if view.dcp_replicate_q_proj:
@@ -2051,8 +2069,9 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
     logger.info(
         "WQ Hopper DCP enabled for DSA model: dcp_size=%d, comm=%s, "
         "flashmla_kv prefill+decode with owner-localized top-k and LSE merge; "
-        "index-K replicated over the virtual loc space.",
+        "index-K replicated over the virtual loc space; speculative=%s.",
         view.dcp_size,
         view.dcp_comm_backend,
+        spec_algo or "off",
     )
     return {}

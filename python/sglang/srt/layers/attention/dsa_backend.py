@@ -117,13 +117,17 @@ def _should_return_dsa_dcp_lse_flashmla_kv(
     dense prefix gather (``all_gather_kv_cache_for_mla_extend``), and
     ``flashmla_kv`` already treats every extend token as an independent
     decode row with its own top-k slot set. So plain EXTEND joins decode and
-    target-verify on the owner-filtered, LSE-merged path. MIXED / draft-extend
-    modes are rejected at config time for DSA+DCP.
+    target-verify on the owner-filtered, LSE-merged path, and so does the
+    EAGLE draft's DRAFT_EXTEND_V2: the draft pool is written through the same
+    owner-striping kernel as the target (``set_mla_kv_buffer_triton`` masks and
+    divides with the global DCP rank/size), so every phase that reads it must
+    filter and merge. MIXED is rejected at config time for DSA+DCP.
     """
     return dcp_enabled and (
         forward_mode.is_decode()
         or forward_mode.is_target_verify()
         or forward_mode == ForwardMode.EXTEND
+        or forward_mode.is_draft_extend_v2()
     )
 
 
@@ -390,18 +394,17 @@ class DeepseekSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
 
-        # WQ Hopper DCP: the target's MLA KV is striped by owner (virtual slot
-        # v lives on rank v % dcp_size at physical v // dcp_size) while the
-        # index-K cache stays replicated in the virtual loc space. The fused
-        # top-k therefore yields VIRTUAL slots on every rank; the target
-        # attention must owner-filter them before the sparse kernel reads the
-        # local physical pool. The draft pool is replicated and addressed by
-        # untranslated virtual locs (kv_cache_configurator.loc_space_scale),
-        # so the draft never localizes.
+        # WQ Hopper DCP: MLA KV is striped by owner (virtual slot v lives on
+        # rank v % dcp_size at physical v // dcp_size) while the index-K cache
+        # stays replicated in the virtual loc space. The fused top-k therefore
+        # yields VIRTUAL slots on every rank; attention must owner-filter them
+        # before the sparse kernel reads the local physical pool. This holds
+        # for the EAGLE draft too: its pool shares the allocator's virtual locs
+        # and is written through the same owner-striping kernel
+        # (kernels/ops/kvcache/mla_buffer.py uses the global DCP rank/size), so
+        # draft decode / draft-extend / target-verify all localize and merge.
         _parallel = get_parallel()
-        self.dcp_localize_topk: bool = (
-            _parallel.dcp_enabled and not model_runner.is_draft_worker
-        )
+        self.dcp_localize_topk: bool = _parallel.dcp_enabled
         self.dcp_rank: int = _parallel.attn_dcp_rank
         self.dcp_size: int = _parallel.attn_dcp_size
         # FlashMLA's ``flash_mla_with_kvcache`` returns a natural-log LSE; the
