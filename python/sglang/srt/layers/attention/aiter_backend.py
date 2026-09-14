@@ -900,6 +900,116 @@ class AiterAttnBackend(AttentionBackend):
 
         return page_table, qo_indptr, draft_num, swa_page_table
 
+    def _build_extend_unified_page_table(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        max_kv_len: int,
+    ):
+        """Build the 2D block page_table (+ SWA translation) that
+        unified_attention needs for a plain extend/prefill batch. Mirrors the
+        target_verify builder with draft_num=0; rows are sized to the batch's own
+        longest sequence since extend is never graph-captured."""
+        device = seq_lens.device
+        page_size = self.page_size
+        max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
+
+        page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+
+        swa_slot_mapping = None
+        swa_page_table = None
+        if self.use_sliding_window_kv_pool:
+            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
+            swa_page_table = torch.zeros(
+                bs, max_blocks, dtype=torch.int32, device=device
+            )
+
+        BLOCK_SIZE = 1024
+        grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
+        scatter_req_to_token_to_page_table_kernel[grid](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            swa_page_table,
+            swa_slot_mapping,
+            DRAFT_NUM=0,
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_SWA=(swa_slot_mapping is not None),
+        )
+        return page_table, swa_page_table
+
+    def _forward_extend_unified(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        bs0: int,
+        window_size,
+        sinks,
+        k_descale,
+        v_descale,
+    ):
+        """Prefill/extend through aiter's Triton ``unified_attention``. The CK
+        ``mha_batch_prefill_func`` hard-asserts head_dim <= 256, which rules out
+        Gemma-4's 512-wide full-attention layers. unified_attention pads the head
+        dim to the next power of two and reads the same paged KV the decode path
+        reads, so one kernel serves prefill and decode."""
+        bs = forward_batch.batch_size
+        max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+        page_table, swa_page_table = self._build_extend_unified_page_table(
+            bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+        )
+
+        # Build cu_seqlens_q from this batch's extend lengths. The standard
+        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
+        # ForwardMetadata), so relying on it corrupts multi-sequence batches
+        # (only bs=1 happens to work).
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
+        cu_seqlens_q[1:] = torch.cumsum(
+            forward_batch.extend_seq_lens.to(torch.int32), dim=0
+        )
+
+        # unified_attention uses (left, right) window = (window-1, 0), NOT the
+        # CK convention (window, -1). Match the decode path (`de_window`).
+        uni_window = (-1, -1)
+        pt = page_table
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            uni_window = (layer.sliding_window_size - 1, 0)
+            if swa_page_table is not None:
+                pt = swa_page_table
+
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o = q_u.new_empty(
+            (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=self.input_dtype,
+        )
+        unified_attention(
+            q=q_u,
+            k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
+            v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+            out=o,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=forward_batch.seq_lens,
+            max_seqlen_q=self.forward_metadata.max_q_len,
+            max_seqlen_k=pt.shape[1] * self.page_size,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=uni_window,
+            block_table=pt,
+            softcap=layer.logit_cap,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _resolve_v2_num_draft_tokens(
         self,
         extend_seq_lens: Optional[torch.Tensor] = None,
@@ -3478,6 +3588,21 @@ class AiterAttnBackend(AttentionBackend):
                     bs0,
                     window_size,
                     sinks,
+                )
+
+            if self.use_triton_unified_attention:
+                # unified_attention has no head_dim cap; route extend through it
+                # so Gemma-4's 512-wide full-attention layers don't hit the CK
+                # `head dimension at most 256` assert.
+                return self._forward_extend_unified(
+                    q,
+                    layer,
+                    forward_batch,
+                    bs0,
+                    window_size,
+                    sinks,
+                    k_descale,
+                    v_descale,
                 )
 
             # NHD path — original aiter paged batch_prefill.
