@@ -1,5 +1,8 @@
 import unittest
 
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    popen_launch_server_npu,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
@@ -38,6 +41,9 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # Default true, both cause failures on CI, Keep off.
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
@@ -63,15 +69,15 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
+    0.68,
     "--prefill-max-requests",
-    32,
+    160,
     "--max-prefill-tokens",
-    131072,
+    80000,
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    96,
+    160,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -101,8 +107,8 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     1,
     2,
     4,
-    5,
-    6,
+    8,
+    10,
 ]
 
 
@@ -110,6 +116,10 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    # Launch via the CANN-version-aware helper: on CANN 9.0.x `sglang serve`
+    # segfaults lightning indexer ops, so use `python -m sglang.launch_server`;
+    # on CANN >= 9.1.0 keep `sglang serve`.
+    launch_server_fn = popen_launch_server_npu
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS
