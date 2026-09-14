@@ -121,11 +121,11 @@ class TestDraftModelConfig(CustomTestCase):
 
 class TestExternalModelConfig(CustomTestCase):
     def setUp(self):
-        self.enterContext(
-            mock.patch.dict(
-                "sglang.srt.configs.model_config._MODEL_CONFIG_FACTORIES", clear=True
-            )
+        registry = mock.patch.dict(
+            "sglang.srt.configs.model_config._MODEL_CONFIG_FACTORIES", clear=True
         )
+        registry.start()
+        self.addCleanup(registry.stop)
 
     def test_factory_preserves_arguments_and_uses_the_shared_cache(self):
         class ExternalArgs(ServerArgs):
