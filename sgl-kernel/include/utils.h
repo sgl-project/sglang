@@ -339,14 +339,40 @@ inline bool getEnvEnablePDL() {
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-#ifndef USE_ROCM
-#define WARP_SIZE 32
+// Warp width: host is one arch-agnostic, so it queries the device at runtime;
+// device code is compiled per-arch so it stays constexpr. Both resolve to the real
+// hardware width
+#ifdef USE_ROCM
+struct Utils {
+  static __host__ int get_warp_size() {
+    static bool is_cached = false;
+    static int result;
+
+    if (!is_cached) {
+      int device_id;
+      cudaDeviceProp deviceProp;
+      cudaGetDevice(&device_id);
+      cudaGetDeviceProperties(&deviceProp, device_id);
+
+      result = deviceProp.warpSize;
+      is_cached = true;
+    }
+
+    return result;
+  }
+
+  static __device__ constexpr int get_warp_size() {
+#ifdef __GFX9__
+    return 64;
 #else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
-#define WARP_SIZE 64
-#else
-#define WARP_SIZE 32
+    return 32;
 #endif
+  }
+};
+
+#define WARP_SIZE Utils::get_warp_size()
+#else
+#define WARP_SIZE 32
 #endif
 
 #ifdef USE_ROCM
