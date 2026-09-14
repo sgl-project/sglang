@@ -97,13 +97,48 @@ pub enum RequestOutcome {
 }
 
 impl RequestOutcome {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+/// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
+/// status: 2xx is success, 504 is the stale-request cancellation, everything
+/// else (incl. forwarded 4xx/5xx and proxy-side 5xx) is an error.
+///
+/// Deriving from the status rather than from `Result::Ok`/`Err` is what keeps a
+/// forwarded worker error honest: a worker 4xx/5xx the router proxies is an
+/// `Ok(Response)` at the handler, so keying off `Ok` credits it as a success.
+///
+/// The 504→`Cancelled` mapping conflates the router's own stale-request cancel
+/// with a genuine upstream 504 forwarded unchanged; the unambiguous signal for a
+/// real stale-cancel is `stale_requests_total{outcome="expired"}`, which only
+/// the janitor increments.
+pub fn outcome_from_status(status: u16) -> RequestOutcome {
+    match status {
+        200..=299 => RequestOutcome::Success,
+        504 => RequestOutcome::Cancelled,
+        _ => RequestOutcome::Error,
+    }
+}
+
+/// Routing context a handler attaches to its `Response` (via response
+/// extensions) so the outermost access-log middleware can name the worker and
+/// model a request was dispatched to. Present on every routed request; absent on
+/// requests rejected before routing (a body-validation 400, model-not-found),
+/// which the middleware logs with empty worker/model fields.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext {
+    pub worker_url: String,
+    pub model_id: String,
+    /// Whether the client asked for an SSE stream. Only the handler knows this
+    /// (it is a body field, not a header or a route), and it separates
+    /// time-to-last-byte from time-to-headers when reading `latency_ms`.
+    pub streaming: bool,
 }
 
 /// Final outcome of a 2xx SSE stream.
