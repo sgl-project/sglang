@@ -2366,17 +2366,21 @@ def select_experts(
         if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
+    # read by both the dispatch and the fold decision, so the two cannot drift apart
+    _jit_gate_serves_request = (
+        not use_grouped_topk
+        and not (torch_native and custom_routing_function is None)
+        and custom_routing_function is None
+        and not _is_cpu
+        and scoring_func in ("sqrtsoftplus", "sigmoid")
+    )
     # the JIT gate writes the shared slot as exactly 1.0, so the append launch can be skipped
     _shared_folded_into_gate = (
         _use_aiter
         and num_fused_shared_experts > 0
         and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
-        and not use_grouped_topk
-        and not torch_native
-        and custom_routing_function is None
-        and not _is_cpu
+        and _jit_gate_serves_request
         and not _is_xpu
-        and scoring_func in ("sqrtsoftplus", "sigmoid")
         and renormalize
         and bool(apply_routed_scaling_factor_on_output)
         and routed_scaling_factor is not None
@@ -2433,12 +2437,8 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
-        _can_use_jit_kernel = not _is_cpu
-
-        if _can_use_jit_kernel and (
-            scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"
-        ):
+        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports.
+        if _jit_gate_serves_request:
             _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
