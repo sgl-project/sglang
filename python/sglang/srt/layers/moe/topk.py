@@ -2069,7 +2069,7 @@ def remap_topk_for_per_rank_shared_slots(
 
 
 def capture_routed_experts_if_allowed(
-    topk_config: TopKConfig,
+    allow_capture: bool,
     layer_id: Optional[int],
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -2083,7 +2083,7 @@ def capture_routed_experts_if_allowed(
     (and ROCm's masks to 0, a valid expert id), so mask a copy here: replay skips
     -1 rows but reads a padded one as a real selection.
     """
-    if not topk_config.allow_routed_experts_capture:
+    if not allow_capture:
         return
     cap = get_global_experts_capturer()
     if cap is None:
@@ -2114,7 +2114,10 @@ def _post_process_topk_ids(
         topk_config.fused_shared_experts_scaling_factor
     )
     capture_routed_experts_if_allowed(
-        topk_config, layer_id, topk_ids, num_token_non_padded
+        topk_config.allow_routed_experts_capture,
+        layer_id,
+        topk_ids,
+        num_token_non_padded,
     )
     recorder_topk_ids = None
     _fold_pad_into_append = False
@@ -2574,7 +2577,9 @@ def build_precomputed_topk_output(
 
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config.allow_routed_experts_capture, layer_id, topk_ids
+    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
