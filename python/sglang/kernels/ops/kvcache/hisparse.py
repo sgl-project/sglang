@@ -417,6 +417,11 @@ def copy_cache_planned_mla(
 
     IO-only, no planning; the small fixed grid keeps the SM footprint low while
     overlapped on a side stream. The anchor's slot table stays valid (lockstep).
+
+    On sm120 the linear path copies each item through `transfer_item_warp_planned`
+    (64B-aligned read base, so no sector is requested twice); before that fix any
+    item length that was not a multiple of 64B cost 4-18x. See that function in
+    `jit/csrc/kvcacheio/hisparse.cuh`.
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32
