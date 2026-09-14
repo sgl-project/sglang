@@ -346,12 +346,18 @@ impl Router {
         worker_url.to_string()
     }
 
-    // Generic simple routing for GET/POST without JSON body
+    // Fan out to *all* workers — the router does not track which worker owns
+    // a given id, so every worker must be probed. `wait_all` drains all
+    // workers before returning (needed for /abort_request: early-return would
+    // cancel the abort on the worker that owns the rid); otherwise returns on
+    // the first success.
     async fn route_simple_request(
         &self,
         headers: Option<&HeaderMap>,
         endpoint: &str,
         method: Method,
+        body: Option<&serde_json::Value>,
+        wait_all: bool,
     ) -> Response {
         // TODO: currently the sglang worker is using in-memory state management, so this implementation has to fan out to all workers.
         // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
@@ -368,6 +374,8 @@ impl Router {
             })
             .unwrap_or_default();
 
+        // Send + read body inside the future so body reads overlap across
+        // workers. Ok(2xx) / Err(otherwise) — both fully-built Responses.
         let futures: Vec<_> = workers
             .into_iter()
             .map(|worker| {
@@ -393,6 +401,10 @@ impl Router {
                         }
                     };
 
+                    if let Some(body) = body {
+                        request_builder = request_builder.json(body);
+                    }
+
                     if let Some(key) = api_key {
                         let mut auth_header = String::with_capacity(7 + key.len());
                         auth_header.push_str("Bearer ");
@@ -404,55 +416,69 @@ impl Router {
                         request_builder = request_builder.header(name.clone(), value.clone());
                     }
 
-                    request_builder.send().await.map_err(convert_reqwest_error)
-                }
-            })
-            .collect();
+                    let res = match request_builder.send().await {
+                        Ok(res) => res,
+                        Err(e) => return Err(convert_reqwest_error(e)),
+                    };
 
-        // Now execute the collected futures concurrently
-        let mut stream = stream::iter(futures).buffer_unordered(32);
-        let mut last_response: Option<Response> = None;
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
                     let response_headers = header_utils::preserve_response_headers(res.headers());
-
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
-
                             if status.is_success() {
-                                return response;
+                                Ok(response)
+                            } else {
+                                Err(response)
                             }
-                            last_response = Some(response);
                         }
-                        Err(e) => {
-                            last_response = Some(error::internal_error(
-                                "read_response_failed",
-                                format!("Failed to read response: {}", e),
-                            ));
-                        }
+                        Err(e) => Err(error::internal_error(
+                            "read_response_failed",
+                            format!("Failed to read response: {}", e),
+                        )),
                     }
                 }
-                Err(e) => {
-                    last_response = Some(e);
+            })
+            .collect();
+
+        if !wait_all {
+            let mut stream = stream::iter(futures).buffer_unordered(32);
+            let mut last_response: Option<Response> = None;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response) => return response,
+                    Err(response) => last_response = Some(response),
                 }
             }
+            return last_response
+                .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"));
         }
 
-        last_response
+        // Track success and failure separately: a success must win over a
+        // later failure regardless of input order.
+        let mut first_success: Option<Response> = None;
+        let mut last_failure: Option<Response> = None;
+        for result in futures_util::future::join_all(futures).await {
+            match result {
+                Ok(response) => {
+                    if first_success.is_none() {
+                        first_success = Some(response);
+                    }
+                }
+                Err(response) => last_failure = Some(response),
+            }
+        }
+        first_success
+            .or(last_failure)
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
     // Route a GET request with provided headers to a specific endpoint
     async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
-        self.route_simple_request(headers, endpoint, Method::GET)
+        self.route_simple_request(headers, endpoint, Method::GET, None, false)
             .await
     }
 
@@ -462,7 +488,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         endpoint: &str,
     ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
+        self.route_simple_request(headers, endpoint, Method::POST, None, false)
             .await
     }
 
@@ -799,6 +825,15 @@ impl RouterTrait for Router {
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
         self.route_post_empty_request(headers, &endpoint).await
+    }
+
+    async fn abort_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &serde_json::Value,
+    ) -> Response {
+        self.route_simple_request(headers, "abort_request", Method::POST, Some(body), true)
+            .await
     }
 
     async fn route_embeddings(
