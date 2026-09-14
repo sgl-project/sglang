@@ -321,6 +321,7 @@ class BaseSpecWorker(ABC):
                 recv_req.model_path,
                 recv_req.load_format,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
+                model_loader_extra_config=recv_req.model_loader_extra_config,
             )
             if not success:
                 return success, message

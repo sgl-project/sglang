@@ -145,6 +145,7 @@ class WeightUpdater:
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        model_loader_extra_config: Optional[Union[str, dict]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
@@ -152,14 +153,24 @@ class WeightUpdater:
         if error is not None:
             return False, error
 
+        if model_loader_extra_config is None:
+            model_loader_extra_config = (
+                self.get_model_runner().load_config.model_loader_extra_config
+            )
+
         logger.info(
             f"Update engine weights online from disk begin. "
+            f"load_format={load_format} "
+            f"model_loader_extra_config={model_loader_extra_config} "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(
+            load_format=load_format,
+            model_loader_extra_config=model_loader_extra_config,
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)

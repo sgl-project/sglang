@@ -1788,6 +1788,9 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # Extra config for the model loader (e.g. {"enable_gds": false} for
+    # fastsafetensors). Defaults to the server's --model-loader-extra-config.
+    model_loader_extra_config: Optional[Union[str, Dict[str, Any]]] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
