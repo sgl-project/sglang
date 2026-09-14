@@ -79,6 +79,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     fp32_jit_paged_topk,
     select_candidate_blocks,
 )
+from sglang.srt.layers.attention.dsv4.late_layer import select_tail_rows as _tail_rows
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -970,14 +971,6 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         return _tail_rows(
             t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
         )
-
-
-def _tail_rows(
-    t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
-) -> torch.Tensor:
-    if contiguous_start is not None:
-        return t[contiguous_start:]
-    return t[token_indices]
 
 
 # Prefill CUDA graph: the ratio-1/2 indexer scores through the paged kernel on
