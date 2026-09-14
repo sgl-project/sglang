@@ -9,7 +9,6 @@ ARG VER_TORCHVISION=0.23.0
 ARG VER_TRITON=3.3.0+spacemit.a0
 ARG VER_PYARROW=21.0.0
 ARG VER_VLLM=0.11.0.post3+spacemit.0.cpu
-ARG VER_GRPCIO=1.83.1
 ARG VER_LLVM=19
 ARG VER_XGRAMMAR=0.2.1
 
@@ -71,6 +70,7 @@ RUN cp pyproject_riscv64.toml pyproject.toml && \
 RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK after sgl-kernel build')"
 
 # 8. Install SGLang (GCC REQUIRED for XGrammar compatibility)
+ARG VER_GRPCIO=1.83.1
 WORKDIR /sgl-workspace/sglang/python
 RUN cp pyproject_cpu.toml pyproject.toml && \
     # TODO: Remove these filters when riscv64 wheels become available.
