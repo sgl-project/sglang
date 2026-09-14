@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -721,19 +722,23 @@ class BaseMultimodalProcessor(ABC):
         return processor, _tokenizer_of(processor)
 
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing submits its work to the serving GPU.
+        """Whether image preprocessing contends with the serving accelerator.
 
-        The fast image processor runs inside the tokenizer process but on
-        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
-        preprocessing worker there is one more competitor for that device rather
-        than added parallelism.
+        The fast image processor runs inside the tokenizer process but may run on
+        the same accelerator as the scheduler. A second preprocessing worker there
+        adds device contention rather than CPU preprocessing parallelism.
         """
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
         if self.disable_fast_image_processor:
             return False
         image_processor = getattr(self._processor, "image_processor", None)
-        return isinstance(image_processor, BaseImageProcessor)
+        if not isinstance(image_processor, BaseImageProcessor):
+            return False
+        if _is_xpu or _is_npu:
+            return True
+        platform = platforms.current_platform
+        return platform.is_cuda_alike()
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """The worker count to use when the user did not ask for one.
@@ -769,9 +774,12 @@ class BaseMultimodalProcessor(ABC):
         if _is_xpu:
             return "xpu"
         if not _is_npu:
+            platform = platforms.current_platform
+            if not platform.is_cuda_alike():
+                return None
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
-            return f"cuda:{server_args.base_gpu_id}"
+            return f"{platform.device_type}:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
