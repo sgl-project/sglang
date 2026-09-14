@@ -3717,6 +3717,7 @@ dependencies = [
  "libc",
  "numpy",
  "pyo3",
+ "pyo3-build-config",
  "regex-syntax",
  "rmp-serde",
  "rmpv",
