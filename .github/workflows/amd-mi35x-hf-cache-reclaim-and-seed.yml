@@ -22,16 +22,7 @@ name: AMD MI35x HF cache reclaim and seed
 # the useful ones; the rest were pushes to unrelated files. So the trigger goes
 # back off as soon as a run has served its purpose.
 #
-# Currently on for a read-only pass: RECLAIM_DIRS is empty, so the job reports
-# the volume and verifies the seeded checkpoint without deleting anything.
-
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - "scripts/ci/amd/reclaim_and_seed_hf_cache.sh"
-      - "scripts/ci/amd/seed_hf_checkpoint.py"
-      - ".github/workflows/amd-mi35x-hf-cache-reclaim-and-seed.yml"
   workflow_dispatch:
 
 permissions:
@@ -84,8 +75,12 @@ jobs:
       # checkpoints, amd/GLM-5.2-MXFP4 half-downloaded at 212 GiB), run
       # 34549982464 reclaimed 372 GiB and completed the checkpoint at 408 GiB,
       # and #38813 then ran both its arms against it. What remains useful is the
-      # read-only half: the audit reports the volume, and the seed step revalidates
-      # amd/GLM-5.2-MXFP4 and downloads nothing while it is complete.
+      # read-only half: the audit reports the volume, and the seed step
+      # revalidates amd/GLM-5.2-MXFP4 and downloads nothing while it is complete.
+      # Run 34842611921 is such a pass, three days after the seed: 408 GiB still
+      # there, and free space down from 176 GiB to 57 GiB, which is the same
+      # fleet pressure that made reclaim-then-queue unworkable in the first
+      # place.
       #
       # The two directories that reclaim deleted were
       # amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 (216 GiB) and
@@ -94,9 +89,13 @@ jobs:
       # both register_cuda_ci on 4-gpu-b200. The first was a mistake, and the
       # script header now carries the rule it broke: passing a repository-wide
       # grep means sglang CI does not need a checkpoint, not that nobody does.
+      # Restoring it needs 216 GiB against those 57 GiB, so it is a decision for
+      # the runner owners rather than something to make room for here.
       #
       # AUDIT_DIRS covers /sgl-data/agentic-traces, the staged corpora #38813
-      # replays, so a run also reports whether they are still there.
+      # replays, so a run also reports whether they are still there. They are,
+      # and they are being added to: 11 corpora totalling 539 MB, up from the 2
+      # totalling 172 MB that the first audit found.
       - name: Reclaim and seed
         run: |
           > github_summary.md
