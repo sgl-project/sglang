@@ -124,13 +124,14 @@ def transform_index_page_table_decode_kernel(
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
 # the exact context length. Treating it as constexpr creates one cubin per
 # observed length and grows the loaded-module set in long-lived processes.
-@triton.jit(do_not_specialize=["page_table_stride_0"])
+@triton.jit(do_not_specialize=["page_table_stride_0", "page_table_cols"])
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_table_stride_0,
+    page_table_cols,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
@@ -160,7 +161,12 @@ def transform_index_page_table_prefill_kernel(
         mask=mask,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    # Out-of-range topk indices (negative or >= page-table width) must read as
+    # absent: MTP index-share rows carry kpool slot positions whose value can
+    # exceed max_seqlen_k, so an unbounded load would go out of bounds.
+    valid_topk_mask = (
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_cols)
+    )
 
     if PAGE_TABLE_IS_EXPANDED:
         page_table_rows = token_indices
@@ -253,6 +259,7 @@ def transform_index_page_table_prefill_fast(
         cu_seqlens_q,
         result,
         page_table.stride(0),
+        page_table.shape[1],
         page_table.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
