@@ -19,6 +19,7 @@ def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
     Resolution order:
+    0) Map a generic "kernel" request onto the device-specific backend.
     1) Layout <-> I/O compatibility for direct conflicts.
     2) Storage <-> layout compatibility (may rewrite layout).
     """
@@ -48,6 +49,10 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+
+    # Step 0: On XPU the "kernel" transfer kernels are CUDA/HIP only, so
+    # redirect to the SYCL implementation.
+    resolve_xpu_io_backend(server_args)
 
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
@@ -124,8 +129,64 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     )
 
 
+def resolve_xpu_io_backend(server_args: Any):
+    """Point a generic "kernel" request at the SYCL kernels when on XPU.
+
+    ``kernel`` means the CUDA/HIP kernels in ``sgl_kernel.kvcacheio``, which
+    does not exist in the XPU build at all, so both it and the ``direct``
+    transfer helpers it also provides are unavailable here. ``kernel_xpu`` is
+    therefore the only working backend on XPU, and a toolchain that cannot
+    build it is a hard error rather than a fallback.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.device != "xpu":
+        if cfg.hicache_io_backend == "kernel_xpu":
+            raise ValueError(
+                f"--hicache-io-backend kernel_xpu requires an XPU device, "
+                f"but the device is {cfg.device!r}."
+            )
+        return
+
+    if cfg.hicache_io_backend == "direct":
+        raise ValueError(
+            "--hicache-io-backend direct is not supported on XPU: its transfer "
+            "helpers live in sgl_kernel.kvcacheio, which the XPU build does not "
+            "ship. Use kernel_xpu (the default on XPU)."
+        )
+
+    if cfg.hicache_io_backend != "kernel":
+        return
+
+    from sglang.srt.mem_cache import xpu_kvcacheio
+
+    # Compile here, in the launcher, before any worker starts, so the build
+    # cost is paid once instead of being raced for by every TP rank on the
+    # first transfer -- and so a broken toolchain fails at startup.
+    xpu_kvcacheio.load()
+    declare_resolution(
+        server_args,
+        "_resolve_xpu_io_backend",
+        hicache_io_backend="kernel_xpu",
+    )
+    logger.info("Using the kernel_xpu (SYCL) hicache io backend on XPU.")
+
+
 def resolve_layout_io_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.hicache_io_backend == "kernel_xpu":
+        # The SYCL kernels implement layer_first and page_first only.
+        if cfg.hicache_mem_layout not in ("layer_first", "page_first"):
+            logger.warning(
+                f"kernel_xpu io backend does not support "
+                f"{cfg.hicache_mem_layout} layout, switching to layer_first"
+            )
+            declare_resolution(
+                server_args,
+                "_resolve_layout_io_compatibility",
+                hicache_mem_layout="layer_first",
+            )
+        return
+
     if (
         cfg.hicache_mem_layout == "page_first_direct"
         and cfg.hicache_io_backend == "kernel"
@@ -160,7 +221,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
 
     if cfg.hicache_io_backend == "direct":
         new_layout = "page_first_direct"
-    elif cfg.hicache_io_backend == "kernel":
+    elif cfg.hicache_io_backend in ("kernel", "kernel_xpu"):
         new_layout = "page_first"
     else:
         # Keep current behavior for unknown backends (e.g., kernel_ascend).
