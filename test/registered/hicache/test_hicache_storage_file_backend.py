@@ -103,6 +103,7 @@ class HiCacheStorageBaseMixin:
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
         env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)

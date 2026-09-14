@@ -23,6 +23,7 @@
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
+//! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -49,6 +50,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
+use crate::proxy::sse::StreamEnd;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -100,6 +102,39 @@ impl RequestOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Final outcome of a 2xx SSE stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Stream ended without errors.
+    Ok,
+    /// The engine sent a `data: {"error"...}` SSE event.
+    StreamErrorEvent,
+    /// The upstream byte stream failed.
+    UpstreamError,
+    /// The client disconnected before the stream finished.
+    ClientDisconnect,
+}
+
+pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
+    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
+        (false, _, _) => StreamOutcome::UpstreamError,
+        (_, true, _) => StreamOutcome::StreamErrorEvent,
+        (_, _, true) => StreamOutcome::ClientDisconnect,
+        _ => StreamOutcome::Ok,
+    }
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::StreamErrorEvent => "stream_error_event",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientDisconnect => "client_disconnect",
         }
     }
 }
@@ -233,6 +268,7 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -269,6 +305,14 @@ struct EdgeResponseKey {
     route: String,
     method: String,
     status_code: u16,
+}
+
+/// Labels for `sgl_router_stream_outcome_total`.
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+struct StreamOutcomeKey {
+    worker_url: String,
+    model_id: String,
+    outcome: &'static str,
 }
 
 /// Per-worker state sampled from the [`crate::workers::WorkerRegistry`] at
@@ -427,6 +471,22 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
+    }
+
+    /// Record the final outcome of a 2xx stream.
+    pub fn record_stream_outcome(&self, worker_url: &str, model_id: &str, outcome: StreamOutcome) {
+        let key = StreamOutcomeKey {
+            worker_url: worker_url.to_owned(),
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let counter = self
+            .stream_outcome_total
+            .lock()
+            .entry(key)
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bump the edge counter `responses_total{route,method,status_code}`. Called
@@ -681,6 +741,26 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_ttft_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // Final outcomes observed after a 2xx stream's headers are committed.
+        out.push_str("# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n");
+        out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
+        let guard = self.stream_outcome_total.lock();
+        let mut entries: Vec<(&StreamOutcomeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort();
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_stream_outcome_total{{worker_url=\"{}\",model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                escape_label(&key.model_id),
+                key.outcome,
+                value,
+            ));
         }
         drop(guard);
 
@@ -1011,6 +1091,13 @@ fn escape_label(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn assert_metric_line(output: &str, expected: &str) {
+        assert!(
+            output.lines().any(|line| line == expected),
+            "missing metric line `{expected}`; got:\n{output}"
+        );
+    }
+
     #[test]
     fn empty_registry_renders_only_help_lines() {
         let reg = MetricsRegistry::new();
@@ -1149,6 +1236,59 @@ mod tests {
                 "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
             );
         }
+    }
+
+    #[test]
+    fn stream_outcome_precedence() {
+        use StreamOutcome::*;
+
+        for (transport_ok, saw_error_event, client_disconnect, expected) in [
+            (false, false, false, UpstreamError),
+            (false, false, true, UpstreamError),
+            (false, true, false, UpstreamError),
+            (false, true, true, UpstreamError),
+            (true, false, false, Ok),
+            (true, false, true, ClientDisconnect),
+            (true, true, false, StreamErrorEvent),
+            (true, true, true, StreamErrorEvent),
+        ] {
+            let end = StreamEnd {
+                transport_ok,
+                saw_error_event,
+                client_disconnect,
+            };
+            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn record_stream_outcome_emits_labelled_counter_lines() {
+        let reg = MetricsRegistry::new();
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        let out = reg.render();
+        for expected in [
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+        ] {
+            assert_metric_line(&out, expected);
+        }
+    }
+
+    #[test]
+    fn stream_outcome_absent_until_recorded() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_stream_outcome_total counter"));
+        assert!(
+            !out.contains("sgl_router_stream_outcome_total{"),
+            "no series until an outcome is recorded; got:\n{out}",
+        );
     }
 
     #[test]
