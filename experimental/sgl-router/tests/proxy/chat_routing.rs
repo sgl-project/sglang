@@ -575,6 +575,107 @@ async fn forwarded_5xx_records_worker_outcome_error_not_success() {
     );
 }
 
+/// Buffer-backed `tracing` writer so a test can assert on the access log.
+#[derive(Clone)]
+struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for VecWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+    type Writer = VecWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install a permissive global subscriber once per test binary.
+///
+/// `tracing` caches each callsite's "interest" the first time it is hit. Under
+/// the parallel test harness a thread with no subscriber of its own evaluates
+/// the `http_request` callsite against `NoSubscriber`, which caches it as
+/// *never* interested — after which a per-test `set_default` capture on another
+/// thread records nothing, and an access-log assertion fails depending only on
+/// which test ran first. A global subscriber that is interested in everything
+/// keeps the callsite live; it discards what it receives, so per-test
+/// `set_default` buffers stay isolated to their own thread.
+fn prime_tracing_callsites() {
+    static PRIMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PRIMED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+    });
+}
+
+/// The access-log line for a DISPATCHED request must name the worker it was
+/// dispatched to. Only the chat handler knows that, so it attaches a
+/// `RequestLogContext` to the response — including on the post-dispatch error
+/// path, which is where "which engine failed" matters most. Without the attach
+/// the line is still emitted, just anonymous, so only a log assertion catches a
+/// regression here.
+#[tokio::test]
+async fn dispatched_error_names_its_worker_in_the_access_log() {
+    prime_tracing_callsites();
+    let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(VecWriter(buf.clone()))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // A worker that accepts the connection then drops it mid-body: dispatch
+    // succeeds, the request fails afterwards.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"{\"partial\": ",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", "rid-dispatched-error")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = logs
+        .lines()
+        .find(|l| l.contains("rid-dispatched-error"))
+        .unwrap_or_else(|| panic!("no access-log line for the request; captured:\n{logs}"));
+    assert!(
+        line.contains(&format!(r#"worker="{}""#, worker.url)),
+        "a dispatched failure must name its worker: {line}",
+    );
+    assert!(
+        line.contains(r#"model="tiny""#) && line.contains(r#"outcome="error""#),
+        "a dispatched failure must carry model and outcome=error: {line}",
+    );
+}
+
 #[tokio::test]
 async fn non_streaming_upstream_4xx_body_passthrough() {
     // Regression: the worker's response bytes must reach the client

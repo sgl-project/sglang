@@ -180,16 +180,20 @@ impl CircuitBreaker {
     ///   unlike [`record_success`](Self::record_success) — backpressure must
     ///   NOT reset an in-progress failure streak, so a worker interleaving real
     ///   5xx faults with 503s still trips.
-    /// - **HalfOpen:** resolve the probe by closing. The probe exists to test
-    ///   whether the worker is alive again; a 503 answer proves it is. Leaving
-    ///   the probe unresolved would wedge the breaker permanently — the probe
-    ///   slot is released only by a success or failure, and backpressure is
-    ///   neither — shutting a recovered-but-busy worker out forever (a worse
-    ///   false-shed than the one ignoring 503 removes).
-    /// - **Open:** unreachable on a response path; [`allow`](Self::allow) never
-    ///   admits a request while Open within cooldown (and moves it to HalfOpen
-    ///   once cooldown elapses), so no response is classified against an Open
-    ///   breaker.
+    /// - **HalfOpen:** close. Any response observed here proves the worker is
+    ///   answering, which is what the probe exists to find out. Leaving HalfOpen
+    ///   unresolved would wedge the breaker permanently — the probe slot is
+    ///   released only by a success or failure, and backpressure is neither —
+    ///   shutting a recovered-but-busy worker out forever (a worse false-shed
+    ///   than the one ignoring 503 removes). The responder is not necessarily
+    ///   the probe: [`allow`](Self::allow) gates admission, not completion, so a
+    ///   request admitted while Closed can land here. [`record_success`] has the
+    ///   same property.
+    /// - **Open:** no-op, and reachable — `allow` gates admission, not
+    ///   completion, so a request admitted while Closed can return after
+    ///   concurrent failures have opened the breaker. A late backpressure answer
+    ///   must not reset a breaker that has already tripped, exactly as
+    ///   [`record_failure`](Self::record_failure) ignores failures while Open.
     pub fn record_backpressure(&self) {
         let mut g = self.inner.lock().unwrap();
         if matches!(g.state, State::HalfOpen { .. }) {

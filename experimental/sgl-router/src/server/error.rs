@@ -85,7 +85,7 @@ pub enum ApiError {
     /// Distinct from `UpstreamUnreachable` (no reply at all) and from a
     /// well-formed non-2xx (which `Proxy` forwards verbatim with the worker's
     /// own body).
-    #[error("upstream returned status {status}")]
+    #[error("upstream response body incomplete after status {status}")]
     UpstreamStatus { status: StatusCode },
 
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
@@ -233,9 +233,9 @@ impl ApiError {
         }
     }
 
-    /// The HTTP status this error maps to — same value the client receives via
-    /// `into_response`. Exposed so the access log records the real status
-    /// (e.g. 502/503/504) instead of a sentinel.
+    /// The HTTP status this error maps to — the same value the client receives
+    /// via `into_response`. Exposed so a caller holding the error, rather than
+    /// the response, can label it with the status the client actually saw.
     pub fn status_code(&self) -> StatusCode {
         self.class().status()
     }
@@ -280,11 +280,14 @@ impl IntoResponse for ApiError {
                 "upstream unavailable".to_string()
             }
             ApiError::UpstreamStatus { status } => {
+                // The worker's status is usually 200 here — it answered, then
+                // dropped the body — so neither message may call it an error
+                // status.
                 tracing::warn!(
                     upstream_status = %status,
-                    "upstream returned an error status",
+                    "upstream response body did not complete",
                 );
-                "upstream returned an error status".to_string()
+                "upstream response was incomplete".to_string()
             }
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
@@ -463,9 +466,8 @@ mod tests {
             worker: worker.clone(),
         };
         let resp = err.into_response();
-        // A timeout is a gateway timeout (504), not a bad gateway (502): same
-        // class — and same status — as the stale-deadline cancel, so the two
-        // can't drift apart.
+        // A timeout is a gateway timeout (504), not a bad gateway (502): the
+        // same class — and so the same status — as the stale-deadline cancel.
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             resp.headers()
@@ -580,8 +582,7 @@ mod tests {
     /// `x-router-upstream-status`. This pins the router half of the status-code
     /// contract:
     ///   * same condition class → same status — both timeouts are 504, so the
-    ///     per-request timeout and the stale-deadline cancel can never diverge
-    ///     to 502-vs-504 the way they used to;
+    ///     per-request timeout and the stale-deadline cancel cannot diverge;
     ///   * a worker's real status is preserved, never silently rewritten.
     #[test]
     fn router_originated_scenarios_match_status_and_headers() {

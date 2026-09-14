@@ -100,7 +100,7 @@
     {
       "type": "stat",
       "title": "Error ratio",
-      "description": "Share of dispatches whose outcome=error.",
+      "description": "Share of dispatches that failed on the WORKER's side (outcome=error). Excludes client_error (4xx), backpressure (429/503) and cancelled, so a saturated fleet or a bad client does not read as a worker fault.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -511,7 +511,7 @@
     {
       "type": "timeseries",
       "title": "Responses by HTTP status",
-      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel).",
+      "description": "Client-visible HTTP status codes. A 504 is any router-side give-up \u2014 the stale-request deadline or an upstream timeout \u2014 or a worker 504 forwarded unchanged; worker_requests_total{outcome} tells them apart.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

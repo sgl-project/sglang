@@ -2,21 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::server::app_context::AppContext;
+use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
+use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
 
-/// Infra endpoints logged at DEBUG rather than INFO. They are polled constantly
-/// — Prometheus scrapes `/metrics`, the kubelet hits `/healthz` + `/readyz`
-/// every few seconds — so logging them at INFO would bury real API traffic. They
-/// are still counted in both edge counters; filter them by `route` in PromQL.
+/// Infra endpoints whose *successful* polls are logged at DEBUG rather than
+/// INFO. They are polled constantly — Prometheus scrapes `/metrics`, the kubelet
+/// hits `/healthz` + `/readyz` every few seconds — so logging every hit at INFO
+/// would bury real API traffic. A FAILING probe is the opposite: a pod dropping
+/// out of readiness is an incident signal, so it keeps the normal INFO line (see
+/// `access_log_and_record`). They are counted in both edge counters either way;
+/// filter them by `route` in PromQL.
 fn is_infra_path(path: &str) -> bool {
     matches!(path, "/healthz" | "/readyz" | "/metrics")
 }
@@ -68,13 +73,23 @@ fn pod_id() -> &'static str {
 /// `route` is the matched template (not the raw URI) and `method` a known-verb
 /// allow-list, so neither label's cardinality is caller-controlled.
 ///
-/// The access log runs at the same site, which is what makes it complete: it
-/// covers responses produced before any handler runs (a 413 from the body-limit
-/// layer, a 400 from the body extractor when a client drops the connection
-/// mid-upload, a `CatchPanicLayer` 500) and handler short-circuits that return
-/// via `?` (a body-validation 400, a model-not-found 404) — none of which can
-/// reach a handler's own logging. Routed requests carry a [`RequestLogContext`]
-/// naming the worker and model; pre-routing rejections log those fields empty.
+/// The access log runs at the same site, which is what lets it cover responses
+/// produced before any handler runs (a 413 from the body-limit layer, a 400 from
+/// the body extractor when a client drops the connection mid-upload, a
+/// `CatchPanicLayer` 500) and handler short-circuits that return via `?` (a
+/// body-validation 400, a model-not-found 404) — none of which can reach a
+/// handler's own logging. Dispatched requests carry a [`RequestLogContext`]
+/// naming the worker, model and outcome; everything else logs those empty.
+///
+/// Two things it does NOT cover, both by construction:
+///   * A client that disconnects before the response head exists. `next.run`
+///     never resolves, so nothing after it runs; the request is already counted
+///     in `requests_total`, and `requests_total - responses_total` is the only
+///     evidence it happened.
+///   * The final fate of a stream. The line is emitted when the response HEAD is
+///     ready, which for SSE is before a single body byte is pumped — so a stream
+///     that dies mid-body is logged `status=200`. The `stream` field marks those
+///     lines; `stream_outcome_total` carries their real ending.
 async fn access_log_and_record(
     State(ctx): State<Arc<AppContext>>,
     req: Request,
@@ -103,7 +118,8 @@ async fn access_log_and_record(
     ctx.metrics
         .record_response(&route, method_label, status.as_u16());
 
-    if is_infra_path(&path) {
+    // A healthy probe is noise; a failing one is an incident signal.
+    if is_infra_path(&path) && status.is_success() {
         tracing::debug!(
             method = %method,
             path = %path,
@@ -114,8 +130,9 @@ async fn access_log_and_record(
         return resp;
     }
 
-    // Per-worker fields are present only when a handler routed the request and
-    // attached them; a pre-routing rejection logs them empty.
+    // Per-worker fields are present only when a handler dispatched the request
+    // and attached them; anything rejected before dispatch logs them empty and
+    // falls back to the status for its outcome, which is all the status can say.
     let log_ctx = resp.extensions().get::<RequestLogContext>();
     tracing::info!(
         pod_id = %pod_id(),
@@ -123,7 +140,10 @@ async fn access_log_and_record(
         method = %method,
         path = %path,
         status = status.as_u16(),
-        outcome = outcome_from_status(status.as_u16()).as_str(),
+        outcome = log_ctx
+            .map(|c| c.outcome)
+            .unwrap_or_else(|| outcome_from_status(status.as_u16()))
+            .as_str(),
         worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
         model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
         stream = log_ctx.is_some_and(|c| c.streaming),
@@ -133,11 +153,12 @@ async fn access_log_and_record(
     resp
 }
 
-/// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
-/// and URI so an operator investigating "client X gets 413s" has a
-/// server-side breadcrumb. The 413 is produced by axum's `DefaultBodyLimit`
-/// layer BEFORE the handler runs, so without this we would have no record
-/// of which request was rejected.
+/// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method and
+/// full URI, at WARN, so an operator investigating "client X gets 413s" has a
+/// server-side breadcrumb. `access_log_and_record` already logs the 413 at INFO,
+/// but only with the route template — this adds the query string and raises the
+/// level, because a body-limit rejection is a client-configuration problem
+/// rather than routine traffic.
 async fn log_413(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -153,7 +174,7 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
@@ -178,14 +199,36 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
-        )
+        );
+    // A route that panics on purpose, so the panic-handling layers below are
+    // exercised as `build_router` actually composes them. Without it the layers
+    // could be deleted from this function and every test would still pass.
+    #[cfg(test)]
+    let router = router.route(
+        "/__test_panic",
+        get(|| async {
+            panic!("handler exploded");
+            #[allow(unreachable_code)]
+            StatusCode::OK
+        }),
+    );
+    router
         // Convert a handler panic into a 500 response. hyper otherwise catches
         // the panic and drops the connection WITHOUT a Response, so the failure
         // never reaches the `access_log_and_record` middleware below and is
         // invisible to both the edge counters and the access log. Positioned
         // INNER relative to that middleware (added before it, so it sits closer
         // to the handlers) so the synthesized 500 is observed and counted.
-        .layer(CatchPanicLayer::new())
+        //
+        // The response is built from `ApiError::Internal` rather than
+        // tower-http's default plain-text body, so a panic answers with the same
+        // JSON envelope and `x-router-error-code` as every other
+        // router-originated error instead of punching a hole in that contract.
+        .layer(CatchPanicLayer::custom(
+            |_: Box<dyn std::any::Any + Send>| {
+                ApiError::Internal(anyhow::anyhow!("handler panicked")).into_response()
+            },
+        ))
         // After routing, so MatchedPath is set for every route.
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
@@ -197,9 +240,9 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::metrics::RequestOutcome;
     use axum::body::Body;
     use axum::http::Request;
-    use axum::response::IntoResponse;
     use std::sync::Mutex;
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
@@ -225,9 +268,32 @@ mod tests {
         }
     }
 
+    /// Install a permissive global subscriber once per test binary.
+    ///
+    /// `tracing` caches each callsite's "interest" the first time it is hit. Under
+    /// the parallel test harness a thread with no subscriber of its own evaluates
+    /// the `http_request` callsite against `NoSubscriber`, which caches it as
+    /// *never* interested — after which a per-test `set_default` capture on another
+    /// thread records nothing, and an access-log assertion fails depending only on
+    /// which test ran first. A global subscriber that is interested in everything
+    /// keeps the callsite live; it discards what it receives, so per-test
+    /// `set_default` buffers stay isolated to their own thread.
+    fn prime_tracing_callsites() {
+        static PRIMED: OnceLock<()> = OnceLock::new();
+        PRIMED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        });
+    }
+
     /// Install a buffer-backed subscriber for the current thread. The returned
     /// guard must stay alive for the duration of the capture.
     fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        prime_tracing_callsites();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -284,49 +350,43 @@ mod tests {
 
     /// A handler panic must become a 500 that the `access_log_and_record`
     /// middleware still observes. hyper catches a handler panic and drops the
-    /// connection WITHOUT producing a Response, so without `CatchPanicLayer`
-    /// the failure is invisible to the edge counters and the access log.
-    /// `CatchPanicLayer` synthesizes a 500; the middleware must be OUTER
-    /// (applied after) so it counts and logs that synthesized 500.
+    /// connection WITHOUT producing a Response, so without the catch-panic layer
+    /// the failure is invisible to the edge counters and the access log; and the
+    /// middleware must be OUTER (applied after) so it counts the synthesized
+    /// 500. Driven through the real `build_router` — via the `#[cfg(test)]`
+    /// panic route it registers — so deleting either layer from production code
+    /// fails this test rather than only the ordering being pinned.
     ///
-    /// This composes the SAME two layers in the SAME order as `build_router`
-    /// (middleware outer, catch-panic inner) over a panicking route — the real
-    /// `build_router` has no panicking route to exercise, so a minimal Router
-    /// pins the ordering contract directly.
+    /// The 500 must also carry the ordinary router error envelope: a panic is a
+    /// router-originated error, and commit-1's contract says every one of those
+    /// is machine-readable through `x-router-error-code`.
     #[tokio::test]
-    async fn handler_panic_becomes_500_and_is_counted() {
+    async fn handler_panic_becomes_a_counted_500_with_the_router_error_envelope() {
         let ctx = Arc::new(AppContext::stub());
-        let app = Router::new()
-            .route(
-                "/boom",
-                get(|| async {
-                    panic!("handler exploded");
-                    #[allow(unreachable_code)]
-                    StatusCode::OK
-                }),
-            )
-            // Inner: convert a handler panic into a 500 response.
-            .layer(CatchPanicLayer::new())
-            // Outer: count and log the final status — must observe the 500.
-            .layer(middleware::from_fn_with_state(
-                Arc::clone(&ctx),
-                access_log_and_record,
-            ));
-
         let req = Request::builder()
             .method("GET")
-            .uri("/boom")
+            .uri("/__test_panic")
             .body(Body::empty())
             .unwrap();
-        let res = app.oneshot(req).await.unwrap();
+        let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
         assert_eq!(
             res.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a handler panic must surface as 500, not a dropped connection",
         );
+        assert_eq!(
+            res.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("internal_error"),
+            "a panic-500 must carry the same error envelope as every other \
+             router-originated error",
+        );
         let m = ctx.metrics.render();
         assert!(
-            m.contains(r#"status_code="500""#),
+            m.contains(
+                r#"sgl_router_responses_total{route="/__test_panic",method="GET",status_code="500"} 1"#
+            ),
             "the middleware must observe and count the panic-500; got:\n{m}",
         );
     }
@@ -356,7 +416,7 @@ mod tests {
             "every request must be logged by the middleware; captured:\n{logs}",
         );
         assert!(
-            logs.contains("status=404") && logs.contains("outcome=\"error\""),
+            logs.contains("status=404") && logs.contains("outcome=\"client_error\""),
             "the access log must carry the final status and its outcome; captured:\n{logs}",
         );
     }
@@ -379,6 +439,7 @@ mod tests {
                         worker_url: "http://worker-a:30000".into(),
                         model_id: "tiny".into(),
                         streaming: false,
+                        outcome: RequestOutcome::Cancelled,
                     });
                     resp
                 }),
@@ -401,18 +462,26 @@ mod tests {
             logs.contains("worker=\"http://worker-a:30000\"") && logs.contains("model=\"tiny\""),
             "a routed request must be logged with its worker and model; captured:\n{logs}",
         );
+        // The handler's outcome must win over the status-derived fallback —
+        // otherwise the log and `worker_requests_total` can disagree about a
+        // request the handler classified itself (here, a cancellation served
+        // with a 200 head, which no status could reveal).
         assert!(
-            logs.contains("outcome=\"success\""),
-            "a 200 must log outcome=success; captured:\n{logs}",
+            logs.contains("outcome=\"cancelled\"") && !logs.contains("outcome=\"success\""),
+            "the handler's own outcome must win over the status fallback; captured:\n{logs}",
         );
     }
 
-    /// Infra probes (`/healthz`, `/readyz`, `/metrics`) are polled every few
-    /// seconds by the kubelet and Prometheus. They log at DEBUG, so a default
-    /// INFO subscriber sees nothing — otherwise probe traffic buries real API
-    /// traffic. They are still counted in both edge counters.
+    /// A SUCCEEDING infra probe (`/healthz`, `/readyz`, `/metrics`) is polled
+    /// every few seconds by the kubelet and Prometheus, so it logs at DEBUG and
+    /// a default INFO subscriber sees nothing — otherwise probe traffic buries
+    /// real API traffic. It is still counted in both edge counters.
+    ///
+    /// The non-infra request in the same test is a positive control: without it
+    /// the negative assertion would also pass if log capture silently broke and
+    /// the buffer were simply empty.
     #[tokio::test]
-    async fn infra_probe_is_counted_but_not_logged_at_info() {
+    async fn successful_infra_probe_is_counted_but_not_logged_at_info() {
         let (buf, _guard) = capture_logs();
         let ctx = Arc::new(AppContext::stub());
         let req = Request::builder()
@@ -422,12 +491,30 @@ mod tests {
             .unwrap();
         let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-
         assert!(
-            !captured(&buf).contains("http_request"),
-            "infra probes must not reach the INFO access log; captured:\n{}",
+            !captured(&buf).contains("/healthz"),
+            "a healthy probe must not reach the INFO access log; captured:\n{}",
             captured(&buf),
         );
+
+        // Positive control: a non-infra request through the same capture must
+        // produce a line, proving the absence above is the filter and not a
+        // broken subscriber.
+        let control = Request::builder()
+            .method("GET")
+            .uri("/nope")
+            .body(Body::empty())
+            .unwrap();
+        let _ = build_router(Arc::clone(&ctx))
+            .oneshot(control)
+            .await
+            .unwrap();
+        assert!(
+            captured(&buf).contains("http_request"),
+            "log capture is broken — the negative assertion above proves nothing; captured:\n{}",
+            captured(&buf),
+        );
+
         let m = ctx.metrics.render();
         assert!(
             m.contains(r#"sgl_router_requests_total{route="/healthz",method="GET"} 1"#)
@@ -435,6 +522,59 @@ mod tests {
                     r#"sgl_router_responses_total{route="/healthz",method="GET",status_code="200"} 1"#
                 ),
             "infra probes must still be counted at the edge: {m}",
+        );
+    }
+
+    /// A FAILING infra probe is the opposite of noise: a pod dropping out of
+    /// readiness is an incident signal, and demoting it to DEBUG alongside the
+    /// healthy polls would hide the transition an operator most needs to see.
+    #[tokio::test]
+    async fn failing_readiness_probe_is_logged_at_info() {
+        let (buf, _guard) = capture_logs();
+        // A stub context has never been marked ready, so /readyz answers 503.
+        let ctx = Arc::new(AppContext::stub());
+        assert!(!ctx.is_ready(), "stub context must start unready");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let logs = captured(&buf);
+        assert!(
+            logs.contains("http_request")
+                && logs.contains("/readyz")
+                && logs.contains("status=503"),
+            "a failing readiness probe must reach the INFO access log; captured:\n{logs}",
+        );
+    }
+
+    /// The `method` label must be bounded where it is USED, not merely where it
+    /// is computed: `normalize_method` existing is worthless if a call site
+    /// still passes the raw verb. An RFC-7230 extension token reaches this
+    /// middleware before axum's method-router can answer 405, so drive a made-up
+    /// verb through the real router and read the metric back.
+    #[tokio::test]
+    async fn unknown_verb_is_collapsed_in_the_metric_labels() {
+        let ctx = Arc::new(AppContext::stub());
+        let req = Request::builder()
+            .method(axum::http::Method::from_bytes(b"BREW").unwrap())
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let _ = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
+
+        let m = ctx.metrics.render();
+        assert!(
+            m.contains(r#"method="other""#),
+            "an unknown verb must be counted under method=\"other\": {m}",
+        );
+        assert!(
+            !m.contains("BREW"),
+            "the raw verb must never reach a metric label: {m}",
         );
     }
 }

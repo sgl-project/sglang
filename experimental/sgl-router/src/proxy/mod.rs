@@ -31,12 +31,15 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
 }
 
 /// How an upstream HTTP response status should affect the worker's circuit
-/// breaker. Each variant maps to one `CircuitBreaker` call at the dispatch
-/// sites (`forward_json_to` / `forward_streaming_to`).
+/// breaker, at the dispatch sites (`forward_json_to` / `forward_streaming_to`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreakerOutcome {
-    /// Healthy completion → `record_success`: reset the failure streak and
-    /// close the breaker.
+    /// The worker was responsive — a 2xx, or a 4xx it answered cleanly (a
+    /// client's bad request says nothing about worker health). The non-streaming
+    /// arm records success immediately; the streaming arm defers to the pump's
+    /// completion hook, which records success or failure by
+    /// [`sse::StreamEnd::transport_ok`], since a 2xx head can still be followed
+    /// by a body that never completes.
     Success,
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
@@ -59,7 +62,9 @@ enum BreakerOutcome {
 /// [`Neutral`](BreakerOutcome::Neutral) (see [`CircuitBreaker::record_backpressure`]
 /// for its exact effect per breaker state). Genuine 5xx faults (500 / 502 /
 /// 504 / …) still count as failures, and transport errors / timeouts /
-/// mid-body drops are recorded as failures at the call sites.
+/// mid-body drops are recorded as failures at the call sites — as are a
+/// malformed discovery URL (`parse_worker_url`) and a stream whose body dies
+/// after a 2xx head.
 ///
 /// Tradeoff: because 503 never opens the breaker, a worker stuck returning 503
 /// indefinitely (a wedged engine, not transient load) is NOT detected here —
@@ -124,9 +129,10 @@ impl Proxy {
         }
     }
 
-    /// Breaker-gated JSON POST: checks `breaker.allow()` first, records
-    /// success/failure based on response status, and returns
-    /// `ApiError::BreakerOpen` immediately when the breaker is Open.
+    /// Breaker-gated JSON POST: checks `breaker.allow()` first, classifies the
+    /// response status through [`breaker_outcome`] (success / failure /
+    /// backpressure), and returns `ApiError::BreakerOpen` immediately when the
+    /// breaker is Open.
     ///
     /// `worker_url` is the discovery-emitted worker URL string. It's parsed
     /// to [`reqwest::Url`] internally so we can use [`Url::join`] for clean
@@ -206,8 +212,9 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
-    /// success/failure, and returns `ApiError::BreakerOpen` when Open.
+    /// Breaker-gated streaming POST: checks `breaker.allow()` first, classifies
+    /// the response status through [`breaker_outcome`], and returns
+    /// `ApiError::BreakerOpen` when Open.
     ///
     /// `stream_guards` — when `Some`, the value is threaded into the SSE
     /// pump task and held for the entire body lifetime (headers → last byte
@@ -397,17 +404,17 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), tx)
     }
 
-    /// The bug this fixes: a saturated engine returning its own queue-full 503s
-    /// must NOT trip the router's circuit breaker. Dispatch well past the
-    /// default threshold (3) and assert the breaker stays Closed and admitting.
+    /// A saturated engine's own queue-full 503s must not trip the router's
+    /// circuit breaker. Dispatch far past any plausible failure threshold and
+    /// assert the breaker stays Closed and admitting.
     #[tokio::test]
     async fn engine_503_does_not_trip_breaker() {
         let (url, _shutdown) = spawn_status_worker(503).await;
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
-        let breaker = CircuitBreaker::new(); // default threshold = 3
+        let breaker = CircuitBreaker::new();
         let headers = HeaderMap::new();
 
-        for i in 0..6 {
+        for i in 0..50 {
             let resp = proxy
                 .forward_json_to(
                     &url,
@@ -435,17 +442,21 @@ mod tests {
         );
     }
 
-    /// Contrast / regression guard: a genuine 5xx fault (500) MUST still trip the
-    /// breaker after the threshold, so the backpressure carve-out didn't disable
-    /// fault detection.
+    /// Contrast guard, so the backpressure carve-out cannot disable fault
+    /// detection: a genuine 5xx fault (500) MUST still open the breaker. Loops
+    /// on `would_allow()` rather than a fixed count so the test stays correct if
+    /// the default `CircuitBreakerConfig` threshold changes.
     #[tokio::test]
     async fn engine_500_still_trips_breaker() {
         let (url, _shutdown) = spawn_status_worker(500).await;
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
-        let breaker = CircuitBreaker::new(); // default threshold = 3
+        let breaker = CircuitBreaker::new();
         let headers = HeaderMap::new();
 
-        for _ in 0..3 {
+        for _ in 0..50 {
+            if !breaker.would_allow() {
+                break;
+            }
             let _ = proxy
                 .forward_json_to(
                     &url,
@@ -459,7 +470,7 @@ mod tests {
         assert_eq!(
             breaker.snapshot().state_code,
             1,
-            "three 500s must open the breaker (fault detection still works)",
+            "a run of 500s must open the breaker (fault detection still works)",
         );
     }
 
@@ -471,11 +482,13 @@ mod tests {
     async fn engine_503_recovers_a_half_open_breaker() {
         let (url, _shutdown) = spawn_status_worker(503).await;
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
-        // threshold=1 so one prior fault opens it; tiny cooldown so the probe
-        // is admitted almost immediately.
+        // threshold=1 so one prior fault opens it; a short cooldown so the probe
+        // is admitted quickly. The wait below is an order of magnitude longer
+        // than the cooldown rather than a thin margin, since this test needs a
+        // real socket and so cannot pause the clock.
         let breaker = CircuitBreaker::with_config(CircuitBreakerConfig {
             threshold: NonZeroU32::new(1).unwrap(),
-            cool_down: Duration::from_millis(50),
+            cool_down: Duration::from_millis(20),
         });
         let headers = HeaderMap::new();
 
@@ -484,7 +497,7 @@ mod tests {
         assert_eq!(breaker.snapshot().state_code, 1, "breaker should be Open");
 
         // Let the cooldown elapse so the next dispatch claims the half-open probe.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let resp = proxy
             .forward_json_to(

@@ -89,10 +89,28 @@ const TTFT_BUCKETS: &[f64] = &[
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
+///
+/// The split exists so `outcome="error"` means *this worker failed*, matching
+/// what [`crate::proxy`]'s `breaker_outcome` counts as a fault. A request can
+/// fail for reasons that say nothing about the worker's health — the caller sent
+/// something invalid, or the worker was merely at capacity — and folding those
+/// into `error` makes the per-worker error ratio fire on client mistakes and on
+/// exactly the backpressure the circuit breaker deliberately tolerates.
 #[derive(Debug, Clone, Copy)]
 pub enum RequestOutcome {
     Success,
+    /// The worker answered and rejected the request as invalid (a 4xx other than
+    /// 429). The caller's fault, not the worker's.
+    ClientError,
+    /// The worker was responsive but at capacity (429 / 503). Not a fault — the
+    /// same judgement `breaker_outcome` makes when it declines to open the
+    /// breaker on these statuses.
+    Backpressure,
+    /// The worker failed to serve the request: a 5xx fault, a transport failure,
+    /// a timeout, or a body that never completed.
     Error,
+    /// The router cancelled the request itself — today only the stale-request
+    /// deadline. Never derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 
@@ -100,6 +118,8 @@ impl RequestOutcome {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::ClientError => "client_error",
+            Self::Backpressure => "backpressure",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
         }
@@ -107,38 +127,52 @@ impl RequestOutcome {
 }
 
 /// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
-/// status: 2xx is success, 504 is the stale-request cancellation, everything
-/// else (incl. forwarded 4xx/5xx and proxy-side 5xx) is an error.
+/// status.
 ///
 /// Deriving from the status rather than from `Result::Ok`/`Err` is what keeps a
 /// forwarded worker error honest: a worker 4xx/5xx the router proxies is an
 /// `Ok(Response)` at the handler, so keying off `Ok` credits it as a success.
 ///
-/// The 504→`Cancelled` mapping conflates the router's own stale-request cancel
-/// with a genuine upstream 504 forwarded unchanged; the unambiguous signal for a
-/// real stale-cancel is `stale_requests_total{outcome="expired"}`, which only
-/// the janitor increments.
+/// This never returns [`RequestOutcome::Cancelled`]. A status cannot identify a
+/// router-side cancellation: a 504 is produced by the stale-request deadline, by
+/// the router's own upstream timeout, and by a worker 504 forwarded unchanged,
+/// and only the caller holding the `ApiError` can tell them apart. Callers that
+/// know they cancelled the request say so explicitly instead.
 pub fn outcome_from_status(status: u16) -> RequestOutcome {
     match status {
         200..=299 => RequestOutcome::Success,
-        504 => RequestOutcome::Cancelled,
+        // Responsive but at capacity. Listed before the 4xx arm so 429 lands
+        // here rather than in `ClientError`.
+        429 | 503 => RequestOutcome::Backpressure,
+        400..=499 => RequestOutcome::ClientError,
         _ => RequestOutcome::Error,
     }
 }
 
 /// Routing context a handler attaches to its `Response` (via response
-/// extensions) so the outermost access-log middleware can name the worker and
-/// model a request was dispatched to. Present on every routed request; absent on
-/// requests rejected before routing (a body-validation 400, model-not-found),
-/// which the middleware logs with empty worker/model fields.
+/// extensions) so the outermost access-log middleware can describe a dispatch it
+/// cannot see itself.
+///
+/// Attached today only by `chat_completions`. There is no compile-time
+/// obligation to attach one — any handler that dispatches to a worker must do so
+/// or its access-log line names no worker and falls back to a status-derived
+/// outcome. A line with empty `worker`/`model` is therefore normal, not a bug:
+/// it means the request was rejected before dispatch, or reached a route that
+/// does not dispatch at all.
 #[derive(Debug, Clone)]
 pub struct RequestLogContext {
+    /// The worker the client-visible response actually came from. In PD mode
+    /// that is the decode worker, not the policy-selected prefill worker.
     pub worker_url: String,
     pub model_id: String,
     /// Whether the client asked for an SSE stream. Only the handler knows this
     /// (it is a body field, not a header or a route), and it separates
     /// time-to-last-byte from time-to-headers when reading `latency_ms`.
     pub streaming: bool,
+    /// The outcome the handler recorded for this request. Carried so the log
+    /// line and `worker_requests_total` cannot disagree — the middleware can
+    /// only see the status, which cannot express a router-side cancellation.
+    pub outcome: RequestOutcome,
 }
 
 /// Final outcome of a 2xx SSE stream.
@@ -293,9 +327,8 @@ pub struct MetricsRegistry {
     // never answered, which `worker_requests_total` (post-dispatch) can't see.
     requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
-    // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
-    // dispatch, so blind to pre-dispatch drops; kept per-worker for the
-    // routing-convergence tests.
+    // Per-worker dispatch outcomes. Recorded after dispatch, so blind to
+    // pre-dispatch drops; kept per-worker for the routing-convergence tests.
     worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
@@ -525,8 +558,8 @@ impl MetricsRegistry {
     }
 
     /// Bump the edge counter `responses_total{route,method,status_code}`. Called
-    /// at the middleware, so it captures every outcome — incl. early-exit
-    /// 400/413/503 that the old per-handler site skipped.
+    /// at the middleware, so it captures every response — including early-exit
+    /// 400/413/503s that never reach a handler.
     pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
         let key = EdgeResponseKey {
             route: route.to_owned(),
@@ -713,7 +746,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // worker_requests_total — per-worker dispatch outcomes (formerly requests_total)
+        // worker_requests_total — per-worker dispatch outcomes
         out.push_str(
             "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
         );
@@ -1594,5 +1627,39 @@ mod tests {
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
         );
+    }
+
+    /// The status → outcome mapping is the single definition shared by the
+    /// access log and `worker_requests_total`, so a silent change here corrupts
+    /// both surfaces at once. Pin every class, including the boundaries.
+    #[test]
+    fn outcome_from_status_maps_every_class() {
+        let cases = [
+            (200, "success"),
+            (204, "success"),
+            (299, "success"),
+            // Backpressure is listed before the 4xx arm, so 429 must not fall
+            // through to client_error.
+            (429, "backpressure"),
+            (503, "backpressure"),
+            (400, "client_error"),
+            (404, "client_error"),
+            (499, "client_error"),
+            (500, "error"),
+            (502, "error"),
+            // A 504 is NOT a cancellation: the router's own upstream timeout and
+            // a worker's forwarded 504 both land here, and only the caller
+            // holding the `ApiError` can tell a real stale-cancel apart.
+            (504, "error"),
+            (199, "error"),
+            (300, "error"),
+        ];
+        for (status, want) in cases {
+            assert_eq!(
+                outcome_from_status(status).as_str(),
+                want,
+                "status {status} must map to `{want}`",
+            );
+        }
     }
 }
