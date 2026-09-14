@@ -157,13 +157,13 @@ class TestExtendLongPrefixAiter(CustomTestCase):
             qs = q[rows].float()
             if kv_dtype != torch.bfloat16:
                 qs = qs.to(kv_dtype).float()  # both kernels feed fp8 q to the fp8 dot
-            s = torch.einsum("thd,nhd->thn", qs, K.repeat_interleave(g, dim=1))
+            s = torch.einsum("thd,khd->thk", qs, K.repeat_interleave(g, dim=1))
             s *= sm_scale
             pos = torch.arange(r0, E, device=device) + P
             kpos = torch.arange(P + E, device=device)
             s.masked_fill_((kpos[None, :] > pos[:, None])[:, None, :], float("-inf"))
             ref = torch.einsum(
-                "thn,nhd->thd", torch.softmax(s, -1), V.repeat_interleave(g, dim=1)
+                "thk,khd->thd", torch.softmax(s, -1), V.repeat_interleave(g, dim=1)
             )
             err_ref = max(err_ref, (o[rows].float() - ref).abs().max().item())
             err_tri = max(err_tri, (o_ref[rows].float() - ref).abs().max().item())
