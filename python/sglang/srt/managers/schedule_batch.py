@@ -2082,10 +2082,8 @@ def set_mamba_track_indices_from_reqs(
     same positions already staged on device (batch.mamba_spec_track_positions),
     which saves the per-step H2D copy.
     """
-    req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+    # (num_reqs, ping_pong_size), int64, on device
     if track_positions is None:
         track_positions = mamba_track_positions_from_reqs(batch.reqs)
     batch.mamba_track_buffer_indices = list(track_positions)
@@ -2096,10 +2094,10 @@ def set_mamba_track_indices_from_reqs(
             track_positions,
             dtype=torch.int64,
             pin_memory=True,
-        ).to(device=all_buffers.device, non_blocking=True)
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx.unsqueeze(1)).squeeze(1).to(torch.int64)
-    )
+        ).to(device=mapping.device, non_blocking=True)
+    # One gather: mapping[req, position] per request, instead of materializing
+    # the [bs, ping_pong_size] rows and gathering a column out of them.
+    batch.mamba_track_indices = mapping[batch.req_pool_indices, idx].to(torch.int64)
 
 
 def release_req(
