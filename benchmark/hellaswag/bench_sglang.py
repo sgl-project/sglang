@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from sglang.utils import read_jsonl
 
 
 def get_one_example(lines, i, include_answer):
@@ -33,10 +33,15 @@ def main(args):
 
     # Read data
     data_path = args.data_path
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    if not os.path.isfile(data_path):
-        data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
+    if os.path.isfile(data_path):
+        lines = list(read_jsonl(data_path))
+    else:
+        from datasets import load_dataset
+
+        lines = [
+            {**ex, "label": int(ex["label"])}
+            for ex in load_dataset("Rowan/hellaswag", split="validation")
+        ]
 
     # Construct prompts
     num_questions = args.num_questions
