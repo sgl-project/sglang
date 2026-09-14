@@ -796,12 +796,13 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
-                # For logits and logprobs post processing, thus we do not care
+                # Logits/logprobs use the parent after child hidden states merge.
                 temperature=None,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+                extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
