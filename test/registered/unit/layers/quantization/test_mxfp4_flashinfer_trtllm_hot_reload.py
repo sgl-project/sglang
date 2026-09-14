@@ -35,6 +35,15 @@ INTERMEDIATE_SIZE = 64
 
 
 class _NoOpFp8:
+    """Stand-in for the wrapped ``Fp8MoEMethod``.
+
+    On the FlashInfer MXFP4 backend the real ``process_weights_after_loading``
+    only re-views the FP4 payloads as ``int8`` and returns before any scale
+    transform, so running it a second time is a no-op and this test can leave
+    it out. If that branch ever starts transforming weights or scales, the
+    reload contract below must be checked with the real method instead.
+    """
+
     def process_weights_after_loading(self, layer: Module) -> None:
         pass
 

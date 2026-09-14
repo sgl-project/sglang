@@ -143,7 +143,11 @@ def test_hash_topk_capture_masks_padded_tokens(monkeypatch):
     def mask_padded_rows(topk_ids, num_token_non_padded, fill_value=-1):
         topk_ids[int(num_token_non_padded.item()) :].fill_(fill_value)
 
+    # ``hash_topk`` imported the helper by name, so it holds its own reference.
     monkeypatch.setattr(topk_module, "_mask_topk_ids_padded_region", mask_padded_rows)
+    monkeypatch.setattr(
+        hash_topk_module, "_mask_topk_ids_padded_region", mask_padded_rows
+    )
 
     topk = HashTopK(
         topk=2,

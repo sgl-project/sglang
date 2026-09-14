@@ -56,18 +56,27 @@ _EXPERT_PARAMS = (
 )
 
 
+# Parameter attributes that must follow an expert weight across rebinds:
+# ``weight_loader`` and ``quant_method`` drive ``load_weights`` dispatch, and
+# ``_skip_weight_check`` marks tensors the weight checker must ignore. Layout
+# facts such as ``format_ue8m0`` describe the load layout only and are set
+# afresh by ``create_weights``.
+_REBOUND_ATTRS = ("weight_loader", "quant_method", "_skip_weight_check")
+
+
 def _rebind(layer: Module, name: str, value: torch.Tensor) -> None:
-    """Replace a parameter's payload, carrying over the attributes it was created with.
+    """Replace a parameter's payload, carrying over its loader-facing attributes.
 
     The kernel layout differs in dtype and extent from the layout weights are
     loaded in, so the parameter object has to be replaced rather than written
-    through. ``create_weights`` installs the loader attributes that
-    ``load_weights`` dispatches on, and weights are loaded again on every
-    online update, so those attributes have to survive each rebuild.
+    through. Weights are loaded again on every online update, so the attributes
+    ``load_weights`` dispatches on have to survive each rebuild.
     """
     old = getattr(layer, name)
     new = Parameter(value, requires_grad=False)
-    new.__dict__.update(old.__dict__)
+    for attr in _REBOUND_ATTRS:
+        if hasattr(old, attr):
+            setattr(new, attr, getattr(old, attr))
     setattr(layer, name, new)
 
 
