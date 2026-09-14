@@ -191,6 +191,7 @@ def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
 
 class NEOChatModel(PreTrainedModel):
     config_class = NEOChatConfig
+    lora_param_names_mapping: dict = {}
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
