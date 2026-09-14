@@ -425,23 +425,19 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    # Prefer the standard path (transformer pre-registered in cache-dit). For
-    # models absent from the registry, fall back to a manual BlockAdapter (see
-    # _build_custom_block_adapter).
-    custom_adapter = None
-    if not BlockAdapterRegister.is_supported(transformer):
-        custom_adapter = _build_custom_block_adapter(
-            transformer, has_separate_cfg=has_separate_cfg
+    # Native forward contracts take precedence over cache-dit's family-name matching.
+    custom_adapter = _build_custom_block_adapter(
+        transformer, has_separate_cfg=has_separate_cfg
+    )
+    if custom_adapter is None and not BlockAdapterRegister.is_supported(transformer):
+        transformer_cls_name = transformer.__class__.__name__
+        raise ValueError(
+            f"{transformer_cls_name} is not officially supported by cache-dit. "
+            "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
+            "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
+            "Please ensure your transformer belongs to one of these families or "
+            "define a custom BlockAdapter."
         )
-        if custom_adapter is None:
-            transformer_cls_name = transformer.__class__.__name__
-            raise ValueError(
-                f"{transformer_cls_name} is not officially supported by cache-dit. "
-                "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
-                "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
-                "Please ensure your transformer belongs to one of these families or "
-                "define a custom BlockAdapter."
-            )
 
     # Build cache config (including SCM fields if provided)
     cache_config = DBCacheConfig(
