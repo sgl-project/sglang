@@ -244,6 +244,25 @@ class CompressedTensorsConfig(QuantizationConfig):
                     use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            try:
+                scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            except ValueError:
+                scheme = None
+            # Only WNA16 registers weight_packed; others (W8A8-fp8/int8,
+            # W8A16-fp8) register `weight` and would be silently miscomputed
+            # by _compute_lm_head's hasattr("weight") matmul short-circuit.
+            if isinstance(scheme, CompressedTensorsWNA16):
+                layer.scheme = scheme
+                return CompressedTensorsLinearMethod(self)
+            elif scheme is not None:
+                logger.warning_once(
+                    f"ParallelLMHead quantization with {type(scheme).__name__} is "
+                    "not supported (lm_head would be computed without weight_scale); "
+                    "loading lm_head unquantized."
+                )
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
