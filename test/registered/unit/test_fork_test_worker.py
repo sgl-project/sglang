@@ -11,7 +11,7 @@ from sglang.test.ci import fork_test_worker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "fork requires a POSIX platform")
@@ -37,27 +37,32 @@ class TestForkTestWorker(CustomTestCase):
                 os.fdopen(result_read_fd) as result_stream,
             ):
                 first = Path(tmpdir) / "first.py"
-                first.write_text(textwrap.dedent("""
+                first.write_text(
+                    textwrap.dedent("""
                         import builtins
                         import os
 
                         builtins._sglang_fork_worker_marker = 41
                         os.environ["SGLANG_FORK_WORKER_TEST"] = "leaked"
                         raise SystemExit(0)
-                        """))
+                        """)
+                )
                 second = Path(tmpdir) / "second.py"
-                second.write_text(textwrap.dedent("""
+                second.write_text(
+                    textwrap.dedent("""
                         import builtins
                         import os
 
                         assert not hasattr(builtins, "_sglang_fork_worker_marker")
                         assert "SGLANG_FORK_WORKER_TEST" not in os.environ
                         raise SystemExit(3)
-                        """))
+                        """)
+                )
                 helper = Path(tmpdir) / "sibling_helper.py"
                 helper.write_text("VALUE = 42\n")
                 sibling_import = Path(tmpdir) / "sibling_import.py"
-                sibling_import.write_text(textwrap.dedent("""
+                sibling_import.write_text(
+                    textwrap.dedent("""
                         import os
                         import sys
 
@@ -65,7 +70,8 @@ class TestForkTestWorker(CustomTestCase):
 
                         assert sys.path[0] == os.path.dirname(__file__)
                         assert VALUE == 42
-                        """))
+                        """)
+                )
 
                 results = []
                 for filename in (first, second, sibling_import):

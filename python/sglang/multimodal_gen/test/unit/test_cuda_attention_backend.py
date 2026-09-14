@@ -1,7 +1,8 @@
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -85,6 +86,71 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             self.resolve(AttentionBackendEnum.AITER),
             "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
         )
+
+    def test_direct_cube_sparse_selection(self):
+        self.assertEqual(
+            self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN),
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "cube_sparse_attn.CubeSparseAttentionBackend",
+        )
+
+    def test_blackwell_cube_selection_initializes_fa4_for_token_refiner(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        module_name = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        )
+        fake_flash_attn = ModuleType(module_name)
+        fake_flash_attn.set_fa_ver = Mock()
+
+        with patch.dict("sys.modules", {module_name: fake_flash_attn}):
+            self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_sm120_uses_fa4(self):
+        FakeCudaPlatform.is_sm120_device = True
+        FakeCudaPlatform.device_capability = DeviceCapability(12, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_ampere_keeps_fa3(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_not_called()
+
+    def test_hybrid_window_h3_rejects_unsupported_capability(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(7, 5)
+
+        with self.assertRaisesRegex(ValueError, "12.0"):
+            self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
 
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
@@ -184,16 +250,30 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             ):
                 _SpargeAttentionBackendResolver.resolve(FakeCudaPlatform)
 
-    def test_explicit_backend_rejected_by_a_model_fails_closed(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
+    def test_explicit_backend_is_not_rejected_by_model_preferences(self):
+        class FakeAITERBackend:
+            @classmethod
+            def get_enum(cls):
+                return AttentionBackendEnum.AITER
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_name",
+                return_value=FakeAITERBackend,
+            ),
         ):
-            _cached_get_attn_backend(
+            backend = _cached_get_attn_backend(
                 128,
                 torch.float16,
                 (AttentionBackendEnum.FA,),
-                AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.AITER,
             )
+
+        self.assertEqual(backend.get_enum(), AttentionBackendEnum.AITER)
 
 
 if __name__ == "__main__":

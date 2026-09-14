@@ -122,7 +122,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
         )
     if weight.shape[0] % 128 != 0:
         raise ValueError(
-            "Fused NVFP4 SwiGLU requires FC1 N % 128 == 0, " f"got N={weight.shape[0]}."
+            f"Fused NVFP4 SwiGLU requires FC1 N % 128 == 0, got N={weight.shape[0]}."
         )
 
     # FLUX.2 stores [gate; up].  The kernel consumes 64-row groups in
@@ -322,10 +322,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            logger.info("Detected nvfp4 checkpoint.")
         self.group_size = group_size
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
