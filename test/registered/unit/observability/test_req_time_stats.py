@@ -28,6 +28,25 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
+    def test_empty_round_trip_restores_queue_breakdown_defaults(self):
+        restored = pickle.loads(pickle.dumps(rts.SchedulerReqTimeStats()))
+
+        meta_info = restored.convert_to_output_meta_info()
+
+        self.assertEqual(meta_info["queue_reason_durations"], {})
+        self.assertEqual(meta_info["queue_reason_checks"], {})
+
+    def test_queue_breakdown_marks_timing_data_for_serialization(self):
+        stats = rts.SchedulerReqTimeStats()
+        stats.set_wait_queue_entry_time(1.0)
+
+        restored = pickle.loads(pickle.dumps(stats))
+
+        self.assertTrue(restored.has_timing_data)
+        self.assertEqual(
+            restored.queue_reason_checks, {"awaiting_scheduler_check": 1}
+        )
+
     def test_two_hop_round_trip(self):
         src = rts.SchedulerReqTimeStats()
         src.enable_metrics = True
