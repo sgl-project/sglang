@@ -44,6 +44,9 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
@@ -876,11 +879,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not self._can_dynamic_batch(base_req, req):
                 return None
 
+        dynamic_batch_seeds: list[int | list[int]] = []
+        try:
+            for req in reqs:
+                if max(1, int(req.num_outputs_per_prompt or 1)) == 1:
+                    dynamic_batch_seeds.append(
+                        normalize_output_seeds(
+                            req.seed,
+                            num_outputs_per_prompt=1,
+                        )[0]
+                    )
+                else:
+                    dynamic_batch_seeds.append(req.seed)
+        except (TypeError, ValueError):
+            return None
+
         merged_req = deepcopy(base_req)
         merged_req.prompt = [req.prompt for req in reqs]
 
         merged_req.extra = deepcopy(merged_req.extra)
-        merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
+        merged_req.extra["dynamic_batch_seeds"] = dynamic_batch_seeds
         merged_req.return_file_paths_only = base_req.return_file_paths_only
         if merged_req.return_file_paths_only:
             dynamic_output_paths: list[str] = []
