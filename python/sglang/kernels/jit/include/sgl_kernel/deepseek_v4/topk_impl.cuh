@@ -194,9 +194,7 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
-  // Added to every selected position by `emit`: the row's output offset in ragged
-  // mode, or the ROCm packed-row undo of the round-down of `in`. Never both.
-  int32_t bias = 0;
+  int32_t bias = 0;  // needed by ragged mode
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
