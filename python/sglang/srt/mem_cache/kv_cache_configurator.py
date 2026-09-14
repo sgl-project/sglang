@@ -1618,6 +1618,18 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ]
+        # WQ Hopper DCP: the target's MLA KV is owner-striped (each rank stores
+        # 1/dcp of the tokens at physical loc // dcp), but the DSA index-K
+        # cache stays REPLICATED and is addressed by the allocator's untranslated
+        # virtual locs, which span [0, (size + page) * dcp). Size it for that
+        # space (same shape of override HiSparse uses for its host ratio). The
+        # draft pool is already virtual-sized via loc_space_scale. The matching
+        # memory budget lives in pool_configurator._compute_dsa_indexer_cell_size.
+        _dcp_size = get_parallel().attn_dcp_size
+        if _dcp_size > 1 and not self.is_draft_worker:
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens + self.pool_page_size
+            ) * _dcp_size
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
