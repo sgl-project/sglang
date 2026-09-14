@@ -933,10 +933,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # chunk_gated_delta_rule would otherwise L2-normalize Q and K in two
         # extra launches; folding the norm into the split also drops the Q/K
         # round-trip through HBM. Speculative verify keeps the plain split
-        # because its kernels normalize internally.
+        # because its kernels normalize internally. Only TritonGDNKernel.extend
+        # reads qk_l2norm_applied -- every other extend swallows it in **kwargs
+        # and would normalize a second time -- so require it explicitly rather
+        # than inferring it from the platform.
         qk_l2norm_applied = (
             use_fused_split
             and is_hip()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not is_target_verify
             and layer.num_q_heads == layer.num_k_heads
             and layer.head_q_dim == layer.head_k_dim

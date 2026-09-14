@@ -213,12 +213,8 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 torch.testing.assert_close(v, v_ref, rtol=0, atol=0)
                 # Fusing the norm changes the reduction block shape, so Q/K
                 # land within an ulp of the two-launch path rather than on it.
-                torch.testing.assert_close(
-                    q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3
-                )
-                torch.testing.assert_close(
-                    k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3
-                )
+                torch.testing.assert_close(q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3)
                 for normalized in (q, k):
                     norms = normalized.float().pow(2).sum(-1).sqrt()
                     torch.testing.assert_close(
@@ -251,6 +247,31 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     rtol=0,
                     atol=0,
                 )
+
+    def test_fused_split_l2norm_post_conv_layout(self):
+        # forward_extend passes the post-conv tensor, a [T, qkv_dim] view of a
+        # [qkv_dim, T] allocation, so the head dim is the strided axis rather
+        # than the contiguous one. Head counts come from
+        # cdiv(num_k_heads, attn_tp_size) and need not be a power of two.
+        for num_qk in (8, 6):
+            with self.subTest(num_qk=num_qk):
+                num_v, head, tokens = 4 * num_qk, self.HEAD_DIM, 17
+                qkv_dim = 2 * num_qk * head + num_v * head
+                mixed_qkv = torch.randn(
+                    qkv_dim, tokens, dtype=torch.bfloat16, device="cuda"
+                ).transpose(0, 1)
+                self.assertEqual(mixed_qkv.stride(), (1, tokens))
+
+                q_ref, k_ref, v_ref = fused_qkv_split_gdn_prefill(
+                    mixed_qkv, num_qk, num_qk, num_v, head, head, head
+                )
+                q, k, v = fused_qkv_split_l2norm_gdn_prefill(
+                    mixed_qkv, num_qk, num_v, head, head
+                )
+
+                torch.testing.assert_close(v, v_ref, rtol=0, atol=0)
+                torch.testing.assert_close(q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3)
 
     def test_qwen35_tp2_ratio4_views_and_empty_batch(self):
         num_qk, num_v, head = 8, 32, 128
