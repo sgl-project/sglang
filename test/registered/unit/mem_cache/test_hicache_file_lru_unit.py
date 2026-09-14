@@ -1,7 +1,7 @@
 """
 Unit tests for HiCacheFile LRU/eviction logic (max_size cap, free-space
-watermark, MLA owner gating, pre-reservation under concurrency) and the
-CP-aware file-key suffix.
+watermark, MLA owner gating, pre-reservation under concurrency) and CP-aware
+rank-sharded/shared file-key suffixes.
 
 The eviction logic lives in ``LRUFileEvictor`` (mem_cache/storage/file/); these
 tests drive it end-to-end through ``HiCacheFile`` and inspect the wired-up
@@ -49,6 +49,7 @@ def _make_config(
     attn_cp_rank=0,
     attn_cp_size=1,
     is_mla=False,
+    use_shared_cp_storage=False,
     model="testmodel",
     extra_config=None,
 ) -> HiCacheStorageConfig:
@@ -64,6 +65,7 @@ def _make_config(
         is_page_first_layout=True,
         model_name=model,
         extra_config=extra_config,
+        use_shared_cp_storage=use_shared_cp_storage,
     )
 
 
@@ -84,6 +86,7 @@ class _BackendBuilder:
         attn_cp_rank=0,
         attn_cp_size=1,
         is_mla=False,
+        use_shared_cp_storage=False,
         model="testmodel",
         subdir=None,
         metadata_ttl=None,
@@ -101,6 +104,7 @@ class _BackendBuilder:
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
             is_mla=is_mla,
+            use_shared_cp_storage=use_shared_cp_storage,
             model=model,
             extra_config={
                 "max_size": max_size,
@@ -273,7 +277,65 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
 
 
 class TestCPSuffix(HiCacheFileLRUTestBase):
-    """Distinct CP ranks must not share a file key."""
+    """CP-sharded caches stay isolated; replicated caches share one namespace."""
+
+    def test_controller_shared_cp_storage_scope(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = mock.Mock(layout="page_first")
+        controller.enable_storage_metrics = False
+        parallel = mock.Mock(attn_tp_rank=0, attn_tp_size=1, pp_rank=0)
+
+        for backend, is_dsv4, supports_shared_cp, cp_rank, cp_size, pp_size, shared in [
+            ("file", True, True, 0, 8, 1, True),
+            ("file", True, True, 7, 8, 1, True),
+            ("file", True, True, 0, 1, 1, False),
+            ("file", True, True, 7, 8, 2, False),
+            ("mooncake", True, True, 7, 8, 1, False),
+            ("file", True, False, 7, 8, 1, False),
+            ("file", False, False, 7, 8, 1, False),
+        ]:
+            with self.subTest(
+                backend=backend,
+                is_dsv4=is_dsv4,
+                supports_shared_cp=supports_shared_cp,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                pp_size=pp_size,
+            ):
+                pool_cls = DeepSeekV4TokenToKVPool if is_dsv4 else MLATokenToKVPool
+                controller.mem_pool_device = mock.Mock(spec=pool_cls)
+                controller.mem_pool_device.supports_hicache_shared_cp_storage = (
+                    supports_shared_cp
+                )
+                controller.get_attn_cp_rank_and_size = mock.Mock(
+                    return_value=(cp_rank, cp_size)
+                )
+                parallel.pp_size = pp_size
+                with (
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.get_parallel",
+                        return_value=parallel,
+                    ),
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.get_attention_dp_rank",
+                        return_value=0,
+                    ),
+                ):
+                    cfg = controller._generate_storage_config(backend)
+
+                self.assertEqual(cfg.use_shared_cp_storage, shared)
+                self.assertEqual(cfg.is_storage_owner, not shared or cp_rank == 0)
+                if backend == "file":
+                    b = HiCacheFile(cfg, file_path=self.tmpdir)
+                    self.assertEqual(b._evictor.is_storage_owner, cfg.is_storage_owner)
 
     def test_cp_disabled_has_no_cp_suffix(self):
         b = self.make_backend(attn_cp_size=1, attn_cp_rank=0)
@@ -295,6 +357,48 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+        self.assertTrue(b0._evictor.is_storage_owner)
+        self.assertTrue(b1._evictor.is_storage_owner)
+
+    def test_pp_suffix_is_unchanged(self):
+        cfg = _make_config(is_mla=True, pp_rank=1, pp_size=2)
+        b = HiCacheFile(cfg, file_path=self.tmpdir)
+        self.assertEqual(b.config_suffix, "_testmodel_2_1")
+
+    def test_shared_cp_storage_uses_one_namespace(self):
+        b0 = self.make_backend(
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=0,
+            attn_cp_size=8,
+            subdir="shared",
+        )
+        b7 = self.make_backend(
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=7,
+            attn_cp_size=8,
+            subdir="shared",
+        )
+        self.assertEqual(b0.config_suffix, b7.config_suffix)
+        self.assertTrue(b0.config_suffix.endswith("_cpfull_8"))
+        value = _t(32, fill=7)
+        self.assertTrue(b0.set("shared", value))
+        self.assertTrue(b7.exists("shared"))
+        torch.testing.assert_close(b7.get("shared", _t(32)), value)
+        self.assertEqual(len(os.listdir(b0.file_path)), 1)
+
+    def test_shared_cp_storage_does_not_read_ranked_namespace(self):
+        b = self.make_backend(
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=0,
+            attn_cp_size=8,
+        )
+        ranked_suffix = b.config_suffix.replace("_cpfull_8", "_cp0_8")
+        with open(os.path.join(b.file_path, f"key{ranked_suffix}.bin"), "wb") as f:
+            f.write(b"stale")
+        self.assertFalse(b.exists("key"))
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
@@ -328,6 +432,46 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
         self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
+
+    def test_shared_cp_storage_only_cp0_owns_eviction(self):
+        b0 = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=0,
+            attn_cp_size=8,
+            subdir="shared-owner",
+        )
+        b1 = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=1,
+            attn_cp_size=8,
+            subdir="shared-owner",
+        )
+        self.assertTrue(b0._evictor.is_storage_owner)
+        self.assertTrue(b0._evictor.enabled)
+        self.assertFalse(b1._evictor.is_storage_owner)
+        self.assertFalse(b1._evictor.enabled)
+        self.assertTrue(b0.set("shared", _t(50)))
+        self.assertIsNotNone(b1.get("shared", _t(50)))
+        self.assertFalse(b1.set("non-owner", _t(50)))
+        self.assertEqual(b0._evictor._total_bytes, 50)
+        self.assertEqual(b1._evictor._total_bytes, 0)
+
+    def test_shared_cp_storage_still_requires_tp0(self):
+        b = self.make_backend(
+            max_size="200",
+            tp_rank=1,
+            tp_size=2,
+            is_mla=True,
+            use_shared_cp_storage=True,
+            attn_cp_rank=0,
+            attn_cp_size=4,
+        )
+        self.assertFalse(b._evictor.is_storage_owner)
+        self.assertFalse(b._evictor.enabled)
 
 
 class TestTrackOrTouch(HiCacheFileLRUTestBase):
