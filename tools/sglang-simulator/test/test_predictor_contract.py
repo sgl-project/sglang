@@ -11,9 +11,10 @@ from sglang_simulator.simulation.manager.env import Envs
 from sglang_simulator.simulation.manager.state import StateManager
 from sglang_simulator.simulation.sglang.scheduler import (
     build_predictor_batch,
+    effective_cpu_overhead,
     predict_schedule_batch,
 )
-from sglang_simulator.simulation.types import SchedulerConfig
+from sglang_simulator.simulation.types import SchedulerConfig, SimulationMode
 from sglang_simulator.spec.accelerator import AcceleratorInfo
 from sglang_simulator.spec.model import ModelInfo
 from sglang_simulator.time_predictor import PredictorError, ScheduleBatch
@@ -51,6 +52,33 @@ def test_simulator_disables_unmodeled_speculative_forwards():
     server_args = SimpleNamespace(speculative_algorithm="EAGLE")
     apply_simulator_server_args(server_args)
     assert server_args.speculative_algorithm is None
+
+
+def test_cpu_bootstrap_masks_rocm_runtime(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from usercustomize import apply_cpu_simulation_compat
+
+    monkeypatch.setenv("SGLANG_SIMULATOR_BOOTSTRAP", "1")
+    monkeypatch.setenv("SGLANG_USE_CPU_ENGINE", "1")
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (0, 0))
+
+    apply_cpu_simulation_compat()
+
+    assert torch.cuda.is_available() is False
+    assert torch.cuda.get_device_capability() == (10, 0)
+    assert torch.version.hip is None
+
+
+def test_cpu_bootstrap_stubs_quantization_registry():
+    from sglang_simulator.simulation.sglang import sgl_kernel_hook
+
+    sgl_kernel_hook.install_quantization_stub()
+    quantization = sys.modules["sglang.srt.layers.quantization"]
+
+    assert "fp8" in quantization.QUANTIZATION_METHODS
+    assert quantization.__path__
 
 
 def test_predictor_paths_resolve_from_config_directory(tmp_path, monkeypatch):
@@ -128,7 +156,7 @@ def test_prepared_extend_metadata_is_authoritative():
 
 def test_prepared_decode_metadata_is_authoritative():
     batch = _batch("DECODE", seq_lens_cpu=[100, 201])
-    assert build_predictor_batch(batch).request_info() == [[1, 100], [1, 201]]
+    assert build_predictor_batch(batch).request_info() == [[1, 99], [1, 200]]
 
 
 def test_idle_batch_makes_no_predictor_work():
@@ -157,3 +185,23 @@ def test_invalid_prediction_does_not_count_or_advance_time():
     assert exc_info.value.code == "invalid_provider_output"
     assert StateManager.get_iteration() == 0
     assert StateManager.get_global_clock() == 0
+
+
+def test_offline_cpu_overhead_excludes_predictor_wall_time():
+    assert effective_cpu_overhead(
+        now=12.0,
+        last_real_time=10.0,
+        blocked_l2_wall_duration=0.0,
+        predictor_wall_duration=1.75,
+        mode=SimulationMode.OFFLINE,
+    ) == pytest.approx(0.25)
+
+
+def test_blocking_cpu_overhead_uses_post_sleep_timestamp():
+    assert effective_cpu_overhead(
+        now=12.0,
+        last_real_time=11.8,
+        blocked_l2_wall_duration=0.1,
+        predictor_wall_duration=1.75,
+        mode=SimulationMode.BLOCKING,
+    ) == pytest.approx(0.1)

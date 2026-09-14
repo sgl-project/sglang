@@ -235,6 +235,26 @@ Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values.
 InferCast currently predicts only reduced `P == 0`; non-zero `P` reaches the
 extend API and fails explicitly without fallback latency or time advancement.
 
+For a CPU-only DeepSeek-R1 smoke against the MI350X TP4/EP2 silicon slice,
+replace the systems root and provider revision in
+[`examples/sim_configs/infercast_deepseek_r1_mi350x.json`](examples/sim_configs/infercast_deepseek_r1_mi350x.json),
+then run:
+
+```bash
+python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py \
+  --model-path /path/to/deepseek-r1-config \
+  --sim-config tools/sglang-simulator/examples/sim_configs/infercast_deepseek_r1_mi350x.json \
+  --output-dir /tmp/deepseek-r1-simulator \
+  --output /tmp/deepseek-r1-simulator.json \
+  --input-length 1024 \
+  --output-length 4 \
+  --num-requests 4
+```
+
+The model path only needs the DeepSeek-R1 `config.json`; weights are loaded in
+dummy mode. This runner disables radix caching and chunked prefill because
+InferCast does not yet model non-zero prefixes.
+
 ## Workload formats
 
 The Autobench trace format uses timestamps in milliseconds:
