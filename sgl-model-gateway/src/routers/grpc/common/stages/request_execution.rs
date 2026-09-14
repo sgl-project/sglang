@@ -128,6 +128,17 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
+        let worker = workers.single().cloned().ok_or_else(|| {
+            error!(
+                function = "execute_single",
+                "Expected single worker but got dual"
+            );
+            error::internal_error(
+                "expected_single_worker_got_dual",
+                "Expected single worker but got dual",
+            )
+        })?;
+
         let client = clients.single_mut().ok_or_else(|| {
             error!(
                 function = "execute_single",
@@ -139,22 +150,29 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let result = client.generate(proto_request).await;
-
-        // Record circuit breaker outcome
-        workers.record_outcome(result.is_ok());
-
-        let stream = result.map_err(|e| {
-            error!(
-                function = "execute_single",
-                error = %e,
-                "Failed to start generation"
-            );
-            error::internal_error(
-                "start_generation_failed",
-                format!("Failed to start generation: {}", e),
-            )
-        })?;
+        // A start failure is terminal at this stage. On start success, the
+        // publication right follows the selected attempt into its body stream.
+        let stream = match client.generate(proto_request).await {
+            Ok(mut stream) => {
+                stream.attach_breaker_receipt(worker).map_err(|message| {
+                    error!(function = "execute_single", %message);
+                    error::internal_error("breaker_receipt_attach_failed", message)
+                })?;
+                stream
+            }
+            Err(e) => {
+                worker.record_outcome(false);
+                error!(
+                    function = "execute_single",
+                    error = %e,
+                    "Failed to start generation"
+                );
+                return Err(error::internal_error(
+                    "start_generation_failed",
+                    format!("Failed to start generation: {}", e),
+                ));
+            }
+        };
 
         Ok(ExecutionResult::Single { stream })
     }
@@ -281,3 +299,6 @@ impl RequestExecutionStage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
