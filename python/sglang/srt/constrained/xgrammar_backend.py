@@ -58,6 +58,68 @@ logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
+def has_xgrammar_unsupported_pattern_length_combination(schema: dict) -> bool:
+    """Whether a schema combines ``pattern`` with a string length bound.
+
+    XGrammar can compile both keywords independently, but currently drops the
+    length bound when they occur in the same string schema. Rejecting this
+    combination prevents constrained decoding from silently violating the
+    input schema.
+    """
+
+    schema_array_keywords = ("allOf", "anyOf", "oneOf", "prefixItems")
+    schema_keywords = (
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    )
+    schema_map_keywords = (
+        "$defs",
+        "dependentSchemas",
+        "definitions",
+        "patternProperties",
+        "properties",
+    )
+
+    def check_schema(obj) -> bool:
+        if not isinstance(obj, dict):
+            return False
+
+        if "pattern" in obj and ("minLength" in obj or "maxLength" in obj):
+            return True
+
+        for key in schema_keywords:
+            value = obj.get(key)
+            if isinstance(value, dict) and check_schema(value):
+                return True
+            if isinstance(value, list) and any(check_schema(item) for item in value):
+                return True
+
+        for key in schema_array_keywords:
+            value = obj.get(key)
+            if isinstance(value, list) and any(check_schema(item) for item in value):
+                return True
+
+        for key in schema_map_keywords:
+            value = obj.get(key)
+            if isinstance(value, dict) and any(
+                check_schema(item) for item in value.values()
+            ):
+                return True
+
+        return False
+
+    return check_schema(schema)
+
+
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
     # Pin where pinning exists, so the later H2D can be a genuine non_blocking
     # copy (a pageable source silently downgrades it).  MPS torch has no
@@ -339,6 +401,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                schema = json.loads(key_string)
+                if isinstance(
+                    schema, dict
+                ) and has_xgrammar_unsupported_pattern_length_combination(schema):
+                    raise RuntimeError(
+                        "JSON schema combines pattern with minLength or maxLength, "
+                        "which xgrammar cannot enforce together"
+                    )
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
