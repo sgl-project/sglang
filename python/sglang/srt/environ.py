@@ -758,6 +758,9 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    # DeepSeek DSML detectors: reject stray body text and forward malformed
+    # calls as content. Complete-invoke buffering is unchanged.
+    SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS = EnvBool(False)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation
