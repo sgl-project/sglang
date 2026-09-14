@@ -199,6 +199,74 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+# The head64 sm100 decode scheduling constants, and the partition count
+# `num_sm_parts` that goes with them. Not exported, so the fast schedule only
+# runs for the shape they are known for and FlashMLA's own shape check is what
+# catches it if they ever stop matching.
+_FLASHMLA_SCHED_BLOCK_SIZE_N = 64
+_FLASHMLA_SCHED_FIXED_OVERHEAD = 5
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
+    return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
+
+
+def _maybe_precompute_flashmla_sched_meta(
+    flashmla_metadata,
+    *,
+    q: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+) -> None:
+    """Compute FlashMLA's split-KV schedule before it has to.
+
+    `sparse_decode_fwd` builds the schedule itself whenever it is handed none,
+    in a `<<<1, 32>>>` kernel whose partition loop runs on thread 0 and stores
+    each 32-byte entry to global memory. At the 152 partitions of a BS=1 step
+    that is 28 us, and a decode graph replays it on the critical path. Filling
+    the buffers here instead means FlashMLA finds them already populated and
+    skips its kernel; `decoding_sched_meta` produces the same schedule, bit for
+    bit, in about 9 us.
+
+    Only fires where FlashMLA would have computed -- when the scheduler holds no
+    buffers yet -- so this does not add work to the calls that already reuse one.
+    """
+    if flashmla_metadata is None or not envs.SGLANG_DSV41_FAST_FLASHMLA_SCHED.get():
+        return
+    if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
+        return
+    if not _fast_flashmla_sched_shape(q):
+        return
+    from sglang.kernels.ops.attention.dsv4.decoding_sched_meta import (
+        META_INTS,
+        decoding_sched_meta,
+    )
+
+    b, s_q = q.shape[0], q.shape[1]
+    num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
+    num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
+    decoding_sched_meta(
+        meta,
+        num_splits,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
+        topk=indices.shape[-1],
+        extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+    )
+    flashmla_metadata.tile_scheduler_metadata = meta
+    flashmla_metadata.num_splits = num_splits
+
+
 def _expand_index_page_table(
     page_table: torch.Tensor,
     *,
@@ -3731,6 +3799,14 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
+                _maybe_precompute_flashmla_sched_meta(
+                    flashmla_metadata,
+                    q=q,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
                 o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
