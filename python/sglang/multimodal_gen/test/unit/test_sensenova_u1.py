@@ -987,6 +987,19 @@ def _run_shared_and_per_layer(monkeypatch, model, embeds, indicators, indexes):
     return shared, run()
 
 
+# Use different steps so each axis has distinct relative positions.
+# Equal-step sequences differ only by a constant offset, which cancels
+# in same-axis RoPE attention scores and can hide h/w table swaps.
+_AXIS_INDEXES = torch.tensor(
+    [
+        [0, 1, 2, 3, 4],
+        [0, 2, 4, 6, 8],
+        [0, 5, 10, 15, 20],
+    ],
+    dtype=torch.long,
+)
+
+
 def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
     """The end-to-end claim: sharing must not move the output by one bit.
 
@@ -1001,10 +1014,9 @@ def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
     model = Qwen3Model(_tiny_dense_config()).eval()
     embeds = torch.randn(1, 5, _HIDDEN_DIM)
     indicators = torch.ones(1, 5, dtype=torch.bool)
-    indexes = torch.zeros(3, 5, dtype=torch.long)
 
     shared, per_layer = _run_shared_and_per_layer(
-        monkeypatch, model, embeds, indicators, indexes
+        monkeypatch, model, embeds, indicators, _AXIS_INDEXES
     )
 
     assert torch.equal(shared, per_layer)
@@ -1026,10 +1038,9 @@ def test_sensenova_u1_rope_sharing_holds_when_a_norm_promotes_dtype(monkeypatch)
     model = Qwen3Model(_tiny_dense_config()).eval()
     embeds = torch.randn(1, 5, _HIDDEN_DIM, dtype=torch.bfloat16)
     indicators = torch.ones(1, 5, dtype=torch.bool)
-    indexes = torch.zeros(3, 5, dtype=torch.long)
 
     shared, per_layer = _run_shared_and_per_layer(
-        monkeypatch, model, embeds, indicators, indexes
+        monkeypatch, model, embeds, indicators, _AXIS_INDEXES
     )
 
     assert torch.equal(shared, per_layer)
