@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _is_hip = is_hip()
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 # the mi35x suite rather than the default AMD one: the ROCm case below is gfx95-only, and
 # everything else in here skips on HIP, so the mi300 registration only ever produced skips
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")

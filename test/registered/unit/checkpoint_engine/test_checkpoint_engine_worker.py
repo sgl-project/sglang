@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # Unit tests may register CPU suites only (scripts/lint/check_registered_tests.py).
 # TestWorkerDeviceUuidOnXpu below still self-skips off XPU, so it stays runnable
 # by hand on an Intel GPU host.
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import importlib.util
 import unittest

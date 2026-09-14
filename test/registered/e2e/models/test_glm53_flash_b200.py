@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=750, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 DFLASH2_DRAFT_MODEL_PATH = "incoai/GLM-5.3-Flash-DFlash2"

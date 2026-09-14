@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import publish
 from sglang.srt.rust_server.multimodal import rust_mm_family_for  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def processor_cls_for(architecture, model_type):
