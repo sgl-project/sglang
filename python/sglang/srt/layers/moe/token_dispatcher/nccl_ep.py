@@ -624,6 +624,9 @@ class NcclEpDispatcher(BaseDispatcher):
             + self.num_experts
         ) // self.num_experts
 
+        # The native handle borrows routing storage through combine completion.
+        # Staged callers can release DispatchOutput and CombineInput earlier.
+        self._dispatched_topk_ids = topk_ids
         self._dispatched_topk_weights = topk_weights
         self._dispatched_t = t
 
@@ -712,6 +715,7 @@ class NcclEpDispatcher(BaseDispatcher):
                 self._eager_session.__exit__(None, None, None)
                 self._eager_session = None
         self.handle = None
+        del self._dispatched_topk_ids
         del self._combine_intermediate_state
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         return combined

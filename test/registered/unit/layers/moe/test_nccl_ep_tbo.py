@@ -1,6 +1,7 @@
 """Interleaved NCCL EP ownership and real staged MoE compute on one GPU."""
 
 import sys
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +82,54 @@ def make_models(environment, monkeypatch, fused_scaling):
         model.ep_size = 2
         models.append(model)
     return models, ids, factors
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
+def test_staged_tbo_keeps_handle_routing_alive_until_combine_complete(
+    monkeypatch, mode
+):
+    from nccl_ep_test.fake_ep import FakeGroup, FakeHandle
+
+    create_handle = FakeGroup.create_handle
+    complete = FakeHandle.complete
+    completed = []
+
+    def borrow_routing(self, **kwargs):
+        handle = create_handle(self, **kwargs)
+        handle.routing_ref = weakref.ref(handle.ids)
+        # Native Handle borrows the routing allocation; it does not own the
+        # Torch tensor as the default one-rank transport double does.
+        handle.ids = weakref.proxy(handle.ids)
+        return handle
+
+    def check_complete(self, **kwargs):
+        if self.pending == "combine":
+            assert (
+                self.routing_ref() is not None
+            ), "Routing released before combine complete"
+            completed.append(self)
+        return complete(self, **kwargs)
+
+    monkeypatch.setattr(FakeGroup, "create_handle", borrow_routing)
+    monkeypatch.setattr(FakeHandle, "complete", check_complete)
+    with dispatcher_environment(capacity=8) as environment:
+        configure_compute(graph_enabled=False)
+        monkeypatch.setattr(
+            get_resources(), "expert_location_metadata", metadata([[0, 1]] * 2)
+        )
+        with get_flags().moe.override(tbo_enabled=True):
+            models, _, _ = make_models(environment, monkeypatch, False)
+            x = torch.ones(8, 2048, device="cuda", dtype=torch.bfloat16) * 0.125
+            forward_tbo(
+                models,
+                x,
+                split=4,
+                padded=(4, 4),
+                counts=torch.tensor([4, 4], device="cuda"),
+                mode=mode,
+            )
+            assert len(completed) == 4
+            assert all(handle.routing_ref() is None for handle in completed)
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
