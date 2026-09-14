@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.layers.sampler import apply_trace_decode_tokens
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
@@ -546,6 +547,8 @@ class TestFromScheduleBatch(CustomTestCase):
         seed=None,
         stop_ids=None,
         eos_id=2,
+        trace=None,
+        prompt_ids=None,
     ):
         req = MagicMock()
         req.sampling_params.temperature = temp
@@ -559,7 +562,9 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.sampling_seed = seed
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
+        req.sampling_params.trace_decode_token_ids = trace
         req.custom_logit_processor = None
+        req.origin_input_ids = prompt_ids if prompt_ids is not None else [1, 2]
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -669,6 +674,22 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertFalse(mask[1].item())
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+    def test_trace_replay_basic(self):
+        req = self._make_req(trace=[7, 8], prompt_ids=[1, 2, 3])
+        batch = MagicMock(reqs=[req], device=DEVICE)
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        sampled = torch.tensor([0])
+        first = apply_trace_decode_tokens(
+            sampled, info, torch.tensor([2], dtype=torch.int64)
+        )
+        second = apply_trace_decode_tokens(
+            sampled, info, torch.tensor([3], dtype=torch.int64)
+        )
+
+        self.assertTrue(torch.equal(first, torch.tensor([7])))
+        self.assertTrue(torch.equal(second, torch.tensor([8])))
 
 
 if __name__ == "__main__":

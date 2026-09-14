@@ -449,6 +449,16 @@ class TestSamplingParamsNormalize(CustomTestCase):
             f"{MAX_STOP_REGEX_LEN}-byte limit",
         )
 
+    def test_trace_decode_token_ids_basic(self):
+        sampling_params = SamplingParams(trace_decode_token_ids=[7, 8])
+        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize_trace_decode_token_ids(
+            prompt_len=1, context_len=16, vocab_size=32000
+        )
+
+        self.assertEqual(sampling_params.trace_decode_token_ids, [7, 8])
+        self.assertEqual(sampling_params.max_new_tokens, 2)
+
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
     def test_rust_sampling_schema_stays_in_lockstep(self):
