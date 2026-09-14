@@ -142,7 +142,12 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         self.assertIsInstance(ack, PrefetchAck)
         self.assertEqual(ack.rid, "r-1")
 
-    def test_page_backup_write_path_carries_no_request_id(self):
+    def test_page_backup_carries_caller_attribution_not_request_id(self):
+        # Flipped from "...carries_no_request_id": the backup write path now
+        # carries caller_id/caller_role (from the registering backup thread) but
+        # still omits request_id (backup is per-node, not per-request -- plan.md
+        # §8.1). When no hicache root span was exported the trace fields are empty
+        # (scenario 1: Mooncake derives a *virtual* backup root from caller).
         ctrl = _hicache_ctrl(page_size=2)
         captured = {}
 
@@ -156,12 +161,121 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
             hash_value=["h0", "h1", "h2"],
             host_indices=list(range(6)),
             completed_tokens=0,
+            # No trace_id/span_id here: scenario 1 (root span not exported).
         )
-        ctrl._page_backup(op)
+        with mock.patch.object(
+            cc_module,
+            "get_thread_caller_info",
+            return_value=("sglang-tp0", "Backup"),
+        ):
+            ctrl._page_backup(op)
 
         self.assertIsNone(captured["extra"].prefix_keys)
-        # Write path never injects request_id -> extra_info is the default None.
-        self.assertIsNone(captured["extra"].extra_info)
+        # Caller attribution present; request_id absent.
+        self.assertEqual(
+            captured["extra"].extra_info,
+            {"caller_id": "sglang-tp0", "caller_role": "Backup"},
+        )
+        self.assertNotIn("request_id", captured["extra"].extra_info or {})
+
+    def test_storage_hit_query_injects_caller_attribution(self):
+        # Prefetch read path: caller_id/caller_role + request_id are injected,
+        # while trace fields stay empty when the op carries none (scenario 1).
+        ctrl = _hicache_ctrl()
+        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1"])
+        ctrl.storage_backend.batch_exists.return_value = 2
+        op = SimpleNamespace(
+            last_hash=None,
+            token_ids=[1, 2],
+            prefix_keys=None,
+            request_id="r-1",
+        )
+        with mock.patch.object(
+            cc_module,
+            "get_thread_caller_info",
+            return_value=("sglang-tp1", "Prefetch"),
+        ):
+            ctrl._storage_hit_query(op)
+
+        extra = ctrl.storage_backend.batch_exists.call_args[0][1]
+        self.assertEqual(
+            extra.extra_info,
+            {
+                "caller_id": "sglang-tp1",
+                "caller_role": "Prefetch",
+                "request_id": "r-1",
+            },
+        )
+
+    def test_storage_hit_query_forwards_trace_fields_when_exported(self):
+        # Scenario 2: op carries the exported hicache root span's trace_id/span_id
+        # -> they are forwarded alongside caller/request attribution.
+        ctrl = _hicache_ctrl()
+        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1"])
+        ctrl.storage_backend.batch_exists.return_value = 2
+        op = SimpleNamespace(
+            last_hash=None,
+            token_ids=[1, 2],
+            prefix_keys=None,
+            request_id="r-1",
+            trace_id="0" * 31 + "1",  # 32-hex
+            span_id="0" * 15 + "2",  # 16-hex
+        )
+        with mock.patch.object(
+            cc_module,
+            "get_thread_caller_info",
+            return_value=("sglang-tp1", "Prefetch"),
+        ):
+            ctrl._storage_hit_query(op)
+
+        extra = ctrl.storage_backend.batch_exists.call_args[0][1]
+        self.assertEqual(
+            extra.extra_info,
+            {
+                "caller_id": "sglang-tp1",
+                "caller_role": "Prefetch",
+                "request_id": "r-1",
+                "trace_id": "0" * 31 + "1",
+                "span_id": "0" * 15 + "2",
+            },
+        )
+
+    def test_page_backup_forwards_trace_fields_when_exported(self):
+        # Scenario 2 backup: the exported root's trace_id/span_id are forwarded
+        # together with caller attribution (still no request_id).
+        ctrl = _hicache_ctrl(page_size=2)
+        captured = {}
+
+        def fake_set(batch_hashes, batch_host_indices, extra_info):
+            captured["extra"] = extra_info
+            return True
+
+        ctrl.page_set_func = fake_set
+        op = SimpleNamespace(
+            prefix_keys=None,
+            hash_value=["h0", "h1", "h2"],
+            host_indices=list(range(6)),
+            completed_tokens=0,
+            trace_id="0" * 31 + "1",
+            span_id="0" * 15 + "2",
+        )
+        with mock.patch.object(
+            cc_module,
+            "get_thread_caller_info",
+            return_value=("sglang-tp0", "Backup"),
+        ):
+            ctrl._page_backup(op)
+
+        self.assertEqual(
+            captured["extra"].extra_info,
+            {
+                "caller_id": "sglang-tp0",
+                "caller_role": "Backup",
+                "trace_id": "0" * 31 + "1",
+                "span_id": "0" * 15 + "2",
+            },
+        )
+        self.assertNotIn("request_id", captured["extra"].extra_info or {})
 
 
 class TestHybridCacheControllerRequestId(unittest.TestCase):

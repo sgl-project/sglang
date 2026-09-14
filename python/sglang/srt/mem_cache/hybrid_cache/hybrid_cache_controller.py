@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.observability.trace import trace_set_thread_info
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -708,6 +709,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
         )
+        self._init_op_trace(operation, rid=request_id, role="Prefetch")
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1035,6 +1037,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        self._init_op_trace(operation, rid=operation.id, role="Backup")
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1053,12 +1056,13 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             return hash_value, kv_hit_pages * self.page_size
 
+        # Carry caller_id/caller_role + the exported root's trace_id/span_id (when
+        # present) plus request_id to the storage backend (plan.md §7.5).
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={
-                "request_id": operation.request_id,
-                **({"pp_rank": pp_rank} if pp_rank is not None else {}),
-            },
+            extra_info=self._storage_trace_extra(operation, include_request_id=True)
+            | ({"pp_rank": pp_rank} if pp_rank is not None else {})
+            or None,
 
         )
         if operation.pool_transfers:
@@ -1144,7 +1148,10 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=operation.prefix_keys,
-                extra_info={"request_id": operation.request_id},
+                extra_info=self._storage_trace_extra(
+                    operation, include_request_id=True
+                )
+                or None,
             )
             results = self.storage_backend.batch_get_v2(
                 transfers_nonkv, extra_info=extra_info
@@ -1190,9 +1197,18 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            # Sidecar backup (rank-sharded pools) also carries caller + trace so
+            # its mooncake spans correlate to the (real or virtual) backup root;
+            # backup carries no request_id (per-node -- plan.md §8.1).
+            sidecar_extra = HiCacheStorageExtraInfo(
+                prefix_keys=operation.prefix_keys,
+                extra_info=self._storage_trace_extra(
+                    operation, include_request_id=False
+                )
+                or None,
+            )
             results = self.storage_backend.batch_set_v2(
-                backup_transfers, extra_info=extra_info
+                backup_transfers, extra_info=sidecar_extra
             )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
@@ -1249,12 +1265,19 @@ class HybridCacheController(BaseHiCacheController):
         ranks. That optimization is valid for replicated MLA KV, but not for
         hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
+        trace_set_thread_info(
+            "Backup",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
                 self._page_backup(operation)
+                self._finish_op_trace(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
