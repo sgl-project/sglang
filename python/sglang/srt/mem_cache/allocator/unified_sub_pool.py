@@ -2389,12 +2389,15 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         ``side`` boundary and the region bound on that side, relocating the
         minimum set of live boundary pages (holes-first destinations, then the far
         gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
-        means the ask is impossible now, and state is then unchanged.
+        means the ask is unavailable now, including while movement is gated.
         Scheduler-phase only; stream safety is owned HERE, not by the caller --
         the entry settles the in-flight forward before the first copy. Moves at
         most min(L_live, G) pages: every live page when the ask exceeds them.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
+        if self.disagg_move_gate is not None and not self.disagg_move_gate():
+            gap_low, gap_high = self._gap_pages()
+            return (gap_low if side == "low" else gap_high) * self.entry_bytes_per_page
         # Order the copies after the in-flight forward, or they carry pre-write
         # bytes; one wait covers read AND write (the event is post-forward).
         self._settle_inflight_forward()
@@ -2602,9 +2605,12 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     def compact_holes(self, *, retreat_side: str) -> int:
         """Close ALL interior holes by packing live pages toward the side
         OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on
-        ``retreat_side`` by the hole count. Returns pages moved."""
+        ``retreat_side`` by the hole count. Returns pages moved, or zero while
+        movement is gated."""
         assert retreat_side in ("low", "high")
         if self._hole_pages() == 0:
+            return 0
+        if self.disagg_move_gate is not None and not self.disagg_move_gate():
             return 0
         # Settle before the first copy -- see `make_room`.
         self._settle_inflight_forward()
