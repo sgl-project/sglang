@@ -117,7 +117,9 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
                 "latency_s": 10.4,
                 "latency_samples_s": [10.3, 10.4, 10.5],
                 "measurement_count": 3,
+                "server_latency_samples_s": [9.9, 10.0],
                 "server_latency_s": 10.0,
+                "missing_perf_dumps": 1,
                 "server_stage_medians_ms": {
                     "TextEncodingStage": 100.0,
                     "DenoisingStage": 9800.0,
@@ -148,6 +150,8 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     assert baseline == 10.0
     assert count == 3
     assert alerts == []
-    assert "| 3 | **10.40** |" in markdown
+    assert "Incomplete Server Telemetry" in markdown
+    assert "**model**: 2/3 server samples available" in markdown
+    assert "| 3 | 2/3 | **10.40** |" in markdown
     assert "## SGLang Server-Side Breakdown" in markdown
     assert "| model | 10.00 | 0.10 | 9.80 | 0.10 | 196.00 |" in markdown

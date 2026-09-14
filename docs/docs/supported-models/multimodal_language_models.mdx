@@ -302,6 +302,11 @@ SGLang supports video input for Vision-Language Models (VLMs), enabling temporal
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The processor gathers <code>video_data</code>, runs Qwen's frame sampler, and merges the resulting features with text tokens before inference.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Ling-VL</strong> (Ling-3.0-flash-VL)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>inclusionAI/Ling-3.0-flash-VL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>InclusionAI's KDA/MLA hybrid MoE VLM (125B total / ~5.1B active) built on the Ling-3.0-flash backbone with a Qwen3-ViT-family vision tower. Image and video inputs are expanded by the Bailing processor with centered mRoPE positions. Requires <code>--trust-remote-code</code>. Audio is not supported.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GLM-4v</strong> (4.5V, 4.1V, MOE)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zai-org/GLM-4.5V</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video clips are read with Decord, converted to tensors, and passed to the model alongside metadata for rotary-position handling.</td>
