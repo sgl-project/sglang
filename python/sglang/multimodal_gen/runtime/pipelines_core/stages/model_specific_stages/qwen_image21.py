@@ -40,6 +40,8 @@ class QwenImage21InputValidationStage(InputValidationStage):
         return None
 
     def forward(self, batch, server_args):
+        if batch.prompt is None:
+            raise ValueError("Qwen-Image 2.1 requires a prompt to build image-token positions")
         batch = super().forward(batch, server_args)
         if batch.height % 32 or batch.width % 32:
             raise ValueError("Qwen-Image 2.1 height and width must be divisible by 32")

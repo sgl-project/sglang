@@ -189,8 +189,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -208,6 +210,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
@@ -686,7 +689,8 @@ class ServerArgs(DisaggServerArgsMixin):
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
             "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, Qwen/Qwen-Image-2.1, "
+            "SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
