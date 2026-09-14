@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 with patch.dict(
     sys.modules,
@@ -47,7 +48,7 @@ def _metadata(rows=1):
     )
 
 
-class TestMiniCPMAttentionAdapter(unittest.TestCase):
+class TestMiniCPMAttentionAdapter(CustomTestCase):
     def test_flashattention_adapter_owns_kernel_arguments(self):
         expected = torch.ones(1, 1, 1)
         flash_attn_backend = SimpleNamespace(
@@ -196,6 +197,7 @@ class TestMiniCPMAttentionAdapter(unittest.TestCase):
                 head_dim=128,
                 page_size=1,
                 max_kv_tokens_per_row=7,
+                rows_per_req=2,
             )
 
         metadata = _metadata(rows=2)

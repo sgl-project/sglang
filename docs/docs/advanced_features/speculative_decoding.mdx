@@ -405,6 +405,52 @@ print(response.choices[0].message.content)
 
 ---
 
+### MiniCPM-SALA
+
+MiniCPM-SALA provides speculative target interfaces and EAGLE-3 chain
+verification (`--speculative-eagle-topk 1`). Use a draft checkpoint trained
+for the target model; this support does not imply that every speculative
+algorithm can use the target.
+
+Add the following options to your MiniCPM-SALA launch command, preserving
+its model, quantization, and memory settings:
+
+```bash
+--attention-backend minicpm_flashinfer \
+--speculative-algorithm EAGLE3 \
+--speculative-draft-model-path /path/to/matching-eagle3-draft \
+--speculative-draft-attention-backend flashinfer \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4 \
+--disable-radix-cache \
+--disable-prefill-cuda-graph \
+--disable-flashinfer-autotune
+```
+
+Decode CUDA graphs remain enabled. The compressed-key cache is request-local,
+so prefix-cache reuse must remain disabled. Prefill graphs are outside this
+configuration. Set `SGLANG_MINICPM_DENSE_AS_SPARSE=1` to use sparse rows for
+short queries as well; otherwise short queries retain dense attention.
+
+#### MiniCPM-SALA with DSpark
+
+A matching DSpark checkpoint can use the same target and cache configuration.
+Replace the EAGLE options above with:
+
+```bash
+--speculative-algorithm DSPARK \
+--speculative-draft-model-path /path/to/matching-dspark-draft \
+--speculative-draft-attention-backend flashinfer
+```
+
+The draft configuration selects target output layers and the verify width.
+The target exposes its input embedding module and captures those layers before
+final normalization and width scaling. The sparse backend plans compression
+from the saved committed history length, adding the pending verify window once.
+This configuration does not require EAGLE tree support. DSpark is validated at
+TP1; TP2 has not been validated, and pipeline parallelism is not supported.
+
 ## Multi Token Prediction
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).

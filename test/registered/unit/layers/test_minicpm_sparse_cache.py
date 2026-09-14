@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -14,6 +15,8 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache import allocation
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -330,6 +333,60 @@ def test_allocator_reset_rebuilds_reserve():
     pool.reset_aux_cache_allocator()
     assert allocator.available_size() == 39
     assert len(pool._aux_cache.free_slots) == 25
+
+
+def _spec_decode_to_len(pool, req, req_pool_idx, allocator, *, cur_len, nxt_len):
+    """Run alloc_for_spec_decode on CPU;
+    the triton req_to_token writer is patched out since it cannot run on CPU tensors."""
+    tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        is_chunk_cache=lambda: True,
+    )
+    with patch.object(allocation, "assign_req_to_token_pool_func"):
+        alloc_for_spec_decode(
+            tree_cache,
+            pool,
+            reqs=[req],
+            req_pool_indices=torch.tensor([req_pool_idx], dtype=torch.int64),
+            cur_kv_lens=torch.tensor([cur_len], dtype=torch.int64),
+            cur_kv_lens_cpu=torch.tensor([cur_len], dtype=torch.int64),
+            nxt_kv_lens=torch.tensor([nxt_len], dtype=torch.int64),
+            nxt_kv_lens_cpu=torch.tensor([nxt_len], dtype=torch.int64),
+            num_needed_tokens=nxt_len - cur_len,
+            batch=SimpleNamespace(
+                req_pool_indices_cpu=torch.tensor([req_pool_idx], dtype=torch.int64)
+            ),
+        )
+
+
+def test_spec_decode_grows_compressed_tables_to_target_lens():
+    """alloc_for_spec_decode must grow the compressed tables to the target kv lens,
+    or the sparse kernels read aux slots past the last allocation."""
+    pool, req, req_pool_idx, allocator = make_pool_and_req()
+    cache = pool._aux_cache
+    alloc_extend(pool, req_pool_idx, seq_len=8)
+    assert len(cache.free_slots) == 22
+
+    req.kv.kv_allocated_len = 8
+    _spec_decode_to_len(pool, req, req_pool_idx, allocator, cur_len=8, nxt_len=12)
+
+    # Aux growth for seq 12 (kernel_size=4, stride=2) matches the decode path.
+    assert len(cache.free_slots) == 20
+    assert req.kv.kv_allocated_len == 12
+
+
+def test_spec_decode_aux_failure_frees_draft_kv_slots():
+    """A failed aux allocation must free the draft-token KV slots;
+    those were allocated just before it."""
+    pool, req, req_pool_idx, allocator = make_pool_and_req(capacity=18)
+    req.kv.kv_allocated_len = 8
+    available_before = allocator.available_size()
+
+    with pytest.raises(RuntimeError, match="out of reserved slots"):
+        _spec_decode_to_len(pool, req, req_pool_idx, allocator, cur_len=8, nxt_len=16)
+
+    assert allocator.available_size() == available_before
+    assert req.kv.kv_allocated_len == 8
 
 
 def test_attach_compressed_cache_is_idempotent():

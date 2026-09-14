@@ -86,6 +86,7 @@ class MiniCPMFlashInferAdapter:
         head_dim: int,
         page_size: int,
         max_kv_tokens_per_row: int,
+        rows_per_req: int,
     ):
         if not is_flashinfer_available():
             raise RuntimeError("minicpm_flashinfer requires the flashinfer package.")
@@ -104,7 +105,9 @@ class MiniCPMFlashInferAdapter:
         self.q_dtype = model_runner.dtype
         self.kv_dtype = model_runner.kv_cache_dtype
 
-        max_sparse_bs = model_runner.req_to_token_pool.size * head_group_num
+        max_sparse_bs = model_runner.req_to_token_pool.size * rows_per_req
+        # The wrapped backend sizes its own kv_indptr per request; sparse plans one
+        # row per (token, head group), so it must borrow this row-sized buffer.
         self.kv_indptr = torch.zeros(
             max_sparse_bs + 1,
             dtype=torch.int32,
