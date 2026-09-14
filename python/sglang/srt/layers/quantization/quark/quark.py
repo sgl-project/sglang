@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import fnmatch
+import functools
 import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
@@ -383,19 +384,19 @@ class QuarkConfig(QuantizationConfig):
         kept_bf16 = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())
         return not (kept_bf16 & set(prefix.split(".")))
 
-    def _online_fp8_config(self) -> "Fp8Config":
-        cfg = getattr(self, "_online_fp8_config_cache", None)
-        if cfg is None:
-            cfg = Fp8Config(
-                is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
-            )
-            self._online_fp8_config_cache = cfg
-            log_info_on_rank0(
-                logger,
-                "Quark: excluded linear layers are quantized to FP8 at load "
-                f"(skip modules: {sorted(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())})",
-            )
-        return cfg
+    @functools.cached_property
+    def _excluded_online_fp8_config(self) -> "Fp8Config":
+        """The `Fp8Config` shared by the excluded layers served online, built and logged once."""
+        log_info_on_rank0(
+            logger,
+            "Quark: SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1, excluded linear "
+            "layers are quantized to FP8 at load (kept bf16 via "
+            "SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES: "
+            f"{sorted(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())})",
+        )
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -414,7 +415,9 @@ class QuarkConfig(QuantizationConfig):
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
                 if self._serves_excluded_as_online_fp8(prefix):
-                    return Fp8LinearMethod(quant_config=self._online_fp8_config())
+                    return Fp8LinearMethod(
+                        quant_config=self._excluded_online_fp8_config
+                    )
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)

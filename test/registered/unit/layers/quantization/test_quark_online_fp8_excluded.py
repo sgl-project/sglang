@@ -38,14 +38,20 @@ class TestQuarkOnlineFp8Excluded(CustomTestCase):
                 cfg._serves_excluded_as_online_fp8("model.layers.3.self_attn.o_proj")
             )
             # dense MLP of the first layers: quantized ("gate_proj" != "gate")
-            self.assertTrue(cfg._serves_excluded_as_online_fp8("model.layers.0.mlp.gate_proj"))
+            self.assertTrue(
+                cfg._serves_excluded_as_online_fp8("model.layers.0.mlp.gate_proj")
+            )
             # router, lm_head and the indexer projections stay bf16
             self.assertFalse(
-                cfg._serves_excluded_as_online_fp8("model.layers.3.block_sparse_moe.gate")
+                cfg._serves_excluded_as_online_fp8(
+                    "model.layers.3.block_sparse_moe.gate"
+                )
             )
             self.assertFalse(cfg._serves_excluded_as_online_fp8("lm_head"))
             self.assertFalse(
-                cfg._serves_excluded_as_online_fp8("model.layers.3.self_attn.index_qkv_proj")
+                cfg._serves_excluded_as_online_fp8(
+                    "model.layers.3.self_attn.index_qkv_proj"
+                )
             )
 
     def test_custom_skip_list(self):
@@ -53,20 +59,24 @@ class TestQuarkOnlineFp8Excluded(CustomTestCase):
         with envs.SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED.override(True):
             with envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.override("o_proj"):
                 self.assertFalse(
-                    cfg._serves_excluded_as_online_fp8("model.layers.3.self_attn.o_proj")
+                    cfg._serves_excluded_as_online_fp8(
+                        "model.layers.3.self_attn.o_proj"
+                    )
                 )
                 self.assertTrue(
-                    cfg._serves_excluded_as_online_fp8("model.layers.3.block_sparse_moe.gate")
+                    cfg._serves_excluded_as_online_fp8(
+                        "model.layers.3.block_sparse_moe.gate"
+                    )
                 )
 
     def test_online_config_is_dynamic_unserialized(self):
         cfg = _bare_config()
-        fp8 = cfg._online_fp8_config()
+        fp8 = cfg._excluded_online_fp8_config
         self.assertIsInstance(fp8, Fp8Config)
         self.assertFalse(fp8.is_checkpoint_fp8_serialized)
         self.assertEqual(fp8.activation_scheme, "dynamic")
         self.assertIsNone(fp8.weight_block_size)
-        self.assertIs(cfg._online_fp8_config(), fp8)
+        self.assertIs(cfg._excluded_online_fp8_config, fp8)
 
 
 if __name__ == "__main__":
