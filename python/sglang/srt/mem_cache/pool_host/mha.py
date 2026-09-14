@@ -28,6 +28,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.hardware_backend.xpu.hicache import backup_to_host as xpu_backup_to_host
+from sglang.srt.hardware_backend.xpu.hicache import load_to_device as xpu_load_to_device
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -262,7 +264,22 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             host_layer_id = device_layer_id = layer_id
 
-        if io_backend == "kernel":
+        if io_backend == "xpu":
+            if self.layout != "layer_first":
+                raise ValueError("XPU HiCache only supports layer_first layout")
+            xpu_load_to_device(
+                host_tensors=[
+                    self.k_buffer[host_layer_id],
+                    self.v_buffer[host_layer_id],
+                ],
+                device_tensors=[
+                    device_pool.k_buffer[device_layer_id],
+                    device_pool.v_buffer[device_layer_id],
+                ],
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        elif io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer(
@@ -410,7 +427,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                 device_v_buffers,
             ) = self._resolve_device_transfer_buffers(device_pool)
             device_kv_buffers = device_k_buffers + device_v_buffers
-        if io_backend == "kernel":
+        if io_backend == "xpu":
+            if self.layout != "layer_first":
+                raise ValueError("XPU HiCache only supports layer_first layout")
+            xpu_backup_to_host(
+                device_tensors=device_kv_buffers,
+                host_tensors=self.host_kv_data_refs,
+                device_indices=device_indices,
+                host_indices=host_indices,
+            )
+        elif io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer(

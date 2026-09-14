@@ -188,6 +188,30 @@ Additionally, the requests can be formed with
 [OpenAI Completions API](../basic_usage/openai_api_completions)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
+## HiCache on XPU [Experimental]
+
+HiCache can extend the device KV cache (L1) with a private host-memory tier
+(L2) on XPU. The XPU backend uses PyTorch indexed copies and pinned host memory.
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --device xpu \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2
+```
+
+When HiCache is enabled on XPU, SGLang selects
+`--hicache-io-backend xpu` and `--hicache-mem-layout layer_first`
+automatically. You can also pass both options explicitly.
+
+The initial XPU implementation supports MHA and MLA models with the
+`write_through` and `write_back` policies. It does not yet support external
+storage (L3), P/D disaggregation, speculative decoding, DCP, HiSparse, hybrid
+Mamba/linear-attention pools, or `write_through_selective`. Device-to-host
+copies prioritize correctness and are synchronous until a native XPU transfer
+kernel is available.
+
 ## XPU Graph [Experimental]
 
 SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.

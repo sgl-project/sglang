@@ -1794,6 +1794,33 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
+    def test_xpu_hicache_selects_xpu_backend_and_layer_first(self):
+        args = self._make_args(enable_hierarchical_cache=True, device="xpu")
+        handle_hicache(args)
+        self._assert_hicache_fields(
+            args, expected_io_backend="xpu", expected_mem_layout="layer_first"
+        )
+
+    def test_xpu_hicache_rejects_unvalidated_features(self):
+        cases = [
+            {"hicache_storage_backend": "file"},
+            {"speculative_algorithm": "EAGLE3"},
+            {"hicache_write_policy": "write_through_selective"},
+            {"dcp_size": 2},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    enable_hierarchical_cache=True, device="xpu", **overrides
+                )
+                with self.assertRaisesRegex(NotImplementedError, "XPU HiCache"):
+                    handle_hicache(args)
+
+    def test_xpu_hicache_backend_requires_xpu_device(self):
+        args = self._make_args(enable_hierarchical_cache=True, hicache_io_backend="xpu")
+        with self.assertRaisesRegex(ValueError, "requires --device xpu"):
+            handle_hicache(args)
+
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,

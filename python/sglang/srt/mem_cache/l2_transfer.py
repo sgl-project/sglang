@@ -123,5 +123,5 @@ class L2TransferEngine:
     def _record_stream(transfers: list[L2Transfer], stream) -> None:
         for transfer in transfers:
             for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
+                if indices.is_cuda or indices.device.type == "xpu":
                     indices.record_stream(stream)
