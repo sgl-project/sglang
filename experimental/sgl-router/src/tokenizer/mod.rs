@@ -68,7 +68,7 @@ impl TokenizerRegistry {
             Ok(Some(formatter)) => {
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
-                tracing::info!(model = %m.id, "Dynamo chat rendering enabled");
+                tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
             }
             Ok(None) => tracing::info!(model = %m.id,
                 "no supported chat formatter; chat traffic routes via raw prompt text"),
@@ -88,7 +88,7 @@ impl TokenizerRegistry {
         self.formatters.contains_key(model_id)
     }
 
-    /// Render with Dynamo and tokenize; return `None` when unavailable or unsuccessful.
+    /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.

@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat rendering via Dynamo for cache-aware routing and input ID forwarding.
+//! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
-//! The router renders what Dynamo renders. Engine-specific normalization of
-//! request fields is deliberately not replicated here; the `input_ids` forward
-//! guard in the chat route omits ids for every request shape whose engine-side
-//! rendering has not been verified against this one.
+//! Engine-specific request normalization is not replicated here. The forwarding
+//! guard omits IDs for request shapes whose engine rendering has not been verified.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,8 +19,8 @@ use serde_json::Value as JsonValue;
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
-// HuggingFace supplies these names through special_tokens_map. Dynamo supplies
-// only bos/eos/unk itself; the rest are passed as template context defaults.
+// HF special_tokens_map names. dynamo-render supplies bos/eos/unk; the rest
+// are passed as template context defaults.
 const SPECIAL_TOKEN_KEYS: [&str; 7] = [
     "bos_token",
     "eos_token",
@@ -33,7 +31,7 @@ const SPECIAL_TOKEN_KEYS: [&str; 7] = [
     "mask_token",
 ];
 
-/// Renders and tokenizes chat requests through Dynamo.
+/// Renders and tokenizes chat requests through dynamo-render.
 pub struct ChatFormatter {
     formatter: Arc<dyn OAIPromptFormatter>,
     /// Template context defaults; request `chat_template_kwargs` override them.
@@ -41,8 +39,7 @@ pub struct ChatFormatter {
 }
 
 impl ChatFormatter {
-    /// Load model files and select a Dynamo formatter. The renderer itself
-    /// accepts parsed config; it does not fetch files or choose HF vs native.
+    /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
         let files = super::adapter::ModelFiles::open(tokenizer_path);
         let model_type = files
@@ -71,20 +68,28 @@ impl ChatFormatter {
         mut cfg: JsonValue,
         chat_template_jinja: Option<&str>,
     ) -> Result<Option<Self>> {
+        let config = cfg
+            .as_object_mut()
+            .context("tokenizer_config.json must be an object")?;
+        // Tokenizer-only settings have types the renderer's config does not support.
+        config.retain(|key, _| {
+            key == "chat_template"
+                || SPECIAL_TOKEN_KEYS.contains(&key.as_str())
+                || key == "additional_special_tokens"
+        });
         if let Some(template) = chat_template_jinja {
             cfg["chat_template"] = template.into();
         }
         // HuggingFace supplies None when no retrieval documents are present.
         let mut defaults = HashMap::from([("documents".into(), JsonValue::Null)]);
         for key in SPECIAL_TOKEN_KEYS {
-            // Dynamo parses the plain-string form; reduce HF's `AddedToken`
-            // object form to its content. Any other shape fails loudly below.
+            // Convert HF AddedToken objects to strings for dynamo-render.
             if let Some(content) = added_token_content(&cfg[key]) {
                 cfg[key] = content.into();
             }
             if matches!(key, "bos_token" | "eos_token" | "unk_token") {
-                // Dynamo supplies these from the parsed config but renders an
-                // absent one as `None`; HF renders "". Kwargs cannot override it.
+                // Missing tokens render as `None` in dynamo-render; HF uses "".
+                // These config values take precedence over kwargs.
                 if cfg[key].is_null() {
                     cfg[key] = "".into();
                 }
@@ -101,7 +106,7 @@ impl ChatFormatter {
             cfg["additional_special_tokens"] = extra.clone().into();
             defaults.insert("additional_special_tokens".into(), extra.into());
         }
-        // HF's `[{name, template}]` list form -> Dynamo's `[{name: template}]`.
+        // HF's `[{name, template}]` list form -> dynamo-render's `[{name: template}]`.
         for entry in cfg["chat_template"].as_array_mut().into_iter().flatten() {
             if let (Some(name), Some(template)) =
                 (entry["name"].as_str(), entry["template"].as_str())
@@ -123,7 +128,7 @@ impl ChatFormatter {
         }))
     }
 
-    /// Dynamo's DeepSeek encoders (V4 family, V3.2), the only built-in ones
+    /// dynamo-render's DeepSeek encoders (V4 family, V3.2), the only built-in ones
     /// verified against the engine. `model_type` (from `config.json`) is
     /// authoritative; the model id's last path segment is the fallback.
     pub fn native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
@@ -142,7 +147,7 @@ impl ChatFormatter {
         });
         let PromptFormatter::OAI(formatter) = deepseek_formatter_for(&model_type, &name)?;
         // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
-        // reasoning-effort preamble; Dynamo defaults to thinking at high effort.
+        // reasoning-effort preamble; dynamo-render defaults to thinking at high effort.
         let defaults = HashMap::from([
             ("thinking".into(), false.into()),
             ("reasoning_effort".into(), "low".into()),
@@ -164,7 +169,7 @@ impl ChatFormatter {
         Ok(kwargs)
     }
 
-    /// Render the prompt text Dynamo produces for `request`.
+    /// Render the prompt text dynamo-render produces for `request`.
     pub fn render(&self, request: &JsonValue) -> Result<String> {
         anyhow::ensure!(request["messages"].is_array(), "messages must be an array");
         let kwargs = self.template_kwargs(request)?;
@@ -196,7 +201,7 @@ struct ChatRequest<'a> {
     kwargs: ChatTemplateKwargs,
 }
 
-/// Mirrors Dynamo's own impl for its wire type: request fields pass through.
+/// Mirrors dynamo-render's own impl for its wire type: request fields pass through.
 impl OAIChatLikeRequest for ChatRequest<'_> {
     fn model(&self) -> String {
         self.request["model"]
@@ -209,7 +214,7 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
     }
     fn tools(&self) -> Option<Value> {
         let tools = self.request.get("tools")?;
-        // HF and the engine treat an empty list as "no tools"; Dynamo's schema
+        // HF and the engine treat an empty list as "no tools"; dynamo-render's schema
         // fixer would hand the template `[]`, which tools-branching templates
         // render as a tool preamble.
         if tools.as_array().is_none_or(|t| t.is_empty()) {
@@ -364,6 +369,22 @@ mod tests {
     fn malformed_special_token_fails_to_load() {
         let cfg = json!({"chat_template": "X", "eos_token": ["</s>"]});
         assert!(ChatFormatter::from_tokenizer_config(cfg, None).is_err());
+    }
+
+    #[test]
+    fn tokenizer_settings_do_not_affect_chat_rendering() {
+        let enc = jinja(json!({
+            "chat_template": "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}",
+            "bos_token": "<s>",
+            "sp_model_kwargs": {"enable_sampling": false, "nbest_size": -1, "alpha": 0.1},
+            "added_tokens_decoder": {"0": {"content": "<s>"}},
+            "truncation_size": 4096
+        }));
+        assert_eq!(
+            enc.render(&request(json!([{"role": "user", "content": "hi"}])))
+                .unwrap(),
+            "<s>hi"
+        );
     }
 
     #[test]
