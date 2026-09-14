@@ -9,7 +9,6 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
-#include <cuda/cmath>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/stl.h>
 #include <tvm/ffi/object.h>
@@ -25,7 +24,32 @@ namespace sglang {
 using device::distributed::PushWorkSpace;
 using device::distributed::Semaphore;
 
-using fast_mod_div_u32_t = cuda::fast_mod_div<uint32_t>;
+// Runtime uint32 division as one 32x32->64 multiply and a shift (the round-up
+// magic number, exact for dividends below 2^31; a vector index is far smaller).
+// Self-contained so the header builds with the CCCL bundled in every CUDA 13
+// toolkit: cuda::fast_mod_div only arrived in a later CCCL.
+struct fast_mod_div_u32_t {
+  uint32_t divisor;
+  uint32_t magic;
+  uint32_t shift;
+
+  __host__ explicit fast_mod_div_u32_t(uint32_t d) : divisor(d), magic(0), shift(0) {
+    if (d > 1) {
+      const uint32_t log2_ceil = 32 - std::countl_zero(d - 1);
+      const uint32_t p = 31 + log2_ceil;
+      magic = static_cast<uint32_t>(((uint64_t{1} << p) + d - 1) / d);
+      shift = p - 32;
+    }
+  }
+
+  __device__ friend uint32_t operator/(uint32_t n, const fast_mod_div_u32_t& fd) {
+    return fd.divisor == 1 ? n : __umulhi(n, fd.magic) >> fd.shift;
+  }
+
+  __device__ friend uint32_t operator%(uint32_t n, const fast_mod_div_u32_t& fd) {
+    return n - (n / fd) * fd.divisor;
+  }
+};
 
 template <uint32_t kWorldSize>
 struct NVLinkCommPushParams {
