@@ -83,10 +83,9 @@ def _mxfp8_quant_kernel(
 ):
     """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per ``[BLOCK_M, 32]``.
 
-    Rows ``[0, M)`` are real. ``xq`` rows ``[M, M_XQ)`` and scale rows
-    ``[M, M_S)`` are padding written as zeros (E8M0 0 == 2^-127, finite), so a
-    consumer that needs row-aligned operands (torch._scaled_mm MX: fp8 rows
-    %32, scale rows %128) gets them straight from this launch.
+    Rows ``[0, M)`` are data; ``xq`` rows up to ``M_XQ`` and scale rows up to
+    ``M_S`` are zero padding, so a consumer that needs row-aligned operands gets
+    them from this launch.
     """
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)  # which 32-element block along K
@@ -105,7 +104,7 @@ def _mxfp8_quant_kernel(
     sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
     descale = tl.exp2(sb - 127.0)
     xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
-    # x loads as 0 for pad rows -> xq is already 0 there; force the scale to 0.
+    # pad rows load x as 0, so xq is already 0 there: force the scale to 0 too
     sb = tl.where(m_mask, sb, 0.0)
     tl.store(
         xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
@@ -127,9 +126,7 @@ def _mxfp8_e4m3_quantize_triton(
     """Fused 2D MXFP8 quant (row-major [M, K//32] UE8M0 scales).
 
     ``pad_rows_to`` / ``scale_pad_rows_to`` round the fp8 / scale row counts up
-    (pad rows are zero-filled by the kernel) so the caller does not need a
-    separate zeros()+copy_() pair per operand -- 4 extra launches per GEMM on
-    the decode path, where M is a handful of tokens.
+    with zero pad rows written by the kernel.
     """
     M, K = x.shape
     x = x.contiguous()
@@ -299,8 +296,7 @@ def _run_mxfp8_linear_kernel(
     return out
 
 
-# torch._scaled_mm MX (1x32) operand alignment on ROCm: fp8 rows %32, E8M0
-# scale rows %128.
+# torch._scaled_mm MX operand alignment on ROCm: fp8 rows %32, E8M0 scale rows %128
 _SCALED_MM_ROW_ALIGN = 32
 _SCALED_MM_SCALE_ROW_ALIGN = 128
 
@@ -316,14 +312,20 @@ def _pad_mx_scale_e8m0(s: torch.Tensor) -> torch.Tensor:
 
 
 def _weight_scale_e8m0(w_scale: torch.Tensor) -> torch.Tensor:
-    """Row-aligned E8M0 view of a (static) weight scale, built once per tensor."""
-    v = getattr(w_scale, "_scaled_mm_e8m0", None)
-    if v is None:
-        v = _pad_mx_scale_e8m0(w_scale)
-        try:
-            w_scale._scaled_mm_e8m0 = v
-        except AttributeError:
-            pass
+    """Row-aligned E8M0 view of a weight scale, memoized on the tensor.
+
+    The memo is keyed by storage pointer, shape and in-place version, so a
+    weight reload or an in-place scale update rebuilds it.
+    """
+    key = (w_scale.data_ptr(), tuple(w_scale.shape), w_scale._version)
+    cached = getattr(w_scale, "_scaled_mm_e8m0", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    v = _pad_mx_scale_e8m0(w_scale)
+    try:
+        w_scale._scaled_mm_e8m0 = (key, v)
+    except AttributeError:
+        pass
     return v
 
 
@@ -335,9 +337,8 @@ def _run_scaled_mm_mxfp8_linear(
     out_dtype: torch.dtype,
     m: Optional[int] = None,
 ) -> torch.Tensor:
-    """``m`` is the real row count when ``x_q``/``x_scale`` were produced with
-    pad rows (see ``mxfp8_e4m3_quantize(pad_rows_to=...)``); the pad rows are
-    then consumed as-is and only sliced off the output."""
+    """``m`` is the data row count when ``x_q`` / ``x_scale`` carry pad rows;
+    they are consumed as-is and only sliced off the output."""
     if m is None:
         m = x_q.shape[0]
     mp = _round_up(x_q.shape[0], _SCALED_MM_ROW_ALIGN)
@@ -466,9 +467,8 @@ def dot_scaled_mxfp8_blockscaled_linear(
 
     if k % 128 == 0:
         if input_scale is None:
-            # Quantize the bf16/fp16 activations per token inside the path. For
-            # torch._scaled_mm, emit the row-aligned operands straight from the
-            # quant kernel (no zeros()+copy_() pair per operand per GEMM).
+            # Quantize the bf16/fp16 activations per token inside the path.
+            # the quant emits row-aligned operands, so no zeros()+copy_() pair per operand
             if _use_scaled_mm_mxfp8_gemm():
                 x_q, x_scale = mxfp8_e4m3_quantize(
                     input_2d,

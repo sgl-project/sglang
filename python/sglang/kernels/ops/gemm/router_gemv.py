@@ -24,9 +24,7 @@ _is_gfx95_supported = _is_hip and is_gfx95_supported()
 
 _MAX_M = 128
 
-# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket. The 128 bucket
-# covers EAGLE target-verify batches (bs x num_draft_tokens rows, e.g. 24 x 4):
-# hipblaslt/aiter split-K GEMMs take ~18us there, this kernel ~10us.
+# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket
 _CONFIGS = (
     (8, (1, 16, 512, 4, 16)),
     (16, (16, 16, 512, 8, 4)),

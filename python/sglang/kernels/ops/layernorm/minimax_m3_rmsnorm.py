@@ -175,4 +175,6 @@ def gemma_fused_add_rmsnorm(
     out = out.reshape(orig_shape)
     if emit_fp8:
         out._fp8_qinput = (q8, scale)
+        # consumers compare with the live _version, so an in-place write invalidates the pair
+        out._fp8_qinput_version = out._version
     return out, res_out.reshape(orig_shape)

@@ -75,11 +75,7 @@ def should_ignore_layer(
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
-            # A packed shard whose projection name never appears in the
-            # producer's exclude list is one the checkpoint does not carry
-            # at all (e.g. MiniMax-M3 `index_v_proj` on value-disabled
-            # indexer layers). Its "not excluded" verdict says nothing about
-            # the fused layer's scheme, so do not let it veto the siblings.
+            # a shard the exclude list never names is not in the checkpoint, so it cannot veto siblings
             if (
                 not should_ignore_shard
                 and should_ignore_layer

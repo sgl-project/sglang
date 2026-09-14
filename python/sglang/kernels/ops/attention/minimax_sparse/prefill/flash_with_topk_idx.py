@@ -20,7 +20,7 @@ from ..common.utils import (
 
 _is_hip = is_hip()
 _MAX_PER_PAGE_SLOT_UNROLL = 8
-# Program budget for the score-only indexer's KV-block split (grid axis 2).
+# program budget for the score-only indexer's KV-block split (grid axis 2)
 _SCORE_ONLY_TARGET_PROGRAMS = 2048
 
 
@@ -509,11 +509,6 @@ def _index_block_score_only_kernel(
     small; otherwise the plain per-token gather runs and only the score-only
     register saving applies. Either way: one BLOCK_SIZE_Q x block_size QK tile per
     KV block, reduced with tl.max over the block. Only score_type == "max".
-
-    Grid axis 2 splits the KV blocks: every (query row, KV block) score is
-    written by exactly one program, so a few query rows over a long cached
-    prefix (a new agent turn) no longer serialize the whole context in a
-    handful of programs. Axis 2 has one program for the full-prefill grids.
     """
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q, pid_bh, pid_s = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -526,7 +521,7 @@ def _index_block_score_only_kernel(
     prefix_len = tl.load(prefix_lens + pid_b)
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
-    # This program's KV-block range (causal upper bound, then the split's slice).
+    # axis 2 slices the causal KV range, so each (row, block) score has exactly one writer
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
     blocks_per_split = tl.cdiv(max_seqblock_k, tl.num_programs(2))
     lo = pid_s * blocks_per_split * block_size
@@ -713,10 +708,8 @@ def flash_prefill_with_topk_index(
         and k_scale == 1.0
         and block_size_k % page_size == 0
     ):
-        # Source layers do not use idx_o, so run the score-only kernel. Few
-        # query rows over a long context (a new turn on a cached prefix) leave
-        # the (q-block, head) grid nearly empty, so split the KV blocks over
-        # grid axis 2 up to a fixed program budget; full chunks keep one split.
+        # Source layers do not use idx_o, so run the score-only kernel.
+        # few rows over a long prefix leave the grid nearly empty, so split the KV blocks
         def grid_score_only(META):
             q_blocks = triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"])
             base = q_blocks * batch_size * num_heads
