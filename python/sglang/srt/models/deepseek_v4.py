@@ -831,12 +831,13 @@ class MqaAttentionBase(nn.Module):
 
             if envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "flashinfer":
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
-                    flashinfer_dsv4_decode_supports_num_heads,
+                    flashinfer_dsv4_decode_native_heads,
                 )
 
-                if flashinfer_dsv4_decode_supports_num_heads(
-                    self.n_local_heads, num_tokens
-                ):
+                # Native per-rank width when the installed FlashInfer covers
+                # it and SGLANG_SM120_DSV4_DECODE_PADDED is not set; otherwise
+                # the padded path below.
+                if flashinfer_dsv4_decode_native_heads(self.n_local_heads, num_tokens):
                     return self.n_local_heads
 
         # Other FlashMLA implementations retain their existing padded shape.
