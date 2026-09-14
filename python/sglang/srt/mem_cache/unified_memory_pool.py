@@ -1918,6 +1918,7 @@ def init_unified_mamba_swa_pools(
     lazy_compaction: bool = False,
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    decode_pre_alloc_size: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -2043,6 +2044,7 @@ def init_unified_mamba_swa_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        pre_alloc_size=decode_pre_alloc_size,
     )
     allocator = UnifiedMambaSWATokenToKVPoolAllocator(
         unified_buffer=shared_pool,

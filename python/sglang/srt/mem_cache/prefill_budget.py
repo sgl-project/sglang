@@ -20,6 +20,8 @@ They neither select requests nor mutate the prefix cache or allocator.
 
 from typing import Optional
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+
 
 def estimate_swa_kv_tokens(
     extend_input_len: int,
@@ -40,8 +42,10 @@ def estimate_swa_kv_tokens(
             else min(extend_input_len, allocation_limit)
         )
         allocated_tail = max(allocated - sliding_window_size, 0)
-        # A full window would double-charge short cached-prefix resumes;
-        # including extend keeps the reservation above the prefill allocation.
+        # With a roughly two-window SWA pool, a cached prefix can already lock
+        # one window. Charging another whole window for a short resume can then
+        # block admission forever on an idle pool. Reserve only its uncached
+        # tail plus decode headroom, capped at the window.
         reserved = (
             allocated_tail
             + min(extend_input_len + max_new_tokens, sliding_window_size)
@@ -151,7 +155,7 @@ class SWAPrefillBudget(PrefillBudget):
     def __init__(self, *args, all_swa=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.all_swa = all_swa
-        self.req_ring = getattr(self.allocator, "swa_req_ring", False) is True
+        self.req_ring = is_swa_req_ring(self.allocator)
 
     def _available_and_evictable(self):
         if self.all_swa:
@@ -368,7 +372,7 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
         return self._fits(0, 0)
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        return chunk_limit
+        return chunk_limit if chunk_limit > 0 else None
 
     def fit_chunk(
         self,
