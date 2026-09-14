@@ -20,7 +20,17 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -750,7 +760,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not is_npu()
         )
 
-    def _cp_router(self, router_logits: torch.Tensor) -> StandardTopKOutput:
+    def _cp_router(
+        self, router_logits: torch.Tensor, symmetric_memory
+    ) -> StandardTopKOutput:
         """Softmax -> top-k -> renormalize (this block's RenormalizeNaive routing)
         in STANDARD (fp32 weights, int32 ids) format, straight from the fused
         CUDA kernel. The block's own `TopK` yields the BYPASSED format for the
@@ -762,12 +774,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         assert cfg.correction_bias is None and not cfg.use_grouped_topk
         assert precomputed_topk_postprocess_is_noop(cfg)
         num_tokens = router_logits.shape[0]
-        topk_weights = torch.empty(
-            num_tokens, cfg.top_k, dtype=torch.float32, device=router_logits.device
-        )
-        topk_ids = torch.empty(
-            num_tokens, cfg.top_k, dtype=torch.int32, device=router_logits.device
-        )
+        # Both buffers feed the rows all-gather: allocate them where the
+        # collective wants them (symmetric memory when enabled).
+        with symmetric_memory():
+            topk_weights = torch.empty(
+                num_tokens, cfg.top_k, dtype=torch.float32, device=router_logits.device
+            )
+            topk_ids = torch.empty(
+                num_tokens, cfg.top_k, dtype=torch.int32, device=router_logits.device
+            )
         topk_softmax(topk_weights, topk_ids, router_logits, cfg.renormalize)
         return build_precomputed_topk_output(topk_weights, topk_ids, cfg, self.layer_id)
 
@@ -777,6 +792,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         all_gather_rows: Callable[..., list[torch.Tensor]],
         reduce_scatter_rows: Callable[[torch.Tensor], torch.Tensor],
+        symmetric_memory: Callable[[], ContextManager],
     ) -> torch.Tensor:
         """Collocated prefill CP: router on this rank's rows, experts on all rows.
 
@@ -790,7 +806,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits, _ = self.gate(hidden_states)
-        topk_local = self._cp_router(router_logits)
+        topk_local = self._cp_router(router_logits, symmetric_memory)
         gathered, topk_weights, topk_ids = all_gather_rows(
             hidden_states, topk_local.topk_weights, topk_local.topk_ids
         )

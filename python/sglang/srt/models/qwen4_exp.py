@@ -26,6 +26,7 @@ from sglang.srt.layers.cp.collocated import (
     cp_all_gather_blocks_multi,
     cp_reduce_scatter_blocks,
     cp_reduce_scatter_global_rows,
+    cp_symmetric_memory,
 )
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
@@ -1367,7 +1368,11 @@ class Qwen4ExpLayerExtensionMixin:
                         ple_query, forward_batch, ple_batch
                     )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        # The mix output is what a GDN layer all-gathers: allocate it where the
+        # collective wants it. (Not wrapped further up: the PLE above gathers
+        # with its own symmetric-memory context, and contexts do not nest.)
+        with self._qwen4_exp_collective_inputs(forward_batch):
+            hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1389,6 +1394,15 @@ class Qwen4ExpLayerExtensionMixin:
         """This batch runs as a collocated CP prefill: the rows this layer
         sees are the rank's zigzag shard, so the GDN / PLE / MoE gather them."""
         return self._collocated_cp and is_cp_active(forward_batch)
+
+    def _qwen4_exp_collective_inputs(self, forward_batch: ForwardBatch):
+        """Allocation context for tensors that feed a CP collective (the rows
+        the GDN gathers, the rows the MoE all-gathers); a no-op outside CP."""
+        return (
+            cp_symmetric_memory()
+            if self._qwen4_exp_cp_active(forward_batch)
+            else nullcontext()
+        )
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
         return get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
@@ -1414,6 +1428,7 @@ class Qwen4ExpLayerExtensionMixin:
                 hidden_states,
                 all_gather_rows=cp_all_gather_blocks_multi,
                 reduce_scatter_rows=cp_reduce_scatter_blocks,
+                symmetric_memory=cp_symmetric_memory,
             )
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
@@ -1517,9 +1532,10 @@ class Qwen4ExpLinearDecoderLayer(
                     # sum the out_proj partials over the TP group here.
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch, skip_reduce=self._collocated_cp
-        )
+        with self._qwen4_exp_collective_inputs(forward_batch):
+            hidden_states, residual = self._prepare_qwen4_exp_mlp(
+                hidden_states, residual, forward_batch, skip_reduce=self._collocated_cp
+            )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 
@@ -1685,9 +1701,10 @@ class Qwen4ExpAttentionDecoderLayer(
 
         # Under collocated CP the attention TP width is 1: o_proj is complete
         # and there is nothing to reduce (in either CP or non-CP forwards).
-        hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch, skip_reduce=self._collocated_cp
-        )
+        with self._qwen4_exp_collective_inputs(forward_batch):
+            hidden_states, residual = self._prepare_qwen4_exp_mlp(
+                hidden_states, residual, forward_batch, skip_reduce=self._collocated_cp
+            )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 

@@ -22,20 +22,40 @@ linear-attn-prefill-cp-ulysses) so both models share one row-order contract:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.runtime_context import get_parallel
 
 
+def cp_symmetric_memory():
+    """Allocation context for tensors that feed a collective over the CP group.
+
+    NCCL's symmetric-memory kernels need every buffer of a collective, inputs
+    included, in a window registered with the group's communicator; the pool
+    behind ``use_symmetric_memory`` registers its segments with a communicator
+    when a context for that group exits, so producers of collective inputs
+    allocate under this context and the collective helpers below allocate
+    their outputs under it right before the call. A no-op unless symmetric
+    memory is enabled."""
+    if not is_symmetric_memory_enabled() or not is_allocation_symmetric():
+        # Keep the disabled path free of group lookups: CPU unit tests build
+        # the CP metadata without a communicator.
+        return nullcontext()
+    return use_symmetric_memory(get_parallel().attn_cp_group)
+
+
 def cp_all_gather_blocks(x: torch.Tensor) -> torch.Tensor:
     """Rank-major all-gather of equal-length local row blocks over the CP group."""
     group = get_parallel().attn_cp_group
-    x = x.contiguous()
-    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+    with cp_symmetric_memory():
+        x = x.contiguous()
         out = torch.empty(
             (x.shape[0] * group.world_size, *x.shape[1:]),
             dtype=x.dtype,
@@ -52,8 +72,8 @@ def cp_all_gather_blocks_multi(*tensors: torch.Tensor) -> list[torch.Tensor]:
     group (one kernel launch for all of them); on the pynccl / symmetric-memory
     path they are issued one after another."""
     group = get_parallel().attn_cp_group
-    inputs = [x.contiguous() for x in tensors]
-    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+    with cp_symmetric_memory():
+        inputs = [x.contiguous() for x in tensors]
         outputs = [
             torch.empty(
                 (x.shape[0] * group.world_size, *x.shape[1:]),
@@ -103,14 +123,17 @@ def cp_rank_major_blocks(x: torch.Tensor, metadata, cp_size: int) -> torch.Tenso
         assert pad >= 0, (phys, logical[rank])
         if pad:
             parts.append(pad_slab[:pad])
-    return torch.cat(parts, dim=0)
+    # The permuted rows are the reduce-scatter input: allocate them in the pool.
+    with cp_symmetric_memory():
+        out = x.new_empty((cp_size * phys, *x.shape[1:]))
+    return torch.cat(parts, dim=0, out=out)
 
 
 def cp_reduce_scatter_blocks(x: torch.Tensor) -> torch.Tensor:
     """Sum rank-major row blocks over the CP group; return this rank's block."""
     group = get_parallel().attn_cp_group
-    x = x.contiguous()
-    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+    with cp_symmetric_memory():
+        x = x.contiguous()
         out = torch.empty(
             (x.shape[0] // group.world_size, *x.shape[1:]),
             dtype=x.dtype,
@@ -133,6 +156,7 @@ def cp_reduce_scatter_global_rows(partial: torch.Tensor, forward_batch) -> torch
 
 __all__ = [
     "cp_all_gather_blocks",
+    "cp_symmetric_memory",
     "cp_all_gather_blocks_multi",
     "cp_rank_major_blocks",
     "cp_reduce_scatter_blocks",

@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
+from sglang.srt.layers.cp.collocated import cp_symmetric_memory
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     is_cp_active,
@@ -1402,7 +1403,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
         k_width = k.shape[1] * k.shape[2]
         v_width = v.shape[1] * v.shape[2]
-        kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
+        with cp_symmetric_memory():
+            kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
         kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
         k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
         k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
