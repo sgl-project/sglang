@@ -1032,6 +1032,8 @@ class LoRAManager:
                     self.embed_tokens_module,
                     self.lm_head_module,
                 )
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).synchronize()
             except Exception as e:
                 # Roll back so the adapter keeps serving its previous weights
                 # instead of a torn half-old/half-new buffer.
@@ -1046,6 +1048,8 @@ class LoRAManager:
                         self.embed_tokens_module,
                         self.lm_head_module,
                     )
+                    if self.device.type == "cuda":
+                        torch.cuda.current_stream(self.device).synchronize()
                 except Exception:
                     logger.exception(
                         f"Failed to restore previous weights for LoRA adapter "
