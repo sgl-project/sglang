@@ -194,27 +194,18 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
-  int32_t bias = 0;  // needed by ragged mode
-#ifdef USE_ROCM
-  // ROCm-only (packed rows, DSA extend): `in` is rounded down to the 16-byte
-  // load boundary, so a selected position is `residue` too large. Applied at
-  // the page lookup rather than at emit because the paged select stages raw
-  // positions in shared memory first; ragged emits directly and uses `bias`.
-  // Zero for every caller that does not round down. On CUDA the packed layout
-  // goes through the ragged transform instead, so the field does not exist and
-  // transform_output keeps its original form.
-  int32_t index_shift = 0;
-#endif
+  // Correction added to every selected position by `emit`. Ragged mode uses it
+  // for the row's offset into the flattened output; the ROCm packed-row path
+  // uses it to undo the 16-byte round-down of `in` (a negative shift). The two
+  // never coexist: paged callers have no output offset, and ragged never
+  // rounds down, so one field carries both.
+  int32_t bias = 0;
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
-#ifdef USE_ROCM
-    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw + index_shift, page_bits);
-#else
     out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
-#endif
   }
 };
 

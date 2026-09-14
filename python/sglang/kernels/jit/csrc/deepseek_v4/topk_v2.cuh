@@ -152,15 +152,15 @@ struct TopKPagedParams {
     // Packed rows: re-point at this row's window and at the request's
     // page-table row. Offsetting `in` makes the index the kernel selects
     // row-local, which is what the page-table transform already expects, so
-    // the emit path needs no change beyond undoing the round-down
-    // (index_shift). seq_len grows by the residue, but never past the score
+    // the emit path needs no change beyond undoing the round-down (folded
+    // into `bias`). seq_len grows by the residue, but never past the score
     // row: the window end is unchanged, and the host picks the dispatch level
     // from the score column count, so the level's seq_len bound still holds.
     if (row_starts != nullptr) {
       const auto residue = head_residue(batch_id);
       problem.in += static_cast<int64_t>(row_starts[batch_id]) - residue;
       problem.seq_len = seq_len + residue;
-      problem.index_shift = -static_cast<int32_t>(residue);
+      problem.bias = -static_cast<int32_t>(residue);
     }
     if (row_to_batch != nullptr) {
       problem.page_table = page_table + static_cast<int64_t>(row_to_batch[batch_id]) * page_table_stride;
@@ -345,12 +345,12 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   // Packed rows: the residue only widens the read window; every decision below
   // is made on the row's real length, and the trivial path reads no scores at
   // all, so it takes the un-rounded problem.
-  const auto residue = static_cast<uint32_t>(-problem.index_shift);
+  const auto residue = static_cast<uint32_t>(-problem.bias);
   const auto row_seq_len = problem.seq_len - residue;
   if (row_seq_len <= problem.topk) {
     problem.in += residue;
     problem.seq_len = row_seq_len;
-    problem.index_shift = 0;
+    problem.bias = 0;
     return trivial_transform<kPDLEarly, kMode>(problem);
   }
   if (residue != 0) {
@@ -629,15 +629,11 @@ struct TopKKernel {
 #ifdef USE_ROCM
     const int32_t* row_starts_ptr = nullptr;
     if (row_starts.has_value()) {
-      // The residue correction lives in `index_shift`, which only
-      // `transform_output` applies; `emit` writes the raw index untouched. So
-      // INDICES mode would silently return window-relative indices that are off
-      // by up to kVecSize-1. No caller needs that combination, so reject it
-      // here rather than leave it unguarded.
-      RuntimeCheck(
-          page_table.has_value(),
-          "topk_transform_paged: row_starts requires page_table "
-          "(raw-index output does not carry the residue correction)");
+      // The packed path is only reached through the paged output, and `bias`
+      // is spoken for by the residue there, so it cannot also carry a raw
+      // output offset. No caller needs that combination, so reject it here
+      // rather than leave it unguarded.
+      RuntimeCheck(page_table.has_value(), "topk_transform_paged: row_starts requires page_table");
       // `mask_head` writes the residue columns back into `scores`, so rows that
       // overlap would let one row clobber its neighbour's tail. Only the packed
       // path writes, so the check stays here rather than covering every caller.
