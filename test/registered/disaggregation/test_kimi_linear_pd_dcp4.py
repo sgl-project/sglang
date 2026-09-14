@@ -461,8 +461,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                     reference,
                     actual,
                     label=(
-                        f"niah prompt_tokens={LONG_CONTEXT_TOKENS} "
-                        f"depth={needle_depth}"
+                        f"niah prompt_tokens={LONG_CONTEXT_TOKENS} depth={needle_depth}"
                     ),
                 )
 

@@ -54,7 +54,7 @@ advanced strategies like DBCache and TaylorSeer. It can achieve up to **1.69x sp
 See [Cache-DiT](./cache_dit) for detailed configuration.
 
 <Note>
-Cache-DiT currently cannot be combined with `--use-fsdp-inference`. Keep FSDP disabled when enabling Cache-DiT, or use other residency/offload controls instead.
+Cache-DiT currently cannot be combined with `--use-fsdp-inference`. Keep FSDP disabled when enabling Cache-DiT. DiT layerwise offload is compatible: skipped blocks are not streamed, and the first layer after a skip may sync-load.
 </Note>
 
 ### Quick Start

@@ -73,7 +73,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -102,7 +102,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -142,7 +142,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -182,7 +182,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -207,7 +207,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     def test_forward_aligns_runtime_dimensions_before_ar_generation(self, _mock_device):
@@ -248,7 +248,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -282,7 +282,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     @patch(
@@ -349,7 +349,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     def test_generate_prior_tokens_rejects_unaligned_internal_dimensions(
@@ -370,7 +370,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.glm_image.get_local_torch_device",
+        "model_specific_stages.glm_image.current_platform.get_local_torch_device",
         return_value=torch.device("cpu"),
     )
     def test_generate_prior_tokens_batch_rejects_unaligned_internal_dimensions(

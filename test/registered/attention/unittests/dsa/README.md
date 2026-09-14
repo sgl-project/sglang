@@ -73,7 +73,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
   `[sum(seq_lens), num_kv_heads, head_dim]`) to `module.attn(q, k, v,
   forward_batch, save_kv_cache=False)`, but `unified_attention_with_output`
   (`radix_attention.py:170-208`, which RadixAttention routes to under
-  piecewise CG) slices K to `forward_batch.num_token_non_padded_cpu` (=
+  piecewise CG) slices K to `forward_batch.global_num_token_non_padded_cpu` (=
   live extend-token count) on the per-token K convention used by
   Triton/FlashInfer/FA. The slice removes the prefix portion, so a
   piecewise CG run diverges from the eager DSA dense fallback by ~50%

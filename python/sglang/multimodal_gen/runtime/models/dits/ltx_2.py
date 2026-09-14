@@ -19,9 +19,11 @@ from sglang.kernels.ops.diffusion import (
     fused_gelu_active,
     fused_linear_gelu_tanh,
     fused_ltx2_rms_norm_modulate,
+    ltx2_qknorm_split_rope_active,
     ltx2_qknorm_split_rope_cuda,
     ltx2_rms_norm_modulate_active,
     mark_fused_gelu_site,
+    mark_ltx2_qknorm_split_rope_site,
     mark_ltx2_rms_norm_modulate_site,
     modulate_scale_shift_cuda,
     residual_gate_add,
@@ -42,7 +44,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -83,6 +85,7 @@ def _ltx2_try_fused_qknorm_split_rope(
     eps: float,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     global _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
 
@@ -104,6 +107,7 @@ def _ltx2_try_fused_qknorm_split_rope(
             k_norm.weight,
             num_heads=num_heads,
             head_dim=head_dim,
+            allow_sm90=allow_sm90,
         )
     ):
         return None
@@ -121,6 +125,7 @@ def _ltx2_try_fused_qknorm_split_rope(
             eps=eps,
             num_heads=num_heads,
             head_dim=head_dim,
+            allow_sm90=allow_sm90,
         )
     except Exception as exc:
         if torch.compiler.is_compiling():
@@ -198,7 +203,7 @@ def _ltx2_rms_norm_modulate(
     """``rms_norm(x) * (1 + scale) + shift`` for the LTX-2 adaLN sites.
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
-    ``quality="high"`` fusion is mounted on ``block`` and the per-call guard
+    request-gated fusion is mounted on ``block`` and the per-call guard
     passes; otherwise the verbatim eager reference chain (the ``lossless``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
@@ -232,12 +237,12 @@ def _ltx2_try_fused_ada_values9(
     if (
         _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
-        or not timestep.is_cuda
+        or not current_platform.tensor_on_device(timestep)
         or timestep.dtype != torch.bfloat16
         or timestep.ndim != 3
         or int(timestep.shape[0]) != int(batch_size)
         or not timestep.is_contiguous()
-        or not scale_shift_table.is_cuda
+        or not current_platform.tensor_on_device(scale_shift_table)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.ndim != 2
         or int(scale_shift_table.shape[0]) != 9
@@ -735,6 +740,7 @@ class LTX2Attention(nn.Module):
         apply_gated_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -752,6 +758,7 @@ class LTX2Attention(nn.Module):
         self.apply_gated_attention = bool(apply_gated_attention)
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
         self.prefix = prefix
+        mark_ltx2_qknorm_split_rope_site(self)
 
         tp_size = get_tp_world_size()
         if tp_size <= 0:
@@ -804,8 +811,12 @@ class LTX2Attention(nn.Module):
         self.k_norm: nn.Module | None = None
         if self.qk_norm:
             if tp_size == 1:
-                self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
-                self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                if _is_npu:
+                    self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                else:
+                    self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
@@ -837,6 +848,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
@@ -852,6 +864,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
@@ -907,6 +920,7 @@ class LTX2Attention(nn.Module):
                         eps=self.norm_eps,
                         num_heads=self.local_heads,
                         head_dim=self.dim_head,
+                        allow_sm90=ltx2_qknorm_split_rope_active(self),
                     )
 
             if fused_qk is not None:
@@ -1196,10 +1210,11 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
-            supported_attention_backends=(
-                {AttentionBackendEnum.TORCH_SDPA}
+            supported_attention_backends=supported_attention_backends,
+            required_attention_backend=(
+                AttentionBackendEnum.TORCH_SDPA
                 if force_sdpa_v2a_cross_attention
-                else supported_attention_backends
+                else None
             ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,
@@ -1767,6 +1782,12 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hf_config.get("rope_double_precision", arch.double_precision_rope)
             )
         )
+        if rope_double_precision and not current_platform.is_float64_supported():
+            logger.warning(
+                "Current platform does not support float64. Falling back to float32."
+            )
+            rope_double_precision = False
+
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
         )

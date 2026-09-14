@@ -17,15 +17,20 @@ from sglang.srt.layers.attention.minicpm.attention_adapter import (
 )
 from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_blackwell_supported, next_power_of_2
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_schedule,
+)
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-from sglang.kernels.jit.minicpm_sala import get_block_table
+from sglang.kernels.ops.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
     MiniCPMSparseMetadata,
@@ -127,7 +132,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         use_flashinfer: bool,
     ):
         super().__init__()
-        use_blackwell = is_blackwell_supported()
+        use_blackwell = get_platform().is_blackwell
         if use_blackwell:
             fa_impl_ver = 4
         self.flash_attn_backend = FlashAttentionBackend(
@@ -185,7 +190,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             model_runner.token_to_kv_pool_allocator,
             kernel_size=self.kernel_size,
             kernel_stride=self.kernel_stride,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
         )
         self.req_to_sparse_k1_token = self.req_to_token_pool.req_to_sparse_k1_token
         self.req_to_sparse_k2_token = self.req_to_token_pool.req_to_sparse_k2_token
@@ -476,9 +481,12 @@ class MiniCPMSparseBackend(AttentionBackend):
                         _gather_compressed_keys(full_compressed_k, level, sparse_bs)
                     )
 
-            (compressed_k, compressed_cu_seqlens), (
-                compressed_k2,
-                compressed_cu_seqlens2,
+            (
+                (compressed_k, compressed_cu_seqlens),
+                (
+                    compressed_k2,
+                    compressed_cu_seqlens2,
+                ),
             ) = compressed
 
             ret = self.sparse_get_topk_impl(

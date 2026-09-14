@@ -92,9 +92,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1200
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -120,8 +120,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
@@ -132,7 +132,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -143,11 +142,12 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=400
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=400
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -185,7 +185,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -219,10 +218,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 8 \
+    --num-prompts 8 \
     --random-input-len 131072 \
     --random-output-len 1024 \
-    --num-prompts 8 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K BS16
@@ -290,9 +290,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1200
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -318,8 +318,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
@@ -330,7 +330,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -341,11 +340,12 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=400
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=400
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -383,7 +383,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -417,9 +416,9 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 16 \
+    --num-prompts 16 \
     --random-input-len 131072 \
     --random-output-len 1024 \
-    --num-prompts 16 \
     --random-range-ratio 1
 ```
 
@@ -488,9 +487,9 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1200
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
@@ -516,8 +515,8 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
@@ -528,7 +527,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -539,11 +537,12 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=400
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=400
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -581,7 +580,6 @@ do
         --trust-remote-code \
         --attention-backend ascend \
         --device npu
-        NODE_RANK=$i
         break
     fi
 done
@@ -615,8 +613,8 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 8 \
+    --num-prompts 8 \
     --random-input-len 131072 \
     --random-output-len 1024 \
-    --num-prompts 8 \
     --random-range-ratio 1
 ```

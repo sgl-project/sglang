@@ -204,9 +204,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         kernel_kind=inputs.kernel_kind,
         assert_equal=False,
     )
-    assert torch.equal(
-        inputs.cuda_canary_buf, inputs.ref_canary_buf
-    ), "CUDA vs ref canary_buf diverged"
+    assert torch.equal(inputs.cuda_canary_buf, inputs.ref_canary_buf), (
+        "CUDA vs ref canary_buf diverged"
+    )
     assert int(cuda_log.write_index[0].item()) == int(ref_log.write_index[0].item())
     assert int(cuda_log.slot_run_counter[0].item()) == int(
         ref_log.slot_run_counter[0].item()
