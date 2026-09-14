@@ -802,7 +802,11 @@ class AscendAttnBackend(AttentionBackend):
                 and _is_dflash_verify(spec_info)
                 and seq_lens_cpu is not None
             ):
-                seq_lens_int = seq_lens_cpu[:bs].int()
+                # seq_lens_cpu lives on CPU while the SWA indices are device
+                # tensors; keep them on the same device or the mask comparison
+                # fails with "Expected all tensors to be on the same device"
+                # during graph capture (#37565 regression).
+                seq_lens_int = seq_lens_cpu[:bs].int().to(seq_lens.device)
             else:
                 seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)

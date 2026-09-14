@@ -231,6 +231,14 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
 
+          # Override the image's prebuilt sglang with the checked-out branch.
+          # The nightly image tag is mutable and its runtime code drifts ahead
+          # of CI (e.g. PR #37565 broke DSPARK+DSV4 graph capture). PYTHONPATH
+          # precedes site-packages, so imports resolve to the branch under
+          # test. Heavy deps (torch_npu, CANN, DeepEP) stay from the image.
+          export PYTHONPATH="${sglang_source_path}/python:${PYTHONPATH:-}"
+          python -c "import sglang, os; print('sglang running from:', os.path.dirname(sglang.__file__))"
+
           # Determine test mode: suite (run_suite.py --suite) or single case file.
           test_suite="${{ inputs.test_suite }}"
           echo "Test mode: suite (${test_suite})"
