@@ -312,14 +312,20 @@ def _pad_mx_scale_e8m0(s: torch.Tensor) -> torch.Tensor:
 
 
 def _weight_scale_e8m0(w_scale: torch.Tensor) -> torch.Tensor:
-    """Row-aligned E8M0 view of a weight scale, memoized on the tensor."""
-    v = getattr(w_scale, "_scaled_mm_e8m0", None)
-    if v is None:
-        v = _pad_mx_scale_e8m0(w_scale)
-        try:
-            w_scale._scaled_mm_e8m0 = v
-        except AttributeError:
-            pass
+    """Row-aligned E8M0 view of a weight scale, memoized on the tensor.
+
+    The memo is keyed by storage pointer, shape and in-place version, so a
+    weight reload or an in-place scale update rebuilds it.
+    """
+    key = (w_scale.data_ptr(), tuple(w_scale.shape), w_scale._version)
+    cached = getattr(w_scale, "_scaled_mm_e8m0", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    v = _pad_mx_scale_e8m0(w_scale)
+    try:
+        w_scale._scaled_mm_e8m0 = (key, v)
+    except AttributeError:
+        pass
     return v
 
 

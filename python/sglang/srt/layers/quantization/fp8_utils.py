@@ -2030,6 +2030,8 @@ def apply_fp8_linear(
                 qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
             elif (
                 pre_quant is not None
+                # stale if the norm output was rewritten in place since the pair was attached
+                and getattr(input, "_fp8_qinput_version", None) == input._version
                 and pre_quant[0].shape[0] == input_2d.shape[0]
                 and pre_quant[0].shape[-1] == input_2d.shape[-1]
             ):
