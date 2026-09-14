@@ -75,12 +75,14 @@ class TestAiterOneBlockDispatch(CustomTestCase):
             dsa_extend_seq_lens_list=[next_n] * batch,
         )
         spy = _AiterSpy()
-        with patch.dict("sys.modules", {"aiter": spy}), patch.object(
-            dtb, "_aiter_topk_available", return_value=True
-        ), patch.object(
-            dtb,
-            "_get_triton_gather",
-            return_value=lambda idx, tab, w, out: out.zero_(),
+        with (
+            patch.dict("sys.modules", {"aiter": spy}),
+            patch.object(dtb, "_aiter_topk_available", return_value=True),
+            patch.object(
+                dtb,
+                "_get_triton_gather",
+                return_value=lambda idx, tab, w, out: out.zero_(),
+            ),
         ):
             out = dtb._aiter_paged_topk_transform(
                 logits, lengths, page_table, TOPK, row_starts, meta
@@ -140,10 +142,12 @@ class TestAiterOneBlockDispatch(CustomTestCase):
             dsa_extend_seq_lens_list=[1] * 2 * 4,  # capture convention
         )
         spy = _AiterSpy()
-        with patch.dict("sys.modules", {"aiter": spy}), patch.object(
-            dtb, "_aiter_topk_available", return_value=True
-        ), patch.object(
-            dtb, "_get_triton_gather", return_value=lambda i, t, w, o: o.zero_()
+        with (
+            patch.dict("sys.modules", {"aiter": spy}),
+            patch.object(dtb, "_aiter_topk_available", return_value=True),
+            patch.object(
+                dtb, "_get_triton_gather", return_value=lambda i, t, w, o: o.zero_()
+            ),
         ):
             out = dtb._aiter_paged_topk_transform(
                 logits, lengths, page_table, TOPK, None, meta
