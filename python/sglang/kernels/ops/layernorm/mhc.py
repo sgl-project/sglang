@@ -1,9 +1,11 @@
+import fcntl
 import functools
 import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+from contextlib import contextmanager
+from typing import Iterator, Tuple
 
 import torch
 import triton
@@ -757,6 +759,30 @@ def get_mhc_pre_token_count_representatives(
     return tuple(sorted(reps.values()))
 
 
+@contextmanager
+def _claim_prewarm_bucket(tag: str, *, wait: bool) -> Iterator[bool]:
+    # Ranks sharing a JIT cache dir walk the same buckets in the same order, so
+    # an unclaimed sweep compiles every kernel once per rank. wait=False yields
+    # False when a peer owns the bucket; wait=True blocks until its compile is
+    # on disk. The kernel drops the lock on process death, so a rank that dies
+    # mid-compile hands the bucket back.
+    from sglang.kernels.jit.utils.compile.cache import cache_root
+
+    lock_dir = cache_root() / "prewarm_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f"{tag}.lock", "w") as lock_file:
+        flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(lock_file, flags)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def prewarm_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -776,6 +802,8 @@ def prewarm_mhc_pre(
     prenorm with the call's real weights. The compiled kernels are written to
     the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
     cache; later server runs hit the cache. Driven once per process from load_weights.
+    Ranks sharing the cache dir split the buckets between them, then replay each
+    other's as cache hits, so every rank still ends up holding every kernel.
     """
     from sglang.srt.runtime_context import get_schedule
 
@@ -786,23 +814,45 @@ def prewarm_mhc_pre(
     )
 
     logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+
+    def replay(num_tokens: int) -> None:
+        mhc_pre(
+            residual.new_zeros(num_tokens, hc_mult, hidden_size),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            n_splits_pre,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+    shard_key = f"mhc_pre_h{hc_mult}x{hidden_size}_s{n_splits}_{n_splits_pre}"
+    taken_by_peers: list[int] = []
     with torch.inference_mode():
         for num_tokens in buckets:
-            mhc_pre(
-                residual.new_zeros(num_tokens, hc_mult, hidden_size),
-                fn,
-                hc_scale,
-                hc_base,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                n_splits,
-                n_splits_pre,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-            )
+            with _claim_prewarm_bucket(f"{shard_key}_m{num_tokens}", wait=False) as own:
+                if own:
+                    replay(num_tokens)
+                else:
+                    taken_by_peers.append(num_tokens)
+        for num_tokens in taken_by_peers:
+            # Wait for the owner's compile to land, then replay outside the lock:
+            # every rank defers the same buckets in the same order, so holding it
+            # across the replay would queue them all behind one another.
+            with _claim_prewarm_bucket(f"{shard_key}_m{num_tokens}", wait=True):
+                pass
+            replay(num_tokens)
+    logger.info(
+        "DeepSeek V4 MHC prenorm prewarm: claimed %d buckets, %d held by peers",
+        len(buckets) - len(taken_by_peers),
+        len(taken_by_peers),
+    )
 
 
 @tilelang.jit(
