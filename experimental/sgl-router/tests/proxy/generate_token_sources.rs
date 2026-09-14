@@ -1,19 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `/generate` prefix-match parity: the routing tokens the router computes
-//! for a `/generate` body must equal the engine's
-//! `add_special_tokens = true` tokenization block-for-block, or every block
-//! boundary in the SHA256 chain shifts and prefix matching against
-//! engine-emitted `BlockStored` hashes silently drops to 0. Also pins the
-//! surface isolation of token production: `/generate` reads `input_ids` /
-//! `text` and nothing else, and a chat body carrying `input_ids` still
-//! routes through the chat encoder.
+//! Where `/generate` routing tokens come from: client `input_ids` verbatim,
+//! else the prompt `text`, and nothing else. `GenerateReqInput` ignores extra
+//! keys, so a body carrying a stray `messages` or `prompt` is legal — routing
+//! on either would key on a prompt the engine never sees. Also pins the
+//! chat surface against the same confusion: a chat body carrying `input_ids`
+//! still routes through the chat encoder.
 
 use serde_json::{json, Value};
 use sgl_router::config::Cli;
 use sgl_router::discovery::ModelId;
-use sgl_router::policies::kv_events::hash::compute_block_hashes;
 use sgl_router::policies::{request_tokens_for, request_tokens_for_generate};
 use sgl_router::tokenizer::{adapter, TokenizerRegistry};
 
@@ -55,39 +52,13 @@ fn chat_encoder_registry() -> (tempfile::TempDir, TokenizerRegistry) {
     (dir, reg)
 }
 
-/// THE test that pins the BOS-offset defect: with a `TemplateProcessing`
-/// (BOS-adding) tokenizer, the routing tokens for a `/generate` text body
-/// are exactly `[bos] ++ encode(text)`, so the router's block hashes equal
-/// the engine's.
+/// A `text` body routes on exactly the registry's own encode of that text —
+/// not a re-tokenization, not a decorated variant. This fixture is
+/// `ByteLevel`, so it cannot tell `add_special_tokens` true from false; that
+/// flag is pinned where a fixture CAN tell the difference, in
+/// `adapter::tests::router_encodes_without_special_tokens`.
 #[test]
-fn generate_block_hashes_match_the_specials_decorated_encoding() {
-    let reg = registry_with("tests/fixtures/tiny_bos_tokenizer.json");
-    let model = ModelId("tiny".into());
-    let text = "The quick brown fox jumps over the lazy dog.";
-
-    let tokens = request_tokens_for_generate(&reg, &model, &json!({"text": text}))
-        .expect("text body must tokenize");
-
-    let raw = adapter::encode(&reg.get("tiny").unwrap(), text).unwrap();
-    let mut want = vec![256]; // <|endoftext|>, the fixture's BOS
-    want.extend_from_slice(&raw);
-    assert_eq!(
-        tokens.ids, want,
-        "the probed BOS must be prepended to the raw-text routing tokens"
-    );
-
-    const BLOCK: usize = 16;
-    assert_eq!(
-        compute_block_hashes(&tokens.ids, BLOCK),
-        compute_block_hashes(&want, BLOCK),
-        "router block hashes must equal the engine's specials-decorated chain"
-    );
-}
-
-/// A byte-level tokenizer adds no specials: the routing tokens are the plain
-/// encoding (regression guard against unconditional decoration).
-#[test]
-fn generate_without_specials_uses_the_plain_encoding() {
+fn generate_text_routes_on_the_plain_encoding() {
     let reg = registry_with("tests/fixtures/tiny_tokenizer.json");
     let model = ModelId("tiny".into());
     let tokens = request_tokens_for_generate(&reg, &model, &json!({"text": "hello"}))

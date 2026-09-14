@@ -35,6 +35,19 @@ use tower::ServiceExt;
 use crate::common::mock_worker::MockWorker;
 
 const MODEL: &str = "tiny";
+const OVERRIDES: &str = r#"{"temperature": 1, "top_p": 0.95}"#;
+
+/// The flag sets under test, named so each case reads as a configuration
+/// rather than an argv fragment.
+const NO_FLAGS: &[&str] = &[];
+const CAP: &[&str] = &["--max-output-tokens", "4096"];
+const PINS: &[&str] = &["--override-sampling-params", OVERRIDES];
+const CAP_AND_PINS: &[&str] = &[
+    "--max-output-tokens",
+    "4096",
+    "--override-sampling-params",
+    OVERRIDES,
+];
 
 /// Build the config the way a deployment does — through `Cli`, so the flag
 /// spelling in a manifest is what these tests pin.
@@ -54,23 +67,74 @@ fn config(flags: &[&str]) -> Config {
         .expect("flags must parse")
 }
 
-fn build_ctx(url: String, flags: &[&str]) -> Arc<AppContext> {
+/// What the worker saw for one request, plus the client-facing status. The
+/// `Option` fields are `None` exactly when the router rejected the request
+/// before dispatch — which is itself the assertion most of these tests make.
+struct Dispatched {
+    status: StatusCode,
+    /// The error message on a rejection, empty on success.
+    error: String,
+    /// The body the worker received.
+    body: Option<Value>,
+    /// The path the worker was called on.
+    path: Option<String>,
+}
+
+impl Dispatched {
+    /// Assert a pre-dispatch rejection whose message names `key`, and that
+    /// nothing reached the engine.
+    fn assert_rejected_naming(&self, key: &str) {
+        assert_eq!(self.status, StatusCode::BAD_REQUEST);
+        assert!(
+            self.error.contains(key),
+            "the 400 must name the key the client sent: {}",
+            self.error
+        );
+        assert!(
+            self.body.is_none(),
+            "a rejected request must not reach the engine"
+        );
+    }
+
+    /// Assert a pre-dispatch rejection, without pinning the message.
+    fn assert_rejected(&self) {
+        assert_eq!(self.status, StatusCode::BAD_REQUEST);
+        assert!(
+            self.body.is_none(),
+            "a rejected request must not reach the engine"
+        );
+    }
+
+    /// Assert a 200 and return the body the worker received.
+    fn forwarded(&self) -> &Value {
+        assert_eq!(self.status, StatusCode::OK);
+        self.body.as_ref().expect("worker received a request")
+    }
+
+    /// The forwarded `sampling_params`, `None` when the body grew no such key.
+    fn sampling_params(&self) -> Option<&Value> {
+        self.forwarded().get("sampling_params")
+    }
+}
+
+/// Send one request through a freshly-built router at `flags` and report what
+/// the worker saw.
+async fn run(flags: &[&str], path: &str, body: Value) -> Dispatched {
+    let mock = MockWorker::start(vec![]).await;
     let cfg = config(flags);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
-        id: WorkerId(url.clone()),
-        url,
+        id: WorkerId(mock.url.clone()),
+        url: mock.url.clone(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
-}
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
 
-async fn send(ctx: Arc<AppContext>, path: &str, body: Value) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
         .uri(path)
@@ -80,16 +144,35 @@ async fn send(ctx: Arc<AppContext>, path: &str, body: Value) -> (StatusCode, Val
     let resp = build_router(ctx).oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, parsed)
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let error = parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let captured = mock.captured.lock().unwrap();
+    Dispatched {
+        status,
+        error,
+        body: captured
+            .last_body
+            .as_ref()
+            .map(|b| serde_json::from_slice(b).expect("captured body is valid JSON")),
+        path: captured.last_path.clone(),
+    }
 }
 
-fn captured(mock: &MockWorker) -> Option<Value> {
-    let b = mock.captured.lock().unwrap().last_body.clone()?;
-    Some(serde_json::from_slice(&b).expect("captured body is valid JSON"))
+/// A plain `/generate` body carrying nothing the controls act on.
+fn plain() -> Value {
+    json!({"model": MODEL, "text": "hi"})
 }
 
-const OVERRIDES: &str = r#"{"temperature": 1, "top_p": 0.95}"#;
+/// A `/generate` body whose `sampling_params` is exactly `sp`.
+fn with_sampling_params(sp: Value) -> Value {
+    json!({"model": MODEL, "text": "hi", "sampling_params": sp})
+}
 
 /// The test that pins enforce-don't-inject: a cap is configured and the
 /// request sets no output budget, so the forwarded body must carry NEITHER
@@ -98,20 +181,15 @@ const OVERRIDES: &str = r#"{"temperature": 1, "top_p": 0.95}"#;
 /// surface's inject-when-absent arm would write one of them and fail here.
 #[tokio::test]
 async fn cap_enforces_but_never_injects_on_generate() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--max-output-tokens", "4096"]);
-    let (status, _) = send(ctx, "/generate", json!({"model": MODEL, "text": "hi"})).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock).expect("worker received a request");
+    let d = run(CAP, "/generate", plain()).await;
+    let body = d.forwarded();
     assert_eq!(
-        mock.captured.lock().unwrap().last_path.as_deref(),
+        d.path.as_deref(),
         Some("/generate"),
         "the request must be proxied to the worker's /generate path"
     );
     assert_eq!(
-        body.get("sampling_params")
-            .and_then(|sp| sp.get("max_new_tokens")),
+        d.sampling_params().and_then(|sp| sp.get("max_new_tokens")),
         None,
         "no budget may be injected on /generate: {body}"
     );
@@ -127,32 +205,13 @@ async fn cap_enforces_but_never_injects_on_generate() {
 /// `max_tokens`, a field `/generate` clients never set.
 #[tokio::test]
 async fn over_cap_max_new_tokens_is_400_naming_the_generate_key() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--max-output-tokens", "4096"]);
-    let (status, resp) = send(
-        ctx,
+    run(
+        CAP,
         "/generate",
-        json!({
-            "model": MODEL,
-            "text": "hi",
-            "sampling_params": {"max_new_tokens": 999999},
-        }),
+        with_sampling_params(json!({"max_new_tokens": 999999})),
     )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let msg = resp
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or_default();
-    assert!(
-        msg.contains("sampling_params.max_new_tokens"),
-        "the 400 must name the generate-side key: {msg}"
-    );
-    assert!(
-        captured(&mock).is_none(),
-        "a rejected request must not reach the engine"
-    );
+    .await
+    .assert_rejected_naming("sampling_params.max_new_tokens");
 }
 
 /// An explicit `"max_new_tokens": null` is NOT the absent case: the engine
@@ -162,37 +221,14 @@ async fn over_cap_max_new_tokens_is_400_naming_the_generate_key() {
 /// forwards untouched.
 #[tokio::test]
 async fn explicit_null_max_new_tokens_is_a_400_under_a_cap() {
-    let body = || {
-        json!({
-            "model": MODEL,
-            "text": "hi",
-            "sampling_params": {"max_new_tokens": null},
-        })
-    };
+    let body = || with_sampling_params(json!({"max_new_tokens": null}));
 
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--max-output-tokens", "4096"]);
-    let (status, resp) = send(ctx, "/generate", body()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let msg = resp
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or_default();
-    assert!(
-        msg.contains("sampling_params.max_new_tokens"),
-        "the 400 must name the generate-side key: {msg}"
-    );
-    assert!(
-        captured(&mock).is_none(),
-        "a rejected request must not reach the engine"
-    );
+    run(CAP, "/generate", body())
+        .await
+        .assert_rejected_naming("sampling_params.max_new_tokens");
 
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &[]);
-    let (status, _) = send(ctx, "/generate", body()).await;
     assert_eq!(
-        status,
+        run(NO_FLAGS, "/generate", body()).await.status,
         StatusCode::OK,
         "with no cap configured the null forwards untouched"
     );
@@ -201,22 +237,15 @@ async fn explicit_null_max_new_tokens_is_a_400_under_a_cap() {
 /// An explicit under-cap budget forwards unchanged.
 #[tokio::test]
 async fn under_cap_max_new_tokens_forwards_unchanged() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--max-output-tokens", "4096"]);
-    let (status, _) = send(
-        ctx,
+    let d = run(
+        CAP,
         "/generate",
-        json!({
-            "model": MODEL,
-            "text": "hi",
-            "sampling_params": {"max_new_tokens": 100},
-        }),
+        with_sampling_params(json!({"max_new_tokens": 100})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = captured(&mock).expect("worker received a request");
+    let body = d.forwarded();
     assert_eq!(
-        body.get("sampling_params"),
+        d.sampling_params(),
         Some(&json!({"max_new_tokens": 100})),
         "{body}"
     );
@@ -227,23 +256,13 @@ async fn under_cap_max_new_tokens_forwards_unchanged() {
 /// a 400 that never reaches a worker.
 #[tokio::test]
 async fn reject_mode_400s_a_conflicting_sampling_params_value() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--override-sampling-params", OVERRIDES]);
-    let (status, _) = send(
-        ctx,
+    run(
+        PINS,
         "/generate",
-        json!({
-            "model": MODEL,
-            "text": "hi",
-            "sampling_params": {"temperature": 0.7},
-        }),
+        with_sampling_params(json!({"temperature": 0.7})),
     )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        captured(&mock).is_none(),
-        "a rejected request must not reach the engine"
-    );
+    .await
+    .assert_rejected();
 }
 
 /// A configured parameter the request omits is injected UNDER
@@ -251,22 +270,15 @@ async fn reject_mode_400s_a_conflicting_sampling_params_value() {
 /// never as a top-level key the engine would discard.
 #[tokio::test]
 async fn omitted_temperature_is_injected_under_sampling_params() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--override-sampling-params", OVERRIDES]);
-    let (status, _) = send(
-        ctx,
+    let d = run(
+        PINS,
         "/generate",
-        json!({
-            "model": MODEL,
-            "text": "hi",
-            "sampling_params": {"top_k": 50},
-        }),
+        with_sampling_params(json!({"top_k": 50})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = captured(&mock).expect("worker received a request");
+    let body = d.forwarded();
     assert_eq!(
-        body.get("sampling_params"),
+        d.sampling_params(),
         Some(&json!({"temperature": 1, "top_p": 0.95, "top_k": 50})),
         "{body}"
     );
@@ -275,40 +287,19 @@ async fn omitted_temperature_is_injected_under_sampling_params() {
 }
 
 /// A request with no `sampling_params` key at all gets the object created
-/// for the injections.
+/// for the injections; an explicit `null` is treated the same way, rather
+/// than the null being forwarded.
 #[tokio::test]
-async fn absent_sampling_params_object_is_created() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--override-sampling-params", OVERRIDES]);
-    let (status, _) = send(ctx, "/generate", json!({"model": MODEL, "text": "hi"})).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = captured(&mock).expect("worker received a request");
-    assert_eq!(
-        body.get("sampling_params"),
-        Some(&json!({"temperature": 1, "top_p": 0.95})),
-        "{body}"
-    );
-}
-
-/// Explicit `null` is treated as absent: the object is created for the
-/// injections rather than the null being forwarded.
-#[tokio::test]
-async fn null_sampling_params_is_treated_as_absent() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone(), &["--override-sampling-params", OVERRIDES]);
-    let (status, _) = send(
-        ctx,
-        "/generate",
-        json!({"model": MODEL, "text": "hi", "sampling_params": null}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = captured(&mock).expect("worker received a request");
-    assert_eq!(
-        body.get("sampling_params"),
-        Some(&json!({"temperature": 1, "top_p": 0.95})),
-        "{body}"
-    );
+async fn absent_or_null_sampling_params_object_is_created() {
+    for body in [plain(), with_sampling_params(Value::Null)] {
+        let d = run(PINS, "/generate", body.clone()).await;
+        assert_eq!(
+            d.sampling_params(),
+            Some(&json!({"temperature": 1, "top_p": 0.95})),
+            "sent {body}, worker saw {}",
+            d.forwarded()
+        );
+    }
 }
 
 /// A present but non-object `sampling_params` is a 400 BEFORE dispatch —
@@ -317,19 +308,9 @@ async fn null_sampling_params_is_treated_as_absent() {
 #[tokio::test]
 async fn non_object_sampling_params_is_400_before_dispatch() {
     for bad in [json!("x"), json!([])] {
-        let mock = MockWorker::start(vec![]).await;
-        let ctx = build_ctx(mock.url.clone(), &[]);
-        let (status, _) = send(
-            ctx,
-            "/generate",
-            json!({"model": MODEL, "text": "hi", "sampling_params": bad}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            captured(&mock).is_none(),
-            "a rejected request must not reach the engine"
-        );
+        run(NO_FLAGS, "/generate", with_sampling_params(bad))
+            .await
+            .assert_rejected();
     }
 }
 
@@ -338,29 +319,18 @@ async fn non_object_sampling_params_is_400_before_dispatch() {
 /// `sampling_params` object.
 #[tokio::test]
 async fn chat_surface_still_writes_top_level_keys() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(
-        mock.url.clone(),
-        &[
-            "--max-output-tokens",
-            "4096",
-            "--override-sampling-params",
-            OVERRIDES,
-        ],
-    );
-    let (status, _) = send(
-        ctx,
+    let d = run(
+        CAP_AND_PINS,
         "/v1/chat/completions",
         json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = captured(&mock).expect("worker received a request");
+    let body = d.forwarded();
     assert_eq!(body.get("max_tokens"), Some(&json!(4096)), "{body}");
     assert_eq!(body.get("temperature"), Some(&json!(1)), "{body}");
     assert_eq!(body.get("top_p"), Some(&json!(0.95)), "{body}");
     assert_eq!(
-        body.get("sampling_params"),
+        d.sampling_params(),
         None,
         "the chat surface must never grow a sampling_params object: {body}"
     );

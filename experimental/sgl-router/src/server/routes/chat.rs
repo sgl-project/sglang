@@ -2090,9 +2090,12 @@ fn select_forward_input_ids<'a>(
     // `GenerateReqInput._validate_inputs` allows it), but because
     // `TokenizerManager._tokenize_one_request` then takes the ids and
     // SILENTLY IGNORES `text` — a forwarded id list would serve a prompt
-    // the client never sent, undetectably, whenever the specials probe was
-    // inconclusive. The routing benefit is already captured by ingress
-    // tokenization; only an engine-side CPU saving is forgone.
+    // the client never sent, undetectably. The router encodes with
+    // `add_special_tokens = false` and `/generate` encodes with `true`, so
+    // router ids are never the engine's ids for that body; the suppression
+    // is unconditional, not a hedge against some uncertain case. The routing
+    // benefit is already captured by ingress tokenization; only an
+    // engine-side CPU saving is forgone.
     if matches!(surface, Surface::Generate) {
         return None;
     }

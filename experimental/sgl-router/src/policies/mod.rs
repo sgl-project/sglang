@@ -101,26 +101,29 @@ pub fn request_tokens_for(
     })
 }
 
-/// The `/generate` counterpart of [`request_tokens_for`]. Two deliberate
-/// differences:
-///
-///   * It NEVER takes the chat-encoder branch and never reads `prompt`.
-///     `GenerateReqInput` is a dataclass that ignores extra keys, so a
-///     `/generate` body carrying a stray `messages` or `prompt` is legal —
-///     and routing on either would key on a prompt the engine never sees.
-///     The `Generate` path reads `input_ids`, else `text`, and nothing else.
-///   * The raw-text branch decorates the tokenization with the model's
-///     load-time-probed [`crate::tokenizer::adapter::RawPromptSpecials`], so
-///     the routing tokens match the engine's `add_special_tokens = true`
-///     `/generate` tokenization block-for-block instead of missing every
-///     engine-emitted block hash on a specials-adding tokenizer.
+/// The `/generate` counterpart of [`request_tokens_for`]. It NEVER takes the
+/// chat-encoder branch and never reads `prompt`: `GenerateReqInput` is a
+/// dataclass that ignores extra keys, so a `/generate` body carrying a stray
+/// `messages` or `prompt` is legal — and routing on either would key on a
+/// prompt the engine never sees. This path reads `input_ids`, else `text`,
+/// and nothing else.
 ///
 /// Client-supplied `input_ids` (a flat integer array — batch bodies are
 /// rejected at the route) are used verbatim: perfect parity by construction,
-/// and no tokenizer needed. `engine_equivalent` stays `false` either way:
-/// router-computed ids are never forwarded on `/generate` (the engine would
-/// prefer them and silently drop `text`), so the flag's only consumer stays
-/// off.
+/// and no tokenizer needed.
+///
+/// A `text` body is tokenized WITHOUT the special tokens the engine adds
+/// (`/generate` encodes with `add_special_tokens = true`, the router with
+/// `false`). On a tokenizer whose post-processor adds any — a
+/// `TemplateProcessing` BOS, say — every block boundary in the routing
+/// tokens is therefore shifted against the engine's, prefix matching against
+/// engine-emitted `BlockStored` hashes finds nothing, and cache-aware
+/// routing degrades to load-only for `/generate` text traffic. Nothing fails
+/// when that happens; send `input_ids` to route such traffic by prefix.
+///
+/// `engine_equivalent` stays `false` either way: router-computed ids are
+/// never forwarded on `/generate` (the engine would prefer them and silently
+/// drop `text`), so the flag's only consumer stays off.
 pub fn request_tokens_for_generate(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
@@ -142,16 +145,6 @@ pub fn request_tokens_for_generate(
     }
     let text = value.get("text").and_then(|t| t.as_str())?;
     let ids = tokenize_text(tokenizers, model_id, text)?;
-    let ids = match tokenizers.raw_prompt_specials(&model_id.0) {
-        Some(s) if !s.is_empty() => {
-            let mut out = Vec::with_capacity(s.prefix.len() + ids.len() + s.suffix.len());
-            out.extend_from_slice(&s.prefix);
-            out.extend_from_slice(&ids);
-            out.extend_from_slice(&s.suffix);
-            out
-        }
-        _ => ids,
-    };
     Some(RequestTokens {
         ids,
         engine_equivalent: false,
