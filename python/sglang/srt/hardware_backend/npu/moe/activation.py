@@ -217,15 +217,15 @@ class NPUSwigluMxfp8Quant(BaseActivation):
         # a cusum list passed through would silently process the wrong rows.
         if group_list_type != 1:
             raise ValueError(
-                "swiglu_group_quant takes a per-expert count group list, got "
+                "npu_swiglu_group_quant takes a per-expert count group list, got "
                 f"group_list_type={group_list_type}"
             )
-        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+        out, scale, _ = torch.ops.npu.npu_swiglu_group_quant(
             x=hidden_states,
             group_index=group_list,
             quant_mode=2,  # MX: one e8m0 scale per 32-element block
-            group_list_type=0,  # sglang numbers the count layout 1, the op numbers it 0
-            clamp_value=self._limit,
+            block_size=32,
+            clamp_limit=self._limit,
         )
         return out, scale
 

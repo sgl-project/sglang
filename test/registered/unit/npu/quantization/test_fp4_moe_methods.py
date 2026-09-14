@@ -64,9 +64,8 @@ class TestFP4MethodGate(unittest.TestCase):
 
 class TestNPUSwigluMxfp8Quant(unittest.TestCase):
     def test_translates_runner_conventions_onto_the_ascend_c_op(self):
-        # The op numbers the group-list layouts the other way round from sglang, so the
-        # count layout arrives as 1 and must leave as 0; the clamp is inert at 0.0, so a
-        # limit that failed to reach clamp_value would silently disable it.
+        # This CANN op accepts only a count-layout group index. The clamp is inert at
+        # 0.0, so a limit that failed to reach clamp_limit would silently disable it.
         activation = NPUSwigluMxfp8Quant(7.0)
         output = torch.empty(2, 4, dtype=torch.float8_e4m3fn)
         scale = torch.empty(2, 1, 2, dtype=torch.float8_e8m0fnu)
@@ -75,7 +74,7 @@ class TestNPUSwigluMxfp8Quant(unittest.TestCase):
 
         with patch.object(
             torch.ops.npu,
-            "swiglu_group_quant",
+            "npu_swiglu_group_quant",
             return_value=(output, scale, None),
             create=True,
         ) as kernel:
@@ -89,8 +88,9 @@ class TestNPUSwigluMxfp8Quant(unittest.TestCase):
         self.assertIs(kwargs["x"], hidden_states)
         self.assertIs(kwargs["group_index"], group_list)
         self.assertEqual(kwargs["quant_mode"], 2)
-        self.assertEqual(kwargs["group_list_type"], 0)
-        self.assertEqual(kwargs["clamp_value"], 7.0)
+        self.assertEqual(kwargs["block_size"], 32)
+        self.assertEqual(kwargs["clamp_limit"], 7.0)
+        self.assertNotIn("group_list_type", kwargs)
 
     def test_rejects_a_cumulative_group_list(self):
         # The op has no cusum layout and sums its group list as counts, so a cusum list
