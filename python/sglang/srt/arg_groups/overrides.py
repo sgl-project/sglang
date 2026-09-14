@@ -1956,3 +1956,91 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
     if getattr(server_args, "_resolution_finished", False):
         server_args._max_speculative_num_draft_tokens = result
     return result
+
+
+@register_post_process
+def _wq_dsa_dcp_validation(view: Any) -> dict:
+    """WQ Hopper DCP for DSA models (DeepSeek-V3.2 / GLM-5.x on SM90).
+
+    Registered last so it reads the RESOLVED DSA split backends and kv-cache
+    dtype. Without this pass a DSA model accepts ``--dcp-size > 1`` (no rule
+    rejects it), boots, and then either crashes in the first decode (the
+    ``flashmla_kv`` wrapper used to discard the LSE the DCP merge needs) or
+    silently reads the wrong KV rows (top-k slots are VIRTUAL under DCP).
+    The supported composition on this fork is exactly:
+
+    * fp8_e4m3 KV with ``flashmla_kv`` for BOTH prefill and decode — the only
+      SM90 DSA impl that owner-filters its top-k slots and returns the LSE
+      (``dsa_backend.dcp_localize_topk_slots`` / ``_forward_flashmla_kv``);
+    * index_kpool == 1 (tail tokens are appended past the fixed top-k columns
+      and would need their own owner filtering);
+    * no HiCache / LMCache / HiSparse yet (the DSA index-K stays replicated in
+      the virtual loc space; the host pools have no translation for that
+      layout) and no speculative decoding yet (milestone 2);
+    * no prefill CP, no mixed chunk (DSA EXTEND rides the decode LSE-merge
+      path, which assumes pure EXTEND batches), no PD disaggregation;
+    * gathered Q (``--no-dcp-replicate-q-proj``: the fp8 q_b_proj has no
+      replicated-weight path).
+    """
+    if view.dcp_size <= 1:
+        return {}
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
+
+    hf_config = view.get_model_config().hf_config
+    if not is_deepseek_dsa(hf_config):
+        return {}
+    platform = get_platform()
+    if not platform.is_cuda or platform.is_blackwell:
+        # Blackwell DSA runs trtllm-gen sparse MLA with native enable_dcp;
+        # leave the upstream composition untouched there.
+        return {}
+
+    problems = []
+    if view.kv_cache_dtype != "fp8_e4m3":
+        problems.append(
+            f"kv_cache_dtype={view.kv_cache_dtype!r} (need 'fp8_e4m3' so the "
+            "DSA split backends resolve to flashmla_kv)"
+        )
+    for attr in ("dsa_prefill_backend", "dsa_decode_backend"):
+        val = getattr(view, attr)
+        if val != "flashmla_kv":
+            problems.append(f"{attr}={val!r} (need 'flashmla_kv')")
+    if get_dsa_index_kpool(hf_config) > 1:
+        problems.append("index_kpool > 1 (tail-token owner filtering not implemented)")
+    for attr, label in (
+        ("enable_hierarchical_cache", "--enable-hierarchical-cache (HiCache)"),
+        ("enable_lmcache", "--enable-lmcache"),
+        ("enable_hisparse", "--enable-hisparse"),
+        ("enable_prefill_cp", "--enable-prefill-cp"),
+        ("enable_dsa_prefill_context_parallel", "DSA prefill context parallel"),
+        ("enable_mixed_chunk", "--enable-mixed-chunk"),
+    ):
+        if getattr(view, attr):
+            problems.append(f"{label} is not supported with DSA + DCP yet")
+    if view.speculative_algorithm is not None:
+        problems.append(
+            f"speculative_algorithm={view.speculative_algorithm!r} "
+            "(DSA + DCP speculative decoding is milestone 2)"
+        )
+    if view.disaggregation_mode != "null":
+        problems.append("PD disaggregation is not supported with DSA + DCP")
+    if view.dcp_replicate_q_proj:
+        problems.append(
+            "--dcp-replicate-q-proj (fp8 q_b_proj has no replicated-weight "
+            "path; use --no-dcp-replicate-q-proj)"
+        )
+    if view.page_size != 64:
+        problems.append(f"page_size={view.page_size} (DSA flashmla_kv needs 64)")
+    if problems:
+        raise ValueError(
+            "DSA model with --dcp-size > 1 on SM90 (WQ Hopper DCP) rejected:\n  - "
+            + "\n  - ".join(problems)
+        )
+    logger.info(
+        "WQ Hopper DCP enabled for DSA model: dcp_size=%d, comm=%s, "
+        "flashmla_kv prefill+decode with owner-localized top-k and LSE merge; "
+        "index-K replicated over the virtual loc space.",
+        view.dcp_size,
+        view.dcp_comm_backend,
+    )
+    return {}
