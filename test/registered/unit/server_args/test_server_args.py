@@ -31,7 +31,12 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_mamba_backend,
+    parse_mamba_prefill_checkpoint_at,
+    validate_mamba_extra_buffer,
+    validate_mamba_no_buffer,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
@@ -42,7 +47,9 @@ from sglang.srt.arg_groups.moe_hook import (
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
+    record_of,
     resolution_result,
+    resolved_view,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -655,6 +662,104 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+def _mamba_extra_buffer_view(**overrides):
+    fields = dict(
+        mamba_radix_cache_strategy="extra_buffer",
+        disaggregation_mode="null",
+        speculative_num_draft_tokens=None,
+        mamba_track_interval=256,
+        page_size=64,
+        chunked_prefill_size=24576,
+        linear_attn_backend="triton",
+        mamba_prefill_checkpoint_at=None,
+    )
+    fields.update(overrides)
+    # A plain (non-dataclass) stand-in for `server_args`: `resolved_view`
+    # wraps it the same way it wraps a real `ServerArgs`, so `record_of` and
+    # `declare_resolution` (which `validate_mamba_extra_buffer` uses to
+    # publish `mamba_prefill_checkpoint_positions`) work unmodified, and
+    # `resolution_result` reads the declaration back off it.
+    fake_server_args = SimpleNamespace(**fields)
+    return resolved_view(fake_server_args), fake_server_args
+
+
+class TestMambaPrefillCheckpointAt(unittest.TestCase):
+    def test_parse_sorts_dedupes_and_handles_empty_input(self):
+        self.assertEqual(parse_mamba_prefill_checkpoint_at(None), [])
+        self.assertEqual(parse_mamba_prefill_checkpoint_at(""), [])
+        self.assertEqual(
+            parse_mamba_prefill_checkpoint_at("136192,65536,65536"),
+            [65536, 136192],
+        )
+
+    @override_platform(is_cuda=True)
+    def test_extra_buffer_rejects_position_off_the_grid(self):
+        view, _ = _mamba_extra_buffer_view(mamba_prefill_checkpoint_at="100")
+
+        with self.assertRaisesRegex(AssertionError, "must be a positive multiple"):
+            validate_mamba_extra_buffer(
+                view,
+                "KimiK3ForConditionalGeneration",
+                mamba_cache_chunk_size_of=lambda: 64,
+            )
+
+    @override_platform(is_cuda=True)
+    def test_extra_buffer_accepts_grid_aligned_position(self):
+        view, fake_server_args = _mamba_extra_buffer_view(
+            mamba_prefill_checkpoint_at="65536,136192"
+        )
+
+        validate_mamba_extra_buffer(
+            view,
+            "KimiK3ForConditionalGeneration",
+            mamba_cache_chunk_size_of=lambda: 64,
+        )
+
+        self.assertEqual(
+            resolution_result(fake_server_args, "mamba_prefill_checkpoint_positions"),
+            [65536, 136192],
+        )
+
+    @override_platform(is_cuda=True)
+    def test_extra_buffer_defers_grid_check_when_page_size_unresolved(self):
+        """Mirrors TestValidateMambaExtraBufferLazyDflash's
+        `test_the_chunk_size_is_not_read_before_the_page_size_resolves`: the
+        grid derives from `page_size`, which is not resolved yet at this
+        hook's call sites, so the chunk-size accessor must not be invoked."""
+
+        def _must_not_be_read():
+            raise AssertionError("the chunk size was read before page_size resolved")
+
+        view, fake_server_args = _mamba_extra_buffer_view(
+            page_size=None, mamba_prefill_checkpoint_at="136192"
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            validate_mamba_extra_buffer(
+                view,
+                "KimiK3ForConditionalGeneration",
+                mamba_cache_chunk_size_of=_must_not_be_read,
+            )
+        self.assertTrue(any("page-size" in m for m in logs.output))
+        # Still exposed to the scheduler, just not validated yet.
+        self.assertEqual(
+            resolution_result(fake_server_args, "mamba_prefill_checkpoint_positions"),
+            [136192],
+        )
+
+    def test_no_buffer_warns_and_ignores(self):
+        view = SimpleNamespace(
+            page_size=1,
+            disable_overlap_schedule=True,
+            attention_backend="triton",
+            mamba_prefill_checkpoint_at="136192",
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            validate_mamba_no_buffer(view, "KimiK3ForConditionalGeneration")
+        self.assertTrue(any("ignored" in m for m in logs.output))
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

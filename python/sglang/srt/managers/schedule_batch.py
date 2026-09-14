@@ -4,6 +4,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_parallel,
     get_schedule,
     get_serving,
@@ -2790,22 +2791,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
-            if req.mamba_branching_seqlen is not None:
+            pinned = self._pinned_checkpoint_in_extend(req, mamba_track_seqlen)
+            effective_branching = req.mamba_branching_seqlen
+            if effective_branching is None and pinned is not None:
+                effective_branching = pinned
+            if effective_branching is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
+                    effective_branching - len(req.prefix_indices)
                 ) % cache_chunk_size == 0
                 if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
+                    effective_branching > len(req.prefix_indices)
+                    and effective_branching < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                     # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+                    mamba_track_seqlen = _force_track_h(effective_branching)
+                    mamba_track_seqlen_aligned = effective_branching
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
@@ -2813,6 +2818,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
         )
+
+    def _pinned_checkpoint_in_extend(self, req: Req, extend_end: int) -> Optional[int]:
+        """Largest configured --mamba-prefill-checkpoint-at position that falls
+        strictly inside this extend, i.e. prefix_len < pos < extend_end. One extend
+        can track only one position, so the deepest wins."""
+        positions = get_exec().mamba.mamba_prefill_checkpoint_positions
+        if not positions:
+            return None
+        # The arg validator may run before page_size resolves and then skips
+        # the grid check; re-check here so an unaligned pin is dropped with a
+        # warning instead of silently failing the chunk-aligned track mask.
+        grid = mamba_checkpoint_grid(self.tree_cache.page_size)
+        aligned = [p for p in positions if p % grid == 0]
+        if len(aligned) != len(positions) and not getattr(
+            self, "_warned_unaligned_pinned_checkpoint", False
+        ):
+            self._warned_unaligned_pinned_checkpoint = True
+            logger.warning(
+                "--mamba-prefill-checkpoint-at positions %s are not multiples of "
+                "the mamba checkpoint grid %d and will be ignored.",
+                [p for p in positions if p % grid != 0],
+                grid,
+            )
+        lo = len(req.prefix_indices)
+        hit = [p for p in aligned if lo < p < extend_end]
+        return max(hit) if hit else None
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""

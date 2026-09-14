@@ -2637,6 +2637,28 @@ class ServerArgs:
     mamba_track_interval: A[
         int, "The interval to track the mamba state during decode.", NS("exec.mamba")
     ] = 256
+    mamba_prefill_checkpoint_at: A[
+        Optional[str],
+        "Comma-separated absolute token positions at which the prefill pass "
+        "pins a Mamba prefix checkpoint, e.g. '136192' or '65536,136192'. "
+        "Each position must be a multiple of the mamba checkpoint grid "
+        "(lcm(mamba_cache_chunk_size, page_size)) and must fall strictly "
+        "inside one chunked-prefill extend (not on its first token). Only "
+        "effective with --mamba-radix-cache-strategy extra_buffer / "
+        "extra_buffer_lazy. Default: none (checkpoints only at extend ends "
+        "and at radix branching points).",
+        NS("exec.mamba"),
+    ] = None
+    mamba_prefill_checkpoint_positions: A[
+        List[int],
+        Arg(
+            help="(Derived) parsed --mamba-prefill-checkpoint-at positions; "
+            "resolved from the raw comma-separated string, no CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+        NS("exec.mamba"),
+    ] = dataclasses.field(default_factory=list)
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",

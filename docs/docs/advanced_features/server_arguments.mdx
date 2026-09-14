@@ -2018,6 +2018,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`256`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-prefill-checkpoint-at`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated absolute token positions at which the prefill pass pins a Mamba prefix checkpoint, e.g. <code>'136192'</code> or <code>'65536,136192'</code>. Each position must be a multiple of the mamba checkpoint grid (<code>lcm(mamba_cache_chunk_size, page_size)</code>) and must fall strictly inside one chunked-prefill extend (not on its first token). Only effective with <code>--mamba-radix-cache-strategy extra_buffer</code> / <code>extra_buffer_lazy</code>. Default: none (checkpoints only at extend ends and at radix branching points).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
       <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-int8-mamba-checkpoint`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.</td>

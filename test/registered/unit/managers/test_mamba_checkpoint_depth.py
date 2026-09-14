@@ -27,9 +27,20 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 CHUNK = 64
 
 
-def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
+def _track_seqlen(
+    *,
+    tree_page: int,
+    prefix_len: int,
+    extend_len: int,
+    checkpoint_positions=None,
+    branching_seqlen=None,
+) -> int:
     """Run one extend through the tracker and report the donated depth."""
-    server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
+    server_args = ServerArgs(
+        model_path="dummy",
+        page_size=CHUNK,
+        mamba_prefill_checkpoint_positions=checkpoint_positions or [],
+    )
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
     set_global_server_args_for_scheduler(server_args)
@@ -47,7 +58,7 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.model_config = SimpleNamespace(
@@ -72,6 +83,63 @@ class TestMambaCheckpointDepth(unittest.TestCase):
     def test_unwidened_tree_page_keeps_the_chunk_grid(self):
         depth = _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth, 20416)
+
+
+class TestMambaPinnedPrefillCheckpoint(unittest.TestCase):
+    """`--mamba-prefill-checkpoint-at` reuses the branching-point snapshot
+    path: a configured absolute position strictly inside the current extend
+    is tracked instead of the extend end when the request has no real radix
+    branching point (`_pinned_checkpoint_in_extend` / `effective_branching`
+    in `_mamba_radix_cache_v2_req_prepare_for_extend`)."""
+
+    def test_pinned_position_inside_extend_is_tracked(self):
+        depth = _track_seqlen(
+            tree_page=CHUNK,
+            prefix_len=0,
+            extend_len=1280,
+            checkpoint_positions=[640],
+        )
+        self.assertEqual(depth, 640)
+
+    def test_pinned_position_outside_extend_has_no_effect(self):
+        depth = _track_seqlen(
+            tree_page=CHUNK,
+            prefix_len=0,
+            extend_len=1280,
+            checkpoint_positions=[2000],
+        )
+        self.assertEqual(depth, 1280)
+
+    def test_multiple_pins_in_one_extend_take_the_deepest(self):
+        depth = _track_seqlen(
+            tree_page=CHUNK,
+            prefix_len=0,
+            extend_len=1280,
+            checkpoint_positions=[128, 640],
+        )
+        self.assertEqual(depth, 640)
+
+    def test_real_branching_point_wins_over_a_pinned_position(self):
+        depth = _track_seqlen(
+            tree_page=CHUNK,
+            prefix_len=0,
+            extend_len=1280,
+            checkpoint_positions=[640],
+            branching_seqlen=384,
+        )
+        self.assertEqual(depth, 384)
+
+    def test_pin_on_the_extend_start_is_not_repinned(self):
+        # `pos == prefix_len` (the extend's first token) is already covered
+        # by the previous chunk's own end-of-chunk checkpoint, so it must not
+        # satisfy the strict `prefix_len < pos` bound here.
+        depth = _track_seqlen(
+            tree_page=CHUNK,
+            prefix_len=640,
+            extend_len=640,
+            checkpoint_positions=[640],
+        )
+        self.assertEqual(depth, 1280)
 
 
 class TestMambaTrackGrid(unittest.TestCase):

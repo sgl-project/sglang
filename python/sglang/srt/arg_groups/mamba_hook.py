@@ -4,15 +4,26 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import math
+from typing import Any, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    record_of,
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def parse_mamba_prefill_checkpoint_at(raw: Optional[str]) -> List[int]:
+    """Parse ``--mamba-prefill-checkpoint-at`` into sorted, de-duplicated
+    absolute token positions. Empty/unset input yields an empty list."""
+    if not raw:
+        return []
+    return sorted({int(x) for x in raw.split(",") if x.strip()})
 
 
 def handle_mamba_backend(server_args: Any):
@@ -139,6 +150,46 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
                 mamba_cache_chunk_size,
             )
 
+    # `getattr` with a default: test doubles for this validator (a bare
+    # SimpleNamespace `view`) predate this field and do not set it.
+    raw_checkpoint_at = getattr(view, "mamba_prefill_checkpoint_at", None)
+    positions = parse_mamba_prefill_checkpoint_at(raw_checkpoint_at)
+    if positions:
+        if view.page_size is None:
+            # `mamba_cache_chunk_size_of()` reads a resolved `page_size`
+            # (this hook's call sites run ahead of `_page_size_default`), so
+            # the grid check can't run yet. The runtime path recomputes the
+            # grid from the fully-resolved config, so this only means an
+            # unaligned position is not rejected until then instead of here.
+            logger.warning(
+                "--mamba-prefill-checkpoint-at=%s could not be validated "
+                "against the mamba checkpoint grid because --page-size is "
+                "not resolved yet.",
+                raw_checkpoint_at,
+            )
+        else:
+            # Called here and not passed in for the same reason as
+            # `mamba_cache_chunk_size` above: it derives from `page_size`.
+            grid = math.lcm(mamba_cache_chunk_size_of(), view.page_size)
+            for p in positions:
+                assert p > 0 and p % grid == 0, (
+                    f"--mamba-prefill-checkpoint-at={p} must be a positive multiple of the "
+                    f"mamba checkpoint grid {grid} (lcm(mamba_cache_chunk_size, page_size))."
+                )
+            if view.chunked_prefill_size is not None and view.chunked_prefill_size > 0:
+                for p in positions:
+                    if p % view.chunked_prefill_size == 0:
+                        logger.info(
+                            "checkpoint-at %d coincides with a chunked-prefill boundary; "
+                            "the normal extend-end checkpoint already covers it.",
+                            p,
+                        )
+        declare_resolution(
+            record_of(view),
+            "validate_mamba_extra_buffer",
+            mamba_prefill_checkpoint_positions=positions,
+        )
+
 
 def validate_mamba_no_buffer(view, model_arch: str):
     assert view.page_size in (1, None), "no_buffer only supports page_size=1."
@@ -148,3 +199,11 @@ def validate_mamba_no_buffer(view, model_arch: str):
     assert (
         view.attention_backend != "trtllm_mha"
     ), "no_buffer do not support trtllm_mha attention backend."
+    raw_checkpoint_at = getattr(view, "mamba_prefill_checkpoint_at", None)
+    if raw_checkpoint_at:
+        logger.warning(
+            "--mamba-prefill-checkpoint-at=%s is ignored under "
+            "--mamba-radix-cache-strategy no_buffer: no_buffer has no "
+            "state-tracking path to pin a prefix checkpoint on.",
+            raw_checkpoint_at,
+        )
