@@ -240,7 +240,7 @@ def alloc_with_pin_memory(
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
-    allocator: None,
+    allocator=None,
     registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
@@ -250,8 +250,26 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def _default_alloc_func():
+    """On ROCm/HIP, hipHostRegister maps host memory at a device virtual address
+    that differs from the host virtual address. The JIT HiCache kernels store
+    data_ptr() (host VA) in pointer tables and dereference them from GPU code,
+    which faults on ROCm because the GPU sees a different mapping.
+
+    hipHostMalloc (used by torch pin_memory=True) allocates at the same virtual
+    address on both host and device, so GPU kernels can safely dereference the
+    host-side data_ptr().
+
+    CUDA is unaffected: cudaHostRegister already provides unified VA."""
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        return alloc_with_pin_memory
+    return alloc_with_host_register
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
+    _default_alloc_func,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
