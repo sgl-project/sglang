@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
+from sglang.srt.models.deepseek_common.utils_rocm import accepts_ptpc_fp8_tuple
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -573,6 +574,39 @@ class DeepseekMLARocmForwardMixin:
                     )
                     if _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif (
+                _use_aiter
+                and envs.SGLANG_ROCM_K3_PTPC_FP8.get()
+                and accepts_ptpc_fp8_tuple(self.q_b_proj)
+            ):
+                from aiter import dtypes as aiter_dtypes
+                from aiter.ops.fused_qk_rmsnorm_group_quant import (
+                    fused_qk_rmsnorm_per_token_quant,
+                )
+
+                q_fp8 = torch.empty(q.shape, dtype=aiter_dtypes.fp8, device=q.device)
+                q_scale = torch.empty(
+                    (q.shape[0], 1), dtype=torch.float32, device=q.device
+                )
+                k_out = torch.empty_like(k_nope)
+                q_unq = torch.empty_like(q) if self.use_dsa else None
+                fused_qk_rmsnorm_per_token_quant(
+                    q_fp8,
+                    q_scale,
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    q_unq,
+                    k_out,
+                    None,
+                    k_nope,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
+                q = (q_fp8, q_scale)
+                k_nope = k_out
+                if self.use_dsa:
+                    q_lora = q_unq
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
