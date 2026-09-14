@@ -1486,6 +1486,10 @@ class Envs:
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    # Compute FlashMLA's split-KV tile-scheduler metadata with the wide DSV4
+    # kernel instead of FlashMLA's one-warp one, which walks num_sm_parts
+    # serially on a single thread inside the decode graph. Off = FlashMLA's.
+    SGLANG_DSV41_FAST_FLASHMLA_SCHED = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
