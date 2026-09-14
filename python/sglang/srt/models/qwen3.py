@@ -55,9 +55,8 @@ if _use_aiter:
         pass
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+    from sglang.srt.hardware_backend.npu.fused_ops import split_qkv_rmsnorm_rope
 
 
 class Qwen3Attention(nn.Module):

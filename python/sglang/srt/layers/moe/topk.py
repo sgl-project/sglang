@@ -604,6 +604,15 @@ class TopK(BaseFusedOp):
         return self.forward_cuda(*args, **kwargs)
 
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
+        # The NPU implementation is expressed through torch.ops.npu custom-op
+        # boundaries, so it is safe for the outer Dynamo trace and preserves
+        # the routing semantics used by eager NPU execution.  Replacing it
+        # with forward_native changes the TopKConfig.torch_native contract and
+        # has been observed to corrupt Qwen3-ASR decode output even when the
+        # outer torch.compile backend is eager.
+        if _is_npu:
+            return None
+
         # torch.compile of the native TopK only pays off at bs=1; for larger
         # batches keep the current optimized dispatch (see MultiPlatformOp
         # history: the compiled path regressed bs > 1).
