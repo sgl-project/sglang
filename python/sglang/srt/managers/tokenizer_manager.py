@@ -1985,12 +1985,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
+        # Tokenizer state may already be gone while the scheduler still owns
+        # the request. Let the scheduler resolve the abort in that case too.
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
@@ -3419,17 +3415,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+        """Abort pending scheduler work before discarding tokenizer state.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Cleanup must still remove local state if the scheduler socket fails,
+        without masking the handler's original cancellation or dispatch error.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
+            if rid in self.rid_to_state:
+                try:
+                    self._dispatch_to_scheduler(AbortReq(rid=rid))
+                except Exception:
+                    logger.exception(
+                        "Failed to abort request during disconnect cleanup: %s",
+                        rid,
+                    )
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
