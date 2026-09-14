@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1300" viewBox="0 0 1900 1120" role="img" aria-labelledby="title desc">
+  <title id="title">SGLang prefix-cache-hit benchmark data structures</title>
+  <desc id="desc">Data structures and transformations from a matrix point through generated dataset rows, request inputs and outputs, aggregate cache reports, validation, and persistent artifacts.</desc>
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f9fbfe"/>
+      <stop offset="1" stop-color="#eef3f9"/>
+    </linearGradient>
+    <filter id="shadow2" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#17324d" flood-opacity="0.13"/>
+    </filter>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#49647d"/>
+    </marker>
+    <style>
+      .title { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 34px; font-weight: 700; fill: #102a43; }
+      .subtitle { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 17px; font-weight: 400; fill: #52677b; }
+      .type { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 18px; font-weight: 700; fill: #102a43; }
+      .field { font-family: "DejaVu Sans Mono", monospace; font-size: 14px; font-weight: 400; fill: #334e68; }
+      .note { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 12px; font-weight: 500; fill: #52677b; }
+      .label { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 13px; font-weight: 700; fill: #47627a; }
+      .box { stroke-width: 1.5; filter: url(#shadow2); }
+      .arrow { fill: none; stroke: #49647d; stroke-width: 2.3; marker-end: url(#arrow2); }
+      .dash { stroke-dasharray: 7 6; }
+      .separator { stroke: #cdd9e5; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1900" height="1120" fill="url(#bg2)"/>
+  <rect x="34" y="28" width="1832" height="1064" rx="24" fill="#ffffff" stroke="#d8e4ef"/>
+  <text x="80" y="84" class="title">Prefix-Cache-Hit Benchmark Data Structures</text>
+  <text x="80" y="116" class="subtitle">How configuration, request metadata, per-request cache accounting, and aggregate validation fit together</text>
+
+  <!-- MatrixPoint -->
+  <g transform="translate(70,170)">
+    <rect width="340" height="246" rx="18" fill="#e8f1ff" stroke="#4c82c3" class="box"/>
+    <text x="24" y="36" class="type">MatrixPoint</text>
+    <line x1="0" y1="54" x2="340" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">input_len</text>
+    <text x="24" y="106" class="field">output_len</text>
+    <text x="24" y="130" class="field">target_hit_rate_pct</text>
+    <text x="24" y="154" class="field">concurrency</text>
+    <text x="24" y="178" class="field">repetition</text>
+    <text x="24" y="202" class="field">tag</text>
+    <text x="24" y="230" class="note">Cartesian-product unit of work</text>
+  </g>
+
+  <!-- Dataset config -->
+  <g transform="translate(520,150)">
+    <rect width="400" height="286" rx="18" fill="#eeeaff" stroke="#7566c7" class="box"/>
+    <text x="24" y="36" class="type">GeneratedSharedPrefixDataset</text>
+    <line x1="0" y1="54" x2="400" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">num_groups</text>
+    <text x="24" y="106" class="field">prompts_per_group</text>
+    <text x="24" y="130" class="field">system_prompt_len</text>
+    <text x="24" y="154" class="field">question_len / output_len</text>
+    <text x="24" y="178" class="field">group_distribution</text>
+    <text x="24" y="202" class="field">zipf_alpha</text>
+    <text x="24" y="226" class="field">include_cache_prefix</text>
+    <text x="24" y="260" class="note">Defines the generated workload</text>
+  </g>
+
+  <!-- DatasetRow -->
+  <g transform="translate(1040,150)">
+    <rect width="380" height="286" rx="18" fill="#eeeaff" stroke="#7566c7" class="box"/>
+    <text x="24" y="36" class="type">DatasetRow</text>
+    <line x1="0" y1="54" x2="380" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">prompt</text>
+    <text x="24" y="106" class="field">prompt_len</text>
+    <text x="24" y="130" class="field">output_len</text>
+    <text x="24" y="154" class="field">routing_key?</text>
+    <rect x="16" y="170" width="348" height="70" rx="10" fill="#d9f1e8" stroke="#55a887"/>
+    <text x="30" y="196" class="field">cache_prefix?</text>
+    <text x="30" y="220" class="field">cache_prefix_len?</text>
+    <text x="24" y="268" class="note">One measured prompt; also source for priming</text>
+  </g>
+
+  <!-- Priming row -->
+  <g transform="translate(1550,170)">
+    <rect width="280" height="246" rx="18" fill="#e7f7f1" stroke="#26936e" class="box"/>
+    <text x="20" y="36" class="type">Priming Row</text>
+    <line x1="0" y1="54" x2="280" y2="54" class="separator"/>
+    <text x="20" y="82" class="field">prompt = prefix</text>
+    <text x="20" y="106" class="field">prompt_len</text>
+    <text x="20" y="130" class="field">output_len = 1</text>
+    <text x="20" y="154" class="field">routing_key?</text>
+    <text x="20" y="194" class="note">One per unique</text>
+    <text x="20" y="212" class="note">routing-key/prefix pair</text>
+  </g>
+
+  <!-- Request input -->
+  <g transform="translate(180,520)">
+    <rect width="380" height="260" rx="18" fill="#e5f5fb" stroke="#3396b7" class="box"/>
+    <text x="24" y="36" class="type">RequestFuncInput</text>
+    <line x1="0" y1="54" x2="380" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">prompt / prompt_len</text>
+    <text x="24" y="106" class="field">output_len</text>
+    <text x="24" y="130" class="field">model / api_url</text>
+    <text x="24" y="154" class="field">routing_key?</text>
+    <text x="24" y="178" class="field">extra_request_body</text>
+    <text x="24" y="220" class="note">Transport-neutral request object</text>
+  </g>
+
+  <!-- Request output -->
+  <g transform="translate(720,500)">
+    <rect width="420" height="300" rx="18" fill="#e5f5fb" stroke="#3396b7" class="box"/>
+    <text x="24" y="36" class="type">RequestFuncOutput</text>
+    <line x1="0" y1="54" x2="420" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">success / error</text>
+    <text x="24" y="106" class="field">latency / ttft / itl[]</text>
+    <text x="24" y="130" class="field">prompt_len / output_len</text>
+    <rect x="16" y="148" width="388" height="94" rx="10" fill="#d9f1e8" stroke="#55a887"/>
+    <text x="30" y="174" class="field">cached_tokens</text>
+    <text x="30" y="198" class="field">cached_tokens_details &#123;</text>
+    <text x="50" y="222" class="field">device, host, storage &#125;</text>
+    <text x="24" y="276" class="note">One object per measured request</text>
+  </g>
+
+  <!-- Result row -->
+  <g transform="translate(1260,500)">
+    <rect width="570" height="300" rx="18" fill="#fff4d6" stroke="#c99b2e" class="box"/>
+    <text x="24" y="36" class="type">ResultRow · results.jsonl</text>
+    <line x1="0" y1="54" x2="570" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">tag / completed / server_info</text>
+    <text x="24" y="106" class="field">TTFT / TPOT / ITL percentiles</text>
+    <text x="24" y="130" class="field">request / input / output throughput</text>
+    <rect x="16" y="148" width="260" height="112" rx="10" fill="#e7f7f1" stroke="#55a887"/>
+    <text x="28" y="174" class="label">prefix_cache_config</text>
+    <text x="28" y="198" class="note">expected tokens / rate</text>
+    <text x="28" y="218" class="note">priming counts</text>
+    <text x="28" y="238" class="note">actual rate / availability</text>
+    <rect x="292" y="148" width="262" height="112" rx="10" fill="#e5f5fb" stroke="#55a4bd"/>
+    <text x="304" y="174" class="label">cache_report</text>
+    <text x="304" y="198" class="note">prompt / cached totals</text>
+    <text x="304" y="218" class="note">device / host / storage</text>
+    <text x="304" y="238" class="note">observed hit-rate %</text>
+  </g>
+
+  <!-- Validation -->
+  <g transform="translate(260,900)">
+    <rect width="480" height="150" rx="18" fill="#fff0ee" stroke="#c55045" class="box"/>
+    <text x="24" y="36" class="type">Validation State</text>
+    <line x1="0" y1="54" x2="480" y2="54" class="separator"/>
+    <text x="24" y="82" class="field">cache_hit_error_pp</text>
+    <text x="24" y="106" class="field">allowed_error_pp = max(floor, page bound)</text>
+    <text x="24" y="132" class="note">Latest attempt controls resumability</text>
+  </g>
+
+  <!-- Artifacts -->
+  <g transform="translate(930,880)">
+    <rect width="700" height="180" rx="18" fill="#f4f7fa" stroke="#8194a6" class="box"/>
+    <text x="24" y="36" class="type">Persistent Artifact Set</text>
+    <line x1="0" y1="54" x2="700" y2="54" class="separator"/>
+    <text x="24" y="84" class="field">manifest.json  · matrix configuration + revision</text>
+    <text x="24" y="110" class="field">results.jsonl  · append-only attempts</text>
+    <text x="24" y="136" class="field">summary.csv    · latest row per tag + validation</text>
+    <text x="24" y="162" class="field">logs/&lt;tag&gt;.log · subprocess evidence</text>
+  </g>
+
+  <!-- Relationships -->
+  <path d="M410 280 H510" class="arrow"/>
+  <text x="460" y="264" text-anchor="middle" class="label">configures</text>
+  <path d="M920 293 H1030" class="arrow"/>
+  <text x="975" y="277" text-anchor="middle" class="label">generates N</text>
+  <path d="M1420 293 H1540" class="arrow"/>
+  <text x="1480" y="277" text-anchor="middle" class="label">deduplicates</text>
+
+  <path d="M1230 436 V462 H370 V510" class="arrow"/>
+  <text x="800" y="480" text-anchor="middle" class="label">measured DatasetRow → RequestFuncInput</text>
+  <path d="M1690 416 V462 H540 V510" class="arrow dash"/>
+  <text x="1370" y="452" text-anchor="middle" class="label">priming row uses the same transport type</text>
+  <path d="M560 650 H710" class="arrow"/>
+  <text x="635" y="636" text-anchor="middle" class="label">HTTP / streaming</text>
+  <path d="M1140 650 H1250" class="arrow"/>
+  <text x="1195" y="636" text-anchor="middle" class="label">aggregate</text>
+  <path d="M1500 800 V840 H500 V890" class="arrow"/>
+  <text x="1000" y="858" text-anchor="middle" class="label">expected vs actual + page-aware tolerance</text>
+  <path d="M740 975 H920" class="arrow"/>
+  <text x="830" y="961" text-anchor="middle" class="label">accept / reject</text>
+  <path d="M1550 800 V850 H1600 V880" class="arrow dash"/>
+  <text x="1620" y="842" class="label">persist</text>
+
+  <text x="80" y="1090" class="note">Green fields carry prefix-cache intent; blue fields carry observed serving measurements; validation joins both views.</text>
+</svg>
