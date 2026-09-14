@@ -5824,3 +5824,62 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParallelToolCallsFalse(unittest.TestCase):
+    """parallel_tool_calls=False must yield at most one tool call even for
+    plain-auto emissions that no grammar constraint covered."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            )
+        ]
+        # pythonic detector: multi-call text is trivially constructable
+        self.multi_call_text = '[get_weather(city="Boston"), get_weather(city="Tokyo")]'
+
+    def test_non_stream_truncates_to_first_call(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(
+            self.tools, "pythonic", parallel_tool_calls=False
+        )
+        _, calls = parser.parse_non_stream(self.multi_call_text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Boston", calls[0].parameters)
+
+    def test_non_stream_default_keeps_all_calls(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "pythonic")
+        _, calls = parser.parse_non_stream(self.multi_call_text)
+        self.assertEqual(len(calls), 2)
+
+    def test_stream_locks_first_tool_index(self):
+        from sglang.srt.function_call.core_types import ToolCallItem
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(
+            self.tools, "pythonic", parallel_tool_calls=False
+        )
+        first = parser._enforce_single_call(
+            [ToolCallItem(tool_index=0, name="get_weather", parameters="{")]
+        )
+        self.assertEqual(len(first), 1)
+        mixed = parser._enforce_single_call(
+            [
+                ToolCallItem(tool_index=0, name=None, parameters='"city": "B"}'),
+                ToolCallItem(tool_index=1, name="get_weather", parameters="{}"),
+            ]
+        )
+        self.assertEqual([c.tool_index for c in mixed], [0])
