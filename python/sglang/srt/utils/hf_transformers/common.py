@@ -24,6 +24,7 @@ from huggingface_hub import snapshot_download
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
+    BeamConfig,
     ChatGLMConfig,
     Cosmos3Config,
     Cosmos3EdgeConfig,
@@ -107,6 +108,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     for cls in [
         AfmoeConfig,
         BailingHybridConfig,
+        BeamConfig,
         ChatGLMConfig,
         DbrxConfig,
         ExaoneConfig,

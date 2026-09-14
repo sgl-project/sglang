@@ -1,5 +1,6 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.cosmos3 import (
@@ -83,6 +84,7 @@ from sglang.srt.configs.zaya import ZayaConfig
 __all__ = [
     "AfmoeConfig",
     "BailingHybridConfig",
+    "BeamConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "Cosmos3Config",
