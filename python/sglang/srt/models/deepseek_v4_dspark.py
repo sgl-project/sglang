@@ -62,7 +62,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, log_info_on_rank0
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -690,11 +690,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DSpark V4 draft requires markov_rank > 0, "
                 f"got markov_rank={dspark_config.markov_rank}."
             )
-        self.gamma = int(
-            dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
+        # No gamma copy here: the runtime resolves it (CLI block size can
+        # override the checkpoint), and it is passed in per call.
+        log_info_on_rank0(
+            logger,
+            "DSpark V4 draft checkpoint block_size="
+            f"{dspark_config.resolve_gamma(default=None)}; the effective gamma "
+            "is owned by the runtime config.",
         )
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
-        self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)
         else:
@@ -886,15 +890,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         anchor_tokens: torch.Tensor,
         sampled_tokens: torch.Tensor,
         x_post_hc: torch.Tensor,
+        gamma: int,
     ) -> Optional[torch.Tensor]:
         confidence_head = self.confidence_head
         if confidence_head is None:
             return None
+        gamma = int(gamma)
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        x_post_hc = x_post_hc.view(bs, gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : gamma - 1]], dim=1
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
