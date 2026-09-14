@@ -37,11 +37,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
@@ -90,11 +86,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import (
-    get_memory,
-    get_model,
-    get_observability,
-)
+from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -111,6 +103,21 @@ if TYPE_CHECKING:
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
+
+
+def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
+    num_pages = 0
+    for transfer in transfers:
+        if transfer.host_indices is None:
+            continue
+        num_slots = len(transfer.host_indices)
+        assert num_slots % page_size == 0, (
+            f"C128 load-back transfers must contain complete physical pages: "
+            f"{num_slots=}, {page_size=}"
+        )
+        num_pages += num_slots // page_size
+    return num_pages
+
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
@@ -563,6 +570,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_chunk_cache(self) -> bool:
         return self.disable
 
+    @rank_consensus(
+        same_params=["len(params.key)"],
+        same_results=["result.prefix_len"],
+    )
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -582,9 +593,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # Drain still-pending actions so frees reach the allocator on abort.
             self._apply_cache_actions(self.tree_core.end_insert())
 
+    @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
+    @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 
@@ -936,6 +949,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
@@ -1080,6 +1094,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1694,6 +1709,21 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
+        c128_allocator = getattr(
+            self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+        )
+        if c128_allocator is not None:
+            c128_num_pages = _c128_transfer_num_pages(
+                comp_xfers.get(ComponentType.C128, ()),
+                c128_allocator.page_size,
+            )
+            if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
+                self, c128_num_pages
+            ):
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
+
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
             needed = kv_tokens - avail
@@ -1783,6 +1813,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1877,6 +1908,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    @rank_consensus(same_params=["req_id", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -3156,6 +3188,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    @rank_consensus(same_params=["params.host_hit_length"])
     def init_load_back(
         self,
         params: InitLoadBackParams,

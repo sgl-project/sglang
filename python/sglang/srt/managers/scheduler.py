@@ -1107,9 +1107,15 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
-        with torch.get_device_module(model_runner.device).stream(
+        device_module = torch.get_device_module(model_runner.device)
+        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
+        forward_stream = (
             model_runner.forward_stream
-        ):
+            if self.enable_overlap or self.ps.pp_size > 1 or use_mlx()
+            else self.schedule_stream
+        )
+        with device_module.stream(forward_stream):
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
@@ -1847,7 +1853,6 @@ class Scheduler(
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
-        Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
         # Engine init (graph capture, warmups) is done; from here on any
@@ -1862,10 +1867,9 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif is_cuda() or _is_hip:
+        elif (is_cuda() or _is_hip) and (self.enable_overlap or self.ps.pp_size > 1):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
@@ -2723,6 +2727,8 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        if recv_req.bootstrap_port is None:
+            recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
             recv_req.session_id is not None and self.enable_session_radix_cache
@@ -2734,10 +2740,6 @@ class Scheduler(
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
-
-            if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
-                recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
@@ -2829,6 +2831,7 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                disagg_mode=self.disaggregation_mode,
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(

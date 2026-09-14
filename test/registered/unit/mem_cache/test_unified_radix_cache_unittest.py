@@ -65,7 +65,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -1215,6 +1215,36 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.evict_host(len(seq))
         removed_cpu = self._removed_events(cache, StorageMedium.CPU)
         self.assertCountEqual(self._event_hashes(removed_cpu), stored_hashes)
+
+    def test_hicache_storage_prefetch_publishes_host_only_suffix(self):
+        """A storage-prefetch refill has no write-through ack to publish it."""
+        from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
+
+        cache, _, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(cache)
+        cache.take_events()  # Clear reset / init events.
+
+        tokens = [1, 2, 7, 8]
+        hash_values = get_hash_str(array("q", tokens), None, page_size=cache.page_size)
+        result = cache.tree_core.insert_host(
+            cache.root_node_handle(),
+            RadixKey(array("q", tokens)),
+            torch.tensor([100, 101, 102, 103], dtype=torch.int64),
+            hash_values,
+        )
+        self.assertFalse(result.host_insert_dropped)
+        self.assertIsNotNone(result.inserted_host_node)
+
+        # The recorder coalesces the parent-linked pages into one event.
+        stored_cpu = self._stored_events(cache, StorageMedium.CPU)
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), tokens)
+        self.assertEqual(stored_cpu[0].block_size, cache.page_size)
+        self.assertEqual(
+            self._event_hashes(stored_cpu),
+            [hash_str_to_int64(value) for value in hash_values],
+        )
+        self.assertIsNone(stored_cpu[0].parent_block_hash)
 
     def test_hicache_split_pending_write_through_publishes_fragments(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -9513,6 +9543,43 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         self.assertEqual(pipeline.try_lock_anchor(self._REQ), "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+
+    def test_storage_cleanup_releases_buffer_prefetch_anchor(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache)
+        cache.buffer_pipeline = pipeline
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        host_indices = torch.arange(4)
+        cache.ongoing_prefetch = {
+            self._REQ: _OngoingPrefetch(
+                anchor_node_id=99,
+                prefetch_key=RadixKey(array("q", range(16))),
+                host_indices=host_indices,
+                operation=mock.Mock(),
+                anchor_lock_params=None,
+                comp_xfers={},
+            )
+        }
+        cache.ongoing_backup = {}
+        cache.host_memory_mode = "buffer_only"
+        cache._prefetch_occupied_span.side_effect = lambda key, indices: (
+            UnifiedRadixCache._prefetch_occupied_span(cache, key, indices)
+        )
+        controller = cache.cache_controller
+        controller.terminate_prefetch.return_value = (4, None)
+        controller.prefetch_tokens_occupied = 12
+
+        StorageAttachment(cache)._release_pending_storage_ops()
+
+        self.assertEqual(cache.ongoing_prefetch, {})
+        self.assertEqual(pipeline.anchor_locks, {})
+        self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+        self.assertNotIn(self._REQ, pipeline._prefetch_prefix_ctx)
+        cache.dec_lock_ref.assert_called_once_with(
+            99, cache.inc_lock_ref.return_value.to_dec_params.return_value
+        )
+        cache.dec_host_lock_ref.assert_not_called()
+        self.assertEqual(controller.prefetch_tokens_occupied, 8)
 
     def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
