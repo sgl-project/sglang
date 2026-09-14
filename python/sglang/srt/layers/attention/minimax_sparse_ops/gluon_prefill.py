@@ -42,7 +42,6 @@ _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
 # scratch is grow-only, so the env cap bounds it; over the cap the caller falls back
 _LEGACY_SCRATCH_BYTES = 512 * 1024 * 1024
-_above_legacy_cap_count = 0
 
 
 def _max_scratch_pages(dtype: torch.dtype) -> int:
@@ -372,10 +371,9 @@ def _aiter_fp8_dtype() -> Optional[torch.dtype]:
     """The fp8 storage dtype AITER's Gluon kernel accepts on this arch, or None without aiter."""
     try:
         import aiter
-
-        return aiter.dtypes.fp8
-    except Exception:
+    except ImportError:
         return None
+    return aiter.dtypes.fp8
 
 
 def _kv_dtype_supported(
@@ -389,18 +387,15 @@ def _kv_dtype_supported(
     return k_cache.dtype == _aiter_fp8_dtype()
 
 
-# Per-tensor fp8 KV scales handed to the kernel: (device, value) -> fp32 [1].
-_SCALE_CACHE: dict = {}
-
-
-def _scale_tensor(value: Optional[float], device: torch.device) -> torch.Tensor:
-    v = 1.0 if value is None else float(value)
-    key = (device, v)
-    t = _SCALE_CACHE.get(key)
-    if t is None:
-        t = torch.full((1,), v, dtype=torch.float32, device=device)
-        _SCALE_CACHE[key] = t
-    return t
+def _pool_scale_tensor(cache: torch.Tensor, value: Optional[float]) -> torch.Tensor:
+    """fp32 ``[1]`` per-tensor scale of an fp8 pool, memoized on the pool tensor."""
+    scale = 1.0 if value is None else float(value)
+    memo = getattr(cache, "_gluon_scale", None)
+    if memo is not None and memo[0] == scale:
+        return memo[1]
+    scale_tensor = torch.full((1,), scale, dtype=torch.float32, device=cache.device)
+    cache._gluon_scale = (scale, scale_tensor)
+    return scale_tensor
 
 
 def can_use_gluon_prefill(
@@ -502,14 +497,11 @@ def gluon_sparse_prefill(
             f"> cap {max_pages}"
         )
     if total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize > _LEGACY_SCRATCH_BYTES:
-        global _above_legacy_cap_count
-        _above_legacy_cap_count += 1
-        logger.info(
-            "gluon prefill span %d pages (%d MiB per buffer) above the former "
-            "512 MiB cap; occurrence %d",
+        # spans above the former fixed cap used to fall back, so leave a trace of them
+        logger.debug(
+            "gluon prefill span %d pages (%d MiB per buffer) above the former 512 MiB cap",
             total_pages,
             (total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize) >> 20,
-            _above_legacy_cap_count,
         )
 
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
@@ -529,8 +521,8 @@ def gluon_sparse_prefill(
     )
 
     kv_is_fp8 = k_cache.dtype != q.dtype
-    key_scale = _scale_tensor(k_scale, q.device) if kv_is_fp8 else None
-    value_scale = _scale_tensor(v_scale, q.device) if kv_is_fp8 else None
+    key_scale = _pool_scale_tensor(k_cache, k_scale) if kv_is_fp8 else None
+    value_scale = _pool_scale_tensor(v_cache, v_scale) if kv_is_fp8 else None
 
     out = torch.empty_like(q)
     num_seqs = total_q
