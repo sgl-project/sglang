@@ -888,6 +888,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
+            # PPU DeepGEMM MoE uses FP4xFP4 (f4f4) with preprocess_mxfp4_scales.
+            # The SM100 path below assumes FP8 activations + FP4 weights via
+            # recipe=(1,32) and f8f8 APIs that accept logical-K recipes; PPU's
+            # nopad f8f8 kernel compares physical K and asserts
+            # m/k/n mismatch (weight K is packed K/2).
+            if _is_ppu:
+                if self.with_bias:
+                    w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
+                    w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+                    layer.w13_weight_bias = Parameter(
+                        w13_weight_bias, requires_grad=False
+                    )
+                    layer.w2_weight_bias = Parameter(
+                        w2_weight_bias, requires_grad=False
+                    )
+                w13_scale = preprocess_mxfp4_scales(
+                    torch.stack(list(layer.w13_weight_scale), dim=0)
+                )
+                layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+                w2_scale = preprocess_mxfp4_scales(
+                    torch.stack(list(layer.w2_weight_scale), dim=0)
+                )
+                layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
+                layer._mxfp4_backend = "deep_gemm"
+                torch.cuda.empty_cache()
+                return
+
             from deep_gemm import transform_sf_into_required_layout
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
@@ -1593,6 +1620,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if moe_runner_backend.is_deep_gemm():
+            # Shared-expert alt stream still reads the routed MoE input during
+            # CUDA graph capture; avoid combine overwriting that buffer.
+            moe_runner_config.inplace = False
             import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if moe_runner_backend.is_aiter():
@@ -1729,15 +1759,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # carry topk_ids/topk_weights directly and have no `.topk_output`.
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
-                is_fp4_experts=True,
-            )
+            if _is_ppu:
+                # PPU fused none+deep_gemm path is FP4xFP4 (physical K matches).
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=layer.w13_weight_bias if self.with_bias else None,
+                    b2=layer.w2_weight_bias if self.with_bias else None,
+                    use_mxfp4=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=[0, 16],
+                )
+            else:
+                # SM100+: FP8 activations + FP4 weights via DeepGEMM recipes.
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=[128, 128],
+                    is_fp4_experts=True,
+                )
             return self.runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
