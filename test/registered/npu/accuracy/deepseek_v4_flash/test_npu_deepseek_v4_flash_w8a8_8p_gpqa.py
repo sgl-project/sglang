@@ -135,7 +135,7 @@ DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
     "timeout": 6000,
     "stream": "true",
     "extra_body": {
-        "chat_template_kwargs": {"thinking": True}
+        "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
     },
 }
 
