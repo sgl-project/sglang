@@ -1384,6 +1384,49 @@ def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
+@_register_for("ZayaForCausalLM")
+def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
+    """ZAYA1 (CCA attention + MoE) memory-pool and DP-attention defaults.
+
+    ``mamba_full_memory_ratio``: the global 0.9 default assumes the linear-attn
+    state dominates the cache, which holds for models with only a few
+    full-attention layers. ZAYA1 is half full-attention, so its KV is the
+    dominant consumer and 0.9 spends ~47% of the post-weights budget on conv
+    states -- measured on ZAYA1-base / MI350X, 214,758 slots (73.7 GB) for a
+    server capped at 8 concurrent requests. Yields to an explicit
+    --mamba-full-memory-ratio.
+
+    ``enable_dp_lm_head``: ZAYA1 ties the LM head to the input embedding, and
+    under DP attention ``embed_tokens`` shards its vocab over the attention-TP
+    sub-group, so the tied head inherits ``vocab/attn_tp`` rows.
+    ``LogitsProcessor`` all-gathers over the attention-TP group iff
+    ``enable_dp_lm_head`` and over the *global* TP group otherwise, so leaving it
+    off gathers a ``vocab/attn_tp``-wide slice across ``tp_size`` ranks and
+    produces garbage.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    cfg = resolving_view(server_args)
+    overrides: Dict[str, Any] = {}
+
+    if cfg.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+        overrides["mamba_full_memory_ratio"] = 0.05
+
+    # ``swa_full_tokens_ratio`` sizes the sliding-window sub-pool as a fraction
+    # of the full one. The 0.8 default assumes comparable residency, but ZAYA1's
+    # 4096 window against a 262144 context needs 64x fewer SWA slots: measured at
+    # tp=8/dp=4, 0.8 gave the SWA pool 91 GiB to hold what ~4096/request needs.
+    # Matches the value Inkling pins. Yields to an explicit
+    # --swa-full-tokens-ratio.
+    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+
+    if cfg.enable_dp_attention and cfg.dp_size > 1 and hf_config.tie_word_embeddings:
+        overrides["enable_dp_lm_head"] = True
+
+    return overrides
+
+
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     """DeepSeek V4 attention/page/window/MoE-runner defaults (from

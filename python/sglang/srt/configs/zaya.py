@@ -101,26 +101,20 @@ class ZayaConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
 
-        # ZAYA1-base ships a ``zaya_layers`` list whose entries are either the
-        # literal string ``"a"`` (attention layer) or an integer (number of
-        # experts in a MoE layer). When present it is the source of truth for
-        # both the total layer count and the per-layer placement. The HF
-        # config also carries a scalar ``num_hidden_layers`` that can disagree
-        # with ``len(zaya_layers)`` for historical reasons, so the list takes
-        # precedence whenever it is non-empty.
+        # ``zaya_layers`` entries are either the literal ``"a"`` (attention) or
+        # an integer (expert count of a MoE layer). The scalar
+        # ``num_hidden_layers`` can disagree with ``len(zaya_layers)`` for
+        # historical reasons, so a non-empty list takes precedence.
         self.zaya_layers = list(zaya_layers) if zaya_layers else None
         if self.zaya_layers:
             self.num_hidden_layers = len(self.zaya_layers)
         else:
             self.num_hidden_layers = num_hidden_layers
 
-        # When the per-layer lists are present, derive each active scalar
-        # field from the first non-zero entry of the corresponding list.
-        # This matches ZAYA1-base in practice: every attention layer shares
-        # the same ``cca_num_q_heads`` (e.g. 8) and ``num_query_groups``
-        # (e.g. 2), and every MoE layer shares the same ``ffn_hidden_size``
-        # (e.g. 4096) and ``zaya_mlp_expansion`` (e.g. 256). When no list is
-        # provided, the constructor argument is used unchanged.
+        # Derive each active scalar from the first non-zero entry of the
+        # corresponding per-layer list; ZAYA1 shares one value across all
+        # attention layers and one across all MoE layers. Without a list the
+        # constructor argument is used unchanged.
         self.cca_num_q_heads_list = list(cca_num_q_heads) if cca_num_q_heads else None
         self.num_query_groups_list = (
             list(num_query_groups_list) if num_query_groups_list else None
@@ -218,6 +212,23 @@ class ZayaConfig(PretrainedConfig):
         self.swa_rotary_base = swa_rotary_base
         self._attn_implementation = _attn_implementation
 
+        # The *inclusive* window, matching the HF ``sliding_window`` convention
+        # ``ModelConfig`` reads. The attention backends take the exclusive
+        # ``window - 1`` via ``get_attention_sliding_window_size`` instead.
+        window = self.swa_window_size
+        self.sliding_window_size = window
+
+        # Opt in to the hybrid-SWA KV pool when the checkpoint interleaves
+        # sliding-window layers. ``ModelConfig.is_hybrid_swa_model`` honours this
+        # flag (paired with ``hybrid_layer_pattern``) as a generic escape from
+        # its architecture allowlist, so ZAYA1 needs no entry there; base
+        # checkpoints omit ``swa_layers`` and stay on the single-pool path.
+        #
+        # SWA-KV and per-request linear state compose with no new pool type: the
+        # KV side takes SWAKVPool + SWATokenToKVPoolAllocator while the CCA conv
+        # state rides on HybridReqToTokenPool.mamba_pool, as Inkling does.
+        self.is_hybrid_swa = window is not None
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -242,6 +253,116 @@ class ZayaConfig(PretrainedConfig):
     def mamba_chunk_size(self) -> int:
         return 1
 
+    # -- CCA v2 lag state (conv[1]) ------------------------------------------
+
+    @property
+    def cca_cache_projected_v2(self) -> bool:
+        """Whether conv[1] caches ``W_v2 . hs`` instead of the raw ``hs``.
+
+        CCA's second state entry exists only to feed ``val_proj2`` with the
+        previous token's hidden state. That projection is linear, so caching its
+        *output* is the same function as caching its input and re-projecting, and
+        the output is ``latent_k_dim / 2`` wide instead of ``hidden_size``. Two
+        conditions gate it:
+
+        * ``attention_bias`` off. MambaPool zeroes a freshly allocated slot and
+          the first ``val_proj2`` input is defined to be zero, which only
+          ``W . 0 == 0`` reproduces.
+        * ``num_query_groups`` even, so ``val_proj1`` / ``val_proj2`` split the K
+          heads on a head boundary; an odd count makes the per-rank slicing
+          channel- rather than head-aligned.
+
+        ``CCA.__init__`` derives the same predicate from its constructor
+        arguments; both must agree or the pool entry and the value written into
+        it disagree in width, which raises on the first prefill.
+        """
+        return (not bool(getattr(self, "attention_bias", False))) and (
+            self.num_query_groups % 2 == 0
+        )
+
+    @property
+    def cca_v2_state_dim(self) -> int:
+        """Feature width of the CCA conv[1] pool entry."""
+        if self.cca_cache_projected_v2:
+            return (self.num_query_groups * self.head_dim) // 2
+        return self.hidden_size
+
+    # -- Sliding-window attention (ZAYA1-74B) -------------------------------
+
+    def sliding_window_for_layer(self, layer_id: int) -> int:
+        """Sliding-window size for ``layer_id`` (0 == full attention).
+
+        ``swa_layers`` is aligned with the global layer index: the window size
+        for a sliding-window attention layer, 0 for a full-attention or MoE one.
+        Base checkpoints omit it, so every attention layer is full attention.
+        """
+        if not self.swa_layers:
+            return 0
+        return int(self.swa_layers[layer_id])
+
+    @property
+    def swa_window_size(self) -> Optional[int]:
+        """The single sliding-window size shared by every SWA layer, or None.
+
+        The runtime tracks one global sliding-window size for the attention
+        backend, so all SWA layers must share the same window. Checkpoints
+        without ``swa_layers`` (or with all-zero entries) report None.
+        """
+        if not self.swa_layers:
+            return None
+        windows = {int(w) for w in self.swa_layers if int(w) > 0}
+        if not windows:
+            return None
+        assert len(windows) == 1, (
+            "ZAYA1 expects a single sliding-window size across all SWA layers, "
+            f"got {sorted(windows)}"
+        )
+        return next(iter(windows))
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        """Global window size handed to the attention backend, or None.
+
+        Returns ``window - 1`` so the backend applies an inclusive
+        ``[i-w+1, i]`` window -- the exclusive convention shared across SGLang's
+        attention backends.
+        """
+        window = self.swa_window_size
+        return (window - 1) if window is not None else None
+
+    @property
+    def swa_attention_layer_ids(self) -> List[int]:
+        """Attention layers that use the sliding window (empty when no SWA)."""
+        if self.swa_window_size is None:
+            return []
+        return [i for i in self.full_attention_layer_ids if self.swa_layers[i]]
+
+    @property
+    def hybrid_layer_pattern(self) -> Optional[List[int]]:
+        """Per-layer KV class: 1 = sliding attention, 0 = full attention, -1 = none.
+
+        ``ModelConfig.get_hybrid_layer_ids`` consumes this generic opt-in (paired
+        with ``is_hybrid_swa``) so ZAYA1 needs no entry in the hybrid-SWA
+        architecture allowlist. It derives ``swa_attention_layer_ids`` from the
+        ``== 1`` entries and ``full_attention_layer_ids`` from the ``== 0`` ones,
+        so any other value -- here -1 -- is excluded from both lists.
+
+        ZAYA1's odd layers are MoE and hold no KV at all, so they MUST be -1 and
+        not 0. Those lists do not merely index the pools, they *size* them:
+        reporting MoE layers as full-attention made ``SWAKVPool``'s full sub-pool
+        90 layers wide instead of 30 on the 74B, tripling its per-token cost.
+        """
+        if self.swa_window_size is None:
+            return None
+        attention_layers = set(self.full_attention_layer_ids)
+        return [
+            (
+                (1 if self.sliding_window_for_layer(i) else 0)
+                if i in attention_layers
+                else -1
+            )
+            for i in range(self.num_hidden_layers)
+        ]
+
     @property
     def mamba2_cache_params(self) -> Optional[Mamba2CacheParams]:
         from sglang.srt.configs.mamba_utils import (
@@ -254,20 +375,20 @@ class ZayaConfig(PretrainedConfig):
         if not attn_layer_ids:
             return None
 
-        # ``conv[0]`` (conv_qk left padding) is sized per TP rank because CCA
-        # is head-parallel. ``conv[1]`` (prev_hs) carries the full hidden_state
-        # and feeds the replicated val_proj1 / val_proj2, so it stays at full
-        # ``hidden_size`` on every rank.
+        # ``conv[0]`` (conv_qk left padding) is sized per TP rank because CCA is
+        # head-parallel. ``conv[1]`` is the one-token ``val_proj2`` lag, holding
+        # the *projected* value rather than the raw hidden state (see
+        # ``cca_cache_projected_v2``). ``val_proj2`` is replicated, so that entry
+        # stays the same width on every rank -- a rank whose K heads all come
+        # from ``val_proj1`` simply leaves it untouched -- which is what keeps
+        # ``max_mamba_cache_size``, and so the replicated scheduler's slot
+        # accounting, identical across the attention-TP group.
         #
-        # Use the *global* TP world size -- the same accessor that
-        # ``ZayaAttention`` / ``CCA`` use to split heads and over which
-        # ``o_proj`` all-reduces -- so the cache shape and the per-rank
-        # ``in_out_ch`` stay in lockstep. ZAYA1 asserts the attention-TP group
-        # equals the global TP group (DP attention is unsupported), so the two
-        # are always identical in practice.
+        # Use the *attention* TP world size: the same accessor ``ZayaAttention``
+        # / ``CCA`` use to split heads, so the cache shape and the per-rank
+        # ``in_out_ch`` stay in lockstep under plain TP and DP attention alike.
         try:
-
-            tp_size = get_parallel().tp_size
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError, ValueError):
             tp_size = 1
 
@@ -275,9 +396,10 @@ class ZayaConfig(PretrainedConfig):
             self.num_attention_heads + self.num_key_value_heads
         ) * self.head_dim
         assert in_out_ch_full % tp_size == 0, (
-            f"CCA channels ({in_out_ch_full}) must be divisible by TP size "
-            f"({tp_size}); both num_attention_heads and num_query_groups must "
-            "be divisible by tp_size for ZAYA1 head-parallel attention."
+            f"CCA channels ({in_out_ch_full}) must be divisible by attention "
+            f"TP size ({tp_size}); both num_attention_heads and num_query_groups "
+            "must be divisible by attention tp_size for ZAYA1 head-parallel "
+            "attention."
         )
         in_out_ch_per_rank = in_out_ch_full // tp_size
         total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)
@@ -285,7 +407,7 @@ class ZayaConfig(PretrainedConfig):
         shape = Mamba2StateShape(
             conv=[
                 (in_out_ch_per_rank, total_padding),
-                (self.hidden_size, 1),
+                (self.cca_v2_state_dim, 1),
             ],
             temporal=(1, 1, 0),
             intermediate_size=in_out_ch_per_rank,

@@ -76,9 +76,35 @@ class TestZayaConfig(CustomTestCase):
         in_out_ch = (cfg.num_attention_heads + cfg.num_key_value_heads) * cfg.head_dim
         total_padding = (cfg.cca_time0 - 1) + (cfg.cca_time1 - 1)
         self.assertEqual(params.shape.conv[0], (in_out_ch, total_padding))
-        # conv[1] = prev_hs: (hidden_size, 1)
-        self.assertEqual(params.shape.conv[1], (cfg.hidden_size, 1))
+        # conv[1] = the val_proj2 lag. It caches the PROJECTED value
+        # ``W_v2 . hs`` (latent_k_dim / 2 wide), not the raw hidden state, so it
+        # is ``hidden_size / (num_query_groups * head_dim / 2)`` times smaller --
+        # 32x on ZAYA1-74B, and the dominant term of the per-request state.
+        self.assertTrue(cfg.cca_cache_projected_v2)
+        v2_dim = (cfg.num_query_groups * cfg.head_dim) // 2
+        self.assertEqual(cfg.cca_v2_state_dim, v2_dim)
+        self.assertEqual(params.shape.conv[1], (v2_dim, 1))
+        self.assertLess(v2_dim, cfg.hidden_size)
         self.assertEqual(params.layers, cfg.linear_layer_ids)
+
+    def test_biased_attention_keeps_the_raw_hidden_state_lag(self):
+        """``W . 0 == 0`` is what makes a zeroed slot mean "no previous token".
+
+        With ``attention_bias`` the fresh-slot value would have to stand for the
+        bias vector instead, so the projected cache is refused and conv[1] falls
+        back to the full hidden width. Same for an odd K-head count, where
+        val_proj1 / val_proj2 split inside a head.
+        """
+        biased = ZayaConfig(attention_bias=True)
+        self.assertFalse(biased.cca_cache_projected_v2)
+        self.assertEqual(biased.cca_v2_state_dim, biased.hidden_size)
+        self.assertEqual(
+            biased.mamba2_cache_params.shape.conv[1], (biased.hidden_size, 1)
+        )
+
+        odd = ZayaConfig(num_query_groups=3, num_key_value_heads=3)
+        self.assertFalse(odd.cca_cache_projected_v2)
+        self.assertEqual(odd.cca_v2_state_dim, odd.hidden_size)
 
     def test_hybrid_model_properties_with_zaya_layers(self):
         """When zaya_layers is provided, layer IDs derive from the list."""

@@ -465,7 +465,10 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.memcpy_triton import (
+    memcpy_scatter_zero_rest_triton,
+    memcpy_triton,
+)
 
 
 # TODO: write c++ kernel for cpu
@@ -495,11 +498,24 @@ def memcpy_cpu(dst, src, dim, offset, sz, offset_src):
     dst[dst_start : dst_start + actual_sz].copy_(src[src_start : src_start + actual_sz])
 
 
+def memcpy_scatter_zero_rest_cpu(dst, src, dim, offset, sz):
+    dst.fill_(0)
+    memcpy_cpu(dst, src, dim, offset, sz, False)
+
+
 memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
+memcpy_scatter_zero_rest_func = (
+    memcpy_scatter_zero_rest_cpu if _is_cpu else memcpy_scatter_zero_rest_triton
+)
 
 
 def memcpy(dst, src, dim, offset, sz, offset_src):
     memcpy_func(dst, src, dim, offset, sz, offset_src)
+
+
+def memcpy_scatter_zero_rest(dst, src, dim, offset, sz):
+    """``dst[offset:offset+sz] = src``; zero every other row of ``dst``."""
+    memcpy_scatter_zero_rest_func(dst, src, dim, offset, sz)
 
 
 def _dp_gather_via_all_reduce(
@@ -507,10 +523,16 @@ def _dp_gather_via_all_reduce(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
-):
+) -> torch.Tensor:
+    """Gather by all-reducing a zero-padded sum_len buffer.
+
+    Returns the tensor holding the gathered rows: ``global_tokens`` when the
+    collective reduced in place, otherwise the collective's own output. Callers
+    needing the result *in* ``global_tokens`` go through
+    :func:`_dp_gather_in_place`.
+    """
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -521,7 +543,13 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
+        # One kernel places this rank's rows and zeros the rest.
+        memcpy_scatter_zero_rest(
+            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens
+        )
+    else:
+        # Nothing to contribute; this rank still supplies a zero addend.
+        global_tokens.fill_(0)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
@@ -530,18 +558,19 @@ def _dp_gather_via_all_reduce(
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
         )
-    else:
-        NUM_GPUS_PER_NODE = 8
-        if (
-            not local_tokens.dtype.is_floating_point
-            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-        ):
-            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+        return global_tokens
 
-            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+    NUM_GPUS_PER_NODE = 8
+    if (
+        not local_tokens.dtype.is_floating_point
+        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+    ):
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
-        else:
-            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+        return global_tokens
+
+    return tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -804,7 +833,12 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
-):
+) -> torch.Tensor:
+    """Dispatch a gather and return the tensor holding the gathered rows.
+
+    Every path but the sum_len all-reduce fills ``global_tokens`` itself; that
+    one may return the collective's out-of-place output instead.
+    """
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
@@ -827,7 +861,7 @@ def _dp_gather(
             _dp_gather_via_all_gatherv(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
-            return
+            return global_tokens
     if (
         forward_batch.dp_padding_mode is not None
         and forward_batch.dp_padding_mode.is_max_len()
@@ -835,10 +869,21 @@ def _dp_gather(
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
-    else:
-        _dp_gather_via_all_reduce(
-            global_tokens, local_tokens, forward_batch, is_partial
-        )
+        return global_tokens
+    return _dp_gather_via_all_reduce(
+        global_tokens, local_tokens, forward_batch, is_partial
+    )
+
+
+def _dp_gather_in_place(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    is_partial: bool,
+):
+    gathered = _dp_gather(global_tokens, local_tokens, forward_batch, is_partial)
+    if gathered is not global_tokens:
+        global_tokens[:] = gathered
 
 
 def dp_gather_partial(
@@ -846,7 +891,24 @@ def dp_gather_partial(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    _dp_gather_in_place(global_tokens, local_tokens, forward_batch, is_partial=True)
+
+
+def dp_gather_partial_out(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """:func:`dp_gather_partial` that returns where the result actually landed.
+
+    On the sum_len path the out-of-place collective's output already holds the
+    gathered rows, so the copy back into ``global_tokens`` is pure overhead.
+    Callers MUST use the returned tensor and treat ``global_tokens`` as scratch:
+    it is left holding the pre-reduce staging content. Every other path returns
+    ``global_tokens`` itself, so a caller written against this signature stays
+    correct under every padding mode.
+    """
+    return _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
 
 
 def dp_gather_replicate(
@@ -854,7 +916,7 @@ def dp_gather_replicate(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+    _dp_gather_in_place(global_tokens, local_tokens, forward_batch, is_partial=False)
 
 
 def dp_scatter(
