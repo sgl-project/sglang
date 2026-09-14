@@ -87,6 +87,37 @@ def test_deterministic_reduce_scatter_preserves_input_and_selects_rank_shard(
     coordinator.all_reduce.assert_called_once()
 
 
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("sizes", [None, [1, 3, 2, 0]])
+def test_deterministic_reduce_scatterv_selects_rank_shard(monkeypatch, rank, sizes):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.rank_in_group = rank
+    coordinator.world_size = 4
+    rows = 8 if sizes is None else sum(sizes)
+    input_ = torch.arange(rows * 3, dtype=torch.float32).view(rows, 3)
+    original = input_.clone()
+    reduced = original + 100
+
+    def all_reduce(tensor):
+        assert tensor.data_ptr() != input_.data_ptr()
+        torch.testing.assert_close(tensor, original)
+        return reduced
+
+    coordinator.all_reduce = Mock(side_effect=all_reduce)
+    # pynccl must not be touched on the deterministic path.
+    coordinator.pynccl_comm = None
+    output = coordinator.reduce_scatterv(input_, sizes=sizes)
+
+    offset = (rows // 4) * rank if sizes is None else sum(sizes[:rank])
+    chunk = rows // 4 if sizes is None else sizes[rank]
+    torch.testing.assert_close(output, reduced.narrow(0, offset, chunk))
+    torch.testing.assert_close(input_, original)
+    coordinator.all_reduce.assert_called_once()
+
+
 def test_nondeterministic_reduce_scatter_keeps_native_path(monkeypatch):
     monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "0")
     monkeypatch.setattr(parallel_state, "_is_cpu", True)

@@ -432,7 +432,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        use_fp8_dispatch: bool = True,
+        use_fp8_dispatch: bool,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
