@@ -696,32 +696,34 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        x = self._run_ffn(x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
