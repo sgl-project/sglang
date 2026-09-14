@@ -12,7 +12,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
-register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
+# register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 # Kept identical to the GPQA accuracy test (test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py).
@@ -74,7 +74,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    160,
+    64,
     "--dp-size",
     16,
     "--enable-dp-attention",

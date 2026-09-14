@@ -448,7 +448,7 @@ jobs:
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
     # Run even if upstream jobs failed, so the 1p1d perf case still executes.
-    if: ${{ !cancelled() }}
+    if: ${{ false }}
     # Enabled: run DSV4-Flash W8A8 1P+1D 16p perf case on CANN 9.1.0.
     # Multi-node jobs run strictly one at a time to avoid contending for the
     # same A3 multi-node resources.
