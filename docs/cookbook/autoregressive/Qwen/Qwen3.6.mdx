@@ -90,13 +90,20 @@ For the full Docker setup and other installation methods, please refer to the [o
 
 For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
+On Ascend NPUs (Atlas 800I A2 / A3), use the official Ascend container image instead — see [SGLang Installation with NPU Support](../../../docs/hardware-platforms/ascend-npus/getting-started/installation) and the [Ascend NPU quickstart](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start):
+
+```bash Command
+# Atlas 800I A3, stable release (daily build: main-cann9.0.0-a3)
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+```
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities, including Ascend NPU (Atlas 800I A3) scenarios.
 
 
 <Qwen36Deployment />
@@ -112,6 +119,7 @@ This section provides deployment configurations optimized for different hardware
 - **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
 - **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
+- **Ascend NPU (Atlas 800I A3):** Each card has 2 dies, so `--tp-size` is twice the card count (1 card → `--tp-size 2`). Add `--attention-backend ascend --device npu` and `--mamba-ssm-dtype bfloat16`, keep the default V1 mamba radix cache strategy (V2 requires NVIDIA FLA kernels), and run speculative decoding with the built-in MTP weights via `--speculative-algorithm NEXTN`. See [Deploying on Ascend NPUs](#ascend-npu-deployment) below.
 - Hardware requirements:
     - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
@@ -166,6 +174,55 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. 
 
 
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+<a id="ascend-npu-deployment" title="Referenced by the configuration tips above. Verify before removing."></a>
+
+### 3.3 Deploying on Ascend NPUs (Atlas 800I A3)
+
+Both Qwen3.6 variants are supported on Ascend NPUs via the `ascend` attention backend. Single-node deployment runs prefill and decode in the same process (PD mixed mode), which is what the commands from the generator above produce. These recipes are verified with SGLang v0.5.16 in the official Ascend container image:
+
+```bash Command
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+```
+
+Launch the container with the host Ascend driver mounted in (see the [Ascend NPU quickstart](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start) for the full `docker run` command), then run the generated `sglang serve` command inside it. Map only the `davinci` devices you need — one A3 card exposes two dies, so a 1-card deployment passes `--device /dev/davinci0 --device /dev/davinci1` plus `davinci_manager` and `hisi_hdc`.
+
+**Weights**: BF16 checkpoints are available from [Qwen](https://huggingface.co/Qwen) (also mirrored on ModelScope); the W8A8 (modelslim) checkpoint for the 27B variant is [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) (36.45 GB — small enough to fit a single 64GB die, so `--tp-size 1` also works). Set `SGLANG_USE_MODELSCOPE=1` to resolve the `Qwen/...` and `Eco-Tech/...` paths from ModelScope, or pre-download the weights and pass the local directory as `--model-path`.
+
+| Model | Checkpoint | Weights | 1 Card (TP 2) | 2 Cards (TP 4) |
+| --- | --- | --- | --- | --- |
+| Qwen3.6-27B | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | ~54 GB (BF16) | ✓ | ✓ |
+| Qwen3.6-27B (W8A8) | [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) | ~36 GB | ✓ | ✓ |
+| Qwen3.6-35B-A3B | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | ~70 GB (BF16) | ✓ | ✓ |
+
+**Verified performance (PD mixed, single node):**
+
+| Model | Cards | Quantization | Dataset | TPOT |
+| --- | --- | --- | --- | --- |
+| Qwen3.6-27B | 1 | BF16 | 1024x1024 (30)+1024 | 50ms |
+| Qwen3.6-27B | 1 | BF16 | 1080p_30+256 | 50ms |
+| Qwen3.6-27B | 1 | BF16 | 64k+1k (90% prefix cache hit rate) | 50ms |
+| Qwen3.6-27B | 1 | W8A8 INT8 | 3.5k+1.5k | 50ms |
+| Qwen3.6-27B | 1 | W8A8 INT8 | 64k+1k | 50ms |
+| Qwen3.6-27B | 2 | W8A8 INT8 | 16k+1k | 50ms |
+| Qwen3.6-27B | 2 | W8A8 INT8 | 64k+1k | 50ms |
+| Qwen3.6-27B | 2 | W8A8 INT8 | 128k+1k | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 254k+1k | 16.1ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 3.5k+1.5k | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 64k+1k | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 64k+1k (90% prefix cache hit rate) | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 128k+1k | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 128k+1k (90% prefix cache hit rate) | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 1024x1024 (30)+1024 | 50ms |
+| Qwen3.6-35B-A3B | 1 | BF16 | 1080p_30+256 | 50ms |
+| Qwen3.6-35B-A3B | 2 | BF16 | 984k+1k | 40.91ms |
+
+Each scenario's full recipe — host tuning, performance environment variables, exact launch flags, and `bench_serving` commands — lives in the Ascend NPU best practices: [Qwen3.6-27B](../../../docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b) · [Qwen3.6-35B-A3B](../../../docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b).
+
+<Note>
+- Multimodal serving on A3 additionally enables `--enable-multimodal --mm-attention-backend ascend_attn`; see the image-input best-practice scenarios for the full flag set.
+- Accuracy evaluation and performance testing methodologies on Ascend NPUs are documented in the [Ascend NPU evaluation guides](../../../docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+</Note>
 
 ## 4. Model Invocation
 
