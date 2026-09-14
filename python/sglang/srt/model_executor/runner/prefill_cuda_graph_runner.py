@@ -42,7 +42,7 @@ import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -120,6 +120,7 @@ from sglang.srt.model_executor.runner_utils import (
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
@@ -441,20 +442,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
-                max_num_tokens=self.max_num_tokens
+                max_num_tokens=self.max_num_tokens,
+                max_num_requests=(
+                    self._capture_req_slots
+                    if self._is_full_backend
+                    else min(self.max_num_tokens, self.max_bs)
+                ),
             )
-            # Clamp Full's request slots to the LoRA segment-slot count
-            # rather than fail capture.
-            lora_max_bs = model_runner.lora_manager.prefill_cuda_graph_max_bs
-            if self._capture_req_slots > lora_max_bs:
-                logger.info(
-                    "Clamping full prefill CUDA graph request slots from %d to %d "
-                    "to fit the LoRA backend's static segment slots.",
-                    self._capture_req_slots,
-                    lora_max_bs,
-                )
-                self._capture_req_slots = lora_max_bs
-
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
@@ -1505,11 +1499,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
-            return self._run_forward(forward_batch, num_tokens)
+            # Record LoRA kernels even when capture uses base-model requests.
+            with (
+                model_capture_mode()
+                if self._is_full_backend and self._capture_lora
+                else nullcontext()
+            ):
+                return self._run_forward(forward_batch, num_tokens)
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
-        # contract is to keep warmup state untouched and let
+        # contract is to keep warmup metadata untouched and let
         # init_forward_metadata_in_graph (recorded inside the captured
         # forward) do any raw->full upgrade. cg-refactor's runner_backend
         # abstraction exposes a post_warmup_hook for backends that need
@@ -1519,6 +1519,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # corrupt warmup iter 2's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
+            req_pool = self.model_runner.req_to_token_pool
+            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            if mamba_pool is not None and not prefix_num_chunks:
+                capture_state_indices = req_pool.translate_mamba_indices(
+                    req_pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ).unique()
+
+                def post_warmup_hook():
+                    mamba_pool.clear_slots(capture_state_indices)
+
+                post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
