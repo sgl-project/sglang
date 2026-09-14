@@ -800,7 +800,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             tensors.extend(self.c128_kv_pool.kv_buffer)
 
         # C4 indexer
-        tensors.extend(self.c4_indexer_kv_pool.index_k_with_scale_buffer)
+        tensors.extend(self.c4_indexer_kv_pool.contiguous_page_row_buffers())
 
         # Attention compression states
         for pool in self.compress_state_pools:
