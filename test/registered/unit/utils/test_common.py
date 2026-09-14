@@ -7,12 +7,27 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_musa,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+
+
+class TestMusaDetection(CustomTestCase):
+    def test_is_musa_is_torch_compile_safe(self):
+        is_musa.cache_clear()
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def add_platform_offset(value):
+            return value + 1 if is_musa() else value - 1
+
+        value = torch.zeros(1)
+        actual = add_platform_offset(value)
+        expected = torch.ones(1) if is_musa() else -torch.ones(1)
+        torch.testing.assert_close(actual, expected)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
