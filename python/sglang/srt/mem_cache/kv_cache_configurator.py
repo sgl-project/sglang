@@ -924,7 +924,9 @@ class KVCacheConfigurator:
         ]
 
         total_bytes = unified_memory_pool_bytes
-        if total_bytes is None and self.spec_algorithm.is_none():
+        # An uncapped, draft-free pool owns the profiled budget, including bytes
+        # left over after rounding the FULL/SWA boot capacities to pages.
+        if unified_total_bytes is not None and self.spec_algorithm.is_none():
             total_bytes = unified_total_bytes
 
         bundle = init_unified_swa_pools(
