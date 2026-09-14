@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm2 import Lfm2ForCausalLM
 from sglang.srt.models.siglip2 import Siglip2Model
+from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -208,14 +209,14 @@ class Lfm2VlForConditionalGeneration(nn.Module):
             all_attention_masks.append(am)
             all_spatial_shapes.append(ss)
 
-        pixel_values = torch.cat(all_pixel_values, dim=0)
-        attention_mask = torch.cat(all_attention_masks, dim=0)
-        spatial_shapes = torch.cat(all_spatial_shapes, dim=0)
-
-        pixel_values = pixel_values.to(
+        pixel_values = materialize_multimodal_features(
+            all_pixel_values,
             device=self.vision_tower.device,
             dtype=self.vision_tower.dtype,
         )
+        attention_mask = torch.cat(all_attention_masks, dim=0)
+        spatial_shapes = torch.cat(all_spatial_shapes, dim=0)
+
         spatial_shapes_cpu = spatial_shapes.cpu()
 
         # Pack padded pixel values using attention mask

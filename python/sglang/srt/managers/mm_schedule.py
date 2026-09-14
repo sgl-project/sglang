@@ -184,21 +184,29 @@ def _discard_mismatched_cached_embedding(
     embedding_cache.free(cache_key, None)
 
 
+def _encoder_owner_class_name(
+    data_embedding_func: DataEmbeddingFunc,
+) -> Optional[str]:
+    """The model class a bound ``get_image_feature``/``get_video_feature`` belongs to."""
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return None
+    if getattr(data_embedding_func, "__name__", None) not in (
+        "get_image_feature",
+        "get_video_feature",
+    ):
+        return None
+    return owner.__class__.__name__
+
+
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
     """Models that materialize and batch visual features inside their encoder.
 
     instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
     for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
     """
-    owner = getattr(data_embedding_func, "__self__", None)
-    if owner is None:
-        return False
-    if getattr(data_embedding_func, "__name__", None) not in (
-        "get_image_feature",
-        "get_video_feature",
-    ):
-        return False
-    return owner.__class__.__name__ in {
+    return _encoder_owner_class_name(data_embedding_func) in {
+        "Lfm2VlForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -206,6 +214,24 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
     }
+
+
+# HIP keeps per-image requests on the per-request encoder fallback: ROCm CI
+# regressed with one large cross-request ViT batch. Models listed here take the
+# cross-request batch on HIP as well. NPU and XPU always use the fallback.
+_HIP_CROSS_REQUEST_ENCODE_ARCHS = frozenset({"Lfm2VlForConditionalGeneration"})
+
+
+def _use_per_request_encode_fallback(data_embedding_func: DataEmbeddingFunc) -> bool:
+    """Whether per-image requests skip the cross-request ViT batch on this platform."""
+    if _is_npu or _is_xpu:
+        return True
+    if _is_hip:
+        return (
+            _encoder_owner_class_name(data_embedding_func)
+            not in _HIP_CROSS_REQUEST_ENCODE_ARCHS
+        )
+    return False
 
 
 def _move_items_to_device(
@@ -578,9 +604,7 @@ def _get_chunked_prefill_embedding(
 
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+            if _use_per_request_encode_fallback(data_embedding_func):
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
