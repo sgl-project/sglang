@@ -32,6 +32,9 @@ from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
     record_fields,
+    redacted_argv,
+    redacted_value,
+    secret_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
@@ -313,7 +316,11 @@ class ServerArgs:
         return f"ServerArgs({values})"
 
     def resolved_dict(self) -> dict[str, Any]:
-        """Serialize resolved field values, expanding nested records and excluding bookkeeping.
+        """Serialize resolved field values, expanding nested records, excluding bookkeeping
+        and redacting credentials.
+
+        Credential markers retain the configured value count; unset credentials
+        stay None. The raw fields remain available to authentication and SSL.
 
         One exception: the deprecated `enable_dp_attention` reports whether an
         attention-DP width was configured, for clients that still read it from
@@ -323,10 +330,14 @@ class ServerArgs:
         attention-DP groups when it is read back.
         """
 
-        resolved = {
-            field.name: _plain(resolution_result(self, field.name))
-            for field in record_fields(type(self))
-        }
+        secrets = secret_fields(type(self))
+        resolved: dict[str, Any] = {}
+        for field in record_fields(type(self)):
+            value = resolution_result(self, field.name)
+            if field.name in secrets and value is not None:
+                resolved[field.name] = redacted_value(value)
+            else:
+                resolved[field.name] = _plain(value)
         # TODO: drop together with `--enable-dp-attention` after 2026-12-31.
         resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
         return resolved
@@ -696,12 +707,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     server_args = ServerArgs.from_cli_args(raw_args)
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
-    # subprocess copy can answer the same question the launcher can.
+    # subprocess copy can publish the command without credentials or watermark keys.
     # lazy: watermark imports torch, outside server_args' top-level boundary.
     from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
 
     server_args._launch_command = redact_watermark_command_line(
-        argv, raw_args.watermark_config
+        redacted_argv(ServerArgs, argv, server_args), raw_args.watermark_config
     )
     return server_args
 

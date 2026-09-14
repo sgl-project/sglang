@@ -75,17 +75,30 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     watermark_config: A[
         Optional[str],
-        "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        Arg(
+            help="Watermark settings as a JSON file path or an inline JSON object with "
+            "optional key, key_b, context_window, mixing_probability, max_probability, "
+            "default_enabled, and enforce_all fields.",
+            secret=True,
+        ),
     ] = None
     watermark_key: A[
         Optional[str],
-        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+        Arg(
+            help="Resolved from --watermark-config.",
+            no_cli=True,
+            resolvable=True,
+            secret=True,
+        ),
     ] = None
     watermark_key_b: A[
         Optional[str],
-        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+        Arg(
+            help="Resolved from --watermark-config.",
+            no_cli=True,
+            resolvable=True,
+            secret=True,
+        ),
     ] = None
     watermark_context_window: A[
         int,
