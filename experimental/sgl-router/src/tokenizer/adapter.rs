@@ -423,140 +423,6 @@ pub fn load_with_opts(source: &str, opts: TokenizerLoadOpts) -> Result<Arc<Token
     Ok(Arc::new(Tokenizer::from(Arc::new(cached))))
 }
 
-/// The special tokens a raw prompt acquires when encoded with
-/// `add_special_tokens = true` (the engine's `/generate` default) versus the
-/// router's `false`, as the exact `(prefix, suffix)` id delta. Routing a
-/// `/generate` `text` prompt by its no-specials tokenization shifts every
-/// block boundary on a tokenizer whose post-processor adds specials (e.g. a
-/// `TemplateProcessing` BOS), so prefix matching against the engine's
-/// `BlockStored` hashes silently drops to 0 for such models; the ingress
-/// prepends/appends this delta to its raw-text routing tokens to restore
-/// parity. An empty `RawPromptSpecials` (both vecs empty) means "encode with
-/// no decoration" — either the tokenizer genuinely adds nothing or the probe
-/// was inconclusive; the two are indistinguishable to the caller by design,
-/// because the fallback (no decoration) is the same safe behavior either way.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RawPromptSpecials {
-    pub prefix: Vec<u32>,
-    pub suffix: Vec<u32>,
-}
-
-impl RawPromptSpecials {
-    /// True when no decoration was probed (or the probe was inconclusive).
-    pub fn is_empty(&self) -> bool {
-        self.prefix.is_empty() && self.suffix.is_empty()
-    }
-}
-
-/// Probe the special-token delta between the engine's `/generate`
-/// tokenization (`add_special_tokens = true`) and the router's (`false`) for
-/// the tokenizer at `path`, against the ALREADY-LOADED `default` instance
-/// that will serve the router's encodes.
-///
-/// Infallible by design: an unprobeable tokenizer degrades to "no specials"
-/// (the pre-existing behavior), it never fails startup.
-///
-/// The caller gates WHICH loads run this probe (see
-/// `TokenizerRegistry::load_from_config`): only a `TokenizerArtifact::HfJson`
-/// served by the HF backend (including the fastokens→HF fallback). A second
-/// permanently-allocated instance with `add_special_tokens: true` is
-/// deliberately NOT how this works — it would refuse the L1 prefix cache and
-/// duplicate a sharded vocabulary — so a throwaway instance is built here and
-/// dropped before returning.
-///
-/// Two probe strings are encoded with both instances. A delta is accepted
-/// only when `with == prefix ++ without ++ suffix` holds EXACTLY for both
-/// probes and the two probes agree; anything else (a mid-sequence insertion,
-/// a re-tokenization, a backend disagreement, a template whose specials
-/// depend on content) is inconclusive and yields an empty
-/// `RawPromptSpecials` with one WARN — silently guessing is the failure this
-/// probe exists to avoid.
-pub fn probe_raw_prompt_specials(path: &Path, default: &Tokenizer) -> RawPromptSpecials {
-    let empty = RawPromptSpecials::default();
-    let Some(path_str) = path.to_str() else {
-        tracing::warn!(path = %path.display(),
-            "raw-prompt specials probe skipped: tokenizer path is not valid UTF-8");
-        return empty;
-    };
-    let with = match Tokenizer::from_file_with_options(
-        path_str,
-        dynamo_tokenizers::TokenizerOptions {
-            add_special_tokens: true,
-        },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e,
-                "raw-prompt specials probe could not build its probe instance; \
-                 assuming the tokenizer adds no specials");
-            return empty;
-        }
-    };
-    // One ASCII word and one multi-token sentence: a single probe cannot
-    // distinguish "adds specials" from "encodes this one string
-    // differently", and two agreeing probes make a content-dependent
-    // template (which this model cannot represent) detectable.
-    const PROBES: [&str; 2] = ["time", "The quick brown fox jumps over the lazy dog."];
-    let mut agreed: Option<(Vec<u32>, Vec<u32>)> = None;
-    for text in PROBES {
-        let (with_ids, without_ids) = match (encode(&with, text), encode(default, text)) {
-            (Ok(w), Ok(d)) => (w, d),
-            (with_res, without_res) => {
-                tracing::warn!(path = %path.display(),
-                    with_err = %with_res.err().map(|e| e.to_string()).unwrap_or_default(),
-                    without_err = %without_res.err().map(|e| e.to_string()).unwrap_or_default(),
-                    "raw-prompt specials probe encode failed; assuming no specials");
-                return empty;
-            }
-        };
-        let Some(delta) = strip_specials_delta(&with_ids, &without_ids) else {
-            tracing::warn!(path = %path.display(),
-                "raw-prompt specials probe inconclusive (the specials-enabled encode is not \
-                 the plain encode plus a constant prefix/suffix); /generate routing uses the \
-                 undecorated tokenization");
-            return empty;
-        };
-        match &agreed {
-            None => agreed = Some(delta),
-            Some(prev) if *prev == delta => {}
-            Some(_) => {
-                tracing::warn!(path = %path.display(),
-                    "raw-prompt specials probe: two probe strings disagree on the special-token \
-                     delta (content-dependent specials cannot be modelled); /generate routing \
-                     uses the undecorated tokenization");
-                return empty;
-            }
-        }
-    }
-    let (prefix, suffix) = agreed.unwrap_or_default();
-    let out = RawPromptSpecials { prefix, suffix };
-    if !out.is_empty() {
-        tracing::info!(path = %path.display(),
-            prefix_len = out.prefix.len(),
-            suffix_len = out.suffix.len(),
-            "raw-prompt specials probe: /generate routing tokens get the probed decoration");
-    }
-    out
-}
-
-/// Split `with` into `(prefix, suffix)` such that
-/// `with == prefix ++ without ++ suffix`, exactly. `None` when no such split
-/// exists (a mid-sequence insertion, a re-tokenization, or a shorter `with`)
-/// — the specials delta is only well-defined when the specials-enabled
-/// encode contains the plain encode as one contiguous interior run.
-fn strip_specials_delta(with: &[u32], without: &[u32]) -> Option<(Vec<u32>, Vec<u32>)> {
-    if with.len() < without.len() {
-        return None;
-    }
-    (0..=with.len() - without.len()).find_map(|pre| {
-        if with[pre..pre + without.len()] == *without {
-            Some((with[..pre].to_vec(), with[pre + without.len()..].to_vec()))
-        } else {
-            None
-        }
-    })
-}
-
 /// The special-token strings a `tokenizer.json` declares that are SAFE to
 /// use as L1 split boundaries, i.e. atomic under encode: `added_tokens`
 /// entries with `special: true` and none of the matching modifiers that
@@ -936,36 +802,32 @@ mod tests {
         assert!(l1_safe_specials(&p).is_empty());
     }
 
-    /// The byte-level fixture's post-processor adds no specials, so the
-    /// probe must report an empty delta — anything else would decorate every
-    /// `/generate` routing tokenization with ids the engine never produces.
+    /// The router encodes with `add_special_tokens = false`, ALWAYS — pinned
+    /// here against the one fixture that can tell the difference (a
+    /// `TemplateProcessing` post-processor that prepends `<|endoftext|>`,
+    /// id 256). Every other fixture is `ByteLevel`, where the flag is a
+    /// no-op, so without this the crate has no test that would notice the
+    /// flag being flipped.
+    ///
+    /// Flipping it is a plausible future attempt to close the `/generate`
+    /// raw-text routing gap documented on `request_tokens_for_generate` —
+    /// and it would be the wrong fix twice over: the CHAT encoder renders
+    /// specials itself from the Jinja template, so a true here double-adds
+    /// the BOS, corrupting chat routing tokens AND the `input_ids` the
+    /// router forwards to the engine on that surface. Fix `/generate` on the
+    /// `/generate` path if it needs fixing, never by moving this flag.
     #[test]
-    fn probe_byte_level_fixture_yields_empty_delta() {
-        let default = load("tests/fixtures/tiny_tokenizer.json").unwrap();
-        let specials =
-            probe_raw_prompt_specials(Path::new("tests/fixtures/tiny_tokenizer.json"), &default);
-        assert!(specials.is_empty(), "{specials:?}");
-    }
+    fn router_encodes_without_special_tokens() {
+        let tk = load("tests/fixtures/tiny_bos_tokenizer.json").unwrap();
+        let ids = encode(&tk, "hello").unwrap();
+        assert_ne!(
+            ids.first(),
+            Some(&256),
+            "the router's encode must not carry the fixture's BOS: {ids:?}"
+        );
 
-    /// The `TemplateProcessing` fixture prepends its one special token
-    /// (`<|endoftext|>`, id 256) when `add_special_tokens = true`, so the
-    /// probe must recover exactly that prefix and no suffix.
-    #[test]
-    fn probe_template_fixture_yields_bos_prefix() {
-        let default = load("tests/fixtures/tiny_bos_tokenizer.json").unwrap();
-        let specials = probe_raw_prompt_specials(
-            Path::new("tests/fixtures/tiny_bos_tokenizer.json"),
-            &default,
-        );
-        assert_eq!(
-            specials,
-            RawPromptSpecials {
-                prefix: vec![256],
-                suffix: vec![],
-            }
-        );
-        // Sanity: the probed delta is what a raw encode + decoration equals.
-        let raw = encode(&default, "hello").unwrap();
+        // And the fixture really does add one when asked — otherwise the
+        // assertion above passes for the wrong reason.
         let with = Tokenizer::from_file_with_options(
             "tests/fixtures/tiny_bos_tokenizer.json",
             dynamo_tokenizers::TokenizerOptions {
@@ -974,32 +836,12 @@ mod tests {
         )
         .unwrap();
         let mut want = vec![256];
-        want.extend(raw);
-        assert_eq!(encode(&with, "hello").unwrap(), want);
-    }
-
-    /// A `default` instance that tokenizes DIFFERENTLY from the probe file's
-    /// own no-specials encode (here: the merging BPE fixture vs the
-    /// merge-free template fixture) makes the delta inconclusive — the probe
-    /// must degrade to empty rather than guess a prefix/suffix.
-    #[test]
-    fn probe_inconclusive_on_backend_disagreement() {
-        let default = load("tests/fixtures/tiny_bpe_tokenizer.json").unwrap();
-        let specials = probe_raw_prompt_specials(
-            Path::new("tests/fixtures/tiny_bos_tokenizer.json"),
-            &default,
+        want.extend_from_slice(&ids);
+        assert_eq!(
+            encode(&with, "hello").unwrap(),
+            want,
+            "fixture must be specials-adding for this test to mean anything"
         );
-        assert!(specials.is_empty(), "{specials:?}");
-    }
-
-    /// An unloadable probe file degrades to empty — never a startup failure.
-    #[test]
-    fn probe_fail_soft_on_unloadable_file() {
-        let default = load("tests/fixtures/tiny_tokenizer.json").unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("tokenizer.json");
-        std::fs::write(&p, "not json").unwrap();
-        assert!(probe_raw_prompt_specials(&p, &default).is_empty());
     }
 
     /// `finalize_load_opts` zeroes the L1 budget when the tokenizer has no

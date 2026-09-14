@@ -489,12 +489,6 @@ pub struct TokenizerRegistry {
     /// requests the way the engine does; models without one fall back to raw
     /// prompt-text tokenization.
     encoders: DashMap<String, Arc<ChatEncoderEntry>>,
-    /// Per-model raw-prompt special-token delta, present only when the
-    /// load-time probe ([`adapter::probe_raw_prompt_specials`]) conclusively
-    /// found one. `/generate` routing prepends/appends it to raw-text
-    /// routing tokens so they match the engine's `add_special_tokens = true`
-    /// tokenization block-for-block.
-    specials: DashMap<String, adapter::RawPromptSpecials>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -590,10 +584,6 @@ impl TokenizerRegistry {
                 tracing::info!(model = %m.id, dir = %dir.display(),
                     "loaded tiktoken vocabulary (this repo ships no tokenizer.json); \
                      tokenizer sharding is not applied");
-                tracing::info!(model = %m.id,
-                    "raw-prompt specials probe skipped: a tiktoken directory has no \
-                     tokenizer.json for the HF-only add_special_tokens construction option; \
-                     /generate routing uses the undecorated tokenization");
                 if is_kimi_k3(&m.id) {
                     tracing::warn!(model = %m.id,
                         "model id looks like Kimi-K3 but its tokenizer path has no \
@@ -640,10 +630,6 @@ impl TokenizerRegistry {
                             m.id.clone(),
                             TokenizerShards::shared(Arc::new(Tokenizer::from(Arc::clone(&bt)))),
                         );
-                        tracing::info!(model = %m.id,
-                            "raw-prompt specials probe skipped: encodes are served by the \
-                             Baseten vocabulary, which has no add_special_tokens option; \
-                             /generate routing uses the undecorated tokenization");
                         Some(bt)
                     }
                     Err(e) => {
@@ -653,7 +639,6 @@ impl TokenizerRegistry {
                              raw prompt text. Point --tokenizer-path at \
                              `baseten/kimi-k3-tokenizer` to enable K3 encoding");
                         let shards = TokenizerShards::load(source, m.tokenizer_shards, opts)?;
-                        me.probe_raw_prompt_specials(&m.id, &path, &shards);
                         me.inner.insert(m.id.clone(), shards);
                         None
                     }
@@ -666,7 +651,6 @@ impl TokenizerRegistry {
             adapter::TokenizerArtifact::HfJson(path) => {
                 let source = path.to_str().unwrap_or(&m.tokenizer_path);
                 let shards = TokenizerShards::load(source, m.tokenizer_shards, opts)?;
-                me.probe_raw_prompt_specials(&m.id, &path, &shards);
                 me.inner.insert(m.id.clone(), shards);
                 None
             }
@@ -683,36 +667,6 @@ impl TokenizerRegistry {
                 .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
         }
         Ok(me)
-    }
-
-    /// Run the raw-prompt specials probe for a model served by
-    /// [`TokenizerShards`] loaded from an HF `tokenizer.json`, and store the
-    /// result. Runs ONLY when the resolved encode backend is the HuggingFace
-    /// one (including a fastokens→HF fallback): `add_special_tokens` is an
-    /// HF-only construction option — `FastTokenizer` implements neither
-    /// `with_options` nor the flag, and the Kimi-K3 Baseten vocabulary and
-    /// tiktoken artifacts are different tokenizers again — so probing across
-    /// backends would produce a cross-BACKEND diff dressed up as a specials
-    /// diff, which is exactly the silent-wrong-answer the probe exists to
-    /// prevent. Skips log once at INFO naming the reason; an inconclusive
-    /// probe stores nothing (the accessor yields `None`).
-    fn probe_raw_prompt_specials(
-        &self,
-        model_id: &str,
-        path: &std::path::Path,
-        shards: &TokenizerShards,
-    ) {
-        match adapter::tokenizer_runtime_states().0 {
-            "hf" | "fast_fallback_hf" => {
-                let specials = adapter::probe_raw_prompt_specials(path, shards.next().as_ref());
-                if !specials.is_empty() {
-                    self.specials.insert(model_id.to_string(), specials);
-                }
-            }
-            resolved => tracing::info!(model = %model_id, backend = resolved,
-                "raw-prompt specials probe skipped: add_special_tokens is an HF-backend-only \
-                 construction option; /generate routing uses the undecorated tokenization"),
-        }
     }
 
     /// Pick the chat encoder for a model, logging the outcome on every branch.
@@ -811,19 +765,6 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_encoder(&self, model_id: &str) -> bool {
         self.encoders.contains_key(model_id)
-    }
-
-    /// This model's probed raw-prompt special-token delta
-    /// ([`adapter::RawPromptSpecials`]), or `None` when the tokenizer adds no
-    /// specials or the load-time probe was inconclusive / not applicable.
-    /// Returned by reference (a map guard): the value is immutable after load
-    /// and the ingress reads it per request, so returning it by value would
-    /// clone two `Vec<u32>` on the hot path.
-    pub fn raw_prompt_specials(
-        &self,
-        model_id: &str,
-    ) -> Option<impl std::ops::Deref<Target = adapter::RawPromptSpecials> + '_> {
-        self.specials.get(model_id)
     }
 
     /// This model's chat encoder's forwarding parity ([`ForwardParity`]),
