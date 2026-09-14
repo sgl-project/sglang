@@ -9,6 +9,12 @@
 //!
 //!   * `insert` — populate one worker's prefix.
 //!   * `match_prefix` — score an incoming request against the tree.
+//!   * `contended_match` — reader `match_prefix` throughput WHILE a
+//!     background writer hammers `insert` / `remove` on distinct chain
+//!     roots. This is the case the sharded tree targets: under a single
+//!     process-wide lock every event write blocks every routing read, so
+//!     this number collapses; sharded, readers and the writer only
+//!     contend when they collide on a shard.
 //!
 //! Output is `criterion`'s default (target/criterion/...). To run:
 //!
@@ -16,6 +22,10 @@
 //!   cargo bench --bench tree_lookup -- --sample-size 30   # faster
 //!
 //! See `BENCHMARKS.md` for the SMG↔sgl-router comparison table.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
@@ -71,9 +81,11 @@ fn bench_match_prefix(c: &mut Criterion) {
         let label = format!("w{workers}_bpw{bpw}_q{query_len}");
         group.throughput(Throughput::Elements(query_len as u64));
         let tree = build_tree(workers, bpw, 0xDEADBEEF);
-        // Pull one real worker's prefix so the query has a non-trivial
-        // partial match — closer to the production hot path.
-        let mut rng = StdRng::seed_from_u64(0x12345);
+        // Re-derive worker 0's prefix (the first `bpw` i64s `build_tree`
+        // drew from this seed) and query its leading `query_len`, so the
+        // bench measures a real descent. Drawing fresh randoms here would
+        // miss at the root's children map and time a single lookup.
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
         let probe: Vec<i64> = (0..query_len).map(|_| rng.gen::<i64>()).collect();
         group.bench_function(label, |b| {
             b.iter(|| {
@@ -85,5 +97,65 @@ fn bench_match_prefix(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_match_prefix);
+/// Reader `match_prefix` throughput while a background writer hammers
+/// `insert` / `remove` on distinct chain roots — the read-vs-write
+/// contention scenario the sharded tree is built for. The number to watch
+/// is how the measured rate degrades as the writer's pressure rises; a
+/// single global lock would serialise the two paths, so the reader rate
+/// would drop sharply, while sharded the writer's churn on unrelated
+/// roots leaves most reads uncontended.
+fn bench_contended_match(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashtree_contended_match");
+    // A warm tree holds many distinct chains that the reader queries; the
+    // writer churns its own scratch chains on disjoint roots.
+    let tree = Arc::new(build_tree(64, 64, 0xDEADBEEF));
+    // Re-derive worker 0's chain (the first 64 i64s `build_tree` drew from
+    // this seed) so the reader gets a non-trivial full match.
+    let warm_chain: Vec<i64> = {
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+        (0..64).map(|_| rng.gen::<i64>()).collect()
+    };
+
+    // Spawn one background writer that never stops until the bench drops
+    // the stop flag. It inserts then removes a fresh 4-block chain each
+    // round, so the tree size stays bounded and the writer keeps taking
+    // write locks.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let tree = tree.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let scratch = KvWorkerId::new("http://scratch:30000".to_string(), 0);
+            let mut round = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                let base = 1_000_000 + round.wrapping_mul(7);
+                let chain = [base, base + 1, base + 2, base + 3];
+                tree.insert(&scratch, None, &chain);
+                tree.remove(&scratch, &chain);
+                round = round.wrapping_add(1);
+            }
+        })
+    };
+
+    group.throughput(Throughput::Elements(warm_chain.len() as u64));
+    group.bench_function("reader_under_write_pressure", |b| {
+        b.iter(|| {
+            let m = tree.match_prefix(None, black_box(&warm_chain));
+            black_box(m.matched_blocks)
+        });
+    });
+
+    // Stop the writer before `finish()` writes its reports: a panic in the
+    // bench body would otherwise leave the thread spinning forever.
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("bench writer thread panicked");
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_insert,
+    bench_match_prefix,
+    bench_contended_match
+);
 criterion_main!(benches);
