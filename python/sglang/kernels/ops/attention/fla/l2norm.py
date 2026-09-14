@@ -174,12 +174,8 @@ def gdn_prefill_qkv_prepare_kernel(
         )
         q_values = tl.load(q_block, mask=m_td, other=0.0).to(tl.float32)
         k_values = tl.load(k_block, mask=m_td, other=0.0).to(tl.float32)
-        q_output_block = (
-            q_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
-        )
-        k_output_block = (
-            k_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
-        )
+        q_output_block = q_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
+        k_output_block = k_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
         tl.store(
             q_output_block,
             q_values.to(q_out.dtype.element_ty),

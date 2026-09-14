@@ -119,19 +119,11 @@ def chunk_local_cumsum_vector_kernel(
     o_s = i_s * BS + tl.arange(0, BS)
     m_ts = (o_t[:, None] < T) & (o_s[None, :] < S)
     if HEAD_FIRST:
-        p_s = (
-            s + (bos * H + i_h * T) * S + o_t[:, None] * S + o_s[None, :]
-        )
-        p_o = (
-            o + (bos * H + i_h * T) * S + o_t[:, None] * S + o_s[None, :]
-        )
+        p_s = s + (bos * H + i_h * T) * S + o_t[:, None] * S + o_s[None, :]
+        p_o = o + (bos * H + i_h * T) * S + o_t[:, None] * S + o_s[None, :]
     else:
-        p_s = (
-            s + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
-        )
-        p_o = (
-            o + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
-        )
+        p_s = s + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
+        p_o = o + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
     # [BT, BS]
     b_s = tl.load(p_s, mask=m_ts, other=0.0).to(tl.float32)
     b_o = tl.dot(m_s, b_s, allow_tf32=False)

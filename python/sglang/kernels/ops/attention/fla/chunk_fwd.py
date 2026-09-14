@@ -167,9 +167,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
                 if i_tc3 < T:
                     p_k3 = k + (i_tc3 + o_i)[:, None] * (Hg * K) + o_k[None, :]
-                    b_k3 = tl.load(
-                        p_k3, mask=m_tc3[:, None] & m_k[None, :], other=0.0
-                    )
+                    b_k3 = tl.load(p_k3, mask=m_tc3[:, None] & m_k[None, :], other=0.0)
                     # diagonal block 3
                     b_A33 += tl.dot(b_k3, tl.trans(b_k3))
                     # off-diagonal (3,0), (3,1), (3,2)

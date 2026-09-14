@@ -182,9 +182,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         m_tv = m_t[:, None] & m_v[None, :]
 
         p_h1 = h + i_t * stride_h + o_v[:, None] * K + o_64[None, :]
-        tl.store(
-            p_h1, b_h1.to(h.dtype.element_ty), mask=m_v[:, None] & m_k1[None, :]
-        )
+        tl.store(p_h1, b_h1.to(h.dtype.element_ty), mask=m_v[:, None] & m_k1[None, :])
         if K > 64:
             p_h2 = h + i_t * stride_h + o_v[:, None] * K + (64 + o_64)[None, :]
             tl.store(
