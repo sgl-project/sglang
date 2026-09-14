@@ -24,7 +24,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunked-prefill-size", type=int, default=196608)
     parser.add_argument("--mem-fraction-static", type=float, default=0.8)
     parser.add_argument("--num-continuous-decode-steps", type=int, default=8)
+    parser.add_argument("--enable-radix-cache", action="store_true")
+    parser.add_argument("--enable-hierarchical-cache", action="store_true")
+    parser.add_argument("--hicache-ratio", type=float, default=2.0)
     return parser.parse_args()
+
+
+def token_ids_for_row(row: dict, input_length: int, request_index: int) -> list[int]:
+    hash_ids = row.get("hash_ids")
+    if not isinstance(hash_ids, list) or not hash_ids:
+        return [1000 + request_index] * input_length
+
+    block_size = int(row.get("block_size", 64))
+    tokens = [1000 + int(hash_id) for hash_id in hash_ids for _ in range(block_size)]
+    if len(tokens) < input_length:
+        tokens.extend([120000 + request_index] * (input_length - len(tokens)))
+    return tokens[:input_length]
 
 
 def load_trace(path: Path) -> SimpleDataset:
@@ -46,7 +61,7 @@ def load_trace(path: Path) -> SimpleDataset:
             raise ValueError(f"invalid trace row {line_number}: values out of range")
         requests.append(
             GenericRequest(
-                token_ids=[1000 + len(requests)] * input_length,
+                token_ids=token_ids_for_row(row, input_length, len(requests)),
                 input_length=input_length,
                 output_length=output_length,
                 custom_params={
@@ -85,21 +100,27 @@ def main() -> None:
     from sglang.srt.server_args import ServerArgs
 
     dataset = load_trace(trace_path)
-    runner = SGLangBenchmarkRunner(
-        server_args=ServerArgs(
-            model_path=str(model_path),
-            load_format="dummy",
-            device="cpu",
-            skip_tokenizer_init=True,
-            max_total_tokens=args.max_total_tokens,
-            max_prefill_tokens=args.max_prefill_tokens,
-            chunked_prefill_size=args.chunked_prefill_size,
-            mem_fraction_static=args.mem_fraction_static,
-            num_continuous_decode_steps=args.num_continuous_decode_steps,
-            page_size=256,
-            disable_radix_cache=True,
+    server_args = {
+        "model_path": str(model_path),
+        "load_format": "dummy",
+        "device": "cpu",
+        "skip_tokenizer_init": True,
+        "max_total_tokens": args.max_total_tokens,
+        "max_prefill_tokens": args.max_prefill_tokens,
+        "chunked_prefill_size": args.chunked_prefill_size,
+        "mem_fraction_static": args.mem_fraction_static,
+        "num_continuous_decode_steps": args.num_continuous_decode_steps,
+        "page_size": 256,
+        "disable_radix_cache": not args.enable_radix_cache,
+    }
+    if args.enable_hierarchical_cache:
+        server_args.update(
+            enable_hierarchical_cache=True,
+            hicache_ratio=args.hicache_ratio,
+            hicache_storage_backend="file",
+            hicache_storage_prefetch_policy="wait_complete",
         )
-    )
+    runner = SGLangBenchmarkRunner(server_args=ServerArgs(**server_args))
     try:
         metrics = runner.benchmark(
             BenchmarkConfig(request_rate=float("inf"), ignore_request_timestamp=False),
@@ -111,6 +132,13 @@ def main() -> None:
             "method": "agentx_open_loop_diagnostic",
             "trace": str(trace_path),
             "request_count": len(dataset),
+            "cache": {
+                "radix": args.enable_radix_cache,
+                "hierarchical": args.enable_hierarchical_cache,
+                "hicache_ratio": (
+                    args.hicache_ratio if args.enable_hierarchical_cache else None
+                ),
+            },
             "metrics": metrics,
         }
     finally:
