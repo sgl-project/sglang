@@ -9,6 +9,7 @@ ARG VER_TORCHVISION=0.23.0
 ARG VER_TRITON=3.3.0+spacemit.a0
 ARG VER_PYARROW=21.0.0
 ARG VER_VLLM=0.11.0.post3+spacemit.0.cpu
+ARG VER_GRPCIO=1.83.1
 ARG VER_LLVM=19
 ARG VER_XGRAMMAR=0.2.1
 
@@ -77,8 +78,11 @@ RUN unset CC CXX && \
     export RISCV_OMP_LIB_PATH=/usr/lib/riscv64-linux-gnu/libomp.so.5 && \
     # Override pyproject pins to the preinstalled riscv64 wheel versions.
     # TODO: Remove these overrides when SpacemiT publishes wheels matching sglang's pinned versions.
-    printf "torch==${VER_TORCH}\ntorchvision==${VER_TORCHVISION}\ntriton==${VER_TRITON}\nxgrammar==${VER_XGRAMMAR}\n" > /tmp/torch-override.txt && \
-    uv pip install . --override /tmp/torch-override.txt --index-strategy unsafe-best-match
+    # RISE publishes CPython 3.13 riscv64 wheels for grpcio through 1.83.1.
+    printf "torch==${VER_TORCH}\ntorchvision==${VER_TORCHVISION}\ntriton==${VER_TRITON}\nxgrammar==${VER_XGRAMMAR}\ngrpcio==${VER_GRPCIO}\n" > /tmp/torch-override.txt && \
+    uv pip install . --override /tmp/torch-override.txt \
+        --extra-index-url https://pypi.riseproject.dev/simple/ \
+        --index-strategy unsafe-best-match
 RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK in final image')"
 
 # 9. Final Configuration
