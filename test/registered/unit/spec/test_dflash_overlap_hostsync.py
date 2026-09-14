@@ -5,6 +5,7 @@ keep-list."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -94,6 +95,7 @@ class TestDFlashMambaCommit(CustomTestCase):
                 worker,
                 batch=batch,
                 seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
+                seq_lens_post_verify=torch.tensor([11, 23], dtype=torch.int64),
                 commit_lens=commit_lens,
             )
         finally:
@@ -122,7 +124,6 @@ class TestDFlashMambaCommit(CustomTestCase):
         worker = SimpleNamespace(
             _need_mamba_verify_commit=True,
             block_size=4,
-            server_args=SimpleNamespace(mamba_track_interval=16),
             target_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(
                     req_to_token_pool=SimpleNamespace(mamba_pool=SimpleNamespace()),
@@ -131,13 +132,17 @@ class TestDFlashMambaCommit(CustomTestCase):
                 )
             ),
         )
-        batch = SimpleNamespace(mamba_track_indices=None)
+        batch = SimpleNamespace(
+            mamba_track_indices=None,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
         commit_lens = torch.tensor([1, 3], dtype=torch.int32)
 
         DFlashWorkerV2._update_target_mamba_state_after_verify(
             worker,
             batch=batch,
             seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_post_verify=torch.tensor([11, 23], dtype=torch.int64),
             commit_lens=commit_lens,
         )
 
@@ -148,6 +153,92 @@ class TestDFlashMambaCommit(CustomTestCase):
         )
         self.assertIsNone(calls[0]["mamba_track_indices"])
         self.assertIsNone(calls[0]["mamba_steps_to_track"])
+
+
+class TestDSparkMambaCommit(CustomTestCase):
+    def _run_commit(self, *, is_kda):
+        from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
+        fold_calls, backend_calls = [], []
+        backend = SimpleNamespace(
+            update_mamba_state_after_mtp_verify=lambda **kwargs: backend_calls.append(
+                kwargs
+            )
+        )
+        worker = SimpleNamespace(
+            _need_mamba_verify_commit=True,
+            verify_num_draft_tokens=4,
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_pool=SimpleNamespace(
+                            replayssm_spec_fold=True,
+                            replayssm_is_kda=is_kda,
+                        )
+                    ),
+                    attn_backend=backend,
+                    model=object(),
+                )
+            ),
+        )
+        batch = SimpleNamespace(
+            mamba_track_indices=None, req_pool_indices=torch.tensor([2, 5])
+        )
+        lengths = torch.tensor([1, 3], dtype=torch.int32)
+        with (
+            patch.object(
+                dspark_worker_v2,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=1),
+            ),
+            patch.object(
+                dspark_worker_v2,
+                "commit_mamba_states_after_verify",
+                side_effect=lambda **kwargs: fold_calls.append(kwargs),
+            ),
+        ):
+            dspark_worker_v2.DSparkWorkerV2._commit_target_mamba_states_after_verify(
+                worker,
+                batch=batch,
+                seq_lens_pre_verify=torch.tensor([10, 20]),
+                seq_lens_post_verify=torch.tensor([11, 23]),
+                commit_lens=lengths,
+            )
+        return fold_calls, backend_calls, batch, lengths
+
+    def test_gdn_fold_uses_dense_request_indices(self):
+        fold_calls, backend_calls, batch, lengths = self._run_commit(is_kda=False)
+        self.assertEqual(len(fold_calls), 1)
+        self.assertEqual(backend_calls, [])
+        self.assertIs(fold_calls[0]["batch"], batch)
+        self.assertIs(fold_calls[0]["accept_lens"], lengths)
+        self.assertEqual(fold_calls[0]["draft_token_num"], 4)
+        torch.testing.assert_close(
+            fold_calls[0]["accept_index"],
+            torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+        )
+
+    def test_kda_keeps_backend_commit(self):
+        fold_calls, backend_calls, batch, _ = self._run_commit(is_kda=True)
+        self.assertEqual(fold_calls, [])
+        self.assertEqual(len(backend_calls), 1)
+        torch.testing.assert_close(
+            backend_calls[0]["last_correct_step_indices"], torch.tensor([0, 2])
+        )
+        self.assertIs(backend_calls[0]["req_pool_indices"], batch.req_pool_indices)
+
+    def test_non_hybrid_commit_is_noop(self):
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        DSparkWorkerV2._commit_target_mamba_states_after_verify(
+            SimpleNamespace(_need_mamba_verify_commit=False),
+            batch=object(),
+            seq_lens_pre_verify=torch.tensor([10]),
+            seq_lens_post_verify=torch.tensor([11]),
+            commit_lens=torch.tensor([1]),
+        )
 
 
 class _FakeTpGroup:
