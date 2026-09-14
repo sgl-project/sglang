@@ -7,7 +7,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
+from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -56,20 +56,6 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
-    @staticmethod
-    def _layout_domains(transfers: list[L2Transfer]) -> list[Any]:
-        domains = []
-        seen = set()
-        for transfer in transfers:
-            if not uses_shared_host_layout(transfer.host_pool):
-                continue
-            domain = transfer.host_pool.shared_allocation_domain
-            if domain is None or id(domain) in seen:
-                continue
-            seen.add(id(domain))
-            domains.append(domain)
-        return domains
-
     def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
         prepared = []
         for transfer in transfers:
@@ -91,7 +77,7 @@ class L2TransferEngine:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
-        domains = self._layout_domains(transfers)
+        domains = shared_host_layout_domains(t.host_pool for t in transfers)
         for domain in domains:
             domain.acquire_layout()
         finish_recorded = False

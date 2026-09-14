@@ -248,7 +248,7 @@ class DecodeKVCacheOffloadManager:
         host_indices = self.cache_controller.write(
             device_indices=device_indices,
             node_id=ack_id,
-            **({"extra_pools": pool_transfers} if pool_transfers else {}),
+            extra_pools=pool_transfers,
         )
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")

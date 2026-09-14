@@ -406,11 +406,17 @@ class HybridCacheController(BaseHiCacheController):
             for entry, (_, need_size) in zip(entries, requests, strict=True)
         ]
 
-        allocated = domain.alloc_many(domain_requests)
-        if self._shared_host_alloc_succeeded_on_all_ranks(allocated, requests):
-            return allocated
+        def try_allocate():
+            allocated = domain.alloc_many(domain_requests)
+            if self._shared_host_alloc_succeeded_on_all_ranks(allocated, requests):
+                return allocated
+            if allocated is not None:
+                self._free_shared_host_allocations(entries, allocated)
+            return None
+
+        allocated = try_allocate()
         if allocated is not None:
-            self._free_shared_host_allocations(entries, allocated)
+            return allocated
 
         pools = [entry.host_pool for entry in entries]
         requested_bytes = sum(
@@ -459,23 +465,21 @@ class HybridCacheController(BaseHiCacheController):
                 if evicted <= 0:
                     continue
                 made_progress = True
-                allocated = domain.alloc_many(domain_requests)
-                if self._shared_host_alloc_succeeded_on_all_ranks(allocated, requests):
-                    return allocated
+                allocated = try_allocate()
                 if allocated is not None:
-                    self._free_shared_host_allocations(entries, allocated)
+                    return allocated
             if not made_progress:
                 return None
 
     def _sync_shared_host_value(self, value: int, op) -> int:
-        if not self._has_shared_host_consensus_peers():
+        if not self._shared_host_consensus_groups():
             return value
         synced = torch.tensor(value, dtype=torch.int64, device="cpu")
         self._all_reduce_shared_host_groups(synced, op)
         return int(synced.item())
 
     def _assert_shared_host_value_equal(self, value: int, label: str) -> None:
-        if not self._has_shared_host_consensus_peers():
+        if not self._shared_host_consensus_groups():
             return
         synced = torch.tensor([value, -value], dtype=torch.int64, device="cpu")
         self._all_reduce_shared_host_groups(synced, torch.distributed.ReduceOp.MIN)
@@ -490,7 +494,7 @@ class HybridCacheController(BaseHiCacheController):
         allocated: Optional[list[torch.Tensor]],
         requests: list[tuple[PoolName, int]],
     ) -> bool:
-        if not self._has_shared_host_consensus_peers():
+        if not self._shared_host_consensus_groups():
             return allocated is not None
 
         pool_names = list(PoolName)
@@ -524,31 +528,23 @@ class HybridCacheController(BaseHiCacheController):
             )
         return bool(mins[0])
 
-    def _has_shared_host_consensus_peers(self) -> bool:
-        groups = (self.attn_cp_group, self.attn_tp_group)
-        if any(
-            group is not None and torch.distributed.get_world_size(group=group) > 1
-            for group in groups
-        ):
-            return True
-        return (
-            self.tp_group is not None
-            and torch.distributed.get_world_size(group=self.tp_group) > 1
-        )
-
-    def _all_reduce_shared_host_groups(self, tensor: torch.Tensor, op) -> None:
-        reduced = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
-            if group is None or torch.distributed.get_world_size(group=group) <= 1:
-                continue
-            torch.distributed.all_reduce(tensor, op=op, group=group)
-            reduced = True
+    def _shared_host_consensus_groups(self) -> list:
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
         if (
-            not reduced
+            not groups
             and self.tp_group is not None
             and torch.distributed.get_world_size(group=self.tp_group) > 1
         ):
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            groups.append(self.tp_group)
+        return groups
+
+    def _all_reduce_shared_host_groups(self, tensor: torch.Tensor, op) -> None:
+        for group in self._shared_host_consensus_groups():
+            torch.distributed.all_reduce(tensor, op=op, group=group)
 
     @staticmethod
     def _free_shared_host_allocations(

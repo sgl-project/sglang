@@ -69,6 +69,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _minimum_full_transfer_tokens(
+    host_pool: HostKVCache, prefetch_threshold: int
+) -> int:
+    page_size = host_pool.page_size
+    return max(page_size, -(-prefetch_threshold // page_size) * page_size)
+
+
 class _UnifiedBackupIntent(msgspec.Struct):
     """Buffer-mode backup intent, unpinned while queued.
 
@@ -223,13 +230,8 @@ def validate_buffer_only_stack(
             full_host_pool = (
                 swa.cache.cache_controller.mem_pool_host.anchor_entry.host_pool
             )
-            min_full_tokens = max(
-                full_host_pool.page_size,
-                (
-                    (swa.cache.prefetch_threshold + full_host_pool.page_size - 1)
-                    // full_host_pool.page_size
-                )
-                * full_host_pool.page_size,
+            min_full_tokens = _minimum_full_transfer_tokens(
+                full_host_pool, swa.cache.prefetch_threshold
             )
             one_transfer_bytes = (
                 window_tokens * swa._swa_kv_pool_host.size_per_token
@@ -405,13 +407,8 @@ class BufferModePipeline:
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
         swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
-        min_full_tokens = max(
-            anchor.page_size,
-            (
-                (self._cache.prefetch_threshold + anchor.page_size - 1)
-                // anchor.page_size
-            )
-            * anchor.page_size,
+        min_full_tokens = _minimum_full_transfer_tokens(
+            anchor, self._cache.prefetch_threshold
         )
         requests = [(anchor.pool_label, min_full_tokens)]
         if swa_entry is not None and self._swa_window_pages:

@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
 @dataclass
@@ -75,16 +75,7 @@ class HostPoolGroup:
 
     @contextmanager
     def layout_lease(self):
-        domains = []
-        seen = set()
-        for entry in self.entries:
-            if not isinstance(entry.host_pool, HostKVCache):
-                continue
-            domain = entry.host_pool.shared_allocation_domain
-            if domain is None or id(domain) in seen:
-                continue
-            seen.add(id(domain))
-            domains.append(domain)
+        domains = shared_host_layout_domains(entry.host_pool for entry in self.entries)
         for domain in domains:
             domain.acquire_layout()
         try:

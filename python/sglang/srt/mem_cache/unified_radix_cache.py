@@ -497,6 +497,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        # Preserve the SWA host window before device eviction makes it unrecoverable.
         if (
             get_memory().enable_unified_memory
             and self.host_memory_mode == "cache"
