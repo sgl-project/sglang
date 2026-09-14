@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -8,6 +9,7 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
+    _cache_indices,
     build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
@@ -346,6 +348,100 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         prefix_lens=(0, 64, 128),
         extend_lens=(64, 65, 129),
     )
+    CAKE_CP_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_cp_prefill",
+        backend="triton",
+        linear_attn_prefill_backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=2,
+        num_v_heads=4,
+        page_size=16,
+        prefix_lens=(0,),
+        extend_lens=(65,),
+    )
+
+    def test_cake_cp_prefill_route_matches_non_cp(self):
+        if _sm_major != 10:
+            self.skipTest("FlashInfer Cake GDN CP prefill requires SM100/SM103")
+
+        import flashinfer.gdn_prefill as flashinfer_gdn_prefill
+
+        cake_prefill = getattr(
+            flashinfer_gdn_prefill, "_chunk_gated_delta_rule_cake_sm100", None
+        )
+        if cake_prefill is None:
+            self.skipTest("FlashInfer build does not contain PR #4539 Cake GDN CP")
+
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=128,
+        )
+        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        initial_conv = cache.conv[0].clone()
+        initial_ssm = cache.temporal.clone()
+        mixed_qkv = fixture.mixed_qkv.clone()
+        a = fixture.a.clone()
+        b = fixture.b.clone()
+        cake_calls = 0
+
+        def observed_cake(*args, **kwargs):
+            nonlocal cake_calls
+            cake_calls += 1
+            return cake_prefill(*args, **kwargs)
+
+        def unexpected_non_cp(*_args, **_kwargs):
+            raise AssertionError("SGLang FlashInfer prefill left the Cake CP route")
+
+        with (
+            patch.object(
+                flashinfer_gdn_prefill,
+                "_chunk_gated_delta_rule_cake_sm100",
+                observed_cake,
+            ),
+            patch.object(
+                flashinfer_gdn_prefill,
+                "chunk_gated_delta_rule_sm100",
+                unexpected_non_cp,
+            ),
+        ):
+            cake_output = run_gdn_fixture_eager(fixture)
+        cake_state = cache.temporal.clone()
+
+        self.assertEqual(cake_calls, 1)
+        torch.testing.assert_close(fixture.mixed_qkv, mixed_qkv, atol=0, rtol=0)
+        torch.testing.assert_close(fixture.a, a, atol=0, rtol=0)
+        torch.testing.assert_close(fixture.b, b, atol=0, rtol=0)
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        flashinfer_kernel = (
+            fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
+        )
+        public_prefill = flashinfer_kernel._prefill_fn
+
+        def non_cp_prefill(*args, **kwargs):
+            kwargs["use_cp"] = False
+            return public_prefill(*args, **kwargs)
+
+        flashinfer_kernel._prefill_fn = non_cp_prefill
+        non_cp_output = run_gdn_fixture_eager(fixture)
+        non_cp_state = cache.temporal.clone()
+
+        torch.testing.assert_close(cake_output, non_cp_output, atol=1e-2, rtol=1e-2)
+        selected = _cache_indices(fixture).long()
+        torch.testing.assert_close(
+            cake_state[selected], non_cp_state[selected], atol=1e-2, rtol=1e-2
+        )
+        untouched = torch.ones(
+            initial_ssm.shape[0], dtype=torch.bool, device=initial_ssm.device
+        )
+        untouched[selected] = False
+        torch.testing.assert_close(
+            cake_state[untouched], initial_ssm[untouched], atol=0, rtol=0
+        )
 
     def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
