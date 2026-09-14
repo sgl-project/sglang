@@ -623,15 +623,14 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
-    /// router's chat encoder failed: a chat request (`messages`) on a model with
-    /// a chat encoder that did not yield engine-equivalent ids. That request
-    /// silently fell back to engine-side tokenization, defeating the offload —
-    /// the actionable "offload broken" signal. It stays at ~0 in healthy
-    /// operation and climbs only on a real tokenizer problem; successful
-    /// forwards and expected omissions (tools / multimodal / thinking, whose
-    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
-    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    /// Recorded ONLY when the `input_ids` offload should have fired but the
+    /// chat encoder failed: a plain text chat request (one the forward guard
+    /// would have forwarded) on a model with a chat encoder that did not
+    /// yield engine-equivalent ids. That request silently fell back to
+    /// engine-side tokenization. It stays at ~0 in healthy operation; requests
+    /// the guard withholds anyway (tools, multimodal, thinking) are not counted
+    /// even when their render fails. Pairs with the per-model WARN log in
+    /// `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
@@ -1026,7 +1025,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-encoder model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();
