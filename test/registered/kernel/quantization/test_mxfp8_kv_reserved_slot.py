@@ -130,3 +130,9 @@ def test_set_kv_buffer_is_cuda_graph_capture_safe():
     kc, _ = pool.get_kv_buffer(0)
     got = kc.view(-1, PS, NHKV, HD)[0, 7].view(torch.uint8)
     assert torch.equal(got, kq[1].view(torch.uint8)), "captured valid write lost"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
