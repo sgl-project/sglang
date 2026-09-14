@@ -112,7 +112,7 @@ sglang serve \\
 
   useEffect(() => {
     const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
-    const targetTabName = isAscend ? 'Ascend A2 Series / A3 Series' : 'AMD MI300X';
+    const targetTabName = isAscend ? 'Ascend A2/A3 Series' : 'AMD MI300X';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
     allTabs.forEach((tab) => {

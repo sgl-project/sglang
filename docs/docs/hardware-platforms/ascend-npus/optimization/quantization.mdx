@@ -351,7 +351,7 @@ python3 -m sglang.launch_server \
 
 **MXFP8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
-LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend 950PR/DT Series or newer (`npu_dynamic_mx_quant` is not available on A2 Series / A3 Series).
+LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend 950PR/DT Series or newer (`npu_dynamic_mx_quant` is not available on A2/A3 Series).
 
 - Online MXFP8 quantization (BF16/FP16 weights → MXFP8 at load time):
 
@@ -453,7 +453,7 @@ python3 -m sglang.launch_server \
 
 **MXFP4 W4A4 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
-LLM dense W4A4 (MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend 950PR/DT Series or newer — the dual-level online path uses the `DualLevelQuantBatchMatmul` op, which A2 Series/A3 Series lack. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
+LLM dense W4A4 (MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend 950PR/DT Series or newer — the dual-level online path uses the `DualLevelQuantBatchMatmul` op, which A2/A3 Series lack. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
 
 - Online W4A4 quantization (BF16/FP16 weights → dual-level MXFP4 at load time):
 
@@ -493,7 +493,7 @@ python3 -m sglang.launch_server \
 
 ## Diffusion Model Quantization on Ascend NPU
 
-SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2 Series/A3 Series.
+SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2/A3 Series.
 
 **Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend 950PR/DT Series
 
@@ -504,7 +504,7 @@ SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion mo
       <th><code>quant_type</code> in JSON</th>
       <th>Scheme class</th>
       <th>Mode</th>
-      <th>Ascend A2 Series Products/A3 Series Products Supported</th>
+      <th>Ascend A2/A3 Series Products Supported</th>
       <th>Ascend 950PR/DT Series Products Supported</th>
       <th>Trigger</th>
     </tr>
