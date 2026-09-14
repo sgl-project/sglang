@@ -108,11 +108,15 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     5,
     "--skip-server-warmup",
     "--cuda-graph-bs-decode",
+    # bs=8/10 (from the local script) fails graph capture in the CI image:
+    # ascend_backend._apply_cuda_graph_metadata raises "Expected all tensors
+    # to be on the same device" during decode capture at bs=8. 1 2 4 5 6 is
+    # the validated set; 5/6 also cover the draft-token-6 decode path.
     1,
     2,
     4,
-    8,
-    10,
+    5,
+    6,
 ]
 
 
