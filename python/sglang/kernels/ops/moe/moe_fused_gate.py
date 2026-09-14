@@ -88,7 +88,7 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
+    scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
@@ -127,16 +127,18 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # Prefetch a real bias before the PDL wait. Plain softmax routing has no
-    # bias, so keep the zero value in registers rather than materializing and
-    # clearing a device tensor for every routing call.
+    # PDL may start this grid before prior kernel stores are visible. Bias can
+    # be produced by a preceding cast or fill kernel, so wait before loading
+    # either bias or scores.
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    # Plain softmax routing has no bias, so keep the zero value in registers
+    # rather than materializing and clearing a device tensor per call.
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
     else:
         bias = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = mask_m[:, None] & mask_n[None, :]
@@ -149,8 +151,13 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + bias[None, :]
     elif SCORING_FUNC == 1:
-        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large.
-        sp = tl.where(scores > 20.0, scores, tl.log(1.0 + tl.exp(scores)))
+        # sqrt(softplus(x)). log(1.0 + exp(x)) rounds to 0 below -16.64 and overflows
+        # above 88.7; Triton has no log1p, so recover it from log via z*log(u)/(u-1).
+        z = tl.exp(-tl.abs(scores))
+        u = 1.0 + z
+        exact = u == 1.0
+        log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
+        sp = tl.maximum(scores, 0.0) + log1p_z
         activated = tl.sqrt(sp)
         biased = activated + bias[None, :]
     else:
