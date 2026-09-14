@@ -109,6 +109,9 @@ class TestDSABackendDPPadding(unittest.TestCase):
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
         )
+        backend._pad_trtllm_sparse_page_table = MethodType(
+            DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
+        )
 
         layer = SimpleNamespace(
             layer_id=0,
