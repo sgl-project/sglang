@@ -1210,6 +1210,45 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_multinode_dp_ports_are_checked_on_primary_only(self, mock_wait):
+        def check_port(port, name):
+            if port == 25002:
+                raise ValueError("detokenizer_port is occupied on this node")
+
+        mock_wait.side_effect = check_port
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 2
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.nccl_port = 26000
+
+        # The primary binds the detokenizer socket, so this is a real conflict.
+        with self.assertRaisesRegex(ValueError, "detokenizer_port"):
+            PortArgs.init_new(server_args)
+
+        # A peer connects to that primary socket; a local router using the same
+        # port number must not prevent the peer from starting.
+        server_args.node_rank = 1
+        port_args = PortArgs.init_new(server_args)
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:25002")
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_multinode_dp_peer_still_checks_nccl_port(self, mock_wait):
+        def check_port(port, name):
+            if port == 26000:
+                raise ValueError("nccl_port is occupied on this node")
+
+        mock_wait.side_effect = check_port
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 2
+        server_args.node_rank = 1
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.nccl_port = 26000
+        with self.assertRaisesRegex(ValueError, "nccl_port"):
+            PortArgs.init_new(server_args)
+
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"

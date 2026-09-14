@@ -384,7 +384,7 @@ class LoRAMemoryPool:
         the LoRA buffer matches the actual shard regardless of which TP group
         owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
         shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
-        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        the module's attention/global TP size. Cached per ``(module_name, layer_idx)``.
 
         MoE-internal names go through ``self.moe_tp_size`` upstream.
         """
@@ -420,7 +420,7 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = found if found is not None else self._effective_tp_size(module_name)
         cache[key] = out
         return out
 
@@ -560,6 +560,11 @@ class LoRAMemoryPool:
             - Standard: [num_loras, rank, hidden_dim]
             - MoE: [num_loras, num_experts, rank, hidden_dim]
         """
+        if not self.is_moe_module(module_name):
+            return self._get_standard_shape(
+                module_name, base_model, max_lora_dim, layer_idx
+            )
+
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
@@ -572,24 +577,21 @@ class LoRAMemoryPool:
         ):
             input_dim = divide(input_dim, effective_tp_size)
 
-        if self.is_moe_module(module_name):
-            if self.is_shared_moe_module(module_name):
-                expert_dim = self._get_num_shared_experts(base_model)
-            else:
-                expert_dim = self._get_num_local_experts(base_model)
-            if self.experts_shared_outer_loras and module_name in (
-                "gate_up_proj_moe",
-                "gate_up_proj_shared_moe",
-            ):
-                expert_dim = 1
-            return (
-                self.max_loras_per_batch,
-                expert_dim,
-                max_lora_dim * c,
-                input_dim,
-            )
+        if self.is_shared_moe_module(module_name):
+            expert_dim = self._get_num_shared_experts(base_model)
         else:
-            return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+            expert_dim = self._get_num_local_experts(base_model)
+        if self.experts_shared_outer_loras and module_name in (
+            "gate_up_proj_moe",
+            "gate_up_proj_shared_moe",
+        ):
+            expert_dim = 1
+        return (
+            self.max_loras_per_batch,
+            expert_dim,
+            max_lora_dim * c,
+            input_dim,
+        )
 
     def get_embedding_lora_A_shape(
         self,
