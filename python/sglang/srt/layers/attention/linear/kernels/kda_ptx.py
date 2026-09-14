@@ -51,10 +51,6 @@ _PAD_GATE = -1000.0
 
 
 class PtxKDAKernel(LinearAttnKernelBase):
-    # Batches carrying the fp32 track snapshot buffer (track_state) route to
-    # the embedded Triton fallback, which forwards the snapshot arguments
-    # (the track_state check in extend -> _triton_extend); boundary-only
-    # tracking stays native.
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
@@ -225,10 +221,8 @@ class PtxKDAKernel(LinearAttnKernelBase):
             )
         eligible = (
             not kwargs.get("is_spec_decode")
-            # The native kernel cannot write the fp32 track snapshot buffer;
-            # a batch carrying one must take the Triton fallback, which
-            # forwards the snapshot arguments (see _triton_extend). Leaving
-            # the buffer unwritten would corrupt prefix-cache track slots.
+            # track_state batches must take the Triton fallback; the native
+            # kernel cannot write the fp32 snapshot.
             and kwargs.get("track_state") is None
             and intermediate_stride_supported
             and shape_known
