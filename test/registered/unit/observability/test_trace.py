@@ -8,9 +8,10 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sglang.srt.observability.trace as mod
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
@@ -25,10 +26,14 @@ from sglang.srt.observability.trace import (
     set_global_trace_level,
     trace_set_thread_info,
 )
+from sglang.test.test_utils import CustomTestCase
 
 try:
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
 
     from sglang.srt.observability.trace import get_otlp_span_exporter
 
@@ -38,6 +43,7 @@ except ImportError:
 
 # Access the private module-level function (avoid name mangling inside classes).
 _get_host_id = getattr(mod, "_get_host_id")
+_resolve_trace_service_name = getattr(mod, "_resolve_trace_service_name")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -164,7 +170,73 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
                 get_otlp_span_exporter("localhost:4317")
 
 
-class TestProcessTracingInit(unittest.TestCase):
+class TestProcessTracingInit(CustomTestCase):
+    def test_explicit_service_name_takes_precedence(self):
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}):
+            self.assertEqual(
+                _resolve_trace_service_name("from-cli"),
+                "from-cli",
+            )
+
+    def test_service_name_uses_otel_environment_variable(self):
+        with patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}):
+            self.assertEqual(
+                _resolve_trace_service_name(None),
+                "from-environment",
+            )
+
+    def test_service_name_defaults_to_sglang(self):
+        for environment_value in (None, ""):
+            with self.subTest(environment_value=environment_value):
+                with patch.dict(os.environ, {}, clear=False):
+                    if environment_value is None:
+                        os.environ.pop("OTEL_SERVICE_NAME", None)
+                    else:
+                        os.environ["OTEL_SERVICE_NAME"] = environment_value
+                    self.assertEqual(_resolve_trace_service_name(None), "sglang")
+
+    def test_resolved_service_name_is_applied_to_resource(self):
+        original_initialized = mod.opentelemetry_initialized
+        original_tracer = mod.tracer
+        resource = MagicMock()
+        provider = MagicMock()
+
+        try:
+            with (
+                patch.object(mod, "opentelemetry_imported", True),
+                patch.object(mod, "SERVICE_NAME", "service.name", create=True),
+                patch.object(mod, "Resource", create=True) as resource_cls,
+                patch.object(
+                    mod, "TracerProvider", return_value=provider, create=True
+                ) as tracer_provider_cls,
+                patch.object(mod, "BatchSpanProcessor", create=True),
+                patch.object(mod, "get_otlp_span_exporter"),
+                patch.object(mod, "trace", create=True),
+                patch(
+                    "sglang.srt.observability.trace_async.start_trace_exporter"
+                ) as start_trace_exporter,
+                patch.dict(os.environ, {"OTEL_SERVICE_NAME": "from-environment"}),
+                envs.SGLANG_TRACE_ASYNC.override(True),
+            ):
+                resource_cls.create.return_value = resource
+                process_tracing_init("localhost:4317", None)
+
+            resource_cls.create.assert_called_once_with(
+                attributes={"service.name": "from-environment"}
+            )
+            tracer_provider_cls.assert_called_once_with(
+                resource=resource,
+                id_generator=unittest.mock.ANY,
+            )
+            start_trace_exporter.assert_called_once_with(
+                "localhost:4317",
+                "from-environment",
+                trace_modules=None,
+            )
+        finally:
+            mod.opentelemetry_initialized = original_initialized
+            mod.tracer = original_tracer
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported
@@ -174,6 +246,68 @@ class TestProcessTracingInit(unittest.TestCase):
                 process_tracing_init("localhost:4317", "test")
         finally:
             mod.opentelemetry_imported = orig
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestTraceServiceNameExport(CustomTestCase):
+    def test_exported_span_and_async_exporter_use_the_same_service_name(self):
+        cases = (
+            ("from-cli", "from-environment", "from-cli"),
+            (None, "from-environment", "from-environment"),
+            (None, None, "sglang"),
+            (None, "", "sglang"),
+        )
+        for cli_name, environment_name, expected in cases:
+            for async_enabled in (False, True):
+                with self.subTest(
+                    cli_name=cli_name,
+                    environment_name=environment_name,
+                    async_enabled=async_enabled,
+                ):
+                    exporter = InMemorySpanExporter()
+                    with (
+                        patch.dict(os.environ),
+                        patch.object(mod, "opentelemetry_initialized", False),
+                        patch.object(mod, "tracer", None),
+                        patch.object(mod.trace, "set_tracer_provider") as set_provider,
+                        patch.object(
+                            mod.trace,
+                            "get_tracer",
+                            side_effect=lambda name: set_provider.call_args.args[
+                                0
+                            ].get_tracer(name),
+                        ),
+                        patch.object(
+                            mod, "get_otlp_span_exporter", return_value=exporter
+                        ),
+                        patch(
+                            "sglang.srt.observability.trace_async.start_trace_exporter"
+                        ) as start_trace_exporter,
+                        envs.SGLANG_TRACE_ASYNC.override(async_enabled),
+                    ):
+                        if environment_name is None:
+                            os.environ.pop("OTEL_SERVICE_NAME", None)
+                        else:
+                            os.environ["OTEL_SERVICE_NAME"] = environment_name
+                        process_tracing_init("localhost:4317", cli_name)
+                        provider = set_provider.call_args.args[0]
+                        try:
+                            with mod.tracer.start_as_current_span("test-service-name"):
+                                pass
+                            self.assertTrue(provider.force_flush())
+                            spans = exporter.get_finished_spans()
+                            self.assertEqual(len(spans), 1)
+                            self.assertEqual(
+                                spans[0].resource.attributes["service.name"], expected
+                            )
+                            if async_enabled:
+                                start_trace_exporter.assert_called_once_with(
+                                    "localhost:4317", expected, trace_modules=None
+                                )
+                            else:
+                                start_trace_exporter.assert_not_called()
+                        finally:
+                            provider.shutdown()
 
 
 class TestTraceReqContextDisabled(unittest.TestCase):
