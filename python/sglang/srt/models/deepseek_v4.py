@@ -2882,7 +2882,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                if quantize:
+                # The fused scale writer supports the small decode/verify
+                # tile only. Large prefill keeps its one-CTA-per-row norm and
+                # lets the projection quantize the full activation layout.
+                if quantize and x.shape[0] <= 8:
                     from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
                         hc_combine_norm_mxfp8,
                     )
