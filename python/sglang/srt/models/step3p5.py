@@ -878,7 +878,13 @@ class Step3p5ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        *,
+        is_full_load: bool = True,
+    ):
         # NOTE:
         # Step3p5 HF checkpoints (e.g. MTP/nextn variants) may include an extra
         # "nextn predict layer" appended after the main decoder layers, such as:
@@ -1022,7 +1028,10 @@ class Step3p5ForCausalLM(nn.Module):
             for p in set(params_dict.keys()) - loaded_params
             if "blockscale_swizzled" not in p
         }
-        assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
+        if is_full_load:
+            assert (
+                len(print_params) == 0
+            ), f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

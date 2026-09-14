@@ -338,7 +338,9 @@ class UnlimitedOCRForCausalLM(nn.Module):
         )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ):
         """Load and remap checkpoint weights into the model parameters."""
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
@@ -398,7 +400,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if is_full_load and unloaded_params:
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )

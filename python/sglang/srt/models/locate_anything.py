@@ -154,7 +154,9 @@ class LocateAnythingForConditionalGeneration(nn.Module):
         )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ) -> Set[str]:
         # Remap HF checkpoint prefixes onto SGLang submodule names.
         prefix_mapping = {
             "vision_model.": "vision_tower.",
@@ -243,7 +245,7 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             missing = {
                 n for n in missing if not n.startswith("language_model.lm_head.")
             }
-        if missing:
+        if is_full_load and missing:
             logger.warning(
                 f"LocateAnything: {len(missing)} parameters did not receive "
                 f"weights, e.g. {sorted(missing)[:10]}"

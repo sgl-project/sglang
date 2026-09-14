@@ -778,6 +778,8 @@ class Grok1ForCausalLM(nn.Module):
         ignore_parent_name: bool = False,
         check_hit_names: bool = True,
         model_config: PretrainedConfig | None = None,
+        *,
+        is_full_load: bool = True,
     ) -> dict[str, torch.Tensor]:
         if model_config is None:
             model_config = self.config
@@ -870,7 +872,7 @@ class Grok1ForCausalLM(nn.Module):
 
                     load_weight_wrapper(name=name, loaded_weight=loaded_weight)
 
-        if check_hit_names:
+        if is_full_load and check_hit_names:
             if len(hit_names) > 5:
                 missing = all_names - hit_names
                 missing_exclude_scales = {x for x in missing if "scale" not in x}
