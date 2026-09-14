@@ -408,6 +408,72 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
             )
 
+    def test_static_verify_dispatch_ratio_1(self):
+        """Ratio 1 pools nothing, so a verify block is only more rows: the
+        fused path takes it and writes the same bytes as the unfused chain."""
+        from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            _low_ratio_compression_metadata,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path="dummy",
+                page_size=POOL_PAGE_SIZE,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                speculative_dspark_block_size=5,
+            )
+        )
+        try:
+            t = _build(12, 1, seed=419)
+            t.draft_len = 6
+            t.req.copy_(torch.arange(2, device="cuda").repeat_interleave(6))
+            t.pos.copy_(
+                (
+                    torch.tensor([31, 32], device="cuda")[:, None]
+                    + torch.arange(6, device="cuda")
+                ).flatten()
+            )
+            core = t.backend.forward_metadata.core_metadata
+            t.out_loc, _ = _low_ratio_compression_metadata(
+                1, t.pos + 1, core.raw_out_loc
+            )
+            core.c1_out_loc = t.out_loc
+            angles = torch.randn(64, ROPE_DIM // 2, device="cuda")
+            t.freqs = t.layer.freqs_cis = torch.polar(torch.ones_like(angles), angles)
+            backend = t.backend
+            backend.is_dspark_draft = False
+            backend.speculative_num_draft_tokens = 6
+            backend._low_ratio_compress_fused = types.MethodType(
+                DeepseekV4AttnBackend._low_ratio_compress_fused, backend
+            )
+            backend._low_ratio_compress_torch = Mock()
+            batch = types.SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY, batch_size=2
+            )
+            with (
+                patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.c1.c1_decode_norm_rope_store",
+                    wraps=c1_decode_norm_rope_store,
+                ) as fused,
+            ):
+                DeepseekV4AttnBackend._low_ratio_compress(
+                    backend, t.layer, t.x, t.req, t.pos, batch
+                )
+                fused.assert_called_once()
+            backend._low_ratio_compress_torch.assert_not_called()
+            ref_kv, ref_index = _reference(t, 1)
+            self.assertTrue(torch.equal(t.kv_cache.view(torch.uint8), ref_kv))
+            self.assertTrue(torch.equal(t.index_cache, ref_index))
+        finally:
+            set_global_server_args_for_scheduler(
+                ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

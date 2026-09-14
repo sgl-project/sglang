@@ -1366,6 +1366,74 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    def _forward_prepare_low_ratio_multi_stream(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        """Decode / target-verify prepare of a compress-ratio 1/2 layer: the
+        compressor and indexer (``forward_low_ratio_sources``) run on one side
+        stream, the fused KV-cache write on another, and only the Q chain stays
+        on the current stream. Both side streams are joined before returning;
+        attention is the first reader of anything written on them, and no
+        tensor they read is released before the join."""
+        assert self.alt_streams is not None
+        current_stream = torch.cuda.current_stream()
+        stream_kv = self.alt_streams[0]
+        stream_sources = self.alt_streams[-1]
+        x_linear = x_quant if x_quant is not None else x
+
+        # NOTE: wait for x ready
+        if self.compressor is not None:
+            stream_sources.wait_stream(current_stream)
+        qkv_a: Optional[torch.Tensor] = None
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+
+        if self.compressor is not None:
+            with torch.cuda.stream(stream_sources):
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=None,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_indexer=False,
+                )
+
+        stream_kv.wait_stream(current_stream)
+        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        # NOTE: wait for the q_lora ready
+        if self.indexer is not None:
+            stream_sources.wait_stream(current_stream)
+
+        q = self._compute_q_b(q_lora, positions, q_out)
+        if self.indexer is not None:
+            # Forked above, right after q_lora; recorded here, after the Q chain.
+            with torch.cuda.stream(stream_sources):
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_compressor=False,
+                )
+
+        with torch.cuda.stream(stream_kv):
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
+
+        current_stream.wait_stream(stream_kv)
+        if self.compressor is not None or self.indexer is not None:
+            current_stream.wait_stream(stream_sources)
+        return q
+
     def _forward_prepare_multi_stream_npu(
         self,
         x: torch.Tensor,
@@ -1589,63 +1657,12 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        early_sources = (
-            _is_cuda
-            and get_platform().is_blackwell
-            and self.compress_ratio in (1, 2)
-            and self.alt_streams is not None
-            and (self.compressor is not None or self.indexer is not None)
-            and (
-                forward_batch.forward_mode.is_decode()
-                or (
-                    forward_batch.forward_mode.is_target_verify()
-                    # Other MXFP8 backends may share mutable GEMM workspace.
-                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
-                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-                )
-            )
-        )
-        src_stream = None
-        if early_sources:
-            src_stream = self.alt_streams[-1]
-            x.record_stream(src_stream)
-            if self.compressor is not None:
-                # Compression depends only on x. Start before the Q/KV
-                # projection; keep its cache writes ordered before indexing.
-                src_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(src_stream):
-                    attn_backend.forward_low_ratio_sources(
-                        layer=self,
-                        x=x,
-                        q_lora=None,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        run_indexer=False,
-                    )
-
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
-
-        if early_sources:
-            q_lora = self.q_norm(q_lora)
-            if self.indexer is not None:
-                # The indexer consumes the NORMALIZED Q, not the view returned
-                # by wqkv_a. Join that producer before launching the indexer.
-                src_stream.wait_stream(torch.cuda.current_stream())
-                q_lora.record_stream(src_stream)
-                with torch.cuda.stream(src_stream):
-                    attn_backend.forward_low_ratio_sources(
-                        layer=self,
-                        x=x,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        run_compressor=False,
-                    )
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
@@ -1677,8 +1694,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
-                if not early_sources:
-                    q_lora = self.q_norm(q_lora)
+                q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
 
             kv = (
@@ -1792,8 +1808,7 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            if not early_sources:
-                q_lora = self.q_norm(q_lora)
+            q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -1832,8 +1847,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
 
-        if src_stream is None:
-            del qkv_a
+        del qkv_a
 
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
@@ -1844,11 +1858,6 @@ class MQALayer(MqaAttentionBase):
                 and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
-            elif src_stream is not None:
-                # Joined right below, before this function returns; attention is
-                # the first reader of anything written here.
-                torch.cuda.current_stream().wait_stream(src_stream)
-                del qkv_a
             else:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
@@ -1911,6 +1920,21 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        low_ratio_multi_stream = (
+            _is_cuda
+            and get_platform().is_blackwell
+            and self.compress_ratio in (1, 2)
+            and self.alt_streams is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    # Other MXFP8 backends may share mutable GEMM workspace.
+                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                )
+            )
+        )
         tp_slice, q_padded, q_out = slice(None), None, None
         kernel_num_heads = self._kernel_num_heads(x.shape[0])
         if kernel_num_heads != self.n_local_heads:
@@ -1972,6 +1996,16 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
+            kv = None
+        elif low_ratio_multi_stream:
+            q = self._forward_prepare_low_ratio_multi_stream(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+            )
             kv = None
         else:
             q, kv = self._forward_prepare(

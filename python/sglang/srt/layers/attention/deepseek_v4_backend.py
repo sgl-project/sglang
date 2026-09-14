@@ -2745,7 +2745,8 @@ class DeepseekV4AttnBackend(
             req, pos = hoisted_req, hoisted_pos
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
-            pos = positions.to(torch.int64)
+            # Every consumer takes int32 or int64 positions; keep the caller's.
+            pos = positions
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
@@ -2807,7 +2808,7 @@ class DeepseekV4AttnBackend(
         elif (
             forward_batch.forward_mode.is_target_verify()
             and not self.is_dspark_draft
-            and layer.compress_ratio == 2
+            and layer.compress_ratio in (1, 2)
             and layer.compressor.use_fused_compress
             and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
             and self.speculative_num_draft_tokens is not None
