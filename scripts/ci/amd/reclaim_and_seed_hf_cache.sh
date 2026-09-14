@@ -34,6 +34,17 @@
 # 34446866991, 34448628528 and 34487053976 each spent an 8-GPU MI35x slot
 # discovering that. Seeding from a 1-GPU runner costs a cheap slot, and the
 # consumer job then finds the checkpoint cached.
+#
+# What RECLAIM_DIRS is not safe to derive from: "no test, doc, config or commit
+# in this repository names it". That test passed for
+# amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2, which this job deleted on 2026-09-11
+# and which #39358 documented three days later as the checkpoint InferenceX
+# 8k1k and AgentX had already been serving on MI355X. The reachability join
+# only sees sglang's own registrations, this volume is shared with sibling
+# systems, and AMD stages weights before the docs that name them land. So a
+# repository-wide grep establishes that sglang CI does not need a checkpoint,
+# and nothing more than that. Confirm with the AMD runner owners before
+# deleting anything that is not this repository's own.
 
 set -uo pipefail
 

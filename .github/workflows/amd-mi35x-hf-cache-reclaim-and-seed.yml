@@ -12,23 +12,26 @@ name: AMD MI35x HF cache reclaim and seed
 # and uploads a listing, and deletes nothing. Run it that way first -- the
 # allowlist should come from what is on the volume, not from memory of it.
 #
-# Dispatch-only: reclaiming and seeding is not a per-PR activity, and this takes
-# a scarce MI35x runner for as long as the download lasts.
+# Dispatch-only once this is on the default branch; until then a workflow file
+# that is not on the default branch cannot be dispatched at all, so running it
+# at all means a pull_request trigger. Worth knowing before reaching for the
+# same trick: a `paths` filter does not limit a pull_request trigger to pushes
+# that touch those paths. The filter matches the whole PR diff, so once the PR
+# contains this file every subsequent push re-runs the job, whatever it changed.
+# Runs 34548293873 (audit), 34549258956 and 34549982464 (reclaim and seed) were
+# the useful ones; the rest were pushes to unrelated files. So the trigger goes
+# back off as soon as a run has served its purpose.
 #
-# It ran on pull_request while it was being brought up, because a workflow file
-# that is not yet on the default branch cannot be dispatched at all, and the
-# cache was blocking the very PR that added it. That is worth knowing before
-# reaching for the same trick: a `paths` filter does not limit a pull_request
-# trigger to pushes that touch those paths. The filter matches the whole PR
-# diff, so once the PR contains this file every subsequent push re-runs the job,
-# whatever it changed. Runs 34548293873 (audit), 34549258956 and 34549982464
-# (reclaim and seed) were the useful ones; the rest were pushes to unrelated
-# files.
-#
-# The values below are left as the record of what that seeding did. Reusing this
-# means editing them and dispatching from the branch carrying that edit.
+# Currently on for a read-only pass: RECLAIM_DIRS is empty, so the job reports
+# the volume and verifies the seeded checkpoint without deleting anything.
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "scripts/ci/amd/reclaim_and_seed_hf_cache.sh"
+      - "scripts/ci/amd/seed_hf_checkpoint.py"
+      - ".github/workflows/amd-mi35x-hf-cache-reclaim-and-seed.yml"
   workflow_dispatch:
 
 permissions:
@@ -76,39 +79,29 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      # Run 34548293873 audited the volume: 15 TB, 775 MB free, 50 checkpoints.
-      # amd/GLM-5.2-MXFP4 sits there half-downloaded at 212 GiB of 408 GiB, so
-      # 196 GiB has to be fetched and the partial is worth keeping -- HF resumes
-      # against the blobs already present.
+      # RECLAIM_DIRS is empty on purpose. The seeding this job was written for is
+      # done: run 34548293873 audited the volume (15 TB, 775 MB free, 50
+      # checkpoints, amd/GLM-5.2-MXFP4 half-downloaded at 212 GiB), run
+      # 34549982464 reclaimed 372 GiB and completed the checkpoint at 408 GiB,
+      # and #38813 then ran both its arms against it. What remains useful is the
+      # read-only half: the audit reports the volume, and the seed step revalidates
+      # amd/GLM-5.2-MXFP4 and downloads nothing while it is complete.
       #
-      # The two entries below are what that audit plus the reachability join in
-      # #36114 found dead on the MI35x cache, and they are dead for reasons that
-      # do not depend on the join being complete:
+      # The two directories that reclaim deleted were
+      # amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 (216 GiB) and
+      # deepseek-ai/DeepSeek-V4-Flash-0731 (156 GiB). The second is still dead --
+      # only test_deepseek_v4_flash_fp4_b200.py and its megamoe variant name it,
+      # both register_cuda_ci on 4-gpu-b200. The first was a mistake, and the
+      # script header now carries the rule it broke: passing a repository-wide
+      # grep means sglang CI does not need a checkpoint, not that nobody does.
       #
-      #   amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 (216 GiB) appears nowhere in
-      #     the tree -- no test, no doc, no config, and nothing in git history.
-      #   deepseek-ai/DeepSeek-V4-Flash-0731 (156 GiB) is named only by
-      #     test_deepseek_v4_flash_fp4_b200.py and its megamoe variant, both
-      #     register_cuda_ci on 4-gpu-b200, so no AMD job can want it.
-      #
-      # 372 GiB against 196 GiB needed. The margin is deliberate: the fleet eats
-      # into anything released while the download runs.
-      #
-      # /sgl-data/agentic-traces is 172 MB that nothing in this repo creates or
-      # reads, so something staged it out of band. The GLM-5.2 agentic benchmark
-      # synthesizes its corpus for want of a real one and takes a real one from
-      # SGLANG_AGENTIC_TRACE_PATH, so it is worth knowing what is in there.
-      #
-      # Not on the list, though the join reports them unreferenced:
-      # amd/Qwen3.5-397B-A17B-MXFP4, because the MI35x Qwen3.5 nightly does load
-      # that checkpoint and only reads as unreferenced because it names a local
-      # /data path rather than the repo id; and zai-org/GLM-5.3-Flash, which has
-      # no test but is new enough that someone is plausibly mid-bring-up on it.
+      # AUDIT_DIRS covers /sgl-data/agentic-traces, the staged corpora #38813
+      # replays, so a run also reports whether they are still there.
       - name: Reclaim and seed
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
-            -e RECLAIM_DIRS="models--amd--Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 models--deepseek-ai--DeepSeek-V4-Flash-0731" \
+            -e RECLAIM_DIRS="" \
             -e SEED_MODEL="amd/GLM-5.2-MXFP4" \
             -e SEED_MIN_GIB="408" \
             -e AUDIT_DIRS="/sgl-data/agentic-traces" \
