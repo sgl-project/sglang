@@ -204,6 +204,10 @@ class Router:
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
+        source_label_header: HTTP header whose sanitized value is recorded as a `source`
+            label on `smg_router_requests_total`. Process-global: with several routers
+            in one process the first one configured wins.
+            Example: 'x-request-source'. Default: None
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'sglang.ai/bootstrap-port'
         request_timeout_secs: Request timeout in seconds. Default: 600

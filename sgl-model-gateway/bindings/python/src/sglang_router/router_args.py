@@ -84,6 +84,7 @@ class RouterArgs:
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
     prometheus_duration_buckets: Optional[List[float]] = None
+    source_label_header: Optional[str] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
@@ -493,6 +494,12 @@ class RouterArgs:
             type=float,
             nargs="+",
             help="Buckets for Prometheus duration metrics",
+        )
+        prometheus_group.add_argument(
+            f"--{prefix}source-label-header",
+            type=str,
+            default=None,
+            help="HTTP request header whose sanitized value is recorded as a source label on smg_router_requests_total (e.g. x-request-source); disabled when not set",
         )
 
         # Request handling configuration
