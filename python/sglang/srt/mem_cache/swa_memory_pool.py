@@ -215,7 +215,8 @@ class SWAKVPool(BaseSWAKVPool):
         # The FULL side's dim, as HybridLinearKVPool.get_v_head_dim(): a caller
         # asking a pool for "the" v_head_dim wants the full-attention geometry.
         # `start_layer`, not 0, so pipeline parallelism (start_layer > 0) works,
-        # and because layer 0 need not be a full-attention layer.
+        # and because layer 0 need not be a full-attention layer. Pure SWA draft
+        # models have no full-attention buffers, so use their SWA geometry.
         pool = self.full_kv_pool if self.full_layer_nums else self.swa_kv_pool
         return pool.get_value_buffer(pool.start_layer).shape[-1]
 
@@ -260,11 +261,10 @@ class SWAKVPool(BaseSWAKVPool):
             # swa_loc is the full->SWA translation, computed once per forward by
             # the attention backend. With hybrid allocation disabled, both pools
             # share the same logical locations and no mapping is registered.
-            loc = (
-                swa_loc
-                if swa_loc is not None
-                else self.translate_loc_from_full_to_swa(loc)
-            )
+            if swa_loc is None:
+                assert self.identity_swa_locations
+            else:
+                loc = swa_loc
         if isinstance(pool, MLATokenToKVPool):
             pool.set_kv_buffer(
                 None,

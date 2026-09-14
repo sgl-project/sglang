@@ -384,7 +384,7 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.is_hybrid_swa_compress:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
@@ -1235,18 +1235,9 @@ class KVCacheConfigurator:
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa or self.is_hybrid_swa_compress:
-                full_max_total_num_tokens = sizes.full_max_total_num_tokens
-                swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
-                if not self.is_hybrid_swa:
-                    # --disable-hybrid-swa-memory keeps one shared logical token
-                    # space, but compressed SWA models can still have different
-                    # full/SWA KV geometries. Back both geometries with the same
-                    # token capacity and use identity locations between them.
-                    full_max_total_num_tokens = sizes.max_total_num_tokens
-                    swa_max_total_num_tokens = sizes.max_total_num_tokens
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(

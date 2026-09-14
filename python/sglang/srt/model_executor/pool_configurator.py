@@ -203,7 +203,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
-        self._use_equal_swa_capacity = kvc.is_hybrid_swa_compress
+        self._use_equal_swa_capacity = (
+            get_exec().kernel.attention_backend == "ascend"
+            and kvc.is_hybrid_swa_compress
+        )
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -400,7 +403,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
-        elif kvc.is_hybrid_swa_compress:
+        elif self._use_equal_swa_capacity:
             start_layer = kvc.layer_info.start_layer
             end_layer = kvc.layer_info.end_layer
             full_layers = sum(
@@ -573,16 +576,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if self._cell_size
             else self._zero_kv_max_tokens
         )
-        max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(
-            max_total_num_tokens=max_total_num_tokens,
-            full_max_total_num_tokens=(
-                max_total_num_tokens if self._use_equal_swa_capacity else None
-            ),
-            swa_max_total_num_tokens=(
-                max_total_num_tokens if self._use_equal_swa_capacity else None
-            ),
-        )
+        return self.calculate_pool_sizes_from_max_tokens(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
