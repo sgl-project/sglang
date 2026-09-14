@@ -12,15 +12,12 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 
-# Below this page-table width the single-program copy is already fast.
+# below this width one program per request copies its page table fast enough
 _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
 def _kv_index_blocks(table_width: int, batch_size: int) -> int:
-    """Token blocks per request for the page-table copy: at long context the
-    copy of each request is spread over several programs instead of one
-    program crawling the whole context serially (this build runs every
-    verify / draft-extend step)."""
+    """Token blocks per request for a page-table copy that runs every step."""
     if table_width < _KV_INDEX_BLOCKS_MIN_CONTEXT:
         return 1
     return kv_indices_num_token_blocks(table_width, batch_size)

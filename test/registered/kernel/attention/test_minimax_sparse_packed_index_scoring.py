@@ -1,12 +1,4 @@
-"""Packed per-request index scoring for the MiniMax-M3 sparse decode kernel.
-
-Chain verify and small extends present ``pack`` consecutive query rows per
-request. ``packed_queries`` scores them in one pass as extra q heads against
-the request's longest causal length; the per-row top-k is then bounded by each
-row's own length. The selected blocks must match scoring every row on its own
-whenever the not-yet-visible tail keys cannot win a block max, which this test
-arranges by pointing the tail keys away from every query.
-"""
+"""Packed per-request index scoring must select the same blocks as per-row scoring."""
 
 import unittest
 
@@ -58,8 +50,7 @@ class TestPackedIndexScoring(CustomTestCase):
             max_reqs * max_len, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev
         )
         q = torch.randn(rows, num_q_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
-        # Tail keys (draft slots after the first) point away from every query
-        # row of their request, so they never set a block max.
+        # tail keys point away from every query, so a shorter row cannot see them win a block
         for r, prefix in enumerate(prefixes):
             req_slot = r + 1
             q_req = q[r * pack : (r + 1) * pack].float().reshape(-1, HEAD_DIM)
@@ -98,13 +89,15 @@ class TestPackedIndexScoring(CustomTestCase):
         self.assertEqual(self._topk_sets(ref_idx), self._topk_sets(packed_idx))
 
     def test_max_score_two_requests(self):
+        """A permuted un-pack would hand one row another row's blocks."""
         self._run("max", num_q_heads=1, pack=4, prefixes=[700, 1200])
 
-    def test_max_score_multi_head_odd_prefix(self):
-        # Prefix lengths straddling a block boundary exercise the tail block.
+    def test_max_score_multi_head_at_a_block_boundary(self):
+        """A draft tail crossing a block boundary must keep every row's local block."""
         self._run("max", num_q_heads=2, pack=3, prefixes=[BLOCK_SIZE * 5 - 1, 333])
 
     def test_lse_score(self):
+        """The lse path shares the un-pack and must match per-row scoring as well."""
         self._run("lse", num_q_heads=1, pack=3, prefixes=[500, 900, 1300])
 
 
