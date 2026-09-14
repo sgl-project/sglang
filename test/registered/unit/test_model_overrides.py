@@ -3069,5 +3069,60 @@ class TestDeclarationValidation(CustomTestCase):
             validate_declarations(args, [("src", {"nope": 1})])
 
 
+class TestBeamOverrides(CustomTestCase):
+    def _args(self, **kw):
+        defaults = dict(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+        )
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    def test_beam_defaults_to_trtllm_mha_on_hopper_and_blackwell(self):
+        from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
+
+        hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])
+        cases = {
+            (True, False, False): {"attention_backend": "trtllm_mha"},
+            (False, True, False): {"attention_backend": "trtllm_mha"},
+            (False, False, True): {"attention_backend": "trtllm_mha"},
+            (False, False, False): {},
+        }
+        for (is_sm90, is_sm100, is_sm120), expected in cases.items():
+            with (
+                self.subTest(is_sm90=is_sm90, is_sm100=is_sm100, is_sm120=is_sm120),
+                override_platform(is_sm90=is_sm90),
+                override_platform(is_sm100=is_sm100),
+                override_platform(is_sm120=is_sm120),
+            ):
+                self.assertEqual(_beam_overrides(self._args(), hf_config), expected)
+                # An explicit choice on any of the three fields is kept.
+                for field in (
+                    "attention_backend",
+                    "prefill_attention_backend",
+                    "decode_attention_backend",
+                ):
+                    self.assertEqual(
+                        _beam_overrides(self._args(**{field: "flashinfer"}), hf_config),
+                        {},
+                    )
+
+    def test_beam_family_is_registered(self):
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+            override_platform(is_sm120=False),
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "BeamForCausalLM",
+                    self._args(),
+                    SimpleNamespace(architectures=["BeamForCausalLM"]),
+                ),
+                [("_beam_overrides", {"attention_backend": "trtllm_mha"})],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
