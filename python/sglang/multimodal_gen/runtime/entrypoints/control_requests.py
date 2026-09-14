@@ -48,3 +48,13 @@ class GetDisaggStatsReq(msgspec.Struct):
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
+
+
+class AutoResidencyReq(msgspec.Struct, frozen=True):
+    """Apply or roll back the warmup-calibrated residency promotion.
+
+    Sent by the server warmup orchestrator after the synthetic warmup
+    requests finish and before the server reports ready.
+    """
+
+    action: str = "apply"  # "apply" | "validate" | "rollback"

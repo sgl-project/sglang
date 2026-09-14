@@ -640,6 +640,10 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
     }
+    # The coarse CPU component-offload load changes the packed Ideogram
+    # numerical path even if the module is promoted before the real request.
+    # Layerwise offload uses its own managed storage layout.
+    supports_quantized_component_offload = False
     param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
