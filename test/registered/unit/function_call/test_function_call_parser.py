@@ -2850,6 +2850,19 @@ class TestGptOssDetector(unittest.TestCase):
         )
         self.assertFalse(self.detector.has_tool_call("no tool call here"))
 
+    def test_finish_flushes_incomplete_final(self):
+        """Flush final text held by HarmonyParser when the stream ends."""
+        self.detector.parse_streaming_increment(
+            "<|start|>assistant<|channel|>final The answer",
+            self.tools,
+        )
+
+        result = self.detector.finish(self.tools)
+
+        self.assertEqual(result.normal_text, "The answer")
+        self.assertEqual(result.calls, [])
+        self.assertEqual(self.detector.finish(self.tools).normal_text, "")
+
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 
