@@ -149,6 +149,17 @@ impl RequestPhase {
 /// a future establishes a happens-before edge over everything the future did
 /// while it was still alive (including any `set()` call) — so the read is
 /// already ordered-after every write without needing `Acquire`/`Release`.
+/// The instant the edge middleware first saw the request, handed to handlers as
+/// a request extension.
+///
+/// A handler's own timer starts after axum has run the body extractor, so it
+/// cannot see the request-body read — which, with the chat body cap at 100 MiB,
+/// can dominate everything the handler goes on to measure. Anything comparing
+/// router metrics against an upstream observer's latency needs that span, or the
+/// difference shows up as an unexplained gap. `Copy`, so extracting is free.
+#[derive(Clone, Copy)]
+pub(crate) struct IngressAt(pub(crate) std::time::Instant);
+
 pub(crate) struct RequestPhaseCell(AtomicU8);
 
 impl Default for RequestPhaseCell {
@@ -287,6 +298,7 @@ async fn access_log_and_record(
     // `RequestPhaseCell`'s doc comment.
     let phase = Arc::new(RequestPhaseCell::default());
     req.extensions_mut().insert(Arc::clone(&phase));
+    req.extensions_mut().insert(IngressAt(start));
 
     let mut log_guard = AccessLogFallbackGuard {
         request_id: request_id.clone(),
