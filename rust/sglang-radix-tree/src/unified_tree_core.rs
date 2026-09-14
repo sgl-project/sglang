@@ -2261,7 +2261,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
-            if self.is_write_back {
+            let skip_host_duplicate_reclaim =
+                std::env::var("SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM").is_ok_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes" | "y"
+                    )
+                });
+            if self.is_write_back && !skip_host_duplicate_reclaim {
                 component.reclaim_coexisting_host_values(
                     self,
                     num_tokens,
