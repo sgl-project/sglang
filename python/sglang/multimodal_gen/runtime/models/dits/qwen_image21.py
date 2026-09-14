@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -27,15 +26,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-
-@dataclass
-class QwenImage21Layout:
-    text_indices: torch.Tensor
-    image_indices: torch.Tensor
-    prefix_rope: torch.Tensor
-    target_rope: torch.Tensor
-    segments: tuple[tuple[int, int, bool], ...]
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -80,12 +70,12 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
         dim=-1,
     )
     rope = torch.polar(torch.ones_like(angles), angles)
-    return QwenImage21Layout(
-        torch.tensor(indices, device=device, dtype=torch.long),
-        torch.tensor(image_indices, device=device, dtype=torch.long),
-        rope[:prefix_len],
-        rope[prefix_len:],
-        tuple(segments),
+    return dict(
+        text_indices=torch.tensor(indices, device=device, dtype=torch.long),
+        image_indices=torch.tensor(image_indices, device=device, dtype=torch.long),
+        prefix_rope=rope[:prefix_len],
+        target_rope=rope[prefix_len:],
+        segments=tuple(segments),
     )
 
 
@@ -259,8 +249,16 @@ class QwenImage21TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, hidden_states, modulation, prefix, prefix_modulation, layout, rope, cache
+        self,
+        hidden_states,
+        modulation,
+        prefix_state,
+        prefix_modulation,
+        layout,
+        rope,
+        cache,
     ):
+        prefix = prefix_state.get("hidden_states")
         scale1, gate1, scale2, gate2 = modulation[:, None].chunk(4, dim=-1)
         ps1, pg1, ps2, pg2 = prefix_modulation[:, None].chunk(4, dim=-1)
         p = None if cache else self.img_norm1(prefix) * (1 + ps1)
@@ -268,8 +266,8 @@ class QwenImage21TransformerBlock(nn.Module):
             self.img_norm1(hidden_states) * (1 + scale1),
             rope,
             p,
-            layout.prefix_rope,
-            layout.segments,
+            layout["prefix_rope"],
+            layout["segments"],
             cache,
         )
         hidden_states = hidden_states + gate1.tanh() * attention
@@ -281,7 +279,8 @@ class QwenImage21TransformerBlock(nn.Module):
             prefix = prefix + pg2.tanh() * self.img_mlp(
                 self.img_norm2(prefix) * (1 + ps2)
             )
-        return hidden_states, prefix
+        prefix_state["hidden_states"] = prefix
+        return hidden_states
 
 
 class QwenImage21OutputNorm(nn.Module):
@@ -375,20 +374,21 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
             if not caches[0]:
                 prefix = self.txt_in(
                     encoder_hidden_states[sample : sample + 1]
-                ).index_select(1, layout.text_indices)
+                ).index_select(1, layout["text_indices"])
                 if condition_latents is not None:
-                    prefix[:, layout.image_indices] = self.img_in(
+                    prefix[:, layout["image_indices"]] = self.img_in(
                         condition_latents[sample : sample + 1]
                     )
+            prefix_state = {"hidden_states": prefix}
             x = images[sample : sample + 1]
             for i, block in enumerate(self.transformer_blocks):
-                x, prefix = block(
+                x = block(
                     x,
                     modulation[sample : sample + 1],
-                    prefix,
+                    prefix_state,
                     prefix_modulation,
                     layout,
-                    layout.target_rope[start:end],
+                    layout["target_rope"][start:end],
                     caches[i],
                 )
             outputs.append(self.proj_out(self.norm_out(x, temb[sample : sample + 1])))

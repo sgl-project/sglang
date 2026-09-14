@@ -5,6 +5,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21DenoisingStage,
     QwenImage21EncodingStage,
     QwenImage21InputValidationStage,
     prepare_qwen21_mu,
@@ -37,7 +38,14 @@ class QwenImage21Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=[prepare_qwen21_mu]
         )
-        self.add_standard_denoising_stage()
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: QwenImage21DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+            "denoising_stage",
+        )
         self.add_standard_decoding_stage()
 
 

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     calculate_linear_shift,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -203,3 +204,29 @@ class QwenImage21EncodingStage(PipelineStage):
 
 def prepare_qwen21_mu(batch, server_args):
     return "mu", batch.extra["qwen21_mu"]
+
+
+class QwenImage21DenoisingStage(DenoisingStage):
+    def _predict_noise(
+        self,
+        current_model,
+        latent_model_input,
+        timestep,
+        target_dtype,
+        guidance,
+        **kwargs,
+    ):
+        caches = kwargs["prefix_caches"]
+        if caches is not None and not caches[0][0]:
+            # prefill is request-specific; graph replay must only see populated cache tensors
+            return current_model(
+                hidden_states=latent_model_input, timestep=timestep, **kwargs
+            )
+        return super()._predict_noise(
+            current_model,
+            latent_model_input,
+            timestep,
+            target_dtype,
+            guidance,
+            **kwargs,
+        )
