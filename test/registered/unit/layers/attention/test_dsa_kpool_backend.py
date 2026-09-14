@@ -151,3 +151,7 @@ def test_hip_write_plan_updates_request_metadata(mode):
     assert kwargs["pool_seqlens_per_q_out"] is plan.pool_seqlens_per_q
     if mode == "draft_extend_v2":
         torch.testing.assert_close(plan.effective_n_per_batch, accepted)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

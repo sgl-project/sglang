@@ -1,6 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
@@ -51,3 +53,7 @@ def test_rocm_fp8_prefix_reads_hybrid_full_attention_page_table():
     assert pool.get_mla_kv_buffer.call_args.args[2] == torch.bfloat16
     torch.testing.assert_close(actual_kv_a, kv_a.squeeze(1))
     assert actual_k_pe is k_pe
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
