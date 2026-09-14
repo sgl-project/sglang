@@ -514,14 +514,22 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Optional[PositionEmbeddings] = None,
     ) -> PositionEmbeddings:
-        if position_embeddings is not None:
-            return position_embeddings
-        # Temporal positions use `rotary_emb`; height and width use `rotary_emb_hw`.
-        return (
-            self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
-        )
+        # Positions are fixed for the whole forward, so a table stays reusable
+        # for as long as the activation dtype does. All three axes share one
+        # dtype, and it follows the activation the table is built from: this
+        # attention is fed the normalized activation, which an fp32 RMSNorm
+        # weight promotes back to fp32 when the model input is bf16.
+        if (
+            position_embeddings is None
+            or position_embeddings[0][0].dtype != hidden_states.dtype
+        ):
+            # Temporal positions use `rotary_emb`; height and width use `rotary_emb_hw`.
+            position_embeddings = (
+                self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
+                self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
+                self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+            )
+        return position_embeddings
 
     def forward_und(
         self,
@@ -1415,9 +1423,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # The tables depend only on the positions, plus the activation dtype and
-        # device that `Qwen3RotaryEmbedding.forward` reads off `x`. All three are
-        # fixed for the whole forward, so one build serves every layer.
+        # Positions are all the tables depend on, so one build covers the whole
+        # forward. `_resolve_rope_tables` rechecks the activation dtype against
+        # each layer and rebuilds if it moved.
         layers = self.layers[: self.config.num_hidden_layers]
         position_embeddings = None
         if layers:

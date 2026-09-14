@@ -960,22 +960,11 @@ def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(image_gen):
     assert len(builds) == 3, f"expected one t/h/w build, got {len(builds)}"
 
 
-def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
-    """The end-to-end claim: sharing must not move the output by one bit.
-
-    Ran with sharing and with sharing bypassed (each layer rebuilding its own
-    tables, as before the change) on identical inputs.
-    """
+def _run_shared_and_per_layer(monkeypatch, model, embeds, indicators, indexes):
+    """Forward twice: once sharing the model's tables, once with every layer rebuilding."""
     from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
         Qwen3Attention,
-        Qwen3Model,
     )
-
-    torch.manual_seed(0)
-    model = Qwen3Model(_tiny_dense_config()).eval()
-    embeds = torch.randn(1, 5, _HIDDEN_DIM)
-    indicators = torch.ones(1, 5, dtype=torch.bool)
-    indexes = torch.zeros(3, 5, dtype=torch.long)
 
     def run():
         with torch.no_grad():
@@ -987,7 +976,6 @@ def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
             ).last_hidden_state
 
     shared = run()
-
     original = Qwen3Attention._resolve_rope_tables
     monkeypatch.setattr(
         Qwen3Attention,
@@ -996,6 +984,52 @@ def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
             self, indexes, hidden_states, None
         ),
     )
-    per_layer = run()
+    return shared, run()
+
+
+def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
+    """The end-to-end claim: sharing must not move the output by one bit.
+
+    Ran with sharing and with sharing bypassed (each layer rebuilding its own
+    tables, as before the change) on identical inputs.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+    )
+
+    torch.manual_seed(0)
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    embeds = torch.randn(1, 5, _HIDDEN_DIM)
+    indicators = torch.ones(1, 5, dtype=torch.bool)
+    indexes = torch.zeros(3, 5, dtype=torch.long)
+
+    shared, per_layer = _run_shared_and_per_layer(
+        monkeypatch, model, embeds, indicators, indexes
+    )
+
+    assert torch.equal(shared, per_layer)
+
+
+def test_sensenova_u1_rope_sharing_holds_when_a_norm_promotes_dtype(monkeypatch):
+    """Tables are only reusable while the activation dtype is unchanged.
+
+    An attention is fed the normalized activation, not the model input, and an
+    fp32 RMSNorm weight promotes a bf16 activation back to fp32 -- what autocast
+    with fp32 weights does. Tables built from the model input are then the wrong
+    dtype, and reusing them would move the output.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+    )
+
+    torch.manual_seed(0)
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    embeds = torch.randn(1, 5, _HIDDEN_DIM, dtype=torch.bfloat16)
+    indicators = torch.ones(1, 5, dtype=torch.bool)
+    indexes = torch.zeros(3, 5, dtype=torch.long)
+
+    shared, per_layer = _run_shared_and_per_layer(
+        monkeypatch, model, embeds, indicators, indexes
+    )
 
     assert torch.equal(shared, per_layer)
