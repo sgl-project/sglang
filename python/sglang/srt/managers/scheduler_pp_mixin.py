@@ -31,7 +31,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode
 from sglang.srt.utils.common import is_npu, is_xpu
 
 _is_npu = is_npu()
@@ -737,12 +737,9 @@ class SchedulerPPMixin:
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
-            p2p_work = point_to_point_pyobj(
-                data,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+            p2p_work = self.zmq_p2p_channel.send_to(
                 ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
+                data,
                 async_send=async_send,
             )
         return p2p_work
@@ -752,12 +749,8 @@ class SchedulerPPMixin:
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
-            data = point_to_point_pyobj(
-                [],
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
-                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+            data = self.zmq_p2p_channel.recv_from(
+                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset
             )
         else:
             data = None

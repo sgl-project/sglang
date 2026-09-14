@@ -148,21 +148,13 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
-        calls = []
-
-        def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
-            calls.append((rank, src, dst))
-            return ["req"]
-
         receiver = _make_receiver(ps)
-        with patch(
-            "sglang.srt.managers.scheduler_components.request_receiver."
-            "point_to_point_pyobj",
-            side_effect=fake_point_to_point_pyobj,
-        ):
-            self.assertEqual(receiver._pull_raw_reqs(), ["req"])
+        receiver.world_group.zmq_p2p = MagicMock()
+        receiver.world_group.zmq_p2p.recv_from.return_value = ["req"]
 
-        self.assertEqual(calls, [(12, 4, 12)])
+        self.assertEqual(receiver._pull_raw_reqs(), ["req"])
+
+        receiver.world_group.zmq_p2p.recv_from.assert_called_once_with(4)
 
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
         ps = _make_ps()
@@ -173,21 +165,13 @@ class TestPPCPRankOffsets(unittest.TestCase):
         scheduler.attn_tp_cpu_group = _fake_group()
         scheduler.attn_cp_group = _fake_group()
         scheduler.attn_cp_cpu_group = _fake_group()
-        calls = []
+        scheduler.zmq_p2p_channel = MagicMock()
+        scheduler.zmq_p2p_channel.send_to.return_value = ["work"]
+        scheduler.zmq_p2p_channel.recv_from.return_value = ["work"]
 
-        def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
-            calls.append((rank, src, dst, kwargs.get("async_send", False)))
-            return ["work"]
-
-        with (
-            patch(
-                "sglang.srt.managers.scheduler_pp_mixin.point_to_point_pyobj",
-                side_effect=fake_point_to_point_pyobj,
-            ),
-            patch(
-                "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
-                side_effect=lambda data: data,
-            ),
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
+            side_effect=lambda data: data,
         ):
             self.assertEqual(
                 scheduler._pp_send_pyobj_to_next_stage(["data"], async_send=True),
@@ -195,13 +179,10 @@ class TestPPCPRankOffsets(unittest.TestCase):
             )
             self.assertEqual(scheduler._pp_recv_pyobj_from_prev_stage(), ["work"])
 
-        self.assertEqual(
-            calls,
-            [
-                (12, 12, 4, True),
-                (12, 4, 12, False),
-            ],
+        scheduler.zmq_p2p_channel.send_to.assert_called_once_with(
+            4, ["data"], async_send=True
         )
+        scheduler.zmq_p2p_channel.recv_from.assert_called_once_with(4)
 
 
 if __name__ == "__main__":

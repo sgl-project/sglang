@@ -43,6 +43,10 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.zmq_p2p import (
+    ZmqP2PChannel,
+    ZmqP2PWork,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -547,6 +551,10 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+
+        # Optional deadline-free p2p transport for send_object/recv_object,
+        # installed by the scheduler on the groups it serves (e.g. pp_group).
+        self.zmq_p2p: Optional[ZmqP2PChannel] = None
 
     def __repr__(self):
         return (
@@ -1560,7 +1568,7 @@ class GroupCoordinator:
         dst: int,
         async_send: bool = False,
         tag: int = 0,
-    ) -> List[P2PWork]:
+    ) -> List[Union[P2PWork, ZmqP2PWork]]:
         """
         Send the input object list to the destination rank.
         This function uses the CPU group for all communications.
@@ -1576,6 +1584,15 @@ class GroupCoordinator:
             "Invalid destination rank. Destination rank is the same "
             "as the current rank."
         )
+
+        # Deadline-free transport when the scheduler installed one on this
+        # group (e.g. pp_group); the gloo path below carries a
+        # CLOCK_MONOTONIC deadline a suspended peer can sleep past.
+        if self.zmq_p2p is not None:
+            return self.zmq_p2p.send_to(
+                self.ranks[dst], obj, tag=tag, async_send=async_send
+            )
+
         send_func = torch.distributed.isend if async_send else torch.distributed.send
 
         # Serialize object to tensor and get the size as well
@@ -1618,6 +1635,9 @@ class GroupCoordinator:
         assert src != self.rank_in_group, (
             "Invalid source rank. Source rank is the same as the current rank."
         )
+
+        if self.zmq_p2p is not None:
+            return self.zmq_p2p.recv_from(self.ranks[src], tag=tag)
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 

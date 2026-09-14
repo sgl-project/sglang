@@ -38,9 +38,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
-from sglang.srt.utils import (
-    point_to_point_pyobj,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -154,12 +151,8 @@ class SchedulerRequestReceiver:
                 dp_offset = (
                     self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
                 )
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                recv_reqs = self.world_group.zmq_p2p.recv_from(
+                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset
                 )
             else:
                 recv_reqs = None

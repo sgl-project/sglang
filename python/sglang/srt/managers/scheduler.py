@@ -97,6 +97,7 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.device_communicators.zmq_p2p import ZmqP2PChannel
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -1198,6 +1199,18 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        # Deadline-free p2p channel for the pipeline-stage edge (request
+        # relay, grammar/HiRadix sync, send_object/recv_object metadata):
+        # the gloo p2p path carries a CLOCK_MONOTONIC deadline a suspended
+        # rank can sleep past. Endpoint exchange is an init-time allgather.
+        self.zmq_p2p_channel = None
+        if self.ps.pp_size > 1:
+            self.zmq_p2p_channel = ZmqP2PChannel.create(
+                self.world_group.cpu_group, self.world_group.rank_in_group
+            )
+            self.pp_group.zmq_p2p = self.zmq_p2p_channel
+            self.world_group.zmq_p2p = self.zmq_p2p_channel
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
