@@ -169,7 +169,7 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, query_output_dtype=None):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
@@ -180,7 +180,12 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
-        q, k = self.rotary_emb(positions, q, k)
+        if query_output_dtype is None:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            q, k = self.rotary_emb(
+                positions, q, k, query_output_dtype=query_output_dtype
+            )
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -287,9 +292,17 @@ class Qwen3Attention(nn.Module):
             )
             save_kv_cache = False
         elif not _is_npu:
+            query_output_dtype = (
+                self.attn.get_query_quantization_dtype(forward_batch.forward_mode)
+                if forward_batch.forward_mode.is_decode()
+                and get_exec().deterministic.rl_on_policy_target is None
+                and getattr(self.rotary_emb, "supports_query_output_dtype", False)
+                else None
+            )
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                query_output_dtype=query_output_dtype,
             )
         else:
             q, k, v = self.forward_prepare_npu(
