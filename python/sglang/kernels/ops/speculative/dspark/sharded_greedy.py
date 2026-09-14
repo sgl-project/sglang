@@ -49,6 +49,9 @@ def _finish(
     offset = ((rank * BS + row) * PARTS + part) * 2
     value = tl.load(P + offset, valid, -float("inf"))
     idx = tl.load(P + offset + 1, valid, 0).to(tl.int32, bitcast=True)
+    # The NVLink push transport changes +0 to -0 as its Lamport sentinel.
+    # Indices are nonnegative int32 bits, so strip that sign bit to recover ID 0.
+    idx &= 2147483647
     valid &= idx != 2147483647
     nan = valid & (value != value)
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
@@ -58,7 +61,7 @@ def _finish(
     tl.store(OUT + row, result.to(tl.int64))
 
 
-def sharded_greedy_step(bias, base_local, *, group, vocab_start):
+def sharded_greedy_step(bias, base_local, *, group, vocab_start, gather=None):
     """Match argmax of rank-ordered BuildStepLocal/all_gather, excluding padding.
 
     ``bias`` is the original GEMM's already-rounded result. Communication carries
@@ -88,7 +91,10 @@ def sharded_greedy_step(bias, base_local, *, group, vocab_start):
     )
     # The padded partition width fixes the transport shape on all ranks;
     # WIDTH masks real entries, including a completely empty final shard.
-    gathered = group.all_gather(partial, dim=0) if group.world_size > 1 else partial
+    if gather is not None:
+        gathered = gather(partial.view(rows, parts * 2))
+    else:
+        gathered = group.all_gather(partial, dim=0) if group.world_size > 1 else partial
     result = torch.empty(rows, device=bias.device, dtype=torch.int64)
     _finish[(rows,)](
         gathered,

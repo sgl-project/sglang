@@ -129,3 +129,75 @@ def hc_combine_norm_mxfp8(
         num_warps=8,
     )
     return y, q, s
+
+
+@triton.jit
+def _rmsnorm_mxfp8_kernel(
+    X,
+    W,
+    Y,
+    Q,
+    S,
+    SX: tl.constexpr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PARTS: tl.constexpr,
+    GROUPS: tl.constexpr,
+    SLICE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid < M * PARTS:
+        row, part = pid // PARTS, pid % PARTS
+        h = tl.arange(0, BLOCK)
+        v = tl.load(X + row * SX + h, h < K, 0).to(tl.float32)
+        weight = tl.load(W + h, h < K, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(v * v, 0) / K + EPS)
+        y = (v * inv * weight).to(tl.bfloat16)
+        tl.store(
+            Y + row * K + h, y, (h < K) & (h >= part * SLICE) & (h < (part + 1) * SLICE)
+        )
+        _mxfp8_epilogue(
+            y,
+            row,
+            Q,
+            S,
+            K,
+            BLOCK,
+            GROUPS,
+            part * (SLICE // 32),
+            (part + 1) * (SLICE // 32),
+        )
+    else:
+        # Padding scale entries are disjoint from the live rows above.
+        off = (pid - M * PARTS) * 512 + tl.arange(0, 512)
+        pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
+        tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
+
+
+def rmsnorm_mxfp8(x, weight, eps, *, parts=1, num_warps=8):
+    m, k = x.shape
+    assert 0 < m <= 8 and k % (parts * 32) == 0
+    assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
+    y = torch.empty_like(x, memory_format=torch.contiguous_format)
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((k // 32) * 128, dtype=torch.uint8, device=x.device)
+    _rmsnorm_mxfp8_kernel[(m * parts + triton.cdiv(s.numel(), 512),)](
+        x,
+        weight,
+        y,
+        q,
+        s,
+        SX=x.stride(0),
+        M=m,
+        K=k,
+        EPS=eps,
+        BLOCK=triton.next_power_of_2(k),
+        PARTS=parts,
+        GROUPS=k // 32,
+        SLICE=k // parts,
+        num_warps=num_warps,
+        enable_fp_fusion=False,
+    )
+    return y, q, s

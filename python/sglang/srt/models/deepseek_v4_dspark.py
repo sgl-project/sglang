@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -440,6 +441,14 @@ class DSparkV4MarkovHead(nn.Module):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._vocab_gather = make_vocab_gather(
+            shard_group,
+            local_width=per_partition,
+            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        )
+        if shard_group.rank == 0:
+            cls_name = type(self._vocab_gather).__name__
+            logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -491,11 +500,7 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
-            assert self._shard_group is not None
-            full = self._shard_group.all_gather(step_local, dim=-1)
-        else:
-            full = step_local
+        full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
     @property
@@ -522,6 +527,7 @@ class DSparkV4MarkovHead(nn.Module):
                 base_logits[:, step],
                 group=self._shard_group,
                 vocab_start=shard.org_vocab_start,
+                gather=self._vocab_gather.gather_stacked,
             )
             tokens.append(prev)
         return torch.stack(tokens, dim=1)
@@ -724,32 +730,34 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        x = self._run_ffn(x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)

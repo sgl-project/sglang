@@ -1228,16 +1228,54 @@ class MQALayer(MqaAttentionBase):
         self._accepts_mxfp8_swizzled_input = ok
         return ok
 
+    def _normalize_q_lora(
+        self, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+        # Keep the BF16 normalized row for the indexer while emitting the
+        # quantized input consumed by wq_b in the same launch.
+        method = self.wq_b.quant_method
+        if (
+            _is_cuda
+            and self.is_dsv41
+            and get_platform().is_blackwell
+            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
+            and q.ndim == 2
+            and 0 < q.shape[0] <= 8
+            and q.shape[1] == 1280
+            and q.stride(1) == 1
+            and getattr(method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(method, "use_mxfp8", False)
+                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+            )
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            if not (
+                is_batch_invariant_mode_enabled()
+                or get_exec().deterministic.enable_deterministic_inference
+            ):
+                from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+
+                y, quant, scale = rmsnorm_mxfp8(
+                    q, self.q_norm.weight, self.q_norm.variance_epsilon
+                )
+                return y, Mxfp8SwizzledInput(quant, scale)
+        q = self.q_norm(q)
+        return q, q
+
     def _compute_q_a(
         self,
         x: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        return self.q_norm(q)
+        return self._normalize_q_lora(q)
 
     def _compute_q_b(
         self,
@@ -1374,7 +1412,7 @@ class MQALayer(MqaAttentionBase):
             qkv_a, _ = self.wqkv_a(x_linear)
             qkv_a_ready = current_stream.record_event()
 
-        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
@@ -1402,12 +1440,80 @@ class MQALayer(MqaAttentionBase):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
         del qkv_a
 
+        return q
+
+    def _forward_prepare_low_ratio_multi_stream(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        """Decode / target-verify prepare of a compress-ratio 1/2 layer: the
+        compressor and indexer (``forward_low_ratio_sources``) run on one side
+        stream, the fused KV-cache write on another, and only the Q chain stays
+        on the current stream. Both side streams are joined before returning;
+        attention is the first reader of anything written on them, and no
+        tensor they read is released before the join."""
+        assert self.alt_streams is not None
+        current_stream = torch.cuda.current_stream()
+        stream_kv = self.alt_streams[0]
+        stream_sources = self.alt_streams[-1]
+        x_linear = x_quant if x_quant is not None else x
+
+        # NOTE: wait for x ready
+        if self.compressor is not None:
+            stream_sources.wait_stream(current_stream)
+        qkv_a: Optional[torch.Tensor] = None
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+
+        if self.compressor is not None:
+            with torch.cuda.stream(stream_sources):
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=None,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_indexer=False,
+                )
+
+        stream_kv.wait_stream(current_stream)
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        # NOTE: wait for the q_lora ready
+        if self.indexer is not None:
+            stream_sources.wait_stream(current_stream)
+
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        if self.indexer is not None:
+            # Forked above, right after q_lora; recorded here, after the Q chain.
+            with torch.cuda.stream(stream_sources):
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_compressor=False,
+                )
+
+        with torch.cuda.stream(stream_kv):
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
+
+        current_stream.wait_stream(stream_kv)
+        if self.compressor is not None or self.indexer is not None:
+            current_stream.wait_stream(stream_sources)
         return q
 
     def _forward_prepare_multi_stream_npu(
@@ -1633,63 +1739,12 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        early_sources = (
-            _is_cuda
-            and get_platform().is_blackwell
-            and self.compress_ratio in (1, 2)
-            and self.alt_streams is not None
-            and (self.compressor is not None or self.indexer is not None)
-            and (
-                forward_batch.forward_mode.is_decode()
-                or (
-                    forward_batch.forward_mode.is_target_verify()
-                    # Other MXFP8 backends may share mutable GEMM workspace.
-                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
-                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-                )
-            )
-        )
-        src_stream = None
-        if early_sources:
-            src_stream = self.alt_streams[-1]
-            x.record_stream(src_stream)
-            if self.compressor is not None:
-                # Compression depends only on x. Start before the Q/KV
-                # projection; keep its cache writes ordered before indexing.
-                src_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(src_stream):
-                    attn_backend.forward_low_ratio_sources(
-                        layer=self,
-                        x=x,
-                        q_lora=None,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        run_indexer=False,
-                    )
-
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
-
-        if early_sources:
-            q_lora = self.q_norm(q_lora)
-            if self.indexer is not None:
-                # The indexer consumes the NORMALIZED Q, not the view returned
-                # by wqkv_a. Join that producer before launching the indexer.
-                src_stream.wait_stream(torch.cuda.current_stream())
-                q_lora.record_stream(src_stream)
-                with torch.cuda.stream(src_stream):
-                    attn_backend.forward_low_ratio_sources(
-                        layer=self,
-                        x=x,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        run_compressor=False,
-                    )
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
@@ -1721,9 +1776,8 @@ class MQALayer(MqaAttentionBase):
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
-                if not early_sources:
-                    q_lora = self.q_norm(q_lora)
-                q, _ = self.wq_b(q_lora)
+                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                q, _ = self.wq_b(q_for_wqb)
 
             kv = (
                 qkv_a[..., self.q_lora_rank :]
@@ -1836,9 +1890,8 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            if not early_sources:
-                q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1876,8 +1929,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
 
-        if src_stream is None:
-            del qkv_a
+        del qkv_a
 
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
@@ -1888,11 +1940,6 @@ class MQALayer(MqaAttentionBase):
                 and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
-            elif src_stream is not None:
-                # Joined right below, before this function returns; attention is
-                # the first reader of anything written here.
-                torch.cuda.current_stream().wait_stream(src_stream)
-                del qkv_a
             else:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
@@ -1955,6 +2002,21 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        low_ratio_multi_stream = (
+            _is_cuda
+            and get_platform().is_blackwell
+            and self.compress_ratio in (1, 2)
+            and self.alt_streams is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    # Other MXFP8 backends may share mutable GEMM workspace.
+                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                )
+            )
+        )
         tp_slice, q_padded, q_out = slice(None), None, None
         kernel_num_heads = self._kernel_num_heads(x.shape[0])
         if kernel_num_heads != self.n_local_heads:
@@ -2017,6 +2079,16 @@ class MQALayer(MqaAttentionBase):
                     x_quant=x_quant,
                 )
             kv = None
+        elif low_ratio_multi_stream:
+            q = self._forward_prepare_low_ratio_multi_stream(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+            )
+            kv = None
         else:
             q, kv = self._forward_prepare(
                 x,
@@ -2039,6 +2111,23 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        fuse_attention_inverse_rope = (
+            self.is_dsv41
+            and 0 < x.shape[0] <= 8
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and getattr(attn_backend, "small_paged_attention_enabled", False)
+            and not getattr(attn_backend, "trtllm_attn", True)
+            and not is_unified_kv_triton()
+            and not (self.wo_a_fp8 and _wo_a_fp8_mxscale_fused_invrope is not None)
+        )
+        attention_kwargs = (
+            {"inverse_rope": (self.freqs_cis, positions)}
+            if fuse_attention_inverse_rope
+            else {}
+        )
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -2076,6 +2165,7 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
+                    **attention_kwargs,
                 )
             o = o[:, tp_slice, :]
         if (
@@ -2110,7 +2200,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            else:
+            elif not fuse_attention_inverse_rope:
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,
@@ -2222,6 +2312,7 @@ class MQALayer(MqaAttentionBase):
                 all_reduce_mhc_norm,
             )
 
+            mhc.materialize_stats()
             if mhc.stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(mhc.stats_stream)
             o, mhc.output, mhc.normalized = all_reduce_mhc_norm(
@@ -2861,35 +2952,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
-    def _hc_mix_and_combine(
+    def _hc_combine(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
         apply_pre: Optional[torch.Tensor],
         norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
         quantized: Optional[list] = None,
         normalized: Optional[torch.Tensor] = None,
         precomputed: Optional[tuple] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mixing coefficients come from x; the sublayer input is x collapsed with
-        apply_pre (None selects copy 0), then RMS-normalized.
-        Returns (y, pre, post, comb).
+    ) -> torch.Tensor:
+        """Collapse and normalize on the main stream, then fork tiny-row stats.
 
-        ``quantized`` (a list) opts into the fused MXFP8 epilogue: the collapsed,
-        normalized row is also emitted as a ``Mxfp8SwizzledInput`` appended to it,
-        so the consuming projection skips its own quantization launch."""
+        Preserve the fused quantization and cross-layer precomputed inputs.
+        Record the stats themselves immediately before their consuming join.
+        """
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
         quantize = quantized is not None
-        from sglang.kernels.ops.layernorm.mhc import (
-            hc_combine,
-            hc_mix_stats,
-            hc_mix_stats_sinkhorn,
-        )
-
-        dtype = x.dtype
         x_flat = x.flatten(1)
+        tiny = 0 < x.shape[0] <= 8
+        if stats_stream is not None and not tiny:
+            stats_stream.wait_stream(torch.cuda.current_stream())
 
         def combine_and_norm():
             if precomputed is not None:
@@ -2939,7 +3023,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                 return hc_combine_norm(
                     x_flat, apply_pre, norm.weight, norm.variance_epsilon
                 )
-            return norm(hc_combine(x_flat, apply_pre, self.hc_mult, dtype))
+            return norm(hc_combine(x_flat, apply_pre, self.hc_mult, x.dtype))
+
+        y = combine_and_norm()
+        if stats_stream is not None and tiny:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        return y
+
+    def _hc_mix_stats(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        stats_stream: Optional[torch.cuda.Stream] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Record coefficient work just before its join, preserving compensation."""
+        from sglang.kernels.ops.layernorm.mhc import hc_mix_stats, hc_mix_stats_sinkhorn
+
+        x_flat = x.flatten(1)
 
         if (
             x.is_cuda
@@ -2953,15 +3055,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The split-K partial fixes the reduction order;
             # fusing the reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
-            # Avoid competing with the statistics projection for a tiny input;
-            # the coefficients still overlap the attention or FFN that follows.
-            y = (
-                combine_and_norm()
-                if stats_stream is not None and 0 < x.shape[0] <= 8
-                else None
-            )
             if stats_stream is not None:
-                stats_stream.wait_stream(main_stream)
                 x.record_stream(stats_stream)
             with (
                 torch.cuda.stream(stats_stream)
@@ -3030,9 +3124,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # after the caller joins it, on the main stream.
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
-            if y is None:
-                y = combine_and_norm()
-            return y, pre, post, comb
+            return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch reductions can
             # change order with num_tokens. Kernel upcasts let x_flat remain a bf16 view.
@@ -3051,8 +3143,30 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = combine_and_norm()
-        return y, pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
+        return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
+
+    def _hc_mix_and_combine(
+        self,
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        apply_pre,
+        norm,
+        stats_stream=None,
+        quantized=None,
+        normalized=None,
+        precomputed=None,
+    ):
+        y = DeepseekV4DecoderLayer._hc_combine(
+            self, x, apply_pre, norm, stats_stream, quantized, normalized, precomputed
+        )
+        return (
+            y,
+            *DeepseekV4DecoderLayer._hc_mix_stats(
+                self, x, hc_fn, hc_scale, hc_base, stats_stream
+            ),
+        )
 
     def _get_hc_stats_stream(self, hidden_states, forward_batch):
         # Verify batches can also compute coefficients beside the
@@ -3084,16 +3198,23 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
+        from functools import partial
+
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
         attn_quantized: Optional[list] = (
             [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
         )
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+        attn_stats = partial(
+            self._hc_mix_stats,
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            stats_stream,
+        )
+        x = self._hc_combine(
+            hidden_states,
             apply_pre=prev_pre,
             norm=self.input_layernorm,
             stats_stream=stats_stream,
@@ -3109,10 +3230,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and x.shape[1] == 5120
             and self.hc_mult == 4
             and x.dtype == residual.dtype == torch.bfloat16
-            and attn_pre.dtype == attn_post.dtype == attn_comb.dtype == torch.float32
-            and all(
-                t.is_contiguous() for t in (residual, attn_pre, attn_post, attn_comb)
-            )
+            and residual.is_contiguous()
             and get_parallel().attn_dp_size == 1
             and get_parallel().tp_size == self.self_attn.attn_tp_size == 4
             and self.self_attn.wo_b.reduce_results
@@ -3137,10 +3255,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             ):
                 attn_mhc = MhcPostFusion(
                     residual,
-                    attn_post,
-                    attn_comb,
+                    None,
+                    None,
                     stats_stream,
-                    pre=attn_pre,
+                    record_stats=attn_stats,
                     norm_weight=self.post_attention_layernorm.weight,
                     norm_eps=self.post_attention_layernorm.variance_epsilon,
                 )
@@ -3155,18 +3273,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant=attn_quantized[0] if attn_quantized else None,
             )
         if attn_mhc is not None:
+            attn_mhc.materialize_stats()
+            attn_pre = attn_mhc.pre
             hidden_states = attn_mhc.output
         else:
+            attn_pre, attn_post, attn_comb = attn_stats()
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
             hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+        ffn_stats = partial(
+            self._hc_mix_stats,
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            stats_stream,
+        )
+        x = self._hc_combine(
+            hidden_states,
             apply_pre=attn_pre,
             norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
@@ -3181,8 +3307,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and x.shape[1] == 5120
             and self.hc_mult == 4
             and x.dtype == residual.dtype == torch.bfloat16
-            and ffn_post.dtype == ffn_comb.dtype == torch.float32
-            and all(t.is_contiguous() for t in (residual, ffn_post, ffn_comb))
+            and residual.is_contiguous()
             and get_parallel().attn_dp_size == 1
             and get_moe_a2a_backend().is_none()
             and not self.dsa_enable_prefill_cp
@@ -3194,13 +3319,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 use_mhc_post_fusion,
             )
 
-            mhc = MhcPostFusion(residual, ffn_post, ffn_comb, stats_stream)
-            if (
-                next_norm is not None
-                and ffn_pre.dtype == torch.float32
-                and ffn_pre.is_contiguous()
-            ):
-                mhc.pre = ffn_pre
+            mhc = MhcPostFusion(
+                residual, None, None, stats_stream, record_stats=ffn_stats
+            )
+            if next_norm is not None:
                 mhc.norm_weight = next_norm.weight
                 mhc.norm_eps = next_norm.variance_epsilon
             context = use_mhc_post_fusion(mhc)
@@ -3210,6 +3332,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self._run_moe_ffn_dp_sync(
                 x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
             )
+        if mhc is not None:
+            mhc.materialize_stats()
+            ffn_pre, ffn_post, ffn_comb = mhc.pre, mhc.post, mhc.comb
+        else:
+            ffn_pre, ffn_post, ffn_comb = ffn_stats()
         if mhc is not None and mhc.output is not None:
             hidden_states = mhc.output
             if next_input is not None and mhc.quantized is not None:

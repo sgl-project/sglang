@@ -1001,15 +1001,6 @@ class DeepseekV2MoE(nn.Module):
         # quant-once fp8 pair when that is on (also fed to the shared expert),
         # otherwise the MXFP8 pre-quant issued on routed_quant_stream, whose
         # layout the shared expert cannot take, or None.
-        routed_pre_quant_input = pre_quant_input
-        if should_quant_routed_input_mxfp8:
-            with torch.cuda.stream(self.routed_quant_stream):
-                x_q, x_sf = self.experts.quant_method.quantize_routed_input(
-                    hidden_states, routed_hidden_size(self.experts)
-                )
-                ready = self.routed_quant_stream.record_event()
-            routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
-
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -1037,6 +1028,17 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
+        # Recorded after the router so the routed MoE's first kernel, which
+        # joins this side stream, keeps the main chain on the main stream at
+        # CUDA-graph replay (the fork point above is unchanged).
+        routed_pre_quant_input = pre_quant_input
+        if should_quant_routed_input_mxfp8:
+            with torch.cuda.stream(self.routed_quant_stream):
+                x_q, x_sf = self.experts.quant_method.quantize_routed_input(
+                    hidden_states, routed_hidden_size(self.experts)
+                )
+                ready = self.routed_quant_stream.record_event()
+            routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
         # The mHC post-split consumes the reduced row without an RMSNorm.
         use_fused_finalize_all_reduce = (
             self._fuse_finalize_all_reduce
@@ -1115,6 +1117,7 @@ class DeepseekV2MoE(nn.Module):
 
                     # Coefficients are produced alongside the MoE. Join before
                     # the fused epilogue reads them, rather than after the AR.
+                    mhc.materialize_stats()
                     if mhc.stats_stream is not None:
                         current_stream.wait_stream(mhc.stats_stream)
                     args = (
