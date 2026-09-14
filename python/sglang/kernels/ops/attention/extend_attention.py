@@ -395,11 +395,7 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
-    # Prefix split-KV: grid axis 2 = q_tile * NUM_PREFIX_SPLITS + split. Each
-    # split sweeps one contiguous slice of the prefix and writes its partial
-    # O/LSE at ``split * stride_osplit`` / ``split * stride_lse_split`` (the
-    # caller combines the partials). NUM_PREFIX_SPLITS == 1 is byte-identical
-    # to the unsplit kernel.
+    # NUM_PREFIX_SPLITS > 1: grid axis 2 = q_tile * splits + split, one partial O/LSE per split
     NUM_PREFIX_SPLITS: tl.constexpr = 1,
     stride_osplit=0,
     stride_lse_split=0,
@@ -506,8 +502,7 @@ def _fwd_kernel(
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
     prefix_start = 0
     if NUM_PREFIX_SPLITS > 1:
-        # Whole BLOCK_N_PREFIX tiles per split so the in-tile reduction order
-        # matches the unsplit sweep; trailing splits may be empty (LSE=-inf).
+        # whole tiles per split, so the in-tile reduction order matches the unsplit sweep
         split_tiles = tl.cdiv(
             tl.cdiv(cur_seq_len_prefix, BLOCK_N_PREFIX), NUM_PREFIX_SPLITS
         )
@@ -1019,8 +1014,7 @@ def extend_attention_fwd(
         and score_mod is None
     )
     STORE_LSE = lse_extend is not None
-    # Partial layout ([splits, tokens, heads, Dv] / [splits, tokens, heads]) is
-    # selected by the tensor rank so a single split still addresses it right.
+    # a 4-D o_extend is the per-split partial layout, even with a single split
     split_layout = o_extend.dim() == 4
     if split_layout or prefix_splits > 1:
         assert (
@@ -1213,13 +1207,9 @@ def _combine_prefix_splits_kernel(
     )
 
 
-# Long-prefix extend: query tile / KV tile / warps used for the prefix sweep.
-# Halves the KV bytes streamed per query row vs the (64, 64, 4) default at
-# head_dim 128 (each workgroup reads the whole prefix slice); measured on
-# MI350X at 198K prefix: 8192-row chunk 41 -> 26 ms, 3222 rows 20 -> 13 ms.
+# (BLOCK_M, BLOCK_N, num_warps) for the prefix sweep: larger tiles halve KV bytes per query row
 LONG_PREFIX_BLOCK_SIZES = (128, 128, 8)
-# Aim for this many workgroups in the prefix sweep; splits fill the gap when
-# the query tiles alone cannot (few extend rows over a long cached prefix).
+# splits fill the workgroup budget when few extend rows leave the grid small
 LONG_PREFIX_TARGET_PROGRAMS = 1024
 LONG_PREFIX_MAX_SPLITS = 16
 
@@ -1272,7 +1262,6 @@ def extend_attention_fwd_long_prefix(
     lse_part = torch.empty(
         (num_parts, tokens, head_num), dtype=torch.float32, device=q_extend.device
     )
-    # Prefix slices (skip the current chunk).
     extend_attention_fwd(
         q_extend,
         k_extend,
@@ -1298,7 +1287,6 @@ def extend_attention_fwd_long_prefix(
         prefix_splits=num_splits,
         block_sizes=LONG_PREFIX_BLOCK_SIZES,
     )
-    # Current chunk only (causal triangle), default tiles.
     extend_attention_fwd(
         q_extend,
         k_extend,

@@ -31,9 +31,7 @@ try:
 except Exception:  # pragma: no cover - aiter missing
     _AITER_OK = False
 
-# Max abs error vs the fp32 reference. Observed on gfx950 (randn inputs):
-# aiter ~1e-3 (bf16 KV), 1e-3..1e-2 (fp8 KV); the Triton kernel is in the same
-# range except with a KV scale != 1, where its fp8 path reaches ~5e-2.
+# observed on gfx950: aiter ~1e-3 (bf16 KV), 1e-3..1e-2 (fp8 KV); scaled fp8 Triton hits 5e-2
 ATOL = {torch.bfloat16: 5e-3, torch.float8_e4m3fn: 3e-2}
 REF_ROWS = 64
 
@@ -45,7 +43,7 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
     total = total_prefix + n_ext
     k_buffer = torch.randn(total, h_kv, d, device=device).to(kv_dtype)
     v_buffer = torch.randn(total, h_kv, d, device=device).to(kv_dtype)
-    # Scrambled cache locations for prefix and chunk alike.
+    # scrambled cache locations for prefix and chunk alike
     perm = torch.randperm(total, device=device)
     kv_indices = perm[:total_prefix].to(torch.int64)
     out_cache_loc = perm[total_prefix:].to(torch.int64)
@@ -58,7 +56,7 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
         torch.tensor(extend_lens, dtype=torch.int32, device=device), 0
     )
     q = torch.randn(n_ext, h_q, d, dtype=torch.bfloat16, device=device)
-    # The chunk's K/V as the model produced them (bf16) and as stored in the cache.
+    # the chunk's K/V as produced (bf16) and as stored in the cache
     k = k_buffer[out_cache_loc].to(torch.bfloat16)
     v = v_buffer[out_cache_loc].to(torch.bfloat16)
     return q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices, out_cache_loc
@@ -92,7 +90,7 @@ class TestExtendLongPrefixAiter(CustomTestCase):
         )
         self.assertEqual(paged_indptr.dtype, torch.int32)
         self.assertEqual(pages.dtype, torch.int32)
-        # Page table = prefix indices then chunk locations, per request.
+        # page table: prefix indices then chunk locations, per request
         for i in range(B):
             exp = torch.cat(
                 [
@@ -111,8 +109,7 @@ class TestExtendLongPrefixAiter(CustomTestCase):
             k_scale=None if kv_dtype == torch.bfloat16 else k_scale,
             v_scale=None if kv_dtype == torch.bfloat16 else v_scale,
         )
-        # fp32 reference on the last REF_ROWS rows of each request (a full
-        # reference is n_ext x h_q x (prefix + extend) fp32).
+        # fp32 reference on the last REF_ROWS rows only: a full one is n_ext x h_q x context
         g = h_q // h_kv
         err_ref, err_tri = 0.0, 0.0
         for i in range(B):

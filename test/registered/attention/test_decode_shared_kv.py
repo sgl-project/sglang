@@ -33,7 +33,7 @@ def _run_case(seq_lens, cache_dtype, k_scale=1.0):
     v_buf = randn(total, H_KV, D)
     kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(lens, 0)
-    # the page table's last slot per request is the token being generated
+    # the last page-table slot per request is the token being generated, so kv_len_adjust=-1
     last = (kv_indptr[1:] - 1).long()
     k_buf[last] = k_new / k_scale
     v_buf[last] = v_new / k_scale
@@ -42,7 +42,6 @@ def _run_case(seq_lens, cache_dtype, k_scale=1.0):
     kv_indices = torch.arange(total, dtype=torch.int64, device=device)
     sm_scale = D**-0.5
 
-    # reference: per-head decode kernel over the full page table
     o_ref = torch.empty(bs, H_Q, D, dtype=torch.bfloat16, device=device)
     max_splits = 32
     attn_logits = torch.empty(bs, H_Q, max_splits, D, dtype=torch.float32, device=device)
