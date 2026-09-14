@@ -29,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    LayerShardInfo,
     MetadataCache,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
@@ -51,6 +52,8 @@ def _make_config(
     is_mla=False,
     model="testmodel",
     extra_config=None,
+    layer_shard=None,
+    is_storage_writer=None,
 ) -> HiCacheStorageConfig:
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
@@ -64,6 +67,8 @@ def _make_config(
         is_page_first_layout=True,
         model_name=model,
         extra_config=extra_config,
+        layer_shard=layer_shard,
+        is_storage_writer=is_storage_writer,
     )
 
 
@@ -88,6 +93,8 @@ class _BackendBuilder:
         subdir=None,
         metadata_ttl=None,
         enable_metadata_cache=None,
+        layer_shard=None,
+        is_storage_writer=None,
     ) -> HiCacheFile:
         # Each backend gets its own subdir so MLA / non-MLA tests don't
         # contaminate each other's file_path.
@@ -109,6 +116,8 @@ class _BackendBuilder:
                 "metadata_ttl": metadata_ttl,
                 "enable_metadata_cache": enable_metadata_cache,
             },
+            layer_shard=layer_shard,
+            is_storage_writer=is_storage_writer,
         )
         return HiCacheFile(cfg, file_path=d)
 
@@ -295,6 +304,64 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+
+
+class TestLayerShardSuffix(HiCacheFileLRUTestBase):
+    def _layer_shard(self, rank: int) -> LayerShardInfo:
+        return LayerShardInfo(rank=rank, size=8)
+
+    def test_layer_shards_get_distinct_file_keys(self):
+        b0 = self.make_backend(
+            is_mla=True,
+            tp_rank=0,
+            tp_size=8,
+            attn_cp_rank=0,
+            attn_cp_size=8,
+            subdir="layer",
+            layer_shard=self._layer_shard(0),
+        )
+        b7 = self.make_backend(
+            is_mla=True,
+            tp_rank=7,
+            tp_size=8,
+            attn_cp_rank=7,
+            attn_cp_size=8,
+            subdir="layer",
+            layer_shard=self._layer_shard(7),
+        )
+
+        self.assertTrue(b0.config_suffix.endswith("_layer0_8"))
+        self.assertTrue(b7.config_suffix.endswith("_layer7_8"))
+        self.assertNotIn("_cp", b0.config_suffix)
+        self.assertNotEqual(b0._get_suffixed_key("k"), b7._get_suffixed_key("k"))
+
+    def test_layer_shard_writer_owns_its_files(self):
+        b = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            tp_rank=7,
+            tp_size=8,
+            layer_shard=self._layer_shard(7),
+            is_storage_writer=True,
+        )
+
+        self.assertTrue(b._evictor.is_storage_owner)
+        self.assertTrue(b._evictor.enabled)
+        self.assertTrue(b.set("a", _t(50)))
+
+    def test_tp_replica_does_not_own_layer_shard_files(self):
+        b = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            tp_rank=7,
+            tp_size=8,
+            layer_shard=self._layer_shard(3),
+            is_storage_writer=False,
+        )
+
+        self.assertFalse(b._evictor.is_storage_owner)
+        self.assertFalse(b._evictor.enabled)
+        self.assertFalse(b.set("a", _t(50)))
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):

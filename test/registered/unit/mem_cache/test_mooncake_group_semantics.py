@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    LayerShardInfo,
     PoolName,
     PoolTransfer,
 )
@@ -206,6 +207,8 @@ def _make_config(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    layer_shard_rank=None,
+    layer_shard_size=None,
 ):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
@@ -215,6 +218,13 @@ def _make_config(
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
+
+    layer_shard = None
+    if layer_shard_rank is not None:
+        layer_shard = LayerShardInfo(
+            rank=layer_shard_rank,
+            size=layer_shard_size,
+        )
 
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
@@ -230,6 +240,7 @@ def _make_config(
         tp_lcm_size=tp_lcm_size,
         should_split_heads=should_split_heads,
         extra_config=extra_config,
+        layer_shard=layer_shard,
     )
 
 
@@ -244,6 +255,8 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    layer_shard_rank=None,
+    layer_shard_size=None,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -255,6 +268,8 @@ def _make_store(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_lcm_size=tp_lcm_size,
+        layer_shard_rank=layer_shard_rank,
+        layer_shard_size=layer_shard_size,
     )
 
     with patch.dict(
@@ -362,6 +377,44 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         call = fake_store.batch_put_calls[0]
         self.assertEqual(call["keys"], ["page0__k"])
         self.assertEqual(call["args"][0].group_ids, ["sglang-hicache:page0"])
+
+    def test_layer_sharded_mla_uses_rank_specific_keys(self):
+        store0, fake_store0 = _make_store(
+            is_mla_model=True, layer_shard_rank=0, layer_shard_size=8
+        )
+        store7, fake_store7 = _make_store(
+            is_mla_model=True, layer_shard_rank=7, layer_shard_size=8
+        )
+        store0.register_mem_pool_host(FakeHostKVCache(objects_per_page=1))
+        store7.register_mem_pool_host(FakeHostKVCache(objects_per_page=1))
+
+        self.assertEqual(store0.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        self.assertEqual(store7.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        self.assertEqual(fake_store0.batch_put_calls[0]["keys"], ["page0_layer0_8_k"])
+        self.assertEqual(fake_store7.batch_put_calls[0]["keys"], ["page0_layer7_8_k"])
+
+    def test_layer_shard_suffix_applies_to_sidecar_pool(self):
+        store, fake_store = _make_store(
+            is_mla_model=True, layer_shard_rank=3, layer_shard_size=8
+        )
+        indexer_pool = FakeIndexerPool()
+        store.register_mem_host_pool_v2(indexer_pool, PoolName.INDEXER)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.INDEXER], [True])
+        self.assertEqual(
+            fake_store.batch_put_calls[0]["keys"], ["page0_layer3_8_indexer"]
+        )
 
     def test_split_heads_group_ids(self):
         store, fake_store = _make_store(
