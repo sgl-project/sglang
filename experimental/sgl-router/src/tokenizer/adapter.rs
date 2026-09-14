@@ -161,11 +161,6 @@ impl ModelFiles {
     }
 }
 
-/// Load the sibling tokenizer config for the current chat formatter.
-pub fn load_tokenizer_config(source: &str) -> Result<Option<serde_json::Value>> {
-    ModelFiles::open(source).json("tokenizer_config.json")
-}
-
 pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let enc = t.encode(text).context("encode")?;
     Ok(enc.token_ids().to_vec())
