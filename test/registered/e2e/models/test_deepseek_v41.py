@@ -55,7 +55,7 @@ class _DSV41Server(CustomTestCase):
             "16384",
             "--max-running-requests",
             "8",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "8",
             "--random-seed",
             "0",
