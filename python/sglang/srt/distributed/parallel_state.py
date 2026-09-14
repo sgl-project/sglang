@@ -2598,7 +2598,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_custom_allreduce=False,
+            use_custom_allreduce=envs.SGLANG_ATTN_TP_CUSTOM_ALL_REDUCE.get(),
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

@@ -188,7 +188,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=envs.SGLANG_DEEPEP_RETURN_RECV_HOOK.get(),
         )
     elif a2a_backend.is_deepep_v2():
         return DeepEPv2Dispatcher(
