@@ -9,14 +9,23 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
 
     def _is_required(self) -> bool:
+        # A request in the batch may carry a raw `None` min_new_tokens that
+        # bypassed `SamplingParams.__post_init__`'s None->0 normalization
+        # (e.g. an internally-constructed request). `or 0` mirrors that
+        # normalization defensively so the comparison can't raise.
         return any(
-            req.sampling_params.min_new_tokens > 0 for req in self.orchestrator.reqs()
+            (req.sampling_params.min_new_tokens or 0) > 0
+            for req in self.orchestrator.reqs()
         )
 
     def _prepare(self):
+        # See `_is_required`: a heterogeneous None/int batch would otherwise
+        # crash the tensor build with
+        # "TypeError: 'NoneType' object cannot be interpreted as an integer".
         self.min_new_tokens = torch.tensor(
             data=[
-                req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()
+                (req.sampling_params.min_new_tokens or 0)
+                for req in self.orchestrator.reqs()
             ],
             dtype=torch.int32,
             device=self.orchestrator.device,
