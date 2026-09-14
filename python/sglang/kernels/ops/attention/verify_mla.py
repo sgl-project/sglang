@@ -29,19 +29,14 @@ DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
-    # MiniMax-M3 dense layers / EAGLE3 draft: 16 query heads on one TP-local
-    # KV head. One 16-head block reads each K/V tile once (4 blocks read it
-    # 4x); with the split budget below this runs at ~3 TB/s on MI355X
-    # (0.38 ms vs 2.0 ms for 24 x 195K-token requests).
+    # one 16-head block reads each K/V tile once, so 4-head blocks would read it 4x
     128: (16, 128, 4),
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
     64: (4, 256, 4),  # K3 GQA (dspark draft attention)
 }
 
 
-# head_dim: (target stage-1 programs, max splits). More splits than the
-# default budget are needed for long-context decode-sized batches (24 x 195K
-# tokens gave 5 splits, i.e. 39K keys per program, under the 512 budget).
+# head_dim -> (target stage-1 programs, max splits): a few splits per request at long context
 _SPLIT_CONFIG = {
     128: (4096, 64),
 }
@@ -119,9 +114,7 @@ def _verify_mla_prefix_stage1(
     R: tl.constexpr = BLOCK_H * L_EXT
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    # KV_LEN_ADJUST trims the prefix range: a decode step whose page table
-    # already holds the token being generated passes -1, so that token is
-    # attended to only as the single extend row.
+    # a decode step's page table already holds its new token, so -1 keeps it out of the prefix
     cur_batch_seq_len = (
         tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx + KV_LEN_ADJUST
     )
@@ -335,8 +328,7 @@ def _verify_mla_combine_stage2(
             other=0.0,
         ).to(tl.float32)
         new_m = tl.maximum(m, lse_s)
-        # An empty prefix (decode with KV_LEN_ADJUST on a 1-token request)
-        # leaves every split at -inf; keep the weights finite (0) instead of NaN.
+        # an empty prefix leaves every split at -inf, so keep the weights at 0 instead of NaN
         safe_m = tl.where(new_m == float("-inf"), 0.0, new_m)
         alpha = tl.exp(m - safe_m)
         beta = tl.exp(lse_s - safe_m)

@@ -7,10 +7,10 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
-from sglang.kernels.ops.kvcache.kv_indices import kv_indices_num_token_blocks
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
+from sglang.kernels.ops.kvcache.kv_indices import kv_indices_num_token_blocks
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -94,11 +94,7 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
-    # Grouped-head verify needs every local query head to share one TP-local
-    # KV head. Qwen3.5 at TP>=2, the MiniMax-M3 dense layers (4 KV heads, TP4/8)
-    # and its Llama-arch EAGLE3 draft all have that shape; the per-head
-    # split-KV kernel re-reads the prefix KV once per query head there (16x
-    # the traffic at 16 local heads: 0.56 ms vs ~0.1 ms per layer at 100K).
+    # per-head split-KV re-reads the prefix once per query head, so grouped shapes use this
     if not (
         is_qwen3_5(model_config.hf_config)
         or is_minimax_sparse(model_config.hf_config)
@@ -195,9 +191,6 @@ class TritonAttnBackend(AttentionBackend):
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
-        # Split-prefix extend for EXTEND rows over a long cached prefix
-        # (see extend_attention_fwd_long_prefix); gated per forward in
-        # _use_long_prefix_extend.
         self.extend_attention_fwd_long_prefix = torch.compiler.disable(
             extend_attention_fwd_long_prefix
         )
@@ -205,28 +198,18 @@ class TritonAttnBackend(AttentionBackend):
         self.long_prefix_extend_min_tokens = (
             envs.SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS.get()
         )
-        # aiter CK paged batch-prefill for large EXTEND chunks over a long
-        # prefix (see aiter_extend_long_prefix); gated per forward in
-        # _use_aiter_long_prefix_extend.
-        self.aiter_long_prefix_extend_enabled = False
+        self.aiter_long_prefix_extend = None
         if _is_hip and envs.SGLANG_USE_AITER_EXTEND_LONG_PREFIX.get():
             from sglang.srt.layers.attention.aiter_extend_long_prefix import (
-                aiter_batch_prefill_available,
+                AiterLongPrefixExtend,
                 build_paged_kv_indices,
-                extend_attention_fwd_aiter_paged,
             )
 
-            if aiter_batch_prefill_available():
-                self.aiter_long_prefix_extend_enabled = True
-                self.aiter_long_prefix_min_rows = (
-                    envs.SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS.get()
-                )
-                self.build_paged_kv_indices = torch.compiler.disable(
-                    build_paged_kv_indices
-                )
-                self.extend_attention_fwd_aiter_paged = torch.compiler.disable(
-                    extend_attention_fwd_aiter_paged
-                )
+            self.aiter_long_prefix_extend = AiterLongPrefixExtend.try_create()
+            self.aiter_long_prefix_min_rows = (
+                envs.SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS.get()
+            )
+            self.build_paged_kv_indices = torch.compiler.disable(build_paged_kv_indices)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -277,17 +260,13 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # Decode steps of the same shapes (draft decode at topk 1, dense
-        # layers) reuse that kernel with one extend row per request; the page
-        # table already holds the new token, so the prefix is trimmed by one.
+        # decode is a one-row verify whose token is already in the page table
         self.use_decode_shared_kv = (
             self.use_verify_shared_kv
             and not envs.SGLANG_DISABLE_TRITON_DECODE_SHARED_KV.get()
         )
         self._decode_shared_kv_qo_indptr = (
-            torch.arange(
-                max_bs + 1, dtype=torch.int32, device=model_runner.device
-            )
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
             if self.use_decode_shared_kv
             else None
         )
@@ -1589,22 +1568,26 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
-    # Largest per-request extend length routed to the verify kernels.
     SMALL_EXTEND_MAX_TOKENS = 8
 
     def _use_long_prefix_extend(
         self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
     ) -> bool:
-        """Route a plain EXTEND / draft-extend over a long cached prefix to the
-        split-prefix kernel. Host-side shape checks only (no device sync): the
-        average prefix per request comes from the kv_indices length."""
+        """Should this EXTEND / draft-extend take the split-prefix kernel?
+        Decided from host-side shapes: the average cached prefix per request."""
         if not self.long_prefix_extend_enabled or kv_indices is None:
             return False
-        # EXTEND / MIXED / SPLIT_PREFILL / DRAFT_EXTEND_V2 only; TARGET_VERIFY
-        # keeps its own kernels (it may run inside a captured graph).
+        # target verify keeps its own kernels
         if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
+            return False
+        # the split count and partial buffers follow host shapes a captured graph would bake in
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
             return False
         bs = forward_batch.batch_size
         return bs > 0 and kv_indices.numel() >= bs * self.long_prefix_extend_min_tokens
@@ -1612,12 +1595,10 @@ class TritonAttnBackend(AttentionBackend):
     def _use_aiter_long_prefix_extend(
         self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
     ) -> bool:
-        """Within the long-prefix route: batches whose largest request has at
-        least ``aiter_long_prefix_min_rows`` extend rows go to aiter's CK
-        paged batch-prefill (page size 1, fp8 or bf16 KV). Host-side checks
-        only."""
+        """Within the long-prefix route, should the batch take aiter's CK paged
+        batch-prefill? True once its largest request extends by `aiter_long_prefix_min_rows`."""
         if (
-            not self.aiter_long_prefix_extend_enabled
+            self.aiter_long_prefix_extend is None
             or self.page_size != 1
             or forward_batch.out_cache_loc is None
             or forward_batch.extend_seq_lens is None
@@ -1625,21 +1606,21 @@ class TritonAttnBackend(AttentionBackend):
             or forward_batch.seq_lens_cpu is None
         ):
             return False
-        ext = forward_batch.extend_seq_lens_cpu
-        if not ext or max(ext) < self.aiter_long_prefix_min_rows:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if not extend_lens or max(extend_lens) < self.aiter_long_prefix_min_rows:
             return False
         return self._use_long_prefix_extend(forward_batch, kv_indices)
 
     def _is_small_constant_extend(
         self, forward_batch: ForwardBatch, kv_indices: torch.Tensor
     ) -> bool:
-        ext = forward_batch.extend_seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
         return (
             forward_batch.forward_mode == ForwardMode.EXTEND
-            and ext is not None
-            and len(ext) > 0
-            and ext[0] <= self.SMALL_EXTEND_MAX_TOKENS
-            and all(e == ext[0] for e in ext)
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and extend_lens[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(n == extend_lens[0] for n in extend_lens)
             and kv_indices is not None
             and kv_indices.numel() > 0
         )
@@ -1818,15 +1799,7 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
-        # The EAGLE v2 draft-extend (DRAFT_EXTEND_V2) has the same shape: a
-        # constant num_draft_tokens-row causal chain per request over a
-        # prefix-only kv_indices, so it takes the same split-KV path. The
-        # serial-prefix extend kernel launches only bs*heads work-groups and
-        # costs O(context) per step at long prefix (2.2 ms at 100K for the
-        # MiniMax-M3 EAGLE3 draft vs ~0.3 ms split-KV).
-        # A small constant-length EXTEND over a cached prefix (a new turn) has
-        # the same shape too; the serial extend kernel costs 6 ms per dense
-        # layer at 195K context there.
+        # draft-extend and small constant extends are verify-shaped, so they skip the serial one
         if (
             verify_fwd is not None
             and score_mod is None
@@ -1892,7 +1865,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     bs,
                 )
-                self.extend_attention_fwd_aiter_paged(
+                self.aiter_long_prefix_extend.forward(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     k_buffer,
@@ -2555,7 +2528,7 @@ class TritonAttnBackend(AttentionBackend):
         return o
 
 
-# Below this context length the single-block page-table copy is already fast.
+# below this context length the single-block page-table copy is already fast
 _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
@@ -2621,9 +2594,7 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
-        # Long-context spec decode copies every request's page table once per
-        # draft step here; spread the copy over token blocks instead of one
-        # program per (step, request) crawling the whole context serially.
+        # one program per (step, request) crawls the whole context, so spread over token blocks
         num_token_blocks = (
             kv_indices_num_token_blocks(
                 self.pool_len, self.speculative_num_steps * num_seqs * self.topk

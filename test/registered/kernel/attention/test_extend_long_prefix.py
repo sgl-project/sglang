@@ -1,13 +1,4 @@
-"""Parity tests for the split-prefix Triton extend attention
-(``extend_attention_fwd_long_prefix``): an EXTEND over a long cached prefix is
-swept with larger query tiles and in parallel prefix slices (one fp32 partial
-O/LSE each, combined in one launch) instead of one serial pass per (query
-tile, head). It must match ``extend_attention_fwd`` up to reduction order on
-ragged batches, GQA ratios, bf16 and fp8 KV caches, KV scales, and any split
-count including a single split (4-D partial layout with one slice).
-
-GPU + Triton required. Runs on the CUDA PR lane and the AMD MI35x lane.
-"""
+"""The split-prefix extend sweep must match the single-pass `extend_attention_fwd`."""
 
 import unittest
 
@@ -21,12 +12,10 @@ from sglang.kernels.ops.attention.extend_attention import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=40, suite="jit-kernel-unit-test-amd")
 
-# Same math, different reduction order over prefix slices (fp32 partials).
-# Observed max abs diff vs the single-pass kernel on gfx950: ~5e-4 (bf16 KV),
-# ~7e-3 (fp8 KV, dominated by the fp8 P.V rounding both kernels share).
+# observed on gfx950: ~5e-4 (bf16 KV), ~7e-3 (fp8 KV, the P.V rounding both kernels share)
 ATOL = {torch.bfloat16: 1e-2, torch.float8_e4m3fn: 3e-2}
 
 
@@ -39,7 +28,7 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
     kv_indptr[1:] = torch.cumsum(
         torch.tensor(prefix_lens, dtype=torch.int32, device=device), 0
     )
-    # Scrambled page table so the split sweep is exercised through kv_indices.
+    # a scrambled page table exercises the split sweep through kv_indices
     kv_indices = torch.randperm(total_prefix, device=device).to(torch.int64)
     n_ext = int(sum(extend_lens))
     q = torch.randn(n_ext, h_q, d, dtype=torch.bfloat16, device=device)
@@ -54,6 +43,8 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestExtendLongPrefix(CustomTestCase):
+    """A slice boundary, partial stride or combine weight error shows as a mismatch."""
+
     def _run(
         self,
         prefix_lens,
@@ -75,13 +66,42 @@ class TestExtendLongPrefix(CustomTestCase):
         sm_scale = 1.0 / (d**0.5)
         o_ref = torch.empty_like(q)
         extend_attention_fwd(
-            q, k, v, o_ref, kb, vb, qo, kvp, kvi, None, True, None, mle,
-            k_scale, v_scale, sm_scale=sm_scale, extend_seq_lens_cpu=extend_lens,
+            q,
+            k,
+            v,
+            o_ref,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            None,
+            True,
+            None,
+            mle,
+            k_scale,
+            v_scale,
+            sm_scale=sm_scale,
+            extend_seq_lens_cpu=extend_lens,
         )
         o = torch.empty_like(q)
         extend_attention_fwd_long_prefix(
-            q, k, v, o, kb, vb, qo, kvp, kvi, True, mle, k_scale, v_scale,
-            sm_scale=sm_scale, extend_seq_lens_cpu=extend_lens, num_splits=num_splits,
+            q,
+            k,
+            v,
+            o,
+            kb,
+            vb,
+            qo,
+            kvp,
+            kvi,
+            True,
+            mle,
+            k_scale,
+            v_scale,
+            sm_scale=sm_scale,
+            extend_seq_lens_cpu=extend_lens,
+            num_splits=num_splits,
         )
         torch.cuda.synchronize()
         self.assertFalse(torch.isnan(o).any().item())
@@ -101,7 +121,7 @@ class TestExtendLongPrefix(CustomTestCase):
         self._run([65536], [3], num_splits=16)
 
     def test_single_split_layout(self):
-        # num_splits == 1 still goes through the 4-D partial layout + combine.
+        # a single split still takes the 4-D partial layout and the combine
         self._run([20000], [2048], num_splits=1)
 
     def test_gqa_group_4(self):
@@ -116,7 +136,7 @@ class TestExtendLongPrefix(CustomTestCase):
         self._run([16384], [512], d=64)
 
     def test_prefix_shorter_than_one_tile_per_split(self):
-        # 100 prefix tokens over 16 splits: most slices are empty (LSE=-inf).
+        # 100 prefix tokens over 16 splits: most slices are empty
         self._run([100], [50], num_splits=16)
 
     def test_auto_split_count(self):
