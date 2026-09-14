@@ -20,12 +20,6 @@ register_npu_ci(
 
 register_npu_ci(
     est_time=7200,
-    suite="nightly-acc-16-npu-a3-cann900",
-    nightly=True,
-)
-
-register_npu_ci(
-    est_time=7200,
     suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
 )
