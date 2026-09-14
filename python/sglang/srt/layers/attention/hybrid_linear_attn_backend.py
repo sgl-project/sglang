@@ -1148,11 +1148,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
-        if layer_id in self.full_attn_layers:
-            return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
-        return None
-
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
