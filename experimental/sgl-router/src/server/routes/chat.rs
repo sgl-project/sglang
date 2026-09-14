@@ -14,8 +14,8 @@ use crate::policies::decode::{
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
-    SelectionContext,
+    has_caller_input_ids, request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind,
+    RequestTokens, SelectionContext,
 };
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
@@ -1307,6 +1307,7 @@ fn build_outgoing_body(
 ///
 /// Verified-and-safe: plain text `messages` with a string `content`.
 /// Not verified -> omit:
+///   * caller `input_ids`: the caller already tokenized; never replace them.
 ///   * `tools` / `functions`: the engine serializes tool schemas through its
 ///     own model dump; Dynamo renders the caller's JSON.
 ///   * non-string `content` (multimodal arrays, text-part arrays, `null`):
@@ -1333,7 +1334,10 @@ fn build_outgoing_body(
 /// tokenizer that does not would diverge by a leading special, again undetectable
 /// from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_has_non_text_content(value) {
+    if has_caller_input_ids(value)
+        || request_has_tools(value)
+        || request_has_non_text_content(value)
+    {
         return false;
     }
     // Fields that steer the engine's template tokenization and whose Dynamo
@@ -1744,6 +1748,8 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
         ];
         for b in blockers {
             assert!(
@@ -1761,6 +1767,7 @@ mod tests {
             "chat_template": null,
             "reasoning_effort": null,
             "chat_template_kwargs": null,
+            "input_ids": null,
             "continue_final_message": false
         })));
     }

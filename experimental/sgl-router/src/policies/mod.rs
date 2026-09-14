@@ -45,13 +45,31 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-rendered tokens may also be forwarded
-/// to the engine (the chat route decides); raw prompt tokens are routing-only.
+/// Whether the caller pre-tokenized the prompt (`input_ids` present and not
+/// null). Such a request is never re-rendered: its ids drive routing and the
+/// body is forwarded untouched, malformed values included, for the engine to
+/// validate.
+pub fn has_caller_input_ids(value: &serde_json::Value) -> bool {
+    value.get("input_ids").is_some_and(|v| !v.is_null())
+}
+
+/// Tokenizes a request for routing. Caller `input_ids` win; chat-rendered
+/// tokens may also be forwarded to the engine (the chat route decides); raw
+/// prompt tokens are routing-only.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
+    if has_caller_input_ids(value) {
+        // A flat u32 array (empty included) supplies routing tokens; anything
+        // else yields none, leaving validation to the engine.
+        let ids = serde::Deserialize::deserialize(&value["input_ids"]).ok()?;
+        return Some(RequestTokens {
+            ids,
+            chat_rendered: false,
+        });
+    }
     if tokenizers.has_chat_formatter(&model_id.0)
         && value.get("messages").is_some_and(|m| m.is_array())
     {
