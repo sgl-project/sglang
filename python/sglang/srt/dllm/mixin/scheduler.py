@@ -520,7 +520,7 @@ class SchedulerDllmMixin:
         if len(uncached):
             self.token_to_kv_pool_allocator.free(uncached)
         if req.last_node is not None:
-            self.tree_cache.dec_lock_ref(req.last_node)
+            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
             req.last_node = None
         kv.mark_kv_released()
 

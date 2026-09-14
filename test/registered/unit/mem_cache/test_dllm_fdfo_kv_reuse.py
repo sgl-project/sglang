@@ -3,17 +3,24 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, EvictParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -84,6 +91,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         last_node=None,
+        lock_receipt=DecLockRefParams(),
         # `_make_abort_req` reads these to build the weight-version spans that
         # every abort output carries.
         output_ids=array("q"),
@@ -314,7 +322,12 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         keep = _make_req("job_10", [20], self.block_size)
         req.kv.cache_protected_len = 2
         req.kv.kv_allocated_len = 4
-        req.last_node = object()
+        req.last_node = 42
+        req.lock_receipt = DecLockRefParams(
+            node_id=req.last_node,
+            swa_uuid_for_lock=7,
+            skipped_lock_components=(ComponentType.MAMBA,),
+        )
         manager.waiting_queue = [req, keep]
         manager.staging_queue = [req]
 
@@ -334,7 +347,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
 
         unlocked = []
 
-        def dec_lock_ref(node):
+        def dec_lock_ref(node, params):
+            self.assertIs(params, req.lock_receipt)
             events.append("unlock")
             unlocked.append(node)
 
@@ -370,6 +384,116 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         # Built through `_make_abort_req` like every other abort path, so the
         # tokenizer manager sees the same payload it does elsewhere.
         self.assertIsNotNone(outputs[0][0].weight_versions)
+
+    def _make_stashed_unified_req(self, phase):
+        # These CPU tests exercise slot ownership; no KV tensor data is read.
+        allocator = TokenToKVPoolAllocator(
+            size=8, dtype=torch.float16, device="cpu", kvcache=None, need_sort=False
+        )
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                req_to_token_pool=self.pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+        req = Req(
+            rid="stashed",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=8),
+            dllm_config=SimpleNamespace(block_size=self.block_size),
+        )
+        req.output_ids = array("q", [5, 6, 7, 8])
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.set_extend_range(0, 8)
+        req.dllm_phase = phase
+        req.dllm_initialized = True
+        self.pool.alloc([req])
+        self.pool.write((req.kv.req_pool_idx, slice(0, 8)), allocator.alloc(8))
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = 8
+        req.last_node = cache.root_node_handle()
+        req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+
+        # Follow the FDFO stash path: caching takes a new lock and stores its
+        # receipt; freeing the request slot leaves that lock and KV alive.
+        cache.cache_unfinished_req(req, chunked=True)
+        self.pool.free(req)
+        self.assertFalse(req.kv.holds_kv)
+        self.assertEqual(req.lock_receipt.node_id, req.last_node)
+        self.assertEqual(cache.protected_size(), 8)
+        self.assertEqual(allocator.available_size(), 0)
+        cache.dec_lock_ref = Mock(wraps=cache.dec_lock_ref)
+
+        scheduler = _SchedulerHarness()
+        scheduler.tree_cache = cache
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.dllm_manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        scheduler.dllm_manager.waiting_queue = [req]
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=Mock())
+        )
+        return scheduler, req
+
+    def test_stashed_unified_req_retracts_under_kv_pressure(self):
+        for phase in (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE):
+            with self.subTest(phase=phase):
+                scheduler, req = self._make_stashed_unified_req(phase)
+                cache = scheduler.tree_cache
+                node, receipt = req.last_node, req.lock_receipt
+
+                scheduler._retract_or_abort_dllm_req(
+                    SimpleNamespace(is_empty=lambda: True)
+                )
+
+                cache.dec_lock_ref.assert_called_once_with(node, receipt)
+                self.assertIs(cache.dec_lock_ref.call_args.args[1], receipt)
+                self.assertEqual(scheduler.dllm_manager.waiting_queue, [req])
+                scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+                self.assertTrue(req.is_retracted)
+                self.assertEqual(req.retraction_count, 1)
+                self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+                self.assertEqual(list(req.output_ids), [5, 6, 7, 8])
+                self.assertIsNone(req.last_node)
+                self.assertIsNone(req.lock_receipt.node_id)
+                self.assertTrue(req.kv.is_kv_released)
+                self.assertEqual(cache.protected_size(), 0)
+                self.assertEqual(cache.evictable_size(), 8)
+                cache.sanity_check()
+                cache.evict(EvictParams(num_tokens=8))
+                self.assertEqual(
+                    scheduler.token_to_kv_pool_allocator.available_size(), 8
+                )
+
+    def test_stashed_unified_req_aborts_and_releases_kv(self):
+        for phase in (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE):
+            with self.subTest(phase=phase):
+                scheduler, req = self._make_stashed_unified_req(phase)
+                cache = scheduler.tree_cache
+                node, receipt = req.last_node, req.lock_receipt
+                scheduler.dllm_manager.staging_queue = [req]
+
+                scheduler._abort_dllm_req_exact(req)
+
+                cache.dec_lock_ref.assert_called_once_with(node, receipt)
+                self.assertIs(cache.dec_lock_ref.call_args.args[1], receipt)
+                self.assertEqual(scheduler.dllm_manager.waiting_queue, [])
+                self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+                send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+                send_output.assert_called_once()
+                self.assertEqual(send_output.call_args.args[0].rid, req.rid)
+                self.assertIs(send_output.call_args.args[1], req)
+                self.assertIsNone(req.last_node)
+                self.assertTrue(req.kv.is_kv_released)
+                self.assertEqual(cache.protected_size(), 0)
+                self.assertEqual(cache.evictable_size(), 8)
+                cache.sanity_check()
+                cache.evict(EvictParams(num_tokens=8))
+                self.assertEqual(
+                    scheduler.token_to_kv_pool_allocator.available_size(), 8
+                )
 
     def test_abort_of_never_admitted_req_keeps_shared_prefix_locked(self):
         """An INCOMING request only ran match_prefix, which does not lock.
