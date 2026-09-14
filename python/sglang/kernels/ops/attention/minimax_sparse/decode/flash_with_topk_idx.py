@@ -1041,6 +1041,17 @@ def flash_decode_with_topk_idx(
         )
         batch_size, num_q_heads = rows_batch, rows_heads
         seq_lens, slot_ids = rows_seq_lens, rows_slot_ids
+        if local_blocks > 0:
+            # The score kernel forced the local blocks of the request's longest
+            # row; rows that end in an earlier block need their own last
+            # block(s) forced (same 1e29 marker), or the boundary case would
+            # drop the local block from a shorter row's top-k.
+            num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
+            blocks = torch.arange(score.shape[2], device=score.device)
+            is_local = (
+                blocks[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
+            ) & (blocks[None, :] < num_blocks[:, None])
+            score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (
