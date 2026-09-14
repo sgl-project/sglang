@@ -47,6 +47,7 @@ def situ_and_mul_masked_post_quant(
     topk: int = 8,
     transposed: bool = False,
     swizzle: bool = False,
+    rows_per_expert: int = 32,
 ) -> None:
     module = _jit_situ_mul_quant_varlen_module(quant_group_size, scale_ue8m0, swizzle)
     module.run(
@@ -55,6 +56,7 @@ def situ_and_mul_masked_post_quant(
         output_scale,
         masked_m,
         topk,
+        rows_per_expert,
         transposed,
         float(beta),
         float(linear_beta),
