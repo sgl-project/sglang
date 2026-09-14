@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -150,7 +151,9 @@ def _sparse_checkout(url: str, revision: str, repo_path: str, dest: Path) -> Non
         ["git", "-C", str(dest), "checkout", "--quiet", "FETCH_HEAD"],
         timeout=CHECKOUT_TIMEOUT_SECONDS,
     )
-    shutil.rmtree(dest / ".git")
+    # Leftovers here are harmless, and rmtree races with anything still writing
+    # into the tree; the GT files live outside .git.
+    shutil.rmtree(dest / ".git", ignore_errors=True)
 
 
 def _fetch_sparse_git(repo: str, revision: str, repo_path: str, dest: Path) -> bool:
@@ -285,8 +288,10 @@ def _ensure_gt_dir(repo: str, revision: str, repo_path: str, cache_root: Path) -
         shutil.rmtree(final_dir, ignore_errors=True)
 
     cache_root.mkdir(parents=True, exist_ok=True)
-    tmp_dir = cache_root / f"{revision}.tmp.{os.getpid()}"
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    # PIDs repeat across container PID namespaces while the cache root is a
+    # shared host mount, so a PID-named directory collides between concurrent
+    # jobs; mkdtemp picks a name atomically instead.
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"{revision}.tmp.", dir=cache_root))
 
     _fetch_into(repo, revision, repo_path, tmp_dir)
     tmp_gt_dir = tmp_dir / repo_path
