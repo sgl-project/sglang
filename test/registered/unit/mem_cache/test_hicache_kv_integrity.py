@@ -284,6 +284,7 @@ def cpu_hicache_patches():
             lambda buf, granularity_bytes=None: None,
         ),
         mock.patch.object(pool_host_common, "_cuda_host_unregister", lambda buf: None),
+        mock.patch.object(pool_host_base, "_cuda_host_unregister", lambda buf: None),
         mock.patch.object(
             pool_host_mha, "transfer_kv_direct", _transfer_kv_direct, create=True
         ),
