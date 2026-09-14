@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,7 @@ def main():
     parser.add_argument("model")
     parser.add_argument("--layers", nargs="+", type=int, default=[0, 22, 44])
     parser.add_argument("--fp32-diagnostic", action="store_true")
+    parser.add_argument("--paired-loader-control", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -81,6 +83,24 @@ def main():
                 module.fused_fg_b_proj.weight_loader(
                     module.fused_fg_b_proj.weight, w, i
                 )
+            control = None
+            if args.paired_loader_control:
+                # Recreate the pre-patch constructor decision, not a hand-written
+                # approximation of its projection methods or checkpoint loaders.
+                with patch.object(
+                    model, "_kda_projections_are_unquantized", return_value=False
+                ):
+                    control = model.Glm5NextLinearAttention(
+                        layer, cfg.hidden_size, cfg, quant_config=quant, prefix=prefix
+                    )
+                assert not control.do_fuse_qkvbfg
+                for shard, w in zip(("q", "k", "v"), weights[:3]):
+                    control.qkv_proj.weight.weight_loader(
+                        control.qkv_proj.weight, w, shard
+                    )
+                for name, w in zip(names[3:], weights[3:]):
+                    param = getattr(control, name).weight
+                    param.weight_loader(param, w)
             # Check rank slices independently of the production loader.
             local = [
                 w.chunk(world, dim=0)[rank] if i < 4 or i >= 6 else w
@@ -92,6 +112,14 @@ def main():
             torch.testing.assert_close(
                 module.fused_fg_b_proj.weight, torch.stack(local[6:]), rtol=0, atol=0
             )
+            if control is not None:
+                torch.testing.assert_close(
+                    control.qkv_proj.weight, torch.cat(local[:3]), rtol=0, atol=0
+                )
+                for name, w in zip(names[3:], local[3:]):
+                    torch.testing.assert_close(
+                        getattr(control, name).weight, w, rtol=0, atol=0
+                    )
             if rank == 0:
                 print(
                     json.dumps(
@@ -114,6 +142,11 @@ def main():
                     (x @ local[5].T) @ local[7].T,
                 )
                 actual = module.forward_qkvbfg_fused(x, None)
+                if control is not None:
+                    manual_reference = reference
+                    reference = control.forward_qkvbfg(x, None)
+                    for a, b in zip(reference, manual_reference):
+                        torch.testing.assert_close(a, b, atol=0.003, rtol=0.02)
                 if args.fp32_diagnostic:
                     xf = x.float()
                     wf = [w.float() for w in local]
@@ -150,20 +183,31 @@ def main():
                     for a, b in zip(actual, reference):
                         torch.testing.assert_close(a, b, atol=0.003, rtol=0.02)
                 if count <= 16:
+                    methods = [module.forward_qkvbfg_fused]
+                    if control is not None:
+                        methods.append(control.forward_qkvbfg)
                     stream = torch.cuda.Stream()
                     stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(stream):
                         for _ in range(3):
-                            module.forward_qkvbfg_fused(x, None)
+                            for method in methods:
+                                method(x, None)
                     torch.cuda.current_stream().wait_stream(stream)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        captured = module.forward_qkvbfg_fused(x, None)
-                    for _ in range(5):
+                        captured = [method(x, None) for method in methods]
+                    for replay in range(5):
+                        if control is not None:
+                            # Reuse the same graph addresses with new request data.
+                            # This catches stale views that a constant-input replay misses.
+                            x.copy_(torch.randn_like(x))
+                            dist.broadcast(x, 0)
                         graph.replay()
-                    torch.cuda.synchronize()
-                    for a, b in zip(captured, actual):
-                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                        torch.cuda.synchronize()
+                        for outputs, method in zip(captured, methods):
+                            expected = method(x, None)
+                            for a, b in zip(outputs, expected):
+                                torch.testing.assert_close(a, b, atol=0, rtol=0)
                 dist.barrier()
                 print(
                     json.dumps(
@@ -172,11 +216,12 @@ def main():
                             "layer": layer,
                             "tokens": count,
                             "checkpoint_shard_projection_graph": "pass",
+                            "paired_loader_control": control is not None,
                         }
                     ),
                     flush=True,
                 )
-            del module, weights, local
+            del module, control, weights, local
     dist.destroy_process_group()
     print(f"KDA_CHECKPOINT_TP{world}_PASS rank={rank}", flush=True)
 
