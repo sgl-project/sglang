@@ -106,12 +106,16 @@ def is_dcp_dsa_extend_phase(forward_batch: ForwardBatch, use_dsa: bool) -> bool:
     (``all_gather_kv_cache_for_mla_extend``; only ``flashinfer_mla_backend``
     does), and ``flashmla_kv`` already treats each extend token as a decode
     row with its own top-k slot set, so the decode machinery is exact here.
-    Mirrors ``dsa_backend._should_return_dsa_dcp_lse_flashmla_kv``. MIXED and
-    draft-extend modes are excluded (rejected at config time for DSA+DCP).
+    The EAGLE draft's DRAFT_EXTEND_V2 takes it as well: the draft pool is
+    written through the same owner-striping kernel as the target, so its
+    reads must filter and merge too. Mirrors
+    ``dsa_backend._should_return_dsa_dcp_lse_flashmla_kv``. MIXED is rejected
+    at config time for DSA+DCP.
     """
     if not (use_dsa and get_parallel().dcp_enabled):
         return False
-    return forward_batch.forward_mode == ForwardMode.EXTEND
+    mode = forward_batch.forward_mode
+    return mode == ForwardMode.EXTEND or mode.is_draft_extend_v2()
 
 
 def is_dcp_lse_merge_phase(forward_batch: ForwardBatch, use_dsa: bool) -> bool:
@@ -123,10 +127,17 @@ def is_dcp_lse_merge_phase(forward_batch: ForwardBatch, use_dsa: bool) -> bool:
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     # The DSA backend publishes its LSE base per decode impl
-    # (``dcp_lse_base_on_e``; FlashMLA kernels are natural-log). Fall back to
-    # the backend-name table for the dense MLA backends.
+    # (``dcp_lse_base_on_e``; FlashMLA kernels are natural-log). On the EAGLE
+    # draft the active backend is the multi-step wrapper
+    # (``DeepseekSparseAttnMultiStepBackend``), which holds the per-step DSA
+    # backends in ``attn_backends`` -- read the base from the first one.
+    # Fall back to the backend-name table for the dense MLA backends.
     backend_obj = get_attn_backend()
     published = getattr(backend_obj, "dcp_lse_base_on_e", None)
+    if published is None:
+        steps = getattr(backend_obj, "attn_backends", None)
+        if steps:
+            published = getattr(steps[0], "dcp_lse_base_on_e", None)
     if published is not None:
         return bool(published)
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
