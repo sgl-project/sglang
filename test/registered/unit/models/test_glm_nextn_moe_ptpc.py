@@ -16,15 +16,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
-    DeepseekV2WeightLoaderMixin,
-    NextNEnabledConfig,
-)
-from sglang.srt.models.deepseek_common.utils import (
+from sglang.srt.models.glm4_moe import (
+    GlmMoeDsaForCausalLMNextN,
     enable_glm_nextn_moe_ptpc,
     should_apply_glm_nextn_moe_ptpc,
 )
-from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,7 +31,7 @@ PREFIX = f"model.layers.{LAYER}"
 EXPERT_LEAF = f"{PREFIX}.mlp.experts.0.w1"
 ATTN_LEAF = f"{PREFIX}.self_attn.q_proj"
 EXPERT_WEIGHT = f"{PREFIX}.mlp.experts.0.gate_proj.weight"
-_PTPC_ENV = "sglang.srt.models.deepseek_common.utils.envs.SGLANG_GLM_NEXTN_MOE_PTPC.get"
+_PTPC_ENV = "sglang.srt.models.glm4_moe.envs.SGLANG_GLM_NEXTN_MOE_PTPC.get"
 
 
 def _quark_cfg(*, exclude=None, layer_quant=None):
@@ -45,15 +41,6 @@ def _quark_cfg(*, exclude=None, layer_quant=None):
         exclude_layers=list(
             exclude if exclude is not None else [EXPERT_LEAF, ATTN_LEAF]
         ),
-    )
-
-
-def _nextn_conf():
-    return NextNEnabledConfig(
-        num_nextn_layers=1,
-        nextn_layer_id=LAYER,
-        nextn_layer_prefix=PREFIX,
-        nextn_spec_weight_names=[],
     )
 
 
@@ -77,18 +64,9 @@ class TestEnableGlmNextnMoePtpc(CustomTestCase):
             _PTPC_ENV,
             return_value=True,
         ):
-            self.assertTrue(
-                should_apply_glm_nextn_moe_ptpc(_quark_cfg(), LAYER, model_type="glm4")
-            )
+            self.assertTrue(should_apply_glm_nextn_moe_ptpc(_quark_cfg(), LAYER))
             self.assertFalse(
-                should_apply_glm_nextn_moe_ptpc(
-                    _quark_cfg(exclude=[ATTN_LEAF]), LAYER, model_type="glm4"
-                )
-            )
-            self.assertFalse(
-                should_apply_glm_nextn_moe_ptpc(
-                    _quark_cfg(), LAYER, model_type="deepseek_v3"
-                )
+                should_apply_glm_nextn_moe_ptpc(_quark_cfg(exclude=[ATTN_LEAF]), LAYER)
             )
 
 
@@ -150,18 +128,16 @@ class TestResolveNextnQuantConfigPtpcOn(CustomTestCase):
 
 
 class TestMaybeQuantGlmNextnMoeToPtpc(CustomTestCase):
-    def _cast(self, cfg, flag: bool, model_type: str = "glm4"):
-        loader = DeepseekV2WeightLoaderMixin.__new__(DeepseekV2WeightLoaderMixin)
+    def _cast(self, cfg, flag: bool):
+        loader = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
         loader.quant_config = cfg
-        loader.config = SimpleNamespace(model_type=model_type)
+        loader.config = SimpleNamespace(num_hidden_layers=LAYER)
         weights = [(EXPERT_WEIGHT, torch.ones(4, 8, dtype=torch.bfloat16))]
         with patch(
             _PTPC_ENV,
             return_value=flag,
         ):
-            return list(
-                loader._maybe_quant_glm_nextn_moe_to_ptpc(weights, _nextn_conf())
-            )
+            return list(loader._maybe_quant_glm_nextn_moe_to_ptpc(weights))
 
     def test_flag_on_casts_excluded_bf16_experts(self):
         out = self._cast(_quark_cfg(), flag=True)
