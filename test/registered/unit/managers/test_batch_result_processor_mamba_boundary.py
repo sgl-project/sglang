@@ -80,7 +80,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
 
 def _make_result():
     return GenerationBatchResult(
-        logits_output=SimpleNamespace(hidden_states=None, customized_info=None),
+        logits_output=SimpleNamespace(
+            hidden_states=None, customized_info=None, sampling_mask_output=None
+        ),
         next_token_ids=[4],
         speculative_num_draft_tokens=0,
     )
