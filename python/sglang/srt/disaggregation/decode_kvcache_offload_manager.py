@@ -177,6 +177,7 @@ class DecodeKVCacheOffloadManager:
                 virtual_indices
             )
         )
+        # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
         if live_swa_indices.numel() == 0:
             return full_indices, []

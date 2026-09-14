@@ -73,19 +73,11 @@ class L2TransferEngine:
     def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
         prepared = []
         for transfer in transfers:
-            if uses_shared_host_layout(transfer.host_pool):
-                host_indices, device_indices = (
-                    transfer.host_pool.prepare_transfer_indices(
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        self.io_backend,
-                    )
-                )
-            else:
-                host_indices, device_indices = (
-                    transfer.host_indices,
-                    transfer.device_indices,
-                )
+            host_indices, device_indices = transfer.host_pool.prepare_transfer_indices(
+                transfer.host_indices,
+                transfer.device_indices,
+                self.io_backend,
+            )
             prepared.append(
                 transfer._replace(
                     host_indices=host_indices,
@@ -128,20 +120,12 @@ class L2TransferEngine:
             transfers, self.device_to_host_stream, "device_to_host"
         ) as (transfers, completion):
             for transfer in transfers:
-                if uses_shared_host_layout(transfer.host_pool):
-                    transfer.host_pool.backup_from_device_all_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        self.io_backend,
-                    )
-                else:
-                    transfer.host_pool.backup_from_device_all_layer(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        self.io_backend,
-                    )
+                transfer.host_pool.backup_from_device_all_layer_physical(
+                    transfer.device_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    self.io_backend,
+                )
         return completion
 
     def submit_host_to_device(
@@ -169,24 +153,14 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
-                    if uses_shared_host_layout(transfer.host_pool):
-                        transfer.host_pool.load_to_device_per_layer_physical(
-                            transfer.device_pool,
-                            transfer.host_indices,
-                            transfer.device_indices,
-                            local_layer_id,
-                            self.io_backend,
-                            is_draft=transfer.is_draft,
-                        )
-                    else:
-                        transfer.host_pool.load_to_device_per_layer(
-                            transfer.device_pool,
-                            transfer.host_indices,
-                            transfer.device_indices,
-                            local_layer_id,
-                            self.io_backend,
-                            is_draft=transfer.is_draft,
-                        )
+                    transfer.host_pool.load_to_device_per_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        local_layer_id,
+                        self.io_backend,
+                        is_draft=transfer.is_draft,
+                    )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion

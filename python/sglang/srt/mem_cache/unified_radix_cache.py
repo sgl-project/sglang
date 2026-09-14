@@ -43,7 +43,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1323,35 +1322,14 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        anchor_entry = self.host_pool_group.anchor_entry
-        if uses_shared_host_layout(anchor_entry.host_pool):
-            allocation = self.cache_controller.allocate_shared_host_transfers(
-                device_indices, extra_transfers or None
-            )
-            if allocation is None and anchor_entry.host_evict_fn is None:
-                self._reclaim_retraction_host(len(device_indices))
-                allocation = self.cache_controller.allocate_shared_host_transfers(
-                    device_indices, extra_transfers or None
-                )
-            if allocation is None:
-                return None
-            host_indices, resolved = allocation
-        else:
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-            if host_indices is None:
-                self._reclaim_retraction_host(len(device_indices))
-                host_indices = self.host_pool_group.alloc(len(device_indices))
-            if host_indices is None:
-                return None
-
-            resolved = self.host_pool_group.resolve_host_transfers(
-                extra_transfers or None,
-                primary_device_indices=device_indices,
-                primary_host_indices=host_indices,
-            )
-            if resolved is None and extra_transfers:
-                self.host_pool_group.free(host_indices)
-                return None
+        allocation = self.cache_controller.allocate_host_transfers(
+            device_indices,
+            extra_transfers or None,
+            reclaim=self._reclaim_retraction_host,
+        )
+        if allocation is None:
+            return None
+        host_indices, resolved = allocation
 
         backup = RetractionBackup(
             host_indices=host_indices,

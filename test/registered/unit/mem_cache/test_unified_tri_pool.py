@@ -961,11 +961,19 @@ class TestTriFactorySizing(unittest.TestCase):
         return kw
 
     def test_budget_sizing_and_boot_signature(self):
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
         budget = 1 << 20
         bundle = init_unified_mamba_swa_pools(
             **self._factory_kwargs(unified_total_bytes=budget)
         )
         pool = bundle.unified_memory_pool
+        allocator = bundle.token_to_kv_pool_allocator
+        self.assertIsInstance(allocator, UnifiedSWAAllocatorBase)
+        self.assertNotIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
         # Buffer = budget + the state pool's bytes (budget captured AFTER the
         # state carve-out), never the token-count re-sum.
         state_bytes = 4 * pool.spec("mamba").entry_bytes()

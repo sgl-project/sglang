@@ -145,6 +145,26 @@ class LogicalHostPool:
     ):
         pass
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        pass
+
     def load_to_device_per_layer(
         self,
         device_pool,
