@@ -1495,15 +1495,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _validate_positional_embed_overrides_hidden_dim(
         self,
-        positional_embed_overrides: Optional[
-            Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
-        ],
+        positional_embed_overrides: Optional[PositionalEmbeds],
     ) -> None:
-        """Validate any positional embed overrides reaching the scheduler.
+        """Validate the positional embed overrides reaching the scheduler.
 
-        Handles both the single-request shape (``PositionalEmbeds``) and the
-        score-request shape (``List[Optional[PositionalEmbeds]]``). Skips None
-        entries. No-op when the request carries no overrides.
+        Called from ``_create_tokenized_object``, which always operates on a
+        single request: batch and score requests are split via ``obj[i]`` before
+        this point, and ``__getitem__`` already reduces a per-item list to its
+        i-th element. The only valid shapes here are therefore a single
+        ``PositionalEmbeds`` or ``None``; a list is rejected rather than iterated,
+        since ``TokenizedGenerateReqInput``/``TokenizedEmbeddingReqInput`` are
+        typed ``Optional[PositionalEmbeds]`` and a list (even ``[null]``) would
+        otherwise be forwarded and fail opaquely inside the scheduler.
 
         The field is typed ``Any`` on the request dataclasses and those are used
         directly as FastAPI bodies, so arbitrary JSON can land here. Anything that
@@ -1515,24 +1518,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """
         if positional_embed_overrides is None:
             return
-        expected = self.model_config.hidden_size
-        if isinstance(positional_embed_overrides, PositionalEmbeds):
-            positional_embed_overrides.validate_hidden_dim(expected)
-        elif isinstance(positional_embed_overrides, (list, tuple)):
-            for item in positional_embed_overrides:
-                if item is None:
-                    continue
-                if not isinstance(item, PositionalEmbeds):
-                    raise ValueError(
-                        "positional_embed_overrides entries must be PositionalEmbeds "
-                        f"or null, got {type(item).__name__}."
-                    )
-                item.validate_hidden_dim(expected)
-        else:
+        if not isinstance(positional_embed_overrides, PositionalEmbeds):
             raise ValueError(
-                "positional_embed_overrides must be a PositionalEmbeds or a list of "
-                f"them, got {type(positional_embed_overrides).__name__}."
+                "positional_embed_overrides must be a PositionalEmbeds or null, got "
+                f"{type(positional_embed_overrides).__name__}."
             )
+        positional_embed_overrides.validate_hidden_dim(self.model_config.hidden_size)
 
     @staticmethod
     def _resolve_embed_overrides(

@@ -118,38 +118,37 @@ class TestValidatePositionalEmbedOverridesHiddenDim(CustomTestCase):
         with self.assertRaises(ValueError):
             self._tm()._validate_positional_embed_overrides_hidden_dim(pe)
 
-    def test_list_skips_none_entries(self):
+    def test_list_is_rejected(self):
+        # _create_tokenized_object always receives a single request -- batch and
+        # score requests are split via obj[i] first, and __getitem__ already
+        # reduces a per-item list to its i-th element -- and the
+        # Tokenized*ReqInput field is typed Optional[PositionalEmbeds]. A list
+        # must therefore be rejected here rather than iterated: otherwise a
+        # payload such as [null] passes validation and is forwarded to the
+        # scheduler, where it fails opaquely as an HTTP 500 instead of the
+        # actionable HTTP 400 this validation exists to produce.
         pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
-        self._tm()._validate_positional_embed_overrides_hidden_dim([None, pe, None])
+        for bogus in ([None], [pe], [None, pe], (pe,), []):
+            with self.subTest(bogus=bogus):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
+                    self._tm()._validate_positional_embed_overrides_hidden_dim(bogus)
 
-    def test_list_mismatch_raises(self):
-        good = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
-        bad = PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 3)], positions=[0])
-        with self.assertRaises(ValueError):
-            self._tm()._validate_positional_embed_overrides_hidden_dim([good, bad])
-
-    def test_non_positional_embeds_entry_raises(self):
+    def test_non_positional_embeds_value_raises(self):
         # positional_embed_overrides is typed Any and bound straight from the
         # FastAPI body, so a raw JSON value can land here. It must be rejected
         # as ValueError (-> HTTP 400) rather than forwarded to the scheduler,
         # where msgpack_decode would raise outside any handler and kill the
         # process.
-        for bogus in ([{"embeds": [[1, 2]], "positions": [0]}], ["str"], [123]):
-            with self.subTest(bogus=bogus):
-                with self.assertRaisesRegex(ValueError, "must be PositionalEmbeds"):
-                    self._tm()._validate_positional_embed_overrides_hidden_dim(bogus)
-
-    def test_non_list_non_struct_raises(self):
-        for bogus in (5, "abc", {"embeds": 1}):
+        for bogus in (
+            {"embeds": [[1, 2]], "positions": [0]},
+            "abc",
+            5,
+            {"embeds": 1},
+            [{"embeds": [[1, 2]], "positions": [0]}],
+        ):
             with self.subTest(bogus=bogus):
                 with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
                     self._tm()._validate_positional_embed_overrides_hidden_dim(bogus)
-
-    def test_all_none_list_is_noop(self):
-        # A list whose only entry is None previously passed validation and then
-        # failed msgpack_decode in the scheduler; it is a legitimate no-op, but
-        # it must stay a no-op rather than becoming a forwarded malformed value.
-        self._tm()._validate_positional_embed_overrides_hidden_dim([None])
 
 
 class TestPositionalEmbedsRankAndEmptiness(CustomTestCase):
