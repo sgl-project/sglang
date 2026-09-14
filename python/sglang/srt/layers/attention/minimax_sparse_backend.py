@@ -158,8 +158,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
-        self._verify_meta_eager = None
-        self._small_extend_meta_cache = None
+        self._eager_verify_row_meta = None
+        self._small_extend_row_meta = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -408,9 +408,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens
             )
             if rows > 0 and rows not in self._decode_topk_buf:
-                _nkv = self.kv_pool.main_pool.head_num
+                num_kv_heads = self.kv_pool.main_pool.head_num
                 self._decode_topk_buf[rows] = torch.empty(
-                    (_nkv, rows, self.topk_blocks * self._idx_group_size),
+                    (num_kv_heads, rows, self.topk_blocks * self._idx_group_size),
                     dtype=torch.int32,
                     device=forward_batch.seq_lens.device,
                 )
@@ -1410,43 +1410,51 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     SMALL_EXTEND_MAX_TOKENS = 8
 
     def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
-        ext = forward_batch.extend_seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
         return (
             not self.is_npu
             and forward_batch.forward_mode == ForwardMode.EXTEND
-            and ext is not None
-            and len(ext) > 0
-            and max(ext) <= self.SMALL_EXTEND_MAX_TOKENS
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and max(extend_lens) <= self.SMALL_EXTEND_MAX_TOKENS
             and forward_batch.extend_prefix_lens_cpu is not None
             and forward_batch.req_pool_indices is not None
         )
 
-    def _small_extend_meta(self, forward_batch: ForwardBatch, disable_value: bool):
+    def _small_extend_row_meta_for(
+        self, forward_batch: ForwardBatch, disable_value: bool
+    ):
         """Per-row metadata for a small extend, built once per forward batch."""
-        cached = self._small_extend_meta_cache
+        cached = self._small_extend_row_meta
         if cached is not None and cached[0] is forward_batch:
             return cached[1]
-        ext = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-        prefix = [int(x) for x in forward_batch.extend_prefix_lens_cpu]
-        dev = forward_batch.seq_lens.device
+        extend_lens = [int(n) for n in forward_batch.extend_seq_lens_cpu]
+        prefix_lens = [int(n) for n in forward_batch.extend_prefix_lens_cpu]
+        device = forward_batch.seq_lens.device
         per_query_req = forward_batch.req_pool_indices.repeat_interleave(
-            torch.tensor(ext, dtype=torch.int64, device=dev)
+            torch.tensor(extend_lens, dtype=torch.int64, device=device)
         )
         per_query_seq_lens = torch.tensor(
-            [p + j + 1 for p, e in zip(prefix, ext) for j in range(e)],
+            [
+                prefix + j + 1
+                for prefix, extend in zip(prefix_lens, extend_lens)
+                for j in range(extend)
+            ],
             dtype=forward_batch.seq_lens.dtype,
-            device=dev,
+            device=device,
         )
-        meta = SimpleNamespace(
+        row_meta = SimpleNamespace(
             per_query_req=per_query_req,
             per_query_seq_lens=per_query_seq_lens,
-            max_seqlen=max(p + e for p, e in zip(prefix, ext)),
-            # Packed per-request index scoring needs equal row counts.
-            packed=ext[0] if all(e == ext[0] for e in ext) else 1,
-            rows=sum(ext),
+            max_seqlen=max(p + e for p, e in zip(prefix_lens, extend_lens)),
+            # packed scoring needs equal row counts, so ragged batches score per row
+            packed=extend_lens[0]
+            if all(e == extend_lens[0] for e in extend_lens)
+            else 1,
+            rows=sum(extend_lens),
         )
-        self._small_extend_meta_cache = (forward_batch, meta)
-        return meta
+        self._small_extend_row_meta = (forward_batch, row_meta)
+        return row_meta
 
     def _forward_gpu_triton_small_extend(
         self,
@@ -1469,27 +1477,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             minimax_sparse_decode,
         )
 
-        meta = self._small_extend_meta(forward_batch, disable_value)
-        rows = meta.rows
-        _use_reuse = self.index_cache_enabled and disable_value
-        _topk_buf = None
-        if _use_reuse:
-            _topk_buf = self._decode_topk_buf.get(rows)
-            if _topk_buf is None:
-                _nkv = self.kv_pool.main_pool.head_num
-                _topk_buf = torch.empty(
-                    (_nkv, rows, self.topk_blocks * self._idx_group_size),
+        row_meta = self._small_extend_row_meta_for(forward_batch, disable_value)
+        rows = row_meta.rows
+        reuse_topk = self.index_cache_enabled and disable_value
+        topk_buf = None
+        if reuse_topk:
+            topk_buf = self._decode_topk_buf.get(rows)
+            if topk_buf is None:
+                num_kv_heads = self.kv_pool.main_pool.head_num
+                topk_buf = torch.empty(
+                    (num_kv_heads, rows, self.topk_blocks * self._idx_group_size),
                     dtype=torch.int32,
                     device=q.device,
                 )
-                self._decode_topk_buf[rows] = _topk_buf
-        _cached_topk = None
-        _want_topk = False
-        if _use_reuse:
+                self._decode_topk_buf[rows] = topk_buf
+        cached_topk = None
+        publish_topk = False
+        if reuse_topk:
             if self._topk_is_source.get(layer.layer_id, True):
-                _want_topk = True
+                publish_topk = True
             else:
-                _cached_topk = _topk_buf
+                cached_topk = topk_buf
 
         idx_o, o = minimax_sparse_decode(
             q,
@@ -1501,9 +1509,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache,
             idx_v_cache,
             self.req_to_token,
-            meta.per_query_req,
-            meta.per_query_seq_lens,
-            int(meta.max_seqlen),
+            row_meta.per_query_req,
+            row_meta.per_query_seq_lens,
+            int(row_meta.max_seqlen),
             1,
             self.block_size_k,
             self.topk_blocks,
@@ -1520,9 +1528,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
-            cached_topk_idx=_cached_topk,
-            topk_out=_topk_buf if _want_topk else None,
-            packed_queries=int(meta.packed) if disable_value else 1,
+            cached_topk_idx=cached_topk,
+            topk_out=topk_buf if publish_topk else None,
+            packed_queries=int(row_meta.packed) if disable_value else 1,
         )
         return idx_o, o
 
@@ -1551,19 +1559,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         bs = forward_batch.seq_lens.shape[0]
         num_tokens = q.shape[0]
         ndt = num_tokens // max(bs, 1)
-        vmeta = self._verify_meta_cg.get((bs, ndt))
-        if vmeta is None:
+        row_meta = self._verify_meta_cg.get((bs, ndt))
+        if row_meta is None:
             # eager verify: the row metadata is layer-invariant, so build it once per forward
-            cached = self._verify_meta_eager
+            cached = self._eager_verify_row_meta
             if cached is not None and cached[0] is forward_batch:
-                vmeta = cached[1]
+                row_meta = cached[1]
             else:
                 # seq_lens is the prefix length on GPU verify batches
                 prefix = forward_batch.seq_lens.to(torch.long)
                 offsets = torch.arange(
                     1, int(ndt) + 1, device=q.device, dtype=torch.long
                 )
-                vmeta = SimpleNamespace(
+                row_meta = SimpleNamespace(
                     per_query_seq_lens=(prefix.unsqueeze(1) + offsets.unsqueeze(0))
                     .reshape(-1)
                     .to(forward_batch.seq_lens.dtype),
@@ -1571,24 +1579,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         int(ndt)
                     ),
                 )
-                self._verify_meta_eager = (forward_batch, vmeta)
-        per_query_seq_lens = vmeta.per_query_seq_lens
-        per_query_req = vmeta.per_query_req
+                self._eager_verify_row_meta = (forward_batch, row_meta)
+        per_query_seq_lens = row_meta.per_query_seq_lens
+        per_query_req = row_meta.per_query_req
         per_query_req = per_query_req.to(forward_batch.req_pool_indices.dtype)
         per_query_seq_lens = per_query_seq_lens.to(forward_batch.seq_lens.dtype)
         # _max_seqlen_k bounds the prefix, so add the draft tail
         max_seqlen = int(self._max_seqlen_k) + int(ndt)
 
         # index top-k reuse: the group's source layer publishes, the others skip scoring
-        _use_reuse = self.index_cache_enabled and disable_value
-        _topk_buf = self._decode_topk_buf.get(num_tokens) if _use_reuse else None
-        _cached_topk = None
-        _want_topk = False
-        if _use_reuse and _topk_buf is not None:
+        reuse_topk = self.index_cache_enabled and disable_value
+        topk_buf = self._decode_topk_buf.get(num_tokens) if reuse_topk else None
+        cached_topk = None
+        publish_topk = False
+        if reuse_topk and topk_buf is not None:
             if self._topk_is_source.get(layer.layer_id, True):
-                _want_topk = True
+                publish_topk = True
             else:
-                _cached_topk = _topk_buf
+                cached_topk = topk_buf
 
         idx_o, o = minimax_sparse_decode(
             q,
@@ -1619,8 +1627,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
-            cached_topk_idx=_cached_topk,
-            topk_out=_topk_buf if _want_topk else None,
+            cached_topk_idx=cached_topk,
+            topk_out=topk_buf if publish_topk else None,
             # packing is a score-only shortcut, so value layers stay per-row
             packed_queries=int(ndt) if disable_value else 1,
         )

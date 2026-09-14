@@ -868,7 +868,7 @@ def flash_decode_with_topk_idx(
     if pack > 1:
         assert disable_index_value and not use_dense_main_attn
         assert batch_size % pack == 0
-        rows_seq_lens, rows_slot_ids, rows_batch, rows_heads = (
+        row_seq_lens, row_slot_ids, num_rows, heads_per_row = (
             seq_lens,
             slot_ids,
             batch_size,
@@ -877,8 +877,8 @@ def flash_decode_with_topk_idx(
         batch_size = batch_size // pack
         q = q.reshape(batch_size, pack * num_q_heads, head_dim)
         num_q_heads = pack * num_q_heads
-        seq_lens = rows_seq_lens.view(batch_size, pack)[:, -1].contiguous()
-        slot_ids = rows_slot_ids.view(batch_size, pack)[:, 0].contiguous()
+        seq_lens = row_seq_lens.view(batch_size, pack)[:, -1].contiguous()
+        slot_ids = row_slot_ids.view(batch_size, pack)[:, 0].contiguous()
     gqa_group_size = num_q_heads // num_kv_heads
     # sm scale
     if sm_scale is None:
@@ -1027,21 +1027,20 @@ def flash_decode_with_topk_idx(
     # The page table + per-query effective KV length are allocated and returned.
     if pack > 1:
         # [pack*H, bs, blocks] -> [H, bs*pack, blocks], request-major rows
-        H = rows_heads
         score = (
-            score.view(pack, H, batch_size, score.shape[2])
+            score.view(pack, heads_per_row, batch_size, score.shape[2])
             .permute(1, 2, 0, 3)
-            .reshape(H, batch_size * pack, score.shape[2])
+            .reshape(heads_per_row, batch_size * pack, score.shape[2])
         )
-        batch_size, num_q_heads = rows_batch, rows_heads
-        seq_lens, slot_ids = rows_seq_lens, rows_slot_ids
+        batch_size, num_q_heads = num_rows, heads_per_row
+        seq_lens, slot_ids = row_seq_lens, row_slot_ids
         if local_blocks > 0:
             # the kernel forced only the longest row's local blocks, so re-force each row's own
             num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
-            blocks = torch.arange(score.shape[2], device=score.device)
+            block_ids = torch.arange(score.shape[2], device=score.device)
             is_local = (
-                blocks[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
-            ) & (blocks[None, :] < num_blocks[:, None])
+                block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
+            ) & (block_ids[None, :] < num_blocks[:, None])
             score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
