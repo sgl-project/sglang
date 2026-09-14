@@ -276,6 +276,117 @@ class TestHostMemoryBudget(CustomTestCase):
         ):
             self.assertEqual(base.ranks_per_host(), 8)
 
+    def _budget_in_group(self, own_reading, peer_readings, ranks=8):
+        # The reduce stands in for the gloo collective: every rank of the
+        # sync group contributes its own psutil reading and all of them get
+        # the minimum back.
+        fake_group = object()
+        seen = {}
+
+        def fake_all_reduce(tensor, op, group):
+            seen["op"] = op
+            seen["group"] = group
+            seen["dtype"] = tensor.dtype
+            tensor.fill_(min([int(tensor.item()), *peer_readings]))
+
+        fake_mem = unittest.mock.Mock(available=own_reading)
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
+            unittest.mock.patch.object(
+                base.psutil, "virtual_memory", return_value=fake_mem
+            ),
+            unittest.mock.patch.object(
+                base, "host_memory_sync_group", return_value=fake_group
+            ),
+            unittest.mock.patch.object(
+                base.torch.distributed, "all_reduce", side_effect=fake_all_reduce
+            ),
+        ):
+            budget = base.host_memory_budget_bytes()
+        return budget, seen, fake_group
+
+    def test_budget_is_sized_from_the_group_wide_minimum_reading(self):
+        # Co-located ranks reach a pool's sizing guard at different times; the
+        # split is only right when all of them size against one reading taken
+        # before any of them allocates, and the lowest reading is the one that
+        # already reflects every pool the group built earlier.
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        budget, seen, fake_group = self._budget_in_group(
+            own_reading=reserve + 64 * gib,
+            peer_readings=[reserve + 96 * gib, reserve + 40 * gib],
+        )
+        self.assertEqual(budget, 40 * gib // 8)
+        self.assertEqual(seen["op"], torch.distributed.ReduceOp.MIN)
+        self.assertIs(seen["group"], fake_group)
+        # Byte counts must not go through a float that rounds them.
+        self.assertEqual(seen["dtype"], torch.int64)
+
+    def test_budget_reads_locally_without_a_sync_group(self):
+        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=8),
+            unittest.mock.patch.object(
+                base.psutil, "virtual_memory", return_value=fake_mem
+            ),
+            unittest.mock.patch.object(
+                base, "host_memory_sync_group", return_value=None
+            ),
+            unittest.mock.patch.object(
+                base.torch.distributed, "all_reduce"
+            ) as all_reduce,
+        ):
+            budget = base.host_memory_budget_bytes()
+        all_reduce.assert_not_called()
+        self.assertEqual(
+            budget, (self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
+        )
+
+    def test_sync_group_is_the_tp_cpu_group(self):
+        # TP ranks of one pipeline stage build the same host pools in the same
+        # order, so a collective issued once per pool is matched on all of
+        # them; pipeline stages are not (they own different layers).
+        cpu_group = object()
+        fake_tp_group = unittest.mock.Mock(world_size=8, cpu_group=cpu_group)
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ),
+            unittest.mock.patch.object(
+                base, "get_tp_group", return_value=fake_tp_group
+            ),
+        ):
+            self.assertIs(base.host_memory_sync_group(), cpu_group)
+
+    def test_single_rank_has_no_sync_group(self):
+        fake_tp_group = unittest.mock.Mock(world_size=1, cpu_group=object())
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ),
+            unittest.mock.patch.object(
+                base, "get_tp_group", return_value=fake_tp_group
+            ),
+        ):
+            self.assertIsNone(base.host_memory_sync_group())
+
+    def test_no_sync_group_before_distributed_init(self):
+        with unittest.mock.patch.object(
+            torch.distributed, "is_initialized", return_value=False
+        ):
+            self.assertIsNone(base.host_memory_sync_group())
+
+    def test_no_sync_group_before_the_tp_group_is_built(self):
+        with (
+            unittest.mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ),
+            unittest.mock.patch.object(
+                base, "get_tp_group", side_effect=AssertionError("not initialized")
+            ),
+        ):
+            self.assertIsNone(base.host_memory_sync_group())
+
 
 class TestHostPoolGroup(CustomTestCase):
     @staticmethod
