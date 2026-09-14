@@ -264,7 +264,7 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
             f"{key}_{value}" for key, value in sorted(algorithm_kwargs.items())
         ]
         variant = f"{'_'.join(variant_parts)}_" if variant_parts else ""
-        return f"{self.name}_{ipc_domain_count}node_{variant}" f"{threads_per_block}TPB"
+        return f"{self.name}_{ipc_domain_count}node_{variant}{threads_per_block}TPB"
 
 
 @dataclass(kw_only=True)
@@ -1052,9 +1052,9 @@ class PyMscclppCommunicator:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)

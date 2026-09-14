@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -20,6 +21,12 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -40,7 +47,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -130,6 +141,19 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _qsa_index_share_requested(hf_config) -> bool:
+    """--json-model-override-args writes top-level hf_config attributes, while
+    checkpoint configs carry the flag on the nested text_config; read both."""
+    text_config = getattr(hf_config, "text_config", hf_config)
+    return bool(
+        getattr(
+            text_config,
+            "index_share_for_mtp_iteration",
+            getattr(hf_config, "index_share_for_mtp_iteration", False),
+        )
+    )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -170,8 +194,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            ctx,
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -265,8 +293,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            else None
+        )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -337,6 +370,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
+            qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
         )
 
         # Initialize decode attention backend
@@ -350,7 +384,57 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
+
+    def _configure_qsa_mtp_index_share(self) -> None:
+        """Reuse the draft-extend QSA selection across the MTP decode steps;
+        chain speculation only: with topk > 1 decode rows are not request-major."""
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+        hf_config = self.draft_runner.model_config.hf_config
+        if (
+            not _qsa_index_share_requested(hf_config)
+            or self.topk != 1
+            or self.speculative_num_steps <= 1
+            or not isinstance(self.draft_attn_backend, QwenSparseMultiStepDraftBackend)
+            or not isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
+        ):
+            return
+        if get_spec().speculative_adaptive:
+            # Adaptive speculation switches SpecRuntimeState between the draft-extend
+            # capture and the decode lookup; per-state index buffers would not match.
+            logger.warning(
+                "index_share_for_mtp_iteration is disabled under adaptive "
+                "speculative decoding"
+            )
+            return
+        layer_ids = sorted(
+            {
+                module.layer_id
+                for module in self.draft_runner.model.modules()
+                if isinstance(module, QSAIndexer)
+            }
+        )
+        if not layer_ids:
+            return
+        pool = self.draft_runner.token_to_kv_pool
+        # The expansion emits token_topk + ratio - 1 columns (top-k blocks
+        # plus the uncompressed tail of the capture position).
+        expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
+        state = QSAMTPSharedSparseIndices(
+            layer_ids=layer_ids,
+            num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
+            token_topk=expanded_width,
+            tail_width=get_spec().speculative_num_steps + 1,
+            device=self.draft_runner.device,
+        )
+        for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
+            backend.set_mtp_shared_sparse_indices(state)
+        logger.info(
+            "QSA MTP index sharing enabled: draft decode steps reuse the "
+            f"draft-extend selection for layers {layer_ids}"
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -436,6 +520,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TRTLLMHAAttnBackend,
             TokenspeedMLABackend,
             FlashInferAttnBackend,
+            QwenSparseAttnBackend,
         ]
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
@@ -797,16 +882,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+
             new_input_ids = torch.empty_like(batch.input_ids)
+            if mm_input_embeds is not None:
+                # Rotate mm embeddings the same way as input_ids: shift left by
+                # one per request so they stay aligned with the rotated ids. The
+                # last position per request is filled by the draft model's own
+                # embed_tokens lookup on next_token_ids (see DeepseekModelNextN).
+                rotated_mm = torch.empty_like(mm_input_embeds)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 new_input_ids[pt : pt + extend_len].copy_(
                     torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
+                if mm_input_embeds is not None:
+                    rotated_mm[pt : pt + extend_len - 1].copy_(
+                        mm_input_embeds[pt + 1 : pt + extend_len]
+                    )
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
+            if mm_input_embeds is not None:
+                mm_input_embeds = rotated_mm
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -893,11 +991,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
+                (num_tokens, self.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
@@ -978,7 +1075,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, select_index
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -999,24 +1096,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = (
-                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
-                )
+                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+        if not can_run_decode_cuda_graph:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+        # Selected-row top-k remains worker-owned for both graph and eager
+        # paths; the graph runner only moves the row selection before lm_head.
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
@@ -1169,7 +1265,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        pp_proxy_tensors=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill

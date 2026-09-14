@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 
 # DeepSeek-V3 channel-INT8 + MTP smoke; int8 GEMM numerics live in
 # unit/layers/quantization/test_int8_linear_methods.py
-register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=118, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):

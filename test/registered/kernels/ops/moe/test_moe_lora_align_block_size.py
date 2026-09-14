@@ -159,9 +159,9 @@ def test_moe_lora_align_block_size(
 
                 # Check that all tokens in this block truly belong to 'lora_idx'
                 actual_owners = token_ownership[original_token_indices]
-                assert torch.all(
-                    actual_owners == lora_idx
-                ), f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
+                assert torch.all(actual_owners == lora_idx), (
+                    f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
+                )
 
 
 if __name__ == "__main__":

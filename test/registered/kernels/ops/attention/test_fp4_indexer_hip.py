@@ -751,6 +751,9 @@ def test_pinned_schedule_matches_unpinned_logits(is_decode: bool) -> None:
             case["page_table"], case["c4_seq_lens"]
         )
         pinned = _run_logits(case, is_decode=False, prefill_ws=workspace)
+    # Prefill scores are views of one pooled block, so the second call would
+    # otherwise hand back the same memory and compare it against itself.
+    pinned = pinned.clone()
     unpinned = _run_logits(case, is_decode=is_decode)
 
     seq_len = case["seq_len"]
@@ -770,6 +773,56 @@ def test_stale_workspace_row_count_falls_back_to_inline_schedule() -> None:
 
     seq_len = case["seq_len"]
     torch.testing.assert_close(with_stale[:, :seq_len], without[:, :seq_len])
+
+
+def test_prefill_logits_come_from_one_pooled_block() -> None:
+    """Prefill must score into one constant-size block, not a per-call rectangle.
+
+    The logits width tracks context length, so a fresh allocation per call feeds
+    the caching allocator a growing size sequence: each request outgrows every
+    cached block and strands a segment, until an allocator that bypasses torch
+    (Triton kernel scratch) is refused. One pooled block keeps the request size
+    constant, which is what makes the blocks reusable.
+    """
+    torch.manual_seed(14)
+    narrow = _run_logits(_build_logits_case(2, 256), is_decode=False)
+    wide = _run_logits(_build_logits_case(4, 512), is_decode=False)
+
+    assert narrow.shape != wide.shape
+    assert narrow.data_ptr() == wide.data_ptr()
+
+
+def test_row_chunks_reproduce_the_unsplit_batch() -> None:
+    """Rows are scored and reduced independently, which is what lets callers chunk.
+
+    ``forward_c4_indexer`` splits prefill rows to whatever fits the pooled block,
+    so a chunk must score its rows exactly as an unsplit call would.
+    """
+    torch.manual_seed(15)
+    batch, chunk_rows = 6, 2
+    case = _build_logits_case(batch, 512)
+    # Cloned: the chunk calls below score into the same pooled block.
+    full = _run_logits(case, is_decode=False).clone()
+
+    for start in range(0, batch, chunk_rows):
+        rows = slice(start, start + chunk_rows)
+        chunk = aiter_fp4_paged_mqa_logits(
+            q_fp4=case["q_fp4"][rows],
+            q_scale=case["q_scale"][rows],
+            k_payload=case["payload"],
+            k_scale=case["scale"],
+            weights=case["weights"][rows],
+            page_table=case["page_table"][rows],
+            c4_seq_lens=case["c4_seq_lens"][rows],
+            weight_scale=case["weight_scale"],
+            is_decode=False,
+        )
+        for row, ctx in enumerate(case["context"][rows].tolist()):
+            torch.testing.assert_close(
+                chunk[row, :ctx],
+                full[start + row, :ctx],
+                msg=f"row {start + row} (ctx={ctx})",
+            )
 
 
 if __name__ == "__main__":

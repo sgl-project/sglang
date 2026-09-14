@@ -243,8 +243,7 @@ def main():
             else:
                 speedup = f"{legacy_us / us:.2f}x"
             print(
-                f"{s_q:>5} {kv_len:>7} {name:>10} {us:>9.1f} "
-                f"{tbps:>9.3f} {speedup:>8}"
+                f"{s_q:>5} {kv_len:>7} {name:>10} {us:>9.1f} {tbps:>9.3f} {speedup:>8}"
             )
         print()
 

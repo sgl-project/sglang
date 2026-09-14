@@ -23,9 +23,9 @@ class HostTensorAllocator:
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        assert (
-            device == "cpu"
-        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+        assert device == "cpu", (
+            f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+        )
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
@@ -46,9 +46,9 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         return self.mms[0] if self.mms else None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        assert (
-            device == "cpu"
-        ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        assert device == "cpu", (
+            f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        )
         self.dtype = dtype
         self.dims = dims
         from sglang.srt.mem_cache.storage.mmap import alloc_shm
@@ -189,8 +189,7 @@ def _cuda_host_unregister_ranges(
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
-                "cudaHostUnregister failed during %s (rc=%d, %s) "
-                "for ptr=%#x size=%d",
+                "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
                 cudart.cudaGetErrorString(rc),
@@ -249,6 +248,32 @@ def alloc_with_pin_memory(
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
+
+
+def make_kernel_ptr_table(
+    tensors: list[torch.Tensor],
+    target_device: torch.device | str,
+    *,
+    host_memory_registered: bool,
+) -> torch.Tensor:
+    device = torch.device(target_device)
+    if host_memory_registered and device.type == "cuda":
+        from sgl_kernel.kvcacheio import get_device_accessible_ptr
+
+        if device.index is None:
+            device_index = torch.cuda.current_device()
+        else:
+            device_index = device.index
+        pointers = [
+            get_device_accessible_ptr(tensor, device_index) for tensor in tensors
+        ]
+    else:
+        pointers = [tensor.data_ptr() for tensor in tensors]
+    return torch.tensor(
+        pointers,
+        dtype=torch.uint64,
+        device=device,
+    )
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(

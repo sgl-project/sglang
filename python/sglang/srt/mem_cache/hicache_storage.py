@@ -129,7 +129,7 @@ class PoolTransferResult:
     extra_pool_hit_pages: dict[str, int]
 
     # Pools with TRAILING_PAGES (SWA, Mamba state) only hold a window that ends on an
-    # offloaded node boundary.
+    # offloaded node boundary, so 5 can be restorable while 4 and 3 are not.
     # Each rank owns its own shard and may hold a different set, so reducing a
     # per-rank maximum would pick a length that is illegal on another rank; the
     # caller intersects these sets instead.
@@ -371,7 +371,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -534,10 +533,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            tmp_path = (
-                f"{tensor_path}.tmp."
-                f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-            )
+            tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
             self._evictor.commit(suffixed)
