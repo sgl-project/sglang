@@ -1510,21 +1510,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node = self.arena.node_mut(root_id);
             node.priority = node.priority.max(params.priority);
         }
-        if let Some(rotation_base) = params.rotation_base {
-            if let Some((prefix_len, node_id)) =
+        if let Some(rotation_base) = params.rotation_base
+            && let Some((prefix_len, node_id)) =
                 self.rotation_conflict_(params, aligned_key_len, rotation_base)
-            {
-                return Ok(InsertStepResult {
-                    actions: Vec::new(),
-                    result: Some(InsertResult {
-                        prefix_len,
-                        last_device_node_id: Some(self.arena.node(node_id).id),
-                        rotation_tail_declined: true,
-                        adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-                        ..InsertResult::default()
-                    }),
-                });
-            }
+        {
+            return Ok(InsertStepResult {
+                actions: Vec::new(),
+                result: Some(InsertResult {
+                    prefix_len,
+                    last_device_node_id: Some(self.arena.node(node_id).id),
+                    rotation_tail_declined: true,
+                    adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                    ..InsertResult::default()
+                }),
+            });
         }
         // The walk reads only [0, aligned_key_len); the ragged tail never enters.
         self.ongoing_insert_walk_state = Some(InsertWalkState {
@@ -2765,10 +2764,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             };
             *tracker.entry(component_type).or_insert(0) += freed;
         }
-        if component_type == BASE_COMPONENT_TYPE && !had_host_copy {
-            if let Some(unbacked_tokens) = self.tracked_unbacked_tokens.as_mut() {
-                *unbacked_tokens += device_freed;
-            }
+        if component_type == BASE_COMPONENT_TYPE
+            && !had_host_copy
+            && let Some(unbacked_tokens) = self.tracked_unbacked_tokens.as_mut()
+        {
+            *unbacked_tokens += device_freed;
         }
 
         // Detach from the targeted LRU list(s).
