@@ -32,7 +32,9 @@ from sglang.srt.runtime_context import get_observability
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -90,6 +92,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
     # Logical-page KV sharding: rotation base of the chain the inserted
@@ -331,6 +334,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    buffer_pipeline: Optional[BufferModePipeline] = None
+    storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
@@ -488,6 +493,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
+    def swa_transient_size(self):
+        """Allocated SWA tokens owned outside the request and tree views."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 
@@ -497,9 +506,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> Optional[Tuple[torch.Tensor, Any]]:
         """
-        Preparing KV cache loading from host to device.
+        Prepare host-to-device loading. None means retry admission; an empty
+        tensor can be a successful auxiliary-only load or a recompute fallback.
         """
         raise NotImplementedError()
 
