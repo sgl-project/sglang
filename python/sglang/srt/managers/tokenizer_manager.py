@@ -29,12 +29,12 @@ import threading
 import time
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
 import numpy as np
@@ -86,7 +86,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
     async_sock_recv,
     async_sock_send,
     build_flat_input_top_logprobs_arrays,
@@ -232,6 +231,7 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    abort_requested: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -641,11 +641,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
-        self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
-            None
-        )
-        self.model_update_expected_workers = self.elastic_worker_count
-        self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
@@ -755,10 +750,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
-                (
-                    UpdateWeightFromDiskReqOutput,
-                    self._handle_update_weights_from_disk_req_output,
-                ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
@@ -813,19 +804,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-            async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
-
-            async with self.model_update_lock.reader_lock:
+            async with self._generation_admission(obj):
                 await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
                     state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    await self._send_one_request(tokenized_obj)
+                    if state.abort_requested:
+                        self._finish_pending_abort(obj.rid)
+                    else:
+                        tokenized_obj = await self._tokenize_one_request(obj)
+                        if obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        await self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -843,6 +834,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_rids)
             raise
+
+    @asynccontextmanager
+    async def _generation_admission(self, obj):
+        rids = [obj.rid] if obj.is_single else obj.rid
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(
+                lambda: (
+                    not self.is_pause
+                    or all(self.rid_to_state[rid].abort_requested for rid in rids)
+                )
+            )
+            # Register the reader before a control operation can close admission.
+            await self.model_update_lock.acquire_reader()
+        try:
+            yield
+        finally:
+            await self.model_update_lock.release_reader()
+
+    def _mark_abort_requests(self, rid: str, abort_all: bool) -> None:
+        if not abort_all and not rid:
+            return
+        for request_id, state in self.rid_to_state.items():
+            if abort_all or request_id.startswith(rid):
+                state.abort_requested = True
+
+    def _finish_pending_abort(self, rid: str) -> None:
+        state = self.rid_to_state[rid]
+        if state.finished:
+            return
+        self._handle_abort_req(
+            AbortReq(rid=rid, abort_message="Aborted before scheduler submission")
+        )
+        # The generator has not entered _wait_one_response yet.
+        self.rid_to_state[rid] = state
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1590,6 +1615,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if self.rid_to_state[tokenized_obj.rid].abort_requested:
+            self._finish_pending_abort(tokenized_obj.rid)
+            return
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1598,6 +1626,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            # Feature publication yields; an abort can arrive before IPC enqueue.
+            if self.rid_to_state[tokenized_obj.rid].abort_requested:
+                self._finish_pending_abort(tokenized_obj.rid)
+                return
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
@@ -1631,6 +1663,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        tokenized_objs = self._filter_aborted_requests(tokenized_objs)
+        if not tokenized_objs:
+            return
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1639,6 +1674,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            live = self._filter_aborted_requests(tokenized_objs)
+            if len(live) != len(tokenized_objs):
+                live_items = {
+                    id(item)
+                    for obj in live
+                    if obj.mm_inputs is not None
+                    for item in obj.mm_inputs.mm_items
+                }
+                self.cuda_vmm_feature_transport.cancel_for_dispatch(
+                    [item for item in prepared_mm_items if id(item) not in live_items]
+                )
+                prepared_mm_items = [
+                    item for item in prepared_mm_items if id(item) in live_items
+                ]
+                tokenized_objs = live
+                if not tokenized_objs:
+                    return
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
@@ -1660,6 +1712,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+
+    def _filter_aborted_requests(self, tokenized_objs):
+        live = []
+        for obj in tokenized_objs:
+            if self.rid_to_state[obj.rid].abort_requested:
+                self._finish_pending_abort(obj.rid)
+            else:
+                live.append(obj)
+        return live
 
     def _coalesce_streaming_chunks(
         self,
@@ -1813,6 +1874,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out = build_beam_search_out(out)
 
             if finished:
+                if self.rid_to_state.get(obj.rid) is state:
+                    self.rid_to_state.pop(obj.rid)
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -1937,6 +2000,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 request_rids.add(tmp_obj.rid)
+                self.rid_to_state[tmp_obj.rid].abort_requested = self.rid_to_state[
+                    objs[i].rid
+                ].abort_requested
                 await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -1955,6 +2021,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
+                    state.abort_requested = self.rid_to_state[
+                        objs[i].rid
+                    ].abort_requested
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -2032,6 +2101,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             elif get_serving().tokenizer_worker_num == 1:
                 return
         req = AbortReq(rid=rid, abort_all=abort_all)
+        self._mark_abort_requests(rid=rid, abort_all=abort_all)
+        if self.is_pause:
+            self._own_control_task(self._notify_control_waiters())
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2045,25 +2117,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
-        async with self.is_pause_cond:
-            self.is_pause = True
-            if obj.mode != "abort":
-                await self._async_dispatch_to_scheduler(obj)
-            else:
-                # we are using the model_update_lock to check if there is still on-going requests.
-                while True:
-                    # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
-                    if not is_locked:
-                        break
-                    await asyncio.sleep(1.0)
+        await self._call_control(obj, "pause")
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
-        async with self.is_pause_cond:
-            self.is_pause = False
-            await self._async_dispatch_to_scheduler(obj)
-            self.is_pause_cond.notify_all()
+        await self._call_control(obj, "continue")
 
     async def update_weights_from_disk(
         self,
@@ -2076,30 +2133,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        success, message, results = await self._update_weights(obj)
+        paused_requests = [r.num_paused_requests for r in results]
+        return (
+            success,
+            message,
+            paused_requests[0] if len(results) == 1 else paused_requests,
         )
-        async with lock_context:
-            (
-                success,
-                message,
-                num_paused_requests,
-            ) = await self._wait_for_model_update_from_disk(obj)
-
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message, num_paused_requests
 
     def record_config_updates(self, source: str, **fields) -> None:
         """Record a control-plane config change: a weight update, a parser
@@ -2141,30 +2181,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = model_path
         self.model_path = model_path
         self.record_config_updates("tokenizer.update_weights", load_format=load_format)
-
-    async def _wait_for_model_update_from_disk(
-        self, obj: UpdateWeightFromDiskReqInput
-    ) -> Tuple[bool, str]:
-        expected_workers = self.elastic_worker_count
-        self.model_update_expected_workers = expected_workers
-        self.model_update_tmp = []
-        self.model_update_result = asyncio.Future()
-        self._dispatch_to_scheduler(obj)
-        if expected_workers == 1:
-            result = await self.model_update_result
-            if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
-            return result.success, result.message, result.num_paused_requests
-        else:
-            result = await self.model_update_result
-
-            all_success = all([r.success for r in result])
-            if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
-            all_message = [r.message for r in result]
-            all_message = " | ".join(all_message)
-            all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_logger.configure(
@@ -3388,14 +3404,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
-
-    def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if self.model_update_expected_workers == 1:
-            self.model_update_result.set_result(recv_obj)
-        else:
-            self.model_update_tmp.append(recv_obj)
-            if len(self.model_update_tmp) == self.model_update_expected_workers:
-                self.model_update_result.set_result(self.model_update_tmp)
 
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

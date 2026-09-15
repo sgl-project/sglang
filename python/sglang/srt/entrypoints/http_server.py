@@ -1451,12 +1451,7 @@ async def update_weights_from_ipc(
 async def update_weight_version(
     obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
 ):
-    """Update the weight version. This operation requires no active requests."""
-    if obj.abort_all_requests:
-        _global_state.tokenizer_manager.abort_request(abort_all=True)
-
-    # Use a simple approach without the complex lock mechanism for now
-    # since weight_version update is a simple operation that doesn't affect model weights
+    """Update the published version, optionally aborting active requests."""
     try:
         await _global_state.tokenizer_manager.update_weight_version(obj)
 

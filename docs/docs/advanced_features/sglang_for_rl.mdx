@@ -633,13 +633,33 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 
 **Modes:**
 
-- `abort`: Default behavior, identical to `abort` endpoint with `abort_all` set. Pending requests from `waiting_queue` and `running_queue` will be returned immediately to the caller.
+- `abort`: Close request admission, cancel requests in the tokenizer workers and scheduler, and wait for them to drain. Admission stays closed until `continue_generation`. A standalone `abort_request` with `abort_all=true` cancels requests without keeping admission closed.
 - `retract`: Put engine in "paused" state.  Move running requests back to waiting queue. KV cache can be flushed and recomputed later.
 - `in_place`: Put engine in "paused" state without changing states of the requests. Running requests rely on availability of KV caches to continue, so any subsequent `flush_cache` call will be unsuccessful.
 
 ### Continue Generation
 
 **Endpoint:** `POST /continue_generation`
+
+### Control completion with multiple tokenizer workers
+
+When you use the Python frontend with `--tokenizer-worker-num` greater than one,
+pause, continue, weight updates, and memory release/resume coordinate all tokenizer
+workers. A successful response means that every worker has acknowledged the
+required local state changes and the shared backend operation has completed.
+Weight payloads are sent to the backend once, using its existing parallel dispatch.
+
+An update during active serving first closes admission and drains active requests.
+An update after a completed pause preserves that pause and its retained requests.
+`update_weight_version` with `abort_all_requests=false` remains available during
+generation and preserves the per-token version attribution described above.
+
+Wait for each instance-wide control operation to finish before issuing another.
+Overlapping mutations are rejected, while cancellation requests can still proceed.
+Disconnecting the HTTP caller does not cancel an accepted mutation. If a mutation
+partially fails or times out, admission stays closed and further mutations are
+rejected; restart the server to recover. Set `SGLANG_TOKENIZER_CONTROL_TIMEOUT`
+to configure the timeout in seconds (default: `300`).
 
 ## Deterministic Inference
 

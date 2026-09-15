@@ -1777,10 +1777,51 @@ class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     worker_ipc_name: str
 
 
-class PauseContinueBroadcastReq(BaseReq, kw_only=True):
-    """Broadcast from router to all workers to set is_pause state."""
+class TokenizerControlReq(BaseReq, kw_only=True):
+    """A typed backend request encoded once, forwarded only to the backend."""
 
-    is_pause: bool
+    operation_id: str
+    kind: Literal["pause", "continue", "weights", "version", "release", "resume"]
+    payload: bytes
+    fan_out: int
+    idle_fan_out: int = 1
+
+
+class TokenizerControlBroadcastReq(BaseReq, kw_only=True):
+    """A local worker action; each broadcast has its own ACK identity."""
+
+    action: Literal["pause", "update_state", "drain", "abort", "fail"]
+    broadcast_id: str = ""
+    revision: int = 0
+    is_pause: bool | None = None
+    wait_for_requests: bool = False
+    abort_all: bool = False
+    updates: dict[str, Any] = msgspec.field(default_factory=dict)
+    clear_mm_cache: bool = False
+    weights_ready: bool = False
+    error: str | None = None
+
+
+class TokenizerControlAckReq(BaseReq, kw_only=True):
+    broadcast_id: str
+    worker_ipc_name: str
+    error: str | None = None
+
+
+class TokenizerControlResultReq(BaseReq, kw_only=True):
+    operation_id: str
+    results: list[bytes] = msgspec.field(default_factory=list)
+    error: str | None = None
+
+
+class TokenizerControlBackendResultReq(BaseReq, kw_only=True):
+    operation_id: str
+    worker_id: str
+    payload: bytes
+
+
+class TokenizerControlBackendAckReq(BaseReq, kw_only=True):
+    """Completion of scheduler operations that previously had no reply."""
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):

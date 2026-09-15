@@ -376,7 +376,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
         manager = object.__new__(TokenizerManager)
-        manager.rid_to_state = {}
+        manager.rid_to_state = {"test-request": SimpleNamespace(abort_requested=False)}
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         transport.prepare_for_dispatch_async = AsyncMock(return_value=[])
@@ -405,7 +405,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
-        manager.rid_to_state = {}
+        manager.rid_to_state = {"test-request": SimpleNamespace(abort_requested=False)}
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
@@ -441,7 +441,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
-        manager.rid_to_state = {}
+        manager.rid_to_state = {"test-request": SimpleNamespace(abort_requested=False)}
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()

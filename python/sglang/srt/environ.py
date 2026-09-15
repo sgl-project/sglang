@@ -622,6 +622,7 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    SGLANG_TOKENIZER_CONTROL_TIMEOUT = EnvFloat(300.0)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get

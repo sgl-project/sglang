@@ -7,14 +7,16 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
+    TokenizerControlBackendAckReq,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -27,7 +29,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
-class TestSchedulerPauseGeneration(unittest.TestCase):
+class TestSchedulerPauseGeneration(CustomTestCase):
     def setUp(self):
         # The scheduler runs after its process publishes; retraction reads the
         # disaggregation and schedule bags rather than the record it is handed.
@@ -75,6 +77,44 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
+
+    def test_control_ack_is_sent_after_handler_completion(self):
+        scheduler = self._new_scheduler()
+        scheduler.scheduler_stage_metrics = None
+        scheduler.session_controller = MagicMock()
+        scheduler.flush_wrapper = MagicMock()
+        scheduler.external_corpus_manager = None
+        scheduler.rust_server = None
+        scheduler.ipc_channels = MagicMock()
+        completed = []
+
+        def handle(req):
+            completed.append(req)
+
+        def send(output, req):
+            self.assertIs(completed[-1], req)
+            self.assertIsInstance(output, TokenizerControlBackendAckReq)
+
+        scheduler._request_dispatcher = handle
+        scheduler.ipc_channels.send_to_tokenizer.send_output.side_effect = send
+        requests = [
+            PauseGenerationReqInput(mode="retract"),
+            ContinueGenerationReqInput(),
+            AbortReq(abort_all=True),
+        ]
+        with patch(
+            "sglang.srt.managers.scheduler.get_mm",
+            return_value=SimpleNamespace(mm_feature_transport="shm"),
+        ):
+            scheduler.process_input_requests(requests)
+            scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+            for req in requests:
+                req.http_worker_ipc = "tokenizer-control:test"
+            scheduler.process_input_requests(requests)
+        self.assertEqual(
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_count,
+            len(requests),
+        )
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(
