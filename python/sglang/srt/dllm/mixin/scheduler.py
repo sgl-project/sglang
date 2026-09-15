@@ -75,23 +75,62 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
-            "FDFO dLLM result is missing accept lengths."
-        )
+        if fdfo_mode:
+            fdfo_signal = (
+                result.dllm_done_per_req_cpu
+                if self.dllm_config.needs_full_prefill
+                else result.accept_length_per_req_cpu
+            )
+            signal_name = (
+                "done states"
+                if self.dllm_config.needs_full_prefill
+                else "accept lengths"
+            )
+            assert fdfo_signal is not None, (
+                f"FDFO dLLM result is missing {signal_name}."
+            )
 
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
-            block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
 
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
 
+                if self.dllm_config.needs_full_prefill and fdfo_mode:
+                    canvas = result.next_token_ids[idx]
+                    if hasattr(canvas, "tolist"):
+                        canvas = canvas.tolist()
+                    canvas = array("q", canvas)
+                    req.full_untruncated_fill_ids = canvas
+
+                    if result.dllm_done_per_req_cpu[idx]:
+                        req.output_ids = array("q", canvas[len(req.origin_input_ids) :])
+                        req.dllm_algo_state = None
+                        self.metrics_reporter.num_generated_tokens += len(
+                            req.output_ids
+                        )
+                        req.update_finish_state(new_accepted_len=len(req.output_ids))
+                        if req.finished():
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                            req.time_stats.set_completion_time()
+                    else:
+                        req.dllm_algo_state = algo_states[idx]
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    continue
+
                 if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
+                    next_token_ids = result.next_token_ids[idx]
+                    if hasattr(next_token_ids, "tolist"):
+                        next_token_ids = next_token_ids.tolist()
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
+                        if self.dllm_config.needs_full_prefill:
+                            req.update_finish_state(new_accepted_len=0)
+                            if req.finished():
+                                release_kv_cache(req, self.tree_cache, is_insert=False)
+                                req.time_stats.set_completion_time()
                         continue
 
                     req.full_untruncated_fill_ids[
@@ -103,10 +142,15 @@ class SchedulerDllmMixin:
                     req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not self.dllm_config.needs_full_prefill,
+                        )
                         req.time_stats.set_completion_time()
                     continue
 
+                block_size = self.dllm_config.block_size
                 next_token_ids = result.next_token_ids[idx]
                 assert len(next_token_ids) == block_size
 
@@ -159,9 +203,12 @@ class SchedulerDllmMixin:
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
-        max_dllm_capacity = self.dllm_config.max_running_requests - len(
-            self.dllm_manager.waiting_queue
+        max_running_reqs = (
+            self.max_running_requests
+            if self.dllm_config.needs_full_prefill
+            else self.dllm_config.max_running_requests
         )
+        max_dllm_capacity = max_running_reqs - len(self.dllm_manager.waiting_queue)
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
