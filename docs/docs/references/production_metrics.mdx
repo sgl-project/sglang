@@ -134,6 +134,33 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Multimodal frontend metrics
+
+With `--enable-metrics`, you can inspect the work performed before multimodal requests reach the scheduler:
+
+| Metric | Type | Additional labels | Meaning |
+| --- | --- | --- | --- |
+| `sglang:mm_frontend_stage_seconds` | Histogram | `stage`, `outcome` | Wall time per request in a frontend stage. |
+| `sglang:mm_frontend_inflight` | Gauge | `stage` | Requests currently inside that stage, summed across live tokenizer workers. |
+| `sglang:mm_frontend_items_total` | Counter | `modality` | Items returned by preprocessing or the encoder receiver. |
+| `sglang:mm_frontend_feature_bytes_total` | Counter | `modality` | Logical bytes in directly available feature tensors, arrays, and precomputed embeddings. |
+
+The stages are `preprocess` (obtaining multimodal processor output, including encoder receiver waits), `hash` (frontend hash precomputation when enabled), and `dispatch` (transport preparation, serialization, and scheduler submission). Each stage records `success`, `error`, or `cancelled` when it exits. Dispatch timing covers the whole batch for each multimodal request in a batched submission. Text-only requests do not emit these stage samples.
+
+Stage durations include awaited work and queue waits. They can overlap across concurrent requests and with GPU execution, so their sum is not CPU utilization or encoder GPU time. An empty preprocessing result can still contribute a stage sample. The item and byte counters count returned preprocessing work, including requests that fail later; they are not counts of completed generations.
+
+`modality` is bounded to `image`, `video`, `audio`, or `other`. The metrics use the collector's configured base labels and do not add request IDs, URLs, or feature hashes. Byte accounting does not reconstruct transport proxies or synchronize devices; opaque transported features contribute zero bytes, and tensor views contribute their logical size rather than their backing allocation size.
+
+For example, to inspect preprocessing p95 over five minutes:
+
+```promql
+histogram_quantile(0.95,
+  sum by (le, model_name) (
+    rate(sglang:mm_frontend_stage_seconds_bucket{stage="preprocess",outcome="success"}[5m])
+  )
+)
+```
+
 ## Setup Guide
 
 This section describes how to set up the monitoring stack (Prometheus + Grafana) provided in the `examples/monitoring` directory.
