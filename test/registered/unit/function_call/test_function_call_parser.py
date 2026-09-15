@@ -3436,6 +3436,29 @@ class TestGlm47MoeDetector(unittest.TestCase):
             tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
         )
 
+    def test_streaming_buffers_arguments_until_tool_call_is_complete(self):
+        incomplete = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+        )
+        result = self.detector.parse_streaming_increment(incomplete, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, "")
+
+        result = self.detector.parse_streaming_increment(
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+            self.tools,
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertIsNone(result.calls[0].name)
+        self.assertEqual(
+            result.calls[0].parameters,
+            '{"city": "Beijing", "date": "2024-06-27"}',
+        )
+
     def test_array_argument_with_escaped_json(self):
         """Test that array arguments with escaped JSON are properly handled without double-escaping."""
         # Add a tool with array parameter
