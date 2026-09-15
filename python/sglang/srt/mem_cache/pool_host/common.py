@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
 
@@ -250,6 +251,29 @@ def alloc_with_pin_memory(
     return buffer
 
 
+@lru_cache(maxsize=1)
+def _resolve_device_accessible_ptr_fn():
+    """Return the AOT helper mapping a registered host tensor to its device alias.
+
+    Returns None when the installed sglang-kernel wheel predates the op, so a
+    source tree newer than its pinned wheel keeps working: callers then fall
+    back to the raw CPU address, which is what kernels used before the op
+    existed and is device-accessible wherever the registered host mapping is
+    address-identical (every supported NVIDIA GPU).
+    """
+    try:
+        from sgl_kernel.kvcacheio import get_device_accessible_ptr
+    except ImportError:
+        logger.warning(
+            "sgl_kernel.kvcacheio.get_device_accessible_ptr is unavailable in the "
+            "installed sglang-kernel wheel. Falling back to raw host addresses for "
+            "kernel pointer tables. On devices whose registered host mapping uses a "
+            "distinct device address (e.g. MI355X), upgrade sglang-kernel."
+        )
+        return None
+    return get_device_accessible_ptr
+
+
 def make_kernel_ptr_table(
     tensors: list[torch.Tensor],
     target_device: torch.device | str,
@@ -257,9 +281,12 @@ def make_kernel_ptr_table(
     host_memory_registered: bool,
 ) -> torch.Tensor:
     device = torch.device(target_device)
-    if host_memory_registered and device.type == "cuda":
-        from sgl_kernel.kvcacheio import get_device_accessible_ptr
-
+    get_device_accessible_ptr = (
+        _resolve_device_accessible_ptr_fn()
+        if host_memory_registered and device.type == "cuda"
+        else None
+    )
+    if get_device_accessible_ptr is not None:
         if device.index is None:
             device_index = torch.cuda.current_device()
         else:
