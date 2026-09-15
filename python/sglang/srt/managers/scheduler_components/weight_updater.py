@@ -290,6 +290,10 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "update_weights_from_distributed requires an open begin_weight_update session"
+        if recv_req.m2n_group_names is not None and recv_req.load_format != "nccl_m2n":
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False, message="m2n_group_names requires load_format=nccl_m2n"
+            )
         with self._observe_weight_load("distributed"):
             if recv_req.load_format == "nccl_m2n":
                 try:
@@ -297,9 +301,21 @@ class SchedulerWeightUpdaterManager:
                         raise ValueError(
                             "NCCL M2N Phase 2 can update only the target model runner"
                         )
-                    self.tp_worker.model_runner.receive_weights_from_m2n(
-                        recv_req.group_name
-                    )
+                    if recv_req.m2n_group_names is None:
+                        self.tp_worker.model_runner.receive_weights_from_m2n(
+                            recv_req.group_name
+                        )
+                    else:
+                        if (
+                            not recv_req.m2n_group_names
+                            or recv_req.m2n_group_names[0] != recv_req.group_name
+                        ):
+                            raise ValueError(
+                                "The first m2n_group_names entry must match group_name"
+                            )
+                        self.tp_worker.model_runner.receive_weights_from_m2n_groups(
+                            recv_req.m2n_group_names
+                        )
                     success, message = (
                         True,
                         "Succeeded to update parameter online through NCCL M2N.",

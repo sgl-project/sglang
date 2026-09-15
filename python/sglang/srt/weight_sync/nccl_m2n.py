@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -839,8 +840,9 @@ class NcclM2NReceiver:
             return buffer, lambda: param.copy_(buffer)
         return buffer, lambda: param.copy_(buffer.transpose(1, 2))
 
-    def receive(self) -> None:
-        m2n = _nccl_rl()
+    def _prepare_receive(self) -> None:
+        if getattr(self, "_failed_receive_buffers", None) is not None:
+            raise RuntimeError("A failed M2N stream must be destroyed before retrying")
         # Quantization hooks may replace Parameter objects between updates.
         # Always target the loadable storage restored by begin_weight_update().
         self._params = dict(self.model.named_parameters())
@@ -848,9 +850,13 @@ class NcclM2NReceiver:
         self._prepare_fp8_destinations()
         self._entries = self._validate_manifest(self._world_size)
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(self.stream):
-            previous_source_mesh = None
-            for entry, src_layout, dst_layout in self._entries:
+
+    def _receive_entries(self, in_flight: list):
+        """Enqueue one entry at a time, retaining its buffers until completion."""
+        m2n = _nccl_rl()
+        previous_source_mesh = None
+        for entry, src_layout, dst_layout in self._entries:
+            with torch.cuda.stream(self.stream):
                 if (
                     previous_source_mesh is not None
                     and src_layout.mesh != previous_source_mesh
@@ -862,6 +868,9 @@ class NcclM2NReceiver:
                 destination, post_copy = self._destination(
                     entry, dst_layout.local_shape
                 )
+                # Keep ownership outside the generator too: an exception from
+                # reshard/post_copy unwinds its frame before receive_many drains.
+                in_flight[:] = [destination, post_copy]
                 m2n.reshard(
                     None,
                     destination,
@@ -878,12 +887,101 @@ class NcclM2NReceiver:
                 )
                 if post_copy is not None:
                     post_copy()
-                # Bound temporary packing memory to one manifest entry.
-                self.stream.synchronize()
+            # Yield OUTSIDE the stream context: another stage must not inherit
+            # this stage's current stream. Generator locals retain destination
+            # and post_copy while the native copy and merge are still in flight.
+            yield
+            self.stream.synchronize()
+            in_flight.clear()
+
+    def receive(self) -> None:
+        self.receive_many([self])
+
+    @staticmethod
+    def receive_many(receivers: Sequence[NcclM2NReceiver]) -> None:
+        """Overlap one entry per PP stream using deterministic host launch order.
+
+        The caller bounds the number of stages in this wave. No background
+        threads or concurrent HTTP requests are needed. Every stream is drained
+        before returning, including on failure. If a drain itself fails, its
+        temporary buffers stay owned by that receiver until teardown succeeds.
+        """
+        if not receivers:
+            raise ValueError("An M2N PP wave requires at least one receiver")
+        parameters: set[str] = set()
+        communicators: set[int] = set()
+        stages: set[int] = set()
+        for receiver in receivers:
+            if (
+                receiver.model is not receivers[0].model
+                or receiver.device != receivers[0].device
+            ):
+                raise ValueError(
+                    "M2N PP receivers must target the same model and device"
+                )
+            if receiver.comm_ptr is None or receiver.comm_ptr in communicators:
+                raise ValueError(
+                    "M2N PP receivers require distinct, live communicators"
+                )
+            communicators.add(receiver.comm_ptr)
+            if len(receivers) > 1:
+                stage = receiver.manifest.get("pp_rank")
+                if not isinstance(stage, int) or stage in stages:
+                    raise ValueError(
+                        "Concurrent M2N receivers require distinct PP stages"
+                    )
+                stages.add(stage)
+            names = {
+                entry["destination"]["parameter"]
+                for entry in receiver.manifest["entries"]
+            }
+            if parameters.intersection(names):
+                raise ValueError(
+                    "Concurrent M2N PP receivers must not share destination parameters"
+                )
+            parameters.update(names)
+
+        iterators = []
+        in_flight = [[] for _ in receivers]
+        error = None
+        try:
+            # Prepare all stages on the caller stream before any native receive.
+            for receiver, buffers in zip(receivers, in_flight):
+                receiver._prepare_receive()
+                iterators.append(receiver._receive_entries(buffers))
+            pending = deque(iterators)
+            while pending:
+                iterator = pending.popleft()
+                try:
+                    next(iterator)
+                except StopIteration:
+                    continue
+                pending.append(iterator)
+        except Exception as exc:
+            error = exc
+        finally:
+            # Keep every generator (and hence its temporary tensors) alive until
+            # ALL streams have been drained, even if an earlier drain fails.
+            for receiver, buffers in zip(receivers, in_flight):
+                try:
+                    receiver.stream.synchronize()
+                except Exception as exc:
+                    # A failed synchronization cannot prove that native kernels
+                    # have stopped using these tensors. Keep them alive beyond
+                    # this stack frame, until destroy can successfully drain.
+                    if getattr(receiver, "_failed_receive_buffers", None) is None:
+                        receiver._failed_receive_buffers = buffers
+                    if error is None:
+                        error = exc
+            for iterator in iterators:
+                iterator.close()
+        if error is not None:
+            raise error
 
     def destroy(self) -> None:
         if getattr(self, "stream", None) is not None:
             self.stream.synchronize()
+        self._failed_receive_buffers = None
         if getattr(self, "comm_ptr", None) is not None:
             _nccl_rl().finalize()
         self.stream = None
