@@ -4222,6 +4222,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if (
             self.vision is not None
             and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
             and any(x is not None for x in forward_batch.mm_inputs)
         ):

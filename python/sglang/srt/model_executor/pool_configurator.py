@@ -47,7 +47,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
-    get_server_args,
     get_spec,
     max_speculative_num_draft_tokens,
 )
@@ -930,12 +929,11 @@ DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
-    """The operator's --swa-full-tokens-ratio, or None when it was not given.
-
-    Read from the pristine record: the resolved schedule bag carries the
-    declared fallback for an unset ratio, which must not count as a request.
-    """
-    return get_server_args().swa_full_tokens_ratio
+    """The operator's --swa-full-tokens-ratio, or None when it was not given."""
+    schedule = get_schedule()
+    if not schedule._swa_full_tokens_ratio_explicitly_set:
+        return None
+    return schedule.swa_full_tokens_ratio
 
 
 @dataclass

@@ -162,6 +162,11 @@ class Schedule(msgspec.Struct):
             fallback=0.8,
         ),
     ] = None
+    # Recorded by the cache hook; the effective field answers the fallback when unset.
+    _swa_full_tokens_ratio_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     swa_prefix_tails: A[
         Optional[int],
         Arg(

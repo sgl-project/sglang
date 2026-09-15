@@ -63,6 +63,7 @@ POSITIONAL_FIELD_ORDER = (
     "page_size",
     "c128_page_size",
     "swa_full_tokens_ratio",
+    "_swa_full_tokens_ratio_explicitly_set",
     "swa_prefix_tails",
     "disable_hybrid_swa_memory",
     "radix_eviction_policy",
