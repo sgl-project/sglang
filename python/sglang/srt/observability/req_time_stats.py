@@ -39,6 +39,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.observability.trace_async import (
     TraceReqContextAsync,
+    flush_trace_contexts_merged,
     is_async_tracing_available,
 )
 from sglang.srt.utils import get_bool_env_var
@@ -1279,14 +1280,26 @@ def set_time_batch(
 def flush_trace_batch(reqs: List[Any]):
     """Proactively flush buffered trace ops for a batch of requests.
 
-    Call at natural CPU/GPU overlap points (e.g., right before run_batch)
-    so the ZMQ send overlaps with GPU forward compute.
+    Async trace contexts in the batch are merged into ONE ZMQ message
+    (single pickle + send per scheduler step) so decode steps no longer pay
+    one send per request.  Sync TraceReqContext / TraceNullContext flushes
+    are no-ops.
     """
-    if reqs is None or not get_global_tracing_enabled():
+    if (
+        reqs is None
+        or not get_global_tracing_enabled()
+        or not is_async_tracing_available()
+    ):
         return
+    async_ctxs: Optional[List[TraceReqContextAsync]] = None
     for req in reqs:
         time_stats = getattr(req, "time_stats", None)
-        if time_stats is not None:
-            trace_ctx = getattr(time_stats, "trace_ctx", None)
-            if trace_ctx is not None:
-                trace_ctx.flush()
+        if time_stats is None:
+            continue
+        trace_ctx = getattr(time_stats, "trace_ctx", None)
+        if isinstance(trace_ctx, TraceReqContextAsync):
+            if async_ctxs is None:
+                async_ctxs = []
+            async_ctxs.append(trace_ctx)
+    if async_ctxs:
+        flush_trace_contexts_merged(async_ctxs)

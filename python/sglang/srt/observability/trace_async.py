@@ -50,6 +50,11 @@ Key design decisions:
    recently completed first-level slice).  The destination exporter uses
    last_span_context as a link on its first span, reconstructing the
    execution flow across processes.
+
+5. Merged step flush — flush_trace_contexts_merged() combines the pending
+   ops of every request in a scheduler step into a single "multi_batch"
+   ZMQ message, so decode steps pay one pickle + one send instead of one
+   per request.
 """
 
 from __future__ import annotations
@@ -235,6 +240,49 @@ def maybe_start_trace_exporter(
         start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
 
 
+def flush_trace_contexts_merged(contexts: List[TraceReqContextAsync]) -> None:
+    """Flush pending ops from multiple contexts in a single ZMQ message.
+
+    Called once per scheduler step: the pending ops of every request in the
+    batch are merged into one "multi_batch" message so decode steps pay one
+    pickle + one send syscall instead of one per request.  Contexts are
+    independent on the exporter side, so merging only affects transport,
+    not replay semantics.
+    """
+    if not contexts:
+        return
+
+    batches: List[Dict[str, Any]] = []
+    for ctx in contexts:
+        ops = ctx.take_pending_ops()
+        if ops:
+            batches.append(
+                {
+                    "rid": ctx.rid,
+                    "context_id": ctx._context_id,
+                    "operations": ops,
+                }
+            )
+
+    if not batches:
+        return
+
+    sock = _get_zmq_socket()
+    if sock is None:
+        return
+
+    try:
+        sock.send_pyobj({"action": "multi_batch", "batches": batches}, zmq.NOBLOCK)
+    except zmq.Again:
+        logger.warning(
+            "ZMQ send buffer full, dropping %d merged trace batches (%d ops total)",
+            len(batches),
+            sum(len(b["operations"]) for b in batches),
+        )
+    except Exception as e:
+        logger.error("Failed to flush merged trace batches: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Exporter process
 # ---------------------------------------------------------------------------
@@ -348,6 +396,19 @@ class _TraceExporterProcess(multiprocessing.Process):
                             msg.get("rid"),
                             e,
                         )
+                elif action == "multi_batch":
+                    try:
+                        self._replay_multi_batch(
+                            msg,
+                            contexts,
+                            threads_info,
+                            TraceCustomIdGenerator,
+                            TraceReqContext,
+                            TraceSliceContext,
+                            TraceEvent,
+                        )
+                    except Exception as e:
+                        logger.error("Trace exporter multi_batch error: %s", e)
 
                 now = time.perf_counter()
                 if now - last_cleanup > self._CLEANUP_INTERVAL:
@@ -510,6 +571,39 @@ class _TraceExporterProcess(multiprocessing.Process):
             except Exception as e:
                 logger.error("Replay op %s for rid %s failed: %s", op_type, rid, e)
 
+    def _replay_multi_batch(
+        self,
+        msg: Dict[str, Any],
+        contexts: Dict[str, tuple],
+        threads_info: Dict[int, TraceThreadInfo],
+        TraceCustomIdGenerator: type,
+        TraceReqContext: type,
+        TraceSliceContext: type,
+        TraceEvent: type,
+    ) -> None:
+        """Replay a merged batch carrying ops from many request contexts.
+
+        Each sub-message is dispatched to _replay_batch independently, so a
+        failure in one rid never affects the others.
+        """
+        for sub in msg.get("batches", ()):
+            try:
+                self._replay_batch(
+                    sub,
+                    contexts,
+                    threads_info,
+                    TraceCustomIdGenerator,
+                    TraceReqContext,
+                    TraceSliceContext,
+                    TraceEvent,
+                )
+            except Exception as e:
+                logger.error(
+                    "Trace exporter replay error for rid=%s: %s",
+                    sub.get("rid"),
+                    e,
+                )
+
     def _cleanup_stale(self, contexts: Dict[str, tuple], now: float) -> None:
         expired = [
             cid for cid, (_, ts) in contexts.items() if now - ts > self._CONTEXT_TTL
@@ -640,6 +734,19 @@ class TraceReqContextAsync:
         if len(self._operations) >= self._flush_threshold:
             self._flush()
 
+    def take_pending_ops(self) -> Optional[List[Dict[str, Any]]]:
+        """Detach and return the buffered ops without sending.
+
+        Returns None when nothing is pending.  Used by
+        flush_trace_contexts_merged() to gather ops from many contexts and
+        ship them in a single ZMQ message.
+        """
+        ops = getattr(self, "_operations", None)
+        if not ops:
+            return None
+        self._operations = []
+        return ops
+
     def flush(self) -> None:
         """Proactively flush buffered ops to the exporter.
 
@@ -649,11 +756,9 @@ class TraceReqContextAsync:
         self._flush()
 
     def _flush(self):
-        if not self._operations:
+        ops = self.take_pending_ops()
+        if ops is None:
             return
-
-        ops = self._operations
-        self._operations = []
 
         sock = _get_zmq_socket()
         if sock is None:
