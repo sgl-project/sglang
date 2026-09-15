@@ -859,17 +859,6 @@ class TraceReqContext:
         pass
 
     def __del__(self):
-        # Safety net for spans whose owner object is retired through an early
-        # exit / terminate / drain path that bypasses trace_req_finish (e.g. a
-        # HiCache prefetch op revoked for insufficient hits). Normal completion
-        # already set root_span=None, so this is a no-op there. Ending root_span
-        # here (in addition to abort()'s thread-span end) prevents unbounded
-        # span accumulation when owners are dropped without an explicit finish.
-        if self.tracing_enable and self.root_span:
-            try:
-                self.root_span.end()
-            except Exception:
-                pass
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})
 
 
