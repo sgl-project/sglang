@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+"""Transactional orchestration of snapshot create and restore.
+
+The controller is the only place that knows the order of the steps; the
+process, CRIU, cuda-checkpoint and artifact-file operations belong to
+:class:`SnapshotRuntime`.
+"""
+
+import os
+from pathlib import Path
+
+import msgspec
+
+from sglang.srt.engine_snapshot import control
+from sglang.srt.engine_snapshot.errors import (
+    SnapshotCompatibilityError,
+    SnapshotRuntimeFailure,
+    SnapshotUsageError,
+    error_detail,
+)
+from sglang.srt.engine_snapshot.manifest import (
+    MANIFEST_FORMAT,
+    SnapshotCanary,
+    SnapshotManifest,
+    artifact_bytes,
+    created_at_now,
+    load_manifest,
+    locked,
+    publish_manifest,
+    record_failure,
+    validate_identity,
+)
+from sglang.srt.engine_snapshot.runtime import SnapshotRuntime
+from sglang.srt.engine_snapshot.startup import validate_server_args
+from sglang.srt.environ import envs, third_party_cache_defaults
+
+
+class RestoreOutcome(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
+    """Where the restored engine ended up listening."""
+
+    root_pid: int
+    host: str
+    port: int
+
+
+_ARTIFACT_SUBDIRS = (
+    "control",
+    "images",
+    "work",
+    "files",
+    # /dev/shm objects replayed on restore: files the engine held open there
+    # and the CRIU link_remap ghosts produced by the dump.
+    "dev_shm",
+    "runtime/cache",
+    "runtime/tmp",
+)
+
+# Cache directories the captured engine must keep inside the artifact, beyond
+# the ones the repository's own redirect table derives from SGLANG_CACHE_DIR.
+# Each name is the environment variable its reader honours.
+_EXTRA_CACHE_DIRS = {
+    "DG_JIT_CACHE_DIR": "cache/deep_gemm",  # deep_gemm JIT (native side)
+    "SGLANG_DG_CACHE_DIR": "cache/deep_gemm",  # sglang's own default for it
+    "TILELANG_CACHE_DIR": "cache/tilelang",  # tilelang
+    "HUMMING_CACHE_DIR": "cache/humming",  # humming-kernels launcher/kernel cache
+    "HUMMING_TMP_DIR": "tmp/humming",  # humming-kernels build scratch
+    "CUTE_DSL_CACHE_DIR": "cache/cutlass-dsl",  # vendored CuTeDSL generated IR
+    "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "cache/flash-attn-cute",  # FA cute DSL
+}
+
+# Every cache variable the controller owns for its child. Importing sglang in
+# the controller's own process already redirects some of these (and writes
+# DG_JIT_CACHE_DIR), so they are dropped from the inherited environment instead
+# of being passed through: the captured engine may only write inside the
+# artifact, whatever the operator's shell had set.
+_MANAGED_CACHE_VARS = (
+    "TMPDIR",
+    "SGLANG_CACHE_DIR",
+    "SGLANG_JIT_CACHE_DIR",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "CUDA_CACHE_PATH",
+    "FLASHINFER_WORKSPACE_BASE",
+    *_EXTRA_CACHE_DIRS,
+)
+
+
+def _child_environment(launch_environment, artifact_path):
+    """Environment for the captured engine, with its state inside the artifact.
+
+    Triton, Inductor, CUDA and FlashInfer roots come from the repository's own
+    ``third_party_cache_defaults`` so this cannot drift from what importing
+    ``sglang`` redirects; the JIT caches that table does not cover are listed in
+    ``_EXTRA_CACHE_DIRS``.
+
+    The values recorded in the manifest identity come from the controller's own
+    environment, not from this one.
+    """
+    cache_root = artifact_path / "runtime/cache"
+    environment = {
+        name: value
+        for name, value in launch_environment.items()
+        if name not in _MANAGED_CACHE_VARS
+    }
+    environment.update(
+        SGLANG_SNAPSHOT_DIR=str(artifact_path),
+        USE_LIBUV="0",
+        GLOO_SOCKET_IFNAME="lo",
+        TMPDIR=str(artifact_path / "runtime/tmp"),
+        SGLANG_CACHE_DIR=str(cache_root),
+        SGLANG_JIT_CACHE_DIR=str(cache_root / "jit"),
+    )
+    # Resolved against the artifact path rather than the controller's
+    # environment: the helper reads SGLANG_CACHE_DIR when it is called.
+    with envs.SGLANG_CACHE_DIR.override(str(cache_root)):
+        environment.update(third_party_cache_defaults())
+    for name, suffix in _EXTRA_CACHE_DIRS.items():
+        environment[name] = str(artifact_path / "runtime" / suffix)
+    return environment
+
+
+def _assemble_manifest(
+    artifact_path,
+    engine_info,
+    inventory,
+    server_argv,
+    launch_environment,
+    runtime,
+    stdio,
+):
+    canary = control.read_json(
+        artifact_path / control.CONTROL_DIRNAME, control.CANARY, SnapshotCanary
+    )
+    return SnapshotManifest(
+        format=MANIFEST_FORMAT,
+        artifact_path=str(artifact_path),
+        created_at=created_at_now(),
+        artifact_bytes=artifact_bytes(artifact_path),
+        model_path=engine_info.model_path,
+        host=engine_info.host,
+        port=engine_info.port,
+        identity=runtime.current_identity(
+            engine_info.model_path, engine_info.gpu_uuid, launch_environment
+        ),
+        root_pid=inventory.root_pid,
+        pids=inventory.pids,
+        cuda_pids=inventory.cuda_pids,
+        stdio=stdio,
+        files=inventory.files,
+        dev_shm=inventory.dev_shm,
+        canary=canary,
+    )
+
+
+def create_snapshot(output, server_argv, timeout=600, runtime=None):
+    """Initialize an engine, checkpoint it and publish the artifact."""
+    runtime = runtime or SnapshotRuntime()
+    launch_environment = dict(os.environ)
+    validate_server_args(server_argv)
+    artifact_path = Path(os.path.abspath(output))
+    runtime.preflight("create", artifact_path)
+    stdio = runtime.stdio_resources()
+    try:
+        artifact_path.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise SnapshotUsageError(
+            f"snapshot output directory already exists: {artifact_path}"
+        ) from error
+    except FileNotFoundError as error:
+        raise SnapshotUsageError(
+            f"snapshot output parent directory does not exist: {artifact_path.parent}"
+        ) from error
+    with locked(artifact_path):
+        for directory in _ARTIFACT_SUBDIRS:
+            (artifact_path / directory).mkdir(parents=True, exist_ok=True)
+        control_dir = artifact_path / control.CONTROL_DIRNAME
+        remaps_before = set(runtime.SHM_DIR.glob("link_remap.*"))
+        root_pid = None
+        try:
+            root_pid = runtime.launch_child(
+                server_argv,
+                _child_environment(launch_environment, artifact_path),
+            )
+            engine_info = runtime.wait_ready(artifact_path, root_pid, timeout)
+            inventory = runtime.inventory(
+                artifact_path, root_pid, engine_info.model_path, engine_info.gpu_uuid
+            )
+            inventory = runtime.dump(artifact_path, inventory, timeout)
+            runtime.verify_dead(inventory)
+            manifest = _assemble_manifest(
+                artifact_path,
+                engine_info,
+                inventory,
+                server_argv,
+                launch_environment,
+                runtime,
+                stdio,
+            )
+            runtime.flush_artifact(artifact_path)
+            publish_manifest(artifact_path, manifest)
+            return manifest
+        except BaseException as error:
+            control.write_abort(control_dir)
+            failures = []
+            runtime.abort_create(root_pid, artifact_path, failures)
+            runtime.discard_new_link_remaps(remaps_before)
+            record_failure(artifact_path, error, failures)
+            raise
+
+
+def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
+    """Restore an artifact on this host; returns the engine PID and address."""
+    runtime = runtime or SnapshotRuntime()
+    artifact_path = Path(os.path.abspath(artifact))
+    with locked(artifact_path):
+        runtime.preflight("restore", artifact_path)
+        manifest = load_manifest(artifact_path)
+        validate_identity(
+            manifest.identity,
+            runtime.current_identity(manifest.model_path, manifest.identity.gpu_uuid),
+        )
+        control_dir = artifact_path / control.CONTROL_DIRNAME
+        if not control_dir.is_dir():
+            raise SnapshotCompatibilityError(
+                f"snapshot has no {control.CONTROL_DIRNAME} directory: {artifact_path}"
+            )
+        effective_host = host or manifest.host
+        effective_port = port or manifest.port
+        control.clear_handshake(control_dir)
+        runtime.verify_restorable(manifest, effective_host, effective_port)
+        root_pid = None
+        try:
+            root_pid = runtime.restore(artifact_path, manifest, timeout)
+            control.write_release(control_dir, host=host, port=port)
+            runtime.wait_listener(
+                artifact_path, manifest, effective_host, effective_port, timeout
+            )
+            runtime.complete_restore(root_pid)
+            return RestoreOutcome(root_pid, effective_host, effective_port)
+        except BaseException as error:
+            control.write_abort(control_dir)
+            failures = []
+            if root_pid is not None:
+                runtime.stop_restored_tree(root_pid, artifact_path, failures)
+            if failures:
+                raise SnapshotRuntimeFailure(
+                    f"Snapshot restore failed: {error_detail(error)}; "
+                    + "; ".join(failures)
+                ) from error
+            raise
