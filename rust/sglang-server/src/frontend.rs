@@ -1,10 +1,10 @@
 //! Transport-neutral entry point into the Rust frontend pipeline.
 //!
-//! Wire adapters normalize their protocol into the existing in-process request
-//! types, submit them through [`FrontendHandle`], and render the returned
-//! [`ResponseItem`] values for their own transport. This module owns shared
-//! preprocessing, runtime capabilities, and request lifetime; it deliberately
-//! knows nothing about Axum, HTTP response shapes, Tonic, or protobuf.
+//! Wire adapters normalize their protocol into [`FrontendRequest`], submit it
+//! through [`FrontendHandle`], and render semantic [`FrontendEvent`]s for their
+//! own transport. This module owns shared preprocessing, runtime translation,
+//! capabilities, and request lifetime; it deliberately knows nothing about
+//! Axum, HTTP response shapes, Tonic, or protobuf.
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -13,12 +13,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::ControlRequest;
-use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::request::{Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
@@ -27,43 +27,17 @@ use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
+mod contract;
 mod prefetch;
+
+pub(crate) use contract::{
+    FrontendError, FrontendErrorKind, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
+    InternalState, ModelInfo, ServerInfo,
+};
 
 /// Sentinel host that makes the KV connector no-op. Parity with
 /// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
-
-/// A transport-neutral failure while executing a frontend operation.
-#[derive(Clone, Debug, thiserror::Error)]
-pub(crate) enum FrontendError {
-    /// The TokenizerManager intake loop has shut down, so callers may retry on
-    /// another healthy server.
-    #[error("service unavailable")]
-    Unavailable,
-
-    #[error("{0}")]
-    InvalidArgument(String),
-
-    #[error(transparent)]
-    Pipeline(#[from] Error),
-
-    #[error("response channel closed before terminal output")]
-    ResponseClosed,
-
-    #[error("{0}")]
-    UnexpectedResponse(&'static str),
-}
-
-/// Semantic result of a deep frontend health check.
-///
-/// Expected lifecycle states are values rather than transport errors so each
-/// adapter can render them according to its own protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HealthStatus {
-    Healthy,
-    NotReady,
-    Stalled,
-}
 
 pub(crate) struct FrontendConfig {
     pub(crate) response_capacity: usize,
@@ -71,6 +45,45 @@ pub(crate) struct FrontendConfig {
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: BTreeMap<String, usize>,
+    pub(crate) metadata: FrontendMetadata,
+}
+
+/// Immutable, transport-independent metadata retained by the frontend.
+/// Keeping this snapshot narrow avoids making adapters or the shared handle
+/// depend on the full launch-configuration object.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FrontendMetadata {
+    model_path: String,
+    served_model_name: String,
+    tokenizer_path: String,
+    preferred_sampling_params: Option<crate::message::config::PreferredSamplingParams>,
+    weight_version: Option<String>,
+    load_format: Option<String>,
+    reasoning_parser: Option<String>,
+    tool_call_parser: Option<String>,
+    disaggregation_mode: DisaggregationMode,
+    max_context_length: u64,
+    max_total_num_tokens: u64,
+    version: String,
+}
+
+impl From<&ServerArgs> for FrontendMetadata {
+    fn from(args: &ServerArgs) -> Self {
+        Self {
+            model_path: args.model_path.clone(),
+            served_model_name: args.served_model_name.clone(),
+            tokenizer_path: args.tokenizer_path.clone(),
+            preferred_sampling_params: args.preferred_sampling_params.clone(),
+            weight_version: args.weight_version.clone(),
+            load_format: args.load_format.clone(),
+            reasoning_parser: args.reasoning_parser.clone(),
+            tool_call_parser: args.tool_call_parser.clone(),
+            disaggregation_mode: args.disaggregation_mode,
+            max_context_length: args.model_config.context_len,
+            max_total_num_tokens: args.max_total_num_tokens,
+            version: args.version.clone(),
+        }
+    }
 }
 
 /// Cloneable capability for submitting work to the existing frontend runtime.
@@ -90,6 +103,7 @@ struct FrontendInner {
     startup_ready: AtomicBool,
     is_disaggregation: bool,
     mm_limits: BTreeMap<String, usize>,
+    metadata: FrontendMetadata,
 }
 
 impl FrontendHandle {
@@ -107,6 +121,7 @@ impl FrontendHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
+                metadata: config.metadata,
             }),
         }
     }
@@ -122,17 +137,19 @@ impl FrontendHandle {
         self.inner.startup_ready.store(true, Ordering::Release);
     }
 
-    pub(crate) fn response_activity(&self) -> u64 {
+    fn response_activity(&self) -> u64 {
         self.inner.response_activity.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn generate(
         &self,
-        mut request: GenerateRequest,
+        mut request: FrontendRequest,
     ) -> Result<FrontendCall, FrontendError> {
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
-        self.submit(RequestKind::Generate(Box::new(request))).await
+        self.submit(RequestKind::Generate(Box::new(request)))
+            .await
+            .map(FrontendCall::new)
     }
 
     /// Preprocess and submit a group atomically from the adapter's perspective:
@@ -141,7 +158,7 @@ impl FrontendHandle {
     /// the already-created calls aborts those accepted requests.
     pub(crate) async fn generate_batch(
         &self,
-        mut requests: Vec<GenerateRequest>,
+        mut requests: Vec<FrontendRequest>,
     ) -> Result<Vec<FrontendCall>, FrontendError> {
         self.prepare_generations(&mut requests).await?;
 
@@ -149,7 +166,8 @@ impl FrontendHandle {
         for request in requests {
             calls.push(
                 self.submit(RequestKind::Generate(Box::new(request)))
-                    .await?,
+                    .await
+                    .map(FrontendCall::new)?,
             );
         }
         Ok(calls)
@@ -157,35 +175,93 @@ impl FrontendHandle {
 
     async fn prepare_generations(
         &self,
-        requests: &mut [GenerateRequest],
+        requests: &mut [FrontendRequest],
     ) -> Result<(), FrontendError> {
         prefetch::prefetch_all(requests, &self.inner.mm_limits)
             .await
             .map_err(FrontendError::InvalidArgument)
     }
 
-    pub(crate) async fn control(&self, request: ControlRequest) -> Result<Bytes, FrontendError> {
-        let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
-        match call.recv().await {
-            Some(ResponseItem::Control(bytes)) => Ok(bytes),
-            Some(ResponseItem::Error(error)) => Err(FrontendError::Pipeline(error)),
-            Some(_) => Err(FrontendError::UnexpectedResponse(
-                "unexpected generation output for control request",
-            )),
-            None => Err(FrontendError::ResponseClosed),
+    /// Return static model metadata without exposing the full launch config.
+    pub(crate) fn model_info(&self) -> ModelInfo {
+        let metadata = &self.inner.metadata;
+        ModelInfo {
+            model_path: metadata.model_path.clone(),
+            served_model_name: metadata.served_model_name.clone(),
+            tokenizer_path: metadata.tokenizer_path.clone(),
+            is_generation: true,
+            preferred_sampling_params: metadata.preferred_sampling_params.clone(),
+            weight_version: metadata.weight_version.clone(),
+            load_format: metadata.load_format.clone(),
+            reasoning_parser: metadata.reasoning_parser.clone(),
+            tool_call_parser: metadata.tool_call_parser.clone(),
+            disaggregation_mode: metadata.disaggregation_mode,
         }
     }
 
-    pub(crate) async fn detokenize(&self, token_ids: TokenIds) -> Result<Bytes, FrontendError> {
-        let mut call = self.submit(RequestKind::Detokenize { token_ids }).await?;
+    /// Return public server metadata with the current scheduler metrics.
+    /// Raw control bytes and the scheduler's full launch-argument dump never
+    /// cross the frontend boundary.
+    pub(crate) async fn server_info(&self) -> Result<ServerInfo, FrontendError> {
+        let internal_state = self.internal_state().await?;
+        let metadata = &self.inner.metadata;
+        Ok(ServerInfo {
+            model_path: metadata.model_path.clone(),
+            served_model_name: metadata.served_model_name.clone(),
+            tokenizer_path: metadata.tokenizer_path.clone(),
+            max_context_length: metadata.max_context_length,
+            max_total_num_tokens: metadata.max_total_num_tokens,
+            version: metadata.version.clone(),
+            internal_states: vec![internal_state],
+        })
+    }
+
+    async fn internal_state(&self) -> Result<InternalState, FrontendError> {
+        let bytes = self
+            .control(ControlRequest::GetInternalStateReq(
+                GetInternalStateReq::new(Rid::new().to_string()),
+            ))
+            .await?;
+        rmp_serde::from_slice::<InternalStateEnvelope>(&bytes)
+            .map(|response| response.internal_state)
+            .map_err(|error| {
+                FrontendError::InvalidResponse(format!("invalid internal-state response: {error}"))
+            })
+    }
+
+    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, FrontendError> {
+        let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
-            Some(ResponseItem::Data(bytes)) => Ok(bytes),
-            Some(ResponseItem::Error(error)) => Err(FrontendError::Pipeline(error)),
-            Some(_) => Err(FrontendError::UnexpectedResponse(
-                "unexpected output for detokenize request",
+            Some(ResponseItem::Control(bytes)) => Ok(bytes),
+            Some(ResponseItem::Error(error)) => Err(translate_runtime_error(error)),
+            Some(_) => Err(FrontendError::InvalidResponse(
+                "unexpected generation output for control request".into(),
             )),
-            None => Err(FrontendError::ResponseClosed),
+            None => Err(FrontendError::ResponseTruncated),
         }
+    }
+
+    /// Decode token IDs into text without exposing the runtime's byte payload.
+    pub(crate) async fn detokenize(&self, token_ids: TokenIds) -> Result<String, FrontendError> {
+        let mut call = self.submit(RequestKind::Detokenize { token_ids }).await?;
+        let bytes = match call.recv().await {
+            Some(ResponseItem::Data(bytes)) => bytes,
+            Some(ResponseItem::Error(Error::Validation(message))) => {
+                return Err(FrontendError::InvalidArgument(message));
+            }
+            Some(ResponseItem::Error(error)) => return Err(translate_runtime_error(error)),
+            Some(_) => {
+                return Err(FrontendError::InvalidResponse(
+                    "unexpected output for detokenize request".into(),
+                ));
+            }
+            None => {
+                return Err(FrontendError::Internal("reply channel closed".into()));
+            }
+        };
+        String::from_utf8(bytes.to_vec()).map_err(|_| {
+            FrontendError::InvalidResponse("detokenized prompt is not valid UTF-8".into())
+        })
     }
 
     /// Confirm that scheduler output is moving. The response heartbeat is the
@@ -200,7 +276,7 @@ impl FrontendHandle {
         }
 
         let baseline = self.response_activity();
-        let probe = GenerateRequest {
+        let probe = FrontendRequest {
             rid: Rid::new_health_check(),
             input_ids: Some(vec![0]),
             sampling_params: SamplingParams {
@@ -238,7 +314,7 @@ impl FrontendHandle {
     /// The async send preserves TokenizerManager inbox backpressure. Once the
     /// request is accepted, the returned call owns cancellation until it
     /// observes a terminal response.
-    async fn submit(&self, kind: RequestKind) -> Result<FrontendCall, FrontendError> {
+    async fn submit(&self, kind: RequestKind) -> Result<RuntimeCall, FrontendError> {
         let rid = request_rid(&kind);
         let expected_response = ExpectedResponse::for_request(&kind);
         let (response_tx, response_rx) = mpsc::channel(self.inner.response_capacity);
@@ -246,7 +322,7 @@ impl FrontendHandle {
         // Arm ownership before awaiting the bounded handoff. If this future is
         // cancelled after the event is queued but before the await observes
         // success, dropping `call` still cancels the request.
-        let mut call = FrontendCall {
+        let mut call = RuntimeCall {
             rid: rid.clone(),
             response_rx,
             abort_tx: self.inner.abort_tx.clone(),
@@ -279,41 +355,74 @@ impl FrontendHandle {
     }
 }
 
-/// One accepted request and its response stream.
+fn translate_runtime_error(error: Error) -> FrontendError {
+    match error {
+        Error::Validation(message) => {
+            FrontendError::InvalidArgument(format!("validation failed: {message}"))
+        }
+        Error::QueueFull => FrontendError::Overloaded("to_scheduler channel full".into()),
+        Error::Disconnected => FrontendError::Cancelled("client disconnected".into()),
+        error => FrontendError::Internal(error.to_string()),
+    }
+}
+
+/// One accepted generation request and its semantic response stream.
 ///
-/// Dropping an unfinished call either cancels a request that Intake has not yet
-/// claimed or notifies the existing abort lane after admission. Reading a
-/// terminal item disarms that cleanup automatically, so transports cannot
-/// accidentally abort completed work or forget disconnect cleanup.
+/// Runtime response variants are translated here so adapters cannot depend on
+/// scheduler/control encodings. Dropping an unfinished call retains the
+/// cancellation guarantees owned by [`RuntimeCall`].
 pub(crate) struct FrontendCall {
-    rid: Rid,
-    response_rx: mpsc::Receiver<ResponseItem>,
-    abort_tx: flume::Sender<AbortSource>,
-    admission: RequestAdmission,
-    expected_response: ExpectedResponse,
-    in_flight: bool,
+    runtime: RuntimeCall,
+    events_finished: bool,
 }
 
 impl FrontendCall {
-    pub(crate) fn rid(&self) -> &Rid {
-        &self.rid
+    fn new(runtime: RuntimeCall) -> Self {
+        Self {
+            runtime,
+            events_finished: false,
+        }
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<ResponseItem> {
-        let item = self.response_rx.recv().await;
-        self.observe(item.as_ref());
-        item
+    /// ID that adapters should return to their client.
+    pub(crate) fn public_id(&self) -> &str {
+        self.runtime.rid.client_facing()
     }
 
-    pub(crate) fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
-        let item = self.response_rx.try_recv()?;
-        self.observe(Some(&item));
-        Ok(item)
+    /// Receive the next semantic event. A runtime channel that closes before a
+    /// terminal response is converted into one terminal failure event; adapters
+    /// never need to infer whether an empty runtime channel means success.
+    pub(crate) async fn recv(&mut self) -> Option<FrontendEvent> {
+        if self.events_finished {
+            return None;
+        }
+
+        let event = match self.runtime.recv().await {
+            Some(item) => generation_event(item),
+            None => FrontendEvent::Failed(FrontendError::Internal(
+                "response truncated before completion".into(),
+            )),
+        };
+        self.events_finished = event.is_terminal();
+        Some(event)
     }
 
-    fn observe(&mut self, item: Option<&ResponseItem>) {
-        if item.is_some_and(|item| self.expected_response.is_terminal(item)) {
-            self.in_flight = false;
+    /// Append every semantic event that is ready without waiting. Channel
+    /// emptiness and closure remain private runtime details.
+    pub(crate) fn drain_ready(&mut self, events: &mut Vec<FrontendEvent>) {
+        while !self.events_finished {
+            let event = match self.runtime.try_recv() {
+                Ok(item) => generation_event(item),
+                // Preserve every queued event before reporting a premature
+                // close. The next awaited `recv` translates that close into
+                // one terminal failure, maintaining stream order while still
+                // hiding channel mechanics from adapters.
+                Err(mpsc::error::TryRecvError::Disconnected | mpsc::error::TryRecvError::Empty) => {
+                    break;
+                }
+            };
+            self.events_finished = event.is_terminal();
+            events.push(event);
         }
     }
 
@@ -325,18 +434,84 @@ impl FrontendCall {
     ) -> Self {
         let admission = RequestAdmission::pending();
         assert!(admission.try_accept(), "test calls start already admitted");
-        Self {
+        Self::new(RuntimeCall {
             rid,
             response_rx,
             abort_tx,
             admission,
             expected_response: ExpectedResponse::Generate,
             in_flight: true,
+        })
+    }
+}
+
+fn generation_event(item: ResponseItem) -> FrontendEvent {
+    match item {
+        ResponseItem::Frame(output) => FrontendEvent::Delta(output.into()),
+        ResponseItem::Done(output) => {
+            if let Some((legacy_http_status, message)) = output
+                .finish_reason
+                .as_ref()
+                .and_then(|reason| reason.abort_status())
+            {
+                FrontendEvent::Failed(FrontendError::from_runtime_rejection(
+                    message.to_owned(),
+                    legacy_http_status,
+                ))
+            } else {
+                FrontendEvent::Finished(output.into())
+            }
+        }
+        ResponseItem::Error(error) => FrontendEvent::Failed(translate_runtime_error(error)),
+        ResponseItem::Control(_) | ResponseItem::Data(_) => FrontendEvent::Failed(
+            FrontendError::InvalidResponse("unexpected non-generation response".into()),
+        ),
+    }
+}
+
+/// Private scheduler response envelope. This MessagePack shape is decoded at
+/// the runtime boundary and deliberately is not part of the frontend contract.
+#[derive(serde::Deserialize)]
+struct InternalStateEnvelope {
+    #[serde(default)]
+    internal_state: InternalState,
+}
+
+/// Runtime-facing request guard kept private behind [`FrontendCall`].
+///
+/// This type is the only owner of the raw response channel and admission/abort
+/// capabilities. It is also used directly by typed unary operations such as
+/// detokenization and internal-state lookup.
+struct RuntimeCall {
+    rid: Rid,
+    response_rx: mpsc::Receiver<ResponseItem>,
+    abort_tx: flume::Sender<AbortSource>,
+    admission: RequestAdmission,
+    expected_response: ExpectedResponse,
+    in_flight: bool,
+}
+
+impl RuntimeCall {
+    async fn recv(&mut self) -> Option<ResponseItem> {
+        let item = self.response_rx.recv().await;
+        self.observe(item.as_ref());
+        item
+    }
+
+    fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
+        let item = self.response_rx.try_recv()?;
+        self.observe(Some(&item));
+        Ok(item)
+    }
+
+    fn observe(&mut self, item: Option<&ResponseItem>) {
+        if item.is_some_and(|item| self.expected_response.is_terminal(item)) {
+            self.in_flight = false;
         }
     }
 }
 
-impl Drop for FrontendCall {
+impl Drop for RuntimeCall {
     fn drop(&mut self) {
         if self.in_flight {
             // Pending cancellation is consumed by Intake before it starts work.
@@ -449,6 +624,7 @@ mod tests {
                 startup_ready,
                 is_disaggregation,
                 mm_limits,
+                metadata: FrontendMetadata::default(),
             },
         )
     }
@@ -516,6 +692,363 @@ mod tests {
         assert!(!admission.try_accept());
         drop(request);
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_live_call_aborts_exactly_once() {
+        let harness = Harness::unbounded(8);
+        let call = harness.handle.submit(generate("live")).await.unwrap();
+        let _request = accept_intake(harness.intake_rx.recv().unwrap());
+
+        drop(call);
+        assert!(matches!(
+            harness.abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "live"
+        ));
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_items_disarm_only_the_matching_operation() {
+        async fn assert_disarmed(kind: RequestKind, item: ResponseItem) {
+            let harness = Harness::unbounded(8);
+            let mut call = harness.handle.submit(kind).await.unwrap();
+            let request = accept_intake(harness.intake_rx.recv().unwrap());
+            request.sink.try_send(item).unwrap();
+
+            let _ = call.recv().await;
+            drop(call);
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
+
+        assert_disarmed(generate("done"), ResponseItem::Done(ChunkEvent::default())).await;
+        assert_disarmed(
+            generate("failed"),
+            ResponseItem::Error(Error::Internal("failed".into())),
+        )
+        .await;
+        assert_disarmed(
+            RequestKind::Control(Box::new(ControlRequest::GetInternalStateReq(
+                GetInternalStateReq::new("control".into()),
+            ))),
+            ResponseItem::Control(Bytes::from_static(b"control")),
+        )
+        .await;
+        assert_disarmed(
+            RequestKind::Detokenize {
+                token_ids: vec![1, 2],
+            },
+            ResponseItem::Data(Bytes::from_static(b"data")),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wrong_response_kind_keeps_generation_armed() {
+        for item in [
+            ResponseItem::Control(Bytes::from_static(b"control")),
+            ResponseItem::Data(Bytes::from_static(b"data")),
+        ] {
+            let harness = Harness::unbounded(8);
+            let mut call = harness.handle.submit(generate("wrong-kind")).await.unwrap();
+            let request = accept_intake(harness.intake_rx.recv().unwrap());
+            request.sink.try_send(item).unwrap();
+
+            let _ = call.recv().await;
+            drop(call);
+            assert!(matches!(
+                harness.abort_rx.recv().unwrap(),
+                AbortSource::Guard(rid) if rid.as_str() == "wrong-kind"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn nonterminal_frame_keeps_call_armed() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness.handle.submit(generate("streaming")).await.unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Frame(ChunkEvent::default()))
+            .unwrap();
+
+        assert!(matches!(call.recv().await, Some(ResponseItem::Frame(_))));
+        drop(call);
+        assert!(matches!(
+            harness.abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "streaming"
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_channel_close_before_terminal_keeps_call_armed() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness.handle.submit(generate("truncated")).await.unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        drop(request);
+
+        assert!(call.recv().await.is_none());
+        drop(call);
+        assert!(matches!(
+            harness.abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "truncated"
+        ));
+    }
+
+    #[test]
+    fn runtime_errors_become_transport_neutral_categories() {
+        assert!(matches!(
+            translate_runtime_error(Error::Validation("bad input".into())),
+            FrontendError::InvalidArgument(message)
+                if message == "validation failed: bad input"
+        ));
+        assert!(matches!(
+            translate_runtime_error(Error::QueueFull),
+            FrontendError::Overloaded(message) if message == "to_scheduler channel full"
+        ));
+        assert!(matches!(
+            translate_runtime_error(Error::Disconnected),
+            FrontendError::Cancelled(message) if message == "client disconnected"
+        ));
+
+        for (error, expected) in [
+            (
+                Error::Tokenize("tokenizer".into()),
+                "tokenize failed: tokenizer",
+            ),
+            (Error::Encode("encoder".into()), "encode failed: encoder"),
+            (
+                Error::Detokenize("decoder".into()),
+                "detokenize failed: decoder",
+            ),
+            (Error::Codec("wire".into()), "serialization error: wire"),
+            (Error::Internal("bug".into()), "internal error: bug"),
+        ] {
+            assert!(matches!(
+                translate_runtime_error(error),
+                FrontendError::Internal(message) if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn scheduler_status_is_classified_once_for_non_http_adapters() {
+        for (status, expected) in [
+            (400, FrontendErrorKind::InvalidArgument),
+            (404, FrontendErrorKind::NotFound),
+            (408, FrontendErrorKind::DeadlineExceeded),
+            (412, FrontendErrorKind::FailedPrecondition),
+            (413, FrontendErrorKind::ResourceExhausted),
+            (429, FrontendErrorKind::ResourceExhausted),
+            (432, FrontendErrorKind::InvalidArgument),
+            (499, FrontendErrorKind::Cancelled),
+            (500, FrontendErrorKind::Internal),
+            (503, FrontendErrorKind::Unavailable),
+            (504, FrontendErrorKind::DeadlineExceeded),
+        ] {
+            let error = FrontendError::from_runtime_rejection("rejected".into(), status);
+            assert_eq!(error.kind(), expected, "legacy status {status}");
+            assert!(matches!(
+                error,
+                FrontendError::RuntimeRejected {
+                    legacy_http_status,
+                    ..
+                } if legacy_http_status == status
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_exposes_public_id_and_semantic_events() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness
+            .handle
+            .generate(GenerateRequest {
+                rid: Rid::from_client("public-id"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(call.public_id(), "public-id");
+        assert_ne!(call.runtime.rid.as_str(), "public-id");
+
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Frame(ChunkEvent {
+                text: "delta".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent {
+                text: "final".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Delta(FrontendOutput { text, .. })) if text == "delta"
+        ));
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Finished(FrontendOutput { text, .. })) if text == "final"
+        ));
+        assert!(call.recv().await.is_none());
+        drop(call);
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn coded_scheduler_abort_becomes_one_semantic_failure() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness
+            .handle
+            .generate(GenerateRequest {
+                rid: "scheduler-rejection".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent {
+                finish_reason: serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "media decode failed",
+                    "status_code": 432,
+                    "err_type": "BadRequestError"
+                }))
+                .unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Failed(FrontendError::RuntimeRejected {
+                kind: FrontendErrorKind::InvalidArgument,
+                message,
+                legacy_http_status: 432,
+            })) if message == "media decode failed"
+        ));
+        assert!(call.recv().await.is_none());
+        drop(call);
+        assert!(
+            harness.abort_rx.try_recv().is_err(),
+            "the runtime already emitted a terminal response"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_scheduler_abort_remains_a_terminal_output() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness
+            .handle
+            .generate(GenerateRequest {
+                rid: "plain-abort".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent {
+                finish_reason: serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "Aborted",
+                    "status_code": null,
+                    "err_type": null
+                }))
+                .unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Finished(FrontendOutput {
+                finish_reason: Some(_),
+                ..
+            }))
+        ));
+        assert!(call.recv().await.is_none());
+        drop(call);
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn generation_channel_close_becomes_failure_and_still_aborts() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness
+            .handle
+            .generate(GenerateRequest {
+                rid: "truncated-event-stream".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        drop(request);
+
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Failed(FrontendError::Internal(message)))
+                if message == "response truncated before completion"
+        ));
+        assert!(call.recv().await.is_none());
+        drop(call);
+        assert!(matches!(
+            harness.abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "truncated-event-stream"
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_ready_preserves_queued_events_before_runtime_closure() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness
+            .handle
+            .generate(GenerateRequest {
+                rid: "drained-event-stream".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = accept_intake(harness.intake_rx.recv().unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Frame(ChunkEvent::default()))
+            .unwrap();
+        drop(request);
+
+        let mut events = Vec::new();
+        call.drain_ready(&mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events.first(), Some(FrontendEvent::Delta(_))));
+
+        // A non-blocking backlog drain must not let channel closure overtake an
+        // event the runtime had already produced. The following awaited read
+        // reports truncation exactly once.
+        assert!(matches!(
+            call.recv().await,
+            Some(FrontendEvent::Failed(FrontendError::Internal(message)))
+                if message == "response truncated before completion"
+        ));
+        assert!(call.recv().await.is_none());
+
+        call.drain_ready(&mut events);
+        assert_eq!(events.len(), 1, "a terminal failure is emitted only once");
+        drop(call);
+        assert!(matches!(
+            harness.abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.as_str() == "drained-event-stream"
+        ));
     }
 
     #[tokio::test]
@@ -590,6 +1123,46 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn readiness_initialization_and_transition_are_shared() {
+        let initially_unready = Harness::unbounded(8).handle;
+        let observer = initially_unready.clone();
+        assert!(!initially_unready.is_ready());
+        initially_unready.mark_ready();
+        assert!(observer.is_ready());
+
+        let (intake_tx, _) = flume::unbounded();
+        let (abort_tx, _) = flume::unbounded();
+        let initially_ready = FrontendHandle::new(
+            intake_tx,
+            abort_tx,
+            FrontendConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: BTreeMap::new(),
+                metadata: FrontendMetadata::default(),
+            },
+        );
+        assert!(initially_ready.is_ready());
+    }
+
+    #[tokio::test]
+    async fn health_probe_reports_not_ready_without_submitting() {
+        let harness = Harness::unbounded(8);
+        assert_eq!(
+            harness
+                .handle
+                .probe_health(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            HealthStatus::NotReady
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn healthy_probe_uses_shared_activity_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -652,25 +1225,172 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_operation_returns_transport_neutral_payload() {
+    async fn health_probe_surfaces_closed_intake_as_operational_error() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        drop(intake_rx);
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            Default::default(),
+            true,
+            false,
+            BTreeMap::new(),
+        );
+
+        assert!(matches!(
+            handle.probe_health(Duration::ZERO).await,
+            Err(FrontendError::Unavailable)
+        ));
+        assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn server_info_decodes_allowlisted_typed_result() {
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let task = tokio::spawn(async move { handle.server_info().await });
+
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(!request.rid.as_str().is_empty());
+        assert!(matches!(request.kind, RequestKind::Control(_)));
+        let memory_usage = rmpv::Value::Map(vec![
+            (rmpv::Value::from("weight"), rmpv::Value::from(12.5)),
+            (rmpv::Value::from("kvcache"), rmpv::Value::from(3.0)),
+            (
+                rmpv::Value::from("startup_available"),
+                rmpv::Value::from(20.0),
+            ),
+            (rmpv::Value::from("token_capacity"), rmpv::Value::from(4096)),
+            (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+            (rmpv::Value::from("graph"), rmpv::Value::Map(vec![])),
+            (
+                rmpv::Value::from("future_uncontracted_metric"),
+                rmpv::Value::from(99),
+            ),
+        ]);
+        let internal_state = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("api_key"),
+                rmpv::Value::from("must-not-cross-the-boundary"),
+            ),
+            (
+                rmpv::Value::from("last_gen_throughput"),
+                rmpv::Value::from(1.5),
+            ),
+            (rmpv::Value::from("memory_usage"), memory_usage),
+            (
+                rmpv::Value::from("effective_max_running_requests_per_dp"),
+                rmpv::Value::from(32),
+            ),
+            (
+                rmpv::Value::from("step_time_dict"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from(4),
+                    rmpv::Value::Array(vec![rmpv::Value::from(0.01)]),
+                )]),
+            ),
+        ]);
+        let envelope =
+            rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal_state)]);
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(payload)))
+            .unwrap();
+        let info = task.await.unwrap().unwrap();
+        assert_eq!(info.internal_states.len(), 1);
+        let state = &info.internal_states[0];
+        assert_eq!(state.last_gen_throughput, Some(1.5));
+        assert_eq!(state.effective_max_running_requests_per_dp, Some(32));
+        assert_eq!(
+            state.memory_usage.as_ref().and_then(|usage| usage.weight),
+            Some(12.5)
+        );
+        assert_eq!(
+            state
+                .step_time_dict
+                .as_ref()
+                .and_then(|steps| steps.get(&4))
+                .map(Vec::as_slice),
+            Some(&[0.01][..])
+        );
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json["internal_states"][0]["memory_usage"]["token_capacity_swa"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json["internal_states"][0]["step_time_dict"]["4"],
+            serde_json::json!([0.01])
+        );
+        assert!(!json.to_string().contains("must-not-cross-the-boundary"));
+        assert!(
+            json["internal_states"][0]["memory_usage"]
+                .get("future_uncontracted_metric")
+                .is_none(),
+            "uncontracted scheduler fields must not silently become public API"
+        );
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_control_response_is_internal_and_still_aborts() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
         let task = tokio::spawn(async move {
             handle
                 .control(ControlRequest::GetInternalStateReq(
-                    GetInternalStateReq::new("control-id".into()),
+                    GetInternalStateReq::new("closed-control".into()),
                 ))
                 .await
         });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
-        assert_eq!(request.rid.as_str(), "control-id");
-        request
-            .sink
-            .try_send(ResponseItem::Control(Bytes::from_static(b"payload")))
-            .unwrap();
-        assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"payload"));
-        assert!(harness.abort_rx.try_recv().is_err());
+        let rid = request.rid.clone();
+        assert!(matches!(&request.kind, RequestKind::Control(_)));
+        drop(request);
+
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), FrontendErrorKind::Internal);
+        assert!(matches!(error, FrontendError::ResponseTruncated));
+        assert!(matches!(
+            harness.abort_rx.recv_async().await.unwrap(),
+            AbortSource::Guard(aborted) if aborted == rid
+        ));
+    }
+
+    #[test]
+    fn model_info_is_a_typed_snapshot_of_shared_configuration() {
+        let (intake_tx, _) = flume::unbounded();
+        let (abort_tx, _) = flume::unbounded();
+        let handle = FrontendHandle::new(
+            intake_tx,
+            abort_tx,
+            FrontendConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: BTreeMap::new(),
+                metadata: FrontendMetadata::from(&ServerArgs {
+                    model_path: "/model".into(),
+                    served_model_name: "served".into(),
+                    tokenizer_path: "/tokenizer".into(),
+                    weight_version: Some("v1".into()),
+                    ..Default::default()
+                }),
+            },
+        );
+
+        let value = serde_json::to_value(handle.model_info()).unwrap();
+        assert_eq!(value["model_path"], "/model");
+        assert_eq!(value["served_model_name"], "served");
+        assert_eq!(value["tokenizer_path"], "/tokenizer");
+        assert_eq!(value["weight_version"], "v1");
+        assert_eq!(value["is_generation"], true);
     }
 
     #[tokio::test]
@@ -686,7 +1406,26 @@ mod tests {
             .sink
             .try_send(ResponseItem::Data(Bytes::from_static(b"decoded")))
             .unwrap();
-        assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"decoded"));
+        assert_eq!(task.await.unwrap().unwrap(), "decoded");
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn detokenize_rejects_non_utf8_before_it_reaches_an_adapter() {
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let task = tokio::spawn(async move { handle.detokenize(vec![1]).await });
+
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Data(Bytes::from_static(&[0xff])))
+            .unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(FrontendError::InvalidResponse(message))
+                if message == "detokenized prompt is not valid UTF-8"
+        ));
         assert!(harness.abort_rx.try_recv().is_err());
     }
 }
