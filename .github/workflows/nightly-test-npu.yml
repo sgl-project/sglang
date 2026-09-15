@@ -310,7 +310,7 @@ jobs:
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
     # Disabled: does not involve CANN 9.1.0.
-    if: ${{ false }}
+    if: ${{ true }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
