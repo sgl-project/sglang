@@ -20,6 +20,7 @@ pub mod compare;
 pub mod environment;
 pub mod http;
 pub mod process;
+mod progress;
 pub mod runner;
 pub mod sse;
 

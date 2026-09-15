@@ -16,6 +16,8 @@ serde_json = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 libc = "0.2"
 sha2 = "0.10"
@@ -24,3 +26,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

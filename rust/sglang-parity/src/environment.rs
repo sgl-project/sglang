@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{Instant, sleep};
 
 use crate::process::{ServerConfig, isolated_command, run_command};
+use crate::progress::track;
 use crate::runner::RunConfig;
 
 pub(crate) mod lock;
@@ -401,12 +402,21 @@ pub(crate) async fn prepare(
         return Err("dependency lock changed after configuration validation".into());
     }
     if plan.managed {
-        preflight(plan, &log, deadline).await?;
+        track(
+            "Checking build tools and platform",
+            &log,
+            preflight(plan, &log, deadline),
+        )
+        .await?;
         let version_log = output.join("uv-version.log");
-        run_command(
-            command("uv", &plan.build_environment).arg("--version"),
+        track(
+            "Checking uv version",
             &version_log,
-            remaining(deadline)?,
+            run_command(
+                command("uv", &plan.build_environment).arg("--version"),
+                &version_log,
+                remaining(deadline)?,
+            ),
         )
         .await?;
         let version = fs::read_to_string(version_log).map_err(|e| e.to_string())?;
@@ -422,12 +432,16 @@ pub(crate) async fn prepare(
     }
     fs::create_dir_all(plan.cache_dir.join("sources")).map_err(|e| e.to_string())?;
     fs::create_dir_all(plan.cache_dir.join("environments")).map_err(|e| e.to_string())?;
-    let _source_lease = Lease::acquire(
-        &plan
-            .cache_dir
-            .join("sources")
-            .join(format!("{}.lock", plan.commit)),
-        deadline,
+    let _source_lease = track(
+        "Waiting for source cache access",
+        &log,
+        Lease::acquire(
+            &plan
+                .cache_dir
+                .join("sources")
+                .join(format!("{}.lock", plan.commit)),
+            deadline,
+        ),
     )
     .await?;
     if !plan.source_snapshot.exists() {
@@ -438,7 +452,12 @@ pub(crate) async fn prepare(
             .args(["worktree", "add", "--detach"])
             .arg(&plan.source_snapshot)
             .arg(&plan.commit);
-        run_command(&mut checkout, &log, remaining(deadline)?).await?;
+        track(
+            "Creating source snapshot",
+            &log,
+            run_command(&mut checkout, &log, remaining(deadline)?),
+        )
+        .await?;
     }
     verify_snapshot(&plan.source_snapshot, &plan.commit).map_err(|error| {
         format!(
@@ -450,7 +469,12 @@ pub(crate) async fn prepare(
     if snapshot_lock.sha256 != plan.lock_sha256 {
         return Err("source snapshot dependency lock differs from the described commit".into());
     }
-    let lease = Lease::acquire(&plan.environment_dir.with_extension("lock"), deadline).await?;
+    let lease = track(
+        "Waiting for environment cache access",
+        &log,
+        Lease::acquire(&plan.environment_dir.with_extension("lock"), deadline),
+    )
+    .await?;
     let mut environment = plan.build_environment.clone();
     environment.insert(
         "PYTHONPATH".into(),
@@ -477,6 +501,7 @@ pub(crate) async fn prepare(
     let ready = plan.environment_dir.join("parity-ready.json");
     let reused = plan.managed && ready.is_file();
     if reused {
+        tracing::info!(python = %plan.python.display(), "Reusing cached environment; verifying before use");
         let previous: Value = serde_json::from_slice(&fs::read(&ready).map_err(|e| e.to_string())?)
             .map_err(|e| format!("invalid environment completion marker: {e}"))?;
         if previous["plan"]["commit"] != plan.commit
@@ -489,6 +514,7 @@ pub(crate) async fn prepare(
     }
     if plan.managed && !reused {
         if plan.environment_dir.exists() {
+            tracing::info!("Rebuilding incomplete environment");
             fs::remove_dir_all(&plan.environment_dir).map_err(|e| e.to_string())?;
         }
         let mut create = command("uv", &environment);
@@ -501,7 +527,12 @@ pub(crate) async fn prepare(
                 &plan.profile.python,
             ])
             .arg(&plan.environment_dir);
-        run_command(&mut create, &log, remaining(deadline)?).await?;
+        track(
+            "Preparing Python environment",
+            &log,
+            run_command(&mut create, &log, remaining(deadline)?),
+        )
+        .await?;
         let mut install = command("uv", &environment);
         install
             .args([
@@ -523,7 +554,12 @@ pub(crate) async fn prepare(
             install.args(["--index", index]);
         }
         install.args(["--index-strategy", "first-index"]);
-        run_command(&mut install, &log, remaining(deadline)?).await?;
+        track(
+            "Installing locked dependencies",
+            &log,
+            run_command(&mut install, &log, remaining(deadline)?),
+        )
+        .await?;
         let mut install_source = command("uv", &environment);
         install_source
             .env("SGLANG_BUILD_RUST_EXTS", "none")
@@ -531,7 +567,12 @@ pub(crate) async fn prepare(
             .arg(&plan.python)
             .args(["--no-deps", "--no-build-isolation", "-e"])
             .arg(plan.source_snapshot.join("python"));
-        run_command(&mut install_source, &log, remaining(deadline)?).await?;
+        track(
+            "Installing SGLang source",
+            &log,
+            run_command(&mut install_source, &log, remaining(deadline)?),
+        )
+        .await?;
     }
     let probe_path = plan
         .source_snapshot
@@ -543,7 +584,12 @@ pub(crate) async fn prepare(
             .arg(&probe_path)
             .arg("--library-paths")
             .arg(&paths_file);
-        run_command(&mut discover, &log, remaining(deadline)?).await?;
+        track(
+            "Locating CUDA runtime libraries",
+            &log,
+            run_command(&mut discover, &log, remaining(deadline)?),
+        )
+        .await?;
         let mut paths: Vec<PathBuf> =
             serde_json::from_slice(&fs::read(paths_file).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -582,7 +628,12 @@ pub(crate) async fn prepare(
         })
         .arg("--output")
         .arg(&verification);
-    run_command(&mut probe, &log, remaining(deadline)?).await?;
+    track(
+        "Verifying packages, device and Rust extension (may build)",
+        &log,
+        run_command(&mut probe, &log, remaining(deadline)?),
+    )
+    .await?;
     verify_snapshot(&plan.source_snapshot, &plan.commit)?;
     let probe: Value = serde_json::from_slice(&fs::read(&verification).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -625,6 +676,7 @@ pub(crate) async fn prepare(
     let mut server = config.server.clone();
     server.python = Some(plan.python.clone());
     server.env = environment;
+    tracing::info!(reused, managed = plan.managed, "Environment ready");
     Ok(PreparedEnvironment {
         server,
         record,

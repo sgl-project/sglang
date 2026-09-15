@@ -607,7 +607,11 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
     fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     let execute = |external: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sglang-parity"));
-        command.arg("--config").arg(&config_path).arg("--describe");
+        command
+            .env_remove("RUST_LOG")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--describe");
         if let Some(path) = external {
             command.arg("--suite-file").arg(path);
         }
@@ -620,6 +624,10 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
         String::from_utf8_lossy(&default.stderr)
     );
     let default_json: Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert!(
+        default.stderr.is_empty(),
+        "describe must not emit run progress"
+    );
     assert_eq!(default_json["suite"]["cases"].as_array().unwrap().len(), 10);
     assert_eq!(default_json["repeats_per_implementation"], 2);
     let external_path = directory.path().join("suite.json");
@@ -797,12 +805,14 @@ async fn cli_sigterm_cleans_managed_descendants_and_retains_an_interrupted_repor
     fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
     let log_path = fixture.directory.path().join("cli.log");
     let log = fs::File::create(&log_path).unwrap();
+    let stdout_path = fixture.directory.path().join("cli.stdout");
     let mut cli = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
+        .env_remove("RUST_LOG")
         .arg("--config")
         .arg(config_path)
         .arg("--suite-file")
         .arg(spec_path)
-        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
         .stderr(Stdio::from(log))
         .spawn()
         .unwrap();
@@ -820,6 +830,23 @@ async fn cli_sigterm_cleans_managed_descendants_and_retains_an_interrupted_repor
         let _ = cli.kill();
     }
     let status = cli.wait().unwrap();
+    let progress = fs::read_to_string(&log_path).unwrap();
+    for expected in [
+        "Run artifacts and logs",
+        "Environment ready",
+        "Server ready",
+        "case 1/1 pending, repeat 1/2",
+        "server.log",
+    ] {
+        assert!(
+            progress.contains(expected),
+            "missing {expected}: {progress}"
+        );
+    }
+    assert!(
+        fs::read_to_string(stdout_path).unwrap().is_empty(),
+        "progress belongs on stderr"
+    );
     assert!(
         received,
         "CLI did not reach its request: {:?}; lifecycle={:#?}",

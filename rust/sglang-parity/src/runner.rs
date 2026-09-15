@@ -12,6 +12,7 @@ use crate::compare::{ComparisonRules, Difference, Violation, compare_json, prepa
 use crate::environment::{self, EnvironmentConfig, EnvironmentPlan, PreparedEnvironment};
 use crate::http::{self, CaptureMode, HttpCase, HttpObservation};
 use crate::process::{Implementation, ServerConfig, SglangProcess};
+use crate::progress::track;
 
 /// Environment and lifecycle limits; comparison rules belong to [`HttpSuite`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -342,9 +343,12 @@ pub async fn run(
     suite: &HttpSuite,
     policy: &impl ResponsePolicy,
 ) -> Result<Report, RunError> {
+    tracing::info!("Validating configuration and source revision");
     let effective = describe(config, suite)?;
     let client = http::client()?;
     let artifacts = Artifacts::create(&config.output_dir)?;
+    tracing::info!(commit = %effective.environment.commit, backend = ?effective.environment.profile.backend, suite = %suite.name, cases = suite.cases.len(), "Starting parity run");
+    tracing::info!(directory = %artifacts.root().display(), "Run artifacts and logs");
     let effective_path = artifacts.root().join("effective_suite.json");
     artifacts.write_json(&effective_path, &effective)?;
     let report = Report {
@@ -377,6 +381,7 @@ pub async fn run(
         match environment::prepare(config, &effective.environment, state.artifacts.root()).await {
             Ok(prepared) => prepared,
             Err(error) => {
+                tracing::error!(%error, "Environment preparation failed");
                 let report = state.report.as_mut().unwrap();
                 report
                     .runtime_errors
@@ -407,17 +412,23 @@ pub async fn run(
         }
         let side_name = implementation.as_str();
         let side_dir = state.artifacts.directory(side_name)?;
-        let mut process = match SglangProcess::start(
-            &prepared.server,
-            implementation,
-            &side_dir.join("server.log"),
-            Duration::from_secs(config.startup_timeout_secs),
-            Duration::from_secs(config.shutdown_timeout_secs),
+        let server_log = side_dir.join("server.log");
+        let mut process = match track(
+            &format!("Starting {side_name} server; waiting for readiness"),
+            &server_log,
+            SglangProcess::start(
+                &prepared.server,
+                implementation,
+                &server_log,
+                Duration::from_secs(config.startup_timeout_secs),
+                Duration::from_secs(config.shutdown_timeout_secs),
+            ),
         )
         .await
         {
             Ok(process) => process,
             Err(error) => {
+                tracing::error!(implementation = side_name, %error, "Server startup failed");
                 state
                     .report
                     .as_mut()
@@ -432,6 +443,7 @@ pub async fn run(
                 continue;
             }
         };
+        tracing::info!(implementation = side_name, "Server ready");
         for (index, case) in suite.cases.iter().enumerate() {
             for repeat in 1..=2 {
                 let directory = state
@@ -452,13 +464,22 @@ pub async fn run(
                 });
                 state.save()?;
                 // The only transport dispatch point; API interpretation follows capture.
-                let observation = http::capture(
-                    &client,
-                    &process.base_url(),
-                    case,
-                    &requests[index],
-                    &directory.join("response.body"),
-                    Duration::from_secs(config.request_timeout_secs),
+                let observation = track(
+                    &format!(
+                        "{side_name}: case {}/{} {}, repeat {repeat}/2",
+                        index + 1,
+                        suite.cases.len(),
+                        case.name
+                    ),
+                    &server_log,
+                    http::capture(
+                        &client,
+                        &process.base_url(),
+                        case,
+                        &requests[index],
+                        &directory.join("response.body"),
+                        Duration::from_secs(config.request_timeout_secs),
+                    ),
                 )
                 .await?;
                 if case.capture == CaptureMode::Sse {
@@ -499,6 +520,9 @@ pub async fn run(
                     .implementations
                     .get_mut(side_name)
                     .unwrap();
+                if observation.transport_error.is_some() || !violations.is_empty() {
+                    tracing::warn!(implementation = side_name, case = %case.name, repeat, status = ?observation.status, error = ?observation.transport_error, violations = violations.len(), "Request failed validation; details retained in report");
+                }
                 *side.attempts.last_mut().unwrap() = Attempt {
                     directory,
                     observation: Some(observation),
@@ -520,11 +544,18 @@ pub async fn run(
                     ..Check::default()
                 },
             };
+            tracing::info!(implementation = side_name, case = %case.name, repeatability = ?side.repeatability.status, "Case complete");
             state.save()?;
         }
-        let shutdown = process.shutdown().await;
+        let shutdown = track(
+            &format!("Stopping {side_name} server"),
+            &server_log,
+            process.shutdown(),
+        )
+        .await;
         source_valid = state.verify_source(&prepared);
         if let Err(error) = shutdown {
+            tracing::error!(implementation = side_name, %error, "Server shutdown failed");
             state
                 .report
                 .as_mut()

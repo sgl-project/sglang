@@ -98,6 +98,14 @@ invocation directory. `--describe` prints the commit, profile, lock digest, cach
 paths, and effective suite without downloading, installing, building, or starting
 services.
 
+The CLI prints progress to stderr by default: source revision, artifact directory,
+environment setup or reuse, server readiness, and each case/repeat. Stages that
+take longer than ten seconds print periodic elapsed-time updates and the log path.
+Detailed installation/build output stays in `setup.log`; service output stays in
+each implementation's `server.log`. Set `RUST_LOG=warn` to hide routine progress.
+Library callers can collect the same events with their own `tracing` subscriber.
+`--describe` keeps stdout as JSON and does not emit execution progress.
+
 The runner rejects staged or unstaged tracked changes and untracked files under
 `python/` or `rust/`. Ignored build outputs are permitted. It installs and runs
 against a detached Git worktree, checks its revision and cleanliness before and
