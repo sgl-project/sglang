@@ -233,6 +233,13 @@ def handle_dwdp(server_args: Any):
     if cfg.dwdp_size <= 1:
         return
 
+    # ROCm reports device == "cuda" but ships no cuda-python either.
+    if cfg.device != "cuda" or get_platform().is_hip:
+        raise ValueError(
+            "DWDP requires an NVIDIA CUDA device (cuMem VMM + peer IPC weight "
+            f"transport); got --device {cfg.device}"
+        )
+
     assert cfg.dwdp_size >= 2, (
         f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
     )
