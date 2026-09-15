@@ -1483,14 +1483,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -1505,8 +1520,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        if save_kv_cache:
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        if save_kv_cache and fused_fp8_query is None:
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
@@ -1520,8 +1535,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
 
         # TODO refactor to avoid code duplication
-        # Prepare query tensor inline
-        if merge_query:
+        # Prepare query tensor inline (already built when the fused fp8 path
+        # ran)
+        if fused_fp8_query is not None:
+            q = fused_fp8_query
+        elif merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(

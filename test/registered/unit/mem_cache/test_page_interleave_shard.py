@@ -612,6 +612,7 @@ class _GraftReq:
         self.swa_prefix_lock_released = False
         self.finished_reason = None
         self.session = None
+        self.session_id = None
 
     def get_fill_ids(self):
         return array("q", self.fill_ids)
