@@ -81,15 +81,24 @@ def _fake_host_pool_modules():
     }
 
 
-def _make_config(*, tp_rank, pp_rank, ssd_offload_path, dp_rank=0):
+def _make_config(
+    *,
+    tp_rank,
+    pp_rank,
+    ssd_offload_path,
+    dp_rank=0,
+    tp_size=8,
+    attn_cp_rank=0,
+    attn_cp_size=1,
+):
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
-        tp_size=8,
+        tp_size=tp_size,
         pp_rank=pp_rank,
         pp_size=1,
         dp_rank=dp_rank,
-        attn_cp_rank=0,
-        attn_cp_size=1,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
         is_mla_model=False,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -104,13 +113,25 @@ def _make_config(*, tp_rank, pp_rank, ssd_offload_path, dp_rank=0):
     )
 
 
-def _make_store(*, tp_rank, pp_rank, ssd_offload_path, dp_rank=0):
+def _make_store(
+    *,
+    tp_rank,
+    pp_rank,
+    ssd_offload_path,
+    dp_rank=0,
+    tp_size=8,
+    attn_cp_rank=0,
+    attn_cp_size=1,
+):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
         tp_rank=tp_rank,
         pp_rank=pp_rank,
         ssd_offload_path=ssd_offload_path,
         dp_rank=dp_rank,
+        tp_size=tp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
     )
     with patch.dict(
         "sys.modules",
@@ -132,7 +153,7 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
         with tempfile.TemporaryDirectory() as base:
             for tp_rank in (0, 3):
                 client = _make_store(tp_rank=tp_rank, pp_rank=0, ssd_offload_path=base)
-                expected = os.path.join(base, f"rank_0_{tp_rank}_0")
+                expected = os.path.join(base, f"rank_0_{tp_rank}_0_0")
                 self.assertEqual(client.setup_kwargs.get("ssd_offload_path"), expected)
                 self.assertTrue(os.path.isdir(expected))
 
@@ -156,7 +177,25 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
                 for dp_rank in range(8)
             }
             self.assertEqual(len(paths), 8)
-            self.assertIn(os.path.join(base, "rank_5_0_0"), paths)
+            self.assertIn(os.path.join(base, "rank_5_0_0_0"), paths)
+
+    def test_cp_ranks_are_distinct_with_dp_attention(self):
+        """CP peers with identical DP/TP/PP ranks must not share SSD files."""
+        with tempfile.TemporaryDirectory() as base:
+            paths = {
+                _make_store(
+                    tp_rank=0,
+                    pp_rank=0,
+                    ssd_offload_path=base,
+                    dp_rank=dp_rank,
+                    tp_size=1,
+                    attn_cp_rank=cp_rank,
+                    attn_cp_size=4,
+                ).setup_kwargs["ssd_offload_path"]
+                for dp_rank in range(2)
+                for cp_rank in range(4)
+            }
+            self.assertEqual(len(paths), 8)
 
 
 if __name__ == "__main__":
