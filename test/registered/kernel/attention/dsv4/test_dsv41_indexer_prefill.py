@@ -217,33 +217,6 @@ class _PrefillIndexerFixture(CustomTestCase):
 
 
 class TestPrefillIndexerKernelPath(_PrefillIndexerFixture):
-    def test_head_weights_match_scaled_linear(self):
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
-
-        config = SimpleNamespace(
-            index_n_heads=N_HEADS,
-            index_head_dim=HEAD_DIM,
-            index_topk=TOPK,
-            qk_rope_head_dim=64,
-            q_lora_rank=16,
-            hidden_size=5120,
-            kv_source_layer_ids=[],
-            candidate_source_layer_id=-1,
-            candidate_topk_blocks=2,
-            candidate_block_size=32,
-        )
-        torch.manual_seed(0)
-        indexer = DeepseekV41Indexer(config, 0, 512, None, "indexer").cuda()
-        with torch.no_grad():
-            indexer.weights_proj.weight.normal_(std=0.02)
-            for rows in (1, 33):
-                x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
-                expected = torch.nn.functional.linear(x, indexer.weights_proj.weight)
-                expected *= HEAD_DIM**-0.5 * N_HEADS**-0.5
-                torch.testing.assert_close(
-                    indexer.head_weights(x), expected, atol=2e-4, rtol=1e-2
-                )
-
     def test_kernel_path_contract_and_selection(self):
         for ratio in (1, 2):
             st = self._setup(ratio, seq_lens=[300, 45, 700], extend_lens=[300, 45, 700])

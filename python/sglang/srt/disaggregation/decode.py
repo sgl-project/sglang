@@ -1198,6 +1198,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        if self.scheduler.enable_lora:
+            running_batches = (
+                self.scheduler.running_mbs
+                if is_pp_mode
+                else (self.scheduler.running_batch,)
+            )
+            # Include finished requests; GPU work may still use their adapters.
+            running_loras = {
+                req.lora_id for batch in running_batches for req in batch.reqs
+            }
+            running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
+            running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1217,6 +1230,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if hisparse_req_budget <= 0:
                 break
+
+            if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
+                decode_req.req, running_loras
+            ):
+                continue
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
@@ -1426,7 +1444,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
                     )
                 )
@@ -1566,6 +1584,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            if self.scheduler.enable_lora:
+                running_loras.add(decode_req.req.lora_id)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         if failed_reqs:

@@ -99,14 +99,12 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
@@ -982,6 +980,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1338,6 +1337,12 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+    def advance_cache_request_handle(self) -> None:
+        self.cache_request_handle = dataclasses.replace(
+            self.cache_request_handle,
+            attempt_id=self.cache_request_handle.attempt_id + 1,
+        )
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1417,10 +1422,59 @@ class Req(ReqDllmMixin):
         self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
-        if self.multimodal_inputs is None:
+        if self.session is not None:
+            self._extend_session_image_inputs(image_inputs)
+        elif self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+
+    def _extend_session_image_inputs(self, image_inputs):
+        """Append media while preserving the saved session and its position history."""
+        # Padding can change token values without changing their count.
+        self.full_untruncated_fill_ids = array("q")
+        if self.multimodal_inputs is not None:
+            # Branches and aborted turns must leave the parent's metadata intact.
+            self.multimodal_inputs = dataclasses.replace(self.multimodal_inputs)
+
+        positions = image_inputs.mrope_positions
+        if positions is not None:
+            prefix_len = len(self.origin_input_ids) - positions.shape[1]
+            prefix = (
+                self.multimodal_inputs.mrope_positions
+                if self.multimodal_inputs is not None
+                else None
+            )
+            if prefix is None:
+                prefix = positions.new_empty((3, 0))
+            prefix = prefix[:, :prefix_len]
+            next_position = prefix.max() + 1 if prefix.numel() else 0
+            text_len = prefix_len - prefix.shape[1]
+            text_positions = (
+                torch.arange(
+                    text_len, dtype=positions.dtype, device=positions.device
+                ).expand(3, -1)
+                + next_position
+            )
+            # Fill the reply/text gap, then shift the new turn's media coordinates.
+            positions = torch.cat(
+                [prefix, text_positions, positions + next_position + text_len], dim=1
+            )
+
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            # Use the full table above, or let the scheduler compute missing positions.
+            self.multimodal_inputs.mrope_positions = None
+            self.multimodal_inputs.mrope_position_delta = None
+            self.multimodal_inputs.merge(image_inputs)
+
+        self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        if positions is not None:
+            self.multimodal_inputs.mrope_positions = positions
+            self.multimodal_inputs.mrope_position_delta = (
+                positions.max() + 1 - positions.shape[1]
+            ).reshape(1, 1)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -1970,6 +2024,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
+            "routed_dp_rank": self.disagg_prefill_dp_rank,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
@@ -3121,8 +3176,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
         return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens, tree_cache=self.tree_cache
+            num_tokens=num_tokens,
+            tree_cache=self.tree_cache,
+            requests=requests,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:

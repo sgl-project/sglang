@@ -1056,6 +1056,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
         return cfg._compute_dsv4_sizes(max_tokens, page_size)
 
     def test_dsv4_rejects_single_page_pool(self):
@@ -1118,6 +1121,14 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
         cfg._unified = True
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
+        cfg.request_window_bytes = 0
+        cfg.bytes_per_swa_token = 0.0
+        cfg._unified_fp8 = False
+        # object.__new__ skips __init__; bf16 unified row is 2B * latent
+        cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
 
     # Token pool plus the three request-scoped fixed pools, sized from the

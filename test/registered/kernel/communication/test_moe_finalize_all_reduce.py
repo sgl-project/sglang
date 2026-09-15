@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HIDDEN = 5120  # DeepSeek-V4 hidden size, the width the fused path is used at
 TOP_K = 6

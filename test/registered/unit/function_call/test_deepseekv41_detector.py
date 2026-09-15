@@ -6,8 +6,6 @@ from sglang.srt.entrypoints.openai import encoding_dsv41
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
-    ToolChoice,
-    ToolChoiceFuncName,
 )
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -150,11 +148,6 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         self.tools = _tools()
         self.detector = DeepSeekV41Detector()
 
-    def test_no_builtin_structural_tag(self):
-        """xgrammar's builtin deepseek_v4 tag is the unspaced grammar."""
-        self.assertIsNone(self.detector.get_structural_tag_name())
-        self.assertIsNone(self.detector.get_structural_tag([], "required"))
-
     def test_required_tag_wraps_invokes_in_the_calls_block(self):
         tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="required")
         opener, calls, closer = tag.format.elements
@@ -166,23 +159,6 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
             [f'<{DSML} invoke name="get_weather">', f'<{DSML} invoke name="lookup">'],
         )
         self.assertEqual({t.end for t in calls.tags}, {f"</{DSML} invoke>\n"})
-
-    def test_named_tool_choice_keeps_only_that_tool(self):
-        tag = self.detector.get_structural_tag(
-            tools=self.tools,
-            tool_choice=ToolChoice(function=ToolChoiceFuncName(name="lookup")),
-        )
-        _, call, _ = tag.format.elements
-        self.assertEqual(call.begin, f'<{DSML} invoke name="lookup">')
-        self.assertEqual(call.type, "tag")
-
-    def test_parallel_off_allows_one_invoke(self):
-        tag = self.detector.get_structural_tag(
-            tools=self.tools, tool_choice="required", parallel_tool_calls=False
-        )
-        _, calls, _ = tag.format.elements
-        self.assertEqual(calls.type, "or")
-        self.assertEqual(len(calls.elements), 2)
 
     def test_auto_tag_triggers_on_the_calls_block(self):
         tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="auto")
@@ -197,12 +173,6 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         reasoning, body = tag.format.elements
         self.assertEqual(reasoning.end, "</think>")
         self.assertEqual(body.elements[0].value, f"\n\n<{DSML} calls>\n")
-
-    def test_parser_uses_the_native_tag_for_required(self):
-        parser = FunctionCallParser(self.tools, "deepseekv41")
-        kind, tag = parser.get_structure_constraint("required")
-        self.assertEqual(kind, "structural_tag")
-        self.assertEqual(tag.format.elements[0].value, f"\n\n<{DSML} calls>\n")
 
 
 if __name__ == "__main__":

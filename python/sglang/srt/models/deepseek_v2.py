@@ -466,6 +466,7 @@ class MoEGate(nn.Module):
         prefix: str = "",
         is_hash_moe: bool = False,
         is_deepseek_v4: bool = False,
+        vl_correction_bias: bool = False,
     ):
         super().__init__()
         self.is_deepseek_v4 = is_deepseek_v4
@@ -499,7 +500,7 @@ class MoEGate(nn.Module):
         else:
             self.e_score_correction_bias = None
         self.e_score_correction_bias_vl = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if vl_correction_bias:
             self.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
@@ -571,6 +572,7 @@ class DeepseekV2MoE(nn.Module):
         routed_quant_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        vl_correction_bias: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -635,6 +637,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("gate", prefix),
             is_hash_moe=self.is_hash,
             is_deepseek_v4=is_deepseek_v4,
+            vl_correction_bias=vl_correction_bias,
         )
 
         # scaling factor for fused shared experts on AMD-platform.

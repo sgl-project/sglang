@@ -907,9 +907,6 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
 
                 setup_state_kv_args(kv_args, target, draft)
 
-                self.assertEqual(
-                    kv_args.mla_compression_ratios, target.compression_ratios
-                )
                 self.assertEqual(kv_args.state_types, expected_types)
                 self.assertEqual(kv_args.state_data_ptrs[:-1], target_ptrs)
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])

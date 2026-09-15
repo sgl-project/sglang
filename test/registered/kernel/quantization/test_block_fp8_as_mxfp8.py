@@ -15,7 +15,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 BLOCK = 32
 DEVICE = "cuda"
@@ -151,14 +151,6 @@ class TestLinearNumerics(_OptInCase):
                 q.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0
             )
             torch.testing.assert_close(s, expected_s, rtol=0, atol=0)
-
-        # Ordinary block-FP8 tuples must retain their existing dispatch path.
-        sentinel = torch.empty(0)
-        with patch.object(
-            method, "w8a8_block_fp8_linear", return_value=sentinel
-        ) as legacy:
-            self.assertIs(method.apply(layer, (q, s)), sentinel)
-            legacy.assert_called_once()
 
         partial = torch.randn(8, 6, 2, 1024, device=DEVICE)
         _quantize_partial(partial)

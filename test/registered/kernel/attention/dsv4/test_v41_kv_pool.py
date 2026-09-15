@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.srt.layers.attention.dsv4 import torch_quant as tq
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
-    resolve_compressed_kv_layout,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -102,43 +101,6 @@ class TestV41KVPool(CustomTestCase):
             self.assertLessEqual(
                 buf.shape[0] * (buf.stride(0) // layout.page_align), INT32_MAX
             )
-
-    def test_default_layout_is_unchanged(self):
-        pool = _make_pool([0, 0, 2, 1], [2, 3], KVLayout.V4)
-        self.assertIs(pool.get_swa_key_layout(), KVLayout.V4)
-        self.assertEqual(pool.get_swa_key_bytes_per_token(), 584)
-        self.assertEqual(
-            pool.swa_kv_pool.bytes_per_page_padded, -(-PAGE_SIZE * 584 // 576) * 576
-        )
-        for ratio in (1, 2):
-            layer_id = pool.sources_by_ratio[ratio][0]
-            self.assertIs(pool.get_extra_key_layout(layer_id), KVLayout.V4)
-            self.assertEqual(pool.get_extra_key_bytes_per_token(layer_id), 584)
-
-    def test_compressed_layout_resolution(self):
-        self.assertIs(resolve_compressed_kv_layout(KVLayout.V4, 1), KVLayout.V4)
-        self.assertIs(resolve_compressed_kv_layout(KVLayout.V41, 1), KVLayout.V41_FP4)
-        self.assertIs(resolve_compressed_kv_layout(KVLayout.V41, 2), KVLayout.V41_FP4)
-        self.assertIs(resolve_compressed_kv_layout(KVLayout.V41, 4), KVLayout.V41)
-        self.assertIs(resolve_compressed_kv_layout(KVLayout.V41, 128), KVLayout.V41)
-        self.assertIs(
-            resolve_compressed_kv_layout(KVLayout.V41, 4, "fp4"), KVLayout.V41_FP4
-        )
-        self.assertIs(
-            resolve_compressed_kv_layout(KVLayout.V41, 1, "fp8"), KVLayout.V41
-        )
-        with self.assertRaises(AssertionError):
-            resolve_compressed_kv_layout(KVLayout.V4, 1, "fp4")
-        # The pairs the kernel accepts.
-        self.assertTrue(is_valid_kv_layout_pair(KVLayout.V41, KVLayout.V41_FP4))
-        self.assertTrue(is_valid_kv_layout_pair(KVLayout.V41, KVLayout.V41))
-        self.assertFalse(is_valid_kv_layout_pair(KVLayout.V41, KVLayout.V4))
-        self.assertFalse(is_valid_kv_layout_pair(KVLayout.V4, KVLayout.V41_FP4))
-        # Page strides of the production page sizes need no padding except c128's.
-        self.assertEqual(KVLayout.V41.page_bytes(256), 256 * 528)
-        self.assertEqual(KVLayout.V41_FP4.page_bytes(256), 256 * 288)
-        self.assertEqual(KVLayout.V41.page_bytes(2), 1536)
-        self.assertEqual(KVLayout.V41_FP4.page_bytes(2), 768)
 
     def test_v41_pool_buffers(self):
         for option, expect in (

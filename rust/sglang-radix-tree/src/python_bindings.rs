@@ -241,6 +241,12 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
         PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
         PoolName::DeepseekV4C128 => "deepseek_v4_c128",
+        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
+        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
+        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
+        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
+        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
+        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
@@ -261,6 +267,12 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
         "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
         "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
+        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
+        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
+        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
+        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
+        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
+        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
@@ -514,6 +526,7 @@ pub struct InsertParamsBinding {
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
@@ -526,13 +539,14 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         swa_branching_seqlen: Option<usize>,
@@ -546,6 +560,7 @@ impl InsertParamsBinding {
             value,
             extra_key,
             cache_salt,
+            session_id,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
@@ -1023,6 +1038,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1059,6 +1075,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1828,6 +1845,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1837,6 +1855,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         block_size,
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
+                        session_id.map(|session_id| session_id.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;
