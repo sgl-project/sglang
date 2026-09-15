@@ -67,7 +67,7 @@ class Spark2_5MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
         )
-        self.act_fn = GeluAndMul()
+        self.act_fn = GeluAndMul("none")
 
     def forward(
         self,
