@@ -1467,6 +1467,7 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # The diffusion GPU worker runs a model and publishes a placeholder so
     # shared SRT reads do not fail closed; declared full for that reason.
     "diffusion_gpu_worker": None,
+    "diffusion_weight_cache_daemon": None,
 }
 
 

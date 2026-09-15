@@ -5,7 +5,6 @@ import gc
 import logging
 import multiprocessing as mp
 import os
-import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
@@ -30,8 +29,12 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
     get_tp_world_size,
-    maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.bootstrap import (
+    bootstrap_diffusion_runtime,
+    configure_persistent_torch_compile_cache,
+    worker_cpu_intra_op_threads,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
@@ -100,7 +103,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -127,10 +129,7 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     of microseconds (measured 500x on request-static packed layouts). An
     explicit OMP_NUM_THREADS keeps deployer intent (returns None).
     """
-    if "OMP_NUM_THREADS" in os.environ:
-        return None
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(16, cpu_count // max(1, num_gpus)))
+    return worker_cpu_intra_op_threads(num_gpus)
 
 
 OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
@@ -262,37 +261,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _configure_persistent_torch_compile_cache(self) -> None:
         """Persist torch.compile's Inductor/Triton cache across restarts"""
-        compile_cache_root = os.path.join(
-            envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
-        )
-        tmp_root = tempfile.gettempdir()
-        sglang_defaults = third_party_cache_defaults()
-        for env_name, sub in (
-            ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
-            ("TRITON_CACHE_DIR", "triton"),
-        ):
-            current = os.environ.get(env_name)
-            if (
-                current
-                and current != sglang_defaults.get(env_name)
-                and not current.startswith(tmp_root)
-            ):
-                # Respect an explicit, non-ephemeral user-provided cache dir.
-                continue
-            cache_path = os.path.join(compile_cache_root, sub)
-            try:
-                os.makedirs(cache_path, exist_ok=True)
-            except OSError as e:
-                logger.warning(
-                    "Could not create torch.compile cache dir %s: %s", cache_path, e
-                )
-                continue
-            os.environ[env_name] = cache_path
-        logger.info(
-            "torch.compile cache: TORCHINDUCTOR_CACHE_DIR=%s TRITON_CACHE_DIR=%s",
-            os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-            os.environ.get("TRITON_CACHE_DIR"),
-        )
+        configure_persistent_torch_compile_cache()
 
     def is_sleeping(self) -> bool:
         return self.memory_occupation.is_sleeping() if self.memory_occupation else False
@@ -331,12 +300,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
         self._cap_device_memory_for_tests()
-        # num_gpus is the total world size across every node; the co-located,
-        # CPU-contending worker count on THIS host is num_gpus // nnodes.
-        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
-        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
-        if intra_op_threads is not None:
-            torch.set_num_threads(intra_op_threads)
         # Set environment variables for distributed initialization. Single
         # node rendezvous stays on loopback; cross-node rendezvous must use
         # an address every node can reach, so --dist-init-addr takes over.
@@ -344,34 +307,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
         else:
             rendezvous_addr = NetworkAddress("127.0.0.1", self.master_port)
-        os.environ["MASTER_ADDR"] = rendezvous_addr.host
-        os.environ["MASTER_PORT"] = str(rendezvous_addr.port)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
-        self._configure_persistent_torch_compile_cache()
-        # initialize the distributed environment
-        maybe_init_distributed_environment_and_model_parallel(
-            tp_size=self.server_args.tp_size,
-            cfg_degree=self.server_args.cfg_parallel_degree or 1,
-            ulysses_degree=self.server_args.ulysses_degree,
-            ring_degree=self.server_args.ring_degree,
-            sp_size=self.server_args.sp_degree,
-            dp_size=self.server_args.dp_size,
-            distributed_init_method=rendezvous_addr.to_tcp(),
-            dist_timeout=self.server_args.dist_timeout,
+        bootstrap_diffusion_runtime(
+            self.server_args,
+            local_rank=self.local_rank,
+            rank=self.rank,
+            rendezvous=rendezvous_addr,
         )
-
-        from sglang.srt.runtime_context import get_context, publish
-        from sglang.srt.server_args import ServerArgs as SrtServerArgs
-
-        if get_context()._server_args is None:
-            # srt reads the size from the configuration and the rank from the
-            # live group, so the dummy carries the width just installed.
-            publish(
-                SrtServerArgs(model_path="dummy", tp_size=self.server_args.tp_size),
-                role="diffusion_gpu_worker",
-            )
 
         # set proc title
         if model_parallel_is_initialized():
