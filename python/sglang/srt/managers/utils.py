@@ -26,8 +26,10 @@ from sglang.srt.utils.common import async_d2h as _async_d2h
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.observability.forward_pass_metrics import ScheduledRequestMetrics
-    from sglang.srt.observability.fpm_timing import FpmTiming
+    from sglang.srt.observability.forward_pass_metrics import (
+        FpmTiming,
+        ScheduledRequestMetrics,
+    )
     from sglang.srt.speculative.spec_info import SpecInput
 
 
