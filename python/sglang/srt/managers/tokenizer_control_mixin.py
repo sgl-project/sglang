@@ -302,9 +302,11 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
+        results = await self.flush_cache_communicator(
+            FlushCacheReqInput(timeout_s=timeout_s)
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        result = FlushCacheReqOutput(success=success, message=message)
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
