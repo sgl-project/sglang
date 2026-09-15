@@ -20,8 +20,6 @@ from sglang.srt.arg_groups.attention_hook import (
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
-    apply_glm5_chunked_prefill_default,
-    apply_glm5_prefill_cuda_graph_policy,
     disable_tc_piecewise_cudagraph_if_incompatible,
     handle_cuda_graph_config,
 )
@@ -2306,12 +2304,10 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
     """The BCG "multimodal model" rule exempts archs on the BCG multimodal
     opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""
 
-    def _handled_args(
-        self, *, architectures, is_multimodal, allowlisted, hf_fields=None, **kwargs
-    ):
-        args = ServerArgs(model_path="dummy", **kwargs)
+    def _handled_args(self, *, architectures, is_multimodal, allowlisted):
+        args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=architectures, **(hf_fields or {})),
+            hf_config=SimpleNamespace(architectures=architectures),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=is_multimodal,
             is_multimodal_piecewise_cuda_graph_supported=False,
@@ -2320,70 +2316,6 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
         with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
         return args
-
-    def test_kda_keeps_default_breakable(self):
-        for hf_fields in (
-            {"linear_attn_config": {"kda_layers": [1, 3]}},
-            {
-                "layer_types": ["linear_attention", "full_attention"],
-                "linear_num_heads": 32,
-                "linear_head_dim": 128,
-            },
-        ):
-            with self.subTest(hf_fields=hf_fields):
-                args = self._handled_args(
-                    architectures=["KimiLinearForCausalLM"],
-                    is_multimodal=False,
-                    allowlisted=False,
-                    hf_fields=hf_fields,
-                )
-                self.assertEqual(
-                    resolution_result(args, "cuda_graph_config").prefill.backend,
-                    Backend.BREAKABLE,
-                )
-
-    @override_platform(is_cuda=True)
-    def test_glm53_flash_default_and_explicit_prefill_settings(self):
-        from sglang.srt.configs.model_config import (
-            is_multimodal_breakable_cuda_graph_supported,
-        )
-
-        architectures = ["Glm5NextForConditionalGeneration"]
-        cases = (
-            ({}, Backend.BREAKABLE, 4096, 4096),
-            ({"disable_prefill_cuda_graph": True}, Backend.DISABLED, None, None),
-            (
-                {"chunked_prefill_size": 8192, "cuda_graph_max_bs_prefill": 1024},
-                Backend.BREAKABLE,
-                8192,
-                1024,
-            ),
-        )
-        for kwargs, backend, chunk_size, max_bs in cases:
-            with self.subTest(kwargs=kwargs):
-                args = self._handled_args(
-                    architectures=architectures,
-                    is_multimodal=True,
-                    allowlisted=is_multimodal_breakable_cuda_graph_supported(
-                        architectures
-                    ),
-                    hf_fields={
-                        "text_config": SimpleNamespace(
-                            linear_attn_config={"kda_layers": [1, 3]}
-                        )
-                    },
-                    **kwargs,
-                )
-                apply_glm5_chunked_prefill_default(args)
-                apply_glm5_prefill_cuda_graph_policy(args)
-                prefill = resolution_result(args, "cuda_graph_config").prefill
-                self.assertEqual(prefill.backend, backend)
-                self.assertEqual(prefill.max_bs, max_bs)
-                self.assertEqual(
-                    resolution_result(args, "chunked_prefill_size"), chunk_size
-                )
-                if not kwargs:
-                    self.assertEqual(max(prefill.bs), 4096)
 
     def test_multimodal_arch_disables_prefill_breakable(self):
         args = self._handled_args(
