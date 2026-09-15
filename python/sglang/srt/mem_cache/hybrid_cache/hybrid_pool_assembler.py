@@ -580,7 +580,9 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
     ]
 
 
-def _dsv4_low_ratio_entries(kvcache: Any, page_size: int, num_host_pages: int):
+def _dsv4_low_ratio_entries(
+    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_num: int
+):
     """Mirror each shared source once, in FULL-page units, before its first use.
 
     Prefixes end at an even page boundary. Ratio-2 compression starts a new
@@ -589,7 +591,6 @@ def _dsv4_low_ratio_entries(kvcache: Any, page_size: int, num_host_pages: int):
     import torch
 
     entries = []
-    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     for ratio, names in (
         (
             1,
@@ -683,7 +684,7 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = layer_mappings.full
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
-    has_paged_swa = kvcache.swa_kv_pool is not None
+    has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
     mtp_swa_device_buffers = []
     if not has_paged_swa:
         # Unified KV and encoder replay rebuild request-local SWA state;
@@ -906,7 +907,9 @@ def build_deepseek_v4_hicache_stack(
             ]
         )
 
-    entries.extend(_dsv4_low_ratio_entries(kvcache, page_size, num_host_pages))
+    entries.extend(
+        _dsv4_low_ratio_entries(kvcache, page_size, num_host_pages, transfer_layer_num)
+    )
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(

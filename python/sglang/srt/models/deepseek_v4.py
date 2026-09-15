@@ -737,6 +737,9 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 
 class MqaAttentionBase(nn.Module):
+    # Read on paths main's fixtures reach without running __init__.
+    wo_a_fp8: bool = False
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1024,6 +1027,8 @@ class MqaAttentionBase(nn.Module):
 
 
 class MQALayer(MqaAttentionBase):
+    is_dsv41: bool = False
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2338,11 +2343,17 @@ class MQALayer(MqaAttentionBase):
                         fuse_mxfp8_quant=(
                             not get_forward().sp_active
                             and getattr(
-                                self.wo_b.quant_method, "mxfp8_dense_backend", None
+                                getattr(self.wo_b, "quant_method", None),
+                                "mxfp8_dense_backend",
+                                None,
                             )
                             == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                             and (
-                                getattr(self.wo_b.quant_method, "use_mxfp8", False)
+                                getattr(
+                                    getattr(self.wo_b, "quant_method", None),
+                                    "use_mxfp8",
+                                    False,
+                                )
                                 or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
                             )
                         ),
