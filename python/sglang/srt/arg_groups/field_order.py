@@ -473,6 +473,7 @@ POSITIONAL_FIELD_ORDER = (
     "prefill_delayer_forward_passes_buckets",
     "prefill_delayer_wait_seconds_buckets",
     "prefill_delayer_queue_min_ratio",
+    "enable_dp_phase_lockstep",
     "prefill_delayer_max_delay_ms",
     "min_free_slots_delay",
     "enable_deterministic_inference",
