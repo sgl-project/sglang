@@ -339,8 +339,14 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             cwd=cwd,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
+        detail = (
+            (exc.stderr or exc.stdout or str(exc)).strip()
+            if isinstance(exc, subprocess.CalledProcessError)
+            else str(exc)
+        )
         raise RuntimeError(
-            f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`"
+            f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}` "
+            f"in {cwd}:\n{detail}"
         ) from exc
     return result.stdout.strip()
 
