@@ -159,12 +159,21 @@ impl WorkerModeLabel {
 }
 
 /// Decode-affinity outcome — see `select_decode_with_affinity` for the
-/// three reasons the affinity may not be honored.
-#[derive(Debug, Clone, Copy)]
+/// reasons the affinity may not be honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeAffinityOutcome {
+    /// The same-host decode peer was healthy, within the load gate, and
+    /// selected.
     SameHostPicked,
+    /// A same-host peer exists but its circuit breaker is open.
     FallbackBreaker,
+    /// A same-host peer is healthy but overloaded relative to the pool
+    /// (or the affinity pick was overridden by capacity admission).
     FallbackLoadImbalance,
+    /// No decode candidate shares a host with the prefill worker (or the
+    /// prefill URL had no parseable host) — there was no affinity to
+    /// honor.
+    FallbackNoSameHost,
 }
 
 impl DecodeAffinityOutcome {
@@ -173,6 +182,7 @@ impl DecodeAffinityOutcome {
             Self::SameHostPicked => "same_host_picked",
             Self::FallbackBreaker => "fallback_breaker",
             Self::FallbackLoadImbalance => "fallback_load_imbalance",
+            Self::FallbackNoSameHost => "fallback_no_same_host",
         }
     }
 }
@@ -1421,17 +1431,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_affinity_counter_emits_three_outcomes() {
+    fn decode_affinity_counter_emits_all_outcomes() {
         let reg = MetricsRegistry::new();
         reg.record_decode_affinity(DecodeAffinityOutcome::SameHostPicked);
         reg.record_decode_affinity(DecodeAffinityOutcome::SameHostPicked);
         reg.record_decode_affinity(DecodeAffinityOutcome::FallbackBreaker);
         reg.record_decode_affinity(DecodeAffinityOutcome::FallbackLoadImbalance);
+        reg.record_decode_affinity(DecodeAffinityOutcome::FallbackNoSameHost);
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="same_host_picked"} 2"#));
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_breaker"} 1"#));
         assert!(out
             .contains(r#"sgl_router_decode_affinity_total{outcome="fallback_load_imbalance"} 1"#,));
+        assert!(
+            out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_no_same_host"} 1"#,)
+        );
     }
 
     #[test]
