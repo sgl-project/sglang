@@ -128,10 +128,15 @@ impl Proxy {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                // Walk the full source chain (`{:#}`) like the connect-error
+                // handler in `classify_reqwest_error_for` — a mid-body drop's
+                // real cause (incomplete message, connection reset) lives in the
+                // wrapped source, not the outer reqwest error.
+                let cause = anyhow::Error::new(e);
                 tracing::warn!(
                     upstream = %url,
                     status = %status,
-                    error = ?e,
+                    error = %format_args!("{cause:#}"),
                     "upstream dropped connection mid-body",
                 );
                 breaker.record_failure();
