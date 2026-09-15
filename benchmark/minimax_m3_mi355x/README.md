@@ -1,19 +1,18 @@
-# MiniMax-M3 on 4x MI350X/MI355X (TP4): launch and AIPerf AgentX scripts
+# MiniMax-M3 on 4x MI350X/MI355X: AgentX reproduction
 
-Scripts used for the measurements in `M3_MI350X_STATUS.md` (repo root). Paths assume the benchmark host layout
-(`/scratch/models/MiniMax-M3-MXFP4`, `/scratch/models/MiniMax-M3-EAGLE3-GQA`, `/scratch/aiperf-sa-venv` = SemiAnalysis AIPerf fork b7b16cf).
+One script, three data files. Results, config rationale and the optimization catalogue are in `OPTIMIZATIONS.md`.
 
-- `launch.sh` / `launch_v2.sh`: server launcher (MXFP4 quark checkpoint, EAGLE3, fp8 KV, custom all-reduce, Gluon prefill).
-- `best_config.sh`: recommended real-acceptance config (source it, then run `launch_v2.sh`). GSM8K-1000 0.854.
-- `best_lossy_config.sh`: ATOM-parity performance-only config (forced acceptance length 2.78 over 3 draft tokens,
-  equivalent to ATOM's `--spec-decode-acceptance-rate 0.5933`). Outputs are not the model's; never use for accuracy.
-- `run_sa_point.sh` + `bench_any.sh` + `atom_client_env.sh`: one AIPerf `inferencex-agentx-mvp` point with ATOM's client flags.
-- `summarize.py`, `needle.py`, `steady.py`: result summary, needle-in-haystack sanity, steady-state decode harness.
-
-Example:
 ```bash
-source benchmark/minimax_m3_mi355x/best_config.sh
-TAG=best GPUS=0,1,2,3 PORT=30000 SPEC_ATTN=decode EXTRA2="--max-running-requests 48 $EXTRA2" \
-  ENVS2="NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1 $ENVS2" bash benchmark/minimax_m3_mi355x/launch_v2.sh
-TAG=best_SAclient CONC=24 DURATION=3600 PORT=30000 bash benchmark/minimax_m3_mi355x/run_sa_point.sh
+export M3_WORK=/scratch            # any writable directory with ~300 GB free (default: /scratch if writable, else ~/m3-agentx)
+bash reproduce.sh setup            # sglang (this checkout), aiter 4ad99832 + swizzle fix, tuned MoE rows, both models, SemiAnalysis aiperf fork
+bash reproduce.sh real             # recommended config: AIPerf inferencex-agentx-mvp at c=1 8 24 32, 3600 s each, summary per point
+bash reproduce.sh lossy 8 24       # ATOM-parity performance-only config (forced acceptance; outputs are not the model's), chosen concurrencies
 ```
+
+`GPUS=4,5,6,7 PORT=30001 DURATION=1800` override the defaults; `CHECK_ONLY=1` runs only the preflight; `serve real|lossy` and `stop`
+manage the server alone. Results land in `$M3_WORK/results/aiperf_<mode>_c<N>/`, server logs in `$M3_WORK/logs/`.
+
+- `reproduce.sh`: setup, server launch (every flag and env var of both configs is in its `serve` function), client, summary.
+- `tuned_fmoe_m3_gfx950.csv`, `tuned_a8w8_bpreshuffle_m3_gfx950.csv`: tuned aiter MoE and PTPC-FP8 GEMM rows for this shape.
+- `aiter_flydsl_xcd_swizzle_fix.patch`: aiter fix applied by `setup`.
+- `tools/`: development helpers used during the tuning work (per-piece launch/config scripts, steady-state and needle probes, chart).

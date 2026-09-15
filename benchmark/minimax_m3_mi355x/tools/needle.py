@@ -1,4 +1,5 @@
 import glob
+import os
 import json
 import sys
 import time
@@ -7,9 +8,8 @@ import requests
 
 url = sys.argv[1]
 lengths = [int(x) for x in sys.argv[2].split(",")]
-files = sorted(
-    glob.glob("/sgl-workspace/sglang/python/sglang/srt/managers/*.py")
-) + sorted(glob.glob("/sgl-workspace/sglang/python/sglang/srt/layers/*.py"))
+SRT = os.path.join(os.environ.get("SGLANG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")), "python", "sglang", "srt")
+files = sorted(glob.glob(f"{SRT}/managers/*.py")) + sorted(glob.glob(f"{SRT}/layers/*.py"))
 corpus = "\n".join(open(f).read() for f in files)
 for L in lengths:
     chars = L * 3

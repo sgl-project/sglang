@@ -18,9 +18,8 @@ url = sys.argv[1]
 N = int(sys.argv[2])
 WINDOW_SEC = float(sys.argv[3])
 WARM_SEC = float(sys.argv[4]) if len(sys.argv) > 4 else 15.0
-files = sorted(
-    glob.glob("/sgl-workspace/sglang/python/sglang/srt/**/*.py", recursive=True)
-)
+SRT = os.path.join(os.environ.get("SGLANG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")), "python", "sglang", "srt")
+files = sorted(glob.glob(f"{SRT}/**/*.py", recursive=True))
 corpus = "\n".join(open(f).read() for f in files)
 # ~4.2 chars per token
 CTX = int(os.environ.get("CTX_CHARS", "300000"))

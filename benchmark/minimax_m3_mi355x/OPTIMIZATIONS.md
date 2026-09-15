@@ -2,30 +2,30 @@
 
 Benchmark: AIPerf `inferencex-agentx-mvp` (393 SemiAnalysis coding-agent traces, seed 42), SemiAnalysis AIPerf fork at InferenceX's pinned commit 754356e9 with InferenceX/ATOM's client flags (idle cap 300 s, trajectory start 0.25-0.75, 10 warmup requests per lane), TP4 on 4 GPUs. Score = total token throughput (prompt tokens incl. cache hits + completion) per second / 4. Hardware here is MI350X (gfx950, 288 GB, ROCm 7.2.4); ATOM's published figures are MI355X.
 
-## Results (tok/s per GPU; 3600 s at c=24/32, 1800 s at c=1/8)
+## Results (tok/s per GPU; 3600 s runs except the 1800 s real c=1/8 and forced c=1 points)
 
 | c | SGLang real acceptance | SGLang forced acceptance (ATOM parity) | ATOM published (forced) |
 |---:|---:|---:|---:|
 | 1 | 3,565 | 4,194 | 4,845 |
-| 8 | 11,021 | 11,332 | 14,047 |
+| 8 | 11,021 | 13,029 | 14,047 |
 | 24 | 34,785 | 38,457 | 39,680 |
 | 32 | 39,083 | 43,956 | 42,476 |
 
-SGLang numbers are the 3600 s window rate; AIPerf's reported value is lower when cancelled requests stall its drain (e.g. 35,935 and 40,598 at c=32). Quality of the real-acceptance config: GSM8K-1000 0.854-0.863, needles coherent to 257K tokens. The forced-acceptance config commits unchecked draft tokens (ATOM's `--spec-decode-acceptance-rate 0.5933`); its outputs are not the model's. Chart: `agentx_sglang_vs_atom.png`.
+SGLang numbers are the in-window rate (tokens of the profiling records over the profiling span); AIPerf's reported value is lower when cancelled requests stall its drain (e.g. 35,935 and 40,598 at c=32, 12,961 at forced c=8). ATOM's recipe runs every concurrency for 3600 s and the low-concurrency score is trace-sample bound, so only 3600 s points are comparable there. Quality of the real-acceptance config: GSM8K-1000 0.854-0.863, needles coherent to 257K tokens. The forced-acceptance config commits unchecked draft tokens (ATOM's `--spec-decode-acceptance-rate 0.5933`); its outputs are not the model's. Chart: `agentx_sglang_vs_atom.png`.
 
 ## Reproduce
 
-All scripts live in `benchmark/minimax_m3_mi355x/` on `kevin-mii/sglang` `M3-perf`; run them from a ROCm 7.2.4 container (Ubuntu 24.04, Python 3.12, torch 2.11.0+rocm7.2, e.g. `docker/rocm.Dockerfile` for gfx950).
+`benchmark/minimax_m3_mi355x/reproduce.sh` on `kevin-mii/sglang` `M3-perf` does everything; run it from a ROCm 7.2.4 container (Ubuntu 24.04, Python 3.12, torch 2.11.0+rocm7.2, e.g. `docker/rocm.Dockerfile` for gfx950) on a node with 4 free gfx950 GPUs. No fixed paths: the checkout is found from the script, everything else goes under `M3_WORK`.
 
 ```bash
-git clone -b M3-perf https://github.com/kevin-mii/sglang /sgl-workspace/sglang
-cd /sgl-workspace/sglang/benchmark/minimax_m3_mi355x
-bash setup_env.sh              # SGLang (editable), aiter 4ad99832 + FlyDSL swizzle fix, tuned MoE rows, both models, SemiAnalysis AIPerf fork
-bash reproduce.sh real         # recommended config: c=1, 8, 24, 32 (1800 s for c<=8, 3600 s otherwise), one server, sequential points
-bash reproduce.sh lossy        # ATOM-parity performance-only config (forced acceptance); outputs are not the model's
+git clone -b M3-perf https://github.com/kevin-mii/sglang && cd sglang/benchmark/minimax_m3_mi355x
+export M3_WORK=/scratch            # any writable directory with ~300 GB free
+bash reproduce.sh setup            # sglang (editable), aiter 4ad99832 + FlyDSL swizzle fix, tuned MoE rows, both models, SemiAnalysis AIPerf fork 754356e9
+bash reproduce.sh real             # recommended config: c=1 8 24 32, 3600 s each, one server, sequential points, summary per point
+bash reproduce.sh lossy            # ATOM-parity performance-only config (forced acceptance); outputs are not the model's
 ```
 
-`reproduce.sh` launches the server from `best_config.sh` / `best_lossy_config.sh` (the full `python -m sglang.launch_server` command and every env var are in those two files plus `launch_v2.sh`), waits for `/health`, runs each point with `run_sa_point.sh` (AIPerf `inferencex-agentx-mvp`, ATOM's client flags and `AIPERF_*` environment), and prints per point the AIPerf `total_tok/s` per GPU and the 3600 s window rate (`window_rate.py`). Results land in `/scratch/results/aiperf_<mode>_c<N>/`. Override `CONCS="24 32"`, `GPUS=4,5,6,7`, `PORT`, `MODELS_DIR` as needed; run one server and one client on the host at a time. Quality gate for the real config: `python -m sglang.test.few_shot_gsm8k --port 30000 --num-questions 1000 --num-shots 5 --parallel 48` (expect 0.85-0.87).
+Each point prints AIPerf's `total_token_throughput` per GPU, the in-window rate, TTFT/ITL and p90 interactivity; raw AIPerf artifacts land in `$M3_WORK/results/aiperf_<mode>_c<N>/`. The `serve` function of the script holds the full `sglang.launch_server` command and every env var of both configs; the `bench` function holds ATOM's client environment and flags. `GPUS`, `PORT`, `DURATION` override the defaults; `CHECK_ONLY=1` runs the preflight (GPUs free, models, client). Run one server and one client per host. Quality gate for the real config: `python -m sglang.test.few_shot_gsm8k --port 30000 --num-questions 1000 --num-shots 5 --parallel 48` (expect 0.85-0.87).
 
 ---
 
