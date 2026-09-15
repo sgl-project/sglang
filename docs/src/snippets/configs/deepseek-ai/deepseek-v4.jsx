@@ -258,6 +258,22 @@ sgl-eval run mmmu_pro \\
               reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
           ] },
         { id: "dpAttn", label: "DP-Attention",
+          // The low-latency and balanced PD roles run TP-only. That is what lets
+          // their decode ladders run to the full ceiling (8 and 96): the ceiling
+          // is server-wide and floor-divided by attn_dp_size, so only at dp_size
+          // 1 is it also the per-rank batch. Forced rather than left to the
+          // reader, because switching DP on would cut the slots per rank without
+          // changing either flag in the command — the ladder would still read 96
+          // while the role could only ever fill 12. High-throughput is the DP
+          // point and is deliberately absent here.
+          forceOff: [
+            { when: { hw: ["mi355x"], strategy: ["low-latency", "balanced"],
+                      pdMode: ["prefill", "decode"] },
+              stripEnv: ["SGLANG_DP_SHARED_EXPERT_LOCAL",
+                         "SGLANG_DP_USE_GATHERV",
+                         "SGLANG_DP_USE_REDUCE_SCATTER"],
+              reason: "The low-latency and balanced PD roles are TP-only, which is what makes --cuda-graph-bs-decode equal the full ceiling. --max-running-requests is server-wide and floor-divided by attn_dp_size, so DP would cut the per-rank batch below the captured graphs." },
+          ],
           values: [
             null,
             false,
@@ -324,10 +340,15 @@ sgl-eval run mmmu_pro \\
       options: [
         { id: "current",    label: "Inherited from base" },
         { id: "off",        label: "Off (greedy)" },
+        // Shown on pro-official as well as the originals: the 0813 checkpoint
+        // bundles a DSpark head but keeps its MTP head, and DSpark cannot run
+        // under PD disaggregation (§3.8), so this shape is the speculative
+        // option a PD role actually has. The 1-1-2 shape stays hidden there —
+        // off PD, DSpark is the better pick, so only one fallback is offered.
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official", "flash-vision", "pro-official"] } },
+          hide: { variant: ["flash-official", "flash-vision"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
@@ -357,8 +378,42 @@ sgl-eval run mmmu_pro \\
       incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
-        { id: "prefill", label: "Prefill role" },
-        { id: "decode",  label: "Decode role" },
+        // The AMD role flags are the MI355X 1P x 1D agentic recipe. Both roles
+        // are gated by `when` because the sizing is ROCm-specific, and they
+        // differ in two places: the prefill worker runs eager (the dsv4 indexer's
+        // prefill path is not graph-captured) and dispatches whole chunked-prefill
+        // batches over MORI, while the decode worker captures graphs for its
+        // small batch ladder and dispatches at most a step's worth of tokens.
+        { id: "prefill", label: "Prefill role",
+          when: { hw: ["mi355x"], strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 8",
+            "--swa-full-tokens-ratio 0.1",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        { id: "decode",  label: "Decode role",
+          when: { hw: ["mi355x"], strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 8",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
       ],
       transferBackends: [
         { id: "mooncake", label: "Mooncake",
@@ -372,10 +427,29 @@ sgl-eval run mmmu_pro \\
         { id: "nixl",     label: "NiXL" },
         // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
         { id: "mori",     label: "MORI",
-          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] } },
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] },
+          // Transport-wide only. The per-rank dispatch budget is sized per role
+          // (see `modes` above), so it lives on the role, not here.
+          env: [
+            "SGLANG_MORI_COMBINE_DTYPE=auto",
+            "MORI_IO_SQ_BACKOFF_TIMEOUT_US=500000",
+            "MORI_IO_QP_MAX_SEND_WR=32767",
+          ],
+          envWhen: { hw: ["mi300x", "mi355x"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
-      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      // The mlx5 names are ConnectX; ROCm nodes enumerate their NICs as rdmaN,
+      // so the two families are mutually hidden. The AMD entry is the full
+      // 8-NIC list in one value because --disaggregation-ib-device takes a
+      // comma list, and the order is the MI355X NUMA-local pairing.
+      ibDevices: [
+        { id: "auto", label: "Auto" },
+        { id: "mlx5_0", label: "mlx5_0", hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "mlx5_7", label: "mlx5_7", hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5",
+          label: "rdma0-7 (all NICs)",
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] } },
+      ],
       // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
       router: {
         port: 8000,
@@ -388,6 +462,98 @@ sgl-eval run mmmu_pro \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`,
       },
+      // The MI355X roles above size for low latency: TP-only, a running-request
+      // ceiling in the single digits, and a MORI dispatch budget per role. The
+      // high-throughput point is the same two roles re-sized against the DP
+      // base cell — TP8/DP8 and the wider batch come from that cell, so these
+      // only carry what the operating point itself changes. The decode graph
+      // ladder grows to 32 to cover the larger steady-state batch, and
+      // --enable-cache-report surfaces the prefix hit rate that decides whether
+      // the offload tier is paying for itself at this concurrency.
+      // The balanced point sits between the two: TP-only like low-latency, but
+      // with a 96-request ceiling and a HiCache tier under the prefill role
+      // (see the hicache roleOverride below) instead of low-latency's bare KV
+      // pool or high-throughput's UMBP. It re-sizes more of the base cell than
+      // the other two because the balanced cell is a DP recipe for aggregated
+      // serving — its 0.90 / 0.15 / 65536 sizing does not carry over.
+      roleOverrides: [
+        { mode: "prefill",
+          when: { hw: ["mi355x"], strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // TP-only, so the server-wide ceiling is also the per-rank batch and
+        // the graph ladder runs all the way to 96.
+        { mode: "decode",
+          when: { hw: ["mi355x"], strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        { mode: "prefill",
+          when: { hw: ["mi355x"], strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 256",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 256",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+      ],
+      // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
+      // than the default round-robin: consistent_hashing keeps a conversation on
+      // the worker that already holds its prefix, and the tight balance
+      // thresholds stop that affinity from starving the peer at the small
+      // running-request ceiling the roles above use. Health checking stays
+      // enabled here (unlike the default's 999999s interval) because a long
+      // agentic run should notice a wedged worker, but it is slack enough that
+      // a multi-minute prefill is not mistaken for a failure.
+      routerOverrides: [
+        { when: { hw: ["mi355x"] },
+          command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --policy consistent_hashing --dp-aware \\
+  --cache-threshold 0.3 \\
+  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
+  --disable-circuit-breaker --health-failure-threshold 100 \\
+  --health-check-timeout-secs 600 --health-check-interval-secs 30` },
+      ],
     },
 
     // ----- Card 6: "Hierarchical KV Cache" -----
@@ -409,12 +575,38 @@ sgl-eval run mmmu_pro \\
           writePolicy: "write_through",
           prefetchPolicy: "best_effort",
         },
+        // Balanced on Pro Official: the same shape at a smaller ratio. 2.5 is
+        // what the 96-request ceiling leaves room for once mem-fraction-static
+        // drops to 0.86 — the host tier competes with the KV pool for the
+        // headroom the prefill role gives up.
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+            strategy: ["balanced"], nodes: ["single"],
+          },
+          mode: "prefill",
+          transferBackend: "mori",
+          memLayout: "page_first",
+          ioBackend: "direct",
+          ratio: 2.5,
+          writePolicy: "write_through",
+          prefetchPolicy: "best_effort",
+        },
       ],
       notices: [
         {
           when: {
             hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
             strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "decode",
+          transferBackend: "mori",
+          text: "HiCache is not recommended on the decode role with MORI.",
+        },
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+            strategy: ["balanced"], nodes: ["single"],
           },
           mode: "decode",
           transferBackend: "mori",
@@ -440,7 +632,30 @@ sgl-eval run mmmu_pro \\
       ],
     },
 
-    // ----- Card 7: "HiSparse" -----
+    // ----- Card 7: "UMBP" (unified cache external linker) -----
+    // Sits beside HiCache rather than inside it. HiCache is a tiered cache
+    // (GPU -> pinned host -> optional storage); UMBP links the unified radix
+    // tree DIRECTLY to an external store with no host tier at all, so the two
+    // are alternatives and sglang rejects them together. Enabling this card
+    // therefore strips the HiCache family from the command.
+    //
+    // ROCm-only in practice: the store is MORI's buffer pool, the same
+    // transport the PD roles use, and there is no CUDA recipe for it yet.
+    umbp: {
+      onlyHw: ["mi300x", "mi355x"],
+      // Under pure TP the linker keys by rank, so an 8-rank prefill worker
+      // opens eight keyspaces and the pool holds eight copies of the same MLA
+      // KV — a tier an eighth the size its byte budget suggests. DP attention
+      // collapses the keys onto one shared keyspace.
+      requiresDpAttention: true,
+      defaultBackend: "mori",
+      backends: [
+        { id: "mori",     label: "MORI (UMBP)" },
+        { id: "mooncake", label: "Mooncake" },
+      ],
+    },
+
+    // ----- Card 8: "HiSparse" -----
     // Decode-only: shown/emitted only when the live PD-Disagg mode is `decode`.
     hisparse: {
       requiredFlags: [
