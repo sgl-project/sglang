@@ -161,7 +161,7 @@ class DSV4AttnMetadata:
     swa_page_indices: torch.Tensor
     swa_topk_lengths: torch.Tensor
 
-    c4_sparse_topk: int
+    index_topk: int
     # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None
@@ -203,7 +203,7 @@ class DSV4AttnMetadata:
             src=other,
             dst=self,
             check_eq_fields=[
-                "c4_sparse_topk",
+                "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
             ],
@@ -323,22 +323,20 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(self, is_prefill: bool = False):
-        # c4_sparse_topk is set from model_config.index_topk per-model
-        # (small model: 512, large model: 1024).
-        assert self.c4_sparse_topk in (512, 1024), (
-            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
+        assert self.index_topk in (512, 1024), (
+            f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+            self.c4_topk_lengths_clamp1, max=self.index_topk
         )
         assert self.c4_topk_lengths_raw is not None
         self.c4_sparse_topk_lengths_raw = torch.clamp(
-            self.c4_topk_lengths_raw, max=self.c4_sparse_topk
+            self.c4_topk_lengths_raw, max=self.index_topk
         )
         self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
+            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
             -1,
             dtype=torch.int32,
             device=self.c4_topk_lengths_clamp1.device,
@@ -470,7 +468,7 @@ class DeepseekV4HipRadixBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.c4_topk = getattr(
+        self.index_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
@@ -1854,7 +1852,7 @@ class DeepseekV4HipRadixBackend(
             page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=self.c4_topk,
+            index_topk=self.index_topk,
         )
 
         if need_compress:
