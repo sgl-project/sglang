@@ -685,6 +685,45 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _sample_rocm_eagle_targets(verify_input, sampling_info, next_token_logits):
+    """Draw target tokens before matching them against the speculative tree.
+
+    Sampling independently at each node's prefix preserves the target model's
+    distribution. The tree matcher only decides how many of these already
+    sampled tokens can reuse the draft forward pass; it does not resample them.
+    """
+    from sglang.srt.layers.sampler import (
+        sampling_from_probs_torch,
+        top_k_top_p_min_p_sampling_from_probs_torch,
+    )
+
+    num_tokens = verify_input.draft_token_num
+    temperatures = sampling_info.temperatures.repeat_interleave(num_tokens, dim=0)
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    seeds = (
+        sampling_info.sampling_seed.repeat_interleave(num_tokens, dim=0)
+        if sampling_info.sampling_seed is not None
+        else None
+    )
+    if (
+        sampling_info.need_top_k_sampling
+        or sampling_info.need_top_p_sampling
+        or sampling_info.need_min_p_sampling
+    ):
+        return top_k_top_p_min_p_sampling_from_probs_torch(
+            probs,
+            sampling_info.top_ks.repeat_interleave(num_tokens, dim=0),
+            sampling_info.top_ps.repeat_interleave(num_tokens, dim=0),
+            sampling_info.min_ps.repeat_interleave(num_tokens, dim=0),
+            sampling_info.need_min_p_sampling,
+            seeds,
+            verify_input.positions,
+        ).to(torch.int64)
+    return sampling_from_probs_torch(
+        probs, sampling_seed=seeds, positions=verify_input.positions
+    ).to(torch.int64)
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -782,7 +821,12 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        if _is_hip and not sampling_info.is_all_greedy:
+            target_predict = _sample_rocm_eagle_targets(
+                verify_input, sampling_info, next_token_logits
+            )
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable

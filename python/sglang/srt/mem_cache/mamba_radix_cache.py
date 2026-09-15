@@ -560,6 +560,12 @@ class MambaRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
+        # effective_kv_committed_len can stop the key short of the tracked state
+        # (a stop inside a committed spec chunk, or strip_thinking_cache).
+        if is_insert and self.enable_mamba_extra_buffer:
+            if (req.kv.mamba_last_track_seqlen or 0) > len(token_ids):
+                is_insert = False
+
         if is_insert:
             if self.enable_mamba_extra_buffer:
                 cache_len = req.kv.mamba_last_track_seqlen
@@ -819,6 +825,7 @@ class MambaRadixCache(BasePrefixCache):
         )
         req.kv.cache_protected_len = len(new_indices)
         req.kv.mamba_last_track_seqlen = None
+        req.kv.mamba_prev_track_seqlen = None
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:

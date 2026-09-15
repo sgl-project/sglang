@@ -11,7 +11,11 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 
 namespace sglang {
 namespace {
@@ -27,6 +31,7 @@ namespace {
 inline constexpr int kGroupTopK = SGL_GROUP_TOPK;
 inline constexpr int kThreadsPerBlock = 1024;
 
+// Keep 4K threshold-bin candidates per round; rescan larger bins without clipping.
 inline constexpr std::size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 
 struct FastTopKParams {
@@ -49,6 +54,11 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+__device__ __forceinline__ auto make_topk_key(float score, int index) -> uint64_t {
+  // Unique keys resolve an overfull bin even when all scores are equal.
+  return (static_cast<uint64_t>(convert_to_uint32(score)) << 32) | ~static_cast<uint32_t>(index);
+}
+
 template <int K>
 __device__ void
 fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
@@ -62,6 +72,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
+  alignas(128) __shared__ uint64_t s_key_prefix;
 
   auto& s_histogram = s_histogram_buf[0];
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
@@ -104,11 +115,69 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
 
   const auto threshold_bin = s_threshold_bin_id;
   topk -= s_histogram[threshold_bin + 1];
+  const auto num_threshold_candidates = s_histogram[threshold_bin] - s_histogram[threshold_bin + 1];
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      }
+    }
+    __syncthreads();
+    return;
+  } else if (num_threshold_candidates > int(SMEM_INPUT_SIZE)) {
+    // Rescan the full row only on overflow. Preserve the unsorted output contract.
+    if (tx == 0) s_key_prefix = 0;
+    __syncthreads();
+
+#pragma unroll 8
+    for (int round = 0; round < 8; ++round) {
+      if (tx < RADIX + 1) s_histogram[tx] = 0;
+      __syncthreads();
+      const auto prefix = s_key_prefix;
+      const auto offset = 56 - round * 8;
+      for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        if (convert_to_uint8(raw_input) != threshold_bin) continue;
+        const auto key = make_topk_key(raw_input, idx);
+        const bool prefix_matches = round == 0 || (key >> (64 - round * 8)) == prefix;
+        if (prefix_matches) ::atomicAdd(&s_histogram[(key >> offset) & 0xFF], 1);
+      }
+      __syncthreads();
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) s_threshold_bin_id = tx;
+      __syncthreads();
+      const auto key_bin = s_threshold_bin_id;
+      topk -= s_histogram[key_bin + 1];
+      if (tx == 0) s_key_prefix = (prefix << 8) | static_cast<uint64_t>(key_bin);
+      __syncthreads();
+
+      if (topk == 0) {
+        const auto selected_prefix = s_key_prefix;
+        const auto prefix_bits = (round + 1) * 8;
+        if (tx == 0) s_counter = 0;
+        __syncthreads();
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto raw_input = input[idx + row_start];
+          const auto coarse_bin = convert_to_uint8(raw_input);
+          const auto key_prefix = make_topk_key(raw_input, idx) >> (64 - prefix_bits);
+          if (coarse_bin > threshold_bin || (coarse_bin == threshold_bin && key_prefix > selected_prefix)) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            index[pos] = idx;
+          }
+        }
+        __syncthreads();
+        return;
+      }
+    }
+
+    const auto threshold_key = s_key_prefix;
+    if (tx == 0) s_counter = 0;
+    __syncthreads();
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      if (make_topk_key(input[idx + row_start], idx) >= threshold_key) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
       }
@@ -290,7 +359,11 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
+#if defined(__HIP_PLATFORM_AMD__)
+    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#else
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -322,7 +395,7 @@ struct KpoolTopKTransformKernel {
     auto S = SymbolicSize{"score_stride"};
     auto out_cols_sym = SymbolicSize{"out_cols"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);

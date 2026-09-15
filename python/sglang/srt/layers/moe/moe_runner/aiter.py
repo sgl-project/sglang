@@ -271,7 +271,7 @@ class AiterRunnerCore(MoeRunnerCore):
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
         elif quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+            # Clamped MXFP4 paths need an explicit gate/up layout.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
             # lives elsewhere / is absent.
@@ -282,10 +282,14 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            # Preserve the layout selected by the quantization method.
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
