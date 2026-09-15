@@ -1334,8 +1334,14 @@ class MlxModelRunner:
 
         vocab_size = logits.shape[-1]
         count_rows = []
+        has_penalty_history = False
         for row, req_id in enumerate(req_ids):
             counts = self._req_penalty_counts.get(req_id)
+            if params[row].has_penalties and (
+                counts is not None
+                or (initial_output_ids is not None and bool(initial_output_ids))
+            ):
+                has_penalty_history = True
             if counts is None:
                 counts = (
                     self._build_penalty_counts(vocab_size, initial_output_ids)
@@ -1353,6 +1359,8 @@ class MlxModelRunner:
                 )
             count_rows.append(counts)
         token_counts = mx.stack(count_rows, axis=0)
+        if not has_penalty_history:
+            return logits, token_counts
         return apply_token_penalties(logits, token_counts, params), token_counts
 
     @staticmethod

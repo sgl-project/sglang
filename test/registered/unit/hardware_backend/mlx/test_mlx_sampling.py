@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from collections import Counter
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -202,6 +203,28 @@ class TestTokenPenalties(CustomTestCase):
                 [0, 0, 0, 2, 0, 0, 0, 0],
                 [0, 1, 0, 0, 0, 1, 0, 0],
             ],
+        )
+
+    def test_frequency_penalty_preserves_uint32_count_above_255(self):
+        import torch
+
+        logits = [[3.0, 200.0, -4.0]]
+        raw_counts = [[0, 300, 0]]
+        counts = mx.array(raw_counts, dtype=mx.uint32)
+
+        actual = apply_token_penalties(
+            mx.array(logits),
+            counts,
+            [_params(frequency_penalty=0.5)],
+        )
+        mx.eval(actual)
+
+        expected = torch.tensor(logits, dtype=torch.float32) - (
+            torch.tensor(raw_counts, dtype=torch.float32) * 0.5
+        )
+        self.assertEqual(counts.dtype, mx.uint32)
+        torch.testing.assert_close(
+            torch.tensor(actual.tolist()), expected, atol=1e-5, rtol=1e-5
         )
 
 
@@ -621,6 +644,29 @@ class TestRunnerSelectTokens(CustomTestCase):
         self.assertEqual(first.tolist(), [1])
         self.assertEqual(second.tolist(), [2])
         self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 1])
+
+    def test_empty_history_first_output_skips_helper_and_advances_once(self):
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {
+            "a": _params(top_k=1, frequency_penalty=0.5),
+        }
+        logits = mx.array([[0.0, 5.0, 4.0]])
+
+        with patch(
+            "sglang.srt.hardware_backend.mlx.model_runner.apply_token_penalties",
+            wraps=apply_token_penalties,
+        ) as penalty_helper:
+            selected = runner._select_tokens_with_logprobs(
+                logits,
+                ["a"],
+                [[self._FakeCache(4)]],
+            )[0]
+
+        mx.eval(selected, runner._req_penalty_counts["a"])
+        penalty_helper.assert_not_called()
+        self.assertEqual(selected.tolist(), [1])
+        self.assertEqual(runner._req_penalty_counts["a"].dtype, mx.uint32)
+        self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 0])
 
     def test_discarded_chunk_does_not_advance_penalty_history(self):
         """A discarded chunk cannot seed state; the next valid output adds one."""
