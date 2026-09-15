@@ -95,7 +95,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             device=self.device,
         )
 
-    def run_fused(self):
+    def run_fused(self, block_v=32):
         ssm_states = self.ssm_states.clone()
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -112,6 +112,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             softplus_beta=self.softplus_beta,
             softplus_threshold=self.softplus_threshold,
             is_kda=True,
+            block_v=block_v,
         )
         return core_attn_out, ssm_states[self.cache_indices]
 
@@ -140,15 +141,16 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         return core_attn_out, last_state
 
     def test_kda_fused_sigmoid_gating_recurrent(self):
-        core_attn_out, last_state = self.run_fused()
         core_attn_out_ref, last_state_ref = self.run_kda()
-        abs_diff_out = (core_attn_out - core_attn_out_ref).abs().max()
-        abs_diff_state = (last_state - last_state_ref).abs().max()
-        print(f"{abs_diff_out=}, {abs_diff_state=}")
-        self.assertTrue(
-            torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
-        )
-        self.assertTrue(torch.allclose(last_state, last_state_ref))
+        for block_v in (8, 32):
+            with self.subTest(block_v=block_v):
+                core_attn_out, last_state = self.run_fused(block_v=block_v)
+                self.assertTrue(
+                    torch.allclose(
+                        core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4
+                    )
+                )
+                self.assertTrue(torch.allclose(last_state, last_state_ref))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

@@ -13,7 +13,7 @@
 # ==============================================================================
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
@@ -63,6 +63,15 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
     return output
 
 
+# Decoder/communicator forward results must remain traceable by torch.compile.
+class MHCPostPreResult(NamedTuple):
+    hidden_states: torch.Tensor
+    residual: torch.Tensor
+    h_res: torch.Tensor
+    h_post: torch.Tensor
+    norm_fused: bool
+
+
 @dataclass
 class MHCState:
     """Parameters belong to the owning layer; this state only holds scratch
@@ -74,6 +83,7 @@ class MHCState:
     hc_post: Callable
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
+    hc_post_attn_pre: Optional[Callable] = None
 
     @staticmethod
     def _resolve_out_norm(out_norm):
@@ -81,12 +91,40 @@ class MHCState:
             return None, None
         return out_norm.weight.data, out_norm.variance_epsilon
 
-    def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
-        residual = hidden_states
+    def attn_split(
+        self,
+        hidden_states,
+        out_norm: Optional[torch.nn.Module] = None,
+        *,
+        residual: Optional[torch.Tensor] = None,
+        previous_mhc: Optional["MHCState"] = None,
+    ):
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
-            hidden_states, out_norm_weight, out_norm_eps
-        )
+        fused = None
+        if previous_mhc is not None:
+            try:
+                if self.hc_post_attn_pre is not None and hidden_states.shape[0] != 0:
+                    fused = self.hc_post_attn_pre(
+                        hidden_states,
+                        residual,
+                        previous_mhc.h_res,
+                        previous_mhc.h_post,
+                        out_norm_weight,
+                        out_norm_eps,
+                    )
+                if fused is None:
+                    hidden_states = previous_mhc.mlp_combine(hidden_states, residual)
+            finally:
+                previous_mhc.reset_aux()
+        if fused is None:
+            residual = hidden_states
+            hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
+                hidden_states, out_norm_weight, out_norm_eps
+            )
+        else:
+            hidden_states, residual = fused.hidden_states, fused.residual
+            self.h_res, self.h_post = fused.h_res, fused.h_post
+            norm_fused = fused.norm_fused
         if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
@@ -406,6 +444,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        hc_post_attn_pre: Optional[Callable] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -413,6 +452,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            hc_post_attn_pre=hc_post_attn_pre,
         )
 
         super().__init__(
@@ -456,11 +496,26 @@ class MHCLayerCommunicator(LayerCommunicator):
             )
         )
 
+    def can_fuse_mhc_boundary(self, next_communicator: "MHCLayerCommunicator"):
+        return (
+            not self.is_last_layer
+            and not next_communicator.is_first_layer
+            and self._communicate_summable_tensor_pair_fn
+            is MHCCommunicateSummableTensorPairFn._trivial
+            and next_communicator._communicate_simple_fn is CommunicateSimpleFn._trivial
+            and self.layer_scatter_modes.layer_output_mode
+            == next_communicator.layer_scatter_modes.layer_input_mode
+            and next_communicator.mhc.hc_post_attn_pre is not None
+            and not get_attn_tp_context().input_scattered
+        )
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        previous_mhc: Optional[MHCState] = None,
     ):
         if self.is_first_layer:
             if get_attn_tp_context().input_scattered:
@@ -472,7 +527,10 @@ class MHCLayerCommunicator(LayerCommunicator):
             hidden_states = hc_expand(hidden_states, self.mhc.hc_mult)
 
         hidden_states, residual = self.mhc.attn_split(
-            hidden_states, out_norm=self.input_layernorm
+            hidden_states,
+            out_norm=self.input_layernorm,
+            residual=residual,
+            previous_mhc=previous_mhc,
         )
 
         hidden_states = self._communicate_simple_fn(

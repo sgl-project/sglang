@@ -991,6 +991,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        metadata_glue = getattr(self, "_metadata_glue", None)
+        if metadata_glue is not None:
+            metadata_glue.reset()
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()

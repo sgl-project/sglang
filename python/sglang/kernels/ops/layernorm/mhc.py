@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import get_device_sm, is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
@@ -1186,7 +1186,16 @@ def mhc_pre(
     },
 )
 def mhc_post_tilelang(
-    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+    split_hidden: bool = False,
 ):
     n = T.dynamic("num_tokens")
     h = hidden
@@ -1199,7 +1208,17 @@ def mhc_post_tilelang(
     x: T.Tensor((n, hc, h), T.bfloat16)
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(n, threads=n_thr) as i_n:
+    hidden_tiles = T.ceildiv(h, h_blk)
+    with T.Kernel(
+        hidden_tiles if split_hidden else n,
+        n if split_hidden else 1,
+        threads=n_thr,
+    ) as (
+        i_x,
+        i_y,
+    ):
+        i_n = i_y if split_hidden else i_x
+        i_h = i_x if split_hidden else 0
         if ENABLE_PDL:
             T.pdl_sync()
 
@@ -1216,7 +1235,10 @@ def mhc_post_tilelang(
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+        for i_tile in T.Pipelined(
+            1 if split_hidden else hidden_tiles, num_stages=1 if split_hidden else 2
+        ):
+            i0_h = i_h + i_tile
             T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
             T.copy(d[i_n, i0_h * h_blk], d_shared)
 
@@ -1226,12 +1248,23 @@ def mhc_post_tilelang(
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
                 for i_hci in T.serial(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
-            T.copy(x_local, x_shared)
-
-            T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
+            if split_hidden:
+                T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+            else:
+                T.copy(x_local, x_shared)
+                T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
 
         if ENABLE_PDL:
             T.pdl_trigger()
+
+
+def _use_split_mhc_post(num_tokens: int, hc_mult: int, hidden_size: int) -> bool:
+    return (
+        hc_mult == 4
+        and hidden_size == 4096
+        and 0 < num_tokens <= 512
+        and get_device_sm() == 103
+    )
 
 
 def mhc_post(
@@ -1254,6 +1287,9 @@ def mhc_post(
         out,
         residual.shape[-2],
         residual.shape[-1],
+        split_hidden=_use_split_mhc_post(
+            x.shape[0], residual.shape[-2], residual.shape[-1]
+        ),
     )
     return out
 
@@ -1641,6 +1677,7 @@ def mhc_fused_post_pre(
             residual_cur,
             hc_mult,
             hidden_size,
+            split_hidden=_use_split_mhc_post(num_tokens, hc_mult, hidden_size),
         )
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
