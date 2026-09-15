@@ -1475,6 +1475,65 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
 
+    def test_dsv41_native_encoder_preserves_inline_system_without_jinja(self):
+        fake = _FakeOpenAIServingChat(chat_template=None)
+        fake.chat_encoding_spec = "dsv41"
+        serving = AnthropicServing(fake)
+        request = self._anthropic_request(
+            stream=False,
+            system="Stable instructions.",
+            messages=[
+                {"role": "user", "content": "A long history."},
+                {"role": "assistant", "content": "Acknowledged."},
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "New reminder."}],
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+        )
+        converted = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.messages[0].content, "Stable instructions.")
+        self.assertEqual(
+            [m.role for m in converted.messages],
+            ["system", "user", "assistant", "system", "user"],
+        )
+        self.assertEqual(converted.messages[3].content, "New reminder.")
+
+    def test_dsv41_appending_system_reminder_preserves_encoded_history(self):
+        from sglang.srt.entrypoints.openai.encoding_dsv41 import encode_messages
+
+        fake = _FakeOpenAIServingChat(chat_template=None)
+        fake.chat_encoding_spec = "dsv41"
+        serving = AnthropicServing(fake)
+        history = [
+            {"role": "user", "content": "Unchanged context. " * 2048},
+            {"role": "assistant", "content": "Acknowledged."},
+            {"role": "user", "content": "Continue."},
+        ]
+
+        def encode(messages):
+            request = self._anthropic_request(
+                stream=False, system="Stable instructions.", messages=messages
+            )
+            converted = serving._convert_to_chat_completion_request(request)
+            return encode_messages(
+                [m.model_dump(exclude_none=True) for m in converted.messages],
+                thinking_mode="chat",
+            )
+
+        before = encode(history)
+        after = encode(
+            history
+            + [
+                {"role": "assistant", "content": "Done."},
+                {"role": "system", "content": "New reminder."},
+                {"role": "user", "content": "Continue again."},
+            ]
+        )
+        self.assertTrue(after.startswith(before))
+        self.assertLess(after.index("Done."), after.index("New reminder."))
+
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages
         system turn) is unaffected on both detection paths: the system field is

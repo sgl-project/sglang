@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 DSV4_REASONING_EFFORT_PROFILE_OVERRIDE = "dsv4_reasoning_effort_profile"
 _DSV4_REASONING_EFFORT_ENCODER = "encoding/encoding_dsv4.py"
 _MAX_DSV4_ENCODER_BYTES = 1 << 20
+_INLINE_SYSTEM_ENCODINGS = frozenset({"dsv41"})
+
+
+def spec_supports_inline_system(spec: Optional[str]) -> bool:
+    return spec in _INLINE_SYSTEM_ENCODINGS
 
 
 def _detect_dsv4_reasoning_effort_profile(
