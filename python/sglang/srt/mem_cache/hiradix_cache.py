@@ -1804,12 +1804,6 @@ class HiRadixCache(RadixCache):
         ):
             return
 
-        if req_id in self.ongoing_prefetch:
-            # A fetch is already in flight for this rid; overwriting the slot
-            # would orphan the in-flight op (losing its span/staging handle),
-            # matching UnifiedRadixCache's guard against duplicate fetches.
-            return
-
         last_host_node.protect_host()
         # NOTE: host_indices is no longer pre-allocated here. It is allocated
         # lazily in _drain_and_alloc_storage_hit() once the L3 storage hit count is known,
