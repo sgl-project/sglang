@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.observability.fpm_timing import FpmTiming
+    from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:

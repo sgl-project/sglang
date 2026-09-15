@@ -4,10 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.observability.fpm_timing import wrap_forward_with_fpm
+from sglang.srt.observability.forward_pass_metrics import wrap_forward_with_fpm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.fpm_test_utils import FakeInterval, capture_timing
+from sglang.test.forward_pass_metrics_test_utils import FakeInterval, capture_timing
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
