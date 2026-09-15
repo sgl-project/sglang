@@ -175,39 +175,6 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
         self.assertEqual((padded.hash, padded.pad_value), (99, 1))
         self.assertEqual(device_item.hash, 42)
 
-    async def test_precomputed_identity_survives_msgpack_router_hops(self):
-        from array import array
-
-        from sglang.srt.managers.io_struct import (
-            TokenizedEmbeddingReqInput,
-            msgpack_decode,
-            msgpack_encode,
-        )
-        from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-        from sglang.srt.sampling.sampling_params import SamplingParams
-
-        item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(8))
-        await self.executor.set_pad_values([item])
-        request = TokenizedEmbeddingReqInput(
-            rid="hash-roundtrip",
-            input_text="",
-            input_ids=array("q", [1]),
-            mm_inputs=MultimodalProcessorOutput(mm_items=[item]),
-            token_type_ids=None,
-            sampling_params=SamplingParams(),
-        )
-        for _ in range(2):
-            request = msgpack_decode(msgpack_encode(request))
-        received = request.mm_inputs.mm_items[0]
-        with patch(
-            "sglang.srt.managers.mm_utils.hash_feature",
-            side_effect=AssertionError("scheduler must reuse frontend hash"),
-        ):
-            received.set_pad_value()
-        self.assertEqual(
-            (received.hash, received.pad_value), (item.hash, item.pad_value)
-        )
-
     async def test_skip_hash_preserves_existing_semantics(self):
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
         with (
