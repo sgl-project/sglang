@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import RemovalReason, StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -1727,7 +1727,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
-        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(
+            node, medium=StorageMedium.CPU, reason=RemovalReason.DUPLICATE_RECLAIMED
+        )
         self._evict_component_and_detach_lru(
             node,
             self.components_by_type[BASE_COMPONENT_TYPE],
@@ -1799,7 +1801,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._cascade_evict(
             node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        self.kv_events.record_remove(
+            node, medium=StorageMedium.GPU, reason=RemovalReason.DEMOTED
+        )
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import RemovalReason, StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1281,7 +1281,9 @@ class HiRadixCache(RadixCache):
 
     def _detach_backuped(self, node: TreeNode) -> int:
         # detach nodes from tree while keeping device slots, for write-back eviction
-        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        self.kv_events.record_remove(
+            node, medium=StorageMedium.GPU, reason=RemovalReason.DEMOTED
+        )
         num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
