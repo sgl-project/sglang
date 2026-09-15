@@ -153,6 +153,15 @@ def _success_counts(text: str) -> dict[str, int]:
     return counts
 
 
+def _registered_workers(text: str) -> set[str]:
+    """Worker URLs the router has registered, from one scrape."""
+    return {
+        labels["worker_url"]
+        for labels, _ in _samples(text, "sgl_router_worker_health")
+        if "worker_url" in labels
+    }
+
+
 def _tier_summary(text: str) -> str:
     """One-line view of the tier state, logged before each assertion so a
     failure (and a pass) shows the numbers it was judged on rather than only
@@ -211,11 +220,13 @@ def _cached_tiers(body: dict) -> dict[str, int]:
     return {k: v for k, v in details.items() if isinstance(v, int)}
 
 
-# Words per prompt. Each `tag<i>` word costs several tokens, so this lands
-# around 2k tokens: comfortably under the context ceiling that
-# --max-total-tokens implies (the engine rejects anything longer), and small
-# enough that a handful of prompts turns the device pool over in stages rather
-# than in one step.
+# Words per prompt. Each `tag<i>` word costs several tokens. Measured against
+# the Qwen3 tokenizer this lands at ~1.1k tokens for the primed prompt and
+# ~2.3k for a filler — the tags differ in how they split, so do not assume one
+# figure covers both (FILLERS_PER_PROBE is sized on the filler). Both are
+# comfortably under the context ceiling that --max-total-tokens implies (the
+# engine rejects anything longer), and small enough that a handful of prompts
+# turns the device pool over in stages rather than in one step.
 PROMPT_WORDS = 300
 
 
@@ -272,10 +283,15 @@ def _chat_and_attribute(
 # Filler requests between two probes of the primed prefix. A probe prefills
 # that prefix again, which makes it the most recently used entry on its
 # worker, so the next probe only means something once enough filler has since
-# passed through to turn the WHOLE device pool over. At PROMPT_WORDS the
-# filler runs to order 1k tokens each, so this comfortably exceeds
-# DEVICE_KV_TOKENS.
-FILLERS_PER_PROBE = 8
+# passed through to turn that worker's WHOLE device pool over.
+#
+# Sized on the OWNER's share, not the fleet's. Filler prompts miss the tree, so
+# the cache-aware policy has no candidates and falls back to power-of-two
+# choices — roughly half of each burst lands on the owner. At ~2.3k tokens per
+# filler that is 16 * 2.3k / 2 ~= 18k against an 8192-token pool, a bit over
+# 2x. Sizing on the fleet total instead leaves ~1.1x, where one unlucky split
+# makes a whole cycle evict nothing.
+FILLERS_PER_PROBE = 16
 # Probe cycles before giving up.
 MAX_PROBE_CYCLES = 5
 
@@ -307,10 +323,18 @@ def _drive_until_host_served(
         deltas, tiers = _chat_and_attribute(router_url, model_id, primed, worker_urls)
         if tiers.get("host", 0) > 0:
             return deltas, tiers
+    # A failing drive loop and an unreachable router look the same from here,
+    # so the router state is best-effort: scraping it is exactly what fails
+    # when the router is the reason, and an exception raised while building
+    # the message would replace this diagnostic with a connection error.
+    try:
+        state = _tier_summary(_scrape(router_url))
+    except Exception as exc:  # noqa: BLE001
+        state = f"(unavailable: {exc!r})"
     raise AssertionError(
         f"no repeat of the primed prefix was served from the host tier after "
         f"{MAX_PROBE_CYCLES} eviction cycles of {FILLERS_PER_PROBE} requests; "
-        f"last tier split={tiers}; router state: {_tier_summary(_scrape(router_url))}"
+        f"last tier split={tiers}; router state: {state}"
     )
 
 
@@ -355,6 +379,27 @@ def test_repeat_returns_to_the_host_tier_owner(
                 worker_urls=worker_urls,
                 policy="cache_aware",
                 timeout=120.0,
+            )
+
+            # Both workers must actually be registered, or the test proves
+            # nothing: if one fails introspection the router keeps the other,
+            # /readyz is still satisfied, every request lands on the survivor
+            # and it trivially is the "sole owner" every assertion below looks
+            # for. The two-worker premise has to be checked, not assumed.
+            # Waited on rather than read once: registration lands per worker,
+            # so a single scrape can catch a half-registered router and fail a
+            # fleet that was about to be complete.
+            expected_workers = set(worker_urls)
+            _wait_until(
+                lambda: (lambda seen: seen if seen == expected_workers else None)(
+                    _registered_workers(_scrape(router.base_url))
+                ),
+                timeout=60.0,
+                what=(
+                    f"the router to register both workers ({expected_workers}); "
+                    "without both, every request lands on the survivor and it "
+                    "is trivially the sole owner each assertion below looks for"
+                ),
             )
 
             primed = _long_prompt("owner")
