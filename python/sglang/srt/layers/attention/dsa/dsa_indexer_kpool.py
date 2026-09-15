@@ -414,7 +414,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
 
             pool_start_id = first_pos // kpool
-            page_size = get_token_to_kv_pool().page_size
+            page_size = get_token_to_kv_pool().index_page_size
             use_returned_compressed = return_compressed and (
                 not write_cache or pool_start_id == 0
             )
@@ -783,7 +783,7 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 
@@ -978,7 +978,7 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         pool_size = self.index_kpool
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().index_page_size
         token_nums = q_fp8.shape[0]
         tail_pool = pool_size - 1
         topk_result = torch.empty(
@@ -1228,7 +1228,7 @@ class IndexerKPool(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().index_page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
