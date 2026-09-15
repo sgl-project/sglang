@@ -49,6 +49,7 @@ def fast_topk_transform_fused(
     cu_seqlens_q: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
+    row_to_page_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Get the topk indices of the score tensor and then transform the topk indices
@@ -65,6 +66,10 @@ def fast_topk_transform_fused(
             For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
             of the score tensor. It's only used for cases where the key is
             ragged, i.e. during extend and draft extend.
+        row_to_page_table: Optional int32 tensor of shape (B,) mapping each Q row
+            to a batch row in page_table_size_1. When provided, the kernel uses
+            direct indexing instead of scanning cu_seqlens_q. This is used in the
+            chunk path where each Q row belongs to a specific batch entry.
     Returns:
         The topk indices tensor of shape (B, topk)
     """
@@ -75,7 +80,13 @@ def fast_topk_transform_fused(
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_fused(
-        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts
+        score,
+        lengths,
+        dst_page_table,
+        src_page_table,
+        cu_seqlens_q,
+        row_starts,
+        row_to_page_table,
     )
     return dst_page_table
 
