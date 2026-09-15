@@ -19,6 +19,7 @@ end-to-end write/read swap path is covered by integration runs rather than here.
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -284,6 +285,95 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         # Asking for more than capacity must fail gracefully (no leak).
         self.assertIsNone(hisparse_alloc.alloc(avail + 1))
         self.assertEqual(hisparse_alloc.available_size(), avail)
+
+
+class TestUnifiedHiSparseCompressRemap(unittest.TestCase):
+    """C4 out_loc remap in forward_unified, sitting next to main's fp8_2buff store.
+
+    fp8 + HiSparse is refused at the pool, so this only pins the live bf16 path.
+    """
+
+    def _capture_forward(self, *, hisparse, ratio):
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+
+        from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+            CompressorBackendMixin,
+        )
+
+        raw = torch.tensor([4, 12], dtype=torch.int32)
+        mapped = torch.tensor([1, 3], dtype=torch.int32)
+        swa_pages = 16
+        unified_loc = torch.tensor([100, 101], dtype=torch.int32)
+        kv = torch.zeros(8, 16, dtype=torch.bfloat16)
+        c4_pool = SimpleNamespace(
+            _translate_loc_to_hisparse_device=MagicMock(return_value=mapped.clone())
+        )
+        backend = CompressorBackendMixin.__new__(CompressorBackendMixin)
+        backend.token_to_kv_pool = SimpleNamespace(
+            uniform_fp8=False,
+            unified_hisparse=hisparse,
+            unified_swa_pages=swa_pages,
+            c4_kv_pool=c4_pool,
+            get_unified_kv=lambda layer_id: kv,
+        )
+        backend.enable_deepseek_v4_fp4_indexer = False
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(
+                c4_out_loc=raw,
+                c128_out_loc=unified_loc,
+                unified=SimpleNamespace(
+                    c4_out_loc=unified_loc, c128_out_loc=unified_loc
+                ),
+            )
+        )
+        compressor = SimpleNamespace(
+            ratio=ratio,
+            is_in_indexer=False,
+            rotate=False,
+            ape=torch.zeros(1),
+            head_dim=512,
+            norm=SimpleNamespace(weight=None, variance_epsilon=1e-6),
+            freqs_cis=torch.zeros(1),
+            compute_kv_score=lambda x, fb: torch.zeros(1),
+            get_state_pool=lambda _backend: SimpleNamespace(
+                kv_score_buffer=SimpleNamespace(kv_score=torch.zeros(1))
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False)
+        )
+        env = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        with (
+            patch.object(backend, "_forward_compress_all_in_one", _capture),
+            patch(f"{env}.is_unified_kv_triton", return_value=True),
+            patch(f"{env}.is_unified_kv_fp8", return_value=False),
+        ):
+            backend.forward_unified(
+                torch.zeros(1), forward_batch, layer_id=0, compressor=compressor
+            )
+        return captured, c4_pool, swa_pages, mapped, unified_loc
+
+    def test_c4_hisparse_remaps_then_bf16_store(self):
+        captured, c4_pool, swa_pages, mapped, _ = self._capture_forward(
+            hisparse=True, ratio=4
+        )
+        c4_pool._translate_loc_to_hisparse_device.assert_called_once()
+        self.assertTrue(torch.equal(captured["out_loc"], mapped + swa_pages))
+        self.assertTrue(captured["bf16_store"])
+        self.assertFalse(captured["fp8_2buff"])
+        self.assertIsNone(captured["kv_cache_rope"])
+
+    def test_c128_hisparse_keeps_dense_unified_loc(self):
+        captured, c4_pool, _, _, unified_loc = self._capture_forward(
+            hisparse=True, ratio=128
+        )
+        c4_pool._translate_loc_to_hisparse_device.assert_not_called()
+        self.assertTrue(torch.equal(captured["out_loc"], unified_loc))
+        self.assertTrue(captured["bf16_store"])
+        self.assertFalse(captured["fp8_2buff"])
 
 
 if __name__ == "__main__":

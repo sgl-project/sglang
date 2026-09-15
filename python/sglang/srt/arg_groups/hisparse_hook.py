@@ -103,10 +103,18 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
-        # DSv4 HiSparse manages its own dtype/backend pairing for both the
-        # separate packed-KV and the unified-KV layouts on ROCm (the unified-KV
-        # path now wires its own HiSparse C4 device/host pool), so skip the
-        # DSA-only dtype checks below.
+        # bf16 unified-KV HiSparse is wired (shrunk C4 device region + host
+        # mirror). fp8 is a two-buffer layout and still needs its own adapter.
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+        )
+
+        if is_unified_kv_fp8():
+            raise ValueError(
+                "--enable-hisparse is not supported with unified-KV fp8 on ROCm "
+                "(SGLANG_DSV4_UNIFIED_KV_FP8=1). Unset that env to use bf16 "
+                "unified-KV HiSparse, or run without --enable-hisparse."
+            )
         return
 
     if resolved_view(server_args).kv_cache_dtype not in (

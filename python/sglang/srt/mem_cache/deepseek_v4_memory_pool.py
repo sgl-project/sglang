@@ -365,6 +365,12 @@ class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
         # Intentionally skip DeepSeekV4SingleKVPool.__init__: we must not
         # allocate a second device buffer. The unified pool already owns the
         # compressed-region storage; we only alias it.
+        # Views are bf16 [rows, head_dim]; fp8 splits nope/rope into two buffers.
+        if unified_kv_pool.fp8:
+            raise ValueError(
+                "HiSparseUnifiedC4DevicePool aliases bf16 unified rows; "
+                "fp8 (SGLANG_DSV4_UNIFIED_KV_FP8=1) needs a separate adapter."
+            )
         self.unified_kv_pool = unified_kv_pool
         self.swa_pages = unified_kv_pool.swa_pages
         self.head_dim = unified_kv_pool.head_dim
@@ -874,6 +880,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # Unified-KV HiSparse (ROCm): device holds only the shrunk C4 hot
             # budget (c4_size); the full C4 is mirrored on the host cold pool.
             unified_c4_hisparse = enable_hisparse and _is_hip
+            if unified_c4_hisparse and self._unified_kv_fp8:
+                # HiSparseUnifiedC4DevicePool aliases bf16 rows. fp8 splits
+                # nope/rope into two buffers; the same views would drop rope.
+                raise ValueError(
+                    "--enable-hisparse is not supported with "
+                    "SGLANG_DSV4_UNIFIED_KV_FP8=1. Unset that env for bf16 "
+                    "unified-KV HiSparse, or drop --enable-hisparse."
+                )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
