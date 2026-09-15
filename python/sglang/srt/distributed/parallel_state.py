@@ -11,8 +11,7 @@ It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
 
 - call `init_distributed_environment` to initialize the distributed environment.
-- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to
- initialize the model parallel groups.
+- call `initialize_model_parallel` to initialize the model parallel groups.
 
 - any code dealing with the distributed stuff
 
@@ -314,6 +313,8 @@ class GroupCoordinator:
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
         self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        # Scale cohorts create these groups without the serving ranks.
+        use_local_synchronization = rank_offset > 0 and not recovered_rank
 
         if is_cuda_alike():
             device_id = (
@@ -336,7 +337,7 @@ class GroupCoordinator:
                 from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     assert max_world_size >= len(ranks), (
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
@@ -350,7 +351,7 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     dev_opts = MooncakeBackendOptions(
                         pg_active_ranks, recovered_rank, max_world_size
                     )
@@ -371,6 +372,7 @@ class GroupCoordinator:
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
@@ -378,6 +380,7 @@ class GroupCoordinator:
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             else:
                 active_ranks = torch.ones(
@@ -391,6 +394,7 @@ class GroupCoordinator:
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
+                    use_local_synchronization=use_local_synchronization,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -399,6 +403,7 @@ class GroupCoordinator:
                     backend="gloo",
                     timeout=gloo_timeout,
                     group_desc=f"{group_name}:cpu",
+                    use_local_synchronization=use_local_synchronization,
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -1811,6 +1816,161 @@ class GroupCoordinator:
                 tensor_dict[key] = value
         return tensor_dict
 
+    def send_recv_tensor_dict(
+        self,
+        send_tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        send_dst: Optional[int] = None,
+        recv_src: Optional[int] = None,
+        send_all_gather_group: Optional["GroupCoordinator"] = None,
+        recv_all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Send tensor dict to *send_dst* and simultaneously recv from *recv_src*.
+
+        Uses ``batch_isend_irecv`` to submit all send/recv operations
+        atomically, avoiding deadlock on backends (e.g. NPU/HCCL) where
+        ``isend`` may block until a matching ``recv`` is posted.
+
+        NOTE: ``send_dst`` / ``recv_src`` are local ranks within this group.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        if send_dst is None:
+            send_dst = (self.rank_in_group + 1) % self.world_size
+        if recv_src is None:
+            recv_src = (self.rank_in_group - 1) % self.world_size
+
+        assert send_dst < self.world_size, f"Invalid send_dst rank ({send_dst})"
+        assert recv_src < self.world_size, f"Invalid recv_src rank ({recv_src})"
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        # ---- 1. Exchange metadata via batch_isend_irecv on CPU group ----
+        send_metadata_list, send_tensor_list = _split_tensor_dict(send_tensor_dict)
+
+        send_meta_bytes = pickle.dumps(send_metadata_list)
+        send_meta_size = torch.tensor([len(send_meta_bytes)], dtype=torch.long)
+        send_meta_data = torch.frombuffer(send_meta_bytes, dtype=torch.uint8)
+
+        recv_meta_size = torch.empty(1, dtype=torch.long)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_size,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_size,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_meta_len = recv_meta_size.item()
+        recv_meta_data = torch.empty(recv_meta_len, dtype=torch.uint8)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_data,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_data,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+
+        # ---- 2. Prepare recv buffers and collect all tensor ops ----
+        recv_tensor_dict: Dict[str, Any] = {}
+        tensor_ops: List[torch.distributed.P2POp] = []
+        recv_tensor_info: List[
+            Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
+        ] = []
+
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    recv_tensor_dict[key] = tensor
+                    continue
+
+                use_all_gather = (
+                    recv_all_gather_group is not None
+                    and tensor.numel() % recv_all_gather_group.world_size == 0
+                )
+                orig_shape = None
+                if use_all_gather:
+                    orig_shape = tensor.shape
+                    tensor = tensor.reshape(recv_all_gather_group.world_size, -1)[
+                        recv_all_gather_group.rank_in_group
+                    ]
+
+                comm_group = metadata_group if tensor.is_cpu else group
+                tensor_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        tensor,
+                        self.ranks[recv_src],
+                        group=comm_group,
+                    )
+                )
+                recv_tensor_info.append((key, tensor, use_all_gather, orig_shape))
+            else:
+                recv_tensor_dict[key] = value
+
+        # Add send ops
+        for tensor in send_tensor_list:
+            if tensor.numel() == 0:
+                continue
+            send_t = tensor
+            if (
+                send_all_gather_group is not None
+                and send_t.numel() % send_all_gather_group.world_size == 0
+            ):
+                send_t = send_t.reshape(send_all_gather_group.world_size, -1)[
+                    send_all_gather_group.rank_in_group
+                ]
+            comm_group = metadata_group if send_t.is_cpu else group
+            tensor_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    send_t,
+                    self.ranks[send_dst],
+                    group=comm_group,
+                )
+            )
+
+        # ---- 3. Batch exchange all tensors ----
+        if tensor_ops:
+            reqs = torch.distributed.batch_isend_irecv(tensor_ops)
+            for req in reqs:
+                req.wait()
+
+        # ---- 4. Post-process received tensors (all_gather if needed) ----
+        for key, tensor, use_all_gather, orig_shape in recv_tensor_info:
+            if use_all_gather:
+                tensor = recv_all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            recv_tensor_dict[key] = tensor
+
+        return recv_tensor_dict
+
     def barrier(self):
         """Barrier synchronization among the group.
         NOTE: don't use `device_group` here! `barrier` in NCCL is
@@ -1874,7 +2034,11 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    recovered_rank: bool = False,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1889,6 +2053,7 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
+        max_world_size=max_world_size,
     )
 
 
@@ -2287,7 +2452,11 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(
-            ranks, local_rank, backend, recovered_rank=recovered_rank
+            ranks=ranks,
+            local_rank=local_rank,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            max_world_size=max_world_size,
         )
     else:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
@@ -2370,7 +2539,7 @@ def initialize_model_parallel(
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
-        if recovered_rank
+        if recovered_rank or rank_offset > 0
         else torch.distributed.get_world_size()
     )
 
@@ -2459,6 +2628,8 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2676,9 +2847,10 @@ def initialize_model_parallel(
             backend,
             use_custom_allreduce=False,
             group_name="self_pp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
-
-    get_parallel().stamp_derived_widths(**derived_widths)
 
 
 def create_custom_parallel_group(
@@ -2728,46 +2900,6 @@ def create_custom_parallel_group(
             )
 
     return my_new_group
-
-
-def ensure_model_parallel_initialized(
-    tensor_model_parallel_size: int,
-    expert_model_parallel_size: int,
-    pipeline_model_parallel_size: int,
-    decode_context_parallel_size: int = 1,
-    backend: Optional[str] = None,
-) -> None:
-    """Helper to initialize model parallel groups if they are not initialized,
-    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
-    values if the model parallel groups are initialized.
-    """
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            expert_model_parallel_size=expert_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            decode_context_parallel_size=decode_context_parallel_size,
-            backend=backend,
-        )
-        return
-
-    assert get_tensor_model_parallel_world_size() == tensor_model_parallel_size, (
-        "tensor parallel group already initialized, but of unexpected size: "
-        f"{get_tensor_model_parallel_world_size()=} vs. "
-        f"{tensor_model_parallel_size=}"
-    )
-    pp_world_size = get_pp_group().world_size
-    assert pp_world_size == pipeline_model_parallel_size, (
-        "pipeline parallel group already initialized, but of unexpected size: "
-        f"{pp_world_size=} vs. "
-        f"{pipeline_model_parallel_size=}"
-    )
-    if decode_context_parallel_size > 1:
-        dcp_world_size = get_dcp_group().world_size
-        assert dcp_world_size == decode_context_parallel_size, (
-            f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
-        )
 
 
 def model_parallel_is_initialized():
