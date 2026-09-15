@@ -6,6 +6,7 @@ import torch
 import triton
 from torch import nn
 
+from sglang.kernels.ops.attention import gdn_fused_decode_aiter
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -243,6 +244,43 @@ class Qwen3GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
+        # Static half of the fused-decode gate: platform, opt-in and the model
+        # shape the AITER kernel hard-codes. The per-call tensor contract is
+        # checked in the backend, which falls back rather than raising.
+        self._gdn_fused_decode_ready = (
+            gdn_fused_decode_aiter.available()
+            and self.num_v_heads == 2 * self.num_k_heads
+            and self.head_k_dim == self.head_v_dim == 128
+            and self.conv_kernel_size == 4
+        )
+        self._gdn_fused_norm_weight = None
+        self._gdn_fused_conv_bias = None
+        if self._gdn_fused_decode_ready:
+            # The kernel always applies a conv bias; models without one get
+            # zeros, allocated here so nothing is allocated inside a captured
+            # decode graph.
+            self._gdn_fused_conv_bias = self.conv1d.bias
+            if self._gdn_fused_conv_bias is None:
+                self._gdn_fused_conv_bias = torch.zeros(
+                    self.conv1d.weight.shape[0],
+                    device=self.conv1d.weight.device,
+                    dtype=self.conv1d.weight.dtype,
+                )
+
+    def _prepare_gdn_fused_decode(self):
+        """Publish the output-norm weight to the fused path, once, after load.
+
+        Called from load_weights: the kernel reads norm_weight directly, so it
+        must be resolved after the weights exist and before graph capture.
+        """
+        if not self._gdn_fused_decode_ready:
+            return
+        weight = self.norm.weight.data
+        if weight.dtype is not torch.bfloat16:
+            self._gdn_fused_decode_ready = False
+            return
+        self._gdn_fused_norm_weight = weight.contiguous()
+
     @staticmethod
     def _override_weight_loader(module, new_loader):
         """Override weight_loader on a module's weight parameter.
@@ -410,7 +448,36 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        # Fused GDN decode handoff (attempt-and-verify): offer the output-norm
+        # weight so a covered AITER kernel can consume the packed projections
+        # directly and fold the gated RMSNorm into the recurrence, replacing the
+        # split + Conv1D + recurrence + norm chain with a single launch. If the
+        # backend leaves the stash unconsumed (env off, wrong arch, or shape not
+        # covered), it returns (core_attn_out, z) and everything below runs as
+        # before.
+        fused_gdn = (
+            self._gdn_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        )
+        if fused_gdn:
+            self.attn._gdn_onorm_args = (
+                self._gdn_fused_norm_weight,
+                self.layer_norm_epsilon,
+                self._gdn_fused_conv_bias,
+            )
+            self.attn._gdn_onorm_consumed = False
+            core_attn_out, z = self.attn(
+                forward_batch,
+                mixed_qkv=(projected_states_qkvz, projected_states_ba),
+                a=projected_states_ba,
+                b=projected_states_ba,
+            )
+            self.attn._gdn_onorm_args = None
+            if self.attn._gdn_onorm_consumed:
+                # Already gated-RMSNormed by the kernel; go straight to out_proj.
+                core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+                output, _ = self.out_proj(core_attn_out)
+                return output
+        elif self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -438,12 +505,13 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if not fused_gdn:
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -1246,6 +1314,13 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Publish the output-norm weight to the fused GDN decode path now that
+        # the weights exist, and before CUDA graph capture.
+        for module in self.modules():
+            if isinstance(module, Qwen3GatedDeltaNet):
+                module._prepare_gdn_fused_decode()
+
         return loaded_params
 
     @classmethod
