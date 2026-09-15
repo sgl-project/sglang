@@ -194,6 +194,39 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn(DSML, normal)
 
+    def test_closed_invoke_rejects_nonstandard_json_constant(self):
+        text = _wrapped(_invoke("get_weather", '{"city": NaN}'))
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual(calls, [])
+        self.assertIn(DSML, normal)
+
+    def test_malformed_first_invoke_does_not_create_flush_state(self):
+        detector = DeepSeekV4Detector()
+
+        result = detector.parse_streaming_increment(
+            _wrapped(_invoke("get_weather", '{"city": }')), self.tools
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(detector.prev_tool_call_arr, [])
+        self.assertEqual(detector.streamed_args_for_tool, [])
+
+    def test_malformed_later_invoke_preserves_completed_call(self):
+        text = _wrapped(
+            _invoke("get_weather", _param("city", "true", "SF"))
+            + "\n"
+            + _invoke("get_weather", '{"city": }')
+        )
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(calls[0].parameters, '{"city": "SF"}')
+        self.assertIn(DSML, normal)
+
     def test_stream_end_drops_incomplete_invoke(self):
         parser = FunctionCallParser(self.tools, "deepseekv4")
         normal, calls = parser.parse_stream_chunk(
