@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     ps: Any
+    dp_tp_group: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
 
@@ -222,7 +223,7 @@ class SchedulerProfilerManager:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            self.dp_tp_group.barrier()
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -356,14 +357,14 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            self.dp_tp_group.barrier()
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            self.dp_tp_group.barrier()
             if self.ps.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -118,6 +117,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -355,7 +355,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
-        gloo_group: ProcessGroup,
+        sync_group: GroupCoordinator,
         tp_rank: int,
         tp_size: int,
         dp_size: int,
@@ -376,7 +376,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.scheduler = scheduler
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
-        self.gloo_group = gloo_group
+        self.sync_group = sync_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
         self.tp_rank = tp_rank
@@ -904,7 +904,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         else:
             polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+                [decode_req.kv_receiver for decode_req in self.queue], self.sync_group
             )
 
         for decode_req, poll in zip(self.queue, polls):
@@ -2091,7 +2091,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def __init__(
         self,
-        gloo_group: ProcessGroup,
+        sync_group: GroupCoordinator,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         tp_rank: int,
         metadata_buffers: MetadataBuffers,
@@ -2099,7 +2099,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
-        self.gloo_group = gloo_group
+        self.sync_group = sync_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
@@ -2304,7 +2304,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         return poll_and_all_reduce(
             pollers,
-            self.gloo_group,
+            self.sync_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
         )
@@ -2313,7 +2313,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
-            self.gloo_group,
+            self.sync_group,
             metadata_buffers=self.metadata_buffers,
         )
 

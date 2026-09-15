@@ -18,6 +18,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.io_struct import (
     ChecksumInfo,
     CheckWeightsReqInput,
@@ -170,7 +171,7 @@ class SchedulerWeightUpdaterManager:
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            get_tp_group().barrier()
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
@@ -186,7 +187,7 @@ class SchedulerWeightUpdaterManager:
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            get_tp_group().barrier()
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -245,7 +246,7 @@ class SchedulerWeightUpdaterManager:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
-            torch.distributed.barrier(self.tp_cpu_group)
+            get_tp_group().barrier()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
@@ -270,7 +271,7 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
+            get_tp_group().barrier()
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -314,11 +315,7 @@ class SchedulerWeightUpdaterManager:
 
             tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
             if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
-                )
-                payload = all_payloads
+                payload = get_tp_group().all_gather_object(payload)
             if payload is not None:
                 # Normalize to one ChecksumInfo per rank so the wire shape is a
                 # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
