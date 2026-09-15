@@ -587,25 +587,66 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
-        if isinstance(loaded_shard_id, tuple):
-            if hasattr(param, "load_merged_column_weight"):
-                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported in weight_loader, "
-                "please use weight_loader_v2 instead."
-            )
-
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
         if is_gguf_weight_type:
+            # q/k/v string shard ids index the per-shard weight types by
+            # logical order; a tuple shard id (e.g. in_proj_qkv -> shards
+            # (0,1,2)) carries one shared weight type for the fused tensor;
+            # a None shard id is a fused tensor split by output_sizes, so the
+            # type applies to every logical shard.
+            if isinstance(loaded_shard_id, tuple):
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+                return
+            if isinstance(loaded_shard_id, str):
+                loaded_shard_id = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
+            if loaded_shard_id is None:
+                for shard_id in range(len(self.output_sizes)):
+                    param.shard_weight_type[shard_id] = loaded_weight.item()
+                return
             param.data[loaded_shard_id].copy_(loaded_weight)
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             return
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
+            # A single fused GGUF tensor can span several logical shards
+            # (e.g. in_proj_qkv -> in_proj_qkvz shards (0,1,2)). Collect it as
+            # one container entry; the logical order is resolved by
+            # process_weights_after_loading.
+            if isinstance(loaded_shard_id, tuple):
+                shard_size = loaded_weight.size(output_dim) // self.tp_size
+                loaded_weight = loaded_weight.narrow(
+                    output_dim, self.tp_rank * shard_size, shard_size
+                )
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
+
+            if isinstance(loaded_shard_id, str):
+                loaded_shard_id = {"q": 0, "k": 1, "v": 2}.get(
+                    loaded_shard_id, loaded_shard_id
+                )
+
+            if loaded_shard_id is None:
+                # Fused-in-checkpoint GGUF tensor covering all output sizes:
+                # split by output_sizes so each logical shard keeps its own
+                # quantized block and weight type.
+                current_shard_offset = 0
+                for shard_id, output_size in enumerate(self.output_sizes):
+                    shard_size = output_size // self.tp_size
+                    shard_offset = current_shard_offset + self.tp_rank * shard_size
+                    shard = loaded_weight.narrow(output_dim, shard_offset, shard_size)
+                    param.shard_id.append(shard_id)
+                    param.shard_id_map[shard_id] = len(param.data_container)
+                    param.data_container.append(shard)
+                    current_shard_offset += output_size
+                return
+
             shard_size = loaded_weight.size(output_dim) // self.tp_size
             start_idx = self.tp_rank * shard_size
 
@@ -615,6 +656,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param.shard_id_map[loaded_shard_id] = len(param.data_container)
             param.data_container.append(loaded_weight)
             return
+
+        if isinstance(loaded_shard_id, tuple):
+            if hasattr(param, "load_merged_column_weight"):
+                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported in weight_loader, "
+                "please use weight_loader_v2 instead."
+            )
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
