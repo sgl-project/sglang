@@ -1465,14 +1465,17 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                # Create the opt-in hicache "Backup" root span here, off the
-                # scheduler hot path, so trace_id/span_id are ready before
-                # _page_backup forwards them to Mooncake (plan.md §6/§8.1).
-                self._init_op_trace(operation, rid=operation.id, role="Backup")
                 if not self.backup_skip:
+                    # Only ranks that actually run the put own a "Backup" root
+                    # span: for MLA models backup_skip drops every non-tp0 rank,
+                    # which issues no storage RPC, so creating a span there
+                    # would be pure noise. The ids are ready before _page_backup
+                    # forwards them to Mooncake (plan.md §6/§8.1).
+                    self._init_op_trace(operation, rid=operation.id, role="Backup")
                     self._page_backup(operation)
                 # Retire the op's hicache root span once the backup op completes
-                # (ack_backup point); bypassed paths fall back to __del__.
+                # (ack_backup point); no-op on skipped ranks (no span created);
+                # bypassed paths fall back to __del__.
                 self._finish_op_trace(operation)
                 self.ack_backup_queue.put(operation)
 
