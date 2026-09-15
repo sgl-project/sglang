@@ -313,6 +313,7 @@ The available modes are:
 
 - `resident`: keep the complete component on the accelerator.
 - `component-offload`: keep the complete component on CPU between uses, moving it to the accelerator before each declared use and back to CPU afterward.
+- `snapshot-offload`: retain CPU parameter storage while a complete component runs on GPU. At the end of a use, restore the CPU parameters instead of copying GPU weights back. Mutable buffers still move back to CPU.
 - `layerwise-offload`: keep component weights on CPU and stream its declared layers during execution.
 
 Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
@@ -320,6 +321,34 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+
+#### Snapshot offload
+
+On NVIDIA CUDA GPUs with separate host and device memory, explicitly select
+`--component-residency vae=snapshot-offload` to avoid repeated weight D2H transfers.
+Existing defaults and `component-offload` behavior are unchanged.
+
+Snapshot offload retains a full host copy during GPU execution. With
+`--pin-cpu-memory` enabled (the default), it shares a per-worker host pin budget
+with layerwise offload. Layerwise initialization claims its allowance first;
+snapshot weights use the remainder. Shared parameter storage is pinned once and
+reused across requests; its allowance is returned when the storage is released.
+Pinning also checks current host headroom, including the cgroup limit.
+
+Weights that do not fit the budget, or have pinning disabled, retain their
+existing CPU storage. Checkpoint mmap stays file-backed unless pinning, dtype
+conversion, or weight mutation materializes a copy. Pageable H2D can be slower,
+and pinning temporarily needs space for both the original and pinned storage.
+This budget limits new pinned weight allocations, not total process RAM or the
+CUDA host allocator's cache. Benchmark repeated requests with the actual host
+storage and workload; avoiding D2H does not guarantee an end-to-end speedup.
+
+The whole component must still fit on GPU. Unlike layerwise offload with all layers
+retained across denoising steps, snapshot offload does not require a layer-structure
+declaration and also covers parameters outside transformer blocks. Weight updates,
+LoRA merge/unmerge, and sleep restore the CPU weights before mutation or release.
+FSDP-managed components, shared-memory GPUs, and snapshot-offloaded DiTs with
+breakable CUDA graphs are not supported.
 
 ### Layerwise Offload Tuning
 

@@ -371,8 +371,6 @@ def finalize_all_reduce_push_norm(
 
     state = _get_state()
     assert state is not None
-    if expert_weights.dtype != torch.bfloat16:
-        expert_weights = expert_weights.to(torch.bfloat16)
     return mod.finalize_all_reduce_push_norm(
         state.world_size,
         out,

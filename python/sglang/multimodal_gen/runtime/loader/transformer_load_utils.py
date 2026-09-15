@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
+    SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -232,7 +233,7 @@ def _uses_component_offload(
 ) -> bool:
     if component_name is None:
         return legacy_enabled
-    return server_args.residency_mode(component_name) == COMPONENT_OFFLOAD
+    return server_args.should_cpu_offload_component(component_name)
 
 
 def _reject_explicit_component_selector(
@@ -243,12 +244,12 @@ def _reject_explicit_component_selector(
 ) -> None:
     if component_name is None:
         return
-    selected_by_component_residency = (
-        server_args.canonical_residency_mode(component_name) == COMPONENT_OFFLOAD
-    )
+    selected_by_component_residency = server_args.canonical_residency_mode(
+        component_name
+    ) in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD)
     if selected_by_component_residency:
         raise ComponentResidencyError(
-            f"{feature_name} does not support component-offload for "
+            f"{feature_name} does not support {server_args.canonical_residency_mode(component_name)} for "
             f"{component_name!r}; select resident or layerwise-offload"
         )
 
