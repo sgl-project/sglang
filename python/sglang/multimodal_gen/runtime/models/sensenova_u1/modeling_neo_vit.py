@@ -8,7 +8,9 @@ from torch import nn
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 
-from .configuration_neo_vit import NEOVisionConfig
+from sglang.multimodal_gen.configs.transformers.configuration_neo_vit import (
+    NEOVisionConfig,
+)
 
 
 def precompute_rope_freqs_sincos(

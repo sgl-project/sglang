@@ -13,8 +13,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
-from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
-from .conversation import get_conv_template
+from sglang.multimodal_gen.configs.transformers.configuration_neo_chat import (
+    NEOChatConfig,
+    NEOMoELLMConfig,
+)
+from sglang.multimodal_gen.runtime.parser.conversation import get_conv_template
+
 from .modeling_fm_modules import (
     ConvDecoder,
     FlowMatchingHead,
