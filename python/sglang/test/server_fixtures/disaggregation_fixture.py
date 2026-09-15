@@ -116,11 +116,7 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def rdma_devices_for(cls, gpu_indices) -> list:
-        """`--disaggregation-ib-device` args for a server pinned to these GPUs.
-
-        `cls.rdma_devices` holds one pair picked without knowing either side's
-        GPUs; a PD pair needs different NICs on each side.
-        """
+        """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
         if not is_in_ci():
             return cls.rdma_devices
         return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
@@ -356,11 +352,8 @@ def _get_available_ib_devices():
 def get_rdma_devices_args(gpu_indices=None) -> str:
     """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
 
-    The absolute id picks the NIC: a decode server pinned with `--base-gpu-id 4`
-    must not be mapped back onto the first NICs, which on a two-socket node sit
-    across the boundary from its GPUs. Without `gpu_indices` the ids come from
-    CUDA_VISIBLE_DEVICES, and with neither the pair is spread across the node so
-    a caller that cannot name its GPUs still gets two distinct NICs.
+    Ids relative to a group base would map a decode server pinned with
+    `--base-gpu-id 4` onto the first NICs, across the socket boundary.
     """
 
     def _parse_list_env(var_name: str):
