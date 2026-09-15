@@ -51,6 +51,18 @@ def handle_context_parallelism(server_args: Any):
                 "DeepSeek V3.2 prefill CP does not support --cp-strategy "
                 "zigzag; use interleave."
             )
+        # NPU ships a prefill-CP path for DeepSeek V4 only; other
+        # architectures would fail deep inside attention (deprecated CP
+        # shims, zigzag-only metadata fields) instead of being rejected here.
+        if (
+            cfg.enable_prefill_cp
+            and get_platform().is_npu
+            and model_arch != "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError(
+                "NPU prefill CP currently supports only DeepSeek V4 "
+                f"(DeepseekV4ForCausalLM), got {model_arch}."
+            )
         if cfg.enable_prefill_cp and model_arch in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",

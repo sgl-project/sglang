@@ -1639,7 +1639,7 @@ class MQALayer(MqaAttentionBase):
                 kv_for_cache = cp_gather_full_sequence_states(
                     kv.contiguous(),
                     forward_batch,
-                    torch.cuda.current_stream(),
+                    torch.npu.current_stream(),
                 )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -1678,16 +1678,21 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
-        use_npu_cp_full_metadata = use_cp and _is_npu
+        use_npu_cp = use_cp and _is_npu
         if self.indexer is not None:
-            if use_npu_cp_full_metadata:
-                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
-                    attn_backend.forward_indexer_compressor(
-                        x,
-                        forward_batch,
-                        self.indexer.layer_id,
-                        self.indexer.compressor,
-                    )
+            if use_npu_cp:
+                # The compressor write below branches on li_kv_dtype, which
+                # only _ensure_npu_c4_indexer initializes (the non-CP path
+                # gets the ordering from forward_c4_indexer). Without it the
+                # first CP forward scatters bf16 K into the int8/FP8 index
+                # cache with no dequant scale.
+                attn_backend._ensure_npu_c4_indexer(self.indexer, x.device)
+                attn_backend.forward_indexer_compressor(
+                    x,
+                    forward_batch,
+                    self.indexer.layer_id,
+                    self.indexer.compressor,
+                )
                 self.indexer(
                     x=x,
                     q_lora=q_lora,
@@ -1703,21 +1708,12 @@ class MQALayer(MqaAttentionBase):
                     attn_backend=attn_backend,
                 )
         if self.compressor is not None:
-            if use_npu_cp_full_metadata:
-                with attn_backend.use_dsv4_cp_full_metadata(forward_batch):
-                    attn_backend.forward_core_compressor(
-                        x,
-                        forward_batch,
-                        self.layer_id,
-                        self.compressor,
-                    )
-            else:
-                attn_backend.forward_core_compressor(
-                    x,
-                    forward_batch,
-                    self.layer_id,
-                    self.compressor,
-                )
+            attn_backend.forward_core_compressor(
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
 
         return q, kv
 
@@ -3252,6 +3248,9 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # The CP runner path calls model.model(...) directly, bypassing the
+        # decorated ForCausalLM wrapper: without this the sharded inputs drag
+        # the whole body into an autograd graph.
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3287,14 +3286,6 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: List[torch.Tensor] = []
 
         attn_backend = get_attn_backend()
-        if _is_npu and forward_batch.attn_cp_metadata is not None:
-            attn_backend.prepare_dsv4_cp_metadata(forward_batch)
-            local_positions = getattr(forward_batch, "dsv4_cp_local_positions", None)
-            if (
-                local_positions is not None
-                and positions.shape[0] == local_positions.shape[0]
-            ):
-                forward_batch.positions = positions
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):

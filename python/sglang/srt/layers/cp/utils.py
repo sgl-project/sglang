@@ -336,6 +336,7 @@ __all__ = [
     "is_mla_cp_enabled",
     "is_mla_cp_active",
     "cp_gather_after_forward",
+    "cp_gather_full_sequence_states",
     "cp_materialize_global_token_order",
     "cp_interleave_input_ids",
     "cp_shard_hidden_states",

@@ -336,11 +336,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
         meta = forward_batch.attn_cp_metadata
-        device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
-        if device is None and meta.cu_seqlens_q_prev_tensor is not None:
-            device = meta.cu_seqlens_q_prev_tensor.device
-        if device is None:
-            device = torch.device("cpu")
+        device = forward_batch.input_ids.device
 
         offsets = [0] + list(accumulate(meta.split_list))
         pieces = []

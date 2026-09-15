@@ -11,7 +11,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -210,7 +209,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 only supports interleave/zigzag CP strategy, got {cfg.cp_strategy}"
         )
 
-    if cfg.cp_strategy == "zigzag" and not is_npu():
+    if cfg.cp_strategy == "zigzag" and not get_platform().is_npu:
         raise ValueError(
             "DeepSeekV4 zigzag CP requires the NPU backend; the CUDA backend "
             "reindexes with interleave order."
@@ -231,19 +230,43 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    if not is_npu():
+    if not get_platform().is_npu:
         assert cfg.dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.tp_size <= 8, (
-            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-        )
+    # Applies on NPU too: every layer all-gathers bf16 KV across the CP group,
+    # so inter-node CP silently degrades precision.
+    assert cfg.tp_size <= 8, (
+        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
+    if cfg.moe_a2a_backend == "none":
+        if cfg.dp_size > 1:
+            # _run_moe_ffn_dp_sync routes CP shards through
+            # dsa_cp_gather_hidden_states, whose first line asserts
+            # attn_dp_size == 1 and attn_tp_size == 1: reject here instead of
+            # crashing at the first MoE layer after startup.
+            raise ValueError(
+                "DeepSeekV4 CP with dp_size > 1 requires an MoE a2a backend "
+                "(--moe-a2a-backend deepep/megamoe/mori); 'none' only supports "
+                "dp_size == 1."
+            )
+        if cfg.cp_strategy == "zigzag":
+            # cp_interleave_input_ids rebuilds input_ids_global in interleave
+            # rank-major order regardless of the strategy, while zigzag shards
+            # and gathers hidden states in block order: hash-routed MoE layers
+            # would silently pick wrong experts row by row.
+            raise ValueError(
+                "DeepSeekV4 zigzag CP requires an MoE a2a backend "
+                "(--moe-a2a-backend deepep/megamoe/mori); with 'none' the "
+                "input_ids_global interleave order does not match the zigzag "
+                "shard order."
+            )
     logger.warning(
         "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
         "context parallelism is enabled."
