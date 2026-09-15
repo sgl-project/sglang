@@ -489,10 +489,10 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
-        except FileNotFoundError:
+        except OSError as e:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning(f"Failed to fetch {key} from HiCacheFile storage: {e}")
             return None
 
     def batch_get(
