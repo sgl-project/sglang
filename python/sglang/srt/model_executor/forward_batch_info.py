@@ -517,6 +517,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    # dLLM prompt positions are immutable, including literal mask-token IDs.
+    dllm_prompt_mask: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -920,6 +922,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+            prompt_lens = torch.tensor(
+                [len(req.origin_input_ids) for req in batch.reqs],
+                dtype=positions_dtype,
+                device=device,
+            )
+            ret.dllm_prompt_mask = (
+                ret.positions.view(-1, block_size) < prompt_lens[:, None]
+            )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

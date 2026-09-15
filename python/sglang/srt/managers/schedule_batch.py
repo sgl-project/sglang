@@ -1513,7 +1513,6 @@ class Req(ReqDllmMixin):
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
         else:
             self._refresh_fill_ids()
 
@@ -1611,6 +1610,9 @@ class Req(ReqDllmMixin):
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
+
+        if self.is_dllm():
+            self.determine_dllm_phase()
 
         if (
             self.is_retracted
@@ -2739,6 +2741,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
+                if req.is_dllm():
+                    # Denoising revisits the current block while only earlier
+                    # blocks are a reusable prefix. Recomputing that block must
+                    # not subtract its size from cross-request cache hits.
+                    new_cached = max(0, new_cached)
                 req.cached_tokens += new_cached
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
