@@ -43,6 +43,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ToolUseBlock,
     is_server_tool,
 )
+from sglang.srt.entrypoints.openai.chat_encoding import spec_supports_inline_system
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -190,8 +191,11 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
+        self._merge_inline_system = not (
+            spec_supports_inline_system(
+                getattr(openai_serving_chat, "chat_encoding_spec", None)
+            )
+            or detect_inline_system_support(self._chat_template())
         )
 
     def _chat_template(self) -> Optional[str]:
