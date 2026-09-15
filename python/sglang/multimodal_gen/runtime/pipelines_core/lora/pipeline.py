@@ -38,6 +38,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
     LoraMergeCache,
     lora_merge_cache_key,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pdd_lora import (
+    apply_pdd_head_bank,
+    clear_pdd_heads,
+    extract_pdd_payload,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     get_peft_lora_alpha,
     load_peft_config,
@@ -187,6 +192,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_alpha = None
         self.lora_path = None
         self.lora_nickname = "default"
+        self.pdd_head_banks = {}
 
         # Initialize from server_args
         self.device = get_local_torch_device()
@@ -885,6 +891,10 @@ class LoRAPipeline(ComposedPipelineBase):
 
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
+        extracted = extract_pdd_payload(raw_state_dict)
+        if extracted is not None:
+            raw_state_dict, pdd_bank = extracted
+            self.pdd_head_banks[lora_nickname] = pdd_bank
         lora_state_dict = normalize_lora_state_dict(
             raw_state_dict,
             logger=logger,
@@ -893,6 +903,8 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_lora_alpha = lora_alpha
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
+        if adapter_lora_alpha is None and extracted is not None:
+            adapter_lora_alpha = int(extracted[1].lora_alpha)
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
@@ -1148,6 +1160,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         tgt_nicknames.copy(),
                         tgt_strengths.copy(),
                     )
+                    self._apply_pdd_head_banks(module_name, tgt_nicknames)
 
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s, merge_mode=%s)",
@@ -1162,6 +1175,48 @@ class LoRAPipeline(ComposedPipelineBase):
             ),
             merge_mode,
         )
+
+    def _pdd_scheduler_shifts(self) -> tuple[float, float]:
+        try:
+            meta = self.release_metadata
+        except AttributeError:
+            return 12.0, 3.0
+        if meta is None:
+            return 12.0, 3.0
+        return float(meta.video_sigma_shift), float(meta.audio_sigma_shift)
+
+    def _apply_pdd_head_banks(self, module_name: str, nicknames: list[str]) -> None:
+        if module_name != "transformer":
+            return
+        module = self.modules.get(module_name)
+        if module is None:
+            return
+        bank = None
+        for name in nicknames:
+            candidate = self.pdd_head_banks.get(name)
+            if candidate is None:
+                continue
+            if bank is not None:
+                raise ValueError("Only one PDD Acc LoRA head bank can be active at a time")
+            bank = candidate
+        if bank is None:
+            clear_pdd_heads(module)
+            return
+        video_shift, audio_shift = self._pdd_scheduler_shifts()
+        apply_pdd_head_bank(
+            module,
+            bank,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+        )
+
+    def _clear_pdd_head_banks(self, module_name: str) -> None:
+        if module_name != "transformer":
+            return
+        module = self.modules.get(module_name)
+        if module is None:
+            return
+        clear_pdd_heads(module)
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
@@ -1251,6 +1306,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
                 self.cur_adapter_config.pop(module_name, None)
+                self._clear_pdd_head_banks(module_name)
                 logger.info("LoRA weights deactivated for %s", module_name)
 
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
