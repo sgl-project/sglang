@@ -383,10 +383,11 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 STEP_MAX_US = 2_000_000
 
-# Min wall-clock between load publishes on the stalled no-batch path, which
-# spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
-# DP-balancing writer and the router-facing socket.
-LOAD_STALL_REFRESH_S = 0.05
+# Min wall-clock between load publishes on the spinning paths of on_idle (the
+# stalled no-batch path and the fully-idle path). Both spin without sleeping,
+# so this bounds the O(queue) get_loads for the DP-balancing writer and the
+# router-facing socket instead of letting them run once per loop pass.
+LOAD_SPIN_REFRESH_S = 0.05
 
 
 @dataclasses.dataclass(frozen=True)
@@ -432,9 +433,10 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
-    # Class-level default so on_idle's stall gate works even if a fork
-    # overrides init_load_publisher (which would otherwise not set it).
-    _last_stall_publish_ts: float = float("-inf")
+    # Class-level defaults so on_idle's publish gate works even if a fork
+    # overrides init_load_publisher (which would otherwise not set them).
+    _last_spin_publish_ts: float = float("-inf")
+    _was_fully_idle: bool = False
 
     def __init__(
         self,
@@ -876,6 +878,33 @@ class Scheduler(
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
             return None
+
+    def publish_spinning_load(self) -> None:
+        """Publish a load snapshot to both sinks from a spinning path.
+
+        Called by `on_idle`, which may run thousands of times per second while
+        the scheduler waits for work, so callers gate the cadence by wall clock
+        and this always publishes (`force=True`) when they decide to.
+        """
+        snapshot = self.publish_load_snapshot(force=True)
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads, force=True, snapshot=snapshot
+        )
+
+    def mark_engine_busy(self) -> None:
+        """Record that the engine processed a real batch.
+
+        `_was_fully_idle` is only written from `on_idle`, which a busy loop can
+        skip for a whole request, so the flag has to be cleared here too: the
+        next fully-idle pass is then a busy->idle transition and publishes
+        immediately instead of waiting out the spin floor.
+
+        Filler batches (`ForwardMode.IDLE`, e.g. a dp-attention rank with no
+        local work) do not count. They are processed while the engine has
+        nothing to do, so clearing the flag there would re-open the unthrottled
+        publish that the spin floor exists to prevent.
+        """
+        self._was_fully_idle = False
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -4561,6 +4590,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if not batch.forward_mode.is_idle():
+            self.mark_engine_busy()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4696,15 +4727,13 @@ class Scheduler(
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
         fully_idle = self.is_fully_idle()
+        now = time.monotonic()
         if not fully_idle:
+            self.mark_engine_busy()
             self.metrics_reporter.record_scheduler_active()
-            now = time.monotonic()
-            if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
-                self._last_stall_publish_ts = now
-                snapshot = self.publish_load_snapshot(force=True)
-                self.load_publisher.publish_load_stat(
-                    self.load_inquirer.get_loads, force=True, snapshot=snapshot
-                )
+            if now - self._last_spin_publish_ts >= LOAD_SPIN_REFRESH_S:
+                self._last_spin_publish_ts = now
+                self.publish_spinning_load()
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -4754,11 +4783,20 @@ class Scheduler(
         self.new_token_ratio_tracker.reset()
 
         # Fully-idle publish, post-flush so the gauge reflects compacted KV.
-        # Forced (immediate) so the busy->idle transition is never delayed.
-        snapshot = self.publish_load_snapshot(force=True)
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads, force=True, snapshot=snapshot
-        )
+        # The busy->idle transition publishes immediately so it is never
+        # delayed: every real batch clears `_was_fully_idle` (see
+        # `mark_engine_busy`), so the first idle pass after one always
+        # publishes. The passes that follow are wall-clock floored because this
+        # loop spins without sleeping while idle (thousands of passes per
+        # second), and nothing but a new request can move the gauge. Such a
+        # request re-enters the busy path, which publishes on its own batch
+        # result -- and the next idle transition publishes again.
+        if not self._was_fully_idle or (
+            now - self._last_spin_publish_ts >= LOAD_SPIN_REFRESH_S
+        ):
+            self._last_spin_publish_ts = now
+            self.publish_spinning_load()
+        self._was_fully_idle = True
 
         # sleep until next event
         self.maybe_sleep_on_idle()
