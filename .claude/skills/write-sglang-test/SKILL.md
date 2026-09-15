@@ -113,7 +113,7 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 
 #### Nightly
 
-Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`.
+Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, `nightly-test-amd-rocm720.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`.
 
 CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine type, holding everything that runs nightly on it. There is no per-purpose split (kernel / eval / perf / precision all share their machine's suite); `auto_partition` splits the work. Examples:
 
@@ -121,13 +121,15 @@ CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine
 - `nightly-test-2-gpu-large` (CUDA)
 - `nightly-test-8-gpu-h200` (CUDA)
 - `nightly-test-4-gpu-gb300` (CUDA)
-- `nightly-amd` (AMD)
-- `nightly-amd-8-gpu-mi35x` (AMD)
+- `nightly-amd` (AMD, `nightly-test-amd.yml`, ROCm 7.0)
+- `nightly-amd-8-gpu-mi35x` (AMD, `nightly-test-amd.yml`, ROCm 7.0)
 - `nightly-1-npu-a3` (NPU)
 - `nightly-2-npu-a3` (NPU)
 - `nightly-4-npu-a3` (NPU)
 - `nightly-8-npu-a3` (NPU)
 - `nightly-16-npu-a3` (NPU)
+
+**`nightly-test-amd-rocm720.yml` (ROCm 7.2)** is a separate workflow from `nightly-test-amd.yml` (ROCm 7.0) and uses a different convention: instead of one shared per-machine suite, most models get their own dedicated job and suite(s), e.g. `nightly-amd-4-gpu-mi35x-minimax-m3-tp4` (accuracy) and `nightly-perf-4-gpu-mi35x-minimax-m3` (perf) for MiniMax-M3. The whole workflow runs as a `matrix.rocm_version` over `[rocm724, rocm720]` image flavors, so every job/suite name is exercised on both regardless of the `-rocm720` suffix on the job id. For a model job that has both an accuracy and a perf suite, the common pattern is to run accuracy first, then perf in the same job with `continue-on-error: true` on the perf step — so a throughput blip doesn't fail a job whose accuracy passed (see the GLM-5.2-FP8, GLM-5-MXFP4, Kimi-K3, and MiniMax-M3 jobs). New/replaced model jobs must also be added to (or removed from) the `job_select` dropdown and the `check-all-jobs`/`needs` list in the same file.
 
 > **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
