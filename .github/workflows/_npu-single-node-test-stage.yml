@@ -258,6 +258,11 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+          # Append the image tag to the workflow-name segment so that runs with
+          # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
+          # image-tagged output/log directories.
+          image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
+          workflow_name="${workflow_name}--${image_label}"
 
           # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
@@ -345,6 +350,7 @@ jobs:
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+          source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh || true
           set -u
 
           # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
