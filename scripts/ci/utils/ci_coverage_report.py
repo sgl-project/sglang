@@ -43,9 +43,9 @@ BACKEND_DISPLAY_ORDER = (
     "MLX",
     "MPS",
 )
-assert set(BACKEND_DISPLAY_ORDER) == {
-    b.name for b in HWBackend
-}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
+    "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+)
 
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage

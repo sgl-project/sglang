@@ -479,8 +479,7 @@ def validate_standard_mps_server_args(server_args: Any):
         or getattr(cfg, "dp_size", 1) != 1
     ):
         raise ValueError(
-            "The standard Torch MPS path requires tp_size=1, pp_size=1, "
-            "and dp_size=1"
+            "The standard Torch MPS path requires tp_size=1, pp_size=1, and dp_size=1"
         )
 
 
