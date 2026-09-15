@@ -110,7 +110,20 @@ def build_inputs(
     for i in range(batch_size):
         base = i * max_kv_len
         slot_ids[i] = i
-        if paged:
+        if paged == "pages":
+            # What PagedTokenToKVPoolAllocator emits: page * page_size + offset, so
+            # slots are contiguous inside a page while pages themselves are shuffled.
+            npages = max_kv_len // block_size
+            pages = torch.randperm(npages, device=DEVICE) + i * npages
+            req_to_token[i, :max_kv_len] = (
+                (
+                    pages[:, None] * block_size
+                    + torch.arange(block_size, device=DEVICE)[None, :]
+                )
+                .reshape(-1)
+                .to(torch.int32)
+            )
+        elif paged:
             req_to_token[i, :max_kv_len] = (
                 torch.randperm(max_kv_len, device=DEVICE) + base
             ).to(torch.int32)
@@ -360,3 +373,51 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.parametrize("page_size,engages", [(128, True), (256, True), (64, False)])
+def test_paged_tile_matches_slot_gather(page_size, engages):
+    """Deriving a block's slots from its first slot must match gathering them.
+
+    Only valid when a block cannot straddle a page, so page_size < block_size must
+    fall back. Uses the page-structured layout the allocator actually produces; the
+    `paged=True` layout above is a bare permutation and violates the precondition.
+    """
+    torch.manual_seed(0)
+    bs, nqh, nkh, hd, blk, tk = 4, 64, 1, 128, 128, 16
+    seq_lens_list = make_seq_lens("aligned", bs, blk)
+    args = build_inputs(
+        bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged="pages"
+    )
+    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = args
+
+    def run(ps):
+        return flash_decode_with_gqa_share_sparse(
+            q,
+            sink,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens,
+            slot_ids,
+            blk,
+            topk_idx,
+            page_size=ps,
+        )
+
+    gather = run(0)
+    assert torch.equal(gather, run(page_size))
+    # A layout that violates the precondition must diverge, else the branch under
+    # test never ran and the assertion above proves nothing.
+    if engages:
+        scattered = build_inputs(
+            bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged=True
+        )
+        q2, s2, k2, v2, r2, sl2, sid2, ti2 = scattered
+        a = flash_decode_with_gqa_share_sparse(
+            q2, s2, k2, v2, r2, sl2, sid2, blk, ti2, page_size=0
+        )
+        b = flash_decode_with_gqa_share_sparse(
+            q2, s2, k2, v2, r2, sl2, sid2, blk, ti2, page_size=page_size
+        )
+        assert not torch.equal(a, b)
