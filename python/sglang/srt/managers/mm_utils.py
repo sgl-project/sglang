@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
 import os
 import pickle
 import sys
@@ -1286,6 +1287,7 @@ class ShmPointerMMData:
     """
 
     def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+        self._uses_shm_view = False
         self._shm_handle = None
         self.tensor = None
         self._materialization_error = None
@@ -1325,6 +1327,7 @@ class ShmPointerMMData:
         }
 
     def __setstate__(self, state):
+        self._uses_shm_view = False
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
@@ -1337,8 +1340,19 @@ class ShmPointerMMData:
         handle = None
         tensor = None
         try:
+            self._uses_shm_view = (
+                os.name == "posix" and envs.SGLANG_ENABLE_MM_SHM_ZERO_COPY.get()
+            )
             handle = shared_memory.SharedMemory(name=self.shm_name)
-            tensor = torch.frombuffer(handle.buf, dtype=self.dtype)
+            if self._uses_shm_view:
+                # frombuffer retains this independent mmap in the tensor's
+                # storage, including through slices/detach/numpy aliases.
+                # ACCESS_COPY preserves per-rank writes without eagerly copying
+                # the feature. Closing the SharedMemory handle cannot unmap it.
+                buffer = mmap.mmap(handle._fd, handle.size, access=mmap.ACCESS_COPY)
+            else:
+                buffer = handle.buf
+            tensor = torch.frombuffer(buffer, dtype=self.dtype)
             self.tensor = tensor.reshape(self.shape)
             self._shm_handle = handle
         except Exception as error:
@@ -1354,11 +1368,20 @@ class ShmPointerMMData:
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
+        """Return a storage-owned view when enabled on POSIX, otherwise copy.
+
+        The receiver's TP/CP barrier must run before unlinking. The independent
+        mapping closes when the last storage alias is released, so request or
+        session cleanup can drop tensors without invalidating active readers.
+        """
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
-            return self.tensor.clone()
+            if self.tensor is None:
+                raise RuntimeError(
+                    "Multimodal SHM feature is not attached or was released"
+                )
+            return self.tensor if self._uses_shm_view else self.tensor.clone()
         finally:
             self.close_and_unlink()
 
