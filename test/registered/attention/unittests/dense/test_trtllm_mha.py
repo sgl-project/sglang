@@ -1,4 +1,6 @@
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 
@@ -12,9 +14,14 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
+    _make_forward_batch,
     build_dense_attention_fixture,
+    expected_dense_fixture_output,
     run_dense_attention_case,
+    run_dense_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -189,6 +196,73 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    @unittest.skipUnless(is_sm90_supported(), "FMHA-v2/XQA transition requires SM90")
+    def test_decode_after_fmha_prefill(self):
+        import flashinfer
+
+        prefill_case = DenseAttentionCase(
+            name="trtllm_mha_fmha_prefill_xqa_decode",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=2,
+            page_size=64,
+            prefix_lens=(0,),
+            extend_lens=(6,),
+            sliding_window_size=511,
+        )
+        # XQA's multi-block dispatch uses the context capacity, even for a
+        # short sequence. Keep it large enough to exercise its semaphores.
+        max_context_len = 4096
+        prefill = build_dense_attention_fixture(
+            self,
+            prefill_case,
+            head_dim=64,
+            hidden_size=128,
+            max_context_len=max_context_len,
+            dtype=torch.bfloat16,
+            loc_layout="contiguous",
+        )
+        decode_case = replace(
+            prefill_case,
+            forward_mode=ForwardMode.DECODE,
+            prefix_lens=(6,),
+            extend_lens=(),
+        )
+        decode = replace(
+            prefill,
+            case=decode_case,
+            forward_batch=_make_forward_batch(
+                decode_case,
+                prefill.runner,
+                max_context_len=max_context_len,
+                device="cuda",
+            ),
+            prefix_hidden=[prefill.input_hidden],
+            input_hidden=torch.randn_like(prefill.input_hidden[:1]),
+        )
+        real_decode = flashinfer.decode.trtllm_batch_decode_with_kv_cache
+
+        def decode_with_nan_output(*, query, **kwargs):
+            # Stale workspace counters can leave heads unwritten. Do not let
+            # an allocator-reused output silently hide missing kernel writes.
+            kwargs["out"] = torch.full_like(query, float("nan"))
+            return real_decode(query=query, **kwargs)
+
+        run_dense_fixture_eager(prefill)
+        with patch.object(
+            flashinfer.decode,
+            "trtllm_batch_decode_with_kv_cache",
+            new=decode_with_nan_output,
+        ):
+            actual = run_dense_fixture_eager(decode)
+        torch.testing.assert_close(
+            actual,
+            expected_dense_fixture_output(decode),
+            atol=DENSE_ATOL,
+            rtol=DENSE_RTOL,
+        )
 
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_DECODE_CASES:
