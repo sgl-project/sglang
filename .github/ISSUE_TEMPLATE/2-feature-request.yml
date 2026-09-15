@@ -1,0 +1,23 @@
+name: 🚀 Feature request
+description: Suggest an idea for this project
+title: "[Feature] "
+
+body:
+- type: checkboxes
+  attributes:
+    label: Checklist
+    options:
+      - label: If this is not a feature request but a general question, please start a discussion at https://github.com/sgl-project/sglang/discussions. Otherwise, it will be closed.
+      - label: Please use English. Otherwise, it will be closed.
+- type: textarea
+  attributes:
+    label: Motivation
+    description: |
+      Clearly and concisely describe the feature's motivation.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Related resources
+    description: |
+      Provide official releases or third-party implementations if available.

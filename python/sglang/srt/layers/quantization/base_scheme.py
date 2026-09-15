@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from abc import ABC, abstractmethod
+from typing import Optional
+
+import torch
+
+__all__ = ["BaseLinearScheme", "BaseMoEScheme"]
+
+
+class BaseLinearScheme(ABC):
+    """
+    Abstract class used to describe the weight creation and forward pass
+    of different quantization schemes.
+    """
+
+    # Schemes whose parameters only implement the v2 loader API
+    # (load_{column,row,merged_column,qkv}_weight) set this so LinearBase
+    # routes them through weight_loader_v2 without flipping the loader for
+    # every scheme that shares the same LinearMethod class.
+    requires_weight_loader_v2: bool = False
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        """
+        Weight creation for the particular scheme. Inputs to this function
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_weights(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ):
+        """
+        Run the forward pass for the particular scheme. This is where
+        scheme-specific dequant/quant steps/kernels should be applied.
+
+        :param layer: torch.nn.Module with the registered weights and
+            other parameters relevant to the particular scheme.
+        :param x: input to the layer
+        :param bias: bias parameter
+
+        """
+        raise NotImplementedError
+
+
+class BaseMoEScheme(ABC):
+    """
+    Abstract class used to describe the weight creation and forward pass
+    of different quantization schemes.
+    """
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        """
+        Weight creation for the particular scheme. Inputs to this function
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
+        """
+        raise NotImplementedError

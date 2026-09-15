@@ -1,0 +1,103 @@
+# Two Nodes Sglang example
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: distributed-sglang
+spec:
+  replicas: 2   # number of nodes/pods to run distributed sglang
+  selector:
+    matchLabels:
+      app: distributed-sglang
+  serviceName: ""
+  template:
+    metadata:
+      labels:
+        app: distributed-sglang
+    spec:
+      containers:
+      - name: sglang-container
+        image: docker.io/lmsysorg/sglang:latest
+        imagePullPolicy: Always # image may be replaced by official CI versioned image
+        command:
+        - /bin/bash
+        - -c
+        # please modify the sglang serving arguments below, as necessary.
+        # NOTE: the --expert-parallel-size is for MoE model like DeepSeek-R1
+        args:
+        - |
+          python3 -m sglang.launch_server \
+          --model /llm-folder \
+          --dist-init-addr sglang-master-pod:5000 \
+          --tensor-parallel-size 16 \
+          --nnodes 2 \
+          --node-rank $POD_INDEX \
+          --trust-remote-code \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --enable-metrics \
+          --expert-parallel-size 16
+        env:
+        - name: POD_INDEX     # reflects the node-rank
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+        - name: NCCL_DEBUG
+          value: INFO
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+          requests:
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /llm-folder
+          name: llm
+        securityContext:
+          privileged: true   # to leverage RDMA/InfiniBand device, co-work with HostNetwork=true
+      hostNetwork: true
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 10Gi
+        name: dshm
+      - hostPath:
+          path: /llm-folder # replace with PVC or hostPath with your model weights
+          type: DirectoryOrCreate
+        name: llm
+      #- persistentVolumeClaim:
+      #  claimName: llm-pvc
+      #  name: llm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-master-pod
+spec:
+  type: ClusterIP
+  selector:
+    app: distributed-sglang
+    apps.kubernetes.io/pod-index: "0"
+  ports:
+  - name: dist-port
+    port: 5000
+    targetPort: 5000
+---
+# the serving service
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-serving-on-master
+spec:
+  type: NodePort
+  selector:
+    app: distributed-sglang
+    apps.kubernetes.io/pod-index: "0"
+  ports:
+  - name: serving
+    port: 8000
+    targetPort: 8000
+  - name: metrics
+    port: 8080
+    targetPort: 8080

@@ -1,0 +1,323 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Inference-only DeepSeek NextN Speculative Decoding."""
+
+import logging
+import os
+from contextlib import ExitStack
+from typing import Iterable, Optional, Tuple
+
+import torch
+from safetensors.torch import load_file
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import Fp8Config
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+
+logger = logging.getLogger(__name__)
+
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+
+
+class DeepseekModelNextN(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+            # refer to real DeepSeek V3 quant config
+            moe_quant_config_override = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            moe_quant_config_override = None
+
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.debug(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            quant_config = None
+
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
+        )
+
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if quant_config is not None and quant_config.get_name() == "quark":
+            self.eh_proj = ReplicatedLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("eh_proj", prefix),
+            )
+        else:
+            self.eh_proj = nn.Linear(
+                2 * config.hidden_size, config.hidden_size, bias=False
+            )
+
+        self.rot_weight = None
+        if _is_npu:
+            rot_weight_path = get_model().model_path + "/rot.safetensors"
+            if os.path.isfile(rot_weight_path):
+                self.rot_weight = load_file(rot_weight_path)
+                self.rot_weight = self.rot_weight["rot.weight"].npu()
+
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
+
+        layer_name = "decoder"
+        if _is_npu and (
+            get_spec().speculative_draft_model_path == get_model().model_path
+        ):
+            layer_name = "layers." + str(config.num_hidden_layers)
+
+        self.quant_config = quant_config
+        self.decoder = DeepseekV2DecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            moe_quant_config_override=moe_quant_config_override,
+            is_nextn=True,
+            prefix=add_prefix(layer_name, prefix),
+            alt_stream=self.alt_stream,
+            skip_rope=config.qk_rope_head_dim == 0,
+        )
+
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        exit_stack = ExitStack()
+        if (
+            _is_npu
+            and self.quant_config is None
+            and get_model().quantization is not None
+        ):
+            # ascend mtp unquant
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            )
+
+        try:
+            zero_allocator = BumpAllocator(
+                buffer_size=2,
+                dtype=torch.float32,
+                device=(
+                    input_embeds.device
+                    if input_embeds is not None
+                    else input_ids.device
+                ),
+            )
+
+            if input_embeds is None:
+                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+                # (far above vocab_size). Use target-produced mm_input_embeds for
+                # these positions and only call embed_tokens on the appended
+                # next-token to avoid embed OOB.
+                input_embeds = forward_batch.mm_input_embeds
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.contains_mm_inputs()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    assert input_embeds is not None
+                    last_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    input_embeds[last_indices] = self.embed_tokens(
+                        input_ids[last_indices]
+                    )
+                if input_embeds is None:
+                    input_embeds = self.embed_tokens(input_ids)
+            hidden_states = input_embeds
+
+            if hidden_states.shape[0] > 0:
+                previous_hidden_states = forward_batch.spec_info.hidden_states
+                if self.rot_weight is not None:
+                    previous_hidden_states = torch.matmul(
+                        previous_hidden_states, self.rot_weight
+                    )
+                if _is_cuda:
+                    eh_input = fused_eh_norm(
+                        hidden_states,
+                        previous_hidden_states,
+                        self.enorm.weight,
+                        self.hnorm.weight,
+                        self.enorm.variance_epsilon,
+                    )
+                else:
+                    eh_input = torch.cat(
+                        (
+                            self.enorm(hidden_states),
+                            self.hnorm(previous_hidden_states),
+                        ),
+                        dim=-1,
+                    )
+                if isinstance(self.eh_proj, ReplicatedLinear):
+                    hidden_states, _ = self.eh_proj(eh_input)
+                else:
+                    hidden_states = self.eh_proj(eh_input)
+
+            residual = None
+            index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states, residual, topk_indices = self.decoder(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    prev_topk_indices=index_topk_share.topk_indices,
+                )
+            if not forward_batch.forward_mode.is_idle():
+                if residual is not None:
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                else:
+                    hidden_states = self.shared_head.norm(hidden_states)
+
+            index_topk_share.update(topk_indices)
+            index_topk_share.publish()
+        finally:
+            exit_stack.close()
+
+        return hidden_states
+
+
+class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+    # The draft checkpoint reports the NextN architecture name.
+    fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
+
+    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
+    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
+    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.layers.61": "model.decoder",
+        },
+    )
+
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.tp_size = get_parallel().tp_size
+        self.quant_config = quant_config
+        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
+        self.pp_group = get_pp_group()
+        self.determine_num_fused_shared_experts()
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
+
+        self.model = DeepseekModelNextN(
+            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        super().load_weights(weights, is_nextn=True)
+
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # `is_nextn` is pinned to True for the NextN subclass; the parameter is kept
+        # only because the mixin's `do_load_weights` calls `self.post_load_weights`
+        # with `is_nextn=...` as a kwarg.
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
+
+
+EntryClass = [DeepseekV3ForCausalLMNextN]

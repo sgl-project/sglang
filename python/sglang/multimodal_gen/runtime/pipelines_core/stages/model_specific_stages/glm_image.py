@@ -1,0 +1,1393 @@
+import inspect
+import re
+import time
+from copy import copy, deepcopy
+from typing import Any, Iterator, List, Optional, Tuple, Union
+
+import numpy as np
+import PIL
+import requests
+import torch
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.utils.torch_utils import randn_tensor
+
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GLM_IMAGE_RESOLUTION_ALIGNMENT,
+    align_glm_image_resolution,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    align_tensor_to_module_dtype,
+    get_module_dtype,
+)
+from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
+
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    base_shift: float = 0.25,
+    max_shift: float = 0.75,
+) -> float:
+    m = (image_seq_len / base_seq_len) ** 0.5
+    mu = m * max_shift + base_shift
+    return mu
+
+
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    r"""
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+    """
+    accepts_timesteps = "timesteps" in set(
+        inspect.signature(scheduler.set_timesteps).parameters.keys()
+    )
+    accepts_sigmas = "sigmas" in set(
+        inspect.signature(scheduler.set_timesteps).parameters.keys()
+    )
+
+    if timesteps is not None and sigmas is not None:
+        if not accepts_timesteps and not accepts_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(
+            timesteps=timesteps, sigmas=sigmas, device=device, **kwargs
+        )
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif timesteps is not None and sigmas is None:
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif timesteps is None and sigmas is not None:
+        if not accepts_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
+    sample_mode: str = "sample",
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def image_path_to_list(image_path: Union[str, List[str]]) -> List[str]:
+    return image_path if isinstance(image_path, list) else [image_path]
+
+
+def resize_glm_image_to_alignment(image: PIL.Image.Image) -> PIL.Image.Image:
+    """Resize an image up so both dimensions use GLM-Image's D32 grid."""
+    width, height = image.size
+    aligned_width, aligned_height = align_glm_image_resolution(width, height)
+    if (aligned_width, aligned_height) == (width, height):
+        return image
+    return image.resize((aligned_width, aligned_height), PIL.Image.Resampling.LANCZOS)
+
+
+def _validate_glm_image_resolution_alignment(width: int, height: int) -> None:
+    if (
+        height % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+        or width % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+    ):
+        raise ValueError(
+            "GLM-Image dimensions must be aligned before AR token generation, "
+            f"got {width}x{height}"
+        )
+
+
+def center_crop_glm_image_output(
+    frames: torch.Tensor,
+    target_width: int | None,
+    target_height: int | None,
+) -> torch.Tensor:
+    """Center-crop decoded GLM-Image pixels back to the requested canvas."""
+    if None in (target_width, target_height):
+        return frames
+
+    decoded_height, decoded_width = frames.shape[-2:]
+    if target_width > decoded_width or target_height > decoded_height:
+        raise ValueError(
+            "Cannot crop GLM-Image output to a canvas larger than the decoded "
+            f"image: requested {target_width}x{target_height}, decoded "
+            f"{decoded_width}x{decoded_height}"
+        )
+    if (target_width, target_height) == (decoded_width, decoded_height):
+        return frames
+
+    left = (decoded_width - target_width) // 2
+    top = (decoded_height - target_height) // 2
+    return frames[
+        ..., top : top + target_height, left : left + target_width
+    ].contiguous()
+
+
+def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
+    pooler_output = getattr(image_features, "pooler_output", None)
+    if pooler_output is not None:
+        image_features = pooler_output
+    if isinstance(image_features, torch.Tensor):
+        return image_features
+    return torch.cat(tuple(image_features), dim=0)
+
+
+def _num_outputs_per_prompt(batch: Req) -> int:
+    return max(1, int(getattr(batch, "num_outputs_per_prompt", 1) or 1))
+
+
+def _seed_for_output(seed: Optional[Union[int, List[int]]], output_idx: int):
+    if seed is None:
+        return None
+    if isinstance(seed, list):
+        if not seed:
+            return None
+        if output_idx < len(seed):
+            return int(seed[output_idx])
+        return int(seed[0]) + output_idx
+    return int(seed) + output_idx
+
+
+def _repeat_to_batch(tensor: Optional[torch.Tensor], batch_size: int):
+    if tensor is None or tensor.shape[0] == batch_size:
+        return tensor
+    if tensor.shape[0] != 1:
+        raise ValueError(
+            f"Cannot expand tensor with batch size {tensor.shape[0]} to {batch_size}"
+        )
+    repeat_shape = [batch_size] + [1] * (tensor.dim() - 1)
+    return tensor.repeat(*repeat_shape)
+
+
+def _extract_srt_usage(meta_info: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(meta_info, dict):
+        return None
+
+    usage = {
+        "prompt_tokens": int(meta_info.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(meta_info.get("completion_tokens", 0) or 0),
+        "reasoning_tokens": int(meta_info.get("reasoning_tokens", 0) or 0),
+        "cached_tokens": int(meta_info.get("cached_tokens", 0) or 0),
+    }
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    return usage
+
+
+def _merge_srt_usage(
+    total_usage: dict[str, Any] | None, usage: dict[str, int] | None
+) -> dict[str, Any] | None:
+    if usage is None:
+        return total_usage
+    if total_usage is None:
+        total_usage = {}
+    for key, value in usage.items():
+        total_usage[key] = int(total_usage.get(key, 0)) + int(value)
+    return total_usage
+
+
+def _merge_srt_usages(
+    usages: list[dict[str, int] | None],
+) -> dict[str, Any] | None:
+    total_usage = None
+    for usage in usages:
+        total_usage = _merge_srt_usage(total_usage, usage)
+    return total_usage
+
+
+class GlmImageAR(PipelineStage):
+    r"""
+    Pipeline for text-to-image generation using GLM-Image.
+
+    This stage for the AR (autoregressive) model for token generation.
+
+    Args:
+        processor (`AutoProcessor`):
+            Processor for the AR model to handle chat templates and tokenization.
+        vision_language_encoder ([`GlmImageForConditionalGeneration`]):
+            The AR model that generates image tokens from text prompts.
+    """
+
+    def __init__(
+        self,
+        processor,
+        vision_language_encoder,
+    ):
+        super().__init__()
+        self.processor = processor
+        self.vision_language_encoder = vision_language_encoder
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if not isinstance(self.vision_language_encoder, torch.nn.Module):
+            return []
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "vision_language_encoder",
+                memory_intensive=True,
+            )
+        ]
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
+
+    @staticmethod
+    def _compute_generation_params(
+        image_grid_thw,
+        is_text_to_image: bool,
+    ):
+        grid_sizes = []
+        grid_hw = []
+
+        for i in range(image_grid_thw.shape[0]):
+            t, h, w = image_grid_thw[i].tolist()
+            grid_sizes.append(int(h * w))
+            grid_hw.append((int(h), int(w)))
+
+        if not is_text_to_image:
+            max_new_tokens = grid_sizes[-1] + 1
+            large_image_start_offset = 0
+            target_grid_h, target_grid_w = grid_hw[-1]
+        else:
+            total_tokens = sum(grid_sizes)
+            max_new_tokens = total_tokens + 1
+            large_image_start_offset = sum(grid_sizes[1:])
+            target_grid_h, target_grid_w = grid_hw[0]
+        return max_new_tokens, large_image_start_offset, target_grid_h, target_grid_w
+
+    @staticmethod
+    def _upsample_token_ids(
+        token_ids: torch.Tensor, token_h: int, token_w: int
+    ) -> torch.Tensor:
+        token_ids = token_ids.reshape(1, 1, token_h, token_w)
+        token_ids = torch.nn.functional.interpolate(
+            token_ids.float(), scale_factor=2, mode="nearest"
+        ).to(dtype=torch.long)
+        token_ids = token_ids.reshape(1, -1)
+        return token_ids
+
+    @staticmethod
+    def _external_ar_sampling_params(max_new_tokens: int, seed: Optional[int]):
+        sampling_params = {
+            "temperature": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        }
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
+        return sampling_params
+
+    @staticmethod
+    def _request_external_ar(payload: dict, server_args: ServerArgs):
+        try:
+            response = requests.post(
+                server_args.srt_encoder_url + "/generate",
+                json=payload,
+                timeout=(
+                    server_args.srt_encoder_connect_timeout,
+                    server_args.srt_encoder_timeout,
+                ),
+            )
+            response.raise_for_status()
+        except requests.ConnectTimeout as e:
+            logger.error(
+                "Connection timeout to SGLang encoder (%s). Try to increase "
+                "--srt-encoder-connection-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_connect_timeout,
+                e,
+            )
+            raise
+        except requests.ReadTimeout as e:
+            logger.error(
+                "Read timeout from SGLang encoder (%s). Try to increase "
+                "--srt-encoder-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_timeout,
+                e,
+            )
+            raise
+        except requests.ConnectionError as e:
+            logger.error(
+                "Failed to connect to SGLang encoder at %s: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        except requests.RequestException as e:
+            logger.error(
+                "SGLang encoder request to %s failed: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        return response.json()
+
+    def _extract_prior_token_ids(
+        self,
+        generated_ids: Any,
+        generation_shape: tuple[int, int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        large_image_offset, token_h, token_w = generation_shape
+        expected_output_len = large_image_offset + token_h * token_w
+        actual_output_len = 0 if generated_ids is None else len(generated_ids)
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={large_image_offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
+
+        prior_token_ids_d32 = torch.tensor(
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
+            device=device,
+        )
+        return self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+
+    def generate_prior_tokens(
+        self,
+        prompt: str,
+        height: int,
+        width: int,
+        server_args: ServerArgs,
+        image: Optional[List[PIL.Image.Image]] = None,
+        seed: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[dict[str, int]]]:
+        """
+        Generate prior tokens using the AR (vision_language_encoder) model.
+
+        Args:
+            prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
+            condition_images: Optional list of condition images for i2i
+
+        Returns:
+            Tuple of the D16 prior token IDs, optional source-image token IDs,
+            and optional usage statistics returned by an external AR server.
+        """
+        device = current_platform.get_local_torch_device()
+        _validate_glm_image_resolution_alignment(width, height)
+
+        is_text_to_image = image is None or len(image) == 0
+        # Build messages for processor
+        content = []
+        if image is not None:
+            for img in image:
+                content.append({"type": "image", "image": img})
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            target_h=height,
+            target_w=width,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(device)
+
+        image_grid_thw = inputs.get("image_grid_thw")
+        max_new_tokens, large_image_offset, token_h, token_w = (
+            self._compute_generation_params(
+                image_grid_thw=image_grid_thw, is_text_to_image=is_text_to_image
+            )
+        )
+
+        prior_token_image_ids = None
+
+        # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
+        # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
+        if server_args.srt_encoder_url is not None:
+            if image is not None:
+                logger.error(
+                    "Image-to-Image tasks is not supported yet when using an external SGLang encoder server."
+                )
+                raise NotImplementedError(
+                    "I2I mode is not supported yet via external SGLang encoder URL."
+                )
+
+            payload = {
+                "input_ids": inputs["input_ids"][0].tolist(),
+                "image_data": [{"image_grid_thw": image_grid_thw.tolist()}],
+                "sampling_params": self._external_ar_sampling_params(
+                    max_new_tokens, seed
+                ),
+            }
+            data = self._request_external_ar(payload, server_args)
+            generated_ids = data.get("output_ids")
+            usage = _extract_srt_usage(data.get("meta_info"))
+        else:
+            if image is not None:
+                source_grids = image_grid_thw[:-1]
+                prior_token_image_embed = pooled_image_features_to_tensor(
+                    self.vision_language_encoder.get_image_features(
+                        inputs["pixel_values"], source_grids
+                    )
+                )
+                prior_token_image_ids_d32 = (
+                    self.vision_language_encoder.get_image_tokens(
+                        prior_token_image_embed, source_grids
+                    )
+                )
+                prior_token_image_ids = []
+                prior_ids_per_source = torch.split(
+                    prior_token_image_ids_d32,
+                    source_grids.prod(dim=-1).tolist(),
+                )
+                for prior_ids, source_grid in zip(prior_ids_per_source, source_grids):
+                    _, source_h, source_w = source_grid.tolist()
+                    prior_token_image_ids.append(
+                        self._upsample_token_ids(
+                            prior_ids,
+                            int(source_h),
+                            int(source_w),
+                        ).squeeze(0)
+                    )
+            outputs = self.vision_language_encoder.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+            )
+            input_len = inputs["input_ids"].shape[-1]
+            generated_ids = outputs[0][input_len:]
+            usage = None
+
+        prior_token_ids = self._extract_prior_token_ids(
+            generated_ids,
+            (large_image_offset, token_h, token_w),
+            device,
+        )
+
+        return prior_token_ids, prior_token_image_ids, usage
+
+    def generate_prior_tokens_batch(
+        self,
+        prompts: list[str],
+        seeds: list[Optional[int]],
+        height: int,
+        width: int,
+        server_args: ServerArgs,
+        device: Optional[torch.device] = None,
+    ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
+        device = device or current_platform.get_local_torch_device()
+        _validate_glm_image_resolution_alignment(width, height)
+
+        input_ids = []
+        image_data = []
+        sampling_params = []
+        generation_shapes = []
+        for prompt, seed in zip(prompts, seeds, strict=True):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                target_h=height,
+                target_w=width,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            image_grid_thw = inputs.get("image_grid_thw")
+            max_new_tokens, large_image_offset, token_h, token_w = (
+                self._compute_generation_params(
+                    image_grid_thw=image_grid_thw,
+                    is_text_to_image=True,
+                )
+            )
+            input_ids.append(inputs["input_ids"][0].tolist())
+            image_data.append([{"image_grid_thw": image_grid_thw.tolist()}])
+            sampling_params.append(
+                self._external_ar_sampling_params(max_new_tokens, seed)
+            )
+            generation_shapes.append((large_image_offset, token_h, token_w))
+
+        payload = {
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "sampling_params": sampling_params,
+        }
+        data = self._request_external_ar(payload, server_args)
+        if not isinstance(data, list) or len(data) != len(prompts):
+            raise RuntimeError(
+                "GLM-Image AR batch returned an unexpected response: "
+                f"expected {len(prompts)} outputs, got "
+                f"{len(data) if isinstance(data, list) else type(data).__name__}."
+            )
+
+        prior_token_ids = []
+        usages = []
+        for item, generation_shape in zip(data, generation_shapes, strict=True):
+            prior_token_ids.append(
+                self._extract_prior_token_ids(
+                    item.get("output_ids"), generation_shape, device
+                )
+            )
+            usages.append(_extract_srt_usage(item.get("meta_info")))
+        return prior_token_ids, usages
+
+    def generate_and_assign_prior_tokens(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+        device: Optional[torch.device] = None,
+    ) -> list[Req]:
+        """Generate one AR batch and assign its tokens and usage to each request."""
+        height = batches[0].height
+        width = batches[0].width
+        start_time = time.time()
+        output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
+        prompts = [
+            batch.prompt
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for _ in range(output_count)
+        ]
+        seeds = [
+            _seed_for_output(batch.seed, output_idx)
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for output_idx in range(output_count)
+        ]
+        prior_token_ids, usages = self.generate_prior_tokens_batch(
+            prompts=prompts,
+            seeds=seeds,
+            height=height,
+            width=width,
+            server_args=server_args,
+            device=device,
+        )
+        duration = time.time() - start_time
+        logger.info(
+            "generate_prior_tokens_batch time: %.3fs for %d requests (%d outputs)",
+            duration,
+            len(batches),
+            len(prior_token_ids),
+        )
+
+        stage_name = self._active_profile_stage_name()
+        output_offset = 0
+        for batch, output_count in zip(batches, output_counts, strict=True):
+            batch.prior_token_id = torch.cat(
+                prior_token_ids[output_offset : output_offset + output_count], dim=0
+            )
+            batch.prior_token_image_ids = None
+            output_usages = usages[output_offset : output_offset + output_count]
+            batch.extra["usage_by_output"] = output_usages
+            usage = _merge_srt_usages(output_usages)
+            if usage is not None:
+                batch.usage = usage
+            if batch.metrics is not None:
+                batch.metrics.record_stage(stage_name, duration)
+            output_offset += output_count
+        return batches
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str) and batch.image_path is None
+                for batch in batches
+            )
+        )
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        return self.generate_and_assign_prior_tokens(batches, server_args)
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        output_count = _num_outputs_per_prompt(batch)
+        if output_count == 1:
+            return iter((batch,))
+
+        prior_token_ids = batch.prior_token_id
+        if not isinstance(prior_token_ids, torch.Tensor) or (
+            prior_token_ids.shape[0] != output_count
+        ):
+            actual_count = (
+                prior_token_ids.shape[0]
+                if isinstance(prior_token_ids, torch.Tensor)
+                else type(prior_token_ids).__name__
+            )
+            raise RuntimeError(
+                "Cannot split GLM-Image AR output for sequential inference: "
+                f"expected {output_count} token rows, got {actual_count}."
+            )
+
+        return map(
+            lambda output_index: self._make_sequential_request(
+                batch, prior_token_ids, output_index
+            ),
+            range(output_count),
+        )
+
+    @staticmethod
+    def _make_sequential_request(
+        batch: Req, prior_token_ids: torch.Tensor, output_index: int
+    ) -> Req:
+        output_req = copy(batch)
+        output_req.sampling_params = copy(batch.sampling_params)
+        output_req.extra = dict(batch.extra)
+        output_req.condition_inputs = dict(batch.condition_inputs)
+        output_req.metrics = deepcopy(batch.metrics)
+        output_req.num_outputs_per_prompt = 1
+        output_req.seed = _seed_for_output(batch.seed, output_index)
+        output_req.seeds = None
+        output_req.generator = None
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        usage_by_output = output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
+        if batch.request_id is not None:
+            output_req.request_id = f"{batch.request_id}:{output_index}"
+            if output_req.metrics is not None:
+                output_req.metrics.request_id = output_req.request_id
+        return output_req
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+
+        prompt = batch.prompt
+        height = batch.height
+        width = batch.width
+        if batch.image_path is not None:
+            ar_condition_images = [
+                load_image(img_path)
+                for img_path in image_path_to_list(batch.image_path)
+            ]
+        else:
+            ar_condition_images = None
+
+        device = current_platform.get_local_torch_device()
+
+        if ar_condition_images is not None:
+            height = height or ar_condition_images[0].height
+            width = width or ar_condition_images[0].width
+
+        if getattr(batch, "requested_width", None) is None:
+            batch.requested_width = width
+        if getattr(batch, "requested_height", None) is None:
+            batch.requested_height = height
+
+        requested_width = width
+        requested_height = height
+        width, height = align_glm_image_resolution(width, height)
+        if (width, height) != (requested_width, requested_height):
+            logger.warning(
+                "GLM-Image requires dimensions divisible by %s; adjusted "
+                "runtime resolution from %sx%s to %sx%s",
+                GLM_IMAGE_RESOLUTION_ALIGNMENT,
+                requested_width,
+                requested_height,
+                width,
+                height,
+            )
+
+        if ar_condition_images is not None:
+            ar_condition_images = [
+                resize_glm_image_to_alignment(image) for image in ar_condition_images
+            ]
+
+        time_start = time.time()
+        num_outputs = _num_outputs_per_prompt(batch)
+        seed = getattr(batch, "seed", None)
+        rng_devices = []
+        rng_device_type = "cuda"
+        if device.type == "cuda":
+            rng_devices.append(torch.cuda.current_device())
+        elif device.type == "npu":
+            rng_devices.append(torch.npu.current_device())
+            rng_device_type = "npu"
+
+        prior_token_image_ids = None
+        if (
+            num_outputs > 1
+            and getattr(server_args, "srt_encoder_url", None) is not None
+            and isinstance(prompt, str)
+            and ar_condition_images is None
+        ):
+            prior_token_ids, output_usages = self.generate_prior_tokens_batch(
+                prompts=[prompt] * num_outputs,
+                seeds=[_seed_for_output(seed, i) for i in range(num_outputs)],
+                height=height,
+                width=width,
+                server_args=server_args,
+            )
+        else:
+            prior_token_ids = []
+            output_usages = []
+            for output_idx in range(num_outputs):
+                output_seed = _seed_for_output(seed, output_idx)
+                if output_seed is None:
+                    prior_token_id, output_prior_token_image_ids, output_usage = (
+                        self.generate_prior_tokens(
+                            prompt=prompt,
+                            image=ar_condition_images,
+                            height=height,
+                            width=width,
+                            server_args=server_args,
+                        )
+                    )
+                else:
+                    with torch.random.fork_rng(
+                        devices=rng_devices,
+                        enabled=True,
+                        device_type=rng_device_type,
+                    ):
+                        torch.manual_seed(output_seed)
+                        prior_token_id, output_prior_token_image_ids, output_usage = (
+                            self.generate_prior_tokens(
+                                prompt=prompt,
+                                image=ar_condition_images,
+                                height=height,
+                                width=width,
+                                server_args=server_args,
+                                seed=output_seed,
+                            )
+                        )
+                prior_token_ids.append(prior_token_id)
+                output_usages.append(output_usage)
+                if prior_token_image_ids is None:
+                    prior_token_image_ids = output_prior_token_image_ids
+
+        prior_token_id = torch.cat(prior_token_ids, dim=0)
+        prior_token_id = prior_token_id.to(device=device)
+        time_end = time.time()
+        logger.debug("generate_prior_tokens time: %.3fs", time_end - time_start)
+
+        batch.prior_token_id = prior_token_id
+        batch.prior_token_image_ids = prior_token_image_ids
+        batch.height = height
+        batch.width = width
+        batch.extra["usage_by_output"] = output_usages
+        usage = _merge_srt_usages(output_usages)
+        if usage is not None:
+            batch.usage = usage
+
+        return batch
+
+
+class GlmImageDecodingStage(DecodingStage):
+    """Decode on the D32 canvas, then restore the user-requested dimensions."""
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        output_batch = super().forward(batch, server_args)
+        if output_batch.output is not None:
+            output_batch.output = center_crop_glm_image_output(
+                output_batch.output,
+                batch.requested_width,
+                batch.requested_height,
+            )
+        if output_batch.trajectory_decoded is not None:
+            output_batch.trajectory_decoded = [
+                center_crop_glm_image_output(
+                    decoded,
+                    batch.requested_width,
+                    batch.requested_height,
+                )
+                for decoded in output_batch.trajectory_decoded
+            ]
+        return output_batch
+
+
+class GlmImageBeforeDenoisingStage(PipelineStage):
+    r"""
+    Pipeline for text-to-image generation using GLM-Image.
+
+    This stage for preparations before denoising stage like encoding, latents, timesteps
+
+    Args:
+        vae ([`AutoencoderKL`]):
+            Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
+        text_encoder ([`T5EncoderModel`]):
+            Frozen text-encoder for glyph embeddings.
+        tokenizer (`PreTrainedTokenizer`):
+            Tokenizer for the text encoder.
+        transformer ([`GlmImageTransformer2DModel`]):
+            A text conditioned transformer to denoise the encoded image latents (DiT).
+        scheduler ([`SchedulerMixin`]):
+            A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        text_encoder,
+        vae,
+        transformer,
+        scheduler,
+    ):
+        super().__init__()
+
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.vae = vae
+        self.transformer = transformer
+        self.scheduler = scheduler
+
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+        self.default_sample_size = (
+            self.transformer.config.sample_size
+            if hasattr(self, "transformer")
+            and self.transformer is not None
+            and hasattr(self.transformer.config, "sample_size")
+            else 128
+        )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(stage_name, "text_encoder", memory_intensive=True)]
+        if self.vae is not None:
+            uses.append(ComponentUse(stage_name, "vae", phase="condition_image"))
+        if self.transformer is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="transformer",
+                    phase="reference_image",
+                    memory_intensive=True,
+                )
+            )
+        return uses
+
+    def get_glyph_texts(self, prompt):
+        prompt = prompt[0] if isinstance(prompt, list) else prompt
+        ocr_texts = (
+            re.findall(r"'([^']*)'", prompt)
+            + re.findall(r"“([^“”]*)”", prompt)
+            + re.findall(r'"([^"]*)"', prompt)
+            + re.findall(r"「([^「」]*)」", prompt)
+        )
+        return ocr_texts
+
+    def _get_glyph_embeds(
+        self,
+        prompt: Union[str, List[str]] = None,
+        max_sequence_length: int = 2048,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+
+        glyph_texts = self.get_glyph_texts(prompt)
+        input_ids = self.tokenizer(
+            glyph_texts if len(glyph_texts) > 0 else [""],
+            max_length=max_sequence_length,
+            truncation=True,
+        ).input_ids
+        input_ids = [
+            [self.tokenizer.pad_token_id] * ((len(input_ids) + 1) % 2) + input_ids_
+            for input_ids_ in input_ids
+        ]
+        max_length = max(len(input_ids_) for input_ids_ in input_ids)
+        attention_mask = torch.tensor(
+            [
+                [1] * len(input_ids_) + [0] * (max_length - len(input_ids_))
+                for input_ids_ in input_ids
+            ],
+            device=device,
+        )
+        input_ids = torch.tensor(
+            [
+                input_ids_
+                + [self.tokenizer.pad_token_id] * (max_length - len(input_ids_))
+                for input_ids_ in input_ids
+            ],
+            device=device,
+        )
+        outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
+        glyph_embeds = outputs.last_hidden_state[attention_mask.bool()].unsqueeze(0)
+
+        return glyph_embeds.to(device=device, dtype=dtype)
+
+    def encode_prompt(
+        self,
+        prompt: Union[str, List[str]],
+        do_classifier_free_guidance: bool = True,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        max_sequence_length: int = 2048,
+    ):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            do_classifier_free_guidance (`bool`, *optional*, defaults to `True`):
+                Whether to use classifier free guidance or not.
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            device: (`torch.device`, *optional*):
+                torch device
+            dtype: (`torch.dtype`, *optional*):
+                torch dtype
+            max_sequence_length (`int`, defaults to `2048`):
+                Maximum sequence length in encoded prompt. Can be set to other values but may lead to poorer results.
+        """
+        device = device or self._execution_device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        if prompt is not None:
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        if prompt_embeds is None:
+            prompt_embeds = self._get_glyph_embeds(
+                prompt, max_sequence_length, device, dtype
+            )
+
+        seq_len = prompt_embeds.size(1)
+        prompt_embeds = prompt_embeds.repeat(1, 1, 1)
+        prompt_embeds = prompt_embeds.reshape(1, seq_len, -1)
+
+        negative_prompt_embeds = None
+        if do_classifier_free_guidance:
+            negative_prompt = ""
+            negative_prompt = (
+                batch_size * [negative_prompt]
+                if isinstance(negative_prompt, str)
+                else negative_prompt
+            )
+
+            if prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
+                )
+
+            negative_prompt_embeds = self._get_glyph_embeds(
+                negative_prompt, max_sequence_length, device, dtype
+            )
+
+            seq_len = negative_prompt_embeds.size(1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, 1, 1)
+            negative_prompt_embeds = negative_prompt_embeds.reshape(1, seq_len, -1)
+
+        return prompt_embeds, negative_prompt_embeds
+
+    def prepare_latents(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+    ):
+
+        shape = (
+            batch_size,
+            num_channels_latents,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return latents
+
+    def check_inputs(
+        self,
+        prompt,
+        height,
+        width,
+        callback_on_step_end_tensor_inputs,
+        prompt_embeds=None,
+    ):
+        if (
+            height is not None
+            and height % (self.vae_scale_factor * self.transformer.config.patch_size)
+            != 0
+            or width is not None
+            and width % (self.transformer.config.patch_size) != 0
+        ):
+            logger.warning(
+                f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
+            )
+
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs
+            for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        if prompt is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt is None and prompt_embeds is None:
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+            )
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def attention_kwargs(self):
+        return self._attention_kwargs
+
+    @property
+    def current_timestep(self):
+        return self._current_timestep
+
+    @property
+    def interrupt(self):
+        return self._interrupt
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+
+        guidance_scale = batch.guidance_scale
+        prompt = batch.prompt
+        num_inference_steps = batch.num_inference_steps
+        if batch.image_path is not None:
+            ar_condition_images = [
+                resize_glm_image_to_alignment(load_image(img_path))
+                for img_path in image_path_to_list(batch.image_path)
+            ]
+        else:
+            ar_condition_images = None
+
+        height = batch.height
+        width = batch.width
+
+        device = current_platform.get_local_torch_device()
+        batch_size = _num_outputs_per_prompt(batch)
+        max_sequence_length = 1024
+        seed = getattr(batch, "seed", None)
+        if batch_size == 1:
+            output_seed = _seed_for_output(seed, 0)
+            generator = (
+                None
+                if output_seed is None
+                else torch.Generator(device=device).manual_seed(int(output_seed))
+            )
+        elif seed is None:
+            generator = None
+        else:
+            output_seeds = [_seed_for_output(seed, i) for i in range(batch_size)]
+            generator = (
+                None
+                if any(output_seed is None for output_seed in output_seeds)
+                else [
+                    torch.Generator(device=device).manual_seed(int(output_seed))
+                    for output_seed in output_seeds
+                ]
+            )
+        attention_kwargs = {}
+        prompt_embeds = None
+        do_classifier_free_guidance = True
+        dtype = get_module_dtype(self.transformer, torch.bfloat16)
+
+        self._guidance_scale = guidance_scale
+        self._current_timestep = None
+        self._interrupt = False
+
+        if ar_condition_images is not None:
+            height = height or ar_condition_images[0].height
+            width = width or ar_condition_images[0].width
+
+        prior_token_id = batch.prior_token_id
+        prior_token_image_ids = batch.prior_token_image_ids
+        prior_token_id = prior_token_id.to(device)
+        prior_token_id = _repeat_to_batch(prior_token_id, batch_size)
+
+        # 3. Encode input prompt
+        self.begin_declared_component_use(
+            component_name="text_encoder", module=self.text_encoder
+        )
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt,
+            do_classifier_free_guidance,
+            prompt_embeds=prompt_embeds,
+            max_sequence_length=max_sequence_length,
+            device=device,
+            dtype=dtype,
+        )
+        prompt_embeds = _repeat_to_batch(prompt_embeds, batch_size)
+        negative_prompt_embeds = _repeat_to_batch(negative_prompt_embeds, batch_size)
+
+        # 4. process images
+        if ar_condition_images is not None:
+            preprocessed_condition_images = []
+            for img in ar_condition_images:
+                image_height, image_width = (
+                    img.size[::-1]
+                    if isinstance(img, PIL.Image.Image)
+                    else img.shape[:2]
+                )
+                image_width, image_height = align_glm_image_resolution(
+                    image_width, image_height
+                )
+                img = self.image_processor.preprocess(
+                    img, height=image_height, width=image_width
+                )
+                preprocessed_condition_images.append(img)
+            ar_condition_images = preprocessed_condition_images
+
+        # 5. Prepare latents and (optional) condition_images kv cache
+        latent_channels = self.transformer.config.in_channels
+        latents = self.prepare_latents(
+            batch_size=batch_size,
+            num_channels_latents=latent_channels,
+            height=height,
+            width=width,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+
+        kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
+
+        if ar_condition_images is not None:
+            latents_mean = torch.tensor(self.vae.config.latents_mean).reshape(
+                1, self.vae.config.latent_channels, 1, 1
+            )
+            latents_std = torch.tensor(self.vae.config.latents_std).reshape(
+                1, self.vae.config.latent_channels, 1, 1
+            )
+
+            vae_dtype = get_module_dtype(self.vae, prompt_embeds.dtype)
+            latents_mean = latents_mean.to(device=device, dtype=vae_dtype)
+            latents_std = latents_std.to(device=device, dtype=vae_dtype)
+
+            self.begin_declared_component_use(
+                component_name="vae",
+                module=self.vae,
+                phase="condition_image",
+            )
+            for condition_image, condition_image_prior_token_id in zip(
+                ar_condition_images, prior_token_image_ids
+            ):
+                condition_image = align_tensor_to_module_dtype(
+                    condition_image, self.vae, device=device
+                )
+                condition_image = _repeat_to_batch(condition_image, batch_size)
+                condition_latent = retrieve_latents(
+                    self.vae.encode(condition_image),
+                    generator=generator,
+                    sample_mode="argmax",
+                )
+                condition_latent = (condition_latent - latents_mean) / latents_std
+                if condition_image_prior_token_id.dim() == 1:
+                    condition_image_prior_token_id = (
+                        condition_image_prior_token_id.unsqueeze(0)
+                    )
+                condition_image_prior_token_id = _repeat_to_batch(
+                    condition_image_prior_token_id.to(device=device), batch_size
+                )
+
+                # Do not remove.
+                # It would be use to run the reference image through a
+                # forward pass at timestep 0 and keep the KV cache.
+                with self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="reference_image",
+                ) as transformer:
+                    assert transformer is not None
+                    self.transformer = transformer
+                    with set_forward_context(current_timestep=1, attn_metadata=None):
+                        _ = transformer(
+                            hidden_states=condition_latent,
+                            encoder_hidden_states=torch.zeros_like(prompt_embeds)[
+                                :, :0, ...
+                            ],
+                            prior_token_id=condition_image_prior_token_id,
+                            prior_token_drop=torch.full_like(
+                                condition_image_prior_token_id, False, dtype=torch.bool
+                            ),
+                            timestep=torch.zeros((batch_size,), device=device),
+                            target_size=torch.tensor(
+                                [condition_image.shape[-2:]],
+                                dtype=prompt_embeds.dtype,
+                                device=device,
+                            ).repeat(batch_size, 1),
+                            crop_coords=torch.zeros(
+                                (batch_size, 2),
+                                dtype=prompt_embeds.dtype,
+                                device=device,
+                            ),
+                            attention_kwargs=attention_kwargs,
+                            kv_caches=kv_caches,
+                            kv_caches_mode="write",
+                        )
+
+        # 6. Prepare additional timestep conditions
+        target_size = (height, width)
+        target_size = torch.tensor(
+            [target_size], dtype=prompt_embeds.dtype, device=device
+        ).repeat(batch_size, 1)
+        crops_coords_top_left = torch.tensor(
+            [(0, 0)], dtype=prompt_embeds.dtype, device=device
+        ).repeat(batch_size, 1)
+
+        # Prepare timesteps
+        scheduler = self.scheduler
+        image_seq_len = (
+            (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
+        ) // (self.transformer.config.patch_size**2)
+        timesteps = np.linspace(
+            scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
+        )[:-1]
+        timesteps = timesteps.astype(np.int64).astype(np.float32)
+        sigmas = timesteps / scheduler.config.num_train_timesteps
+        mu = calculate_shift(
+            image_seq_len,
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("base_shift", 0.25),
+            scheduler.config.get("max_shift", 0.75),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
+        )
+        self._num_timesteps = len(timesteps)
+
+        # 7. Prepare for denoising loop
+
+        batch.prompt_embeds = [prompt_embeds]
+        batch.negative_prompt_embeds = [negative_prompt_embeds]
+        batch.latents = latents
+        batch.timesteps = timesteps
+        batch.scheduler = scheduler
+        batch.num_inference_steps = num_inference_steps
+        batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
+        batch.generator = generator
+        batch.raw_latent_shape = latents.shape
+
+        batch.prior_token_id = prior_token_id
+        batch.prior_token_drop_cond = torch.full_like(
+            prior_token_id, False, dtype=torch.bool
+        )
+        batch.prior_token_drop_uncond = torch.full_like(
+            prior_token_id, True, dtype=torch.bool
+        )
+        batch.target_size = target_size
+        batch.crop_coords = crops_coords_top_left
+
+        batch.kv_caches = kv_caches
+
+        batch.height = height
+        batch.width = width
+
+        return batch

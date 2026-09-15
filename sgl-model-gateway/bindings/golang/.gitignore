@@ -1,0 +1,24 @@
+# Build artifacts
+target/
+lib/
+
+# Compiled binaries
+examples/simple/simple
+examples/streaming/streaming
+
+# Go build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.env.local

@@ -1,0 +1,2473 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+# SPDX-License-Identifier: Apache-2.0
+
+import functools
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import diffusers
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.normalization import AdaLayerNormContinuous
+
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
+    can_use_linear_gelu,
+    fused_gelu_active,
+    fused_layernorm_modulate_raw,
+    fused_linear_gelu_tanh,
+    is_plain_layer_norm,
+    mark_fused_gelu_site,
+    mark_qwen_image_added_qkv_site,
+    qwen_image_added_qkv_active,
+    try_fused_bias_mul_add,
+    try_fused_bias_scale_residual_norm_scale_shift,
+    try_fused_norm_scale_shift_fp8,
+    try_fused_qwen_qkv_epilogue,
+    try_fused_scale_residual_norm_scale_shift_fp8,
+    try_fused_scale_residual_norm_scale_shift_nvfp4,
+)
+from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    join_seqs,
+    shard_like,
+    should_shard_text,
+    split_seqs,
+    tail_attn_meta,
+)
+from sglang.multimodal_gen.runtime.layers.attention import (
+    DynamicVarlenMaskMeta,
+    USPAttention,
+    build_varlen_mask_meta,
+    build_varlen_mask_meta_from_ranges,
+)
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
+    FusedLayerNormScaleShiftGateSelect01,
+    FusedResidualLayerNormScaleShiftGateSelect01,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    RMSNorm,
+    ScaleResidualLayerNormScaleShift,
+    apply_qk_norm_with_optional_rope,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+    apply_unquantized_linear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+    is_nunchaku_available,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptFp8LinearMethod,
+    apply_nvfp4_gemm_prequantized,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+
+logger = init_logger(__name__)  # pylint: disable=invalid-name
+_QWEN_NORM_OUT = BitExactFusionGate("Qwen-Image fused norm_out", per_signature=True)
+_QWEN_NORM_OUT_SIGS = _QWEN_NORM_OUT.verified_sigs
+assert _QWEN_NORM_OUT_SIGS is not None
+
+
+def _qwen_norm_out(
+    norm_out: AdaLayerNormContinuous,
+    hidden_states: torch.Tensor,
+    conditioning_embedding: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact final LayerNorm and adaLN scale/shift fusion."""
+    if torch.compiler.is_compiling():
+        return norm_out(hidden_states, conditioning_embedding)
+
+    # Keep the projected modulation available for direct eager dispatch. The
+    # public custom-op wrapper costs more than this small final norm itself.
+    emb = norm_out.linear(norm_out.silu(conditioning_embedding).to(hidden_states.dtype))
+    scale, shift = torch.chunk(emb, 2, dim=1)
+    if (
+        _QWEN_NORM_OUT.disabled
+        or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
+        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+    ):
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+
+    sig = (
+        hidden_states.dtype,
+        hidden_states.device,
+        hidden_states.shape[0],
+        hidden_states.shape[-1],
+        hidden_states.stride(-1),
+        scale.stride(0) if scale.shape[0] > 1 else hidden_states.shape[-1],
+        shift.stride(0) if shift.shape[0] > 1 else hidden_states.shape[-1],
+        norm_out.norm.eps,
+    )
+    verified = sig in _QWEN_NORM_OUT_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    try:
+        fused = fused_layernorm_modulate_raw(
+            hidden_states, scale, shift, norm_out.norm.eps
+        )
+    except Exception as exc:
+        _QWEN_NORM_OUT.on_exception(exc, logger=logger)
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    if verified:
+        return fused
+    reference = (
+        norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+    )
+    return _QWEN_NORM_OUT.accept_or_fallback(
+        fused,
+        reference,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "Qwen-Image fused norm_out is not bit-exact on this platform; "
+            "falling back to eager"
+        ),
+    )
+
+
+def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
+    if attn_mask_meta is None or isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+        return 0
+    return attn_mask_meta.get("local_pad", 0)
+
+
+try:
+    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
+except Exception:
+    NunchakuFeedForward = None
+
+
+def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
+    """get the local seq len, from seq_len padding to the next multiple of sp_world_size, then shard to local"""
+    if sp_world_size <= 1:
+        return seq_len
+    padded_len = seq_len
+    if padded_len % sp_world_size != 0:
+        padded_len += sp_world_size - (padded_len % sp_world_size)
+    return padded_len // sp_world_size
+
+
+_get_qkv_projections = get_qkv_projections
+
+
+def _split_unquantized_merged_linear(
+    linear: MergedColumnParallelLinear, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a packed Q/K/V weight as three reference linear projections."""
+    sizes = linear.output_partition_sizes
+    if len(sizes) != 3:
+        raise ValueError(f"Expected three packed projection shards, got {sizes}")
+    weights = linear.weight.split(sizes, dim=0)
+    biases = (
+        linear.bias.split(sizes, dim=0)
+        if linear.bias is not None
+        else (None, None, None)
+    )
+    return tuple(
+        apply_unquantized_linear(x, weight, bias)
+        for weight, bias in zip(weights, biases)
+    )
+
+
+def _can_defer_modelopt_output_bias(
+    quant_config: Optional[QuantizationConfig], capability: Any
+) -> bool:
+    # Absorbing the bias moves a BF16 rounding point. The resulting image
+    # quality has only been validated on SM103, so other GPUs keep the GEMM
+    # bias epilogue used before this optimization.
+    return (
+        quant_config is not None
+        and hasattr(quant_config, "get_name")
+        and quant_config.get_name() in {"modelopt_fp8", "modelopt_fp4"}
+        and capability is not None
+        and (capability.major, capability.minor) == (10, 3)
+    )
+
+
+def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> bool:
+    return _can_defer_modelopt_output_bias(
+        quant_config, current_platform.get_device_capability()
+    )
+
+
+def _safe_tensor_version(tensor: torch.Tensor) -> Optional[int]:
+    """Read a tensor version counter without rejecting inference tensors."""
+    return None if tensor.is_inference() else tensor._version
+
+
+@dataclass(frozen=True, eq=False)
+class _QwenModulationCacheKey:
+    timestep: torch.Tensor
+    timestep_version: Optional[int]
+    additional_t_cond: Optional[torch.Tensor]
+    additional_t_cond_version: Optional[int]
+    hidden_dtype: torch.dtype
+    hidden_device: torch.device
+
+    def matches(self, other: "_QwenModulationCacheKey") -> bool:
+        return (
+            self.timestep is other.timestep
+            and self.timestep_version == other.timestep_version
+            and self.additional_t_cond is other.additional_t_cond
+            and self.additional_t_cond_version == other.additional_t_cond_version
+            and self.hidden_dtype == other.hidden_dtype
+            and self.hidden_device == other.hidden_device
+        )
+
+
+def _qwen_modulation_cache_key(
+    timestep: Optional[torch.Tensor],
+    additional_t_cond: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> Optional[_QwenModulationCacheKey]:
+    """Build the key shared by the two serial CFG forwards at one timestep."""
+    if (
+        not isinstance(timestep, torch.Tensor)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or is_in_breakable_cuda_graph()
+        or (timestep.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+    ):
+        return None
+
+    return _QwenModulationCacheKey(
+        timestep=timestep,
+        timestep_version=_safe_tensor_version(timestep),
+        additional_t_cond=additional_t_cond,
+        additional_t_cond_version=(
+            _safe_tensor_version(additional_t_cond)
+            if isinstance(additional_t_cond, torch.Tensor)
+            else None
+        ),
+        hidden_dtype=hidden_states.dtype,
+        hidden_device=hidden_states.device,
+    )
+
+
+def _modelopt_quant_name(
+    quant_config: Optional[QuantizationConfig],
+) -> str | None:
+    return None if quant_config is None else quant_config.get_name()
+
+
+_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING = {
+    # ModelOpt FP8 uses one QKV GEMM per stream. Merge the three Diffusers
+    # projections and their static scales into MergedColumnParallelLinear.
+    r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        2,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        2,
+        3,
+    ),
+}
+
+
+class QwenTimestepProjEmbeddings(nn.Module):
+    def __init__(self, embedding_dim, use_additional_t_cond=False):
+        super().__init__()
+
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000
+        )
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.use_additional_t_cond = use_additional_t_cond
+        if use_additional_t_cond:
+            self.addition_t_embedding = nn.Embedding(2, embedding_dim)
+
+    def forward(self, timestep, hidden_states, addition_t_cond=None):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(
+            timesteps_proj.to(dtype=hidden_states.dtype)
+        )  # (N, D)
+
+        conditioning = timesteps_emb
+        if self.use_additional_t_cond:
+            if addition_t_cond is None:
+                raise ValueError(
+                    "When additional_t_cond is True, addition_t_cond must be provided."
+                )
+            addition_t_emb = self.addition_t_embedding(addition_t_cond)
+            addition_t_emb = addition_t_emb.to(dtype=hidden_states.dtype)
+            conditioning = conditioning + addition_t_emb
+
+        return conditioning
+
+
+class QwenEmbedRope(nn.Module):
+    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        pos_index = torch.arange(4096)
+        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.pos_freqs = torch.cat(
+            [
+                self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                self.rope_params(pos_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                self.rope_params(neg_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+
+        # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
+        self.scale_rope = scale_rope
+
+    def rope_params(self, index, dim, theta=10000):
+        """
+        Args:
+            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
+        """
+        device = index.device
+        assert dim % 2 == 0
+        freqs = torch.outer(
+            index,
+            (
+                1.0
+                / torch.pow(
+                    theta,
+                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                )
+            ).to(device=device),
+        )
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
+
+    def forward(
+        self,
+        video_fhw: Union[Tuple[int, int, int], List[Tuple[int, int, int]]],
+        txt_seq_lens: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            video_fhw (`Tuple[int, int, int]` or `List[Tuple[int, int, int]]`):
+                A list of 3 integers [frame, height, width] representing the shape of the video.
+            txt_seq_lens (`List[int]`):
+                A list of integers of length batch_size representing the length of each text prompt.
+            device: (`torch.device`):
+                The device on which to perform the RoPE computation.
+        """
+        # When models are initialized under a "meta" device context (e.g. init_empty_weights),
+        # tensors created during __init__ become meta tensors. Calling .to(...) on a meta tensor
+        # raises "Cannot copy out of meta tensor". Rebuild the frequencies on the target device
+        # in that case; otherwise move them if just on a different device.
+        if getattr(self.pos_freqs, "device", torch.device("meta")).type == "meta":
+            pos_index = torch.arange(4096, device=device)
+            neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
+            self.pos_freqs = torch.cat(
+                [
+                    self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+            self.neg_freqs = torch.cat(
+                [
+                    self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+        elif self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            # RoPE frequencies are cached via a lru_cache decorator on _compute_video_freqs
+            video_freq = self._compute_video_freqs(frame, height, width, idx)
+            video_freq = video_freq.to(device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        vid_freqs = torch.cat(vid_freqs, dim=0).to(device=device)
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=128)
+    def _compute_video_freqs(
+        self, frame: int, height: int, width: int, idx: int = 0
+    ) -> torch.Tensor:
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_pos[0][idx : idx + frame]
+            .view(frame, 1, 1, -1)
+            .expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+
+class QwenEmbedLayer3DRope(nn.Module):
+    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        pos_index = torch.arange(4096)
+        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.pos_freqs = torch.cat(
+            [
+                self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                self.rope_params(pos_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                self.rope_params(neg_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+
+        self.scale_rope = scale_rope
+
+    def rope_params(self, index, dim, theta=10000):
+        """
+        Args:
+            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
+        """
+        device = index.device
+        assert dim % 2 == 0
+        freqs = torch.outer(
+            index,
+            (
+                1.0
+                / torch.pow(
+                    theta,
+                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                )
+            ).to(device=device),
+        )
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
+
+    def forward(self, video_fhw, txt_seq_lens, device):
+        """
+        Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
+        txt_length: [bs] a list of 1 integers representing the length of the text
+        """
+
+        # When models are initialized under a "meta" device context (e.g. init_empty_weights),
+        # tensors created during __init__ become meta tensors. Calling .to(...) on a meta tensor
+        # raises "Cannot copy out of meta tensor". Rebuild the frequencies on the target device
+        # in that case; otherwise move them if just on a different device.
+        if getattr(self.pos_freqs, "device", torch.device("meta")).type == "meta":
+            pos_index = torch.arange(4096, device=device)
+            neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
+            self.pos_freqs = torch.cat(
+                [
+                    self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                    self.rope_params(pos_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+            self.neg_freqs = torch.cat(
+                [
+                    self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                    self.rope_params(neg_index, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(device=device)
+        elif self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        layer_num = len(video_fhw) - 1
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            if idx != layer_num:
+                video_freq = self._compute_video_freqs(frame, height, width, idx)
+            else:
+                # For the condition image, we set the layer index to -1
+                video_freq = self._compute_condition_freqs(frame, height, width)
+            video_freq = video_freq.to(device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_vid_index = max(max_vid_index, layer_num)
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_video_freqs(self, frame, height, width, idx=0):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_pos[0][idx : idx + frame]
+            .view(frame, 1, 1, -1)
+            .expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_condition_freqs(self, frame, height, width):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+
+class QwenImageCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,  # query_dim
+        num_heads: int,
+        head_dim: int,
+        window_size=(-1, -1),
+        added_kv_proj_dim: int = None,
+        out_bias: bool = True,
+        qk_norm=True,  # rmsnorm
+        eps=1e-6,
+        pre_only=False,
+        context_pre_only: bool = False,
+        parallel_attention=False,
+        out_dim: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.qk_norm = qk_norm
+        self.eps = eps
+        self.parallel_attention = parallel_attention
+        self.added_kv_proj_dim = added_kv_proj_dim
+        self.prefix = prefix
+        self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
+        quant_name = _modelopt_quant_name(quant_config)
+        capability = current_platform.get_device_capability()
+        self.use_fused_qkv_epilogue = quant_name in {
+            "modelopt_fp4",
+            "modelopt_fp8",
+        } or (
+            quant_config is None
+            and current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 9
+            and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
+        self.use_fused_qkv = (
+            isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
+        )
+
+        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        self.inner_kv_dim = self.inner_dim
+
+        tp_size = get_tp_world_size()
+        assert self.num_heads % tp_size == 0, (
+            f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        )
+        self.local_num_heads = self.num_heads // tp_size
+        self._unquantized_added_qkv_is_packed = False
+
+        if self.use_fused_qkv:
+            # Use fused QKV projection for nunchaku quantization
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [self.inner_dim] * 3,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
+            )
+
+        if self.qk_norm:
+            self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+
+        if added_kv_proj_dim is not None:
+            self._unquantized_added_qkv_is_packed = quant_config is None
+            self.use_fused_added_qkv = (
+                self._unquantized_added_qkv_is_packed
+                or isinstance(quant_config, NunchakuConfig)
+                or quant_name == "modelopt_fp8"
+            )
+            if self.use_fused_added_qkv:
+                self.to_added_qkv = MergedColumnParallelLinear(
+                    added_kv_proj_dim,
+                    [self.inner_dim] * 3,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_added_qkv",
+                )
+                if self._unquantized_added_qkv_is_packed:
+                    # Packing changes BF16 GEMM reduction association. Keep it
+                    # off for lossless and mount it at extra-high or high.
+                    mark_qwen_image_added_qkv_site(self)
+            else:
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj",
+                )
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj",
+                )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj",
+                )
+
+        if context_pre_only is not None and not context_pre_only:
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim,
+                self.dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                skip_bias_add=self.defer_output_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
+        else:
+            self.to_add_out = None
+
+        if not pre_only:
+            self.to_out = nn.ModuleList([])
+            self.to_out.append(
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    skip_bias_add=self.defer_output_bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            )
+        else:
+            self.to_out = None
+
+        self.norm_added_q = RMSNorm(head_dim, eps=eps)
+        self.norm_added_k = RMSNorm(head_dim, eps=eps)
+
+        # Despite the historical class name, this is joint text-image
+        # self-attention: Q/K/V are concatenated before the kernel call.
+        self.attn = USPAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
+                AttentionBackendEnum.AITER_SAGE,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.SAGE_ATTN_3,
+                AttentionBackendEnum.SPARGE_ATTN,
+            },
+        )
+
+    def _get_added_qkv_projections(
+        self, encoder_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_fused_added_qkv:
+            if (
+                self._unquantized_added_qkv_is_packed
+                and not qwen_image_added_qkv_active(self)
+            ):
+                return _split_unquantized_merged_linear(
+                    self.to_added_qkv, encoder_hidden_states
+                )
+            added_qkv, _ = self.to_added_qkv(encoder_hidden_states)
+            return tuple(t.contiguous() for t in added_qkv.chunk(3, dim=-1))
+
+        encoder_query, _ = self.add_q_proj(encoder_hidden_states)
+        encoder_key, _ = self.add_k_proj(encoder_hidden_states)
+        encoder_value, _ = self.add_v_proj(encoder_hidden_states)
+        return encoder_query, encoder_key, encoder_value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        **cross_attention_kwargs,
+    ):
+        """Run joint text-image attention.
+
+        `attn_mask` or `attention_mask` takes precedence. Otherwise,
+        `encoder_hidden_states_mask` keeps valid text tokens in the joint
+        text-image sequence.
+        """
+        seq_len_txt = encoder_hidden_states.shape[1]
+        attn_mask = cross_attention_kwargs.get("attn_mask")
+        if attn_mask is None:
+            attn_mask = cross_attention_kwargs.get("attention_mask")
+        encoder_hidden_states_mask = cross_attention_kwargs.get(
+            "encoder_hidden_states_mask"
+        )
+        # Varlen metadata precomputed in QwenImageTransformer2DModel.forward,
+        # paired with the same ``attn_mask`` for the USPAttention FA fast path.
+        attn_mask_meta = cross_attention_kwargs.get("attn_mask_meta")
+        # When the text stream is sharded across SP ranks the joint sequence is
+        # fully sequence-parallel, so no leading tokens are replicated.
+        sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
+        # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
+        sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
+
+        if self._unquantized_added_qkv_is_packed and not qwen_image_added_qkv_active(
+            self
+        ):
+            img_query, img_key, img_value, _, _, _ = _get_qkv_projections(
+                self,
+                hidden_states,
+                make_contiguous=not self.use_fused_qkv_epilogue,
+            )
+            txt_query, txt_key, txt_value = self._get_added_qkv_projections(
+                encoder_hidden_states
+            )
+        else:
+            (
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+            ) = _get_qkv_projections(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                make_contiguous=not self.use_fused_qkv_epilogue,
+            )
+
+        freqs_complex = cross_attention_kwargs.get("freqs_complex")
+        if freqs_complex is not None:
+            img_complex, txt_complex = freqs_complex
+        else:
+            img_complex = txt_complex = None
+
+        # Reshape for multi-head attention
+        img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
+        img_key = img_key.unflatten(-1, (self.local_num_heads, self.head_dim))
+        img_value = img_value.unflatten(-1, (self.local_num_heads, self.head_dim))
+
+        txt_query = txt_query.unflatten(-1, (self.local_num_heads, self.head_dim))
+        txt_key = txt_key.unflatten(-1, (self.local_num_heads, self.head_dim))
+        txt_value = txt_value.unflatten(-1, (self.local_num_heads, self.head_dim))
+
+        img_cache = txt_cache = None
+        if image_rotary_emb is not None:
+            if not (
+                isinstance(image_rotary_emb[0], torch.Tensor)
+                and image_rotary_emb[0].dim() == 2
+            ):
+                raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+
+            img_cache, txt_cache = image_rotary_emb
+
+        joint_qkv = None
+        if (
+            self.use_fused_qkv_epilogue
+            and self.qk_norm
+            and img_cache is not None
+            and txt_cache is not None
+            and not sp_text_sharded
+            and sp_txt_pad == 0
+            # Masked attention packs the image and text segments separately.
+            # Its prefix tensors must go through the ordinary normalization.
+            and attn_mask is None
+            and encoder_hidden_states_mask is None
+        ):
+            joint_qkv = try_fused_qwen_qkv_epilogue(
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                img_cache,
+                txt_cache,
+                self.norm_q.variance_epsilon,
+                self.norm_added_q.variance_epsilon,
+            )
+
+        if joint_qkv is None:
+            # Fused ModelOpt FP8 projections expose zero-copy Q/K/V views into
+            # one packed GEMM output. Unsupported epilogue cases keep the old
+            # contiguous contract before entering the generic QKNorm/RoPE path.
+            img_query, img_key, img_value = [
+                tensor.contiguous() for tensor in (img_query, img_key, img_value)
+            ]
+            txt_query, txt_key, txt_value = [
+                tensor.contiguous() for tensor in (txt_query, txt_key, txt_value)
+            ]
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm_with_optional_rope(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=img_cache,
+                    freqs_complex=img_complex,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+                txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                    q=txt_query,
+                    k=txt_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=txt_cache,
+                    freqs_complex=txt_complex,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+            elif img_cache is not None and txt_cache is not None:
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                    txt_query, txt_key, txt_cache, is_neox=False
+                )
+
+        # Joint order [text, image]; join_seqs relocates any SP text tail-pad
+        # behind the image (see sp_shard.join_seqs for why).
+        if attn_mask is None and encoder_hidden_states_mask is not None:
+            image_mask = torch.ones(
+                (hidden_states.shape[0], img_query.shape[1]),
+                device=encoder_hidden_states_mask.device,
+                dtype=torch.bool,
+            )
+            attn_mask = torch.cat(
+                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
+                dim=1,
+            )
+
+        seg_qkv = None
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                _ipc_input_a2a_qkv_segmented,
+            )
+
+            seg_qkv = _ipc_input_a2a_qkv_segmented(
+                txt_query,
+                img_query,
+                txt_key,
+                img_key,
+                txt_value,
+                img_value,
+                sp_txt_pad,
+            )
+        if joint_qkv is not None:
+            joint_query, joint_key, joint_value = joint_qkv
+        elif seg_qkv is not None:
+            joint_query, joint_key, joint_value = seg_qkv
+        elif attn_mask is not None and not sp_text_sharded:
+            # Let the eager attention break point pack directly from the text
+            # and image segments. Materializing three dense joint tensors here
+            # only to gather their valid rows again wastes one launch per Q/K/V.
+            joint_query, joint_key, joint_value = img_query, img_key, img_value
+        else:
+            joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
+            joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
+            joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
+
+        # Compute joint attention
+        joint_hidden_states = self.attn(
+            joint_query,
+            joint_key,
+            joint_value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
+            qkv_pre_all_to_all=seg_qkv is not None,
+            q_prefix=(
+                txt_query if attn_mask is not None and not sp_text_sharded else None
+            ),
+            k_prefix=(
+                txt_key if attn_mask is not None and not sp_text_sharded else None
+            ),
+            v_prefix=(
+                txt_value if attn_mask is not None and not sp_text_sharded else None
+            ),
+        )
+
+        # Reshape back
+        joint_hidden_states = joint_hidden_states.flatten(2, 3)
+        joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
+
+        # Split attention outputs back
+        txt_attn_output, img_attn_output = split_seqs(
+            joint_hidden_states, seq_len_txt, sp_txt_pad
+        )
+
+        # Apply output projections
+        img_attn_output, img_attn_bias = self.to_out[0](img_attn_output)
+        if len(self.to_out) > 1:
+            (img_attn_output,) = self.to_out[1](img_attn_output)  # dropout
+
+        txt_attn_output, txt_attn_bias = self.to_add_out(txt_attn_output)
+
+        return img_attn_output, txt_attn_output, img_attn_bias, txt_attn_bias
+
+
+class QwenImageGELU(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        inner_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        replicated: bool = False,
+    ) -> None:
+        super().__init__()
+        if replicated:
+            self.proj = ReplicatedLinear(
+                dim,
+                inner_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
+        else:
+            self.proj = ColumnParallelLinear(
+                dim,
+                inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
+        # Extra-high-or-higher fusion site: up-proj GEMM + tanh-GELU in cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.proj,
+                *hidden_states,
+                output_dtype=self.proj.params_dtype,
+                bias=self.proj.bias,
+            )
+        elif fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
+        else:
+            hidden_states, _ = self.proj(hidden_states)
+        return F.gelu(hidden_states, approximate="tanh")
+
+
+class QwenImageFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        mult: int = 4,
+        replicated: bool = False,
+    ) -> None:
+        super().__init__()
+        inner_dim = dim * mult
+        self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
+        if replicated:
+            # Keep the whole FFN resident on every rank: no per-block
+            # all-reduce. Only worth it when the branch's token count is small
+            # enough that the duplicated GEMM is cheaper than the all-reduce.
+            down = ReplicatedLinear(
+                inner_dim,
+                dim_out,
+                bias=True,
+                skip_bias_add=self.defer_output_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
+        else:
+            down = RowParallelLinear(
+                inner_dim,
+                dim_out,
+                bias=True,
+                input_is_parallel=True,
+                skip_bias_add=self.defer_output_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
+            )
+        self.net = nn.ModuleList(
+            [
+                QwenImageGELU(
+                    dim,
+                    inner_dim,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.0",
+                    replicated=replicated,
+                ),
+                nn.Dropout(0.0),
+                down,
+            ]
+        )
+
+    def forward_with_bias(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states = self.net[0](hidden_states)
+        hidden_states = self.net[1](hidden_states)
+        return self.net[2](hidden_states)
+
+    def forward(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        hidden_states, bias = self.forward_with_bias(hidden_states)
+        return hidden_states if bias is None else hidden_states + bias
+
+
+class QwenImageTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        qk_norm: str = "rms_norm",
+        eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] | NunchakuConfig = None,
+        prefix: str = "",
+        zero_cond_t: bool = False,
+    ):
+        super().__init__()
+        self.prefix = prefix
+
+        self.dim = dim
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
+        self.quant_config = quant_config
+        self.zero_cond_t = zero_cond_t
+
+        # Image processing modules
+        self.img_mod = nn.Sequential(
+            nn.SiLU(),
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mod",
+            ),  # For scale, shift, gate for norm1 and norm2
+        )
+        self.img_norm1 = LayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
+
+        self.attn = QwenImageCrossAttention(
+            dim=dim,
+            num_heads=num_attention_heads,
+            added_kv_proj_dim=dim,
+            context_pre_only=False,
+            head_dim=attention_head_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+        )
+        self.img_norm2 = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False
+        )
+
+        # Text processing modules
+        self.txt_mod = nn.Sequential(
+            nn.SiLU(),
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mod",
+            ),  # For scale, shift, gate for norm1 and norm2
+        )
+        self.txt_norm1 = LayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
+        # Text doesn't need separate attention - it's handled by img_attn joint computation
+        self.txt_norm2 = ScaleResidualLayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
+        # Utils
+        self.fuse_mul_add = MulAdd()
+        self.fused_ln_ss_gate_select01 = FusedLayerNormScaleShiftGateSelect01()
+        self.fused_res_ln_ss_gate_select01 = (
+            FusedResidualLayerNormScaleShiftGateSelect01()
+        )
+        self._modulation_cache: Optional[
+            Tuple[
+                _QwenModulationCacheKey,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = None
+
+        nunchaku_enabled = (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "svdquant"
+            and is_nunchaku_available()
+        )
+        if nunchaku_enabled:
+            ff_class = diffusers.models.attention.FeedForward
+            self.img_mlp = ff_class(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+            )
+            self.txt_mlp = ff_class(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+            )
+        else:
+            self.img_mlp = QwenImageFeedForward(
+                dim=dim,
+                dim_out=dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mlp",
+            )
+            self.txt_mlp = QwenImageFeedForward(
+                dim=dim,
+                dim_out=dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mlp",
+                # The text branch is ~1K tokens regardless of image size, so
+                # sharding its FFN saves less GEMM time than the per-block
+                # all-reduce it adds. Measured e2e crossover (H100, 1024x1024):
+                # tp=2 replication wins (5.58s -> 5.12s, -8%) but at tp=4 the
+                # duplicated GEMM outgrows the all-reduce saved (~1% loss), so
+                # gate on the TP degree.
+                replicated=get_tp_world_size() <= 2,
+            )
+
+        if nunchaku_enabled:
+            nunchaku_kwargs = {
+                "precision": quant_config.precision,
+                "rank": quant_config.rank,
+                "act_unsigned": quant_config.act_unsigned,
+            }
+            self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
+            self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
+
+        self._enable_nvfp4_resnorm_quant = False
+        capability = current_platform.get_device_capability()
+        if (
+            not nunchaku_enabled
+            and dim == 3072
+            and capability is not None
+            and capability.major == 10
+        ):
+            img_fc1 = self.img_mlp.net[0].proj
+            txt_fc1 = self.txt_mlp.net[0].proj
+            self._enable_nvfp4_resnorm_quant = isinstance(
+                img_fc1.quant_method, ModelOptFp4LinearMethod
+            ) and isinstance(txt_fc1.quant_method, ModelOptFp4LinearMethod)
+
+        self._fp8_img_attn_norm_quant = False
+        self._fp8_txt_attn_norm_quant = False
+        self._fp8_img_mlp_norm_quant = False
+        self._fp8_txt_mlp_norm_quant = False
+
+    @staticmethod
+    def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
+        input_scale = getattr(linear, "input_scale", None)
+        return (
+            isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+            and isinstance(input_scale, torch.Tensor)
+            and input_scale.is_cuda
+            and input_scale.dtype == torch.float32
+            and input_scale.numel() == 1
+            and input_scale.is_contiguous()
+            and bool(torch.isfinite(input_scale).all().item())
+            and bool((input_scale > 0).all().item())
+        )
+
+    @classmethod
+    def _shared_modelopt_fp8_scale(cls, linears: list[nn.Module]) -> bool:
+        if not all(cls._valid_modelopt_fp8_linear(linear) for linear in linears):
+            return False
+        reference = linears[0].input_scale
+        return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+    def configure_fp8_norm_quant(self) -> None:
+        """Enable exact norm+quant paths after checkpoint scales are materialized."""
+        if not torch.cuda.is_available():
+            return
+        capability = torch.cuda.get_device_capability()
+        if self.dim != 3072 or capability[0] < 10 or self.zero_cond_t:
+            return
+        if self.attn.use_fused_qkv:
+            self._fp8_img_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                self.attn.to_qkv
+            )
+        else:
+            self._fp8_img_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                [self.attn.to_q, self.attn.to_k, self.attn.to_v]
+            )
+        if self.attn.added_kv_proj_dim is not None:
+            if self.attn.use_fused_added_qkv:
+                self._fp8_txt_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                    self.attn.to_added_qkv
+                )
+            else:
+                self._fp8_txt_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                    [self.attn.add_q_proj, self.attn.add_k_proj, self.attn.add_v_proj]
+                )
+        if isinstance(self.img_mlp, QwenImageFeedForward):
+            self._fp8_img_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+                self.img_mlp.net[0].proj
+            )
+        if isinstance(self.txt_mlp, QwenImageFeedForward):
+            self._fp8_txt_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+                self.txt_mlp.net[0].proj
+            )
+
+    def _norm_scale_shift(
+        self,
+        norm_module: LayerNormScaleShift,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return norm_module(x=x, shift=shift, scale=scale)
+
+    def _scale_residual_norm_scale_shift(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return norm_module(
+            residual=residual,
+            x=x,
+            gate=gate,
+            shift=shift,
+            scale=scale,
+        )
+
+    def _mul_add(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ) -> torch.Tensor:
+        return self.fuse_mul_add(a, b, c, k)
+
+    def _bias_mul_add(
+        self,
+        a: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        b: torch.Tensor,
+        c: torch.Tensor,
+        *,
+        use_bcg_helpers: bool,
+    ) -> torch.Tensor:
+        if bias is not None and not use_bcg_helpers:
+            fused = try_fused_bias_mul_add(a, bias, b, c)
+            if fused is not None:
+                return fused
+        if bias is not None:
+            a = a + bias
+        if use_bcg_helpers:
+            return self._mul_add(a, b, c)
+        return self.fuse_mul_add(a, b, c)
+
+    def _get_modulation_params(
+        self,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
+        cache_key: Optional[_QwenModulationCacheKey],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached = self._modulation_cache
+        if (
+            cache_key is not None
+            and cached is not None
+            and cached[0].matches(cache_key)
+        ):
+            self._modulation_cache = None
+            return cached[1], cached[2]
+
+        img_mod_params, _ = self.img_mod[1](temb_img_silu)
+        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)
+        self._modulation_cache = (
+            (cache_key, img_mod_params, txt_mod_params)
+            if cache_key is not None
+            else None
+        )
+        return img_mod_params, txt_mod_params
+
+    def _try_nvfp4_resnorm_quant(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        mlp: QwenImageFeedForward,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        x_bias: Optional[torch.Tensor],
+        residual_gate: torch.Tensor,
+        mod_params: torch.Tensor,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[
+        tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ]:
+        if (
+            not self._enable_nvfp4_resnorm_quant
+            or modulate_index is not None
+            or use_bcg_helpers
+        ):
+            return None
+
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        fc1 = mlp.net[0].proj
+        result = try_fused_scale_residual_norm_scale_shift_nvfp4(
+            residual,
+            x,
+            x_bias,
+            residual_gate,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale.unsqueeze(1),
+            shift.unsqueeze(1),
+            fc1.input_scale_inv,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        packed, residual_out = result
+        return packed, residual_out, gate.unsqueeze(1)
+
+    def _try_fp8_norm_quant(
+        self,
+        norm_module: LayerNormScaleShift,
+        *,
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        input_scale: Optional[torch.Tensor],
+        enabled: bool,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not enabled or modulate_index is not None or use_bcg_helpers:
+            return None
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        result = try_fused_norm_scale_shift_fp8(
+            x,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale,
+            shift,
+            input_scale,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        normalized, quantized = result
+        return quantized, gate.unsqueeze(1), normalized
+
+    def _try_fp8_residual_norm_quant(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        residual_gate: torch.Tensor,
+        mod_params: torch.Tensor,
+        input_scale: Optional[torch.Tensor],
+        enabled: bool,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not enabled or modulate_index is not None or use_bcg_helpers:
+            return None
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        result = try_fused_scale_residual_norm_scale_shift_fp8(
+            residual,
+            x,
+            residual_gate,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale,
+            shift,
+            input_scale,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        normalized, quantized, residual_out = result
+        return quantized, residual_out, gate.unsqueeze(1), normalized
+
+    def _modulate(
+        self,
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        norm_module: Union[LayerNormScaleShift, ScaleResidualLayerNormScaleShift],
+        index: Optional[torch.Tensor] = None,
+        gate_x: Optional[torch.Tensor] = None,
+        residual_x: Optional[torch.Tensor] = None,
+        x_bias: Optional[torch.Tensor] = None,
+        use_bcg_helpers: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        # Apply attention gates and add residual (like in Megatron)
+        #   - residual_out = gate_x * x + residual_x
+        # - x = norm(residual_out) * (1 + scale) + shift
+        is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
+
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        if index is not None:
+            if x_bias is not None:
+                x = x + x_bias
+            actual_batch = x.shape[0]
+            shift0, shift1 = (
+                shift[:actual_batch],
+                shift[actual_batch : 2 * actual_batch],
+            )
+            scale0, scale1 = (
+                scale[:actual_batch],
+                scale[actual_batch : 2 * actual_batch],
+            )
+            gate0, gate1 = (
+                gate[:actual_batch],
+                gate[actual_batch : 2 * actual_batch],
+            )
+            if is_scale_residual:
+                x, residual_out, gate_result = self.fused_res_ln_ss_gate_select01(
+                    x,
+                    residual_x,
+                    gate_x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale0,
+                    shift0,
+                    gate0,
+                    scale1,
+                    shift1,
+                    gate1,
+                    index,
+                    norm_module.eps,
+                )
+                return x, residual_out, gate_result
+            else:
+                x, gate_result = self.fused_ln_ss_gate_select01(
+                    x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale0,
+                    shift0,
+                    gate0,
+                    scale1,
+                    shift1,
+                    gate1,
+                    index,
+                    norm_module.eps,
+                )
+                return x, gate_result
+        else:
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+        if is_scale_residual:
+            if x_bias is not None and not use_bcg_helpers:
+                fused = try_fused_bias_scale_residual_norm_scale_shift(
+                    residual_x,
+                    x,
+                    x_bias,
+                    gate_x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale_result,
+                    shift_result,
+                    norm_module.norm_type,
+                    norm_module.eps,
+                )
+                if fused is not None:
+                    modulated, residual_out = fused
+                    return modulated, residual_out, gate_result
+            if x_bias is not None:
+                x = x + x_bias
+            if use_bcg_helpers:
+                modulated, residual_out = self._scale_residual_norm_scale_shift(
+                    norm_module,
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+            else:
+                modulated, residual_out = norm_module(
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+            return modulated, residual_out, gate_result
+        else:
+            if use_bcg_helpers:
+                modulated = self._norm_scale_shift(
+                    norm_module, x=x, shift=shift_result, scale=scale_result
+                )
+            else:
+                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+            return modulated, gate_result
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        modulate_index: Optional[torch.Tensor] = None,
+        modulation_cache_key: Optional[_QwenModulationCacheKey] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Get modulation parameters for both streams
+        img_mod_params, txt_mod_params = self._get_modulation_params(
+            temb_img_silu,
+            temb_txt_silu,
+            modulation_cache_key,
+        )
+
+        if (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "get_name")
+            and self.quant_config.get_name() == "svdquant"
+        ):
+            # When NOT using nunchaku, reshape mod_params from [B, 6*dim] to [B, dim*6]
+            # When using nunchaku (svdquant), keep original format
+            img_mod_params = (
+                img_mod_params.view(img_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(img_mod_params.shape[0], -1)
+            )
+            txt_mod_params = (
+                txt_mod_params.view(txt_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(txt_mod_params.shape[0], -1)
+            )
+
+        # Split modulation parameters for norm1 and norm2
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
+        use_bcg_helpers = is_in_breakable_cuda_graph()
+
+        # Process image stream - norm1 + modulation
+        img_fp8 = self._try_fp8_norm_quant(
+            self.img_norm1,
+            x=hidden_states,
+            mod_params=img_mod1,
+            input_scale=(
+                (
+                    self.attn.to_qkv.input_scale
+                    if self.attn.use_fused_qkv
+                    else self.attn.to_q.input_scale
+                )
+                if self._fp8_img_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_img_attn_norm_quant,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        if img_fp8 is None:
+            img_modulated, img_gate1 = self._modulate(
+                hidden_states,
+                img_mod1,
+                self.img_norm1,
+                modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            img_modulated_bf16 = None
+        else:
+            img_modulated, img_gate1, img_modulated_bf16 = img_fp8
+        # Process text stream - norm1 + modulation
+        txt_fp8 = self._try_fp8_norm_quant(
+            self.txt_norm1,
+            x=encoder_hidden_states,
+            mod_params=txt_mod1,
+            input_scale=(
+                (
+                    self.attn.to_added_qkv.input_scale
+                    if self.attn.use_fused_added_qkv
+                    else self.attn.add_q_proj.input_scale
+                )
+                if self._fp8_txt_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_txt_attn_norm_quant,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
+        if txt_fp8 is not None:
+            txt_modulated, txt_gate1, txt_modulated_bf16 = txt_fp8
+        elif use_bcg_helpers:
+            txt_modulated_bf16 = None
+            txt_modulated = self._norm_scale_shift(
+                self.txt_norm1,
+                encoder_hidden_states,
+                shift=txt_shift1,
+                scale=txt_scale1,
+            )
+        else:
+            txt_modulated_bf16 = None
+            txt_modulated = self.txt_norm1(
+                encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+            )
+        if txt_fp8 is None:
+            txt_gate1 = txt_gate1_raw.unsqueeze(1)
+
+        # Use QwenAttnProcessor2_0 for joint attention computation
+        # This directly implements the DoubleStreamLayerMegatron logic:
+        # 1. Computes QKV for both streams
+        # 2. Applies QK normalization and RoPE
+        # 3. Concatenates and runs joint attention
+        # 4. Splits results back to separate streams
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        attn_output = self.attn(
+            # Image stream (will be processed as "sample")
+            hidden_states=img_modulated,
+            # Text stream (will be processed as "context")
+            encoder_hidden_states=txt_modulated,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+        del img_modulated_bf16, txt_modulated_bf16
+
+        # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
+        (
+            img_attn_output,
+            txt_attn_output,
+            img_attn_bias,
+            txt_attn_bias,
+        ) = attn_output
+        # Process image stream - norm2 + MLP
+        img_nvfp4 = self._try_nvfp4_resnorm_quant(
+            self.img_norm2,
+            self.img_mlp,
+            residual=hidden_states,
+            x=img_attn_output,
+            x_bias=img_attn_bias,
+            residual_gate=img_gate1,
+            mod_params=img_mod2,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        if img_nvfp4 is not None:
+            img_modulated2, hidden_states, img_gate2 = img_nvfp4
+            img_modulated2_bf16 = None
+        else:
+            img_fp8_mlp = self._try_fp8_residual_norm_quant(
+                self.img_norm2,
+                residual=hidden_states,
+                x=img_attn_output,
+                residual_gate=img_gate1,
+                mod_params=img_mod2,
+                input_scale=(
+                    self.img_mlp.net[0].proj.input_scale
+                    if self._fp8_img_mlp_norm_quant
+                    else None
+                ),
+                enabled=self._fp8_img_mlp_norm_quant,
+                modulate_index=modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            if img_fp8_mlp is None:
+                img_modulated2, hidden_states, img_gate2 = self._modulate(
+                    img_attn_output,
+                    img_mod2,
+                    self.img_norm2,
+                    modulate_index,
+                    gate_x=img_gate1,
+                    residual_x=hidden_states,
+                    x_bias=img_attn_bias,
+                    use_bcg_helpers=use_bcg_helpers,
+                )
+                img_modulated2_bf16 = None
+            else:
+                (
+                    img_modulated2,
+                    hidden_states,
+                    img_gate2,
+                    img_modulated2_bf16,
+                ) = img_fp8_mlp
+        if isinstance(self.img_mlp, QwenImageFeedForward):
+            img_mlp_output, img_mlp_bias = self.img_mlp.forward_with_bias(
+                img_modulated2
+            )
+        else:
+            img_mlp_output = self.img_mlp(img_modulated2)
+            img_mlp_bias = None
+        del img_modulated2_bf16
+
+        if img_mlp_output.dim() == 2:
+            img_mlp_output = img_mlp_output.unsqueeze(0)
+        hidden_states = self._bias_mul_add(
+            img_mlp_output,
+            img_mlp_bias,
+            img_gate2,
+            hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+
+        # Process text stream - norm2 + MLP
+        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
+        txt_nvfp4 = self._try_nvfp4_resnorm_quant(
+            self.txt_norm2,
+            self.txt_mlp,
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            x_bias=txt_attn_bias,
+            residual_gate=txt_gate1,
+            mod_params=txt_mod2,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        txt_fp8_mlp = None
+        if txt_nvfp4 is not None:
+            txt_modulated2, encoder_hidden_states, txt_gate2 = txt_nvfp4
+            txt_modulated2_bf16 = None
+        else:
+            txt_fp8_mlp = self._try_fp8_residual_norm_quant(
+                self.txt_norm2,
+                residual=encoder_hidden_states,
+                x=txt_attn_output,
+                residual_gate=txt_gate1,
+                mod_params=txt_mod2,
+                input_scale=(
+                    self.txt_mlp.net[0].proj.input_scale
+                    if self._fp8_txt_mlp_norm_quant
+                    else None
+                ),
+                enabled=self._fp8_txt_mlp_norm_quant,
+                modulate_index=modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            if txt_fp8_mlp is not None:
+                (
+                    txt_modulated2,
+                    encoder_hidden_states,
+                    txt_gate2,
+                    txt_modulated2_bf16,
+                ) = txt_fp8_mlp
+            elif use_bcg_helpers:
+                txt_modulated2_bf16 = None
+                if txt_attn_bias is not None:
+                    txt_attn_output = txt_attn_output + txt_attn_bias
+                (
+                    txt_modulated2,
+                    encoder_hidden_states,
+                ) = self._scale_residual_norm_scale_shift(
+                    self.txt_norm2,
+                    residual=encoder_hidden_states,
+                    x=txt_attn_output,
+                    gate=txt_gate1,
+                    shift=txt_shift2,
+                    scale=txt_scale2,
+                )
+            elif txt_attn_bias is not None:
+                txt_modulated2_bf16 = None
+                txt_modulated2, encoder_hidden_states, _ = self._modulate(
+                    txt_attn_output,
+                    txt_mod2,
+                    self.txt_norm2,
+                    gate_x=txt_gate1,
+                    residual_x=encoder_hidden_states,
+                    x_bias=txt_attn_bias,
+                )
+            else:
+                txt_modulated2_bf16 = None
+                txt_modulated2, encoder_hidden_states = self.txt_norm2(
+                    residual=encoder_hidden_states,
+                    x=txt_attn_output,
+                    gate=txt_gate1,
+                    shift=txt_shift2,
+                    scale=txt_scale2,
+                )
+        if txt_nvfp4 is None and txt_fp8_mlp is None:
+            txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        if isinstance(self.txt_mlp, QwenImageFeedForward):
+            txt_mlp_output, txt_mlp_bias = self.txt_mlp.forward_with_bias(
+                txt_modulated2
+            )
+        else:
+            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            txt_mlp_bias = None
+        del txt_modulated2_bf16
+
+        if txt_mlp_output.dim() == 2:
+            txt_mlp_output = txt_mlp_output.unsqueeze(0)
+        encoder_hidden_states = self._bias_mul_add(
+            txt_mlp_output,
+            txt_mlp_bias,
+            txt_gate2,
+            encoder_hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+
+        # Clip to prevent overflow for fp16
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        return encoder_hidden_states, hidden_states
+
+
+def to_hashable(obj):
+    if isinstance(obj, list):
+        return tuple(to_hashable(x) for x in obj)
+    return obj
+
+
+class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    """
+    The Transformer model introduced in Qwen.
+
+    """
+
+    _supports_gradient_checkpointing = True
+    _no_split_modules = ["QwenImageTransformerBlock"]
+    _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
+    _repeated_blocks = ["QwenImageTransformerBlock"]
+
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "to_added_qkv": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
+    _fsdp_shard_conditions = [is_transformer_block]
+
+    @classmethod
+    def get_param_names_mapping_for_quant_config(
+        cls, quant_config: Optional[QuantizationConfig]
+    ) -> dict:
+        mapping = dict(cls.param_names_mapping)
+        if _modelopt_quant_name(quant_config) == "modelopt_fp8":
+            mapping.update(_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING)
+        return mapping
+
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attn.to_qkv",
+                "attn.to_out",
+                "attn.add_qkv_proj",
+                "attn.to_add_out",
+                "img_mlp",
+                "txt_mlp",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
+
+    def __init__(
+        self,
+        config: QwenImageDitConfig,
+        hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__(config=config, hf_config=hf_config)
+        # Only ModelOpt FP8 constructs packed QKV modules for checkpoints with
+        # Diffusers-style split Q/K/V names. Keep the mapping instance-local so
+        # eager and NVFP4 checkpoints still target their split projections.
+        self.param_names_mapping = self.get_param_names_mapping_for_quant_config(
+            quant_config
+        )
+        arch = self.config
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        out_channels = arch.out_channels
+        num_layers = arch.num_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
+        self.zero_cond_t = getattr(arch, "zero_cond_t", False)
+        self.out_channels = out_channels or in_channels
+        self.inner_dim = num_attention_heads * attention_head_dim
+
+        self.use_additional_t_cond: bool = getattr(
+            arch, "use_additional_t_cond", False
+        )  # For qwen-image-layered now
+        self.use_layer3d_rope: bool = getattr(
+            arch, "use_layer3d_rope", False
+        )  # For qwen-image-layered now
+
+        if not self.use_layer3d_rope:
+            self.rotary_emb = QwenEmbedRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
+        else:
+            self.rotary_emb = QwenEmbedLayer3DRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
+
+        self.time_text_embed = QwenTimestepProjEmbeddings(
+            embedding_dim=self.inner_dim,
+            use_additional_t_cond=self.use_additional_t_cond,
+        )
+
+        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+
+        self.img_in = ColumnParallelLinear(
+            in_channels,
+            self.inner_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix="img_in",
+        )
+        self.txt_in = ColumnParallelLinear(
+            joint_attention_dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix="txt_in",
+        )
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                QwenImageTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
+                    zero_cond_t=self.zero_cond_t,
+                )
+                for layer_idx in range(num_layers)
+            ]
+        )
+
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.proj_out = ColumnParallelLinear(
+            self.inner_dim,
+            patch_size * patch_size * self.out_channels,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix="proj_out",
+        )
+
+        self.timestep_zero = torch.zeros(
+            (1,), dtype=torch.int, device=get_local_torch_device()
+        )
+
+        self.layer_names = ["transformer_blocks"]
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        enabled = sum(
+            block._fp8_img_attn_norm_quant
+            + block._fp8_txt_attn_norm_quant
+            + block._fp8_img_mlp_norm_quant
+            + block._fp8_txt_mlp_norm_quant
+            for block in self.transformer_blocks
+        )
+        if enabled:
+            logger.info(
+                "Enabled Qwen FP8 norm+quant fusion for %d/%d block paths",
+                enabled,
+                4 * len(self.transformer_blocks),
+            )
+
+    @functools.lru_cache(maxsize=50)
+    def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        sp_world_size = get_sp_world_size()
+
+        modulate_index_list = []
+        for sample in img_shapes:
+            first_size = sample[0][0] * sample[0][1] * sample[0][2]
+            total_size = sum(s[0] * s[1] * s[2] for s in sample)
+            if sp_world_size > 1:
+                first_local_size = _local_seq_len(first_size, sp_world_size)
+                tail_local_size = _local_seq_len(total_size - first_size, sp_world_size)
+                idx = torch.cat(
+                    [
+                        torch.zeros(first_local_size, device=device, dtype=torch.int),
+                        torch.ones(tail_local_size, device=device, dtype=torch.int),
+                    ]
+                )
+            else:
+                idx = (torch.arange(total_size, device=device) >= first_size).int()
+            modulate_index_list.append(idx)
+
+        modulate_index = torch.stack(modulate_index_list)
+        return modulate_index
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
+        freqs_complex: tuple[torch.Tensor, torch.Tensor] = None,
+        additional_t_cond: Optional[torch.Tensor] = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples=None,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        """
+        The [`QwenTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
+                Valid-token mask of the input conditions, where True keeps a text token.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        if (
+            attention_kwargs is not None
+            and attention_kwargs.get("scale", None) is not None
+        ):
+            logger.warning(
+                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+            )
+
+        if isinstance(encoder_hidden_states, list):
+            encoder_hidden_states = encoder_hidden_states[0]
+        if isinstance(encoder_hidden_states_mask, list):
+            encoder_hidden_states_mask = encoder_hidden_states_mask[0]
+
+        hidden_states, _ = self.img_in(hidden_states)
+
+        modulation_cache_key = _qwen_modulation_cache_key(
+            timestep,
+            additional_t_cond,
+            hidden_states,
+        )
+
+        timestep = (timestep / 1000).to(hidden_states.dtype)
+
+        if self.zero_cond_t:
+            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            device = timestep.device
+            modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
+        else:
+            modulate_index = None
+
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states, _ = self.txt_in(encoder_hidden_states)
+
+        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
+        sp_text_sharded = False
+        if encoder_hidden_states_mask is not None:
+            encoder_hidden_states_mask = encoder_hidden_states_mask.to(
+                device=hidden_states.device, dtype=torch.bool
+            )
+            batch_size, image_seq_len = hidden_states.shape[:2]
+            image_mask = torch.ones(
+                (batch_size, image_seq_len),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            block_attention_kwargs["attn_mask"] = joint_mask
+            if is_in_breakable_cuda_graph():
+                # Qwen/FireRed BCG buckets text inputs so different prompt
+                # lengths can share a graph. Attention break kwargs are captured
+                # once, so build varlen metadata replay-locally from the current
+                # static mask instead of closing over stale cu_seqlens/indices.
+                block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            elif (
+                txt_seq_lens is not None
+                and len(txt_seq_lens) == batch_size
+                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
+            ):
+                # txt_seq_lens already carries each row's valid text prefix
+                # (the mask is built from it), so the varlen metadata can be
+                # assembled host-side; the mask-based builder costs a GPU
+                # nonzero plus a device sync on every denoising step.
+                txt_len = encoder_hidden_states.shape[1]
+                block_attention_kwargs["attn_mask_meta"] = (
+                    build_varlen_mask_meta_from_ranges(
+                        [
+                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                            for n in txt_seq_lens
+                        ],
+                        max_seqlen=txt_len + image_seq_len,
+                        device=hidden_states.device,
+                    )
+                )
+            else:
+                # Precompute varlen metadata once per request so every block
+                # reuses the same cu_seqlens / indices instead of rebuilding.
+                block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
+                    joint_mask
+                )
+        elif should_shard_text(encoder_hidden_states.shape[1]):
+            # Shard the replicated text stream across SP ranks; non-divisible
+            # lengths tail-pad the last rank and attention skips the pad via the
+            # per-request tail meta. Otherwise fall through to replicated text.
+            txt_shard = build_shard_plan(encoder_hidden_states.shape[1])
+            encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+            if freqs_cis is not None:
+                img_cache, txt_cache = freqs_cis
+                freqs_cis = (img_cache, shard_like(txt_cache, txt_shard, dim=0))
+            if freqs_complex is not None:
+                img_complex, txt_complex = freqs_complex
+                freqs_complex = (img_complex, shard_like(txt_complex, txt_shard, dim=0))
+            tail_meta = tail_attn_meta(
+                txt_shard,
+                encoder_hidden_states.shape[0],
+                hidden_states.device,
+                image_seq_len=hidden_states.shape[1],
+            )
+            if tail_meta is not None:
+                block_attention_kwargs["attn_mask_meta"] = tail_meta
+            sp_text_sharded = True
+        block_attention_kwargs["sp_text_sharded"] = sp_text_sharded
+
+        temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
+
+        temb_img_silu = F.silu(temb)
+        if self.zero_cond_t:
+            temb_txt = temb.chunk(2, dim=0)[0]
+            temb_txt_silu = temb_img_silu.chunk(2, dim=0)[0]
+        else:
+            temb_txt = temb
+            temb_txt_silu = temb_img_silu
+
+        image_rotary_emb = freqs_cis
+        if freqs_complex is not None:
+            block_attention_kwargs["freqs_complex"] = freqs_complex
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb_img_silu=temb_img_silu,
+                temb_txt_silu=temb_txt_silu,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=block_attention_kwargs,
+                modulate_index=modulate_index,
+                modulation_cache_key=modulation_cache_key,
+            )
+
+            # controlnet residual
+            if controlnet_block_samples is not None:
+                interval_control = len(self.transformer_blocks) / len(
+                    controlnet_block_samples
+                )
+                interval_control = int(np.ceil(interval_control))
+                hidden_states = (
+                    hidden_states
+                    + controlnet_block_samples[index_block // interval_control]
+                )
+        # Use only the image part (hidden_states) from the dual-stream blocks
+        hidden_states = _qwen_norm_out(self.norm_out, hidden_states, temb_txt)
+
+        output, _ = self.proj_out(hidden_states)
+        return output
+
+
+EntryClass = QwenImageTransformer2DModel

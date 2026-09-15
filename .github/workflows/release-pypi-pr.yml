@@ -1,0 +1,188 @@
+name: Release PyPI PR Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to build wheel for (works with both internal and fork PRs)'
+        required: true
+        type: string
+
+concurrency:
+  group: build-pr-wheel-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  build-pr-wheel:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      wheel_version: ${{ steps.wheel.outputs.wheel_version }}
+      wheel_filename: ${{ steps.wheel.outputs.wheel_filename }}
+      commit_hash: ${{ steps.gen_version.outputs.commit_hash }}
+      build_date: ${{ steps.gen_version.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0  # Need full history for version generation
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Generate PR wheel version
+        id: gen_version
+        run: |
+          LATEST_TAG=$(python3 scripts/release/get_version_tag.py --tag-only)
+          BASE_VERSION=${LATEST_TAG#v}
+          echo "Latest release tag: ${LATEST_TAG}"
+
+          # Get commit info
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+
+          # Get current date in YYYY-MM-DD format
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+
+          # Always use pr-{number} format for suffix
+          SUFFIX="pr-${{ inputs.pr_number }}"
+
+          # Generate PR wheel version following PEP 440
+          # Format: {base_version}.dev{commit_count}+pr-{number}.g{commit_hash}
+          WHEEL_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+${SUFFIX}.g${COMMIT_HASH}"
+
+          echo "Base version: ${BASE_VERSION}"
+          echo "PR wheel version: ${WHEEL_VERSION}"
+          echo "Commit: ${COMMIT_HASH}"
+          echo "Build date: ${BUILD_DATE}"
+
+          {
+            echo "wheel_version=${WHEEL_VERSION}"
+            echo "commit_hash=${COMMIT_HASH}"
+            echo "base_version=${BASE_VERSION}"
+            echo "build_date=${BUILD_DATE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update pyproject.toml with PR wheel version
+        run: |
+          cd python
+          WHEEL_VERSION="${{ steps.gen_version.outputs.wheel_version }}"
+
+          # Update pyproject.toml to use static version instead of dynamic
+          # Remove 'version' from dynamic list and add static version
+          sed -i 's/dynamic = \["version"\]/dynamic = []/' pyproject.toml
+          sed -i "/^name = \"sglang\"/a version = \"${WHEEL_VERSION}\"" pyproject.toml
+
+          # Verify update
+          echo "Updated version in pyproject.toml:"
+          grep "^version" pyproject.toml
+          grep "^dynamic" pyproject.toml
+
+      - name: Install build dependencies
+        run: |
+          pip install \
+            auditwheel build patchelf wheel "setuptools>=61.0" \
+            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0"
+
+      - name: Build wheel
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+          python3 -m build --wheel --no-isolation
+
+          # List built wheels
+          echo "Built wheel:"
+          ls -lh dist/
+
+      - name: Repair and smoke-test wheel
+        id: wheel
+        run: |
+          python3 scripts/release/prepare_sglang_wheel.py python/dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-wheel-${{ inputs.pr_number }}
+          path: python/dist/*.whl
+          retention-days: 30
+
+  release-pr-wheel:
+    needs: build-pr-wheel
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-wheel-${{ inputs.pr_number }}
+          path: dist/
+
+      - name: List downloaded wheels
+        run: |
+          echo "Downloaded wheel:"
+          ls -lh dist/
+
+      - name: Create GitHub Release for PR wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}
+          name: "PR #${{ inputs.pr_number }} Build (${{ needs.build-pr-wheel.outputs.commit_hash }})"
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          prerelease: true
+          body: |
+            PR wheel build from PR #${{ inputs.pr_number }}
+            Commit: ${{ needs.build-pr-wheel.outputs.commit_hash }}
+            Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
+            Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
+
+            **Installation via index (pip):**
+            ```bash
+            pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/
+            ```
+
+            **Installation via index (uv):**
+            ```bash
+            uv pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/ --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+            ```
+
+            **Direct installation:**
+            ```bash
+            pip install https://github.com/sgl-project/whl/releases/download/pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}/${{ needs.build-pr-wheel.outputs.wheel_filename }}
+            ```
+          files: |
+            dist/*.whl
+
+      - name: Clone wheel index repository
+        run: |
+          git clone "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Update wheel index
+        run: |
+          python3 scripts/update_pr_whl_index.py \
+            --pr-number "${{ inputs.pr_number }}" \
+            --commit-hash "${{ needs.build-pr-wheel.outputs.commit_hash }}" \
+            --wheel-version "${{ needs.build-pr-wheel.outputs.wheel_version }}" \
+            --build-date "${{ needs.build-pr-wheel.outputs.build_date }}"
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git add -A
+          git diff --staged --quiet || git commit -m "Update PR wheel index for PR #${{ inputs.pr_number }} (commit ${{ needs.build-pr-wheel.outputs.commit_hash }})"
+          git push
