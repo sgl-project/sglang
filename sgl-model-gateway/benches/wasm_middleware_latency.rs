@@ -68,7 +68,6 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
     let app_state = Arc::new(AppState {
         router: Arc::new(MockRouter),
         context: Arc::new(context),
-        concurrency_queue_tx: None,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,

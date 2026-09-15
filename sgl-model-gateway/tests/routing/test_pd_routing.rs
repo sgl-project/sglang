@@ -2,7 +2,7 @@
 mod pd_routing_unit_tests {
     use serde_json::json;
     use smg::{
-        app_context::AppContext,
+        app_context::{request_limiters_from_config, AppContext},
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
@@ -220,14 +220,11 @@ mod pd_routing_unit_tests {
                 };
                 use smg::{
                     core::{LoadMonitor, WorkerRegistry},
-                    middleware::TokenBucket,
                     policies::PolicyRegistry,
                 };
 
                 let client = reqwest::Client::new();
-
-                // Initialize rate limiter
-                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+                let request_limiters = request_limiters_from_config(&config);
 
                 // Initialize registries
                 let worker_registry = Arc::new(WorkerRegistry::new());
@@ -255,7 +252,8 @@ mod pd_routing_unit_tests {
                     AppContext::builder()
                         .router_config(config)
                         .client(client)
-                        .rate_limiter(rate_limiter)
+                        .admission_limiter(request_limiters.admission_limiter)
+                        .rate_limiter(request_limiters.rate_limiter)
                         .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
                         .reasoning_parser_factory(None) // reasoning_parser_factory
                         .tool_parser_factory(None) // tool_parser_factory
