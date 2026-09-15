@@ -314,12 +314,17 @@ class QSAIndexer(MultiPlatformOp):
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
         if is_extend:
-            # Extend chunks are group-aligned; each planned group lies in this forward,
-            # so read its members from the packed chunk tensors.
             member_rows = metadata.compress_member_rows.long()
+            prefix_members = metadata.compress_prefix_members.long()
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
+            # A private chunk-cache tail can leave the first group crossing the
+            # extend boundary. Clamp its prefix-side rows to the first current
+            # row for this main pass; _overwrite_cross_prefix_groups replaces
+            # that group's result using the pending ring below.
+            first_current_rows = member_rows + prefix_members
+            group_locs = torch.maximum(group_locs, first_current_rows[:, None])
             source_keys = token_k
             group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
@@ -347,14 +352,62 @@ class QSAIndexer(MultiPlatformOp):
                 source_keys=source_keys,
                 source_rope=source_rope,
             )
-            return
-        key_groups = source_keys[group_locs]
+        else:
+            key_groups = source_keys[group_locs]
+            pooled = average_pool_qsa_keys(key_groups)
+            compressed_rope_positions = self._rope_from_matrix(
+                source_rope[group_locs[:, 0]]
+            )
+            normalized = self.normalize_compressed_keys(
+                pooled, compressed_rope_positions
+            )
+            pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+
+        if is_extend and metadata.has_cross_prefix_group:
+            self._overwrite_cross_prefix_groups(
+                token_k, metadata, group_locs, compressed_locs
+            )
+
+    def _overwrite_cross_prefix_groups(
+        self,
+        token_k: torch.Tensor,
+        metadata,
+        current_group_locs: torch.Tensor,
+        compressed_locs: torch.Tensor,
+    ) -> None:
+        """Compress groups spanning a retained private prefix and this extend."""
+
+        prefix_members = metadata.compress_prefix_members.long()
+        partial = (prefix_members > 0) & (compressed_locs != 0)
+        prefix_members = prefix_members[partial]
+        current_group_locs = current_group_locs[partial]
+        ring_group_locs = metadata.compress_group_ring_locs
+        if ring_group_locs is None:
+            raise RuntimeError("QSA cross-prefix groups require pending-ring locations")
+        ring_group_locs = ring_group_locs[partial].long()
+
+        pool = metadata.token_to_kv_pool
+        current_keys = token_k[current_group_locs]
+        ring_keys = pool.get_qsa_key_state_buffer(self.layer_id)[ring_group_locs]
+        use_ring = (
+            torch.arange(
+                self.compress_ratio,
+                device=prefix_members.device,
+                dtype=torch.long,
+            )[None, :]
+            < prefix_members[:, None]
+        )
+        while use_ring.ndim < current_keys.ndim:
+            use_ring = use_ring.unsqueeze(-1)
+        key_groups = torch.where(use_ring, ring_keys, current_keys)
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
-            source_rope[group_locs[:, 0]]
+            pool.qsa_rope_position_buffer[ring_group_locs[:, 0]]
         )
         normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
-        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+        pool.set_qsa_compressed_k_buffer(
+            self.layer_id, compressed_locs[partial], normalized
+        )
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
         """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
