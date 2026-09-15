@@ -3601,17 +3601,14 @@ class DeepseekSparseAttnBackend(
                 self.dsa_prefill_impl = "flashmla_sparse"
 
     def get_topk_transform_method(
-        self, forward_mode: Optional[ForwardMode] = None
+        self, forward_mode: ForwardMode
     ) -> TopkTransformMethod:
         """
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
-        if (
-            self._dcp_sharded_kv
-            and forward_mode is not None
-            and forward_mode.is_extend_without_speculative()
-        ):
+        # Note(kpham-sgl): Gathered prefill KV uses sequence offsets, not cache slots.
+        if self._dcp_sharded_kv and forward_mode.is_extend_without_speculative():
             return TopkTransformMethod.RAGGED
         if (
             # disable for MTP
