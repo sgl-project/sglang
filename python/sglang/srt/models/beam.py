@@ -290,7 +290,12 @@ class BeamAttention(nn.Module):
             loaded_weight.narrow(0, self.tp_rank * self.num_heads, self.num_heads),
         )
 
-    def forward(self, positions, hidden_states, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
@@ -355,7 +360,12 @@ class BeamDecoderLayer(nn.Module):
         )
         self.mlp_output_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, positions, hidden_states, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
@@ -411,10 +421,10 @@ class BeamModel(nn.Module):
 
     def forward(
         self,
-        input_ids,
-        positions,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds=None,
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if self.pp_group.is_first_rank:
@@ -477,10 +487,10 @@ class BeamForCausalLM(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        input_ids,
-        positions,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds=None,
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = self.model(
