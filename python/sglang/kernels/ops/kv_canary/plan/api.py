@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 from sglang.kernels.ops.kv_canary.plan.entries_kernel import (
     launch_plan_entries_kernel,
 )
@@ -106,17 +107,42 @@ def launch_canary_plan_kernels(
     :func:`sglang.kernels.ops.kv_canary.plan_ref.launch_canary_plan_kernels_torch_reference`; both the Triton
     offsets kernel and the CUDA JIT entries kernel must match byte-for-byte.
     """
+    # SWA plans are meaningless without the full->swa LUT (entries would carry
+    # untranslated full-pool slots), so this is a cross-backend contract, not a
+    # CUDA-only guard. Enforce it before dispatching: the torch reference does not
+    # re-check, so leaving it below the early-return would silently skip it.
+    if swa_window_size > 0 and full_to_swa_index_mapping is None:
+        raise ValueError(
+            "kv-canary: launch_canary_plan_kernels requires full_to_swa_index_mapping when swa_window_size > 0"
+        )
+
+    if use_torch_reference(verify_plan_out.verify_slot_indices.device):
+        from sglang.kernels.ops.kv_canary.plan_ref import (
+            launch_canary_plan_kernels_torch_reference,
+        )
+
+        launch_canary_plan_kernels_torch_reference(
+            verify_plan_out=verify_plan_out,
+            write_plan_out=write_plan_out,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            req_to_token=req_to_token,
+            swa_window_size=swa_window_size,
+            full_to_swa_index_mapping=full_to_swa_index_mapping,
+            verify_capacity=verify_capacity,
+            req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+            req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
+            kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
+        )
+        return
+
     bs = int(req_pool_indices.shape[0])
     if bs > _PLAN_BS_BLOCK_SIZE:
         raise ValueError(
             f"kv-canary: launch_canary_plan_kernels supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
             f"got bs={bs}. Bump _PLAN_BS_BLOCK_SIZE if real workloads need this."
         )
-    if swa_window_size > 0 and full_to_swa_index_mapping is None:
-        raise ValueError(
-            "kv-canary: launch_canary_plan_kernels requires full_to_swa_index_mapping when swa_window_size > 0"
-        )
-
     device = verify_plan_out.verify_slot_indices.device
     verify_offsets_scratch = torch.empty(
         _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int64, device=device
