@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=945, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=1171, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
@@ -686,10 +686,7 @@ class TestDisaggregationStagingRadixPrefillLargerTP(PDDisaggregationServerBase):
             eval_name="gsm8k",
             api="completion",
             max_tokens=512,
-            # 50, not the 200 its siblings use: the small chunked-prefill-size
-            # above costs ~90x throughput, every request walks the same
-            # grid-split path, and 50 still clears 0.60 by ~2.6 sigma at 0.76.
-            num_examples=50,
+            num_examples=200,
             num_threads=128,
         )
         metrics = run_eval(args)
