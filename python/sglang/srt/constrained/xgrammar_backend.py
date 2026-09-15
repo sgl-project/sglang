@@ -351,10 +351,21 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
-        except RuntimeError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+            dispatch_type = "ebnf"
+        except RuntimeError as ebnf_error:
+            try:
+                ctx = self.grammar_compiler.compile_lark(key_string)
+                dispatch_type = "lark"
+            except RuntimeError as lark_error:
+                error_message = (
+                    f"Failed to compile grammar as EBNF ({ebnf_error}) "
+                    f"or Lark ({lark_error})"
+                )
+                logger.error(f"Hit invalid grammar: {key_string=}, {error_message}")
+                return InvalidGrammarObject(error_message)
+        return self._from_context(
+            ctx, key_string, GrammarStats(dispatch_type=dispatch_type)
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
