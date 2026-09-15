@@ -3248,9 +3248,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(kv_chunk.room) == KVPoll.Failed
                     )
                 ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
-                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    self._purge_room_state(
+                        kv_chunk.room,
+                        terminal_status=self.request_status.get(kv_chunk.room),
+                        purge_request_status=False,
+                        purge_deferred_ack_targets=False,
+                    )
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
                         # Snapshot first: the scheduler thread adds concurrently.
@@ -3290,6 +3293,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._handle_deferred_abort_notification(notification, room_active)
         else:
             self._handle_legacy_abort_notification(notification, room_active)
+        if self._staging_outstanding.get(room, 0) <= 0:
+            self._purge_room_state(
+                room,
+                terminal_status=KVPoll.Failed,
+                purge_request_status=False,
+                purge_deferred_ack_targets=False,
+            )
         return True
 
     def _handle_deferred_abort_notification(
@@ -3356,6 +3366,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                self.sweep_stale_rooms()
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -3409,8 +3420,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             mooncake_session_id, required_dst_info_num
                         )
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
+                    if not self.admit_bootstrap_room(room):
+                        continue
 
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)

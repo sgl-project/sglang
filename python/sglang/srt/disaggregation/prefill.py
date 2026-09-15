@@ -509,6 +509,11 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
+        if (
+            hasattr(self.kv_manager, "register_prefill_room")
+            and req.bootstrap_room is not None
+        ):
+            self.kv_manager.register_prefill_room(req.bootstrap_room)
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -601,6 +606,9 @@ class PrefillBootstrapQueue:
         return them."""
 
         bootstrapped_reqs = []
+
+        if hasattr(self.kv_manager, "sweep_stale_rooms"):
+            self.kv_manager.sweep_stale_rooms()
 
         if len(self.queue) == 0:
             return []

@@ -857,6 +857,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    SGLANG_DISAGGREGATION_ROOM_TTL = EnvFloat(15.0)
+    SGLANG_DISAGGREGATION_MAX_PENDING_ROOMS = EnvInt(4096)
+    SGLANG_DISAGGREGATION_STRICT_ROOM_ADMISSION = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

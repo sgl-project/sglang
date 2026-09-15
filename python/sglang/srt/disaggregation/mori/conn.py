@@ -885,7 +885,9 @@ class MoriKVManager(CommonKVManager):
                         current,
                     )
                     return
-                infos = self.transfer_infos.setdefault(transfer_info.room, {})
+                if not self.admit_bootstrap_room(transfer_info.room):
+                    return
+                infos = self.transfer_infos[transfer_info.room]
                 infos[transfer_info.engine_key] = transfer_info
 
                 if len(infos) >= transfer_info.required_dst_info_num:
@@ -956,6 +958,14 @@ class MoriKVManager(CommonKVManager):
             )
 
         self._arm_abort_ack(bootstrap_room, notification)
+        if self._staging_outstanding.get(bootstrap_room, 0) <= 0:
+            with self.transfer_lock:
+                self._purge_room_state(
+                    bootstrap_room,
+                    terminal_status=KVPoll.Failed,
+                    purge_request_status=False,
+                    purge_deferred_ack_targets=False,
+                )
 
     def _arm_abort_ack(
         self,
@@ -982,6 +992,7 @@ class MoriKVManager(CommonKVManager):
         def bootstrap_worker():
             while not self._stopped:
                 try:
+                    self.sweep_stale_rooms()
                     msg = recv()
                     if msg is None:
                         continue

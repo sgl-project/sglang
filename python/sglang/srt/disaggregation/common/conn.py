@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import heapq
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from typing import (
     Dict,
@@ -322,6 +323,15 @@ class CommonKVManager(BaseKVManager):
     # Each room's `SendRecord`, from its first queued send until the sender is
     # cleared or the room starts a new lifecycle. Created on first use.
     _send_records: Optional[Dict[int, SendRecord]] = None
+    _room_lock: Optional[threading.RLock] = None
+    _room_expiry_heap: Optional[List[Tuple[float, int]]] = None
+    _room_expiries: Optional[Dict[int, float]] = None
+    _terminal_status_cache: Optional[OrderedDict[int, KVPoll]] = None
+    _terminal_status_cache_max_size: int = 2048
+    _scheduled_prefill_rooms: Optional[Set[int]] = None
+    _prefill_admission_enabled: bool = False
+    room_ttl: float = 15.0
+    max_pending_rooms: int = 4096
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
@@ -476,6 +486,18 @@ class CommonKVManager(BaseKVManager):
                     envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
                     + envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
                 )
+
+        self._room_lock = threading.RLock()
+        self._room_expiry_heap: List[Tuple[float, int]] = []
+        self._room_expiries: Dict[int, float] = {}
+        self._terminal_status_cache: OrderedDict[int, KVPoll] = OrderedDict()
+        self._terminal_status_cache_max_size: int = 2048
+        self._scheduled_prefill_rooms: Set[int] = set()
+        self._prefill_admission_enabled: bool = (
+            envs.SGLANG_DISAGGREGATION_STRICT_ROOM_ADMISSION.get()
+        )
+        self.room_ttl: float = envs.SGLANG_DISAGGREGATION_ROOM_TTL.get()
+        self.max_pending_rooms: int = envs.SGLANG_DISAGGREGATION_MAX_PENDING_ROOMS.get()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -702,8 +724,173 @@ class CommonKVManager(BaseKVManager):
         )
         self._dcp_pack_max_tokens = max_tokens
 
+    def _ensure_room_lifecycle_state(self) -> threading.RLock:
+        lock = self._room_lock
+        if lock is None:
+            lock = threading.RLock()
+            self._room_lock = lock
+        if self._room_expiry_heap is None:
+            self._room_expiry_heap = []
+        if self._room_expiries is None:
+            self._room_expiries = {}
+        if self._terminal_status_cache is None:
+            self._terminal_status_cache = OrderedDict()
+        if self._scheduled_prefill_rooms is None:
+            self._scheduled_prefill_rooms = set()
+        return lock
+
+    def _record_terminal_status(self, room: int, status: KVPoll) -> None:
+        """Record terminal status in a bounded LRU cache for client poll grace periods."""
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            cache = self._terminal_status_cache
+            if room in cache and isinstance(cache, OrderedDict):
+                cache.move_to_end(room)
+            cache[room] = status
+            while len(cache) > self._terminal_status_cache_max_size:
+                if isinstance(cache, OrderedDict):
+                    cache.popitem(last=False)
+                else:
+                    cache.pop(next(iter(cache)))
+
+    def enable_prefill_admission_guard(self) -> None:
+        """Enable strict prefill admission control to reject unsolicited bootstrap rooms."""
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            self._prefill_admission_enabled = True
+
+    def register_prefill_room(self, room: int) -> None:
+        """Register a bootstrap_room that has been scheduled by the prefill engine."""
+        if room is None:
+            return
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            self._scheduled_prefill_rooms.add(room)
+
+    def is_room_scheduled(self, room: int) -> bool:
+        """Verify whether a bootstrap_room was scheduled on this prefill instance."""
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            if not self._prefill_admission_enabled:
+                return True
+            return room in self._scheduled_prefill_rooms
+
+    def record_room_active(self, room: int, ttl: Optional[float] = None) -> None:
+        """Record room activation with TTL in the min-heap."""
+        if ttl is None:
+            ttl = self.room_ttl
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            expiry = time.time() + ttl
+            self._room_expiries[room] = expiry
+            heapq.heappush(self._room_expiry_heap, (expiry, room))
+
+    def admit_bootstrap_room(self, room: int) -> bool:
+        """Validate and admit an incoming bootstrap room into transfer_infos.
+
+        Enforces the optional strict pre-authorization guard and the
+        ``max_pending_rooms`` cap for unscheduled rooms, while tracking TTL
+        expiry so orphan rooms are reaped without blocking legitimate
+        decode-before-prefill arrivals.
+        """
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            if not self.is_room_scheduled(room):
+                logger.warning(
+                    "Rejecting unscheduled bootstrap room %s to prevent memory leak / DoS",
+                    room,
+                )
+                return False
+            if room not in self.transfer_infos:
+                if len(self.transfer_infos) >= self.max_pending_rooms:
+                    self.sweep_stale_rooms()
+                if (
+                    len(self.transfer_infos) >= self.max_pending_rooms
+                    and room not in self._scheduled_prefill_rooms
+                ):
+                    logger.warning(
+                        "Rejecting unscheduled bootstrap room %s: max pending rooms limit (%s) reached",
+                        room,
+                        self.max_pending_rooms,
+                    )
+                    return False
+                self.transfer_infos[room] = {}
+                self.record_room_active(room)
+            return True
+
+    def _purge_room_state(
+        self,
+        room: int,
+        terminal_status: Optional[KVPoll] = None,
+        *,
+        purge_request_status: bool = True,
+        purge_deferred_ack_targets: bool = True,
+    ) -> None:
+        """Thread-safe centralized purge of all state associated with a room."""
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            if hasattr(self, "transfer_infos"):
+                self.transfer_infos.pop(room, None)
+            if hasattr(self, "req_to_decode_prefix_len"):
+                self.req_to_decode_prefix_len.pop(room, None)
+            if purge_deferred_ack_targets and hasattr(self, "_deferred_ack_targets"):
+                self._deferred_ack_targets.pop(room, None)
+            self._scheduled_prefill_rooms.discard(room)
+
+            if purge_request_status:
+                self._room_expiries.pop(room, None)
+                curr = self.request_status.pop(room, None)
+            else:
+                if room not in self.request_status:
+                    self._room_expiries.pop(room, None)
+                curr = self.request_status.get(room)
+            status = terminal_status if terminal_status is not None else curr
+            if status is not None:
+                self._record_terminal_status(room, status)
+
+    def sweep_stale_rooms(self, now: Optional[float] = None) -> int:
+        """O(1) head inspection min-heap sweeper to evict stale/orphan rooms."""
+        if now is None:
+            now = time.time()
+        evicted = 0
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            while self._room_expiry_heap and self._room_expiry_heap[0][0] <= now:
+                expiry, room = heapq.heappop(self._room_expiry_heap)
+                if self._room_expiries.get(room) != expiry:
+                    continue
+                if room in self._scheduled_prefill_rooms:
+                    # Scheduled prefill rooms have an active CommonKVSender
+                    # governed by bootstrap_timeout and clear().
+                    self._room_expiries.pop(room, None)
+                    continue
+                status = self.request_status.get(room)
+                in_transfer_infos = (
+                    hasattr(self, "transfer_infos") and room in self.transfer_infos
+                )
+                if status in (
+                    KVPoll.Bootstrapping,
+                    KVPoll.WaitingForInput,
+                    KVPoll.Failed,
+                    None,
+                ) and (in_transfer_infos or room in self.request_status):
+                    logger.warning(
+                        f"Purging stale/orphan bootstrap room {room} after TTL expiry ({self.room_ttl}s)"
+                    )
+                    self._purge_room_state(room, terminal_status=KVPoll.Failed)
+                    evicted += 1
+                else:
+                    self._room_expiries.pop(room, None)
+        return evicted
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            if bootstrap_room in self.request_status:
+                return self.request_status[bootstrap_room]
+            if bootstrap_room in self._terminal_status_cache:
+                return self._terminal_status_cache[bootstrap_room]
+            return self.request_status[bootstrap_room]
 
     def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
         statuses = self.request_status.collect(bootstrap_room)
@@ -785,34 +972,40 @@ class CommonKVManager(BaseKVManager):
             )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # The room does not exist yet, or clear() already popped it. Only a
-            # request's opening status may create it: Bootstrapping normally, or
-            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
-            # Anything else would resurrect a concluded room and pollute a later
-            # request that reuses the same bootstrap_room.
-            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                # A new room lifecycle drops deferred-ACK state left by the
-                # previous request that used this bootstrap_room.
-                self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
-                self._forget_sends(bootstrap_room)
-                self.request_status[bootstrap_room] = status
-            return
-        if status == KVPoll.Failed:
-            self.request_status[bootstrap_room] = KVPoll.Failed
-            if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
-                )
-            return
-        if current == KVPoll.Failed:
-            # Failed is terminal. It also sorts lowest, so the max() below would
-            # happily promote it back to Transferring or Success.
-            return
-        self.request_status[bootstrap_room] = max(current, status)
+        lock = self._ensure_room_lifecycle_state()
+        with lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # The room does not exist yet, or clear() already popped it. Only a
+                # request's opening status may create it: Bootstrapping normally, or
+                # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
+                # Anything else would resurrect a concluded room and pollute a later
+                # request that reuses the same bootstrap_room.
+                if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                    # A new room lifecycle drops deferred-ACK state left by the
+                    # previous request that used this bootstrap_room.
+                    self._deferred_ack_targets.pop(bootstrap_room, None)
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                    self._staging_outstanding.pop(bootstrap_room, None)
+                    self._forget_sends(bootstrap_room)
+                    self._terminal_status_cache.pop(bootstrap_room, None)
+                    self.request_status[bootstrap_room] = status
+                elif status == KVPoll.Failed:
+                    self._record_terminal_status(bootstrap_room, KVPoll.Failed)
+                return
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+                self._record_terminal_status(bootstrap_room, KVPoll.Failed)
+                if self.deferred_bootstrap is not None:
+                    self._notify_bootstrap(
+                        bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+                    )
+                return
+            if current == KVPoll.Failed:
+                # Failed is terminal. It also sorts lowest, so the max() below would
+                # happily promote it back to Transferring or Success.
+                return
+            self.request_status[bootstrap_room] = max(current, status)
 
     def send_record(self, bootstrap_room: int) -> SendRecord:
         """The room's send record, created by its first send (scheduler
@@ -1218,7 +1411,15 @@ class CommonKVManager(BaseKVManager):
             # A target registered concurrently with the poison must not fire.
             self._deferred_ack_targets.pop(room, None)
             return
-        self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
+        targets = self._deferred_ack_targets.pop(room, None)
+        if targets is not None:
+            self._send_abort_acks(room, targets)
+            self._purge_room_state(
+                room,
+                terminal_status=KVPoll.Failed,
+                purge_request_status=False,
+                purge_deferred_ack_targets=False,
+            )
 
     def _send_abort_acks(
         self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
@@ -2634,10 +2835,17 @@ class CommonKVSender(BaseKVSender):
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self._retire_sends()
-        self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_purge_room_state"):
+            self.kv_mgr._purge_room_state(
+                self.bootstrap_room,
+                terminal_status=self.conclude_state,
+                purge_deferred_ack_targets=False,
+            )
+        else:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:
             self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
