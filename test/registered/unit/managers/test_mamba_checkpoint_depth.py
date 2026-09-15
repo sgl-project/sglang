@@ -22,7 +22,7 @@ from sglang.srt.server_args import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CHUNK = 64
 
@@ -45,8 +45,8 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     )
     req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
     req.set_extend_range(prefix_len, prefix_len + extend_len)
-    req.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
-    req.mamba_next_track_idx = 0
+    req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
+    req.kv.mamba_next_track_idx = 0
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
@@ -58,7 +58,7 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
     batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
-    return req.mamba_last_track_seqlen
+    return req.kv.mamba_last_track_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):

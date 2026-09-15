@@ -43,6 +43,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _sm120_sparse_decode_fwd,
     _split_kv_pages_to_64,
     flash_mla_with_kvcache_sm120,
+    flashinfer_dsv4_decode_supports_num_heads,
 )
 from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _apply_attn_sink,
@@ -53,7 +54,7 @@ from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 
 
 # Per-token byte layout
@@ -152,9 +153,7 @@ def _build_kvcache(
     nope_dequant = (
         nope_fp8.view(num_pages, page_size, _NUM_TILES, _TILE_SIZE)
         * scale_e8m0.view(num_pages, page_size, _NUM_TILES, 1)
-    ).view(
-        num_pages, page_size, _NOPE_DIM
-    )  # float32
+    ).view(num_pages, page_size, _NOPE_DIM)  # float32
     ref_per_token = torch.cat(
         [nope_dequant.to(torch.bfloat16), rope_bf16_vals], dim=-1
     )  # (num_pages, page_size, 512) bf16
@@ -503,6 +502,87 @@ class TestEntryPointDispatch(CustomTestCase):
             atol=5e-2,
             rtol=5e-2,
         )
+
+    def test_flashinfer_exact_heads_match_padded_64_heads(self):
+        """Native TP4/TP8 heads agree with padding across the prefill boundary."""
+        num_pages, page_size, topk = 2, 64, 128
+        k_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=17)
+        extra_cache, _ = _build_kvcache(
+            num_pages, page_size, device=self.device, seed=23
+        )
+        for num_heads in (8, 16):
+            with self.subTest(heads=num_heads):
+                if not flashinfer_dsv4_decode_supports_num_heads(num_heads, 1):
+                    self.skipTest(
+                        f"FlashInfer has no {num_heads}-head DSV4 decode specialization"
+                    )
+                self.assertTrue(
+                    flashinfer_dsv4_decode_supports_num_heads(num_heads, 64)
+                )
+                self.assertFalse(
+                    flashinfer_dsv4_decode_supports_num_heads(num_heads, 65)
+                )
+                for num_tokens in (1, 64, 65):
+                    for dual_cache in (False, True):
+                        with self.subTest(tokens=num_tokens, dual_cache=dual_cache):
+                            q, indices = _build_q_indices(
+                                num_tokens,
+                                num_heads,
+                                topk,
+                                num_pages,
+                                page_size,
+                                device=self.device,
+                                seed=29,
+                            )
+                            topk_length = torch.full(
+                                (num_tokens,),
+                                topk,
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                            sink = torch.linspace(
+                                -1.0,
+                                1.0,
+                                num_heads,
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            q_padded = q.new_zeros(num_tokens, 1, 64, _D)
+                            q_padded[:, :, :num_heads].copy_(q)
+                            sink_padded = sink.new_zeros(64)
+                            sink_padded[:num_heads].copy_(sink)
+
+                            common = dict(
+                                k_cache=k_cache,
+                                indices=indices,
+                                topk_length=topk_length,
+                                head_dim_v=_D,
+                                softmax_scale=_D**-0.5,
+                                extra_k_cache=extra_cache if dual_cache else None,
+                                extra_indices_in_kvcache=indices
+                                if dual_cache
+                                else None,
+                                extra_topk_length=topk_length if dual_cache else None,
+                            )
+                            with mock.patch.object(
+                                fmod, "_sm120_default_backend", "flashinfer"
+                            ):
+                                out_exact, _ = flash_mla_with_kvcache_sm120(
+                                    q=q, attn_sink=sink, **common
+                                )
+                                out_padded, _ = flash_mla_with_kvcache_sm120(
+                                    q=q_padded, attn_sink=sink_padded, **common
+                                )
+
+                            self.assertEqual(
+                                out_exact.shape, (num_tokens, 1, num_heads, _D)
+                            )
+                            torch.testing.assert_close(
+                                out_exact.float(),
+                                out_padded[:, :, :num_heads].float(),
+                                atol=5e-2,
+                                rtol=5e-2,
+                            )
 
 
 @unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")

@@ -74,6 +74,30 @@ def test_ltx2_derives_cross_attention_role_from_context(use_local_attention):
     assert self_attention_kwargs["is_cross_attention"] is False
 
 
+@pytest.mark.parametrize("use_local_attention", [False, True])
+def test_ltx2_forwards_required_attention_backend(use_local_attention):
+    selected_layer = "LocalAttention" if use_local_attention else "USPAttention"
+    with (
+        mock.patch.object(ltx_2, "get_tp_world_size", return_value=1),
+        mock.patch.object(ltx_2, "ColumnParallelLinear", return_value=nn.Identity()),
+        mock.patch.object(ltx_2, "RowParallelLinear", return_value=nn.Identity()),
+        mock.patch.object(ltx_2, selected_layer) as attention,
+    ):
+        ltx_2.LTX2Attention(
+            query_dim=8,
+            context_dim=8,
+            heads=1,
+            dim_head=8,
+            use_local_attention=use_local_attention,
+            required_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+        )
+
+    assert (
+        attention.call_args.kwargs["required_attention_backend"]
+        is AttentionBackendEnum.TORCH_SDPA
+    )
+
+
 def test_mova_bridge_marks_conditional_attention_as_cross_attention():
     with (
         mock.patch.object(mova_dual_tower, "get_tp_world_size", return_value=1),

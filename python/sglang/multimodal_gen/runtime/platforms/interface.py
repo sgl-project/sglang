@@ -8,13 +8,13 @@ import enum
 import random
 from collections.abc import Callable
 from functools import lru_cache
+from pkgutil import resolve_name
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -33,7 +33,10 @@ class AttentionBackendEnum(enum.Enum):
     DYNAMIC_CUDNN_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
+    SPARGE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
+    VIDEO_SPARSE_ATTN_H3 = enum.auto()
+    HYBRID_WINDOW_ATTN_H3 = enum.auto()
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
@@ -45,6 +48,7 @@ class AttentionBackendEnum(enum.Enum):
     RAIN_FUSION_ATTN = enum.auto()
     SOL_ATTN = enum.auto()
     SUBBLOCK_SPARSE_ATTN = enum.auto()
+    CUBE_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -55,15 +59,19 @@ class AttentionBackendEnum(enum.Enum):
         return self in {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+            AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3,
             AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
+            AttentionBackendEnum.SPARGE_ATTN,
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
             AttentionBackendEnum.SOL_ATTN,
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.CUBE_SPARSE_ATTN,
         }
 
 
@@ -386,8 +394,7 @@ class Platform:
         """
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
-                f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
+                f"{quant} quantization is currently not supported in {cls.device_name}."
             )
 
     @classmethod
@@ -430,13 +437,27 @@ class Platform:
         return True
 
     @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        """Whether the accelerator draws from the same physical pool as the host.
+
+        On such a part (DGX Spark's GB10, Jetson) a device allocation is host
+        memory the kernel no longer has, and a host copy of a mapped weight is
+        a second copy of bytes the page cache already holds.
+        """
+        return False
+
+    @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
-        return resolve_obj_by_qualname(attention_cls_str)
+        return resolve_name(attention_cls_str)
+
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        """Check if a tensor is on the current platform's device."""
+        return t.is_cuda
 
 
 class UnspecifiedPlatform(Platform):

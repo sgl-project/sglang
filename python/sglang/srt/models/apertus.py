@@ -394,7 +394,7 @@ class ApertusModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -442,7 +442,7 @@ class ApertusForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

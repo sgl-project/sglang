@@ -196,8 +196,9 @@ def kimi_k3_nonexpert_weights_iterator(
                             f"duplicate Kimi-K3 target parameter: {type_name}"
                         )
                     emitted.add(type_name)
-                    yield type_name, torch.tensor(
-                        int(tensor.tensor_type), dtype=torch.uint8
+                    yield (
+                        type_name,
+                        torch.tensor(int(tensor.tensor_type), dtype=torch.uint8),
                     )
                 emitted.add(runtime_name)
                 yield runtime_name, value

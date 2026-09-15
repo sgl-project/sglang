@@ -153,9 +153,9 @@ class TestOpenAIServerFunctionCalling:
 
         tool_calls = response.choices[0].message.tool_calls
 
-        assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
-        ), "tool_calls should be a non-empty list"
+        assert isinstance(tool_calls, list) and len(tool_calls) > 0, (
+            "tool_calls should be a non-empty list"
+        )
 
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
@@ -221,20 +221,20 @@ class TestOpenAIServerFunctionCalling:
             if choice.delta.tool_calls:
                 tool_call = choice.delta.tool_calls[0]
                 if tool_call.function.name:
-                    assert (
-                        tool_call.function.name == "get_current_weather"
-                    ), "Function name should be 'get_current_weather'"
+                    assert tool_call.function.name == "get_current_weather", (
+                        "Function name should be 'get_current_weather'"
+                    )
                     found_function_name = True
                     break
 
-        assert (
-            found_function_name
-        ), "Target function name 'get_current_weather' was not found in the streaming chunks"
+        assert found_function_name, (
+            "Target function name 'get_current_weather' was not found in the streaming chunks"
+        )
 
         finish_reason = chunks[-1].choices[0].finish_reason
-        assert (
-            finish_reason == "tool_calls"
-        ), "Final response of function calling should have finish_reason 'tool_calls'"
+        assert finish_reason == "tool_calls", (
+            "Final response of function calling should have finish_reason 'tool_calls'"
+        )
 
     def test_function_calling_streaming_args_parsing(self, setup_backend):
         """Test: Whether the function call arguments returned in streaming mode can be correctly concatenated into valid JSON.
@@ -299,14 +299,14 @@ class TestOpenAIServerFunctionCalling:
 
         assert function_name == "add", "Function name should be 'add'"
         joined_args = "".join(argument_fragments)
-        assert (
-            len(joined_args) > 0
-        ), "No parameter fragments were returned in the function call"
+        assert len(joined_args) > 0, (
+            "No parameter fragments were returned in the function call"
+        )
 
         finish_reason = chunks[-1].choices[0].finish_reason
-        assert (
-            finish_reason == "tool_calls"
-        ), "Final response of function calling should have finish_reason 'tool_calls'"
+        assert finish_reason == "tool_calls", (
+            "Final response of function calling should have finish_reason 'tool_calls'"
+        )
 
         # Check whether the concatenated JSON is valid
         try:
@@ -445,21 +445,21 @@ class TestOpenAIServerFunctionCalling:
         arguments = tool_calls[0].function.arguments
         args_obj = json.loads(arguments)
 
-        assert (
-            function_name == "get_weather"
-        ), f"Function name should be 'get_weather', got: {function_name}"
-        assert (
-            "city" in args_obj
-        ), f"Function arguments should have 'city', got: {args_obj}"
+        assert function_name == "get_weather", (
+            f"Function name should be 'get_weather', got: {function_name}"
+        )
+        assert "city" in args_obj, (
+            f"Function arguments should have 'city', got: {args_obj}"
+        )
 
         # Make the test more robust by checking type and accepting valid responses
         city_value = args_obj["city"]
-        assert isinstance(
-            city_value, str
-        ), f"Parameter city should be a string, got: {type(city_value)}"
-        assert (
-            "Paris" in city_value or "France" in city_value
-        ), f"Parameter city should contain either 'Paris' or 'France', got: {city_value}"
+        assert isinstance(city_value, str), (
+            f"Parameter city should be a string, got: {type(city_value)}"
+        )
+        assert "Paris" in city_value or "France" in city_value, (
+            f"Parameter city should contain either 'Paris' or 'France', got: {city_value}"
+        )
 
     def test_function_call_specific(self, setup_backend):
         """Test: Whether tool_choice: ToolChoice works as expected.
@@ -592,9 +592,9 @@ class TestOpenAIServerFunctionCalling:
                         finish_reason_chunks[index].append(choice.finish_reason)
 
         # Verify we got finish_reason chunks for both indices
-        assert (
-            len(finish_reason_chunks) == 2
-        ), f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}"
+        assert len(finish_reason_chunks) == 2, (
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}"
+        )
 
         # Verify both index 0 and 1 have finish_reason
         assert 0 in finish_reason_chunks, "Missing finish_reason chunk for index 0"
@@ -602,9 +602,9 @@ class TestOpenAIServerFunctionCalling:
 
         # Verify the finish_reason is "tool_calls" since we forced tool calls
         for index, reasons in finish_reason_chunks.items():
-            assert (
-                reasons[-1] == "tool_calls"
-            ), f"Expected finish_reason 'tool_calls' for index {index}, got {reasons[-1]}"
+            assert reasons[-1] == "tool_calls", (
+                f"Expected finish_reason 'tool_calls' for index {index}, got {reasons[-1]}"
+            )
 
     def test_function_calling_streaming_no_tool_call(self, setup_backend):
         """Test: Whether the finish_reason is stop in streaming mode when no tool call is given.
@@ -663,14 +663,14 @@ class TestOpenAIServerFunctionCalling:
                 found_tool_call = True
                 break
 
-        assert (
-            not found_tool_call
-        ), "Shouldn't have any tool_call in the streaming chunks"
+        assert not found_tool_call, (
+            "Shouldn't have any tool_call in the streaming chunks"
+        )
 
         finish_reason = chunks[-1].choices[0].finish_reason
-        assert (
-            finish_reason == "stop"
-        ), "Final response of no function calling should have finish_reason 'stop'"
+        assert finish_reason == "stop", (
+            "Final response of no function calling should have finish_reason 'stop'"
+        )
 
     def test_streaming_multiple_choices_without_tools(self, setup_backend):
         """Test: Verify that each choice gets its own finish_reason chunk without tool calls.
@@ -705,9 +705,9 @@ class TestOpenAIServerFunctionCalling:
                         finish_reason_chunks[index].append(choice.finish_reason)
 
         # Verify we got finish_reason chunks for both indices
-        assert (
-            len(finish_reason_chunks) == 2
-        ), f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}"
+        assert len(finish_reason_chunks) == 2, (
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}"
+        )
 
         # Verify both index 0 and 1 have finish_reason
         assert 0 in finish_reason_chunks, "Missing finish_reason chunk for index 0"
@@ -718,7 +718,9 @@ class TestOpenAIServerFunctionCalling:
             assert reasons[-1] in [
                 "stop",
                 "length",
-            ], f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}"
+            ], (
+                f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}"
+            )
 
 
 # =============================================================================
@@ -749,9 +751,9 @@ class TestOpenAIPythonicFunctionCalling:
         assert isinstance(tool_calls, list), "No tool_calls found"
         assert len(tool_calls) >= 1
         names = [tc.function.name for tc in tool_calls]
-        assert (
-            "get_weather" in names or "get_tourist_attractions" in names
-        ), f"Function name '{names}' should contain either 'get_weather' or 'get_tourist_attractions'"
+        assert "get_weather" in names or "get_tourist_attractions" in names, (
+            f"Function name '{names}' should contain either 'get_weather' or 'get_tourist_attractions'"
+        )
 
     def test_pythonic_tool_call_streaming(self, setup_backend):
         """Test: Streaming pythonic tool call format; assert tool_call index is present."""
@@ -782,7 +784,9 @@ class TestOpenAIPythonicFunctionCalling:
         assert found_index, "No index field found in any streamed tool_call"
         assert (
             "get_weather" in found_names or "get_tourist_attractions" in found_names
-        ), f"Function name '{found_names}' should contain either 'get_weather' or 'get_tourist_attractions'"
+        ), (
+            f"Function name '{found_names}' should contain either 'get_weather' or 'get_tourist_attractions'"
+        )
 
 
 # =============================================================================
@@ -1132,13 +1136,13 @@ class _TestToolChoiceBase:
                         tool_call["id"] = tool_call_delta.id
                     if tool_call_delta.function:
                         if tool_call_delta.function.name:
-                            tool_call["function"][
-                                "name"
-                            ] = tool_call_delta.function.name
+                            tool_call["function"]["name"] = (
+                                tool_call_delta.function.name
+                            )
                         if tool_call_delta.function.arguments:
-                            tool_call["function"][
-                                "arguments"
-                            ] += tool_call_delta.function.arguments
+                            tool_call["function"]["arguments"] += (
+                                tool_call_delta.function.arguments
+                            )
 
         assert len(tool_calls_by_index) > 0
 
@@ -1271,9 +1275,9 @@ class _TestToolChoiceBase:
             assert len(tool_calls) == 2, f"Expected 2 tool calls, got {len(tool_calls)}"
 
             called_functions = {call.function.name for call in tool_calls}
-            assert (
-                called_functions == expected_functions
-            ), f"Expected functions {expected_functions}, got {called_functions}"
+            assert called_functions == expected_functions, (
+                f"Expected functions {expected_functions}, got {called_functions}"
+            )
 
     def test_multi_tool_scenario_required(self, setup_backend):
         """Test multi-tool scenario with tool_choice='required'."""
@@ -1307,9 +1311,9 @@ class _TestToolChoiceBase:
 
         if self._is_flaky_test("test_multi_tool_scenario_required"):
             # For flaky tests, just ensure basic functionality works
-            assert (
-                len(tool_calls) > 0
-            ), f"Expected at least 1 tool call, got {len(tool_calls)}"
+            assert len(tool_calls) > 0, (
+                f"Expected at least 1 tool call, got {len(tool_calls)}"
+            )
             for call in tool_calls:
                 assert call.function.name in available_names
         else:
@@ -1317,9 +1321,9 @@ class _TestToolChoiceBase:
             assert len(tool_calls) == 2, f"Expected 2 tool calls, got {len(tool_calls)}"
 
             called_functions = {call.function.name for call in tool_calls}
-            assert (
-                called_functions == expected_functions
-            ), f"Expected functions {expected_functions}, got {called_functions}"
+            assert called_functions == expected_functions, (
+                f"Expected functions {expected_functions}, got {called_functions}"
+            )
 
     def test_error_handling_invalid_tool_choice(self, setup_backend):
         """Test error handling for invalid tool_choice."""
