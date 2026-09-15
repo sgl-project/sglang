@@ -369,6 +369,7 @@ class MoeFlags(_FlagGroupBase):
     quantization: str | None = None
     nccl_ep_mode: Any = None  # NcclEpMode | None (typed Any to avoid import cycle)
     nccl_ep_num_max_dispatch_tokens_per_rank: int = 0
+    nccl_ep_multistream: bool = False
 
 
 @dataclasses.dataclass

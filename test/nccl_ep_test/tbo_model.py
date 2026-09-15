@@ -19,6 +19,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
 
 
 def _layer(model, residual_scale=None, input_transform=None):
@@ -107,7 +108,9 @@ def forward_tbo(
             for model in models
         ]
     )
-    with forward_context(ForwardContext(attn_backend=None)):
+    with forward_context(ForwardContext(attn_backend=None)), get_parallel().override(
+        attn_tp_size=1
+    ):
         outputs = execute_overlapped_operations(
             inputs_arr=inputs,
             operations_arr=[strategy.operations] * 2,

@@ -325,13 +325,18 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
     moe.deepep_config = server_args.deepep_config or ""
     moe.nccl_ep_mode = NcclEpMode(server_args.nccl_ep_mode)
+    moe.nccl_ep_multistream = server_args.enable_nccl_ep_multistream
     moe.nccl_ep_num_max_dispatch_tokens_per_rank = int(
         server_args.nccl_ep_num_max_dispatch_tokens_per_rank or 0
     )
     moe.tbo_enabled = server_args.enable_two_batch_overlap
     moe.sbo_enabled = server_args.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
-        if torch.cuda.get_device_capability()[0] == 9:
+        if torch.cuda.get_device_capability()[0] == 9 and not (
+            moe.nccl_ep_multistream
+            and moe.a2a_backend.is_nccl_ep()
+            and moe.runner_backend.is_triton()
+        ):
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )

@@ -260,8 +260,13 @@ def dispatcher_environment(*, capacity=32):
         try:
             yield library
         finally:
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep_stream import (
+                destroy_nccl_ep_streams,
+            )
+
             torch.cuda.synchronize()
             module.NcclEpBuffer.destroy()
+            destroy_nccl_ep_streams()
             get_resources().buffers.pop("nccl_ep_state", None)
             get_resources().buffers.pop("nccl_ep_state_1", None)
             # Restore the import cache while the module remains importable.

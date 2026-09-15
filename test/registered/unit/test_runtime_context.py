@@ -401,6 +401,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             deepep_config=None,
             nccl_ep_mode="low_latency",
             nccl_ep_num_max_dispatch_tokens_per_rank=0,
+            enable_nccl_ep_multistream=False,
             enable_two_batch_overlap=False,
             enable_single_batch_overlap=False,
             tbo_token_distribution_threshold=0.48,

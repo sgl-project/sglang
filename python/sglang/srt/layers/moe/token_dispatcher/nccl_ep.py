@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+from contextlib import nullcontext
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
@@ -457,6 +458,9 @@ class NcclEpDispatcher(BaseDispatcher):
         self._graph_resources = None
         self._eager_session = None
         self._active_buffer = self.buffer
+        from .nccl_ep_stream import get_nccl_ep_stream
+
+        self._comm = get_nccl_ep_stream(ep_group.device, instance_id=instance_id or 0)
 
         # Staged execution state machine (mirrors deepep.py _Stage).
         self._stage = _Stage.INITIAL
@@ -473,6 +477,17 @@ class NcclEpDispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
+
+    def _send_context(self, *inputs):
+        return self._comm.send(*inputs) if self._comm is not None else nullcontext()
+
+    def _complete(self):
+        if self._comm is not None:
+            self._comm.complete(self.handle)
+        else:
+            self.handle.complete(
+                config=0, stream=torch.cuda.current_stream().cuda_stream
+            )
 
     # _Stage state machine: guards a/b call order. handle's continue_fn is a
     # single slot — calling combine(send_only=1) before dispatch_b (complete)
@@ -522,15 +537,8 @@ class NcclEpDispatcher(BaseDispatcher):
                 f"{_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}."
             )
 
-        stream = torch.cuda.current_stream()
-        if graph_owner is not None:
-            state, handle, hidden_states, topk_ids, topk_weights = graph_owner.prepare(
-                self, hidden_states, topk_ids, topk_weights
-            )
-            self._graph_resources = graph_owner
-        else:
-            state = self.buffer
-            if state.borrower is not None:
+        if graph_owner is None:
+            if self.buffer.borrower is not None:
                 raise RuntimeError("NCCL EP eager group has an incomplete transaction")
             if owner is not None:
                 if self.instance_id is not None:
@@ -541,45 +549,54 @@ class NcclEpDispatcher(BaseDispatcher):
                     session = owner.submission_session("transaction")
                     session.__enter__()
                     self._eager_session = session
-            try:
-                if self.handle is not None:
-                    self.handle.destroy()
-                handle = state.group.create_handle(
-                    layout=nccl_ep.Layout.EXPERT_MAJOR,
-                    topk_idx=nccl_ep.Tensor(topk_ids),
-                    config=nccl_ep.HandleConfig(),
-                    stream=stream.cuda_stream,
+        with self._send_context(hidden_states, topk_ids, topk_weights):
+            stream = torch.cuda.current_stream()
+            if graph_owner is not None:
+                state, handle, hidden_states, topk_ids, topk_weights = (
+                    graph_owner.prepare(self, hidden_states, topk_ids, topk_weights)
                 )
-                state.borrower = self
-            except BaseException:
-                if self._eager_session is not None:
-                    self._eager_session.__exit__(None, None, None)
-                    self._eager_session = None
-                raise
-        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        self.handle = handle
-        self._active_buffer = state
+                self._graph_resources = graph_owner
+            else:
+                state = self.buffer
+                try:
+                    if self.handle is not None:
+                        self.handle.destroy()
+                    handle = state.group.create_handle(
+                        layout=nccl_ep.Layout.EXPERT_MAJOR,
+                        topk_idx=nccl_ep.Tensor(topk_ids),
+                        config=nccl_ep.HandleConfig(),
+                        stream=stream.cuda_stream,
+                    )
+                    state.borrower = self
+                except BaseException:
+                    if self._eager_session is not None:
+                        self._eager_session.__exit__(None, None, None)
+                        self._eager_session = None
+                    raise
+            self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+            self.handle = handle
+            self._active_buffer = state
 
-        # Reuse pre-allocated scratch; counters re-zeroed each dispatch.
-        recv_tokens = state.recv_tokens
-        expert_counters = state.expert_counters.zero_()
-        expert_offsets = state.expert_offsets.zero_()
-        recv_total = state.recv_total.zero_()
+            # Reuse pre-allocated scratch; counters re-zeroed each dispatch.
+            recv_tokens = state.recv_tokens
+            expert_counters = state.expert_counters.zero_()
+            expert_offsets = state.expert_offsets.zero_()
+            recv_total = state.recv_total.zero_()
 
-        inputs = nccl_ep.DispatchInputs(tokens=nccl_ep.Tensor(hidden_states))
-        outputs = nccl_ep.DispatchOutputs(tokens=nccl_ep.Tensor(recv_tokens))
-        layout_info = nccl_ep.LayoutInfo(
-            expert_counters=nccl_ep.Tensor(expert_counters),
-            expert_offsets=nccl_ep.Tensor(expert_offsets),
-            recv_total_counter=nccl_ep.Tensor(recv_total),
-        )
-        handle.dispatch(
-            inputs,
-            outputs,
-            layout_info=layout_info,
-            config=nccl_ep.DispatchConfig(send_only=1),
-            stream=stream.cuda_stream,
-        )
+            inputs = nccl_ep.DispatchInputs(tokens=nccl_ep.Tensor(hidden_states))
+            outputs = nccl_ep.DispatchOutputs(tokens=nccl_ep.Tensor(recv_tokens))
+            layout_info = nccl_ep.LayoutInfo(
+                expert_counters=nccl_ep.Tensor(expert_counters),
+                expert_offsets=nccl_ep.Tensor(expert_offsets),
+                recv_total_counter=nccl_ep.Tensor(recv_total),
+            )
+            handle.dispatch(
+                inputs,
+                outputs,
+                layout_info=layout_info,
+                config=nccl_ep.DispatchConfig(send_only=1),
+                stream=stream.cuda_stream,
+            )
 
         self._dispatch_intermediate_state = (
             recv_tokens,
@@ -611,8 +628,7 @@ class NcclEpDispatcher(BaseDispatcher):
         ) = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
 
-        stream = torch.cuda.current_stream()
-        self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._complete()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             expert_counters
@@ -674,18 +690,19 @@ class NcclEpDispatcher(BaseDispatcher):
         # Reuse pre-allocated [max_send, H] buffer.
         combined = self._active_buffer.combined[:t]
 
-        stream = torch.cuda.current_stream()
-        inputs = nccl_ep.CombineInputs(tokens=nccl_ep.Tensor(expert_outputs))
-        outputs = nccl_ep.CombineOutputs(
-            tokens=nccl_ep.Tensor(combined),
-            topk_weights=nccl_ep.Tensor(topk_weights),
-        )
-        self.handle.combine(
-            inputs,
-            outputs,
-            config=nccl_ep.CombineConfig(send_only=1),
-            stream=stream.cuda_stream,
-        )
+        with self._send_context(expert_outputs, topk_weights):
+            stream = torch.cuda.current_stream()
+            inputs = nccl_ep.CombineInputs(tokens=nccl_ep.Tensor(expert_outputs))
+            outputs = nccl_ep.CombineOutputs(
+                tokens=nccl_ep.Tensor(combined),
+                topk_weights=nccl_ep.Tensor(topk_weights),
+            )
+            self.handle.combine(
+                inputs,
+                outputs,
+                config=nccl_ep.CombineConfig(send_only=1),
+                stream=stream.cuda_stream,
+            )
 
         self._combine_intermediate_state = (combined, inputs, outputs)
 
@@ -693,11 +710,10 @@ class NcclEpDispatcher(BaseDispatcher):
         if self._stage != _Stage.AFTER_COMBINE_A:
             raise RuntimeError("NCCL EP combine_b requires a pending combine")
         combined, _inputs, _outputs = self._combine_intermediate_state
-        stream = torch.cuda.current_stream()
         # Release ownership only after successful completion. Native/GPU faults
         # leave an incomplete transaction and require process restart, rather
         # than allowing another layer to reuse uncertain communication state.
-        self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._complete()
         if self._graph_resources is not None:
             # Later MoE layers reuse the group's combine scratch. Keep this
             # layer's live output in the captured graph's allocator pool.

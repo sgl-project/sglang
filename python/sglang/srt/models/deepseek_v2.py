@@ -1226,7 +1226,7 @@ class DeepseekV2MoE(nn.Module):
         )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
-            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+            sbo_enabled_flag and SboFlags.enable_dispatch_shared_overlap()
         )
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()

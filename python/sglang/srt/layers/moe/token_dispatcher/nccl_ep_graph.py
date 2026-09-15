@@ -303,3 +303,6 @@ def destroy_nccl_ep_resources():
 
         torch.cuda.synchronize()
         NcclEpBuffer.destroy()
+    from .nccl_ep_stream import destroy_nccl_ep_streams
+
+    destroy_nccl_ep_streams()

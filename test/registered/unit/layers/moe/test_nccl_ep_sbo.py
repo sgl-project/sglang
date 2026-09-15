@@ -61,6 +61,7 @@ def test_nccl_sbo_does_not_select_deepep_combine_signals(
         a2a_backend=MoeA2ABackend.NCCL_EP, runner_backend=runner, sbo_enabled=True
     ):
         assert SboFlags.enable_dispatch_shared_one_stream_overlap()
+        assert SboFlags.fuse_shared_experts_inside_sbo()
         assert not SboFlags.enable_combine_shared_two_stream_overlap()
         assert not SboFlags.enable_combine_down_gemm_two_stream_overlap()
 
@@ -83,6 +84,7 @@ def test_deepep_sbo_policy_is_preserved(monkeypatch, blackwell, runner):
     ):
         assert SboFlags.enable_dispatch_shared_one_stream_overlap() == (not blackwell)
         assert SboFlags.enable_combine_shared_two_stream_overlap() == blackwell
+        assert SboFlags.fuse_shared_experts_inside_sbo()
         assert SboFlags.enable_combine_down_gemm_two_stream_overlap() == (
             runner.is_deep_gemm() and not blackwell
         )

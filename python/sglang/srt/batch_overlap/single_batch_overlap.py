@@ -44,12 +44,20 @@ class SboFlags:
     def enable_combine_shared_two_stream_overlap(cls):
         return (
             is_sbo_enabled()
-            and not cls.enable_dispatch_shared_one_stream_overlap()
+            and not cls.enable_dispatch_shared_overlap()
             and not envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
         )
 
     @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
+        from sglang.srt.runtime_context import get_flags
+
+        return cls.enable_dispatch_shared_overlap() and not (
+            get_moe_a2a_backend().is_nccl_ep() and get_flags().moe.nccl_ep_multistream
+        )
+
+    @classmethod
+    def enable_dispatch_shared_overlap(cls):
         # NCCL EP exposes send_only/complete on both Hopper and Blackwell.
         # Its combine does not consume DeepEP/DeepGEMM overlap signals.
         return is_sbo_enabled() and (
@@ -60,7 +68,7 @@ class SboFlags:
     def fuse_shared_experts_inside_sbo(cls):
         return (
             cls.enable_combine_shared_two_stream_overlap()
-            or cls.enable_dispatch_shared_one_stream_overlap()
+            or cls.enable_dispatch_shared_overlap()
         )
 
 

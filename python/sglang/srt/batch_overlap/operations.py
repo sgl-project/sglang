@@ -14,11 +14,15 @@ from typing import (
     Union,
 )
 
+import torch
+
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
 )
+from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
@@ -90,6 +94,16 @@ def _resolve_tbo_child_contexts():
     )
 
 
+def _supports_nccl_ep_compute_stream(child_ctx):
+    # A missing backend is used by attention-free MoE tests. Real attention
+    # needs a separate child: other backends can share mutable workspace.
+    if child_ctx is None:
+        return get_forward_context().attn_backend is None
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+    return type(child_ctx.attn_backend) is TritonAttnBackend
+
+
 class YieldOperation:
     pass
 
@@ -122,6 +136,32 @@ class _StageExecutor:
         # per-child backend (with sub-batch metadata) instead of the TBO
         # parent's primary.
         self._child_ctx = child_ctx
+        self._cuda_stream = None
+        zero_allocator = inputs.get("zero_allocator")
+        if (
+            debug_name in ("a", "b")
+            and get_flags().moe.nccl_ep_multistream
+            and get_parallel().attn_tp_size == 1
+            and get_parallel().moe_dense_tp_size == 1
+            and (zero_allocator is None or isinstance(zero_allocator, BumpAllocator))
+            and _supports_nccl_ep_compute_stream(child_ctx)
+        ):
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep_stream import (
+                get_nccl_ep_stream,
+            )
+
+            self._cuda_stream = get_nccl_ep_stream(
+                "cuda", instance_id=int(debug_name == "b"), role="compute"
+            ).stream
+            producer = torch.cuda.current_stream()
+            self._cuda_stream.wait_stream(producer)
+            for value in inputs.values():
+                if isinstance(value, torch.Tensor):
+                    value.record_stream(self._cuda_stream)
+            if zero_allocator is not None:
+                # Host submission is still serial, so allocate() returns disjoint
+                # slices. Keep their shared storage alive on both compute lanes.
+                zero_allocator.record_stream(self._cuda_stream)
 
         # handling DP attention
         forward_batch: ForwardBatch = inputs["forward_batch"]
@@ -154,7 +194,12 @@ class _StageExecutor:
             debug_name=f"{self._debug_name}{self._index}",
             color="orange",
         )
-        with ctx_mgr, stage_range:
+        stream_mgr = (
+            torch.cuda.stream(self._cuda_stream)
+            if self._cuda_stream is not None
+            else nullcontext()
+        )
+        with stream_mgr, ctx_mgr, stage_range:
             for op in stage:
                 with operations_nvtx_range(
                     debug_name=op.debug_name,
@@ -172,6 +217,12 @@ class _StageExecutor:
     @property
     def output(self):
         assert self.done
+        if self._cuda_stream is not None:
+            consumer = torch.cuda.current_stream()
+            consumer.wait_stream(self._cuda_stream)
+            for value in self._stage_output.values():
+                if isinstance(value, torch.Tensor):
+                    value.record_stream(consumer)
         return self._stage_output
 
     @property

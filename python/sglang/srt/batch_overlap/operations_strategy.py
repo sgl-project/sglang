@@ -8,6 +8,7 @@ from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -96,6 +97,11 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
+        if get_moe_a2a_backend().is_nccl_ep() and get_flags().moe.nccl_ep_multistream:
+            # Each lane has independent communication state and a stream. Submit
+            # both dispatches before either routed GEMM, then delay each combine
+            # join until the other lane's routed GEMM has been submitted.
+            return _compute_moe_deepseek_blog_prefill(layer)
         return _compute_moe_deepseek_blog_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
