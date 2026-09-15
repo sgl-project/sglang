@@ -1,8 +1,8 @@
 """Registry for pluggable TreeCore implementations.
 
 The unified cache constructs its TreeCore through `create_tree_core`, selected
-by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "rust", with compatibility
-fallbacks when unset). To plug in a custom implementation, register it via
+by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "rust"). Rust selections use
+centralized compatibility fallbacks. To plug in a custom implementation, register it via
 `register_tree_core_backend(name, factory)`.
 """
 
@@ -40,7 +40,7 @@ _RUST_TREE_CORE_MANIFEST = (
 logger = logging.getLogger(__name__)
 
 
-def _rust_default_unsupported_reason(params: CacheInitParams) -> Optional[str]:
+def _rust_unsupported_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
@@ -79,16 +79,26 @@ def _rust_default_unsupported_reason(params: CacheInitParams) -> Optional[str]:
     return None
 
 
-def select_tree_core_backend(params: CacheInitParams) -> str:
-    """Use Rust by default where supported; explicit backend choices stay strict."""
-    backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-    if backend != "rust" or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
-        return backend
-    reason = _rust_default_unsupported_reason(params)
+def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
+    """Resolve known Rust capability gaps before loading a backend.
+
+    Explicit Rust selections use the same compatibility policy as the default.
+    Build, import, and runtime failures remain errors in supported configurations.
+    """
+    if name != "rust":
+        return name
+    reason = _rust_unsupported_reason(params)
     if reason is not None:
         logger.info("Using the Python TreeCore: %s", reason)
         return "python"
-    return backend
+    return name
+
+
+def select_tree_core_backend(params: CacheInitParams) -> str:
+    """Resolve the configured TreeCore backend using the shared fallback policy."""
+    return resolve_tree_core_backend(
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), params
+    )
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:
@@ -137,7 +147,8 @@ def create_tree_core(
     params: CacheInitParams,
     components: dict[ComponentType, TreeComponent],
 ) -> UnifiedTreeCoreInterface:
-    """Construct the TreeCore registered under `name`."""
+    """Resolve compatibility and construct the registered TreeCore."""
+    name = resolve_tree_core_backend(name, params)
     factory = get_tree_core_factory(name)
     if factory is None:
         raise ValueError(

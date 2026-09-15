@@ -1,8 +1,6 @@
 """Integration tests driving the real compiled Rust mem_cache extension."""
 
 import hashlib
-import importlib.util
-import shutil
 import sys
 from array import array
 from types import SimpleNamespace
@@ -13,13 +11,6 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=17, suite="base-a-test-cpu")
-
-if (
-    shutil.which("cargo") is None
-    and importlib.util.find_spec("sglang.srt.mem_cache.rust_tree_core.mem_cache")
-    is None
-):
-    pytest.skip("the rust backend builds with cargo", allow_module_level=True)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,

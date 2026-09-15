@@ -77,7 +77,10 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    _TREE_CORE_REGISTRY,
+    resolve_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
@@ -123,9 +126,6 @@ def _selected_tree_core_test_backend() -> str:
 
 
 def _session_radix_cache_test_values() -> tuple[bool, ...]:
-    # TODO(Jialin): Restore the session-enabled case after porting #29173 to Rust.
-    if _selected_tree_core_test_backend() == "rust":
-        return (False,)
     return False, True
 
 
@@ -454,11 +454,11 @@ def _aux_storage_key_transfers(cache, node_id):
 
 def build_fixture(
     cfg: CacheConfig,
-    *,
     enable_kv_cache_events: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
+    tree_core_backend: Optional[str] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -593,29 +593,26 @@ def build_fixture(
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
-    selected_backend = _selected_tree_core_test_backend()
-    if selected_backend == "python":
+    requested_backend = tree_core_backend or _selected_tree_core_test_backend()
+    selected_backend = resolve_tree_core_backend(requested_backend, cache_init_params)
 
-        def inspector_factory(params, components):
-            return UnifiedTreeCoreInspector(params, components)
+    def python_inspector_factory(params, components):
+        return UnifiedTreeCoreInspector(params, components)
 
-    elif selected_backend == "rust":
+    def rust_inspector_factory(params, _components):
         from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
 
-        def inspector_factory(params, _components):
-            return RustUnifiedTreeCoreInspector(params)
+        return RustUnifiedTreeCoreInspector(params)
 
-    else:
-        inspector_factory = None
-
-    if inspector_factory is not None:
-        with (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(selected_backend),
-            mock.patch.dict(_TREE_CORE_REGISTRY, {selected_backend: inspector_factory}),
-        ):
-            cache = UnifiedRadixCache(params=cache_init_params)
-    else:
+    with (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(requested_backend),
+        mock.patch.dict(
+            _TREE_CORE_REGISTRY,
+            {"python": python_inspector_factory, "rust": rust_inspector_factory},
+        ),
+    ):
         cache = UnifiedRadixCache(params=cache_init_params)
+    assert cache._tree_core_backend == selected_backend
     assert isinstance(cache.tree_core, UnifiedTreeCoreInspectionInterface), (
         "The shared unified radix-cache unit suite requires a TreeCore backend "
         "that implements UnifiedTreeCoreInspectionInterface"
@@ -5682,8 +5679,8 @@ class UnifiedRadixCacheSuite:
             # Background prefetch/backup threads are daemon; stop them per-test.
             self.addCleanup(cache.cache_controller._stop_storage_threads)
 
-    def _build_hicache_fixture(self):
-        fixture = build_fixture(self.cfg)
+    def _build_hicache_fixture(self, tree_core_backend: Optional[str] = None):
+        fixture = build_fixture(self.cfg, tree_core_backend=tree_core_backend)
         cache, _, _ = fixture
         self._init_hicache(cache)
         return fixture
@@ -6510,11 +6507,10 @@ class UnifiedRadixCacheSuite:
             self.skipTest("requires SWA-only")
         if self.cfg.sliding_window_size <= self.cfg.page_size:
             self.skipTest("the window must reach past the leaf's own page")
-        if _selected_tree_core_test_backend() == "rust":
-            # needs_incremental_backup is a component method on Python nodes;
-            # the Rust core pins the same contract in its own unit suite.
-            self.skipTest("component-level check is Python-core only")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        # This test exercises the Python component's collector directly.
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
+            tree_core_backend="python"
+        )
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
         if len(chain) < 2:
             self.skipTest("chain too short")
@@ -10809,9 +10805,9 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         unlocks, so a leaf whose last lock is an auxiliary one is readmitted
         even when Full released first. Component-level replay of the Python
         core; the Rust crate covers its own order in its unit tests."""
-        if _selected_tree_core_test_backend() != "python":
-            self.skipTest("drives Python component objects directly")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, tree_core_backend="python"
+        )
         seq = self._make_seq(1, self.cfg.sliding_window_size)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)

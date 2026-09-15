@@ -4,11 +4,12 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 
 ## Usage
 
-Rust is the default for supported Linux installations with PyTorch 2.11 through
-2.13 and CPU or CUDA devices. When the backend is unset, session-aware caching,
-C128 or custom components, unsupported platforms, and installations without the
-extension or its sources use Python. Build, import, and runtime failures in
-supported configurations remain errors.
+Rust is temporarily the default to exercise broader CI coverage on supported
+Linux installations with PyTorch 2.11 through 2.13 and CPU or CUDA devices.
+The centralized tree-core registry resolves session-aware caching, C128 or custom
+components, unsupported platforms, and installations without the extension or
+its sources to Python. This policy also applies when Rust is explicitly selected.
+Build, import, and runtime failures in supported configurations remain errors.
 
 Select a backend explicitly with:
 
@@ -18,8 +19,8 @@ SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust
 SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 ```
 
-An explicit selection never falls back to another backend. Standard SGLang wheels
-bundle the production extension; some platform distributions omit it. A source checkout falls back to
+Standard SGLang wheels bundle the production extension; some platform
+distributions omit it. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
