@@ -180,6 +180,25 @@ class TestDefaultBackend(unittest.TestCase):
 
 
 class TestHiCacheMetrics(unittest.TestCase):
+    def test_multimodal_stages_use_injected_metric_backend(self):
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            collector = _RecordingTokenizerMetricsCollector(
+                labels={"model_name": "test"}
+            )
+        with self.assertRaisesRegex(ValueError, "bad image"):
+            with collector.mm_frontend.record("preprocess"):
+                raise ValueError("bad image")
+        labels = {"model_name": "test", "stage": "preprocess"}
+        self.assertEqual(
+            collector.mm_frontend._inflight.increments, [(labels, 1), (labels, -1)]
+        )
+        observations = collector.mm_frontend._duration.observations
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0][0], {**labels, "outcome": "error"})
+        self.assertGreaterEqual(observations[0][1], 0)
+
     def test_cached_tokens_uses_literal_storage_source(self):
         labels = {"model_name": "test"}
         with get_context().override_server_args(

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.mm_frontend_metrics import MultimodalFrontendMetrics
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
 )
@@ -1541,6 +1542,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+
+        self.mm_frontend = MultimodalFrontendMetrics(
+            labels=self.labels,
+            counter_cls=Counter,
+            gauge_cls=Gauge,
+            histogram_cls=Histogram,
+        )
 
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
