@@ -69,6 +69,46 @@ class TestKdaStateUpdateDispatch(CustomTestCase):
         ):
             self.assertFalse(chunk_delta_h._use_gfx950_128_config(**kwargs))
 
+    def test_fused_state_output_gate(self):
+        shape = (1, 128, 8, 128)
+        kwargs = dict(
+            q=torch.empty(shape, dtype=torch.bfloat16),
+            k=torch.empty(shape, dtype=torch.bfloat16),
+            v=torch.empty(shape, dtype=torch.bfloat16),
+            w=torch.empty(shape, dtype=torch.bfloat16),
+            gk=torch.empty(shape, dtype=torch.float32),
+            A=torch.empty((1, 128, 8, 64), dtype=torch.bfloat16),
+            initial_state=torch.empty((1, 8, 128, 128), dtype=torch.bfloat16),
+            cu_seqlens=torch.tensor([0, 128]),
+            num_chunks=2,
+        )
+        with patch.object(
+            chunk_delta_h,
+            "is_gfx95_supported",
+            return_value=True,
+        ):
+            self.assertTrue(chunk_delta_h.can_use_fused_kda_state_output(**kwargs))
+            for field, value in (
+                ("num_chunks", 1),
+                ("num_chunks", 5),
+                ("cu_seqlens", torch.tensor([0, 64, 128])),
+                ("q", torch.empty((1, 128, 4, 128), dtype=torch.bfloat16)),
+                ("gk", torch.empty(shape, dtype=torch.bfloat16)),
+                ("A", torch.empty((1, 128, 8, 32), dtype=torch.bfloat16)),
+            ):
+                with self.subTest(field=field):
+                    self.assertFalse(
+                        chunk_delta_h.can_use_fused_kda_state_output(
+                            **(kwargs | {field: value})
+                        )
+                    )
+        with patch.object(
+            chunk_delta_h,
+            "is_gfx95_supported",
+            return_value=False,
+        ):
+            self.assertFalse(chunk_delta_h.can_use_fused_kda_state_output(**kwargs))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
