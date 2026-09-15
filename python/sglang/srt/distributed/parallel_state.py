@@ -2849,6 +2849,13 @@ def create_custom_parallel_group(
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
+
+    NOTE: `group_ranks` must be the full rank list of the group, identical on
+    every rank of the world (e.g. obtained via get_process_group_ranks()).
+    Both paths below are world-collective: the general path performs a
+    world-size all_gather_object, and on NPU the fast path derives groups
+    locally from a rank-local check — a rank-local subset passed by only
+    some ranks would make ranks take different paths and deadlock.
     """
     assert torch.distributed.is_initialized()
 
