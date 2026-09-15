@@ -1197,6 +1197,25 @@ def select_candidate_blocks(
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
     query's newest position is always kept."""
+    if (
+        envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.get()
+        and torch.is_tensor(compress_lens)
+        and logits.dim() == 2
+    ):
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_logits,
+        )
+
+        _, keep = candidate_block_logits(
+            logits,
+            compress_lens.reshape(-1),
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+            published=None,
+        )
+        assert keep is not None
+        return keep
+
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
