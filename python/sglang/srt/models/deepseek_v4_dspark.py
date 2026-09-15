@@ -18,6 +18,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -637,9 +640,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        y = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=None, input_ids_global=None
-        )
+        # DSpark stages have separate weights and layer IDs from the target
+        # model, whose expert distribution recorder is shared with the draft.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            y = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=None, input_ids_global=None
+            )
         return y.view(shape)
 
 
