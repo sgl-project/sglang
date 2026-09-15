@@ -2360,6 +2360,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.data.float() * layer.w2_input_scale.data.float()
             )
 
+    def _get_flashinfer_cutedsl_fp8_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl_fp8 import (
+            FlashInferCuteDslFp8MoeQuantInfo,
+        )
+
+        # The contiguous grouped GEMM consumes the checkpoint's 128x128 fp32
+        # block scales as loaded; per-tensor, MXFP8 and FP4-expert checkpoints
+        # have no such scales.
+        if not self.block_quant or self.use_mxfp8 or self.is_fp4_expert:
+            raise ValueError(
+                "The flashinfer_cutedsl_fp8 MoE runner backend only supports "
+                "128x128 block-quantized FP8 MoE weights; use another "
+                "--moe-runner-backend for this model."
+            )
+        if self.with_bias:
+            raise ValueError(
+                "The flashinfer_cutedsl_fp8 MoE runner backend does not support "
+                "MoE GEMM biases (w13_weight_bias / w2_weight_bias)."
+            )
+        return FlashInferCuteDslFp8MoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale_inv=layer.w13_weight_scale_inv,
+            w2_weight_scale_inv=layer.w2_weight_scale_inv,
+            block_shape=list(self.quant_config.weight_block_size),
+        )
+
     def _get_hpc_ops_quant_info(self, layer: torch.nn.Module):
         from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsMoeQuantInfo
 
@@ -2526,6 +2553,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
             or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_flashinfer_cutedsl_fp8()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -2872,6 +2900,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
+        elif self.runner.runner_backend.is_flashinfer_cutedsl_fp8():
+            quant_info = self._get_flashinfer_cutedsl_fp8_quant_info(layer)
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

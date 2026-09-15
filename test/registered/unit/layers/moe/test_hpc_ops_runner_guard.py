@@ -8,7 +8,7 @@ import pytest
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
@@ -134,6 +134,33 @@ def test_deepep_v2_runner_backstop(_moe_flags):
     with pytest.raises(ValueError, match="deep_gemm"):
         MoeRunner(MoeRunnerBackend.TRITON, MoeRunnerConfig())
     assert MoeRunner(MoeRunnerBackend.DEEP_GEMM, MoeRunnerConfig()).runner_core
+
+
+def test_flashinfer_cutedsl_fp8_runner_rejected_off_sm100(_moe_flags):
+    # The CuTe DSL contiguous grouped FP8 GEMM only exists for SM100/SM103, so
+    # the runner must refuse at startup instead of failing inside a forward.
+    with override_platform(is_sm100=False):
+        with pytest.raises(ValueError, match="SM100"):
+            MoeRunner(MoeRunnerBackend.FLASHINFER_CUTEDSL_FP8, MoeRunnerConfig())
+
+
+def test_flashinfer_cutedsl_fp8_runner_registers_fused_func(_moe_flags, monkeypatch):
+    # Constructing the runner must import the backend module so its fused
+    # func for the standard ("none") dispatcher is registered; otherwise the
+    # runner has neither a core nor a fused func and raises NotImplementedError.
+    from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl_fp8
+
+    monkeypatch.setattr(
+        flashinfer_cutedsl_fp8, "has_flashinfer_cutedsl_fp8_group_gemm", lambda: True
+    )
+    _moe_flags.a2a_backend = MoeA2ABackend.NONE
+    with override_platform(is_sm100=True):
+        runner = MoeRunner(MoeRunnerBackend.FLASHINFER_CUTEDSL_FP8, MoeRunnerConfig())
+    assert runner.runner_core is None
+    assert (
+        runner.fused_func
+        is flashinfer_cutedsl_fp8.fused_experts_none_to_flashinfer_cutedsl_fp8
+    )
 
 
 if __name__ == "__main__":

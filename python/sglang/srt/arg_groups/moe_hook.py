@@ -84,6 +84,18 @@ def handle_moe_kernel_config(server_args: Any):
                 "moe_a2a_backend='none' or 'flashinfer'."
             )
 
+    if view.moe_runner_backend == "flashinfer_cutedsl_fp8":
+        # The runner consumes the checkpoint's 128x128 fp32 block scales;
+        # Fp8MoEMethod rejects per-tensor / MXFP8 layers at load time.
+        assert view.quantization in ["fp8", None], (
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuTe DSL FP8 "
+            "MoE supports only 128x128 block-quantized 'fp8' checkpoints."
+        )
+        assert view.moe_a2a_backend == "none", (
+            "flashinfer_cutedsl_fp8 supports moe_a2a_backend='none' only "
+            f"(standard dispatch), got '{view.moe_a2a_backend}'."
+        )
+
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
         assert view.quantization in [
             "modelopt_fp4",

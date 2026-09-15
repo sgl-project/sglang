@@ -147,6 +147,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_fp8",  # FlashInfer CuTe DSL blockwise FP8 grouped GEMM, SM100/SM103 only
     "flashinfer_megamoe",
     "cutlass",
     "aiter",
