@@ -951,6 +951,8 @@ class Envs:
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(False)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

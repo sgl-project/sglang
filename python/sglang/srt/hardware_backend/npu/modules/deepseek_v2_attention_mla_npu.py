@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Optional
+import logging
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch_npu
@@ -33,8 +34,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
+
+logger = logging.getLogger(__name__)
+
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
+_debug_dcp_extend_memory = envs.SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY.get()
 
 
 # region MHA
@@ -525,12 +530,55 @@ def forward_dsa_prepare_npu(
     )
 
 
+# Gathered rows per extend-gather collective. A bf16 latent row is 1024 bytes,
+# so a piece's scratch is at most 256 MiB (plus 32 MiB of rope key); a ~976k
+# prefix at dcp16 takes four collectives per layer instead of one.
+_DCP_EXTEND_GATHER_PIECE_ROWS = 1 << 18
+
+_last_dcp_extend_rows: Optional[Tuple[int, int]] = None
+
+
+def _log_dcp_extend_memory(prefix_rows: int, extend_rows: int) -> None:
+    """Log the previous DCP extend's peak device memory on this rank, then reset.
+
+    Called on the first layer of each DCP extend forward, so the peak spans one
+    whole forward -- plus whatever ran between the two extends, such as decode
+    steps. It is the number a chunk size and ``--mem-fraction-static`` have to
+    fit under; npu-smi shows only what the allocator has reserved, which at a
+    stall is the whole die.
+    """
+    global _last_dcp_extend_rows
+    if _last_dcp_extend_rows is not None:
+        gib = 1 << 30
+        logger.info(
+            "DCP extend memory: prefix=%d extend=%d peak_allocated=%.2f GiB "
+            "allocated=%.2f GiB reserved=%.2f GiB",
+            *_last_dcp_extend_rows,
+            torch.npu.max_memory_allocated() / gib,
+            torch.npu.memory_allocated() / gib,
+            torch.npu.memory_reserved() / gib,
+        )
+    torch.npu.reset_peak_memory_stats()
+    _last_dcp_extend_rows = (prefix_rows, extend_rows)
+
+
+def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
+    """Lay this rank's per-request shards out at their padded send offsets."""
+    send = shards.new_empty((plan.send_rows, *shards.shape[1:]))
+    src = dst = 0
+    for local_len, padded_len in zip(plan.local_lens, plan.padded_lens):
+        send[dst : dst + local_len] = shards[src : src + local_len]
+        src += local_len
+        dst += padded_len
+    return send
+
+
 def _dcp_gather_extend_kv_npu(
     m: "DeepseekV2AttentionMLA",
     forward_batch: "ForwardBatch",
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Materialise each request's FULL prefix+extend KV, for one layer.
 
     Under DCP a rank holds only 1/c of the context, so at extend it cannot
@@ -552,78 +600,104 @@ def _dcp_gather_extend_kv_npu(
     ``actual_seq_lengths_kv`` **cumulative**, which together require one
     contiguous run per request.
 
-    **One copy of the context per layer, not three.** The shared
-    ``all_gather_kv_cache_for_dcp`` reshapes the gathered KV into position
-    order and re-concatenates it per request, and the result was then copied
-    into the buffer: three copies of the whole context. At a ~1M prefix that is
-    ~3 GiB of transient memory per layer, and with decode capture reserving its
-    pool at ``--mem-fraction-static 0.76`` it filled the dies -- a prefix-cache
-    hit's first chunk stalled for minutes while every collective waited on
-    whichever rank was freeing memory. Here the shards are all-gathered straight
-    into a scratch buffer, rank-major as ``all_gather_into_tensor`` writes them,
-    this chunk's own KV is appended after them, and one ``index_select`` writes
-    every row into ``dcp_kv_buffer`` in position order
-    (``plan_dcp_extend_gather``). The plan, the send and scratch buffers and the
-    device index are built on the first layer of a forward and reused by the
-    rest.
+    **Nothing the size of the context outlives one layer's attention.** The
+    prefix is gathered in pieces of at most ``_DCP_EXTEND_GATHER_PIECE_ROWS``
+    rows, and each piece -- the gathered rows, rank-major as
+    ``all_gather_into_tensor`` writes them, then this chunk's own KV for the
+    requests that end in it -- is written straight into its place in the output
+    with one ``index_select`` (``plan_dcp_extend_gather``) before the next is
+    gathered. The output is returned as two contiguous tensors, the latent and
+    the rope key, and the caller drops them as soon as attention returns. The
+    peak is the output plus one piece -- about 1.3x the context at a ~976k
+    prefix -- and nothing context-sized is alive through the MoE.
+
+    Both halves were learned at ``--mem-fraction-static 0.76`` with decode
+    capture, where the dies have little headroom and a shortfall shows up as a
+    stall rather than an OOM: every collective waits on whichever rank is
+    freeing memory. The shared ``all_gather_kv_cache_for_dcp`` made three
+    transient copies of the context per layer on top of the planner's
+    ``dcp_kv_buffer``, and a ~976k prefix-cache hit's first chunk stalled for
+    minutes. A first rewrite (4c7684f874) cut the transient to one copy but kept
+    that scratch, and ``dcp_kv_buffer``, alive for the whole forward -- and the
+    stall came *earlier*, in the cold warm-up from a ~590k prefix. So the
+    binding peak is not the gather itself but whatever else runs while
+    context-sized tensors are held, which is why the planner's buffer is
+    released on the first layer (nothing on this path reads it) and the output
+    lives for one attention call.
+
+    The two keys are gathered and written separately, not as one 576-wide row,
+    because the operator takes them as separate tensors: slices of a wide buffer
+    are not contiguous, and non-contiguous inputs can cost a full-context copy
+    inside the operator.
 
     Only the prefix is gathered. This chunk's own KV is computed identically on
     every rank and arrives as ``k_nope``/``k_pe``, so it is copied in locally.
     """
+    parallel = get_parallel()
     md = forward_batch.attn_dcp_metadata
-    buf = md.dcp_kv_buffer
-    state = getattr(forward_batch, "npu_dcp_extend_gather", None)
-    if state is None:
-        parallel = get_parallel()
+    plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
+    if plan is None:
+        # Sized by the shared planner for the whole context, for CUDA's
+        # kernels. Nothing on this path reads it, and held it is a
+        # context-sized tensor alive through every layer.
+        md.dcp_kv_buffer = None
         plan = plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens_cpu,
             parallel.dcp_size,
             parallel.dcp_rank,
+            _DCP_EXTEND_GATHER_PIECE_ROWS,
         )
-        state = (
-            plan,
-            buf.new_empty((plan.send_rows, *buf.shape[1:])),
-            buf.new_empty((plan.gather_rows + plan.extend_rows, *buf.shape[1:])),
-            plan.index.to(buf.device),
+        plan = plan._replace(
+            pieces=[
+                piece._replace(index=piece.index.to(k_nope.device))
+                for piece in plan.pieces
+            ]
         )
-        forward_batch.npu_dcp_extend_gather = state
-    plan, send, scratch, index = state
-    rank_dim = m.kv_lora_rank
+        forward_batch.npu_dcp_extend_gather = plan
+        if _debug_dcp_extend_memory:
+            _log_dcp_extend_memory(
+                sum(forward_batch.extend_prefix_lens_cpu),
+                sum(forward_batch.extend_seq_lens_cpu),
+            )
 
-    # A batch with no cached prefix gathers nothing; every rank sees the same
-    # batch, so every rank skips the collective together.
-    if plan.gather_rows:
-        cache_k_nope, cache_k_rope = get_token_to_kv_pool().get_mla_kv_buffer(
+    total_rows = plan.pieces[-1].out_end if plan.pieces else 0
+    out_nope = k_nope.new_empty((total_rows, *k_nope.shape[1:]))
+    out_rope = k_pe.new_empty((total_rows, *k_pe.shape[1:]))
+
+    send_nope = send_rope = None
+    if plan.send_rows:
+        send_nope, send_rope = get_token_to_kv_pool().get_mla_kv_buffer(
             m.attn_mqa,
             md.dcp_local_prefix_kv_indices,
         )
-        if plan.local_lens == plan.padded_lens:
-            # Prefixes are dcp_size-aligned (the widened allocator page), so the
-            # local shards already fill the send buffer end to end.
-            send[..., :rank_dim] = cache_k_nope
-            send[..., rank_dim:] = cache_k_rope
-        else:
-            src = dst = 0
-            for local_len, padded_len in zip(plan.local_lens, plan.padded_lens):
-                send[dst : dst + local_len, ..., :rank_dim] = cache_k_nope[
-                    src : src + local_len
-                ]
-                send[dst : dst + local_len, ..., rank_dim:] = cache_k_rope[
-                    src : src + local_len
-                ]
-                src += local_len
-                dst += padded_len
-        get_parallel().dcp_group.all_gather_into_tensor(
-            scratch[: plan.gather_rows], send
-        )
+        if plan.local_lens != plan.padded_lens:
+            # Served prefixes are dcp_size-aligned (the widened allocator page)
+            # and need no padding; this is the general case.
+            send_nope = _pad_dcp_extend_send(send_nope, plan)
+            send_rope = _pad_dcp_extend_send(send_rope, plan)
 
-    own = scratch[plan.gather_rows :]
-    own[..., :rank_dim] = k_nope[: plan.extend_rows]
-    own[..., rank_dim:] = k_pe[: plan.extend_rows]
-    out = buf[: index.numel()]
-    torch.index_select(scratch, 0, index, out=out)
-    return out
+    # Every rank plans the same pieces, so every rank runs -- or, for a piece
+    # with no prefix rows, skips -- the same collectives in the same order.
+    for piece in plan.pieces:
+        gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
+        for out, send, own in (
+            (out_nope, send_nope, k_nope),
+            (out_rope, send_rope, k_pe),
+        ):
+            scratch = out.new_empty(
+                (gathered + piece.extend_end - piece.extend_start, *out.shape[1:])
+            )
+            if gathered:
+                parallel.dcp_group.all_gather_into_tensor(
+                    scratch[:gathered], send[piece.send_start : piece.send_end]
+                )
+            scratch[gathered:] = own[piece.extend_start : piece.extend_end]
+            torch.index_select(
+                scratch, 0, piece.index, out=out[piece.out_start : piece.out_end]
+            )
+            del scratch
+    return out_nope, out_rope
 
 
 def forward_dsa_core_npu(
@@ -648,18 +722,21 @@ def forward_dsa_core_npu(
     # context parallelism has to be composed here as well. This mirrors
     # forward_mla.py:640-809 rather than sharing it -- the two prepare/core
     # pairs have different shapes -- so the two must be kept in step by hand.
-    if (
+    dcp_extend = (
         get_parallel().dcp_enabled
         and forward_batch.forward_mode.is_extend()
         and not is_dcp_mla_decode_phase(forward_batch)
         and forward_batch.attn_dcp_metadata is not None
-    ):
+    )
+    if dcp_extend:
         # Extend under DCP: gather the context so this rank can see all of it,
-        # and hand the result to the backend through the metadata it already
-        # reads. Without this the backend attends over its own shard with a
-        # full-span page table -- in bounds and wrong, which is why generation
-        # came out fluent and unrelated to the prompt rather than crashing.
-        _dcp_gather_extend_kv_npu(m, forward_batch, k_nope, k_pe)
+        # and hand the result to the backend on the batch. Without this the
+        # backend attends over its own shard with a full-span page table -- in
+        # bounds and wrong, which is why generation came out fluent and
+        # unrelated to the prompt rather than crashing.
+        forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
+            m, forward_batch, k_nope, k_pe
+        )
 
     if is_dcp_mla_decode_phase(forward_batch):
         # Every rank attends with the FULL head set against its own KV shard and
@@ -724,6 +801,10 @@ def forward_dsa_core_npu(
             k_rope=k_pe.contiguous(),
             topk_indices=topk_indices,
         )
+    if dcp_extend:
+        # Dropped here, before the MoE, not at the end of the forward: held,
+        # the gathered context is alive through every layer's peak.
+        forward_batch.npu_dcp_extend_kv = None
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     if _is_npu_arch35 or (

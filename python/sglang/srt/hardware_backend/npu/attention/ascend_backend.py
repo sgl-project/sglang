@@ -1291,17 +1291,17 @@ class AscendAttnBackend(AttentionBackend):
             # This condition and the one guarding _dcp_gather_extend_kv_npu in
             # deepseek_v2_attention_mla_npu.py must select the same forwards. If
             # the model gathers and the backend does not, attention silently
-            # reads the sharded pool with a full-span page table; if the backend
-            # reads and the model did not gather, it reads a stale buffer. Both
-            # are wrong-but-plausible rather than loud, so they are written in
-            # the same shape and cross-referenced deliberately.
+            # reads the sharded pool with a full-span page table -- wrong but
+            # plausible rather than loud, so the two are written in the same
+            # shape and cross-referenced deliberately. The other direction is
+            # loud: the gathered KV lives for one layer's attention, so a
+            # backend that reads without a gather finds nothing and asserts.
             dcp_meta = forward_batch.attn_dcp_metadata
             dcp_extend = (
                 get_parallel().dcp_enabled
                 and forward_batch.forward_mode.is_extend()
                 and not dcp_decode
                 and dcp_meta is not None
-                and dcp_meta.dcp_kv_buffer is not None
             )
 
             key_nope, key_rope = k_nope, k_pe
@@ -1342,9 +1342,14 @@ class AscendAttnBackend(AttentionBackend):
                 # own output is already correct -- it selects within a request --
                 # and it is why the gather writes each request's KV as one
                 # contiguous run.
-                gathered = dcp_meta.dcp_kv_buffer
-                key_nope = gathered[..., : self.kv_lora_rank]
-                key_rope = gathered[..., self.kv_lora_rank :]
+                # Gathered for this layer alone by _dcp_gather_extend_kv_npu, as
+                # two contiguous tensors, and dropped as soon as this returns.
+                gathered = getattr(forward_batch, "npu_dcp_extend_kv", None)
+                assert gathered is not None, (
+                    "DCP extend reached the sparse operator without the model "
+                    "gathering this layer's context"
+                )
+                key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
                 layout_kv = "TND"

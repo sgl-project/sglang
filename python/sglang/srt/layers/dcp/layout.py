@@ -189,23 +189,38 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
 
 
+class DcpExtendGatherPiece(NamedTuple):
+    """One collective of the extend-time prefix gather.
+
+    Every rank sends rows ``[send_start, send_end)`` of its padded send, and the
+    all-gather lays them out rank-major; rows ``[extend_start, extend_end)`` of
+    this chunk's own KV are appended after them. ``index`` maps the output rows
+    ``[out_start, out_end)`` -- a contiguous run of the position-ordered output
+    -- to rows of that scratch.
+    """
+
+    send_start: int
+    send_end: int
+    extend_start: int
+    extend_end: int
+    out_start: int
+    out_end: int
+    index: torch.Tensor
+
+
 class DcpExtendGatherPlan(NamedTuple):
     """How one rank gathers a batch's prefix KV at extend.
 
     ``local_lens[i]`` rows of request i live on this rank; each rank sends them
     padded to ``padded_lens[i]`` so every rank's send is ``send_rows`` long. The
-    all-gather output is ``gather_rows = send_rows * dcp_size`` rows, rank-major.
-    ``index`` maps each row of the position-ordered buffer -- request 0's prefix
-    then extend, request 1's prefix then extend, ... -- to its row in
-    ``[gathered prefixes | extend_rows of this chunk's own KV]``.
+    output is position-ordered -- request 0's prefix then extend, request 1's
+    prefix then extend, ... -- and ``pieces`` tile it in order.
     """
 
     local_lens: List[int]
     padded_lens: List[int]
     send_rows: int
-    gather_rows: int
-    extend_rows: int
-    index: torch.Tensor
+    pieces: List[DcpExtendGatherPiece]
 
 
 def plan_dcp_extend_gather(
@@ -213,6 +228,7 @@ def plan_dcp_extend_gather(
     extend_lens: Sequence[int],
     dcp_size: int,
     dcp_rank: int,
+    max_piece_gather_rows: int,
 ) -> DcpExtendGatherPlan:
     """Plan the extend-time gather of the prefix KV into position order.
 
@@ -220,35 +236,117 @@ def plan_dcp_extend_gather(
     starting at position 0, rank r holds positions ``r, r + dcp_size, ...`` of a
     request in order, so position p sits in rank ``p % dcp_size``'s send at
     local row ``p // dcp_size``. Local shards are concatenated per request, as
-    the planner's ``dcp_local_prefix_kv_indices`` lists them. The index is the
-    same on every rank; only ``local_lens`` depends on ``dcp_rank``.
+    the planner's ``dcp_local_prefix_kv_indices`` lists them.
+
+    The sends are cut into pieces of ``max_piece_gather_rows // dcp_size`` rows
+    (at least one), so no collective gathers more than ``max_piece_gather_rows``
+    rows (at least ``dcp_size``) and the caller can write each piece into place
+    before gathering the next. Cuts fall on whole local rows, which keeps every
+    piece's output a contiguous run; small requests share a piece, and a
+    request's own KV rides in the piece its prefix ends in. The pieces and their
+    indices are the same on every rank; only ``local_lens`` depends on
+    ``dcp_rank``.
     """
     prefix_lens = [int(p) for p in prefix_lens]
     extend_lens = [int(e) for e in extend_lens]
     local_lens = [p // dcp_size + int(dcp_rank < p % dcp_size) for p in prefix_lens]
     padded_lens = [-(-p // dcp_size) for p in prefix_lens]
-    send_rows = sum(padded_lens)
-    gather_rows = send_rows * dcp_size
+    piece_rows = max(1, max_piece_gather_rows // dcp_size)
 
+    pieces = []
     parts = []
+    send_start = extend_start = out_start = 0
+    send_end = extend_end = out_end = 0
     send_offset = 0
-    extend_offset = gather_rows
     for prefix_len, extend_len, padded_len in zip(
         prefix_lens, extend_lens, padded_lens
     ):
-        pos = torch.arange(prefix_len, dtype=torch.int64)
-        parts.append((pos % dcp_size) * send_rows + send_offset + pos // dcp_size)
-        parts.append(
-            torch.arange(extend_offset, extend_offset + extend_len, dtype=torch.int64)
-        )
+        row = 0
+        while row < padded_len:
+            if send_end - send_start == piece_rows:
+                pieces.append(
+                    _dcp_extend_gather_piece(
+                        parts,
+                        dcp_size,
+                        send_start,
+                        send_end,
+                        extend_start,
+                        extend_end,
+                        out_start,
+                        out_end,
+                    )
+                )
+                parts = []
+                send_start, extend_start, out_start = send_end, extend_end, out_end
+            take = min(padded_len - row, piece_rows - (send_end - send_start))
+            positions = torch.arange(
+                row * dcp_size,
+                min((row + take) * dcp_size, prefix_len),
+                dtype=torch.int64,
+            )
+            parts.append(("prefix", positions, send_offset))
+            row += take
+            send_end += take
+            out_end += positions.numel()
+        if extend_len:
+            parts.append(("extend", extend_end, extend_len))
+            extend_end += extend_len
+            out_end += extend_len
         send_offset += padded_len
-        extend_offset += extend_len
-    index = torch.cat(parts) if parts else torch.empty(0, dtype=torch.int64)
+    if parts:
+        pieces.append(
+            _dcp_extend_gather_piece(
+                parts,
+                dcp_size,
+                send_start,
+                send_end,
+                extend_start,
+                extend_end,
+                out_start,
+                out_end,
+            )
+        )
     return DcpExtendGatherPlan(
         local_lens=local_lens,
         padded_lens=padded_lens,
-        send_rows=send_rows,
-        gather_rows=gather_rows,
-        extend_rows=sum(extend_lens),
-        index=index,
+        send_rows=sum(padded_lens),
+        pieces=pieces,
+    )
+
+
+def _dcp_extend_gather_piece(
+    parts,
+    dcp_size: int,
+    send_start: int,
+    send_end: int,
+    extend_start: int,
+    extend_end: int,
+    out_start: int,
+    out_end: int,
+) -> DcpExtendGatherPiece:
+    """Close one piece: index its output rows into its rank-major scratch."""
+    send_len = send_end - send_start
+    gathered_rows = send_len * dcp_size
+    index = []
+    for kind, first, second in parts:
+        if kind == "prefix":
+            # Position p of a request whose send starts at `second` is rank
+            # p % dcp_size's local row second + p // dcp_size.
+            positions, request_send_offset = first, second
+            index.append(
+                (positions % dcp_size) * send_len
+                + (request_send_offset - send_start)
+                + positions // dcp_size
+            )
+        else:
+            start = gathered_rows + first - extend_start
+            index.append(torch.arange(start, start + second, dtype=torch.int64))
+    return DcpExtendGatherPiece(
+        send_start=send_start,
+        send_end=send_end,
+        extend_start=extend_start,
+        extend_end=extend_end,
+        out_start=out_start,
+        out_end=out_end,
+        index=torch.cat(index),
     )
