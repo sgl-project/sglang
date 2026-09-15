@@ -285,6 +285,7 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
+        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
             self.token_to_kv_pool
         )
@@ -304,9 +305,11 @@ class PrefillBootstrapQueue:
         if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                draft_kv_pool.get_contiguous_buf_infos()
-            )
+            (
+                draft_kv_data_ptrs,
+                draft_kv_data_lens,
+                draft_kv_item_lens,
+            ) = draft_kv_pool.get_contiguous_buf_infos()
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -336,9 +339,11 @@ class PrefillBootstrapQueue:
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
-        )
+        (
+            kv_args.aux_data_ptrs,
+            kv_args.aux_data_lens,
+            kv_args.aux_item_lens,
+        ) = self.metadata_buffers.get_buf_infos()
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
 
@@ -387,6 +392,8 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if hasattr(kv_manager, "enable_prefill_admission_guard"):
+            kv_manager.enable_prefill_admission_guard()
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
@@ -408,6 +415,11 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        if (
+            hasattr(self.kv_manager, "register_prefill_room")
+            and req.bootstrap_room is not None
+        ):
+            self.kv_manager.register_prefill_room(req.bootstrap_room)
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -495,6 +507,9 @@ class PrefillBootstrapQueue:
 
         bootstrapped_reqs = []
         indices_to_remove = set()
+
+        if hasattr(self.kv_manager, "sweep_stale_rooms"):
+            self.kv_manager.sweep_stale_rooms()
 
         if len(self.queue) == 0:
             return []
