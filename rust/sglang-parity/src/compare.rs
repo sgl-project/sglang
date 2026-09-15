@@ -31,11 +31,22 @@ pub enum ValueRequirement {
     NonNegativeNumber,
 }
 
+/// Whether an exception requires its field; optional fields retain their absence.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldPresence {
+    #[default]
+    Required,
+    Optional,
+}
+
 /// One literal JSON Pointer and the documented reason its value may vary.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValueException {
     pub path: String,
+    #[serde(default)]
+    pub presence: FieldPresence,
     pub require: ValueRequirement,
     pub reason: String,
 }
@@ -106,7 +117,7 @@ impl Violation {
     }
 }
 
-/// Validate every declared path, then replace only its value in a full copy.
+/// Validate declared values, then replace them in a full copy, preserving absence.
 ///
 /// Callers validate configuration before starting services. This function also
 /// rejects invalid rules so direct library calls cannot silently weaken checks.
@@ -134,7 +145,9 @@ pub fn prepare_comparison(
         for rule in &rules.per_result_value_exceptions {
             let path = format!("{prefix}{}", rule.path);
             let Some(value) = original.pointer(&path) else {
-                violations.push(Violation::new(path, "required exception path is missing"));
+                if rule.presence == FieldPresence::Required {
+                    violations.push(Violation::new(path, "required exception path is missing"));
+                }
                 continue;
             };
             let (valid, replacement, message) = match rule.require {
@@ -327,6 +340,73 @@ mod tests {
     }
 
     #[test]
+    fn optional_fields_validate_present_values_and_preserve_presence_differences() {
+        let rules: ComparisonRules = serde_json::from_value(json!({
+            "base": "exact_json",
+            "per_result_value_exceptions": [{
+                "path": "/time", "presence": "optional",
+                "require": "non_negative_number", "reason": "Elapsed time."
+            }]
+        }))
+        .unwrap();
+        for scope in [ComparisonScope::Root, ComparisonScope::TopLevelArrayItems] {
+            let wrap = |value: Value| match scope {
+                ComparisonScope::Root => value,
+                ComparisonScope::TopLevelArrayItems => json!([{"time": 5}, value]),
+            };
+            let path = if scope == ComparisonScope::Root {
+                "/time"
+            } else {
+                "/1/time"
+            };
+            for (left, right, expected) in [
+                (json!({"time": 1}), json!({"time": 2.5}), None),
+                (json!({}), json!({}), None),
+                (
+                    json!({"time": 0}),
+                    json!({}),
+                    Some(DifferenceKind::MissingRight),
+                ),
+                (
+                    json!({}),
+                    json!({"time": 1}),
+                    Some(DifferenceKind::MissingLeft),
+                ),
+            ] {
+                let (left, right) = (wrap(left), wrap(right));
+                let originals = (left.clone(), right.clone());
+                let prepared_left = prepare_comparison(&left, scope, &rules).unwrap();
+                let prepared_right = prepare_comparison(&right, scope, &rules).unwrap();
+                let differences = compare_json(&prepared_left, &prepared_right);
+                assert_eq!(
+                    differences
+                        .iter()
+                        .map(|d| (d.path.as_str(), d.kind))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .map(|kind| (path, kind))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!((left, right), originals);
+            }
+            for invalid in [
+                json!(null),
+                json!("1"),
+                json!(-1),
+                json!(true),
+                json!([]),
+                json!({}),
+            ] {
+                let errors =
+                    prepare_comparison(&wrap(json!({"time": invalid})), scope, &rules).unwrap_err();
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, path);
+            }
+        }
+    }
+
+    #[test]
     fn empty_exception_list_preserves_error_responses_and_has_no_defaults() {
         let mut rules = rules();
         rules.per_result_value_exceptions.clear();
@@ -363,9 +443,11 @@ mod tests {
         let mut invalid = rules();
         invalid.per_result_value_exceptions[0].reason = " \n".into();
         assert!(invalid.validate().is_err());
-        let mut value = serde_json::to_value(rules()).unwrap();
-        value["per_result_value_exceptions"][0]["require"] = json!("anything");
-        assert!(serde_json::from_value::<ComparisonRules>(value).is_err());
+        for key in ["require", "presence"] {
+            let mut value = serde_json::to_value(rules()).unwrap();
+            value["per_result_value_exceptions"][0][key] = json!("anything");
+            assert!(serde_json::from_value::<ComparisonRules>(value).is_err());
+        }
     }
 
     #[test]

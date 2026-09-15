@@ -16,6 +16,12 @@
         "path": "/meta_info/e2e_latency",
         "require": "non_negative_number",
         "reason": "Elapsed time varies across runs."
+      },
+      {
+        "path": "/meta_info/response_sent_to_client_ts",
+        "presence": "optional",
+        "require": "non_negative_number",
+        "reason": "Response timestamps vary between requests and may be absent from final streaming responses."
       }
     ]
   },

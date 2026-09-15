@@ -630,6 +630,17 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
     );
     assert_eq!(default_json["suite"]["cases"].as_array().unwrap().len(), 10);
     assert_eq!(default_json["repeats_per_implementation"], 2);
+    let rules = default_json["suite"]["comparison"]["per_result_value_exceptions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .map(|rule| rule["presence"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["required", "required", "optional"]
+    );
+    assert_eq!(rules[2]["path"], "/meta_info/response_sent_to_client_ts");
     let external_path = directory.path().join("suite.json");
     fs::write(
         &external_path,
