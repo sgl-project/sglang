@@ -228,6 +228,18 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
+    if server_args.tokenizer_worker_device == "cpu":
+        # Prevent the tokenizer worker from creating a CUDA context on the
+        # default device; the CPU transport path does not need one.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        if server_args.mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+            logger.warning(
+                "tokenizer_worker_device=cpu forces mm_feature_transport to cpu "
+                "(was %s)",
+                server_args.mm_feature_transport,
+            )
+            server_args.mm_feature_transport = "cpu"
+
     publish(server_args, role="tokenizer")
 
     # API key authentication is not supported in multi-tokenizer mode
