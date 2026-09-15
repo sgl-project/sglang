@@ -231,14 +231,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Sliding-window token ids as the PD transfer engine addresses them.
-
-        The sibling of `translate_kv_indices_for_transfer` for the SWA state
-        component. On a static pool the sliding-window buffers are indexed by
-        the same ids the kernels use, so the read-path translate IS the answer.
-        A virtual-id pool must override: the transfer addresses raw bytes and
-        needs PHYSICAL ids, not kernel-facing ones.
-        """
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
         return self.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):

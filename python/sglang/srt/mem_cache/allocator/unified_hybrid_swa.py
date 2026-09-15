@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, TypeGuard
 
 import torch
 from torch.profiler import record_function
@@ -42,6 +42,13 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
+
+
+def supports_swa_byte_budget(
+    allocator: BaseTokenToKVPoolAllocator | None,
+) -> TypeGuard[UnifiedSWATokenToKVPoolAllocator]:
+    """Whether FULL/SWA demand can be checked against a two-pool byte budget."""
+    return isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
 
 
 class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
@@ -1086,14 +1093,17 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
                 hi = mid - 1
         return lo
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
+    def evict_to_free_tokens(
+        self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
+    ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         if tree_cache is None or tree_cache.is_chunk_cache():
             return
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
         reclaim_plan = self.reclaim_plan(
             num_tokens,
-            num_tokens,
+            required_swa,
             full_evictable_tokens=tree_cache.full_evictable_size(),
             swa_evictable_tokens=tree_cache.swa_evictable_size(),
         )
@@ -1105,7 +1115,69 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
-        return self.ensure_capacity(num_tokens, num_tokens)
+        return self.ensure_capacity(num_tokens, required_swa)
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Allocate full KV for an extend and SWA KV only for its aligned tail."""
+        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            assert self.page_size > 1
+            assert len(seq_lens_cpu) == len(prefix_lens_cpu) == 1
+            prefix_len = int(prefix_lens_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            assert seq_len - prefix_len == extend_num_tokens
+            assert 0 <= swa_tail_len <= extend_num_tokens
+            tail_start = seq_len - swa_tail_len
+            assert prefix_len <= tail_start
+            assert swa_tail_len == 0 or tail_start % self.page_size == 0, (
+                "unified SWA tail allocation requires a page-aligned tail; "
+                f"got extend_num_tokens={extend_num_tokens}, "
+                f"tail_len={swa_tail_len}, page_size={self.page_size}"
+            )
+
+            num_full_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+            if not self.ensure_capacity(
+                num_full_pages * self.page_size,
+                num_swa_pages * self.page_size,
+            ):
+                return None
+
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_full_pages].clone()
+            tail_virtual_pages = (
+                new_virtual_pages[-num_swa_pages:]
+                if num_swa_pages > 0
+                else new_virtual_pages[:0]
+            )
+            out_indices = fa.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_full_pages,
+            )
+            assert out_indices is not None, (
+                "UnifiedSWA.alloc_extend_swa_tail: full.alloc_extend returned "
+                "None after the capacity check passed"
+            )
+            if num_swa_pages > 0:
+                self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
+            return out_indices
 
     def verify_byte_accounting(self) -> List[str]:
         return (
