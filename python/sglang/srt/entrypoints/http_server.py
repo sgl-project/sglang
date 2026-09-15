@@ -913,12 +913,24 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        from sglang.srt.multimodal.video_cache import has_video_cache_ids
+
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+        first_out = None
+        if has_video_cache_ids(obj.video_data):
+            # Like chat streaming, validate caller-ID requests before sending
+            # HTTP 200. Advancing the real generator also works with tokenizer
+            # workers and batched requests, without duplicating validation.
+            try:
+                first_out = await generator.__anext__()
+            except ValueError as e:
+                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                if first_out is not None:
+                    yield b"data: " + dumps_json(first_out) + b"\n\n"
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
