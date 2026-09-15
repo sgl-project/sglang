@@ -61,6 +61,7 @@ class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+    _embed_and_head_shared: bool = False
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
@@ -104,6 +105,23 @@ class EagleDraftWorkerBase(ABC):
 
     def alloc_memory_pool(self, **kwargs):
         pass
+
+    def share_target_embed_and_head(self) -> None:
+        """Bind the target's embedding/lm_head into the draft model(s).
+
+        MTP-style drafts build their own vocab-sized embed + lm_head while
+        loading and hand both back here (2 * vocab * hidden / tp bytes -- 2.4
+        GiB for a 248k vocab at tp=2). The scheduler calls this before the
+        target KV pool is sized so those bytes reach the KV cache instead of
+        being stranded; alloc_memory_pool() calls it again and hits the guard.
+        """
+        if self._embed_and_head_shared:
+            return
+        self._embed_and_head_shared = True
+        init_token_map = getattr(self, "init_token_map", None)
+        if init_token_map is not None:
+            init_token_map()
+        self.init_lm_head()
 
     def init_attention_backends(self):
         """Subclasses wrap this with their context managers (draft_tp_context,
@@ -189,6 +207,14 @@ class BaseSpecWorker(ABC):
         # dflash / dspark drive the draft model through a plain TpModelWorker;
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
+
+    def share_target_embed_and_head(self) -> None:
+        """Hand the target's embedding/lm_head to the draft worker, if it wants
+        them. No-op for algorithms whose draft owns its own vocab layers (or has
+        no draft worker at all)."""
+        share = getattr(self.draft_worker, "share_target_embed_and_head", None)
+        if share is not None:
+            share()
 
     @property
     def graph_memory_usage(self) -> dict[str, float]:
