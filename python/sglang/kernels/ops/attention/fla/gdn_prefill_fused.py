@@ -230,9 +230,9 @@ def gdn_prefill_fused(
     assert qkv_dim == 2 * num_qk_heads * head_qk_dim + num_v_heads * head_v_dim
     assert mixed_qkv.stride(1) == 1, "fused path requires a row-contiguous mixed_qkv"
     assert head_qk_dim == 128, "norm body is the verified BD=128 clone shape"
-    assert (
-        num_v_heads & (num_v_heads - 1) == 0
-    ), "matched gating tile requires power-of-two num_v_heads (tl.arange)"
+    assert num_v_heads & (num_v_heads - 1) == 0, (
+        "matched gating tile requires power-of-two num_v_heads (tl.arange)"
+    )
     assert A_log.shape == dt_bias.shape == (num_v_heads,)
     assert a.shape == b.shape == (seq_len, num_v_heads)
     assert a.stride(1) == 1 and b.stride(1) == 1

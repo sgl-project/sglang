@@ -746,9 +746,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         if out is not None:
             expected_shape = (1, total_seq_len, num_v_heads, head_v_dim)
-            assert (
-                out.shape == expected_shape
-            ), f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
+            assert out.shape == expected_shape, (
+                f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
+            )
         output_buf = out.squeeze(0) if out is not None else None
 
         # When no request in the batch has a prefix, skip the pool gather and
