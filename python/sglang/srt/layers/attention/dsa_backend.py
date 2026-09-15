@@ -510,7 +510,9 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
+            _flashinfer_sparse_mla_max_tokens,
             _validate_flashinfer_sparse_mla_backend,
+            create_flashinfer_sparse_mla_runner,
         )
 
         uses_flashinfer_sparse_mla = _validate_flashinfer_sparse_mla_backend(
@@ -529,6 +531,20 @@ class DeepseekSparseAttnBackend(
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
+            )
+            max_runner_tokens = _flashinfer_sparse_mla_max_tokens(
+                chunked_prefill_size=model_runner.server_args.chunked_prefill_size,
+                max_prefill_tokens=model_runner.server_args.max_prefill_tokens,
+                context_len=model_runner.model_config.context_len,
+                max_running_requests=model_runner.max_running_requests,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            )
+            self.flashinfer_sparse_mla_runner = create_flashinfer_sparse_mla_runner(
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                max_num_tokens=max_runner_tokens,
+                max_num_heads=self.num_q_heads,
+                device=model_runner.device,
             )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -2821,6 +2837,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1,
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
+            runner=self.flashinfer_sparse_mla_runner,
             page_size=self.real_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,
