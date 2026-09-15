@@ -1,30 +1,9 @@
-"""Ordering regression for ``BreakableCudaGraphBackend.capture_one`` — CPU-only.
-
-Bug mechanism (black-box): ``capture_one`` runs two eager warmup iterations and,
-on each, calls ``post_warmup_hook`` — the hook the attention backend uses to reset
-state that warmup mutated. It then constructs the ``BreakableCUDAGraph`` and enters
-capture. Between the *final* warmup/hook and that construction there was no
-device synchronize and no TP barrier, so asynchronous work still in flight from the
-last warmup (or from the hook) could straddle the capture boundary, and the TP ranks
-were not aligned before one of them started capturing.
-
-``FullCudaGraphBackend.capture_one`` has the same warmup-to-capture completion gap;
-closing it there is what #33795 proposes. This case pins the invariant for the
-breakable backend, which is the default prefill graph backend on CUDA.
-
-Guarded invariant — after the last ``post_warmup_hook`` and before the
-``BreakableCUDAGraph`` is constructed there must be at least one
-``device_module.synchronize()`` followed by at least one ``tp_group.barrier()``.
-A future diff that drops either call, or reorders them, turns this case red.
-
-The real capture path needs CUDA (breakable graph capture + device graph pool), so
-the graph type and its capture context are mocked; the logic under test (call
-counts and call ordering) is pure Python and runs on CPU.
-"""
+"""Ordering regression for Breakable CUDA Graph capture initialization."""
 
 import contextlib
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -40,9 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def _make_backend(call_log):
-    """Build a ``BreakableCudaGraphBackend`` without running ``__init__`` (which
-    would touch CUDA), wiring just the attributes ``capture_one`` reads."""
+def _make_backend(call_log: list[str]) -> BreakableCudaGraphBackend:
     backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
@@ -66,15 +43,15 @@ class TestBreakableCaptureOrdering(CustomTestCase):
     def test_syncs_after_final_warmup_before_graph_construction(self):
         call_log = []
 
-        def forward_fn():
+        def forward_fn() -> None:
             call_log.append("forward")
             return None
 
-        def post_warmup_hook():
+        def post_warmup_hook() -> None:
             call_log.append("post_warmup_hook")
 
         class FakeBreakableCUDAGraph:
-            def __init__(self, *args, **kwargs):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 call_log.append("breakable_cudagraph_create")
 
         with mock.patch.object(
