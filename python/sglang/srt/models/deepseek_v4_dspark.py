@@ -503,6 +503,35 @@ class DSparkV4MarkovHead(nn.Module):
         full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
+    @property
+    def supports_sharded_greedy(self) -> bool:
+        return self._tp_shard is not None and self._opt_markov_w2_bf16
+
+    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+        if not self.supports_sharded_greedy or not base_logits.is_cuda:
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
+            sharded_greedy_step,
+        )
+
+        shard = self._tp_shard
+        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
+        prev = first_prev_tokens.long()
+        tokens = []
+        for step in range(base_logits.shape[1]):
+            latent = self.get_prev_embeddings(prev)
+            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
+            bias = F.linear(latent.to(weight.dtype), weight)
+            prev = sharded_greedy_step(
+                bias,
+                base_logits[:, step],
+                group=self._shard_group,
+                vocab_start=shard.org_vocab_start,
+                gather=self._vocab_gather.gather_stacked,
+            )
+            tokens.append(prev)
+        return torch.stack(tokens, dim=1)
+
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
@@ -909,6 +938,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+            # The FlashMLA writer reads an explicit KV row stride. Keep the
+            # stacked projection's views and avoid a copy for every draft stage.
+            allow_strided_output=(
+                get_platform().is_blackwell
+                and not is_unified_kv_triton()
+                and not pool.uniform_fp8
+            ),
         )
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
@@ -979,7 +1015,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 

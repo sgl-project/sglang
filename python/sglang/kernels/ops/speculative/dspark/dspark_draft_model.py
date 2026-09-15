@@ -384,9 +384,14 @@ class CommitKvProj:
         *,
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
+        allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
         if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
-            return cls.triton(main_x=main_x, wkv_linears=wkv_linears)
+            return cls.triton(
+                main_x=main_x,
+                wkv_linears=wkv_linears,
+                allow_strided_output=allow_strided_output,
+            )
         return cls.torch(main_x=main_x, wkv_linears=wkv_linears)
 
     @classmethod
@@ -404,8 +409,13 @@ class CommitKvProj:
         *,
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
+        allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        return commit_kv_proj_fused(main_x=main_x, wkv_linears=wkv_linears)
+        return commit_kv_proj_fused(
+            main_x=main_x,
+            wkv_linears=wkv_linears,
+            allow_strided_output=allow_strided_output,
+        )
 
 
 def commit_kv_proj(
@@ -420,6 +430,7 @@ def commit_kv_proj_fused(
     *,
     main_x: torch.Tensor,
     wkv_linears: list[torch.nn.Module],
+    allow_strided_output: bool = False,
 ) -> list[torch.Tensor]:
     num_stages = len(wkv_linears)
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
@@ -446,10 +457,8 @@ def commit_kv_proj_fused(
         kv_all = torch.nn.functional.linear(main_x, stacked.weight)
 
     head_dim = kv_all.shape[-1] // num_stages
-    return [
-        kv_all[:, i * head_dim : (i + 1) * head_dim].contiguous()
-        for i in range(num_stages)
-    ]
+    slices = list(kv_all.split(head_dim, dim=-1))
+    return slices if allow_strided_output else [kv.contiguous() for kv in slices]
 
 
 class _StackedWkvWeight(msgspec.Struct):

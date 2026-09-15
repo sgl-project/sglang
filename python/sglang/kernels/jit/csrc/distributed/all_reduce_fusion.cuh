@@ -99,7 +99,100 @@ struct FinalizeAllReduceParams {
   uint32_t num_tokens;
   uint32_t num_push_counters;  // full counter array size (bumper range end)
   PushWorkSpace<kWorldSize> ws;
+  bf16_t* mhc_out = nullptr;
+  const bf16_t* residual = nullptr;
+  const float* post = nullptr;
+  const float* comb = nullptr;
+  const float* pre = nullptr;
+  bf16_t* normalized = nullptr;
+  fp8_e4m3_t* quantized = nullptr;
+  uint8_t* scales = nullptr;
 };
+
+template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
+SGL_DEVICE void mhc_quant_vec(
+    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& value, uint32_t token, uint32_t hvec) {
+  using namespace device;
+  fp32x2_t v[4];
+  float amax = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    v[j] = cast<fp32x2_t>(value[j]);
+    amax = fmaxf(amax, fmaxf(fabsf(v[j].x), fabsf(v[j].y)));
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
+  const float normalized = amax * (1.0f / 448.0f);
+  const uint32_t bits = __float_as_uint(normalized);
+  const uint32_t exponent = (bits >> 23) & 255;
+  const uint32_t mantissa = bits & 0x7fffff;
+  const bool bump = mantissa != 0 && !(exponent == 0 && mantissa <= 0x400000);
+  const uint32_t sf = normalized <= 0 ? 0 : min(exponent + uint32_t(bump), 254u);
+  const float inv_scale = __uint_as_float(sf == 0 ? 0 : (254 - sf) << 23);
+  AlignedVector<fp8x2_e4m3_t, 4> q;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    q[j] = cast<fp8x2_e4m3_t>(
+        fp32x2_t{fminf(fmaxf(v[j].x * inv_scale, -448.0f), 448.0f), fminf(fmaxf(v[j].y * inv_scale, -448.0f), 448.0f)});
+  }
+  q.store(params.quantized + static_cast<int64_t>(token) * kHiddenDim, hvec);
+  if (hvec % 4 == 0) {
+    const uint32_t g = hvec / 4;
+    const uint32_t off = (g / 4) * 512 + ((token % 32) * 4 + (token / 32) % 4) * 4 + g % 4;
+    params.scales[off] = sf;
+  }
+}
+
+/// Apply HC=4 post mixing to an already BF16-rounded all-reduce vector.
+/// Match mhc_post_split_h: round comb[0]*residual[0], then FMA post*x,
+/// then FMA the remaining three residual streams in order.
+template <uint32_t kHiddenDim, bool kCollapse = false, uint32_t kWorldSize, typename WeightT>
+SGL_DEVICE StageVec mhc_post_vec(
+    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& red, uint32_t token, uint32_t hvec) {
+  using namespace device;
+  StageVec residual[4];
+  fp32x2_t collapsed[4] = {};
+#pragma unroll
+  for (uint32_t c = 0; c < 4; ++c) {
+    residual[c].load(params.residual + (static_cast<int64_t>(token) * 4 + c) * kHiddenDim, hvec);
+  }
+#pragma unroll
+  for (uint32_t c = 0; c < 4; ++c) {
+    const float post = params.post[token * 4 + c];
+    float comb[4];
+#pragma unroll
+    for (uint32_t r = 0; r < 4; ++r)
+      comb[r] = params.comb[token * 16 + r * 4 + c];
+    StageVec out;
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const auto x = cast<fp32x2_t>(red[j]);
+      const auto r0 = cast<fp32x2_t>(residual[0][j]);
+      fp32x2_t acc{fmaf(post, x.x, __fmul_rn(comb[0], r0.x)), fmaf(post, x.y, __fmul_rn(comb[0], r0.y))};
+#pragma unroll
+      for (uint32_t r = 1; r < 4; ++r) {
+        const auto v = cast<fp32x2_t>(residual[r][j]);
+        acc.x = fmaf(comb[r], v.x, acc.x);
+        acc.y = fmaf(comb[r], v.y, acc.y);
+      }
+      out[j] = cast<bf16x2_t>(acc);
+      if constexpr (kCollapse) {
+        const auto rounded = cast<fp32x2_t>(out[j]);
+        const float pre = params.pre[token * 4 + c];
+        collapsed[j].x = fmaf(rounded.x, pre, collapsed[j].x);
+        collapsed[j].y = fmaf(rounded.y, pre, collapsed[j].y);
+      }
+    }
+    out.store(params.mhc_out + (static_cast<int64_t>(token) * 4 + c) * kHiddenDim, hvec);
+  }
+  StageVec result;
+  if constexpr (kCollapse) {
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j)
+      result[j] = cast<bf16x2_t>(collapsed[j]);
+  }
+  return result;
+}
 
 /// Row geometry: one 16B vector per thread, one cluster per row, so the block
 /// size follows from the hidden width and the cluster size. The cluster size
@@ -215,7 +308,9 @@ template <
     bool kUsePDL,
     bool kHasShared,
     bool kNorm,
-    typename WeightT>
+    typename WeightT,
+    bool kMhc = false,
+    bool kQuant = false>
 __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ FinalizeAllReduceParams<kWorldSize, WeightT> params) {
@@ -243,6 +338,15 @@ __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBloc
 
   if (row_idx == params.num_tokens) {
     PDLWaitPrimary<kUsePDL>();
+    if constexpr (kQuant) {
+      // The SF buffer is padded to 128 rows. Active rows are written by the
+      // norm epilogue; the existing bumper zeros only the disjoint padding.
+      for (uint32_t off = hvec; off < (kHiddenDim / 32) * 128; off += kRowVecs) {
+        const uint32_t swizzled_row = (off % 512) / 4;
+        const uint32_t row = swizzled_row / 4 + (swizzled_row % 4) * 32;
+        if (row >= params.num_tokens) params.scales[off] = 0;
+      }
+    }
     if (cluster_rank == 0) {
       const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
       __syncthreads();
@@ -302,12 +406,17 @@ __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBloc
   if constexpr (!kNorm) {
     const auto red = reduce_vec(vec);
     ptx::st_global_16B(red, params.out, vid);
+    if constexpr (kMhc) mhc_post_vec<kHiddenDim>(params, red, row_idx, hvec);
     // ensure epoch is consumed, so flipping it won't lead to error
     barrier_cluster_wait();
   } else {
     // push to peer
     __shared__ float smem_sq[kClusterSize][kNumWarps];
-    const auto red = reduce_vec(vec);
+    auto red = reduce_vec(vec);
+    if constexpr (kMhc) {
+      ptx::st_global_16B(red, params.out, vid);
+      red = mhc_post_vec<kHiddenDim, true>(params, red, row_idx, hvec);
+    }
     StageVec w;
     w.load(params.norm_weight, hvec);
     const auto cluster = cg::this_cluster();
@@ -341,7 +450,8 @@ __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBloc
       const auto [wa, wb] = cast<fp32x2_t>(w[j]);
       out[j] = cast<bf16x2_t>(fp32x2_t{acc[j].x * factor * wa, acc[j].y * factor * wb});
     }
-    ptx::st_global_16B(out, params.out, vid);
+    ptx::st_global_16B(out, kMhc ? params.normalized : params.out, vid);
+    if constexpr (kQuant) mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
   }
   PDLTriggerSecondary<kUsePDL>();
 
@@ -364,7 +474,9 @@ template <
     uint32_t kTopK,
     uint32_t kClusterSize,
     bool kUsePDL,
-    typename WeightT>
+    typename WeightT,
+    bool kMhc = false,
+    bool kQuant = false>
 struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
@@ -373,8 +485,17 @@ struct MoeFinalizeAllReduceKernel {
   using Trait = AllReduceNormTrait<kHiddenDim, kClusterSize>;
 
   template <bool kHasShared, bool kNorm>
-  static constexpr auto kernel =
-      moe_finalize_all_reduce_kernel<kWorldSize, kHiddenDim, kTopK, kClusterSize, kUsePDL, kHasShared, kNorm, WeightT>;
+  static constexpr auto kernel = moe_finalize_all_reduce_kernel<
+      kWorldSize,
+      kHiddenDim,
+      kTopK,
+      kClusterSize,
+      kUsePDL,
+      kHasShared,
+      kNorm,
+      WeightT,
+      kMhc,
+      kQuant>;
 
  public:
   /// out = [allreduce over ranks of] finalize(gemm2_out, idx, weights) [+ shared] [-> RMSNorm(norm_weight, eps)].
@@ -390,6 +511,143 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> norm_weight,
       double eps,
       bool prefetch_metadata) {
+    static_assert(!kMhc);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        prefetch_metadata,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt);
+  }
+
+  /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
+  static void run_mhc(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView mhc_out,
+      TensorView residual,
+      TensorView post,
+      TensorView comb) {
+    static_assert(kMhc);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        std::nullopt,
+        0.0,
+        false,
+        mhc_out,
+        residual,
+        post,
+        comb);
+  }
+
+  static void run_mhc_norm(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView mhc_out,
+      TensorView residual,
+      TensorView post,
+      TensorView comb,
+      TensorView pre,
+      TensorView norm_weight,
+      double eps,
+      TensorView normalized) {
+    static_assert(kMhc);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        false,
+        mhc_out,
+        residual,
+        post,
+        comb,
+        pre,
+        normalized);
+  }
+
+  static void run_mhc_quant(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView mhc_out,
+      TensorView residual,
+      TensorView post,
+      TensorView comb,
+      TensorView pre,
+      TensorView norm_weight,
+      double eps,
+      TensorView normalized,
+      TensorView quantized,
+      TensorView scales) {
+    static_assert(kMhc && kQuant);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        false,
+        mhc_out,
+        residual,
+        post,
+        comb,
+        pre,
+        normalized,
+        quantized,
+        scales);
+  }
+
+ private:
+  static void run_impl(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      std::optional<TensorView> norm_weight,
+      double eps,
+      bool prefetch_metadata,
+      std::optional<TensorView> mhc_out,
+      std::optional<TensorView> residual,
+      std::optional<TensorView> post,
+      std::optional<TensorView> comb,
+      std::optional<TensorView> pre = std::nullopt,
+      std::optional<TensorView> normalized = std::nullopt,
+      std::optional<TensorView> quantized = std::nullopt,
+      std::optional<TensorView> scales = std::nullopt) {
     using namespace host;
     const auto& comm = *ref.get();
     const auto& push = comm.get_push_obj();
@@ -433,6 +691,29 @@ struct MoeFinalizeAllReduceKernel {
           .verify(norm_weight.value());
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    if constexpr (kQuant) {
+      CHECK_HOST(num_tokens <= 8);
+      CHECK_HOST(norm_weight.has_value());
+      TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
+      TensorMatcher({(kHiddenDim / 32) * 128})
+          .with_dtype<uint8_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(scales.value());
+    }
+    if constexpr (kMhc) {
+      static_assert(kHiddenDim == 5120);
+      if (norm_weight.has_value()) {
+        TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(pre.value());
+        TensorMatcher({T, kHiddenDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(normalized.value());
+      }
+      TensorMatcher({T, 4, kHiddenDim})
+          .with_dtype<bf16_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(mhc_out.value())
+          .verify(residual.value());
+      TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(post.value());
+      TensorMatcher({T, 4, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(comb.value());
+    }
     CHECK_HOST(num_tokens > 0) << "num_tokens must be positive";
     CHECK_HOST(reinterpret_cast<uintptr_t>(gemm2_out.data_ptr()) % 16 == 0) << "gemm2_out must be 16B aligned";
     CHECK_HOST(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0) << "out must be 16B aligned";
@@ -463,6 +744,14 @@ struct MoeFinalizeAllReduceKernel {
         .num_tokens = num_tokens,
         .num_push_counters = push.num_blocks,
         .ws = push.get_workspace<kWorldSize>(nbytes),
+        .mhc_out = mhc_out.has_value() ? static_cast<bf16_t*>(mhc_out.value().data_ptr()) : nullptr,
+        .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,
+        .post = post.has_value() ? static_cast<const float*>(post.value().data_ptr()) : nullptr,
+        .comb = comb.has_value() ? static_cast<const float*>(comb.value().data_ptr()) : nullptr,
+        .pre = pre.has_value() ? static_cast<const float*>(pre.value().data_ptr()) : nullptr,
+        .normalized = normalized.has_value() ? static_cast<bf16_t*>(normalized.value().data_ptr()) : nullptr,
+        .quantized = quantized.has_value() ? static_cast<fp8_e4m3_t*>(quantized.value().data_ptr()) : nullptr,
+        .scales = scales.has_value() ? static_cast<uint8_t*>(scales.value().data_ptr()) : nullptr,
     };
 
     const auto has_shared = shared_output.has_value();

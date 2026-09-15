@@ -1,7 +1,8 @@
 """Check the MXFP8 linear layer against an FP32 dequantization reference."""
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -197,6 +198,126 @@ class TestLinearNumerics(_OptInCase):
                 amax = ref.abs().max().item()
                 error = (out.float() - ref).abs().max().item() / amax
                 self.assertLess(error, 1e-2, (n, k, m, error))
+
+
+class TestPrefillAutotune(_OptInCase):
+    def test_model_hook_deduplicates_ready_block_fp8_weights(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        layers = torch.nn.ModuleList()
+        methods = []
+        q, s = _quant_block32(torch.randn(128, 128, device=DEVICE))
+        for _ in range(2):
+            method = Fp8LinearMethod(_block32_config())
+            layer = _build_layer(method, q, s)
+            layer.quant_method = method
+            method.apply = Mock()
+            methods.append(method)
+            layers.append(layer)
+        # An unprepared layer intentionally has no swizzled scale buffer.
+        fallback = torch.nn.Module()
+        fallback.quant_method = Fp8LinearMethod(_block32_config())
+        fallback.block_fp8_mxfp8_ready = False
+        layers.append(fallback)
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), model=layers
+        )
+        count = DeepseekV4ForCausalLM.autotune_prefill_kernels(
+            model, 4096, dtype=torch.bfloat16
+        )
+        self.assertEqual(count, 1)
+        methods[0].apply.assert_called_once()
+        self.assertEqual(methods[0].apply.call_args.args[1].shape, (4096, 128))
+        methods[1].apply.assert_not_called()
+        for method in methods:
+            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+        self.assertIsNone(fallback.quant_method.mxfp8_prefill_autotune_min_tokens)
+
+    def test_block_fp8_dispatch_keeps_decode_and_determinism_pinned(self):
+        method = Fp8LinearMethod(_block32_config())
+        q, scale = _quant_block32(torch.randn(128, 128, device=DEVICE))
+        layer = _build_layer(method, q, scale)
+        method.mxfp8_prefill_autotune_min_tokens = 4096
+        call = Mock(return_value=torch.empty(0))
+        method.w8a8_mxfp8_linear = call
+        for rows, invariant, deterministic, expected in (
+            (6, False, False, None),
+            (384, False, False, None),
+            (4096, False, False, False),
+            (65536, False, False, False),
+            (4096, True, False, True),
+            (4096, False, True, True),
+        ):
+            with self.subTest(
+                rows=rows, invariant=invariant, deterministic=deterministic
+            ):
+                with (
+                    patch(
+                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                        return_value=invariant,
+                    ),
+                    patch(
+                        "sglang.srt.runtime_context.get_exec",
+                        return_value=SimpleNamespace(
+                            deterministic=SimpleNamespace(
+                                enable_deterministic_inference=deterministic
+                            )
+                        ),
+                    ),
+                ):
+                    method.apply(layer, torch.empty(rows, 128, device=DEVICE))
+                self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
+
+    def test_tuned_prefill_against_fp32_reference(self):
+        self.enterContext(
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(
+                    deterministic=SimpleNamespace(enable_deterministic_inference=False)
+                ),
+            )
+        )
+        from flashinfer.autotuner import autotune
+
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        method = Fp8LinearMethod(_block32_config())
+        n, k = 1792, 5120
+        original_tf32 = torch.backends.cuda.matmul.allow_tf32
+        self.addCleanup(
+            setattr, torch.backends.cuda.matmul, "allow_tf32", original_tf32
+        )
+        torch.backends.cuda.matmul.allow_tf32 = False
+        q, s = _quant_block32(
+            torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16) / k**0.5
+        )
+        layer = _build_layer(method, q, s)
+        w_deq = _dequant_block32(q, s)
+        x = torch.randn(65536, k, device=DEVICE, dtype=torch.bfloat16)
+        method.mxfp8_prefill_autotune_min_tokens = 4096
+        with autotune(True):
+            method.apply(layer, x)
+        for rows in (6, 384, 4096, 65536):
+            with self.subTest(rows=rows):
+                out = method.apply(layer, x[:rows])
+                self.assertTrue(torch.isfinite(out).all().item())
+                # Independently quantize/dequantize the first 64 rows.
+                xr = x[: min(rows, 64)]
+                xq, xs = sglang_per_token_group_quant_fp8(xr, BLOCK, scale_ue8m0=True)
+                x_deq = (
+                    xq.float().view(-1, k // BLOCK, BLOCK)
+                    * xs.view(-1, k // BLOCK, 1).float()
+                ).view(-1, k)
+                ref = x_deq @ w_deq.t()
+                error = out[: ref.shape[0]].float() - ref
+                self.assertLess((error.norm() / ref.norm()).item(), 0.004)
+                if rows < 4096:
+                    method.mxfp8_prefill_autotune_min_tokens = None
+                    original = method.apply(layer, x[:rows])
+                    method.mxfp8_prefill_autotune_min_tokens = 4096
+                    torch.testing.assert_close(out, original, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

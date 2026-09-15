@@ -324,3 +324,7 @@ def test_extend_with_scheduler_history_and_image_spans():
         starts=starts,
         **_common(image=True),
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

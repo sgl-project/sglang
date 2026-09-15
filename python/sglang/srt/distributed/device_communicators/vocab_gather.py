@@ -24,11 +24,19 @@ class VocabGather(ABC):
     @abstractmethod
     def __call__(self, local: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def gather_stacked(self, local: torch.Tensor) -> torch.Tensor:
+        """Gather compact row blocks as [world_size * rows, local_width]."""
+        ...
+
 
 class LocalVocabGather(VocabGather):
     """A group of one: the slice is the whole row."""
 
     def __call__(self, local: torch.Tensor) -> torch.Tensor:
+        return local
+
+    def gather_stacked(self, local: torch.Tensor) -> torch.Tensor:
         return local
 
 
@@ -40,6 +48,9 @@ class NcclVocabGather(VocabGather):
 
     def __call__(self, local: torch.Tensor) -> torch.Tensor:
         return self.group.all_gather(local, dim=-1)
+
+    def gather_stacked(self, local: torch.Tensor) -> torch.Tensor:
+        return self.group.all_gather(local, dim=0)
 
 
 def _alloc_symm(
@@ -118,7 +129,21 @@ class NVLinkVocabGather(VocabGather):
             return self._pull(local, self.pull_out[:total_rows])
         return self.fallback(local)
 
+    def gather_stacked(self, local: torch.Tensor) -> torch.Tensor:
+        # Compact argmax partials need rank-major output and no symmetric pull
+        # buffer. Unaligned rows and payloads past the push slot use NCCL.
+        if (
+            local.is_contiguous()
+            and local.shape[1] * local.element_size() % 16 == 0
+            and local.nbytes <= self.slot_bytes
+        ):
+            return self._push_stacked(local)
+        return self.fallback.gather_stacked(local)
+
     def _push(self, local: torch.Tensor) -> torch.Tensor:
+        return self._unstack(self._push_stacked(local))
+
+    def _push_stacked(self, local: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.communication import nvlink_comm
 
         rows, width = local.shape
@@ -126,7 +151,7 @@ class NVLinkVocabGather(VocabGather):
             (self.world_size * rows, width), dtype=local.dtype, device=local.device
         )
         nvlink_comm.all_gather_push(self.comm, local, gathered)
-        return self._unstack(gathered)
+        return gathered
 
     def _pull(self, local: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.communication import nvlink_comm

@@ -78,6 +78,34 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+def candidate_request_length_bound(
+    reqs, pending_verify_tokens: int = 0
+) -> Optional[int]:
+    """Bound committed positions without reading asynchronous acceptance results.
+
+    The overlap loop can have one unprocessed result, which may overshoot the
+    output budget. Reserve its full width here; the runner adds the current
+    verify width as well. Neither bound depends on CPU acceptance results.
+    Aborted/embedding/multimodal requests keep the general graph because their
+    visible token IDs may not represent the actual cache position space.
+    """
+    if not reqs:
+        return None
+    longest = 0
+    for req in reqs:
+        budget = req.sampling_params.max_new_tokens
+        if (
+            not isinstance(budget, int)
+            or budget < 0
+            or getattr(req, "to_finish", None) is not None
+            or getattr(req, "input_embeds", None) is not None
+            or getattr(req, "multimodal_inputs", None) is not None
+        ):
+            return None
+        longest = max(longest, len(req.origin_input_ids) + budget)
+    return longest + pending_verify_tokens
+
+
 class TargetVerifyExecutor:
     def __init__(
         self,
@@ -296,6 +324,10 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        if verify_input.live_seq_lens_cpu is None:
+            verify_input.candidate_max_seq_len_upper_bound = (
+                candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
+            )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )

@@ -301,7 +301,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             create_attention_graph_variants(model_runner.model_config.hf_config)
             or create_dsv41_candidate_graph_variants(
-                model_runner, self.capture_forward_mode
+                model_runner, self.capture_forward_mode, self.captured_req_width
             )
         )
 

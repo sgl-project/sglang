@@ -5,7 +5,6 @@ from typing import Generic, Optional, Protocol, TypeVar
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
 
@@ -55,18 +54,19 @@ class CandidateIndexer(Protocol, Generic[T]):
 
 
 def make_candidate_indexer(topk_blocks: int, block_size: int) -> CandidateIndexer:
-    """Decided once, at backend init: DeepGEMM's sparse indexer when
-    ``SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER`` is set (the user vouches for the
-    kernel being there), the torch algorithm otherwise. A model without a
-    candidate source gets the torch one too; it is never asked to publish or
-    select."""
-    from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
-        DeepGemmCandidateIndexer,
+    """Use the sparse indexer when the installed DeepGEMM provides its APIs."""
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+        DEEPGEMM_SPARSE_INDEXER,
     )
+
+    if DEEPGEMM_SPARSE_INDEXER and block_size == 8 and topk_blocks > 0:
+        from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+            DeepGemmCandidateIndexer,
+        )
+
+        return DeepGemmCandidateIndexer(topk_blocks, block_size)
     from sglang.srt.layers.attention.dsv4.candidate_torch import (
         TorchCandidateIndexer,
     )
 
-    if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
-        return DeepGemmCandidateIndexer(topk_blocks, block_size)
     return TorchCandidateIndexer(topk_blocks, block_size)
