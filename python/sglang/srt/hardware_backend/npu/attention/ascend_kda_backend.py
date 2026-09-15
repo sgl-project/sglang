@@ -2,9 +2,7 @@ import math
 from typing import Optional
 
 import torch
-
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -14,7 +12,6 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 
 _LOG2_E = math.log2(math.e)
 
