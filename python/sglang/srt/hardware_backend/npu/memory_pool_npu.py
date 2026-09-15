@@ -576,6 +576,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.index_page_size = page_size
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )

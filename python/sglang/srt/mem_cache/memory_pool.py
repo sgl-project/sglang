@@ -3805,6 +3805,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         index_buf_size: Optional[int] = None,
+        index_page_size: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3891,6 +3892,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 index_buf_size=index_buf_size,
+                index_page_size=index_page_size,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3952,6 +3954,11 @@ class HybridLinearKVPool(KVCache):
     def index_buf_size(self) -> int:
         assert isinstance(self.full_kv_pool, DSATokenToKVPool)
         return self.full_kv_pool.index_buf_size
+
+    @property
+    def index_page_size(self) -> int:
+        assert isinstance(self.full_kv_pool, DSATokenToKVPool)
+        return self.full_kv_pool.index_page_size
 
     @property
     def quant_block_size(self) -> Optional[int]:
@@ -4837,6 +4844,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        index_page_size: Optional[int] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4862,7 +4870,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
-        self.slots_per_page = self.page_size
+        self.index_page_size = page_size if index_page_size is None else index_page_size
+        self.slots_per_page = self.index_page_size
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
@@ -4878,20 +4887,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert self.page_size % 16 == 0, (
-                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.index_page_size % 16 == 0, (
+                    f"HIP preshuffle requires index_page_size to be a multiple of 16, got {self.index_page_size}"
                 )
             else:
-                assert self.page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.index_page_size == 1, (
+                    f"HIP legacy DSA path requires index_page_size == 1, got {self.index_page_size}"
                 )
         elif is_xpu():
-            assert self.page_size in (
+            assert self.index_page_size in (
                 64,
                 128,
-            ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
+            ), f"XPU DSA requires index_page_size 64 or 128, got {self.index_page_size}"
         else:
-            assert self.page_size == 64
+            assert self.index_page_size == 64
         self.index_key_cache = self._create_index_key_cache()
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
