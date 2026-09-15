@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -60,6 +60,26 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if get_platform().is_hip:
+                from sglang.kernels.ops.attention.dsa.hip_cooperative_topk import (
+                    hip_cooperative_topk,
+                    hip_cooperative_topk_is_available,
+                    hip_cooperative_topk_supports,
+                )
+
+                if hip_cooperative_topk_supports(topk, score.device):
+                    return hip_cooperative_topk(
+                        score, lengths, topk, row_starts=row_starts
+                    )
+                if hip_cooperative_topk_is_available(score.device):
+                    return _topk_unfused(
+                        score,
+                        lengths,
+                        topk,
+                        row_starts=row_starts,
+                        topk_op=torch.topk,
+                        topk_op_kwargs={"dim": -1},
+                    )
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
@@ -154,6 +174,43 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
+            if get_platform().is_hip:
+                from sglang.kernels.ops.attention.dsa.hip_cooperative_topk import (
+                    hip_cooperative_topk_page_size_one,
+                    hip_cooperative_topk_ragged,
+                    hip_cooperative_topk_supports,
+                )
+
+                if hip_cooperative_topk_supports(topk, logits.device):
+                    if topk_transform_method == TopkTransformMethod.PAGED:
+                        page_table_size_1 = (
+                            attn_metadata.page_table_1[batch_idx_list]
+                            if batch_idx_list is not None
+                            else attn_metadata.page_table_1
+                        )
+                        return hip_cooperative_topk_page_size_one(
+                            score=logits,
+                            lengths=lengths,
+                            page_table=page_table_size_1,
+                            cu_seqlens_q=cu_seqlens_q_topk,
+                            topk=topk,
+                            row_starts=row_starts,
+                        )
+                    if topk_transform_method == TopkTransformMethod.RAGGED:
+                        if topk_indices_offset is None:
+                            raise RuntimeError(
+                                "RAGGED topk_transform requires topk_indices_offset; "
+                                "expected extend-without-speculative metadata."
+                            )
+                        return hip_cooperative_topk_ragged(
+                            score=logits,
+                            lengths=lengths,
+                            offsets=topk_indices_offset,
+                            topk=topk,
+                            row_starts=row_starts,
+                        )
+                    raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+
             from sgl_kernel import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,

@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.model_hook import _apply_hip_dsa_topk_default
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -108,6 +109,52 @@ _mock_device = patch(
     "sglang.srt.arg_groups.serving_hook.get_device", return_value="cuda"
 )
 _mock_device.start()
+
+
+class TestHipDsaTopkDefault(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.topk_v2 = envs.SGLANG_OPT_USE_TOPK_V2
+        self.config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        )
+
+    @override_platform(is_hip=True)
+    @patch(
+        "sglang.kernels.ops.attention.dsa.hip_cooperative_topk."
+        "hip_cooperative_topk_is_available",
+        return_value=True,
+    )
+    def test_unset_uses_cooperative_hip_topk(self, _mock_available):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.topk_v2.name, None)
+            _apply_hip_dsa_topk_default(self.config)
+            self.assertTrue(self.topk_v2.is_set())
+            self.assertFalse(self.topk_v2.get())
+
+    @override_platform(is_hip=True)
+    @patch(
+        "sglang.kernels.ops.attention.dsa.hip_cooperative_topk."
+        "hip_cooperative_topk_is_available",
+        return_value=True,
+    )
+    def test_explicit_setting_wins(self, _mock_available):
+        for value in (False, True):
+            with self.subTest(value=value), self.topk_v2.override(value):
+                _apply_hip_dsa_topk_default(self.config)
+                self.assertIs(self.topk_v2.get(), value)
+
+    @override_platform(is_hip=True)
+    @patch(
+        "sglang.kernels.ops.attention.dsa.hip_cooperative_topk."
+        "hip_cooperative_topk_is_available",
+        return_value=False,
+    )
+    def test_unsupported_device_preserves_previous_glm_default(self, _mock_available):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.topk_v2.name, None)
+            _apply_hip_dsa_topk_default(self.config)
+            self.assertTrue(self.topk_v2.get())
 
 
 class TestPrepareServerArgs(CustomTestCase):

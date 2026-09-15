@@ -56,9 +56,29 @@ def topk_transform_paged(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        from sglang.kernels.ops.attention.dsa.hip_cooperative_topk import (
+            hip_cooperative_topk_paged,
+            hip_cooperative_topk_supports,
         )
+
+        if hip_cooperative_topk_supports(out_page_indices.shape[1], scores.device):
+            hip_cooperative_topk_paged(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+        else:
+            torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
     elif is_xpu():
         torch.ops.sgl_kernel.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
