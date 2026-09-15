@@ -2,6 +2,7 @@
 """Strict diffusion component admission on the existing SRT wire/IPC layers."""
 
 import dataclasses
+import json
 import os
 import socket
 import stat
@@ -110,14 +111,18 @@ class WeightCacheClient:
 def materialize_from_cache(prepared, args):
     start = time.perf_counter()
     plan = compatibility_plan(prepared, args)
+    planned = time.perf_counter()
     admission = args._weight_cache_admission
     if admission is None or admission[0] != plan:
         raise RuntimeError("Strict cache client requires matching launcher admission")
     with WeightCacheClient(plan, args) as client:
         generation, manifest = client.manifest(admission[1])
+        admitted = time.perf_counter()
         # Watchdog is live before even requesting any counted send references.
         importer = CudaIpcImporter(generation, manifest)
+        guarded = time.perf_counter()
         model = dit_wan.build_meta(prepared.transformer)
+        constructed = time.perf_counter()
         request_id = uuid.uuid4().hex
         response = client.request(
             "fetch_component",
@@ -132,13 +137,32 @@ def materialize_from_cache(prepared, args):
         )
         if delivery.request_id != request_id:
             raise ValueError("Weight-cache delivery request ID mismatch")
+        fetched = time.perf_counter()
         importer.receive(delivery, model, request_id=request_id)
+        mapped = time.perf_counter()
         model = dit_wan.finalize_after_import(model)
-    elapsed = time.perf_counter() - start
+    finalized = time.perf_counter()
+    elapsed = finalized - start
     logger.info(
         "[WeightCache] transformer imported in %.3fs (%d shared bytes)",
         elapsed,
         manifest.unique_storage_bytes,
+    )
+    logger.info(
+        "[WeightCache] transformer import stages: %s",
+        json.dumps(
+            {
+                "compatibility": planned - start,
+                "manifest": admitted - planned,
+                "guard": guarded - admitted,
+                "meta": constructed - guarded,
+                "fetch": fetched - constructed,
+                "mapping": mapped - fetched,
+                "finalize": finalized - mapped,
+                "total": elapsed,
+            },
+            sort_keys=True,
+        ),
     )
     pipeline = prepared.materialize(args, loaded_modules={"transformer": model})
     pipeline.memory_usages["transformer"] = manifest.unique_storage_bytes / (1024**3)

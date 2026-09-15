@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,25 +22,42 @@ class FileStamp:
     inode: int
 
     @classmethod
-    def read(cls, path: Path) -> FileStamp:
-        stat = path.stat()
-        if not path.is_file():
+    def read(cls, path: Path | str) -> FileStamp:
+        info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"Identity input is not a regular file: {path}")
         return cls(
-            stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino
         )
 
 
-def hash_file(path: Path) -> tuple[str, FileStamp]:
+def hash_file(path: Path | str) -> tuple[str, FileStamp]:
     """Reject an input that changes during hashing; never trust size alone."""
     before = FileStamp.read(path)
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     if FileStamp.read(path) != before:
         raise ValueError(f"Identity input changed during hashing: {path}")
     return digest.hexdigest(), before
+
+
+def _source_files(root: str) -> list[str]:
+    def on_error(error):
+        raise error
+
+    files = []
+    # Like Path.rglob, do not recurse through directory symlinks. Include
+    # directories named *.py as well, so hash_file rejects them as before.
+    for parent, directories, names in os.walk(root, onerror=on_error):
+        files.extend(
+            os.path.join(parent, name)
+            for name in (*directories, *names)
+            if name.endswith(".py")
+        )
+    # Preserve pathlib's component-wise order, not whole-path string order.
+    return sorted(files, key=lambda name: os.path.normcase(name).split(os.sep))
 
 
 def source_digest(package_root: Path) -> str:
@@ -49,23 +67,30 @@ def source_digest(package_root: Path) -> str:
     dependencies and immutable artifact IDs belong to the deployment stamp.
     """
     root = package_root.resolve(strict=True)
-    files = sorted(root.rglob("*.py"))
+    root_name = os.fspath(root)
+    files = _source_files(root_name)
     if not files:
         raise ValueError(f"No Python source files under {root}")
     entries, stamps = [], []
     for path in files:
-        if not path.resolve(strict=True).is_relative_to(root):
+        # Path.is_relative_to/relative_to repeatedly construct ancestor Paths.
+        # For thousands of files this costs more than hashing their contents.
+        # Keep strict realpath and the path-component boundary check, but use
+        # string-based path operations. This is NOT a stat-only digest cache:
+        # every source byte and the complete file set are checked on each call.
+        resolved = os.path.realpath(path, strict=True)
+        if os.path.commonpath((root_name, resolved)) != root_name:
             raise ValueError(f"Source symlink escapes package root: {path}")
         digest, stamp = hash_file(path)
         stamps.append((path, stamp))
         entries.append(
             {
-                "path": path.relative_to(root).as_posix(),
+                "path": os.path.relpath(path, root_name).replace(os.sep, "/"),
                 "sha256": digest,
                 "size": stamp.size,
             }
         )
-    if sorted(root.rglob("*.py")) != files:
+    if _source_files(root_name) != files:
         raise ValueError("Package file set changed while computing source identity")
     if any(FileStamp.read(path) != stamp for path, stamp in stamps):
         raise ValueError("Package source changed while computing source identity")

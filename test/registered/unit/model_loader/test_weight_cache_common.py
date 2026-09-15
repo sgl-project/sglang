@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests for shared, opt-in weight-cache correctness primitives."""
 
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -24,8 +25,8 @@ from sglang.weight_cache_common.checkpoint import (
     verify_manifest,
     write_manifest,
 )
-from sglang.weight_cache_common.descriptors import StateManifest
-from sglang.weight_cache_common.identity import socket_path, source_digest
+from sglang.weight_cache_common.descriptors import StateManifest, canonical_digest
+from sglang.weight_cache_common.identity import hash_file, socket_path, source_digest
 from sglang.weight_cache_common.liveness import (
     ProcessIdentity,
     ProducerDiedError,
@@ -143,9 +144,11 @@ class TestStateMapping(unittest.TestCase):
         manifest = self.snapshot.manifest
         tied = next(tensor for tensor in manifest.tensors if tensor.name == "weight")
         tensors = tuple(
-            replace(tensor, storage_offset=tensor.storage_offset + 1)
-            if tensor.name == "child.tied"
-            else tensor
+            (
+                replace(tensor, storage_offset=tensor.storage_offset + 1)
+                if tensor.name == "child.tied"
+                else tensor
+            )
             for tensor in manifest.tensors
         )
         self.assertEqual(
@@ -251,6 +254,73 @@ class TestIdentity(unittest.TestCase):
             before = source_digest(root)
             dependency.write_text("x = 2\n")
             self.assertNotEqual(before, source_digest(root))
+
+    def test_source_digest_preserves_canonical_paths_order_and_internal_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a").mkdir()
+            (root / "a/z.py").write_text("nested")
+            (root / "a.py").write_text("sibling")
+            (root / "非ascii.py").write_text("unicode")
+            (root / "alias.py").symlink_to(root / "a/z.py")
+            # Match the original pathlib ordering/encoding, including the
+            # directory-vs-sibling edge where sorting whole strings differs.
+            entries = [
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "size": path.stat().st_size,
+                }
+                for path in sorted(root.rglob("*.py"))
+            ]
+            self.assertEqual(
+                source_digest(root), canonical_digest({"schema": 1, "files": entries})
+            )
+
+    def test_source_digest_rejects_sibling_prefix_symlink_and_non_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "package"
+            sibling = Path(directory) / "package-other"
+            root.mkdir()
+            sibling.mkdir()
+            (sibling / "outside.py").write_text("outside")
+            link = root / "alias.py"
+            link.symlink_to(sibling / "outside.py")
+            with self.assertRaisesRegex(ValueError, "symlink escapes"):
+                source_digest(root)
+            link.unlink()
+            (root / "directory.py").mkdir()
+            with self.assertRaisesRegex(ValueError, "not a regular file"):
+                source_digest(root)
+
+    def test_source_digest_rechecks_file_set_and_already_hashed_files(self):
+        for change in ("add", "edit"):
+            with (
+                self.subTest(change=change),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                path = root / "source.py"
+                path.write_text("before")
+
+                def hash_then_change(input_path):
+                    result = hash_file(input_path)
+                    if change == "add":
+                        (root / "added.py").write_text("new")
+                    else:
+                        path.write_text("after!")
+                        info = path.stat()
+                        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 10**9))
+                    return result
+
+                with (
+                    patch(
+                        "sglang.weight_cache_common.identity.hash_file",
+                        side_effect=hash_then_change,
+                    ),
+                    self.assertRaisesRegex(ValueError, "changed while computing"),
+                ):
+                    source_digest(root)
 
     def test_checkpoint_content_and_fast_stat_receipt(self):
         with tempfile.TemporaryDirectory() as directory:

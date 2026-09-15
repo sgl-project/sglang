@@ -99,3 +99,27 @@ default uses a pinned HF revision. Readiness samples and median/p90 for both
 `/liveness` and `/health` are written to the pytest temporary output directory.
 The initial regression threshold is not a speedup claim; speedup must be
 established separately for the target model, storage and host.
+
+For startup performance, use the separate paired benchmark from the repo root:
+
+```bash
+python test/manual/bench_diffusion_weight_cache_startup.py \
+  --model-path /path/to/pinned/Wan/snapshot \
+  --output-dir /tmp/wan-startup-run
+```
+
+The output directory must not exist. This runs five ordinary/cache pairs for
+each warmup mode, alternates pair order, keeps an owner present in both modes,
+checks identical resolved placement and byte-exact generated videos, and probes
+both HTTP readiness endpoints every 50 ms. It saves raw samples, per-start logs,
+videos, median/p90 and paired deltas; owner startup is reported separately.
+This is a warm-file recovery benchmark, without page-cache eviction or artificial
+I/O throttling. It does not assert a speedup merely because a regression limit
+passes. Use an idle GPU/host and do not edit installed Python code during a run.
+
+Cache logs separately report launcher preparation/identity/admission and worker
+identity/manifest/watchdog/meta construction/fetch/mapping/finalization. Worker
+component import excludes uncached pipeline loading, so it is not end-to-end
+startup. A small model with subsecond ordinary DiT loading has little startup
+time for a DiT-only cache to remove; do not extrapolate a large-model speedup
+from its functional recovery result.
