@@ -556,13 +556,12 @@ class TokenizerControlMixin:
             async with self.is_pause_cond:
                 is_paused = self.is_pause
                 if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
 
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
