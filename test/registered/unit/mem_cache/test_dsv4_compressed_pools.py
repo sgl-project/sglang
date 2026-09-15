@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -25,6 +26,8 @@ class TestDSV4CompressedPools(CustomTestCase):
                 pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
                 pool._unified_kv = unified
                 pool.uniform_fp8 = False
+                pool.kv_layout = KVLayout.V4
+                pool.compressed_kv_layout_option = None
                 pool.compressed_pool_configs = {
                     4: _CompressedPoolConfig(
                         256, 64, torch.bfloat16, indexer_size=1024

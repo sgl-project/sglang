@@ -9,7 +9,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
-from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -57,9 +56,6 @@ class DsparkDraftSampler:
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         max_bs = int(max_bs)
-        # Resolved once: this sampler runs inside cuda-graph capture, so the
-        # branch below is baked into the captured graph anyway.
-        self._fused_greedy = envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
         if out is not None:
             assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
             self.out = out
@@ -129,10 +125,8 @@ class DsparkDraftSampler:
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
         # through to the block sampler below.
         draft_tokens = None
-        if (
-            not self.folded_sampling
-            and self._fused_greedy
-            and isinstance(self.markov_head, VanillaMarkov)
+        if not self.folded_sampling and getattr(
+            self.markov_head, "supports_sharded_greedy", False
         ):
             draft_tokens = self.markov_head.sample_block_greedy_fused(
                 base_logits, first_prev_tokens=anchor
@@ -198,6 +192,10 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
+    # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
+    # Sampling batches retain the ordinary eager proposal and verification path.
+    if getattr(model.markov_head, "supports_sharded_greedy", False):
+        return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
