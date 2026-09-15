@@ -1,12 +1,18 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
@@ -14,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
@@ -172,6 +179,108 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_sidecar_read_error_is_only_a_cache_miss_with_unified_memory(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        class FailingStorage:
+            def batch_get_v2(self, transfers):
+                raise ValueError("sidecar read failed")
+
+        self.addCleanup(reset_context)
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                reset_context()
+                publish(
+                    ServerArgs(model_path="dummy", enable_unified_memory=unified),
+                    role="tokenizer",
+                )
+                cc = HybridCacheController.__new__(HybridCacheController)
+                cc.storage_backend = FailingStorage()
+                cc.prefetch_sync_queue = Queue()
+                operation = PrefetchOperation(
+                    CacheRequestHandle("r", 0),
+                    [1],
+                    pool_transfers=[PoolTransfer(name=PoolName.SWA)],
+                )
+                operation.hash_value = ["h0"]
+                if unified:
+                    with self.assertLogs(level="ERROR"):
+                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
+                    ack = cc.prefetch_sync_queue.get_nowait()
+                    self.assertIs(ack.operation, operation)
+                    self.assertEqual(ack.pool_hits, {})
+                else:
+                    with self.assertRaisesRegex(ValueError, "sidecar read failed"):
+                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
+                self.assertTrue(cc.prefetch_sync_queue.empty())
+
+    def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
+        page_size = 4
+        full_pool, swa_pool = _build_unified_host_pair(
+            _build_unified_swa_pool(page_size)
+        )
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.page_size = page_size
+        cc.host_memory_mode = "cache"
+        cc.attn_cp_group = cc.attn_tp_group = cc.tp_group = None
+        cc.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(PoolName.KV, full_pool, None, None),
+                PoolEntry(PoolName.SWA, swa_pool, None, None),
+            ]
+        )
+        hit_tokens = full_pool.available_size()
+        hashes = [str(i) for i in range(hit_tokens // page_size)]
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=hashes[-2:],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        operation = PrefetchOperation(
+            CacheRequestHandle("r", 0),
+            list(range(hit_tokens)),
+            pool_transfers=[transfer],
+        )
+        operation.hash_value = hashes
+        self.assertIsNone(cc.alloc_prefetch_host_buffers(operation, hit_tokens))
+        fitting = [
+            n
+            for n in range(page_size, hit_tokens + 1, page_size)
+            if cc.can_fit_prefetch_host_buffers(operation, n, empty=False)
+        ]
+        self.assertTrue(fitting)
+        self.assertEqual(transfer.keys, hashes[-2:])
+        length = max(fitting)
+        self.assertLess(length, hit_tokens)
+        host_indices = cc.alloc_prefetch_host_buffers(operation, length)
+        self.assertEqual(host_indices.numel(), length)
+        self.assertEqual(transfer.host_indices.numel(), 2 * page_size)
+        self.assertEqual(
+            transfer.keys, hashes[length // page_size - 2 : length // page_size]
+        )
+        cc.free_prefetch_host_buffers(operation, host_indices)
+
+        # A hit-time rematch can trim some or all FULL pages while the entire
+        # trailing SWA window still needs staging from the same shared arena.
+        for full_tokens in (page_size, 0):
+            with self.subTest(full_tokens=full_tokens):
+                transfer.keys = hashes[-2:]
+                operation.hash_value = list(hashes)
+                operation.storage_hit_count = hit_tokens
+                operation.sidecar_hash_values = None
+                cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertTrue(
+                    cc.can_fit_prefetch_host_buffers(operation, full_tokens)
+                )
+                host_indices = cc.alloc_prefetch_host_buffers(operation, full_tokens)
+                self.assertEqual(host_indices.numel(), full_tokens)
+                self.assertEqual(transfer.host_indices.numel(), 2 * page_size)
+                self.assertEqual(transfer.keys, hashes[-2:])
+                cc.free_prefetch_host_buffers(operation, host_indices)
+
     def test_shared_arena_can_reuse_bytes_across_sides(self):
         page_size = 4
         full_pool, swa_pool = _build_unified_host_pair(

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple, TypeGuard
+from typing import Callable, Hashable, List, Optional, Sequence, Tuple, TypeGuard
 
 import torch
 from torch.profiler import record_function
@@ -641,13 +641,25 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """No-op stub for HiCache load-back: in shared mode the swa v2p IS the
-        mapping, and HiCache for shared SWA is out of scope."""
-        return
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
-        # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
-        return
+        if full_indices.numel() == 0:
+            return
+        full_pages = torch.unique(full_indices.to(torch.int64) // self.page_size)
+        swa = self.swa_attn_allocator
+        physical_pages = swa.virtual_to_physical[full_pages].clone()
+        swa.virtual_to_physical.index_fill_(0, full_pages, -1)
+        live = physical_pages > 0
+        physical_pages = physical_pages[live]
+        full_pages = full_pages[live]
+        still_owned = swa.physical_to_virtual[physical_pages] == full_pages
+        swa.physical_to_virtual.index_fill_(0, physical_pages[still_owned], -1)
 
     # -- free-group --
 
@@ -721,6 +733,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         self.full_free_group = []
 
     # -- Lazy compaction hooks --
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
 
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
@@ -935,7 +951,8 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
     def _compaction_allowed(self) -> bool:
         return all(
-            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            allocator._pending_hicache_load_pages == 0
+            and (allocator.disagg_move_gate is None or allocator.disagg_move_gate())
             for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
         )
 

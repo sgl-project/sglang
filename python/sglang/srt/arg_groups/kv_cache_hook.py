@@ -262,10 +262,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             )
         if cfg.disaggregation_decode_retraction_backup == "host_pool":
             model_config = model_config_of(server_args)
-            assert not cfg.disaggregation_decode_enable_radix_cache, (
-                "--enable-unified-memory host-pool decode retraction does not "
-                "support decode radix-cache H2D/D2H transfers yet."
-            )
             assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-Mamba models."
@@ -305,13 +301,49 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "write loc, so a captured decode replay raises. "
         "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
     )
-    assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
-        "--enable-unified-memory is not yet compatible with hierarchical / "
-        "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-        "the unified-memory-pool init wires up no host pools, and its device mamba / "
-        "full-attention slots are VIRTUAL — the host-offload path does not "
-        "translate them to physical."
+    assert not cfg.enable_lmcache, (
+        "--enable-unified-memory is not yet compatible with --enable-lmcache."
     )
+    assert not cfg.enable_unified_cache_external_linker, (
+        "--enable-unified-memory does not support "
+        "--enable-unified-cache-external-linker: direct L3 transfers do not "
+        "preserve unified page-envelope indices and compaction lifetimes. "
+        "Use --enable-hierarchical-cache for supported L2/L3 transfers."
+    )
+    if cfg.enable_hierarchical_cache:
+        model_config = model_config_of(server_args)
+        assert not use_mla_backend(server_args), (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "MLA models yet."
+        )
+        assert mambaish_config(model_config) is None, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "recurrent-state models yet."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "speculative decoding yet."
+        )
+        assert cfg.hicache_io_backend in {"kernel", "direct"}, (
+            "--enable-unified-memory with hierarchical cache supports only "
+            "the kernel and direct I/O backends."
+        )
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "pipeline parallelism (--pp-size > 1)."
+        )
+        supported_storage_backends = {None, "file", "sim", "mori", "shm"}
+        if cfg.hicache_storage_backend not in supported_storage_backends:
+            raise ValueError(
+                "--enable-unified-memory with hierarchical cache does not "
+                "support this storage backend yet; supported backends are "
+                "file, sim, mori, and shm. Got "
+                f"{cfg.hicache_storage_backend!r}."
+            )
+        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+            "--enable-unified-memory with hierarchical cache requires lazy "
+            "compaction so pending H2D physical reservations remain stable."
+        )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured

@@ -421,6 +421,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
+        self.swa_write_back_eviction_barrier_enabled = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
@@ -1535,15 +1536,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         updated_tracker = defaultdict(int, tracker)
+        component = self.components_by_type[component_type]
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            result.node_id = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        backup_node_id = component.take_backup_before_device_eviction()
+        if backup_node_id is not None:
+            assert result.node_id is None
+            result.backup_kv = self._build_backup_kv_action(
+                self.node_by_id(backup_node_id), write_back=True
+            )
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
@@ -1591,36 +1597,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
-        """Write-back fallback when a D-leaf's D->H backup fails under host
-        memory pressure: drop the subtree rooted at the unbacked leaf so
-        device eviction keeps making progress instead of leaving its KV
-        unevictable until host space frees up."""
+        """Drop an unlocked subtree when its write-back cannot reserve host KV."""
         result = DropSubtreeNoHostResult(is_dropped=False)
         node = self.node_by_id(node_id)
-        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
-            return result
-        descendants: list[UnifiedTreeNode] = []
-        stack = list(node.children.values())
+        subtree: list[UnifiedTreeNode] = []
+        stack = [node]
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
-            descendants.append(cur)
+            subtree.append(cur)
             stack.extend(cur.children.values())
-        for desc in reversed(descendants):
-            # Host-only by construction: a device descendant would contradict
-            # this node being a D-leaf, and D-leaves evict before ancestors.
-            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
-            assert desc.write_through_pending_id is None
+        for desc in reversed(subtree[1:]):
+            if not desc.evicted and desc.backuped:
+                self.kv_events.record_remove(desc, medium=StorageMedium.CPU)
             self._release_all_component_layers(
                 desc,
-                StorageMedium.CPU,
+                StorageMedium.CPU if desc.evicted else StorageMedium.GPU,
                 result.tracker,
                 result.device_frees,
                 result.host_frees,
@@ -2100,6 +2102,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        self.swa_write_back_eviction_barrier_enabled = True
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
