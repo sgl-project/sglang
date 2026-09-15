@@ -352,11 +352,18 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 "with per-token-group scales."
             )
 
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_ll,
-        )
+        from sglang.srt.environ import envs
 
-        output = cutlass_w4a8_moe_deepep_ll(
+        if envs.SGLANG_W4AFP8_CUTEDSL_LL.get():
+            from sglang.srt.layers.moe.cutedsl_w4afp8_moe import (
+                cutedsl_w4afp8_moe_deepep_ll as run_ll,
+            )
+        else:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+                cutlass_w4a8_moe_deepep_ll as run_ll,
+            )
+
+        output = run_ll(
             hidden_states,
             hidden_scales,
             layer.w13_weight,
