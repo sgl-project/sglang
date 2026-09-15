@@ -427,45 +427,6 @@ jobs:
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-poc-multi-node-tests-cann910:
-    name: multi-node-poc-cann910
-    # Run even if upstream jobs failed, so the 1p1d perf case still executes.
-    if: ${{ false }}
-    # Enabled: run DSV4-Flash W8A8 1P+1D 16p perf case on CANN 9.1.0.
-    # Multi-node jobs run strictly one at a time to avoid contending for the
-    # same A3 multi-node resources.
-    # Cann910 single-node jobs (perf-16/acc-16) must finish before this starts.
-    # Only depend on enabled jobs: a skipped (if: false) job in `needs`
-    # would skip this job as well.
-    needs: [set-image-config, nightly-perf-16-npu-a3-cann910, nightly-acc-16-npu-a3-cann910]
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        test_config:
-          # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
-    with:
-      runner: linux-amd64-cpu-4
-      test_type: ${{ matrix.test_config.test_type || 'perf' }}
-      test_config_name: ${{ matrix.test_config.name }}
-      prefill_size: ${{ matrix.test_config.prefill_size }}
-      decode_size: ${{ matrix.test_config.decode_size }}
-      router_size: ${{ matrix.test_config.router_size }}
-      test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3_cann910 }}
-      install_sglang_from_source: false
-      prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
-      transformers_version: ''
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
@@ -497,39 +458,6 @@ jobs:
       node_size: ${{ matrix.test_config.node_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_from_source: false
-      prefill_decode_deployment: 'mix'
-      transformers_version: ''
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-poc-multi-node-mix-tests-cann910:
-    name: multi-node-mix-poc-cann910
-    # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
-    if: ${{ false }}
-    needs: [set-image-config]
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        test_config:
-          # glm_5_2 accuracy tests
-          - name: glm_5_2_w8a8_16p_gpqa
-            node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-            test_type: 'accuracy'
-          # kimi_k3 accuracy tests
-          - name: kimi_k3_w4a8_32p_gpqa
-            node_size: 4
-            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
-            test_type: 'accuracy'
-    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
-    with:
-      runner: linux-amd64-cpu-4
-      test_type: ${{ matrix.test_config.test_type || 'perf' }}
-      test_config_name: ${{ matrix.test_config.name }}
-      node_size: ${{ matrix.test_config.node_size }}
-      test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3_cann910 }}
       install_sglang_from_source: false
       prefill_decode_deployment: 'mix'
       transformers_version: ''
