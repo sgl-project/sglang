@@ -22,7 +22,8 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     let mut streaming = case("streaming", "/sse", "normal");
     unary["equivalence_group"] = json!("same_request");
     streaming["equivalence_group"] = json!("same_request");
-    let suite = suite(vec![unary, streaming]);
+    let mut suite = suite(vec![unary, streaming]);
+    suite.response_policy = Some(json!({"terminator": "[FIN]"}));
     let effective = serde_json::to_value(describe(&fixture.config, &suite).unwrap()).unwrap();
     assert!(fixture.lifecycle().is_empty());
     assert!(!fixture.config.output_dir.exists());
@@ -42,6 +43,7 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     );
     let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
     assert!(html.contains("SGLang Parity — PASS"));
+    assert!(html.contains("Recorded response policy"));
     // Re-render a moved run with no tools on PATH; the lifecycle must stay unchanged.
     let moved = fixture.directory.path().join("moved report");
     fs::rename(&report.directory, &moved).unwrap();
@@ -142,10 +144,13 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
                     json!({"keep": [1, null, {"nested": true}]})
                 );
                 if case.name == "streaming" {
+                    assert_eq!(attempt.origins.get(""), Some(&vec![0]));
                     assert_eq!(
                         read_json(attempt.directory.join("events.json"))[1]["data"],
                         "[FIN]"
                     );
+                } else {
+                    assert!(attempt.origins.is_empty());
                 }
             }
             assert!(

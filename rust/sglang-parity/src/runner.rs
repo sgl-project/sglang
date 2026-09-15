@@ -51,22 +51,44 @@ pub struct HttpSuite {
     pub name: String,
     pub response_implementation: String,
     pub output_mode: String,
+    /// Opaque API rules retained for review; only the suite interprets them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_policy: Option<Value>,
     pub comparison: ComparisonRules,
     pub cases: Vec<HttpCase>,
 }
 
-/// Validate an API response and return its full final JSON without masking fields.
+/// A complete reconstructed response, before applying comparison exceptions.
+#[derive(Clone, Debug)]
+pub struct PreparedResponse {
+    pub value: Value,
+    /// Result JSON pointers mapped to zero-based observation event indices.
+    /// Descendants inherit their closest ancestor's sources.
+    pub origins: BTreeMap<String, Vec<usize>>,
+}
+
+impl From<Value> for PreparedResponse {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            origins: BTreeMap::new(),
+        }
+    }
+}
+
+/// Validate an API response and reconstruct its complete, unmasked result.
 pub trait ResponsePolicy {
     /// Validate the API contract and reconstruct the complete response.
     ///
-    /// Implementations must preserve unknown final fields and must not mask
-    /// differences. Return violations for invalid responses, including in-band
-    /// errors. This method performs no I/O and receives no implementation identity.
+    /// Implementations must preserve fields or explicitly reject unsupported
+    /// semantics, never silently discard differences. Return violations for
+    /// invalid responses, including in-band errors. This method performs no I/O
+    /// and receives no implementation identity.
     fn prepare(
         &self,
         case: &HttpCase,
         observation: &HttpObservation,
-    ) -> Result<Value, Vec<Violation>>;
+    ) -> Result<PreparedResponse, Vec<Violation>>;
 }
 
 impl RunConfig {
@@ -198,6 +220,8 @@ pub struct Attempt {
     pub directory: PathBuf,
     pub observation: Option<HttpObservation>,
     pub final_json: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub origins: BTreeMap<String, Vec<usize>>,
     pub violations: Vec<Violation>,
     #[serde(skip)]
     comparison: Option<Value>,
@@ -462,6 +486,7 @@ pub async fn run(
                     directory: directory.clone(),
                     observation: None,
                     final_json: None,
+                    origins: BTreeMap::new(),
                     violations: Vec::new(),
                     comparison: None,
                 });
@@ -493,9 +518,12 @@ pub async fn run(
                 let mut violations = observation.violations.clone();
                 let mut comparison = None;
                 let mut final_json = None;
+                let mut origins = BTreeMap::new();
                 if observation.transport_error.is_none() && violations.is_empty() {
                     match policy.prepare(case, &observation) {
-                        Ok(value) => {
+                        Ok(prepared) => {
+                            let value = prepared.value;
+                            origins = prepared.origins;
                             let path = directory.join("final.json");
                             state.artifacts.write_json(&path, &value)?;
                             final_json = Some(path);
@@ -530,6 +558,7 @@ pub async fn run(
                     directory,
                     observation: Some(observation),
                     final_json,
+                    origins,
                     violations,
                     comparison,
                 };
