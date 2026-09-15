@@ -9,8 +9,11 @@ from typing import Optional, Union
 
 import orjson
 from openai.types.responses import (
+    ResponseCodeInterpreterToolCall,
     ResponseOutputItem,
-    ResponseOutputMessage,
+)
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
@@ -43,6 +46,11 @@ from openai_harmony import (
 from sglang.srt.entrypoints.openai.protocol import (
     ReasoningEffortTier,
     ResponseInputOutputItem,
+    ResponseOutputMessage,
+)
+from sglang.srt.entrypoints.openai.responses_adapters import (
+    decode_reasoning_state,
+    encode_custom_tool_input,
 )
 from sglang.srt.utils import random_uuid
 
@@ -163,35 +171,66 @@ def parse_response_input(
             # text chunk always carries the system→developer text_prefix even if
             # earlier parts were non-text (image/audio) and got dropped.
             text_chunks = [
-                c for c in content if c.get("type") in ("text", "input_text")
+                c
+                for c in content
+                if c.get("type") in ("text", "input_text", "output_text")
             ]
             contents = [
                 TextContent(text=(text_prefix if i == 0 else "") + c.get("text", ""))
                 for i, c in enumerate(text_chunks)
             ]
             msg = Message.from_role_and_contents(role, contents)
-    elif response_msg["type"] == "function_call_output":
+        if role == "assistant" and response_msg.get("phase") is not None:
+            msg = msg.with_channel(
+                "final" if response_msg["phase"] == "final_answer" else "commentary"
+            )
+    elif response_msg["type"] in ("function_call_output", "custom_tool_call_output"):
         call_id = response_msg["call_id"]
-        call_response: Optional[ResponseFunctionToolCall] = None
-        for prev_response in reversed(prev_responses):
+        call_response = None
+        for previous in reversed(prev_responses):
+            if not isinstance(previous, dict):
+                previous = previous.model_dump()
             if (
-                isinstance(prev_response, ResponseFunctionToolCall)
-                and prev_response.call_id == call_id
+                previous.get("type") in ("function_call", "custom_tool_call")
+                and previous.get("call_id") == call_id
             ):
-                call_response = prev_response
+                call_response = previous
                 break
         if call_response is None:
             raise ValueError(f"No call message found for {call_id}")
+        output = response_msg.get("output", "")
+        if isinstance(output, list):
+            output = "".join(
+                part.get("text", "") for part in output if isinstance(part, dict)
+            )
         msg = Message.from_author_and_content(
-            Author.new(Role.TOOL, f"functions.{call_response.name}"),
-            response_msg["output"],
+            Author.new(Role.TOOL, f"functions.{call_response['name']}"),
+            output,
         )
     elif response_msg["type"] == "reasoning":
-        content = response_msg["content"]
-        assert len(content) == 1
-        msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
-    elif response_msg["type"] == "function_call":
-        msg = Message.from_role_and_content(Role.ASSISTANT, response_msg["arguments"])
+        text = ""
+        for field in ("summary", "content"):
+            text = "\n".join(
+                part.get("text", "")
+                for part in response_msg.get(field) or []
+                if isinstance(part, dict)
+            )
+            if text:
+                break
+        if not text:
+            text = decode_reasoning_state(response_msg.get("encrypted_content")) or ""
+        msg = Message.from_role_and_content(Role.ASSISTANT, text).with_channel(
+            "analysis"
+        )
+    elif response_msg["type"] in ("function_call", "custom_tool_call"):
+        arguments = (
+            encode_custom_tool_input(response_msg.get("input") or "")
+            if response_msg["type"] == "custom_tool_call"
+            else response_msg.get("arguments") or "{}"
+        )
+        if isinstance(arguments, dict):
+            arguments = orjson.dumps(arguments).decode()
+        msg = Message.from_role_and_content(Role.ASSISTANT, arguments)
         msg = msg.with_channel("commentary")
         msg = msg.with_recipient(f"functions.{response_msg['name']}")
         msg = msg.with_content_type("json")
@@ -201,10 +240,13 @@ def parse_response_input(
 
 
 def parse_response_output(output: ResponseOutputItem) -> Message:
-    if isinstance(output, ResponseOutputMessage):
+    if isinstance(output, OpenAIResponseOutputMessage):
         role = output.role
         contents = [TextContent(text=c.text) for c in output.content]
         msg = Message.from_role_and_contents(role, contents)
+        phase = getattr(output, "phase", None)
+        if phase is not None:
+            msg = msg.with_channel("final" if phase == "final_answer" else "commentary")
         return msg
     elif isinstance(output, ResponseFunctionToolCall):
         msg = Message.from_role_and_content(Role.ASSISTANT, output.arguments)
@@ -282,6 +324,17 @@ def parse_output_message(message: Message):
             type="web_search_call",
         )
         output_items.append(web_search_item)
+    elif recipient is not None and recipient.startswith("python"):
+        output_items.append(
+            ResponseCodeInterpreterToolCall(
+                id=f"ci_{random_uuid()}",
+                type="code_interpreter_call",
+                code="".join(content.text for content in message.content),
+                container_id="auto",
+                outputs=[],
+                status="completed",
+            )
+        )
     elif message.channel == "analysis":
         for content in message.content:
             reasoning_item = ResponseReasoningItem(
@@ -296,9 +349,9 @@ def parse_output_message(message: Message):
                 status=None,
             )
             output_items.append(reasoning_item)
-    elif message.channel == "commentary":
+    elif message.channel == "commentary" and message.recipient is not None:
         if message.recipient.startswith("functions."):
-            function_name = message.recipient.split(".")[-1]
+            function_name = message.recipient.removeprefix("functions.")
             for content in message.content:
                 random_id = random_uuid()
                 response_item = ResponseFunctionToolCall(
@@ -327,7 +380,9 @@ def parse_output_message(message: Message):
                 output_items.append(reasoning_item)
         else:
             raise ValueError(f"Unknown recipient: {message.recipient}")
-    elif message.channel == "final":
+    elif message.channel == "final" or (
+        message.channel == "commentary" and message.recipient is None
+    ):
         contents = []
         for content in message.content:
             output_text = ResponseOutputText(
@@ -338,6 +393,7 @@ def parse_output_message(message: Message):
             )
             contents.append(output_text)
         text_item = ResponseOutputMessage(
+            phase="final_answer" if message.channel == "final" else "commentary",
             id=f"msg_{random_uuid()}",
             content=contents,
             role=message.author.role,
@@ -359,6 +415,17 @@ def parse_remaining_state(parser: StreamableParser):
     if current_recipient is not None and current_recipient.startswith("browser."):
         return []
 
+    if current_recipient is not None and current_recipient.startswith("python"):
+        return [
+            ResponseCodeInterpreterToolCall(
+                id=f"ci_{random_uuid()}",
+                type="code_interpreter_call",
+                code=parser.current_content,
+                container_id="auto",
+                outputs=[],
+                status="in_progress",
+            )
+        ]
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
             id=f"rs_{random_uuid()}",
@@ -372,7 +439,21 @@ def parse_remaining_state(parser: StreamableParser):
             status=None,
         )
         return [reasoning_item]
-    elif parser.current_channel == "final":
+    elif current_recipient is not None and current_recipient.startswith("functions."):
+        random_id = random_uuid()
+        return [
+            ResponseFunctionToolCall(
+                id=f"ft_{random_id}",
+                call_id=f"call_{random_id}",
+                type="function_call",
+                name=current_recipient.removeprefix("functions."),
+                arguments=parser.current_content,
+                status="in_progress",
+            )
+        ]
+    elif parser.current_channel == "final" or (
+        parser.current_channel == "commentary" and current_recipient is None
+    ):
         output_text = ResponseOutputText(
             text=parser.current_content,
             annotations=[],  # TODO
@@ -380,6 +461,7 @@ def parse_remaining_state(parser: StreamableParser):
             logprobs=None,  # TODO
         )
         text_item = ResponseOutputMessage(
+            phase="final_answer" if parser.current_channel == "final" else "commentary",
             id=f"msg_{random_uuid()}",
             content=[output_text],
             role="assistant",

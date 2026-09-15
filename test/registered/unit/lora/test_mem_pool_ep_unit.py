@@ -906,17 +906,19 @@ class TestModuleLevelHelpers(unittest.TestCase):
         # Without a specific flashinfer backend selected, default is False.
         self.assertFalse(_moe_runner_keeps_global_expert_ids())
 
-    def test_real_backend_predicate_matches_dispatcher_and_pool(self):
+    def test_real_backend_predicates_match_supported_id_contracts(self):
         backends = _load_moe_backend_enum()
-        expected_global = {
+        dispatcher_global_ids = {
             backends.FLASHINFER_TRTLLM,
             backends.EXPERIMENTAL_SGL_TRTLLM,
             backends.FLASHINFER_TRTLLM_ROUTED,
             backends.FLASHINFER_CUTLASS,
             backends.FLASHINFER_MXFP4,
             backends.FLASHINFER_CUTEDSL,
+            backends.FLASHINFER_MEGAMOE,
             backends.HPC_OPS,
         }
+        lora_global_ids = dispatcher_global_ids - {backends.FLASHINFER_MEGAMOE}
         config = types.SimpleNamespace(
             num_experts=8,
             num_local_experts=2,
@@ -938,11 +940,11 @@ class TestModuleLevelHelpers(unittest.TestCase):
                 dispatcher = standard_dispatcher(config)
                 self.assertEqual(
                     dispatcher.skip_local_expert_mapping,
-                    backend in expected_global,
+                    backend in dispatcher_global_ids,
                 )
                 self.assertEqual(
                     _moe_runner_keeps_global_expert_ids(),
-                    backend in expected_global,
+                    backend in lora_global_ids,
                 )
 
 
