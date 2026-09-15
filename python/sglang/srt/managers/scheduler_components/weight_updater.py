@@ -465,13 +465,22 @@ class SchedulerWeightUpdaterManager:
         loadable state on the selected runners (target and/or draft), so the draft
         model is prepared identically to the target. Re-entering after a failed
         transfer resets the open transaction so a reconnected sender can replay
-        the complete update without exposing the partial weights."""
+        the complete update without exposing the partial weights. A restart must
+        retain the original selector so end finalizes exactly the prepared runners."""
         if self._weight_update_in_progress:
+            if recv_req.selector != self._weight_update_selector:
+                return BeginWeightUpdateReqOutput(
+                    success=False,
+                    message=(
+                        "Cannot change the runner selector of an open weight-update "
+                        f"session from {self._weight_update_selector!r} to "
+                        f"{recv_req.selector!r}; restart with the original selector."
+                    ),
+                )
             logger.warning(
                 "Restarting an incomplete weight-update session; the sender must "
                 "replay the complete update before generation resumes."
             )
-            self._weight_update_selector = recv_req.selector
             self._weight_update_loaded = False
             self._weight_update_requires_post_load = False
             torch.distributed.barrier(group=self.tp_cpu_group)

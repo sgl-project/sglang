@@ -565,12 +565,77 @@ def test_end_weight_update_reuses_session_selector_from_begin():
     draft_runner.end_weight_update.assert_called_once()
 
 
-def test_begin_weight_update_rejects_reentry():
-    # A second begin while a session is open would leave the first session's
-    # restored runners unfinalized — reject it loudly.
-    manager = _session_manager(Mock(), Mock())
-    manager._weight_update_in_progress = True
+@pytest.mark.parametrize("selector", ["all", "target", "draft"])
+def test_begin_weight_update_restarts_with_the_same_selector(selector):
+    target, draft = Mock(), Mock()
+    manager = _session_manager(target, draft)
+    manager._weight_update_in_progress = False
 
     with patch("torch.distributed.barrier"):
-        with pytest.raises(AssertionError, match="already open"):
-            manager.begin_weight_update(BeginWeightUpdateReqInput())
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector=selector))
+        manager._weight_update_loaded = True
+        manager._weight_update_requires_post_load = True
+        output = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector=selector)
+        )
+
+        assert output.success is True
+        assert manager._weight_update_selector == selector
+        assert manager._weight_update_in_progress is True
+        assert manager._weight_update_loaded is False
+        assert manager._weight_update_requires_post_load is False
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+    for role, runner in (("target", target), ("draft", draft)):
+        if selector in ("all", role):
+            # Retry must not restore an already loadable runner a second time.
+            runner.begin_weight_update.assert_called_once_with()
+            runner.end_weight_update.assert_called_once_with(run_post_load=True)
+        else:
+            runner.begin_weight_update.assert_not_called()
+            runner.end_weight_update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "initial,restart",
+    [
+        (initial, restart)
+        for initial in ("all", "target", "draft")
+        for restart in ("all", "target", "draft")
+        if initial != restart
+    ],
+)
+def test_begin_weight_update_rejects_selector_changes_without_mutating_session(
+    initial, restart
+):
+    target, draft = Mock(), Mock()
+    manager = _session_manager(target, draft)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier") as barrier:
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector=initial))
+        manager._weight_update_loaded = True
+        manager._weight_update_requires_post_load = True
+        barrier.reset_mock()
+        output = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector=restart)
+        )
+
+        assert output.success is False
+        assert "Cannot change the runner selector" in output.message
+        assert manager._weight_update_selector == initial
+        assert manager._weight_update_in_progress is True
+        assert manager._weight_update_loaded is True
+        assert manager._weight_update_requires_post_load is True
+        barrier.assert_not_called()
+        # The original transaction can still finalize exactly the runners
+        # prepared by its first begin, including the all -> target regression.
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+    for role, runner in (("target", target), ("draft", draft)):
+        if initial in ("all", role):
+            runner.begin_weight_update.assert_called_once_with()
+            runner.end_weight_update.assert_called_once_with(run_post_load=True)
+        else:
+            runner.begin_weight_update.assert_not_called()
+            runner.end_weight_update.assert_not_called()

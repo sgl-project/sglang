@@ -635,12 +635,12 @@ class NcclM2NReceiver:
             valid = tuple(param.shape) == local_shape and param.is_contiguous()
         elif recipe in ("expert_gate", "expert_up"):
             canonical = (local_shape[0], local_shape[1] * 2, local_shape[2])
-            valid = (
-                tuple(param.shape) == canonical
-                if entry.get("tensor_role") == "weight"
-                else tuple(param.shape)
-                in (canonical, (local_shape[0], local_shape[2], local_shape[1] * 2))
+            expected = (
+                (canonical[0], canonical[2], canonical[1])
+                if self._unquantized_expert_is_transposed(entry)
+                else canonical
             )
+            valid = tuple(param.shape) == expected
         elif recipe in ("expert_gate_scale", "expert_up_scale"):
             valid = bool(getattr(param, "format_ue8m0", False)) or tuple(
                 param.shape
@@ -650,11 +650,13 @@ class NcclM2NReceiver:
                 local_shape[2],
             )
         elif recipe == "expert_down":
-            valid = (
-                tuple(param.shape) == local_shape and param.is_contiguous()
-                if entry.get("tensor_role") == "weight"
-                else tuple(param.shape)
-                in (local_shape, (local_shape[0], local_shape[2], local_shape[1]))
+            expected = (
+                (local_shape[0], local_shape[2], local_shape[1])
+                if self._unquantized_expert_is_transposed(entry)
+                else local_shape
+            )
+            valid = tuple(param.shape) == expected and (
+                entry.get("tensor_role") != "weight" or param.is_contiguous()
             )
         elif recipe == "expert_down_scale":
             valid = bool(getattr(param, "format_ue8m0", False)) or (
@@ -667,6 +669,10 @@ class NcclM2NReceiver:
             and allow_packed_expert_weights
             and entry["family"] == "routed_expert"
             and recipe in _ROUTED_EXPERT_WEIGHT_RECIPES
+            and (
+                entry.get("tensor_role") == "weight"
+                or self._is_blocked_bf16_expert(entry)
+            )
         ):
             canonical_shape = self._canonical_parameter_shape(recipe, local_shape)
             canonical_numel = 1
@@ -727,6 +733,29 @@ class NcclM2NReceiver:
             return (local_shape[0], local_shape[1] * 2, local_shape[2])
         return local_shape
 
+    def _unquantized_expert_is_transposed(self, entry: Mapping[str, Any]) -> bool:
+        if entry["family"] != "routed_expert" or entry.get("tensor_role") is not None:
+            return False
+        name = entry["destination"]["parameter"]
+        module = self.model.get_submodule(name.rsplit(".", 1)[0])
+        # Match FusedMoE's weight loader. Shapes alone are ambiguous for square
+        # matrices, and triton_kernel deliberately stores both weights as KxN.
+        return bool(
+            getattr(module, "use_triton_kernels", False)
+            or getattr(self._params[name], "is_transposed", False)
+        )
+
+    def _is_blocked_bf16_expert(self, entry: Mapping[str, Any]) -> bool:
+        if entry["family"] != "routed_expert" or entry.get("tensor_role") is not None:
+            return False
+        name = entry["destination"]["parameter"]
+        module = self.model.get_submodule(name.rsplit(".", 1)[0])
+        return (
+            self._params[name].dtype == torch.bfloat16
+            and bool(getattr(module, "use_flashinfer_trtllm_moe", False))
+            and not self._unquantized_expert_is_transposed(entry)
+        )
+
     def _prepare_fp8_destinations(self) -> None:
         for entry, _, _ in self._entries:
             if entry.get("tensor_role") in ("weight", "scale"):
@@ -785,6 +814,7 @@ class NcclM2NReceiver:
                 or entry.get("tensor_role") is not None
                 or recipe not in _ROUTED_EXPERT_WEIGHT_RECIPES
                 or parameter in prepared
+                or not self._is_blocked_bf16_expert(entry)
             ):
                 continue
             prepared.add(parameter)
@@ -813,6 +843,10 @@ class NcclM2NReceiver:
         descriptor = entry["destination"]
         param = self._params[descriptor["parameter"]].data
         recipe = descriptor["recipe"]
+        if self._unquantized_expert_is_transposed(entry):
+            # Copy through a logical NxK view without changing the parameter's
+            # inference shape, strides, or CUDA-graph-visible storage.
+            param = param.transpose(1, 2)
         if recipe == "dense_down":
             return param, None
 

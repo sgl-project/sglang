@@ -684,6 +684,7 @@ def test_receiver_initialization_accepts_equal_numel_packed_fp8_weight_storage()
 def test_receiver_restores_blocked_bf16_expert_weights_before_transfer():
     model = _bf16_moe_tp_model()
     experts = model.model.layers[0].mlp.experts
+    experts.use_flashinfer_trtllm_moe = True
     experts.w13_weight.data = experts.w13_weight.data.view(2, 4, 256, 64)
     experts.w2_weight.data = experts.w2_weight.data.view(2, 2, 256, 64)
     w13_ptr = experts.w13_weight.data_ptr()
@@ -710,6 +711,124 @@ def test_receiver_restores_blocked_bf16_expert_weights_before_transfer():
     assert experts.w2_weight.shape == (2, 256, 128)
     assert experts.w2_weight.data_ptr() == w2_ptr
     receiver._validate_manifest(4)
+
+
+@pytest.mark.parametrize("layout_hint", ["triton_kernel", "parameter", "canonical"])
+@pytest.mark.parametrize("contiguous", [False, True])
+@pytest.mark.parametrize("hidden,intermediate", [(6, 3), (4, 4), (5, 3)])
+def test_bf16_refits_preserve_expert_layout_and_values(
+    layout_hint, contiguous, hidden, intermediate
+):
+    # Include square W13 and square W2: shape inference cannot distinguish
+    # their transposed layouts. Nonuniform values catch incorrect axis copies.
+    model = _bf16_moe_tp_model()
+    experts = model.model.layers[0].mlp.experts
+    transposed = layout_hint != "canonical"
+    experts.use_triton_kernels = layout_hint == "triton_kernel"
+    for name, shape in (
+        ("w13_weight", (2, 2 * intermediate, hidden)),
+        ("w2_weight", (2, hidden, intermediate)),
+    ):
+        value = torch.zeros(shape, dtype=torch.bfloat16)
+        if transposed:
+            value = value.transpose(1, 2)
+        elif not contiguous:
+            value = value.transpose(1, 2).contiguous().transpose(1, 2)
+        if contiguous:
+            value = value.contiguous()
+        param = torch.nn.Parameter(value, requires_grad=False)
+        param.is_transposed = layout_hint == "parameter"
+        setattr(experts, name, param)
+
+    manifest = _bf16_moe_tp_manifest()
+    for entry in manifest["entries"]:
+        is_down = entry["destination"]["recipe"] == "expert_down"
+        entry["global_shape"] = (
+            [2, hidden, 2 * intermediate] if is_down else [2, 2 * intermediate, hidden]
+        )
+        entry["source"]["local_shape"] = [1, *entry["global_shape"][1:]]
+        entry["destination"]["local_shape"] = (
+            [2, hidden, intermediate] if is_down else [2, intermediate, hidden]
+        )
+    receiver = _receiver(manifest, model=model, topology=_MOE_TP_TOPOLOGY)
+    receiver._entries = receiver._validate_manifest(4, allow_packed_expert_weights=True)
+    receiver._pg = object()
+    receiver.comm_ptr = 123
+    receiver.stream = Mock()
+    graph_weights = [experts.w13_weight.detach(), experts.w2_weight.detach()]
+    pointers = [value.data_ptr() for value in graph_weights]
+    strides = [value.stride() for value in graph_weights]
+    m2n = Mock()
+
+    for update in (1, 2):
+        payloads = {}
+        for index, entry in enumerate(manifest["entries"]):
+            shape = entry["destination"]["local_shape"]
+            value = torch.arange(shape[0] * shape[1] * shape[2]).reshape(shape)
+            payloads[entry["destination"]["recipe"]] = (
+                (value % 17 + index * 19 + update) / 32
+            ).to(torch.bfloat16)
+        incoming = iter(payloads.values())
+        m2n.reshard.side_effect = lambda source, destination, *args, **kwargs: (
+            destination.copy_(next(incoming))
+        )
+        with (
+            patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+            patch("torch.cuda.current_stream"),
+            patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+        ):
+            receiver.receive()
+
+        canonical = [
+            torch.cat((payloads["expert_gate"], payloads["expert_up"]), dim=1),
+            payloads["expert_down"],
+        ]
+        for index, param in enumerate((experts.w13_weight, experts.w2_weight)):
+            expected = (
+                canonical[index].transpose(1, 2) if transposed else canonical[index]
+            )
+            assert param.shape == expected.shape
+            assert param.data_ptr() == pointers[index]
+            assert param.stride() == strides[index]
+            torch.testing.assert_close(param, expected)
+            torch.testing.assert_close(graph_weights[index], expected)
+
+        # Exercise both GEMMs with the stored inference orientation.
+        x = torch.arange(2 * hidden, dtype=torch.float32).reshape(1, 2, hidden)
+        x = x.expand(2, -1, -1) / 8
+        w13, w2 = [value.float() for value in graph_weights]
+        if not transposed:
+            w13, w2 = w13.transpose(1, 2), w2.transpose(1, 2)
+        gate, up = torch.bmm(x, w13).chunk(2, dim=-1)
+        actual = torch.bmm(torch.nn.functional.silu(gate) * up, w2)
+        gate, up = torch.bmm(x, canonical[0].float().transpose(1, 2)).chunk(2, dim=-1)
+        expected = torch.bmm(
+            torch.nn.functional.silu(gate) * up, canonical[1].float().transpose(1, 2)
+        )
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("triton_kernel", [False, True])
+def test_receiver_rejects_unknown_bf16_blocked_layouts(triton_kernel):
+    model = _bf16_moe_tp_model()
+    experts = model.model.layers[0].mlp.experts
+    experts.use_triton_kernels = triton_kernel
+    experts.w2_weight.data = experts.w2_weight.data.view(2, 2, 256, 64)
+    receiver = _receiver(
+        _bf16_moe_tp_manifest(), model=model, topology=_MOE_TP_TOPOLOGY
+    )
+    with pytest.raises(ValueError, match="incompatible with expert_down"):
+        receiver._validate_manifest(4, allow_packed_expert_weights=True)
+
+
+def test_receiver_rejects_canonical_shape_for_transposed_bf16_backend():
+    model = _bf16_moe_tp_model()
+    model.model.layers[0].mlp.experts.use_triton_kernels = True
+    receiver = _receiver(
+        _bf16_moe_tp_manifest(), model=model, topology=_MOE_TP_TOPOLOGY
+    )
+    with pytest.raises(ValueError, match="incompatible with expert_down"):
+        receiver._validate_manifest(4, allow_packed_expert_weights=True)
 
 
 def test_fp8_manifest_requires_exact_metadata_and_complete_atomic_pairs():
