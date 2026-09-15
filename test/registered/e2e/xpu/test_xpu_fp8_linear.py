@@ -8,16 +8,13 @@ Usage:
 
 import unittest
 from typing import List
-from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
     per_token_group_quant_fp8,
     torch_w8a8_block_fp8_linear,
-    use_rowwise_torch_scaled_mm,
 )
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -311,138 +308,6 @@ class TestXPUFP8Linear(CustomTestCase):
             q_input, input_scale, weight, block_size, weight_scale, bias
         ).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
-
-    def test_rowwise_torch_scaled_mm_xpu(self):
-        """Verify rowwise torch scaled_mm path at decode and prefill sizes."""
-        self.assertTrue(use_rowwise_torch_scaled_mm())
-
-        K, N = 256, 256
-        weight = torch.randn(K, N, dtype=torch.bfloat16, device=self.device).to(
-            torch.float8_e4m3fn
-        )
-        weight_scale = torch.rand(N, 1, dtype=torch.float32, device=self.device) + 0.1
-
-        for M in (1, 8, 64):
-            with self.subTest(M=M):
-                x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
-                out = apply_fp8_linear(
-                    input=x,
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    use_per_token_if_dynamic=True,
-                )
-                q_input, input_scale = per_token_group_quant_fp8(x, K)
-                ref = torch.matmul(
-                    q_input.float() * input_scale.float(),
-                    weight.float() * weight_scale.t(),
-                ).to(torch.bfloat16)
-                self.assertEqual(out.shape, (M, N))
-                self.assertEqual(out.dtype, torch.bfloat16)
-                torch.testing.assert_close(out, ref, rtol=0.01, atol=0.01)
-
-        noncontiguous_scale_storage = torch.empty(
-            N * 2, 1, dtype=torch.float32, device=self.device
-        )
-        noncontiguous_scale_storage[::2] = weight_scale
-        noncontiguous_weight_scale = noncontiguous_scale_storage[::2]
-        x = torch.randn(8, K, dtype=torch.bfloat16, device=self.device)
-        out_fallback = apply_fp8_linear(
-            input=x,
-            weight=weight,
-            weight_scale=noncontiguous_weight_scale,
-            input_scale=None,
-            use_per_token_if_dynamic=True,
-        )
-        q_input, input_scale = per_token_group_quant_fp8(x, K)
-        ref_fallback = torch.matmul(
-            q_input.float() * input_scale.float(),
-            weight.float() * noncontiguous_weight_scale.t(),
-        ).to(torch.bfloat16)
-        torch.testing.assert_close(out_fallback, ref_fallback, rtol=0.01, atol=0.01)
-
-    def test_rowwise_xpu_dispatch_conditions(self):
-        """Verify fused eligibility and fallback behavior independently of output shape."""
-        M_values = (1, 8)
-        K = N = 256
-        weight = torch.randn(K, N, dtype=torch.bfloat16, device=self.device).to(
-            torch.float8_e4m3fn
-        )
-        weight_scale = torch.rand(N, 1, dtype=torch.float32, device=self.device) + 0.1
-
-        original_scaled_mm = torch._scaled_mm
-        observed_scale_shapes = []
-
-        def traced_scaled_mm(*args, **kwargs):
-            observed_scale_shapes.append(
-                (tuple(kwargs["scale_a"].shape), tuple(kwargs["scale_b"].shape))
-            )
-            return original_scaled_mm(*args, **kwargs)
-
-        with patch.object(torch, "_scaled_mm", side_effect=traced_scaled_mm):
-            for M in M_values:
-                x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
-                q_input, input_scale = per_token_group_quant_fp8(x, K)
-                reference = torch.matmul(
-                    q_input.float() * input_scale.float(),
-                    weight.float() * weight_scale.t(),
-                ).to(torch.bfloat16)
-
-                observed_scale_shapes.clear()
-                output = apply_fp8_linear(
-                    input=x,
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    use_per_token_if_dynamic=True,
-                )
-                self.assertEqual(len(observed_scale_shapes), 1)
-                expected = ((M, 1), (1, N)) if M >= 8 else ((1,), (1,))
-                self.assertEqual(observed_scale_shapes[0], expected)
-                torch.testing.assert_close(output, reference, rtol=0.01, atol=0.01)
-
-            observed_scale_shapes.clear()
-            x = torch.randn(8, K, dtype=torch.bfloat16, device=self.device)
-            output = apply_fp8_linear(
-                input=x,
-                weight=weight,
-                weight_scale=weight_scale,
-                input_scale=None,
-                use_per_token_if_dynamic=False,
-            )
-            self.assertEqual(observed_scale_shapes, [((1,), (1,))])
-            q_input, input_scale = per_token_group_quant_fp8(x, K)
-            reference = torch.matmul(
-                q_input.float() * input_scale.float(),
-                weight.float() * weight_scale.t(),
-            ).to(torch.bfloat16)
-            torch.testing.assert_close(output, reference, rtol=0.01, atol=0.01)
-
-        x = torch.randn(8, K, dtype=torch.bfloat16, device=self.device)
-        q_input, input_scale = per_token_group_quant_fp8(x, K)
-        scale_storage = torch.empty(16, 1, dtype=torch.float32, device=self.device)
-        scale_storage[::2] = input_scale
-        noncontiguous_input_scale = scale_storage[::2]
-        self.assertFalse(noncontiguous_input_scale.is_contiguous())
-        observed_scale_shapes.clear()
-        with patch.object(torch, "_scaled_mm", side_effect=traced_scaled_mm):
-            with patch(
-                "sglang.srt.layers.quantization.fp8_utils.per_token_group_quant_fp8",
-                return_value=(q_input, noncontiguous_input_scale),
-            ):
-                output = apply_fp8_linear(
-                    input=x,
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    use_per_token_if_dynamic=True,
-                )
-        self.assertEqual(observed_scale_shapes, [((1,), (1,))])
-        reference = torch.matmul(
-            q_input.float() * noncontiguous_input_scale.float(),
-            weight.float() * weight_scale.t(),
-        ).to(torch.bfloat16)
-        torch.testing.assert_close(output, reference, rtol=0.01, atol=0.01)
 
 
 if __name__ == "__main__":

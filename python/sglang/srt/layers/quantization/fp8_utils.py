@@ -283,8 +283,6 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
-    if _is_xpu:
-        return True
     return False
 
 
@@ -2125,32 +2123,16 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-    dynamic_rowwise_scaling = (
+    if (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-    )
-    rowwise_torch_scaled_mm = USE_ROWWISE_TORCH_SCALED_MM
-    if _is_xpu:
-        # XPU's rowwise fused kernel requires these scale layouts and is
-        # beneficial from M=8 for representative projection shapes.
-        rowwise_torch_scaled_mm = rowwise_torch_scaled_mm and (
-            x_scale.ndim == 2
-            and x_scale.shape[1] == 1
-            and x_scale.is_contiguous()
-            and weight_scale.ndim == 2
-            and weight_scale.shape[1] == 1
-            and weight_scale.t().is_contiguous()
-            and qinput.shape[0] >= 8
-        )
-    if dynamic_rowwise_scaling and (rowwise_torch_scaled_mm or _use_aiter):
+        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+    ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
-        # Must agree with the load-time predicate that decides whether the
-        # weight was pre-shuffled; an unshuffled weight through the aiter path
-        # (or a shuffled one through torch._scaled_mm) silently returns garbage.
-        if use_aiter_bpreshuffle_gemm(weight.shape[1]):
+        if _use_aiter:
             # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
             # XQ -> input tensor, shape = (m, k)
             # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
