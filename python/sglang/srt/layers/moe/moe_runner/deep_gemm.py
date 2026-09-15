@@ -1356,6 +1356,13 @@ def post_permute_deep_gemm_to_deepep_normal(
     )
 
 
+# CTAs launched per local expert by the expert-mapped SiTU varlen kernel
+# (grid = (rows_per_expert, num_local_experts)). 32 was the fastest setting
+# across all 29 routing scenarios in the standalone EP32 prototype; each CTA
+# strides over masked_m[e] rows, so idle experts exit immediately.
+_K3_SITU_ROWS_PER_EXPERT = 32
+
+
 def _varlen_deep_gemm_situ_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: torch.Tensor,
@@ -1395,6 +1402,7 @@ def _varlen_deep_gemm_situ_mul_quant(
         scale_ue8m0=packed_ue8m0,
         topk=topk,
         transposed=packed_ue8m0,
+        rows_per_expert=_K3_SITU_ROWS_PER_EXPERT,
     )
 
     if packed_ue8m0:

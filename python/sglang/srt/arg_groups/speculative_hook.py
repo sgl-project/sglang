@@ -335,6 +335,14 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+_KIMI_K3_ARCH = "KimiK3ForConditionalGeneration"
+
+
+def _is_kimi_k3_target(server_args: ServerArgs) -> bool:
+    archs = getattr(model_config_of(server_args).hf_config, "architectures", None) or []
+    return _KIMI_K3_ARCH in archs
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
@@ -348,11 +356,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
         if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
-            raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
-                f"{cfg.moe_a2a_backend!r}."
-            )
+            # DeepEP is admitted only for the validated Kimi-K3 + static-verify
+            # combination (the static-mode check below applies to it as any
+            # other non-'none' backend); do not generalize to other models.
+            if not (
+                cfg.moe_a2a_backend == "deepep" and _is_kimi_k3_target(server_args)
+            ):
+                raise ValueError(
+                    "DSpark with dp attention supports moe_a2a_backend 'none' "
+                    "(built-in TP MoE) or 'megamoe', plus 'deepep' only for "
+                    "the validated Kimi-K3 + static-verify combination, got "
+                    f"{cfg.moe_a2a_backend!r}."
+                )
         if not _is_npu and cfg.moe_a2a_backend != "none":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -536,6 +551,88 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
         )
+
+    if (
+        not _is_npu
+        and cfg.enable_dp_attention
+        and cfg.dp_size > 1
+        and cfg.moe_a2a_backend == "deepep"
+    ):
+        _check_dspark_deepep_dispatch_capacity(server_args)
+
+
+def _check_dspark_deepep_dispatch_capacity(server_args: ServerArgs) -> None:
+    """Fail fast when the worst-case DeepEP low-latency dispatch rows per EP
+    rank exceed SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, instead of
+    letting each rank error out mid-collective at runtime.
+
+    Row accounting for one DSPARK decode/verify step on one attention-DP rank:
+    the scheduler never runs more than max_running_requests local requests; a
+    CUDA-graph replay pads the batch up to the smallest captured bucket that
+    covers it; the MLP-sync then pads the token rows to a multiple of
+    attn_tp_size (forward_batch_info.prepare_mlp_sync_batch); the K3 SP-MoE
+    reduce-scatter finally hands each EP rank rows/attn_tp_size of that padded
+    batch. Verify widens every request to gamma+1 rows, so it dominates plain
+    decode. Prefill dispatches through the normal-mode buffers and is not
+    bounded by this capacity; idle DP ranks pad to the same global row count,
+    so they cannot exceed the busy rank either.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import derive_attention_widths
+    from sglang.srt.utils import ceil_align
+
+    view = resolved_view(server_args)
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    verify_window = int(view.speculative_num_draft_tokens)
+    attn_tp_size = derive_attention_widths(
+        tp_size=view.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=view.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )[1]
+
+    # --max-running-requests is a global budget: each DP worker admits
+    # max_running_requests // attn_dp_size
+    # (kv_cache_configurator.resolve_max_num_reqs), not the CLI value itself.
+    attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+    max_local_bs = max(1, int(view.max_running_requests) // attn_dp_size)
+    worst_local_bs = max_local_bs
+    graph_cfg = view.cuda_graph_config
+    decode_graph = getattr(graph_cfg, "decode", None) if graph_cfg is not None else None
+    if (
+        not view.disable_cuda_graph
+        and decode_graph is not None
+        and decode_graph.backend != Backend.DISABLED
+        and decode_graph.bs
+    ):
+        # The runner drops capture buckets whose bs*window is not a multiple
+        # of the graph batch-size alignment (attn_tp_size here); mirror that
+        # filter before picking the smallest bucket covering max_local_bs.
+        eligible = [
+            bs
+            for bs in decode_graph.bs
+            if bs >= max_local_bs and (bs * verify_window) % attn_tp_size == 0
+        ]
+        if eligible:
+            worst_local_bs = min(eligible)
+
+    padded_rows = ceil_align(worst_local_bs * verify_window, attn_tp_size)
+    rows_per_rank = padded_rows // attn_tp_size
+    if rows_per_rank <= capacity:
+        return
+    raise ValueError(
+        "DSpark + DeepEP low-latency dispatch capacity exceeded: the worst "
+        f"verify step dispatches {rows_per_rank} rows per EP rank "
+        f"(dp-local bs {worst_local_bs} x verify window {verify_window} "
+        f"= {worst_local_bs * verify_window} rows, padded to {padded_rows} "
+        f"for attn_tp_size={attn_tp_size}, then scattered /{attn_tp_size} "
+        "across the SP-MoE group), but "
+        f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity}. "
+        "Raise the env value (<= 1024, the DeepEP FINISHED_SUM_TAG limit), or "
+        "lower --max-running-requests / --cuda-graph-max-bs-decode / the "
+        "DSpark gamma."
+    )
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:

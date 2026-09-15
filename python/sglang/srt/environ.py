@@ -1080,6 +1080,9 @@ class Envs:
     # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    # Split DeepEP low-latency dispatch/combine into a SEND launch plus a
+    # hook-launched RECV launch; set to 0 to fuse both phases in one launch.
+    SGLANG_DEEPEP_RETURN_RECV_HOOK = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
@@ -1172,6 +1175,10 @@ class Envs:
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Build CustomAllReduce(V2) communicators on the attention_tp group, which
+    # is single-node under DP attention; enables k3_sp_collective fused RS/AG.
+    # Cross-node groups (_TP/_DCP) still follow --disable-custom-all-reduce.
+    SGLANG_ATTN_TP_CUSTOM_ALL_REDUCE = EnvBool(True)
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)

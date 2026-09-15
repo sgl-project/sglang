@@ -41,6 +41,7 @@ def situ_and_mul_masked_post_quant(
     topk: int = 8,
     transposed: bool = False,
     swizzle: bool = False,
+    rows_per_expert: int = 32,
 ) -> None:
     from .moe import situ_and_mul_masked_post_quant as impl
 
@@ -56,6 +57,7 @@ def situ_and_mul_masked_post_quant(
         topk,
         transposed,
         swizzle,
+        rows_per_expert,
     )
 
 

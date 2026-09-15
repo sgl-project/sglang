@@ -276,92 +276,95 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(8 * kWorkThreads == 128, "Invalid tiling");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
-  const auto [expert_id, token_id, valid] = get_work(params);
-
-  if (!valid) return;
-
-  const auto work_id = threadIdx.x / kWorkThreads;
-
-  const auto offset = expert_id * params.num_tokens + token_id;
-  const auto input = params.input + offset * params.hidden_dim * 2;
-  const auto output = params.output + offset * params.hidden_dim;
-  [[maybe_unused]]
-  const auto output_scale = [&] {
-    const auto num_groups = params.hidden_dim / kGroupSize;
-    if constexpr (kTransposed) {
-      const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
-      // Physical layout is [E, G//4, N] int32.  Each int32 packs 4 consecutive
-      // group scales for the same token, so the byte address is:
-      //   expert_offset + (group/4)*N*4 + token*4 + group%4
-      return base + expert_id * num_groups * params.num_tokens + (work_id / 4u) * (params.num_tokens * 4u) +
-             token_id * 4u + (work_id % 4u);
-    } else {
-      return params.output_scale + offset * num_groups + work_id;
-    }
-  }();
-
-  const float beta = params.beta;
-  const float linear_beta = params.linear_beta;
-  const float inv_beta = 1.0f / beta;
-  const float inv_linear_beta = 1.0f / linear_beta;
-
+  // Expert-mapped grid: blockIdx.y selects the local expert directly and
+  // blockIdx.x strides over that expert's valid rows, so no CTA pays the
+  // masked_m prefix-scan cost and idle experts exit without any scan.
+  // masked_m is finalized upstream of the preceding (primary) kernel, so it
+  // is safe to read before PDLWaitPrimary.
+  const auto expert_id = blockIdx.y;
+  const auto valid_rows = params.masked_m[expert_id];
   PDLWaitPrimary<kUsePDL>();
+  for (uint32_t token_id = blockIdx.x; token_id < valid_rows; token_id += gridDim.x) {
+    const auto work_id = threadIdx.x / kWorkThreads;
 
-  InputVec gate_vec, up_vec;
-  if constexpr (kSwizzle) {
-    // gran=8 interleaved: every 16-element chunk on the N axis is
-    // [gate[0..7], up[0..7]]. Each thread handles 8 consecutive output
-    // elements, so its gate chunk lives at vec index 2*threadIdx.x and its
-    // up chunk at 2*threadIdx.x+1.
-    gate_vec.load(input, threadIdx.x * 2);
-    up_vec.load(input, threadIdx.x * 2 + 1);
-  } else {
-    gate_vec.load(input, threadIdx.x);
-    up_vec.load(input, threadIdx.x + blockDim.x);
-  }
+    const auto offset = expert_id * params.num_tokens + token_id;
+    const auto input = params.input + offset * params.hidden_dim * 2;
+    const auto output = params.output + offset * params.hidden_dim;
+    [[maybe_unused]]
+    const auto output_scale = [&] {
+      const auto num_groups = params.hidden_dim / kGroupSize;
+      if constexpr (kTransposed) {
+        const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
+        // Physical layout is [E, G//4, N] int32.  Each int32 packs 4 consecutive
+        // group scales for the same token, so the byte address is:
+        //   expert_offset + (group/4)*N*4 + token*4 + group%4
+        return base + expert_id * num_groups * params.num_tokens + (work_id / 4u) * (params.num_tokens * 4u) +
+               token_id * 4u + (work_id % 4u);
+      } else {
+        return params.output_scale + offset * num_groups + work_id;
+      }
+    }();
 
-  float local_max = 0.0f;
-  float results[8];
+    const float beta = params.beta;
+    const float linear_beta = params.linear_beta;
+    const float inv_beta = 1.0f / beta;
+    const float inv_linear_beta = 1.0f / linear_beta;
+
+    InputVec gate_vec, up_vec;
+    if constexpr (kSwizzle) {
+      // gran=8 interleaved: every 16-element chunk on the N axis is
+      // [gate[0..7], up[0..7]]. Each thread handles 8 consecutive output
+      // elements, so its gate chunk lives at vec index 2*threadIdx.x and its
+      // up chunk at 2*threadIdx.x+1.
+      gate_vec.load(input, threadIdx.x * 2);
+      up_vec.load(input, threadIdx.x * 2 + 1);
+    } else {
+      gate_vec.load(input, threadIdx.x);
+      up_vec.load(input, threadIdx.x + blockDim.x);
+    }
+
+    float local_max = 0.0f;
+    float results[8];
 
 #pragma unroll
-  for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
-    results[2 * i + 0] = x;
-    results[2 * i + 1] = y;
-    local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
-  }
+    for (uint32_t i = 0; i < 4; ++i) {
+      const auto [x, y] = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+      results[2 * i + 0] = x;
+      results[2 * i + 1] = y;
+      local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
 
-  local_max = warp::reduce_max<kWorkThreads>(local_max);
+    local_max = warp::reduce_max<kWorkThreads>(local_max);
 
-  const float absmax = fmaxf(local_max, 1e-10f);
-  float scale;
-  uint32_t ue8m0_exp;
+    const float absmax = fmaxf(local_max, 1e-10f);
+    float scale;
+    uint32_t ue8m0_exp;
 
-  if constexpr (kScaleUE8M0) {
-    const float raw_scale = absmax / math::FP8_E4M3_MAX;
-    ue8m0_exp = cast_to_ue8m0(raw_scale);
-    scale = __uint_as_float(ue8m0_exp << 23);
-  } else {
-    scale = absmax / math::FP8_E4M3_MAX;
-  }
-  const auto inv_scale = 1.0f / scale;
+    if constexpr (kScaleUE8M0) {
+      const float raw_scale = absmax / math::FP8_E4M3_MAX;
+      ue8m0_exp = cast_to_ue8m0(raw_scale);
+      scale = __uint_as_float(ue8m0_exp << 23);
+    } else {
+      scale = absmax / math::FP8_E4M3_MAX;
+    }
+    const auto inv_scale = 1.0f / scale;
 
-  OutputVec out_vec;
+    OutputVec out_vec;
 #pragma unroll
-  for (uint32_t i = 0; i < 4; ++i) {
-    const float scaled_val0 = results[2 * i + 0] * inv_scale;
-    const float scaled_val1 = results[2 * i + 1] * inv_scale;
-    out_vec[i] = pack_fp8(scaled_val0, scaled_val1);
-  }
+    for (uint32_t i = 0; i < 4; ++i) {
+      const float scaled_val0 = results[2 * i + 0] * inv_scale;
+      const float scaled_val1 = results[2 * i + 1] * inv_scale;
+      out_vec[i] = pack_fp8(scaled_val0, scaled_val1);
+    }
 
+    out_vec.store(output, threadIdx.x);
+    if constexpr (kTransposed) {
+      *output_scale = ue8m0_exp;
+    } else {
+      *output_scale = scale;
+    }
+  }  // all rows assigned to this CTA
   PDLTriggerSecondary<kUsePDL>();
-
-  out_vec.store(output, threadIdx.x);
-  if constexpr (kTransposed) {
-    *output_scale = ue8m0_exp;
-  } else {
-    *output_scale = scale;
-  }
 }
 
 // ---- Host wrapper
@@ -378,6 +381,7 @@ struct SituAndMulMaskedPostQuantKernel {
       const tvm::ffi::TensorView output_scale,
       const tvm::ffi::TensorView masked_m,
       const uint32_t topk,
+      const uint32_t rows_per_expert,
       const bool transposed,
       const double beta,
       const double linear_beta) {
@@ -443,8 +447,12 @@ struct SituAndMulMaskedPostQuantKernel {
     const auto num_threads = hidden_dim / 8;
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
     RuntimeCheck(num_threads >= num_experts);
+    RuntimeCheck(rows_per_expert > 0, "rows_per_expert must be positive");
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
-    LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
+    // Grid is (rows_per_expert, num_experts): blockIdx.y picks the expert,
+    // blockIdx.x strides over its valid rows. `topk` no longer sizes the
+    // launch; it is kept in the signature for caller compatibility.
+    LaunchKernel(dim3(rows_per_expert, num_experts), num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
