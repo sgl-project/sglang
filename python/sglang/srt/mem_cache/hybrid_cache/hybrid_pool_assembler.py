@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
@@ -8,6 +9,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     SidecarPoolSpec,
+)
+from sglang.srt.mem_cache.hybrid_cache.hicache_mamba_sizing import (
+    MambaHostSplit,
+    all_sizes_or_none,
+    mamba_host_coverage,
+    parse_mamba_host_size,
+    proportional_split,
+    resolve_mamba_host_split,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -179,6 +188,109 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _device_pool_bytes(pool: Any) -> int:
+    size_bytes = pool.get_kv_size_bytes()
+    return sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+
+
+def _mamba_host_bytes_per_slot(mamba_pool: Any) -> int:
+    """Host bytes of one Mamba checkpoint slot, the MambaPoolHost.get_size_per_token
+    arithmetic evaluated on the device pool before the host pool exists."""
+    cache = mamba_pool.mamba_cache
+    conv_bytes = sum(
+        math.prod(conv.shape[2:]) * conv.dtype.itemsize for conv in cache.conv
+    )
+    temporal_bytes = math.prod(cache.temporal.shape[2:]) * cache.temporal.dtype.itemsize
+    return (conv_bytes + temporal_bytes) * mamba_pool.num_mamba_layers
+
+
+def _resolve_hicache_mamba_split(
+    *,
+    knob: Any,
+    kv_pools: tuple[Any, ...],
+    mamba_pool: Any,
+    params: CacheInitParams,
+) -> tuple[tuple[float, ...], float, MambaHostSplit]:
+    """--hicache-mamba-size-gb: the KV host shares (one per non-Mamba pool, in
+    GB), the Mamba host share (GB) and the resolved split for the boot line.
+
+    The KV pools stay byte-proportional among themselves; only the Mamba share
+    is taken from the knob. Bytes per token are the device pools' bytes over
+    the anchor pool's tokens, which is what the proportional split implies.
+    """
+    hicache_size = get_memory().hicache_size
+    kv_pool_bytes = tuple(_device_pool_bytes(pool) for pool in kv_pools)
+    device_kv_bytes = sum(kv_pool_bytes)
+    split = resolve_mamba_host_split(
+        hicache_size_gb=hicache_size,
+        knob=knob,
+        kv_bytes_per_token=device_kv_bytes / kv_pools[0].size,
+        mamba_bytes_per_slot=_mamba_host_bytes_per_slot(mamba_pool),
+        device_kv_bytes=device_kv_bytes,
+        device_mamba_bytes=_device_pool_bytes(mamba_pool),
+        chunked_prefill_size=params.chunked_prefill_size,
+        max_running_requests=params.req_to_token_pool.size,
+    )
+    kv_shares = (
+        proportional_split(split.kv_gb, kv_pool_bytes)
+        if len(kv_pools) > 1
+        else (split.kv_gb,)
+    )
+    return kv_shares, split.mamba_gb, split
+
+
+def _log_mamba_host_coverage(
+    *,
+    kv_host_pool: Any,
+    mamba_host_pool: Any,
+    params: CacheInitParams,
+    split: Optional[MambaHostSplit],
+) -> None:
+    """Boot line: how many KV host tokens the host Mamba slots can anchor.
+
+    Uses the pools as built (their token/slot counts), so the line is exact
+    whichever way the sizes were chosen; below 100% a warning names the knob.
+
+    Skipped unless every input is a real size: pool-assembly tests build the
+    stack with MagicMock params and a patched MambaPoolHost, and an
+    informational line must not break pool assembly.
+    """
+    sizes = (
+        kv_host_pool.size,
+        mamba_host_pool.size,
+        params.chunked_prefill_size,
+        params.req_to_token_pool.size,
+    )
+    if not all_sizes_or_none(sizes):
+        return
+    report = mamba_host_coverage(
+        kv_tokens=kv_host_pool.size,
+        slots=mamba_host_pool.size,
+        chunked_prefill_size=params.chunked_prefill_size,
+        max_running_requests=params.req_to_token_pool.size,
+    )
+    if split is not None:
+        mode = split.mode
+        prefix = (
+            f"HiCache host split ({mode}, --hicache-size "
+            f"{split.hicache_size_gb:g} GB): KV {split.kv_gb:.2f} GB, mamba "
+            f"{split.mamba_gb:.2f} GB; "
+        )
+    else:
+        mode = "proportional" if get_memory().hicache_size > 0 else "ratio"
+        prefix = f"HiCache host split ({mode}): "
+    if report.is_full:
+        logger.info("%s%s", prefix, report.boot_line())
+    else:
+        logger.warning(
+            "%s%s. Prefixes whose KV is still on host lose their last Mamba "
+            "checkpoint before their KV; set --hicache-mamba-size-gb (a GB "
+            "figure or 'auto') to size the Mamba host pool to the KV tier.",
+            prefix,
+            report.boot_line(),
+        )
 
 
 def build_pool_entry(
@@ -858,10 +970,21 @@ def build_hybrid_mamba_stack(
         for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
+    mamba_host_split: Optional[MambaHostSplit] = None
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+        mamba_size_knob = parse_mamba_host_size(get_memory().hicache_mamba_size_gb)
+        if mamba_size_knob is not None:
+            (kv_host_size,), mamba_host_size, mamba_host_split = (
+                _resolve_hicache_mamba_split(
+                    knob=mamba_size_knob,
+                    kv_pools=(kv_pool,),
+                    mamba_pool=mamba_pool,
+                    params=params,
+                )
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -882,6 +1005,12 @@ def build_hybrid_mamba_stack(
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
+    )
+    _log_mamba_host_coverage(
+        kv_host_pool=kv_host_pool,
+        mamba_host_pool=mamba_host_pool,
+        params=params,
+        split=mamba_host_split,
     )
     entries = [
         build_pool_entry(
@@ -959,10 +1088,21 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
+    mamba_host_split: Optional[MambaHostSplit] = None
     if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
+        mamba_size_knob = parse_mamba_host_size(get_memory().hicache_mamba_size_gb)
+        if mamba_size_knob is not None:
+            (kv_host_size, swa_host_size), mamba_host_size, mamba_host_split = (
+                _resolve_hicache_mamba_split(
+                    knob=mamba_size_knob,
+                    kv_pools=(full_kv_pool, swa_kv_pool),
+                    mamba_pool=mamba_pool,
+                    params=params,
+                )
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
@@ -983,6 +1123,12 @@ def build_hybrid_mamba_swa_stack(
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
+    )
+    _log_mamba_host_coverage(
+        kv_host_pool=kv_host_pool,
+        mamba_host_pool=mamba_host_pool,
+        params=params,
+        split=mamba_host_split,
     )
     entries = [
         build_pool_entry(
