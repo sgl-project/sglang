@@ -149,7 +149,7 @@ The stages are `preprocess` (obtaining multimodal processor output, including en
 
 Stage durations include awaited work and queue waits. They can overlap across concurrent requests and with GPU execution, so their sum is not CPU utilization or encoder GPU time. An empty preprocessing result can still contribute a stage sample. The item and byte counters count returned preprocessing work, including requests that fail later; they are not counts of completed generations.
 
-`modality` is bounded to `image`, `video`, `audio`, or `other`. The metrics use the collector's configured base labels and do not add request IDs, URLs, or feature hashes. Byte accounting does not reconstruct transport proxies or synchronize devices; opaque transported features contribute zero bytes, and tensor views contribute their logical size rather than their backing allocation size.
+`modality` is bounded to `image`, `video`, `audio`, or `other`. The metrics use the collector's configured base labels and do not add request IDs, URLs, or feature hashes. The names `stage`, `outcome`, and `modality` are reserved for the frontend dimensions; configured labels with those names are omitted from these metrics. Byte accounting does not reconstruct transport proxies or synchronize devices; opaque transported features contribute zero bytes, and tensor views contribute their logical size rather than their backing allocation size.
 
 For example, to inspect preprocessing p95 over five minutes:
 
