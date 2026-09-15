@@ -17,6 +17,21 @@ pub enum ApiError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    /// A request refused by the fleet-wide sampling contract
+    /// (`--override-sampling-params` under `--sampling-param-conflict
+    /// reject`).
+    ///
+    /// Distinct from [`Self::BadRequest`] on purpose: rolling a contract out
+    /// across a fleet turns previously-served client traffic into 400s, and
+    /// the operator's first question is how much and on which parameter.
+    /// Folded into `bad_request` that is unanswerable — the code would be the
+    /// same one malformed JSON and a missing `model` field already emit.
+    /// `param` is a `&'static str` from
+    /// [`crate::config::SamplingField::wire_name`], which keeps it usable as a
+    /// bounded metric label.
+    #[error("{param} is fixed by this deployment: {detail}")]
+    SamplingContract { param: &'static str, detail: String },
+
     /// Could not reach the upstream worker (connect refused, DNS, TLS, request
     /// build error). `source` captures the full anyhow chain for server-side
     /// logging; clients see a generic message.
@@ -114,6 +129,9 @@ impl ApiError {
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            ApiError::SamplingContract { .. } => {
+                (StatusCode::BAD_REQUEST, "sampling_contract_violation")
+            }
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
             ApiError::UpstreamUnreachable { .. } => {
                 (StatusCode::BAD_GATEWAY, "upstream_unreachable")
@@ -242,7 +260,9 @@ impl IntoResponse for ApiError {
                 );
                 "service unavailable".to_string()
             }
-            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
+            ApiError::BadRequest(_)
+            | ApiError::ModelNotFound(_)
+            | ApiError::SamplingContract { .. } => self.to_string(),
         };
         let mut resp = (
             status,
@@ -440,6 +460,29 @@ mod tests {
         assert!(
             !body_str.contains(secret_msg),
             "ApiError::Internal must not leak anyhow chain to client; got: {body_str}"
+        );
+    }
+    /// A sampling-contract rejection must not be filed under `bad_request`:
+    /// an operator rolling `--sampling-param-conflict reject` across a fleet
+    /// has to be able to alert on contract rejections without them being
+    /// indistinguishable from clients sending malformed JSON.
+    #[test]
+    fn sampling_contract_has_a_distinct_code_from_other_bad_requests() {
+        let err = ApiError::SamplingContract {
+            param: "temperature",
+            detail: "got 0.5, expected 1 (or omit the field)".into(),
+        };
+        let (status, code_header, env) = parse_envelope(err.into_response());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code_header.as_deref(), Some("sampling_contract_violation"));
+        assert_eq!(env.error.code, "sampling_contract_violation");
+        assert_ne!(env.error.code, "bad_request");
+        // The parameter and both values reach the client: a 400 here is
+        // actionable without an operator explaining it.
+        assert!(
+            env.error.message.contains("temperature") && env.error.message.contains("0.5"),
+            "got: {}",
+            env.error.message
         );
     }
 }
