@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -36,6 +37,17 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheRequestHandle:
+    rid: str
+    attempt_id: int
+
+
+class CacheRequestOutcome(Enum):
+    SUCCESS = auto()
+    ABORT = auto()
 
 
 @runtime_checkable
@@ -78,7 +90,13 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    session_id: Optional[str] = None
     track_adopted_ranges: bool = False
+
+    # Logical-page KV sharding: rotation base of the chain the inserted
+    # values belong to (stamped onto new tree nodes; None when sharding is
+    # off). See UnifiedTreeNode.rotation_base.
+    rotation_base: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -90,6 +108,13 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     swa_branch_inserted: bool = False
+
+    # Logical-page KV sharding: the un-matched tail was NOT inserted because
+    # its rotation base disagrees with the matched chain's (a cross-chain
+    # graft would break the cyclic-owner gather contract). The tail's pages
+    # stay owned by the inserting request; callers must not dedup/rebind
+    # past prefix_len.
+    rotation_tail_declined: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
@@ -334,6 +359,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Release attempt state; caches without prefetch state have nothing to drop."""
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        """Finish an attempt without cancelling successful asynchronous cache work."""
+        if outcome != CacheRequestOutcome.SUCCESS:
+            self.release_aborted_request(handle)
+
     @abstractmethod
     def reset(self):
         pass
@@ -380,6 +413,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """The hash chain of the node's ancestors, in root-to-parent order."""
         return node.get_prefix_hash_values(node.parent)
 
+    def rotation_base_of(self, node: Any) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base stamped on ``node``.
+
+        ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
+        for the unified tree, None for caches without tree nodes). None means
+        "no base available here", which sends the alloc path to the base the
+        request recorded at its previous alloc. Tree caches that keep the
+        per-chain base override this. See UnifiedTreeNode.rotation_base.
+        """
+        return None
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
@@ -392,12 +436,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
         """
-        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        # Adjacent pieces whose seam falls inside one (DCP-widened) page would
+        # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
             self.token_to_kv_pool_allocator,
-            [(row[start:end], start) for start, end in ranges],
+            [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
         )
 
@@ -459,19 +505,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self,
+        handle: CacheRequestHandle,
+        fulfilled_tokens: int,
+        reason: Optional[str],
     ) -> None:
         """Resolve storage-hit accounting once a request is admitted.
 
         Non-storage caches have no lifecycle state to resolve.
         """
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
-        return self.pop_prefetch_loaded_tokens(req_id), None
+        return self.pop_prefetch_loaded_tokens(handle), None
 
     def ready_to_load_host_cache(self) -> Any:
         """
