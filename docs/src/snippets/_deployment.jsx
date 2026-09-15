@@ -80,6 +80,7 @@
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by
+//                      `hw|variant|quant` then `variant|quant` then
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
@@ -108,6 +109,11 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
+  const AMD_RDMA_DOCKER_FLAGS = [
+    "--device /dev/infiniband", "--cap-add IPC_LOCK",
+    "--ulimit memlock=-1", "--ulimit stack=67108864",
+    "--ulimit nofile=1048576:1048576",
+  ];
   const HARDWARE_CATALOG = {
     blackwell: [
       { id: "b300",  label: "B300",  vram: "288GB" },
@@ -127,16 +133,24 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
+    // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
+    // memlock let the transport pin its registered buffers, and the stack /
+    // nofile raises are for the per-QP file descriptors a full 8-NIC mesh opens.
     amd: [
-      { id: "mi300x", label: "MI300X", vram: "192GB" },
-      { id: "mi325x", label: "MI325X", vram: "256GB" },
-      { id: "mi350x", label: "MI350X", vram: "288GB" },
-      { id: "mi355x", label: "MI355X", vram: "288GB" },
+      { id: "mi300x", label: "MI300X", vram: "192GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi325x", label: "MI325X", vram: "256GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi350x", label: "MI350X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi355x", label: "MI355X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
     ],
-    // Atlas 800I A3 (910C): 1 card = 2 dies, so --tp-size is 2× the card
+    // Ascend A3 Series: 1 card = 2 dies, so --tp-size is 2× the card
     // count (32 cards -> --tp-size 64).
     npu: [
-      { id: "a3", label: "Atlas 800I A3", vram: "64GB/die" },
+      { id: "a3", label: "Ascend A3 Series", vram: "64GB/die" },
     ],
   };
 
@@ -780,11 +794,15 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`,
-      // then `hw`; `:dev` if unmapped. The strategy key covers a tier that
-      // needs its own build (e.g. a spec-decoding preview image).
+      // Image keyed by `hw|variant|quant` (most specific), then `variant|quant`,
+      // then `hw|quant|strategy`, `hw|quant`, `hw`; `:dev` if unmapped. The
+      // variant keys cover a checkpoint that needs its own build (e.g. a
+      // new-variant preview image); the strategy key covers a tier that needs
+      // one (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+        || di[`${sel.variant}|${sel.quant}`]
+        || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
         ? config.dockerRunCommand(sel)
@@ -821,7 +839,7 @@ export const Deployment = ({ config, benchmarks }) => {
         : vendorOf(sel.hw) === "npu"
         ? [
             // NPU: --privileged grants the davinci devices (16 dies on an
-            // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
+            // 8-card Ascend A3 Series node); the host CANN driver/firmware/state
             // must be mounted in.
             "docker run --privileged --shm-size=16g",
             "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",

@@ -12,7 +12,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 
@@ -235,6 +235,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            kv_index_translator=None,
             model_config=SimpleNamespace(context_len=2048),
         )
         # The backend takes the mode from the published configuration, not from

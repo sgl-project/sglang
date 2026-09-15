@@ -22,14 +22,16 @@ namespace {
 //      plain causal mask (correct for non-spec extend and topk == 1 chains).
 //
 
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, typename packed_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
     scalar_t* __restrict__ o_extend,
     const scalar_t* __restrict__ q_extend,
     const scalar_t* __restrict__ k_extend,
     const scalar_t* __restrict__ v_extend,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    const packed_t* __restrict__ k_buffer,
+    const packed_t* __restrict__ v_buffer,
+    const float* __restrict__ k_buf_scale,
+    const float* __restrict__ v_buf_scale,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -160,9 +162,10 @@ void extend_attention_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
+            /* src_scale*/ k_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     N  */ n_size,
             /*     K  */ head_size,
@@ -214,9 +217,10 @@ void extend_attention_kernel_impl(
         }
 
         // get value and pack
-        pack_vnni2<scalar_t>(
+        pack_vnni2<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
+            /* src_scale*/ v_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -382,13 +386,15 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   do {                                                                                     \
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v); \
                                                                                            \
-    extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(                     \
+    extend_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_M, BLOCK_N>(           \
         o_extend.data_ptr<scalar_t>(),                                                     \
         q_extend.data_ptr<scalar_t>(),                                                     \
         k_extend.data_ptr<scalar_t>(),                                                     \
         v_extend.data_ptr<scalar_t>(),                                                     \
-        k_buffer.data_ptr<scalar_t>(),                                                     \
-        v_buffer.data_ptr<scalar_t>(),                                                     \
+        k_buffer.data_ptr<packed_t>(),                                                     \
+        v_buffer.data_ptr<packed_t>(),                                                     \
+        k_buf_scale_ptr,                                                                   \
+        v_buf_scale_ptr,                                                                   \
         req_to_token.data_ptr<index_t>(),                                                  \
         req_pool_indices.data_ptr<int64_t>(),                                              \
         seq_lens.data_ptr<int64_t>(),                                                      \
@@ -453,6 +459,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -536,8 +544,16 @@ void extend_attention_cpu(
   // D and DV need to be 32x as we transpose by 512-bit
   TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
   TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
-
+  auto kv_dtype = k_buffer.scalar_type();
+  if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+    TORCH_CHECK(k_buf_scale > 0.0 && v_buf_scale > 0.0, "float8 static scales must be positive");
+  }
   int num_threads = at::get_num_threads();
+  float k_buf_scale_float = static_cast<float>(k_buf_scale);
+  float v_buf_scale_float = static_cast<float>(v_buf_scale);
+  const float* k_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &k_buf_scale_float : nullptr;
+  const float* v_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &v_buf_scale_float : nullptr;
   auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
 
   bool has_encoder_lens = encoder_lens.has_value();
@@ -575,15 +591,17 @@ void extend_attention_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      if (max_len_extend <= 256) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
-      } else if (max_len_extend <= 1024) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
-      } else if (max_len_extend <= 4096) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
-      } else {  // max_len_extend > 4096
-        LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
-      }
+      CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "extend_attention_packed_types", [&] {
+        if (max_len_extend <= 256) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
+        } else if (max_len_extend <= 1024) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+        } else if (max_len_extend <= 4096) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
+        } else {  // max_len_extend > 4096
+          LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
+        }
+      });
     });
   });
 }

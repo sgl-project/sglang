@@ -59,31 +59,30 @@ def flashinfer_cutedsl_moe_masked(
 
     # === Assertions on dtypes ===
     assert w1.dtype == torch.uint8, f"w1 must be uint8 (fp4 packed), got {w1.dtype}"
-    assert (
-        w1_blockscale.dtype == torch.float8_e4m3fn
-    ), f"w1_blockscale must be float8_e4m3fn, got {w1_blockscale.dtype}"
-    assert (
-        w1_alpha.dtype == torch.float32
-    ), f"w1_alpha must be float32, got {w1_alpha.dtype}"
+    assert w1_blockscale.dtype == torch.float8_e4m3fn, (
+        f"w1_blockscale must be float8_e4m3fn, got {w1_blockscale.dtype}"
+    )
+    assert w1_alpha.dtype == torch.float32, (
+        f"w1_alpha must be float32, got {w1_alpha.dtype}"
+    )
     assert w2.dtype == torch.uint8, f"w2 must be uint8 (fp4 packed), got {w2.dtype}"
-    assert (
-        a2_global_scale.dtype == torch.float32
-    ), f"a2_global_scale must be float32, got {a2_global_scale.dtype}"
-    assert (
-        w2_blockscale.dtype == torch.float8_e4m3fn
-    ), f"w2_blockscale must be float8_e4m3fn, got {w2_blockscale.dtype}"
-    assert (
-        w2_alpha.dtype == torch.float32
-    ), f"w2_alpha must be float32, got {w2_alpha.dtype}"
-    assert (
-        len(hidden_states) == 2
-    ), f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"
+    assert a2_global_scale.dtype == torch.float32, (
+        f"a2_global_scale must be float32, got {a2_global_scale.dtype}"
+    )
+    assert w2_blockscale.dtype == torch.float8_e4m3fn, (
+        f"w2_blockscale must be float8_e4m3fn, got {w2_blockscale.dtype}"
+    )
+    assert w2_alpha.dtype == torch.float32, (
+        f"w2_alpha must be float32, got {w2_alpha.dtype}"
+    )
+    assert len(hidden_states) == 2, (
+        f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"
+    )
 
     # === Assertions on shapes ===
     n = w2.shape[-1] * 2  # intermediate dimension
 
     if hidden_states[1] is not None:
-
         a_q = hidden_states[0].view(torch.uint8)
         a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
         m, k_by_2, num_experts = a_q.shape
@@ -91,12 +90,12 @@ def flashinfer_cutedsl_moe_masked(
     else:
         num_experts, m, k = hidden_states[0].shape
 
-        assert (
-            input_global_scale.dtype == torch.float32
-        ), f"input_global_scale must be float32, got {input_global_scale.dtype}"
-        assert input_global_scale.shape == (
-            num_experts,
-        ), f"input_global_scale must be (l,), got {input_global_scale.shape}"
+        assert input_global_scale.dtype == torch.float32, (
+            f"input_global_scale must be float32, got {input_global_scale.dtype}"
+        )
+        assert input_global_scale.shape == (num_experts,), (
+            f"input_global_scale must be (l,), got {input_global_scale.shape}"
+        )
 
         a_q, a_q_sf = scaled_fp4_grouped_quantize(
             hidden_states[0],
@@ -116,25 +115,25 @@ def flashinfer_cutedsl_moe_masked(
     # Gated (silu_and_mul) GEMM1 emits [gate, up] so w1 has 2*n rows; non-gated
     # relu2 emits a single projection of n rows.
     gemm1_out_dim = 2 * n if gated else n
-    assert (
-        w1.shape[-2] == gemm1_out_dim
-    ), f"w1 last-2 dim must be {gemm1_out_dim} (gated={gated}), got {w1.shape}"
-    assert (
-        w1.shape[-1] * 2 == k
-    ), f"w1 last dim * 2 must equal k, got {w1.shape[-1]} vs k={k}"
+    assert w1.shape[-2] == gemm1_out_dim, (
+        f"w1 last-2 dim must be {gemm1_out_dim} (gated={gated}), got {w1.shape}"
+    )
+    assert w1.shape[-1] * 2 == k, (
+        f"w1 last dim * 2 must equal k, got {w1.shape[-1]} vs k={k}"
+    )
     assert w2.shape[-2:] == (
         k,
         n // 2,
-    ), f"w2 shape mismatch, got {w2.shape[-2:]}, expected {(k, n//2)}"
-    assert w1_alpha.shape == (
-        num_experts,
-    ), f"w1_alpha must be (l,), got {w1_alpha.shape}"
-    assert a2_global_scale.shape == (
-        num_experts,
-    ), f"a2_global_scale must be (l,), got {a2_global_scale.shape}"
-    assert w2_alpha.shape == (
-        num_experts,
-    ), f"w2_alpha must be (l,), got {w2_alpha.shape}"
+    ), f"w2 shape mismatch, got {w2.shape[-2:]}, expected {(k, n // 2)}"
+    assert w1_alpha.shape == (num_experts,), (
+        f"w1_alpha must be (l,), got {w1_alpha.shape}"
+    )
+    assert a2_global_scale.shape == (num_experts,), (
+        f"a2_global_scale must be (l,), got {a2_global_scale.shape}"
+    )
+    assert w2_alpha.shape == (num_experts,), (
+        f"w2_alpha must be (l,), got {w2_alpha.shape}"
+    )
 
     # TODO(kaixih@nvidia): dtype should be based on inputs.
     gateup_output = torch.empty(

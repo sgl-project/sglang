@@ -54,7 +54,17 @@ def _python_tree_core_factory(
     return UnifiedTreeCore(params, components)
 
 
+def _rust_tree_core_factory(
+    params: CacheInitParams, components: dict[ComponentType, TreeComponent]
+) -> UnifiedTreeCoreInterface:
+    """Load and construct the in-tree Rust TreeCore only when selected."""
+    from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
+
+    return RustUnifiedTreeCore(params)
+
+
 register_tree_core_backend("python", _python_tree_core_factory)
+register_tree_core_backend("rust", _rust_tree_core_factory)
 
 
 def create_tree_core(

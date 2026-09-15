@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from sglang.multimodal_gen.runtime import launch_server as ls
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 
 
 class _FakeProcess:

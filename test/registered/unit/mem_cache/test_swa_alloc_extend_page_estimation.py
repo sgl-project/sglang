@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_self(*, page_size: int, full_available: int, swa_available: int):
@@ -36,6 +36,8 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
     return SimpleNamespace(
         page_size=page_size,
+        # alloc_extend reads _swa_req_ring; pin the paged-SWA path.
+        _swa_req_ring=False,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,
             alloc_extend=MagicMock(return_value=full_indices),
