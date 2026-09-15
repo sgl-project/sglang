@@ -5,8 +5,16 @@ import triton
 import triton.language as tl
 
 
-def dequantize_k_cache(quant_k_cache):
-    return _dequantize_k_cache_fast_wrapped(quant_k_cache)
+def _infer_dsa_dims(dim_quant: int) -> tuple[int, int]:
+    if dim_quant == 264:
+        return 256, 0
+    if dim_quant == 656:
+        return 512, 64
+    raise ValueError(f"Unsupported packed DSA KV row width: {dim_quant}")
+
+
+def dequantize_k_cache(quant_k_cache, dv: int | None = None):
+    return _dequantize_k_cache_fast_wrapped(quant_k_cache, dv=dv)
 
 
 def _dequantize_k_cache_ref(
@@ -54,7 +62,7 @@ def _dequantize_k_cache_ref(
 
 def _dequantize_k_cache_fast_wrapped(
     quant_k_cache: torch.Tensor,
-    dv: int = 512,
+    dv: int | None = None,
     tile_size: int = 128,
 ) -> torch.Tensor:
     original_ndim = quant_k_cache.ndim
@@ -62,12 +70,15 @@ def _dequantize_k_cache_fast_wrapped(
         # set block_size = 1
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
-    assert dv == 512
-    assert dim_quant == 656
     assert tile_size == 128
+    inferred_dv, dim_rope = _infer_dsa_dims(dim_quant)
+    if dv is None:
+        dv = inferred_dv
+    if dv != inferred_dv:
+        raise ValueError(f"dv={dv} does not match packed row width {dim_quant}")
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
-    output = _dequantize_k_cache_fast(quant_k_cache)
+    output = _dequantize_k_cache_fast(quant_k_cache, dim_nope=dv, dim_rope=dim_rope)
 
     if original_ndim == 3:
         return output.view(num_blocks, 1, -1)
@@ -75,14 +86,20 @@ def _dequantize_k_cache_fast_wrapped(
         return output.view(num_blocks, block_size, 1, -1)
 
 
-def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
+def _dequantize_k_cache_fast(
+    quant_k_cache,
+    group_size: int = 128,
+    dim_nope: int | None = None,
+    dim_rope: int | None = None,
+):
     num_tokens, dim_quant = quant_k_cache.shape
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
+    inferred_nope, inferred_rope = _infer_dsa_dims(dim_quant)
+    dim_nope = inferred_nope if dim_nope is None else dim_nope
+    dim_rope = inferred_rope if dim_rope is None else dim_rope
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -90,8 +107,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
         device=quant_k_cache.device,
     )
 
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     assert dim_nope % group_size == 0
 
@@ -181,18 +197,14 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656, (
-        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
-    )
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 512 // 128 = 4
+    num_tiles = dim_nope // group_size
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),
@@ -200,9 +212,7 @@ def dequantize_k_cache_paged(
         device=quant_k_cache.device,
     )
 
-    # cdiv(512 + 64, 128) = 5
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     assert dim_nope % group_size == 0
 
@@ -301,7 +311,7 @@ def gather_dequant_requant_fp8_paged(
     extra_rows: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Gather paged fp8 KV tokens and re-pack into flat [576] fp8 layout.
+    """Gather paged FP8 KV tokens and re-pack into a flat raw FP8 layout.
 
     The paged KV cache stores 656 bytes per token:
         [512 nope_fp8 | 16 scales_f32 (4 groups) | 128 rope_bf16_bytes]
@@ -332,15 +342,13 @@ def gather_dequant_requant_fp8_paged(
         output: [num_tokens + extra_rows, 1, 576] fp8_e4m3fn
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 4
-    out_dim = dim_nope + dim_rope  # 576
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
     assert num_tiles * group_size == dim_nope
 
     total_rows = num_tokens + extra_rows
@@ -460,13 +468,17 @@ def _gather_dequant_requant_fp8_paged_vec_kernel(
     tl.store(dst_q, y, mask=row_in_range[:, None, None])
 
     # b. rope: [T, R] bf16 -> fp8; pad rows: 0.0 -> byte 0x00
-    offs_r = tl.arange(0, DIM_ROPE)
-    src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
-    data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
-    dst_r = (
-        output_ptr + offs_t64[:, None] * output_stride_0 + DIM_NOPE + offs_r[None, :]
-    )
-    tl.store(dst_r, data, mask=row_in_range[:, None])
+    if DIM_ROPE > 0:
+        offs_r = tl.arange(0, DIM_ROPE)
+        src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
+        data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
+        dst_r = (
+            output_ptr
+            + offs_t64[:, None] * output_stride_0
+            + DIM_NOPE
+            + offs_r[None, :]
+        )
+        tl.store(dst_r, data, mask=row_in_range[:, None])
 
 
 def gather_dequant_requant_fp8_paged_legacy(
@@ -484,15 +496,13 @@ def gather_dequant_requant_fp8_paged_legacy(
     (token, 128-elem slice).
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 4
-    out_dim = dim_nope + dim_rope  # 576
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
     assert num_tiles * group_size == dim_nope
 
     total_rows = num_tokens + extra_rows
@@ -505,8 +515,7 @@ def gather_dequant_requant_fp8_paged_legacy(
         device=quant_k_cache.device,
     )
 
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)  # 5
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     input_nope_q = quant_k_cache[:, :dim_nope]
     input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
