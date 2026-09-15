@@ -378,6 +378,12 @@ class AnthropicMessagesRequest(BaseModel):
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
+    # SGLang extension for PD disaggregation. External routers attach these
+    # fields before the request reaches the Anthropic compatibility endpoint.
+    bootstrap_host: Optional[Union[list[str], str]] = None
+    bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[list[int], int]] = None
+
     @field_validator("model")
     @classmethod
     def _validate_model(cls, v):
