@@ -1,8 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
 from sglang.srt.arg_groups.speculative_hook import _handle_dflash
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -29,6 +29,7 @@ def test_dflash_rejects_platform_without_capability():
 def test_dflash_accepts_platform_with_capability():
     cfg = SimpleNamespace(
         device="custom",
+        enable_dp_attention=False,
         pp_size=1,
         speculative_draft_model_path=None,
     )
@@ -39,13 +40,13 @@ def test_dflash_accepts_platform_with_capability():
             return_value=cfg,
         ),
         patch(
-            "sglang.srt.arg_groups.speculative_hook.resolved_view",
-            return_value=SimpleNamespace(enable_dp_attention=False),
-        ),
-        patch(
             "sglang.srt.arg_groups.speculative_hook.current_platform.supports_dflash",
             return_value=True,
         ),
         pytest.raises(ValueError, match="requires setting"),
     ):
         _handle_dflash(SimpleNamespace())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
