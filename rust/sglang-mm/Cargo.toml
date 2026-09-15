@@ -60,6 +60,7 @@ image = { version = "0.25", default-features = false, features = [
 rayon = { version = "1.10", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sglang-environ = { workspace = true }
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the
 # extension never links the system OpenSSL.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
