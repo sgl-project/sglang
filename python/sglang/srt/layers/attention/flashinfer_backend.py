@@ -2004,17 +2004,9 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
-                if use_ragged:
-                    # The ragged wrapper covers the extend tokens, whose K/V are
-                    # written after attention, so the paged wrapper must see the
-                    # prefix only, as in update_single_wrapper.
-                    paged_kernel_lens = prefix_lens
-                    paged_kernel_lens_sum = prefix_lens.sum().item()
-                    kv_start_idx = None
-                else:
-                    paged_kernel_lens = seq_lens
-                    paged_kernel_lens_sum = seq_lens_sum
-                    kv_start_idx = seq_lens - paged_kernel_lens
+                paged_kernel_lens = seq_lens
+                paged_kernel_lens_sum = seq_lens_sum
+                kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )

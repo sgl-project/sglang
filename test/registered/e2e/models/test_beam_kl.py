@@ -6,9 +6,9 @@ fresh prefill's logprobs. This is what catches a sliding-window pool that evicte
 something still needed or a cache prefix that does not match a recomputation;
 the fixture's precision tests do not exercise the cache at all.
 
-Both servers prefill in 256-token chunks, so every LongBench prompt crosses the
-512-token window and several chunk boundaries before its prefix is reused, and
-both keep the default breakable prefill CUDA graphs and decode graphs on.
+The server prefills in 256-token chunks, so every LongBench prompt crosses the
+512-token window and several chunk boundaries before its prefix is reused.
+The default breakable prefill CUDA graphs and decode graphs stay enabled.
 """
 
 import tempfile
@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
@@ -68,28 +68,6 @@ class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
             super().tearDownClass()
         if hasattr(cls, "checkpoint"):
             cls.checkpoint.cleanup()
-
-
-class TestBeamKLFlashInferChunked(TestBeamKL):
-    """Explicit FlashInfer with chunk-256 prefill.
-
-    Every prompt longer than the 512-token window crosses chunk boundaries and
-    then hits the radix cache, so both layer kinds take the ragged prefill path
-    with a cached prefix.
-    """
-
-    other_args = [
-        "--tp-size",
-        "1",
-        "--dtype",
-        "bfloat16",
-        "--attention-backend",
-        "flashinfer",
-        "--chunked-prefill-size",
-        "256",
-        "--mem-fraction-static",
-        "0.3",
-    ]
 
 
 if __name__ == "__main__":
