@@ -30,6 +30,7 @@ use super::frame::{
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
+use super::timing::ForwardedReceivedTiming;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
@@ -69,9 +70,17 @@ impl RequestTiming {
         }
     }
 
-    fn with_options(mut self, detailed: bool, received_time: Option<f64>) -> Result<Self, String> {
+    fn with_options(
+        mut self,
+        detailed: bool,
+        received_time: Option<f64>,
+        forwarded: Option<ForwardedReceivedTiming>,
+    ) -> Result<Self, String> {
         self.detailed = detailed;
-        if let Some(received) = received_time.filter(|value| *value != 0.) {
+        if let Some(forwarded) = forwarded {
+            self.received_age = forwarded.age_at(self.wall_created)?;
+            self.created_is_positive = forwarded.created_is_positive;
+        } else if let Some(received) = received_time.filter(|value| *value != 0.) {
             self.received_age = crate::metrics::monotonic_seconds()?
                 - self.created_at.elapsed().as_secs_f64()
                 - received;
@@ -302,15 +311,21 @@ async fn generate(
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
+    let forwarded = match ForwardedReceivedTiming::from_headers(&headers) {
+        Ok(timing) => timing,
+        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error, stream),
+    };
     let timing = match RequestTiming::new().with_options(
         state.server_args.enable_metrics,
         payloads.first().and_then(|request| request.received_time),
+        forwarded,
     ) {
         Ok(timing) => timing,
         Err(error) => return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, stream),
     };
     for request in &mut payloads {
         request.started = Some(timing.created_at);
+        request.received_age = forwarded.map(|_| timing.received_age);
     }
     if let Some(extension) = &state.http_extension {
         if let Err(error) = super::prefetch::validate_limits(
@@ -1383,6 +1398,51 @@ mod tests {
 
         let response = health_generate(State(state), Duration::ZERO).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn forwarded_received_time_uses_ingress_age_and_preserves_python_metadata() {
+        for (received, age, first_latency, received_ts) in [
+            (995., 5.5, Some(6.5), Some(9995.)),
+            (1002., -1.5, None, Some(10002.)),
+            (-1., 1001.5, None, None),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-sglang-received-timing",
+                serde_json::json!({
+                    "age": 1000. - received,
+                    "sent_at": 10000.,
+                    "created_is_positive": received > 0.,
+                })
+                .to_string()
+                .parse()
+                .unwrap(),
+            );
+            let forwarded = ForwardedReceivedTiming::from_headers(&headers).unwrap();
+            let timing = RequestTiming {
+                wall_created: 10000.5,
+                time_to_first_token: Some(Duration::from_secs(1)),
+                e2e_latency: Some(Duration::from_secs(2)),
+                ..RequestTiming::new()
+            }
+            .with_options(true, Some(received), forwarded)
+            .unwrap();
+            assert_eq!(timing.received_age, age);
+            let mut output = serde_json::json!({"meta_info": {"completion_tokens": 3}});
+            add_e2e_latency(&mut output, &timing);
+            let metadata = &output["meta_info"];
+            assert_eq!(metadata["e2e_latency"], age + 2.);
+            assert_eq!(metadata["first_token_latency"].as_f64(), first_latency);
+            assert_eq!(metadata["request_received_ts"].as_f64(), received_ts);
+            assert_eq!(metadata["request_finished_ts"], 10002.5);
+            assert_eq!(metadata["decode_throughput"], 2.);
+        }
+        for invalid in ["untrusted", "null", "{}", r#"{"age":"old"}"#] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-sglang-received-timing", invalid.parse().unwrap());
+            assert!(ForwardedReceivedTiming::from_headers(&headers).is_err());
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def python_frontend_schema():
+def python_frontend_metrics():
     """Capture the actual Python registrations, before any observations."""
     import prometheus_client
     from fastapi import FastAPI
@@ -84,11 +84,11 @@ def python_frontend_schema():
             ),
         ),
     ):
-        metrics_collector.TokenizerMetricsCollector(labels=labels)
+        collector = metrics_collector.TokenizerMetricsCollector(labels=labels)
         add_prometheus_track_response_middleware(
             FastAPI(), extra_labels={"cluster": "test"}
         )
-    return schema
+    return collector, registry, schema
 
 
 def write_worker_metrics(directory, rank, gauge_value=1):
@@ -396,7 +396,60 @@ class TestMetricsDirectory(unittest.TestCase):
             Path(__file__).resolve().parents[6]
             / "rust/sglang-server/testdata/metrics_python_schema.json"
         )
-        self.assertEqual(python_frontend_schema(), json.loads(fixture.read_text()))
+        _, _, schema = python_frontend_metrics()
+        self.assertEqual(schema, json.loads(fixture.read_text()))
+
+    def test_future_request_times_preserve_counts_and_valid_exposition(self):
+        from prometheus_client.exposition import choose_encoder
+
+        fixture = (
+            Path(__file__).resolve().parents[6]
+            / "rust/sglang-server/testdata/metrics_latency_cases.json"
+        )
+        for case in json.loads(fixture.read_text()):
+            for stream in (False, True):
+                with self.subTest(case=case["name"], stream=stream):
+                    collector, registry, _ = python_frontend_metrics()
+                    collector.observe_time_to_first_token(
+                        collector.labels,
+                        case["received_age"] + case["first_elapsed"],
+                        stream=stream,
+                    )
+                    collector.observe_one_finished_request(
+                        collector.labels,
+                        prompt_tokens=6,
+                        generation_tokens=3,
+                        cached_tokens=0,
+                        e2e_latency=case["received_age"] + case["finish_elapsed"],
+                        has_grammar=False,
+                        is_streaming=stream,
+                    )
+                    for accept, parser in (
+                        ("text/plain", text_string_to_metric_families),
+                        (
+                            "application/openmetrics-text; version=1.0.0",
+                            openmetrics_families,
+                        ),
+                    ):
+                        encoder, _ = choose_encoder(accept)
+                        body = metrics.encode_metrics(registry, encoder).decode()
+                        samples = {
+                            sample.name: sample.value
+                            for family in parser(body)
+                            for sample in family.samples
+                        }
+                        for name, expected in (
+                            ("time_to_first_token_seconds", case["ttft"]),
+                            ("e2e_request_latency_seconds", case["e2e"]),
+                        ):
+                            self.assertEqual(samples[f"sglang:{name}_count"], 1)
+                            self.assertEqual(samples[f"sglang:{name}_sum"], expected)
+                        for name, expected in (
+                            ("num_requests_total", 1),
+                            ("prompt_tokens_total", 6),
+                            ("generation_tokens_total", 3),
+                        ):
+                            self.assertEqual(samples[f"sglang:{name}"], expected)
 
     def test_repeated_setup_keeps_live_collector_files(self):
         maybe_stub_sgl_kernel()

@@ -207,6 +207,109 @@ fn scheduler_snapshots_count_tokens_and_weight_speculative_intervals_once() {
 }
 
 #[test]
+fn forwarded_request_age_does_not_use_the_worker_monotonic_clock_origin() {
+    let metrics = FrontendMetrics::new(&ServerArgs::default()).unwrap();
+    let start = metrics.clock.0;
+    let request = GenerateRequest {
+        started: Some(start),
+        received_time: Some(995.),
+        received_age: Some(5.5),
+        ..Default::default()
+    };
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("received_age")
+            .is_none()
+    );
+    let mut state = RequestMetrics::new(metrics.clone(), &request).unwrap();
+    state.observe_at(
+        &ChunkEvent {
+            completion_tokens: 3,
+            finish_reason: Some(FinishKind::Length { length: Some(3) }.into()),
+            ..Default::default()
+        },
+        start + Duration::from_secs(2),
+    );
+    for name in ["time_to_first_token_seconds", "e2e_request_latency_seconds"] {
+        let metric = sample(&metrics, &format!("sglang:{name}"));
+        let histogram = metric.get_histogram();
+        assert_eq!(histogram.get_sample_count(), 1);
+        assert_eq!(histogram.get_sample_sum(), 7.5);
+    }
+}
+
+#[test]
+fn latency_histograms_follow_python_for_future_received_times() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../testdata/metrics_latency_cases.json")).unwrap();
+    for case in cases {
+        for forwarded in [false, true] {
+            for stream in [false, true] {
+                let metrics = FrontendMetrics::new(&ServerArgs::default()).unwrap();
+                let start = metrics.clock.0;
+                let age = case["received_age"].as_f64().unwrap();
+                let mut state = RequestMetrics::new(
+                    metrics.clone(),
+                    &GenerateRequest {
+                        started: Some(start),
+                        received_time: Some(if forwarded {
+                            995.
+                        } else {
+                            metrics.clock.1 - age
+                        }),
+                        received_age: forwarded.then_some(age),
+                        stream,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for (elapsed, tokens, finished) in
+                    [("first_elapsed", 1, false), ("finish_elapsed", 2, true)]
+                {
+                    state.observe_at(
+                        &ChunkEvent {
+                            prompt_tokens: 6,
+                            completion_tokens: tokens,
+                            finish_reason: finished
+                                .then(|| FinishKind::Length { length: Some(3) }.into()),
+                            ..Default::default()
+                        },
+                        start + Duration::from_secs_f64(case[elapsed].as_f64().unwrap()),
+                    );
+                }
+                for (name, expected) in [
+                    ("time_to_first_token_seconds", "ttft"),
+                    ("e2e_request_latency_seconds", "e2e"),
+                ] {
+                    let metric = sample(&metrics, &format!("sglang:{name}"));
+                    let histogram = metric.get_histogram();
+                    assert_eq!(histogram.get_sample_count(), 1, "{case}");
+                    assert_eq!(
+                        histogram.get_sample_sum(),
+                        case[expected].as_f64().unwrap(),
+                        "{case}: {name}, forwarded={forwarded}, stream={stream}"
+                    );
+                }
+                for (name, expected) in [
+                    ("num_requests_total", 1.),
+                    ("prompt_tokens_total", 6.),
+                    ("generation_tokens_total", 3.),
+                ] {
+                    assert_eq!(
+                        sample(&metrics, &format!("sglang:{name}"))
+                            .get_counter()
+                            .get_value(),
+                        expected,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn prefill_suppression_and_unfinished_drop_follow_python_accounting() {
     let metrics = FrontendMetrics::new(&ServerArgs {
         disaggregation_mode: DisaggregationMode::Prefill,

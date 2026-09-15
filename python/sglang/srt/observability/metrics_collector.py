@@ -1828,8 +1828,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
+        # Future received_time values must not make duration histogram sums negative.
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(
-            float(e2e_latency)
+            max(float(e2e_latency), 0.0)
         )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
@@ -1844,7 +1845,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     ):
         self.histogram_time_to_first_token.labels(
             **labels, is_streaming="true" if stream else "false"
-        ).observe(value)
+        ).observe(max(value, 0.0))
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         # Injected backends (e.g. Ray) route metrics out of process and can't

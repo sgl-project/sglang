@@ -365,13 +365,16 @@ impl RequestMetrics {
         let params = &request.sampling_params;
         let created = request.started.unwrap_or_else(Instant::now);
         // received_time is Python perf_counter/CLOCK_MONOTONIC, not Unix time.
-        let received_age = request
-            .received_time
-            .filter(|value| *value != 0.)
-            .map(|received| {
-                metrics.clock.1 + created.duration_since(metrics.clock.0).as_secs_f64() - received
-            })
-            .unwrap_or(0.);
+        let received_age = request.received_age.unwrap_or_else(|| {
+            request
+                .received_time
+                .filter(|value| *value != 0.)
+                .map(|received| {
+                    metrics.clock.1 + created.duration_since(metrics.clock.0).as_secs_f64()
+                        - received
+                })
+                .unwrap_or(0.)
+        });
         Some(Self {
             metrics,
             labels,
@@ -397,6 +400,8 @@ impl RequestMetrics {
         if self.finished {
             return;
         }
+        // Future received_time values must not make duration histogram sums negative.
+        let latency = (now.duration_since(self.created).as_secs_f64() + self.received_age).max(0.);
         let tokens = output
             .counts
             .generation_tokens
@@ -409,8 +414,7 @@ impl RequestMetrics {
                 &self.labels,
                 Some(self.streaming),
             ) {
-                histogram
-                    .observe(now.duration_since(self.created).as_secs_f64() + self.received_age);
+                histogram.observe(latency);
             }
         } else if let Some(new_tokens) = tokens.checked_sub(self.tokens).filter(|&n| n > 0) {
             let interval = now.duration_since(previous_time).as_secs_f64();
@@ -492,11 +496,7 @@ impl RequestMetrics {
                 None,
             ),
             ("generation_tokens_histogram", tokens as f64, None),
-            (
-                "e2e_request_latency_seconds",
-                now.duration_since(self.created).as_secs_f64() + self.received_age,
-                Some(self.streaming),
-            ),
+            ("e2e_request_latency_seconds", latency, Some(self.streaming)),
         ] {
             if let Some(histogram) = self.metrics.histogram(name, labels, stream) {
                 histogram.observe(value);

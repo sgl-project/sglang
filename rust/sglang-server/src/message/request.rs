@@ -681,6 +681,7 @@ impl GenerateBody {
                 log_metrics,
                 custom_labels: custom_labels.clone(),
                 received_time,
+                received_age: None,
                 started: None,
                 metric_state: None,
                 response_metadata: None,
@@ -1088,6 +1089,8 @@ pub struct GenerateRequest {
     pub log_metrics: Option<bool>,
     pub custom_labels: Option<BTreeMap<String, String>>,
     pub received_time: Option<f64>,
+    #[serde(skip)]
+    pub(crate) received_age: Option<f64>,
     #[serde(skip)]
     pub started: Option<std::time::Instant>,
     #[serde(skip)]

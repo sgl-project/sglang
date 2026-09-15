@@ -150,18 +150,21 @@ async fn public_dp_ingress_preserves_batches_routing_streams_loads_and_cancellat
             .body(body.to_string())
     };
 
+    let received_time = crate::metrics::monotonic_seconds().unwrap() - 2.;
     let response = post(json!({
         "input_ids":[[11],[12],[13]],"rid":"body","bootstrap_room":1,
         "extra_key":["tenant-a","tenant-b",""], "cache_salt":"namespace",
         "routing_key":"session",
+        "received_time": received_time,
         "image_data":[["/a"],["/b"],["/c"]],
         "multimodal_placeholders":vec![json!([{"type":"image","token_index":0,"item_index":0}]);3],
         "sampling_params":{"max_new_tokens":3}
     }))
     .header("x-override-rid", "router")
     .header("x-override-bootstrap-room", "1000")
-    .header("connection", "x-hop")
+    .header("connection", "x-hop, x-sglang-received-timing")
     .header("x-hop", "removed")
+    .header("x-sglang-received-timing", "untrusted")
     .send()
     .await
     .unwrap();
@@ -193,17 +196,32 @@ async fn public_dp_ingress_preserves_batches_routing_streams_loads_and_cancellat
         );
         assert_eq!(body["cache_salt"], "namespace");
         assert_eq!(body["routing_key"], "session");
+        assert_eq!(body["received_time"], received_time);
+        let timing: Value = serde_json::from_slice(
+            headers
+                .get("x-sglang-received-timing")
+                .expect("DP forwarding must preserve request age across host clock origins")
+                .as_bytes(),
+        )
+        .unwrap();
+        let age = timing["age"].as_f64().unwrap();
+        assert!(age >= 2.);
+        assert!(age <= crate::metrics::monotonic_seconds().unwrap() - received_time);
+        assert_eq!(timing["created_is_positive"], true);
         assert_eq!(body["multimodal_placeholders"][0]["token_index"], 0);
         assert!(!headers.contains_key("x-override-rid"));
         assert!(!headers.contains_key("x-hop"));
     }
     let response = post(json!({"input_ids":[7],"data_parallel_rank":0,"routed_dp_rank":0}))
         .header("x-override-routed-dp-rank", "1")
+        .header("x-sglang-received-timing", "untrusted")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(requests.recv().await.unwrap().0, 1);
+    let (rank, _, headers) = requests.recv().await.unwrap();
+    assert_eq!(rank, 1);
+    assert!(!headers.contains_key("x-sglang-received-timing"));
     let response = post(json!({"input_ids":[7],"data_parallel_rank":2}))
         .send()
         .await

@@ -1,0 +1,6 @@
+[
+  {"name": "past", "received_age": 5.5, "first_elapsed": 1, "finish_elapsed": 2, "ttft": 6.5, "e2e": 7.5},
+  {"name": "present", "received_age": 0, "first_elapsed": 1, "finish_elapsed": 2, "ttft": 1, "e2e": 2},
+  {"name": "future", "received_age": -3600, "first_elapsed": 1, "finish_elapsed": 2, "ttft": 0, "e2e": 0},
+  {"name": "crossed", "received_age": -1.5, "first_elapsed": 1, "finish_elapsed": 2, "ttft": 0, "e2e": 0.5}
+]

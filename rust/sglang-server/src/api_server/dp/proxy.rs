@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::{DpState, error, routing};
 use crate::api_server::headers;
 use crate::api_server::native_api::native_error;
+use crate::api_server::timing::ForwardedReceivedTiming;
 use crate::message::request::GenerateBody;
 
 fn origin_form(parts: &Parts) -> &str {
@@ -148,6 +149,10 @@ pub(super) async fn generate(state: &DpState, mut parts: Parts, bytes: Bytes) ->
         }
     }
     let stream = body.stream;
+    parts.headers = end_to_end_headers(&parts.headers);
+    if let Err(error) = ForwardedReceivedTiming::forward(&mut parts.headers, body.received_time) {
+        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, stream);
+    }
     if let Some(preferred) = &state.preferred_sampling
         && let Err(e) = body.apply_preferred_sampling(preferred)
     {

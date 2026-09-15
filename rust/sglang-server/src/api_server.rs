@@ -18,4 +18,5 @@ mod native_api;
 mod openai;
 mod prefetch;
 mod submit;
+mod timing;
 mod transport;
