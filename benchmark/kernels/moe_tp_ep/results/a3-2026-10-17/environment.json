@@ -1,0 +1,160 @@
+{
+  "hardware": {
+    "device_count": 2,
+    "device_names": [
+      "Ascend910_9392",
+      "Ascend910_9392"
+    ],
+    "physical_devices": [
+      14,
+      15
+    ],
+    "physical_cards": 1,
+    "interconnect": "SIO"
+  },
+  "driver": "25.5.2",
+  "cann_compiler_and_opp": "9.1.0",
+  "metadata": {
+    "python": "3.12.13",
+    "packages": {
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post4",
+      "deep-ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "sglang": null,
+      "sgl-kernel-npu": "2026.9.0",
+      "transformers": "5.19.0"
+    },
+    "sglang_commit": "000e768237025fb5227959364a5caae5ac5bf06d",
+    "sglang_diff_sha256": null,
+    "scripts_sha256": {
+      "bench_moe_tp_ep.py": "81f3076ce24a3f366c8d4f068bf6cc334e471f9bf5e816e34065011d4aa02478",
+      "bench_serving.py": "0505db70370d526cb4bf0258bcdead793139bb99b4ca0b11eb6e745167a5f982",
+      "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+      "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+      "launch_serving.py": "3ada15da977e2c91023c5974d7042595df98bbd2540b07d92372c3d2ab01d5c8",
+      "observe_tokens.py": "06b933993f38b9118b4d9cda91577b951bb111cc07067a64f189b528c377412e",
+      "summarize.py": "891b38a7efe4be0591af8ca5ae4a6c06f9f8d3d96232af78ddf2fba36a5916aa",
+      "summarize_profile.py": "dd9d5b97c2be69979e6f6b2054d0c0fc4061199bc2a1af212f99a99569fe0a7c",
+      "summarize_serving.py": "3b2c2e6e822296571c75a1959185ddacddab84df35f77ccfe37c0cc83e00dbbe",
+      "test_contracts.py": "fbe8c1ed0071174dffa1d0fa35f73a3adc1182f609eca486704be1cba9118b3c",
+      "test_workload.py": "3da3885ff4eea7e061adcbb3444ec5bdbd54d1ed495d578e2d499bfdd71b8d76",
+      "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+    },
+    "environment": {
+      "ASCEND_CUSTOM_OPP_PATH": "/workspace/venv/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/workspace/venv/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer:/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize:",
+      "HCCL_SOCKET_IFNAME": "lo",
+      "HCCL_NPU_SOCKET_PORT_RANGE": "25100-25131",
+      "HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HYBRID_DEPLOYMENT": "1",
+      "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+      "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+      "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512"
+    },
+    "execution_mode": "torch.inference_mode; eager",
+    "image_digest": "sha256:2718547835f84b8074c1ad72f9c0a1f6b0ae52133929f5b8879f3ad1b9dc470c"
+  },
+  "installed_software": {
+    "python": "3.12.13",
+    "architecture": "aarch64",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4",
+    "packages": {
+      "aiohttp": "3.14.3",
+      "airportsdata": "20260905",
+      "asttokens": "3.0.2",
+      "attentions": "0.2",
+      "blobfile": "3.0.0",
+      "compressed-tensors": "0.17.0",
+      "custom_ops": "1.0",
+      "datasets": "4.3.0",
+      "deep_ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "diskcache": "5.6.3",
+      "distro": "1.9.0",
+      "easydict": "1.13",
+      "executing": "2.3.0",
+      "gguf": "0.19.0",
+      "grpcio": "1.84.0",
+      "grpcio-health-checking": "1.84.0",
+      "grpcio-reflection": "1.84.0",
+      "hf_transfer": "0.1.9",
+      "huggingface_hub": "1.31.0",
+      "ipython": "9.17.1",
+      "ipython_pygments_lexers": "1.1.1",
+      "jedi": "0.20.1",
+      "lxml": "6.1.3",
+      "matplotlib-inline": "0.2.2",
+      "msgspec": "0.21.1",
+      "multiprocess": "0.70.19",
+      "nest-asyncio": "1.6.0",
+      "numpy": "1.26.4",
+      "openai": "2.6.1",
+      "orjson": "3.13.0",
+      "outlines": "0.1.11",
+      "outlines_core": "0.1.26",
+      "parso": "0.8.7",
+      "pexpect": "4.9.0",
+      "prompt_toolkit": "3.0.53",
+      "psutil": "7.2.2",
+      "ptyprocess": "0.7.0",
+      "pure_eval": "0.2.4",
+      "pyarrow": "21.0.0",
+      "pycryptodomex": "3.24.1",
+      "pydantic": "2.13.5",
+      "safetensors": "0.8.0",
+      "sentencepiece": "0.2.1",
+      "sgl_kernel_npu": "2026.9.0",
+      "smg-grpc-proto": "0.4.27",
+      "smg-grpc-servicer": "0.14.0",
+      "stack-data": "0.6.3",
+      "timm": "1.0.16",
+      "tokenizers": "0.23.3",
+      "torch": "2.10.0+cpu",
+      "torch_memory_saver": "0.0.8",
+      "torch_npu": "2.10.0.post4",
+      "traitlets": "5.16.1",
+      "transformers": "5.19.0",
+      "triton": "3.5.0",
+      "triton_ascend": "3.2.2",
+      "wcwidth": "0.9.2",
+      "xgrammar": "0.2.7",
+      "xxhash": "4.0.1"
+    },
+    "deep_ep_native_sha256": "23971f59dba1e7d25eeca0098f6443c881c4b31eb85953d40886555aca3c2728",
+    "registered_inner_test_count": 12,
+    "package_scope": "Core inference dependencies and additional packages used by the module and registered CPU tests; base image identified separately."
+  },
+  "model": {
+    "repo": "Qwen/Qwen3-30B-A3B",
+    "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+    "tensor_count": 385,
+    "tensor_bytes": 1208483840,
+    "subset_sha256": "8f734376f5830f584506e4bf95b394a897066aa28d32fa57112a31526e939097",
+    "source_shard": "model-00001-of-00016.safetensors",
+    "scope": "Unmodified layer 0 MLP tensors only; not a full-model checkpoint"
+  },
+  "official_model_source_shard_sha256": "454e77b346a61bfb201d54df60e15158838cf930617ee135113556204f2802b5",
+  "setup_notes": "Independent environment from the September measurements. Source archive imported with PYTHONPATH; no installed sglang distribution metadata. Explicit loopback rendezvous used in a network-isolated container.",
+  "official_npu_release": "2026.9.0.post9",
+  "official_package_archives": [
+    {
+      "name": "custom-ops-2026.9.0.post9-torch2.10.0-cann9.1.0-a3-aarch64.zip",
+      "size": 56488650,
+      "url": "https://github.com/sgl-project/sgl-kernel-npu/releases/download/2026.9.0.post9/custom-ops-2026.9.0.post9-torch2.10.0-cann9.1.0-a3-aarch64.zip",
+      "sha256": "2c7e86974d4f7049be29dbf887589117fd817df0e7ba191c408c9fe36f44280d"
+    },
+    {
+      "name": "ops-transformer-2026.9.0.post9-torch2.10.0-cann9.1.0-a3-aarch64.zip",
+      "size": 6315633,
+      "url": "https://github.com/sgl-project/sgl-kernel-npu/releases/download/2026.9.0.post9/ops-transformer-2026.9.0.post9-torch2.10.0-cann9.1.0-a3-aarch64.zip",
+      "sha256": "93196a02edf94ff882559d67a8a9b5d6f96b146492a16562011a1ef92626122e"
+    },
+    {
+      "name": "sgl-kernel-npu-2026.9.0.post9-torch2.10.0-py312-cann9.1.0-a3-aarch64.zip",
+      "size": 14215113,
+      "url": "https://github.com/sgl-project/sgl-kernel-npu/releases/download/2026.9.0.post9/sgl-kernel-npu-2026.9.0.post9-torch2.10.0-py312-cann9.1.0-a3-aarch64.zip",
+      "sha256": "73c3bd25b95528ae8d827ae951a817cc7f439377a772bb31007ad3f6ad3e41f9"
+    }
+  ]
+}

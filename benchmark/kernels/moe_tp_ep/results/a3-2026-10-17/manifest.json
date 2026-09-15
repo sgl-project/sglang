@@ -1,0 +1,47 @@
+[
+  {
+    "path": "cpu-regressions.txt",
+    "bytes": 1871,
+    "sha256": "6b3eed60ae5c42dcc4e733034d791210fe1390274e0d1c192d7ee8164783a635"
+  },
+  {
+    "path": "environment.json",
+    "bytes": 6866,
+    "sha256": "9cc27978f0d946c21168393c5dff90d2d2da13f877104bc5b4a99f7d4f3d5d94"
+  },
+  {
+    "path": "registered-wrapper.txt",
+    "bytes": 197,
+    "sha256": "fbd81f4a61d7bf801bc0a97892497ff019d54887b39c79962b20898d8fda6a26"
+  },
+  {
+    "path": "timing-smoke/deepep_decode_r1.json",
+    "bytes": 6446,
+    "sha256": "2a24fe0947b4f0f031b9b2a564e45e2b23d2c950be8fbb74fa2c7571fd9d7218"
+  },
+  {
+    "path": "timing-smoke/deepep_prefill_r1.json",
+    "bytes": 6438,
+    "sha256": "ae36b9f6d60cd28bd24704da0a4c3c5ce68e469b5c6d349c32cb9fbbcb6c6395"
+  },
+  {
+    "path": "timing-smoke/none_decode_r1.json",
+    "bytes": 6442,
+    "sha256": "d9c5f7bc6f79ca266aad6e7e23fd8a635707328ec197b33cc4d0904e05882175"
+  },
+  {
+    "path": "timing-smoke/none_prefill_r1.json",
+    "bytes": 6434,
+    "sha256": "5fb073355fe6b801edcc180dabe30dc817d44d71dffc1db9f533360c697d8ab8"
+  },
+  {
+    "path": "timing-smoke-summary.json",
+    "bytes": 1925,
+    "sha256": "a2c0c539ec6ed9fad6f97dc388b75cbbb70b3a38a939417711b86e0e083089bf"
+  },
+  {
+    "path": "validation-summary.json",
+    "bytes": 14341,
+    "sha256": "bd8facccf9ee1578e1484859cef04f5dd4e79097ff871ffc42c3afb59a304c62"
+  }
+]
