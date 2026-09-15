@@ -1355,7 +1355,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
         start_skipping, end_skipping = teacache_params.get_skip_boundaries(
-            ctx.num_inference_steps, ctx.do_cfg
+            ctx.num_inference_steps,
+            ctx.do_cfg,
+            cfg_parallel=ctx.is_cfg_parallel,
         )
 
         # Determine boundary step
