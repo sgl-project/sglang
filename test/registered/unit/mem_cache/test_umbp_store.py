@@ -366,7 +366,7 @@ class TestUMBPStore(unittest.TestCase):
 class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
     @staticmethod
     def _make_v2_store():
-        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.pool_transfer import PoolName
 
         UMBPStore = import_umbp_store_module().UMBPStore
         store = UMBPStore.__new__(UMBPStore)
@@ -433,7 +433,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         self.assertEqual(store.batch_set_v1(["page0"], [0]), [True])
 
     def test_short_batch_exists_result_fails_closed(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
         store = self._make_v2_store()
         store.client.batch_exists.return_value = [True]
@@ -448,7 +448,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         self.assertEqual(result.kv_hit_pages, 0)
 
     def test_batch_exists_v2_narrows_queries_across_side_pools(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
         store = self._make_v2_store()
         store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C128)
@@ -494,7 +494,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         )
 
     def test_short_batch_get_result_marks_every_page_failed(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
         store = self._make_v2_store()
         store.client.batch_get_into_ptr.return_value = [True]
@@ -509,7 +509,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [False, False])
 
     def test_short_batch_set_result_marks_every_page_failed(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
         store = self._make_v2_store()
         store.client.batch_put_from_ptr.return_value = [True]

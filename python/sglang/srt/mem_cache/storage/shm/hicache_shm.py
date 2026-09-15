@@ -7,6 +7,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+)
+from sglang.srt.mem_cache.pool_transfer import (
     PoolTransfer,
     PoolTransferResult,
 )

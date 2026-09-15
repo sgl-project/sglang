@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.pool_transfer import PoolName
 from sglang.srt.mem_cache.storage.nixl.nixl_routing import BUCKET_HEX_CHARS
 
 logger = logging.getLogger(__name__)

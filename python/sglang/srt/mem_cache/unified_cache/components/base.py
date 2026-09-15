@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.pool_transfer import PoolTransfer, PoolTransferResult
 from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
     BASE_COMPONENT_TYPE,
     ComponentType,

@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.hicache_storage import (
+from sglang.srt.mem_cache.pool_transfer import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
