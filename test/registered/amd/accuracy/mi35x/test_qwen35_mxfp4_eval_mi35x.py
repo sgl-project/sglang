@@ -31,7 +31,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -92,7 +92,7 @@ COMMON_ENV = {
 def _run_gsm8k(
     base_url: str, model: str, num_examples: int, max_tokens: int = 2048
 ) -> dict:
-    """Few-shot GSM8K against a running server; returns run_eval metrics.
+    """sgl-eval GSM8K against a running server; returns sgl-eval metrics.
 
     ``metrics["score"]`` is the accuracy in [0, 1].
     """
@@ -101,12 +101,11 @@ def _run_gsm8k(
         base_url=base_url,
         model=model,
         eval_name="gsm8k",
-        api="completion",
         max_tokens=max_tokens,
         num_examples=num_examples,
         num_threads=256,
     )
-    return run_eval(args)
+    return run_sgl_eval(args)
 
 
 def _generate_perf_report(results: List[BenchmarkResult]) -> str:

@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
@@ -69,13 +69,11 @@ class TestGLM51HiSparseEvalAMD(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=4000,
             num_examples=500,
             num_threads=100,
-            num_shots=24,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

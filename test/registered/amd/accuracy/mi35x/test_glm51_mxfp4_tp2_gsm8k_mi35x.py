@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -88,14 +88,13 @@ class TestGLM51MXFP4TP2GSM8KMI35x(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
             max_tokens=512,
             temperature=0.0,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}", flush=True)
         score = metrics["score"]
 

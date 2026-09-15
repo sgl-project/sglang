@@ -3,12 +3,12 @@
 Regression guard: launches DeepSeek-R1-0528 (native FP8, MLA, aiter attention
 backend) on MI35x with the full L1+L2+L3 HiCache hierarchy wired up
 (``--enable-hierarchical-cache --hicache-storage-backend file``), then runs
-GSM8K few-shot completion and asserts the accuracy still matches the
+sgl-eval sgl-eval GSM8K chat and asserts the accuracy still matches the
 established threshold. The goal is to catch regressions where HiCache
 breaks DSR1-0528 generation correctness, not to stress-test the cascade
 overflow path.
 
-Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93,
+Acceptance: GSM8K (1319 questions, sgl-eval chat) score >= 0.93,
 matching ``test_deepseek_r1_eval_mi35x.py`` /
 ``test_deepseek_r1_eval_amd.py``.
 
@@ -22,7 +22,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -134,18 +134,17 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
             shutil.rmtree(cls.l3_storage_dir, ignore_errors=True)
 
     def test_gsm8k(self):
-        """GSM8K few-shot completion against the HiCache-enabled DSR1-0528."""
+        """sgl-eval sgl-eval GSM8K chat against the HiCache-enabled DSR1-0528."""
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            max_tokens=512,
+            max_tokens=16384,
             temperature=0.0,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}", flush=True)
         score = metrics["score"]
 
