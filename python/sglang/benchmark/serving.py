@@ -198,6 +198,7 @@ async def async_request_trt_llm(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -601,6 +602,7 @@ async def async_request_truss(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -1881,6 +1883,15 @@ async def benchmark(
             )
 
     result_details = {
+        "model_id": model_id,
+        # Client request start, after any concurrency wait, relative to the
+        # benchmark start (seconds). Missing timestamps must not become negative
+        # offsets when a backend does not populate start_time.
+        "arrival_times": [
+            output.start_time - benchmark_start_time if output.start_time > 0 else None
+            for output in outputs
+        ],
+        "successes": [output.success for output in outputs],
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],

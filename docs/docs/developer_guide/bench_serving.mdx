@@ -259,6 +259,36 @@ With `--output-details`, an extended object also includes arrays:
 - `input_lens`, `output_lens`
 - `ttfts`, `itls` (per request: ITL arrays)
 - `generated_texts`, `errors`
+- `arrival_times`: client request start offsets in seconds relative to benchmark start; `null` when unavailable
+- `successes`: whether each request completed successfully
+
+The detailed result also records `model_id`.
+
+### Client-side streaming timeline
+
+You can convert detailed benchmark results into a Chrome trace to inspect request overlap, first-output waits, and pauses between outputs without enabling server tracing. With a running SGLang server, run the following from the repository root. Replace `MODEL_PATH` with the server's Hugging Face model ID or local model path. This client-side workflow works with any platform supported by your server.
+
+```bash Command
+python -m sglang.benchmark.serving \
+  --backend sglang-oai \
+  --host 127.0.0.1 --port 30000 \
+  --model MODEL_PATH \
+  --dataset-name random \
+  --num-prompts 20 \
+  --random-input-len 128 --random-output-len 32 \
+  --output-details --output-file perf.jsonl
+
+python scripts/convert_benchmark_to_trace.py \
+  --input perf.jsonl --output perf_trace.json
+```
+
+Open `perf_trace.json` in [Perfetto](https://ui.perfetto.dev/). Each request has a separate lane containing a `TTFT` slice followed by `Output interval N` slices. The converter uses only the Python standard library. It accepts a JSON object or JSONL, defaults to the last nonempty record, and supports `--run-index 0` to select the first run. Failed requests and requests without a recorded start or first output are skipped. Older results without `arrival_times` cannot reconstruct request overlap; rerun the benchmark with `--output-details`.
+
+Trace boundaries are rounded to integer microseconds so adjacent slices share the same endpoint. Intervals that round to zero appear as instant events.
+
+Keep streaming enabled: do not use `--disable-stream`. The native `--backend sglang` endpoint also works, but streaming chunks can contain multiple tokens, and its benchmark may estimate per-token intervals by dividing a chunk interval. An output interval therefore does not necessarily represent one token.
+
+`arrival_times` records when the client starts a request, after acquiring any `--max-concurrency` slot; it is not the server arrival time. `TTFT` includes network transfer, server queuing, and prefill. These slices show client-observed timing, not GPU execution durations. For scheduler events and server-side phases, use [production request tracing](/docs/references/production_request_trace).
 
 ### End-to-end examples
 
