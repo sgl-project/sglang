@@ -29,6 +29,12 @@ _fp8_dtype = torch.float8_e4m3fn
 # fmha_fwd_hd128_fp8_gfx950 ASM kernel. Support full MHA with q/k/v head_dim == 128 -- e.g., Wan 2.2 self- and cross-attention.
 _FMHA_FP8_HEAD_DIM = 128
 
+# AITER FAv3 on gfx942 supports three different rounding modes:
+#   0 = RTNE (round to nearest even)
+#   1 = RTNA (round to nearest away)
+#   2 = RTZ  (round to zero)
+AITER_BF16_CVT_MODE: int = 2
+
 
 if _use_fp8_attn:
     logger.info("DiT FP8 attention enabled via SGLANG_DIFFUSION_AITER_FP8_ATTN=1")
@@ -212,6 +218,7 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=False,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return output
 
