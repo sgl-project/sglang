@@ -2457,6 +2457,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2514,6 +2515,11 @@ def _run_granian_server(
     server = Server(**granian_kwargs)
 
     if tokenizer_worker_num == 1:
+        if tokenizer_manager is not None:
+            # Same handoff as the uvicorn path: the signal handler wired below
+            # is replaced once auto_create_handle_loop runs, so shutdown has to
+            # reach the server through the hook instead.
+            tokenizer_manager.set_server_stop_hook(server.stop)
 
         async def serve():
             # The embedded server does not install its own signal handlers, so wire
@@ -2638,6 +2644,7 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=get_serving().ssl_ca_certs,
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
+                    tokenizer_manager=tokenizer_manager,
                 )
             elif get_serving().enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2704,7 +2711,9 @@ def _setup_and_run_http_server(
                 )
                 server.run()
         else:
-            # Multiple tokenizer and http processes
+            # Multiple tokenizer and http processes. No stop hook here: the app
+            # is re-imported in child processes, so this manager is not the one
+            # serving and has nothing to ask.
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
