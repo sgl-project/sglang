@@ -1318,6 +1318,10 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        # The psum recv layout already carries local expert ids, so the
+        # global-to-local shift is zero.
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
