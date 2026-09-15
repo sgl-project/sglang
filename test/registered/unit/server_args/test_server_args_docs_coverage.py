@@ -1,34 +1,12 @@
-"""A safeguard that prevents the CLI and its documentation from getting out of sync.
-Every implemented action must be documented and every documented action must exist
-in the CLI.
-
-Builds the real argparse surface (``ServerArgs.add_cli_args``) rather than
-AST parsing the dataclass fields. This means ``cli_name=`` overrides, ``aliases=``
-and argparse's generated ``--no-*`` forms all resolve for free. The check does
-not care which module a field is declared in.
-
-Two fixed sets of names (not counts). We track names rather than counts because a
-count could stay the same even if one flag is documented and a different flag
-becomes undocumented:
-
-- ``_UNDOCUMENTED``: Actions with no row. May only shrink.
-- ``_STALE_ROWS``: Documented flags that no longer register. May only shrink.
-
-Each set is checked three ways (the ratchet idiom in
-``test_global_config_read_ratchet.py``): a new member outside the set fails
-("you broke coverage"), a member that no longer belongs fails ("lock in the
-win by editing the set") and a member that is not a real member of the
-current live/stale computation fails ("the set has drifted from reality or
-you fixed it without updating the baseline").
+"""Every live ServerArgs flag needs a row in server_arguments.mdx and every flag
+the doc names must still register. The two allowlists below may only shrink.
 """
 
 import argparse
 import re
 import unittest
 from pathlib import Path
-from typing import Annotated, get_args, get_origin, get_type_hints
 
-from sglang.srt.arg_groups.arg_utils import Arg, field_names
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -56,14 +34,14 @@ _DEPRECATED_ACTION_TYPES = (
     DeprecatedAliasStoreAction,
 )
 
-# Coverage and staleness are different questions, so they use different
-# regexes on purpose. A symmetric matcher either misses a bare prose mention or
-# promotes a prose wildcard like `--cuda-graph-*` into a fabricated flag name.
+# Argument, Description, Defaults, Options.
+_DOC_COLUMNS = 4
+
+# Only delimited mentions count, so a prose wildcard like `--cuda-graph-*`
+# never becomes a fabricated flag name.
 _ROW_FLAG_RE = re.compile(r"`(--[a-zA-Z0-9][\w-]*)`|<code>(--[a-zA-Z0-9][\w-]*)</code>")
 
-# Actions allowed to have no docs row.
-# This set may only shrink. See TestNoNewUndocumentedFlags below.
-# Re-measure with the two functions in this file before editing it.
+# Live flags with no row. May only shrink.
 _UNDOCUMENTED = frozenset(
     {
         "--c128-page-size",
@@ -142,8 +120,7 @@ _UNDOCUMENTED = frozenset(
     }
 )
 
-# Rows naming a flag that no longer registers.
-# This set may only shrink. See TestNoNewStaleRows below.
+# Flags named anywhere in the doc that no longer register. May only shrink.
 _STALE_ROWS = frozenset(
     {
         "--custom-sigquit-handler",
@@ -155,7 +132,6 @@ _STALE_ROWS = frozenset(
 
 
 def _parser_actions():
-    """(live, deprecated) argparse actions, ``-h``/``--help`` excluded."""
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     live, deprecated = [], []
@@ -169,174 +145,115 @@ def _parser_actions():
     return live, deprecated
 
 
-def _doc_cells() -> list[str]:
+def _doc_rows() -> list[list[str]]:
     text = _DOC_PATH.read_text(encoding="utf-8-sig")
-    return re.findall(r"<td[^>]*>(.*?)</td>", text, re.S)
+    rows = [
+        re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", text, re.S)
+    ]
+    # Header rows hold only <th> cells.
+    return [cells for cells in rows if cells]
 
 
-def _uncovered(live_actions, cells_blob: str) -> set[str]:
-    """Live actions with no spelling mentioned anywhere in a cell.
-    The action is the unit and any of its option strings counts, with a
-    trailing boundary so `--model` cannot match inside `--model-path`."""
+def _uncovered(live_actions, arg_cells_blob: str) -> set[str]:
     uncovered = set()
     for action in live_actions:
         options = [o for o in action.option_strings if o not in ("-h", "--help")]
+        # Any alias counts. A trailing boundary stops `--model` matching `--model-path`.
         if not any(
-            re.search(re.escape(opt) + r"(?![\w-])", cells_blob) for opt in options
+            re.search(re.escape(opt) + r"(?![\w-])", arg_cells_blob) for opt in options
         ):
             uncovered.add(action.option_strings[0])
     return uncovered
 
 
-def _stale(cells: list[str], live_actions, deprecated_actions) -> set[str]:
-    """Delimited flag mentions (backtick or ``<code>``) that name neither a
-    live nor a deprecated registered action."""
-    documented = set()
-    for cell in cells:
-        for match in _ROW_FLAG_RE.finditer(cell):
-            documented.add(match.group(1) or match.group(2))
-    registered = {
-        o for a in live_actions + deprecated_actions for o in a.option_strings
+def _documented_flags(rows: list[list[str]]) -> set[str]:
+    return {
+        match.group(1) or match.group(2)
+        for cells in rows
+        for cell in cells
+        for match in _ROW_FLAG_RE.finditer(cell)
     }
-    return documented - registered
-
-
-def _classify_stale(flag: str) -> str:
-    """Why a documented flag no longer registers. Advisory only. This
-    never gates pass/fail. A gap or a break in this classifier can only make
-    the failure message less useful, never turn a real gap into a false
-    green (see TestClassifierIsAdvisoryOnly)."""
-    field_name = flag.lstrip("-").replace("-", "_")
-    if field_name not in field_names(ServerArgs):
-        return "no ServerArgs field at all -- renamed or removed"
-
-    hint = get_type_hints(ServerArgs, include_extras=True).get(field_name)
-    if get_origin(hint) is not Annotated:
-        return "field exists with no A[] annotation -- never had a CLI surface"
-
-    arg_meta = next((a for a in get_args(hint)[1:] if isinstance(a, Arg)), None)
-    if arg_meta is not None and arg_meta.no_cli:
-        return "field exists with Arg(no_cli=True) -- never had a CLI surface"
-
-    return (
-        "field exists with live-looking CLI metadata under this name -- the "
-        "real spelling likely differs via cli_name=; check by hand"
-    )
 
 
 class TestServerArgsDocsCoverage(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.live_actions, cls.deprecated_actions = _parser_actions()
-        cls.cells = _doc_cells()
-        cls.cells_blob = "\n".join(cls.cells)
+        cls.live_actions, deprecated_actions = _parser_actions()
+        cls.rows = _doc_rows()
+        cls.arg_cells_blob = "\n".join(cells[0] for cells in cls.rows)
+        cls.uncovered = _uncovered(cls.live_actions, cls.arg_cells_blob)
+        cls.documented = _documented_flags(cls.rows)
+        registered = {
+            o for a in cls.live_actions + deprecated_actions for o in a.option_strings
+        }
+        cls.stale = cls.documented - registered
 
     def test_cell_parser_still_matches_the_doc(self):
-        """An under matching regex fails loudly (everything reads
-        missing) but an over matching one fails quietly, inflating the
-        documented set and hiding real gaps, This is dangerous direction for a
-        guardrail. Pin both a minimum cell count and one known row."""
+        """An over matching parser fails quietly. It inflates the documented set
+        and hides real gaps. Pin the table shape and one known row."""
         self.assertGreater(
-            len(self.cells),
-            1600,
-            f"only {len(self.cells)} <td> cells recovered from {_DOC_PATH}. "
-            "The cell regex no longer matches the table markup",
+            len(self.rows),
+            400,
+            f"only {len(self.rows)} table rows recovered from {_DOC_PATH}. "
+            "The row regex no longer matches the table markup",
+        )
+        misshapen = [cells[0][:80] for cells in self.rows if len(cells) != _DOC_COLUMNS]
+        self.assertFalse(
+            misshapen,
+            f"these rows do not have {_DOC_COLUMNS} cells, so their first cell may "
+            "not be the Argument column:\n  " + "\n  ".join(misshapen),
         )
         self.assertIn(
             "--model-path",
-            self.cells_blob,
-            "a flag known to be documented was not found in any cell. The "
-            "cell regex is over or under matching",
+            self.arg_cells_blob,
+            "a flag known to be documented was not found in the Argument column. "
+            "The row regex is over or under matching",
         )
 
     def test_no_new_undocumented_flags(self):
-        uncovered = _uncovered(self.live_actions, self.cells_blob)
-        added = sorted(uncovered - _UNDOCUMENTED)
+        added = sorted(self.uncovered - _UNDOCUMENTED)
         self.assertFalse(
             added,
             "these live flags have no row in server_arguments.mdx and are not "
-            "on the allow-list. Add a row (lift the help text from the "
-            f"field's Arg(help=...)) or if it is a deliberate omission, add "
+            "on the allow list. Add a row (lift the help text from the "
+            "field's Arg(help=...)) or if it is a deliberate omission, add "
             f"it to _UNDOCUMENTED in {Path(__file__).name}:\n  " + "\n  ".join(added),
         )
 
-    def test_undocumented_allowlist_only_shrinks(self):
-        healed = sorted(_UNDOCUMENTED - _uncovered(self.live_actions, self.cells_blob))
-        self.assertFalse(
-            healed,
-            "these flags are documented now but still listed in _UNDOCUMENTED "
-            f"Remove them from the set in {Path(__file__).name} to lock in "
-            "the win:\n  " + "\n  ".join(healed),
-        )
-
-    def test_undocumented_allowlist_has_no_ghosts(self):
+    def test_undocumented_allowlist_is_current(self):
         live_options = {a.option_strings[0] for a in self.live_actions}
-        ghosts = sorted(_UNDOCUMENTED - live_options)
+        outdated = []
+        for flag in sorted(_UNDOCUMENTED - self.uncovered):
+            reason = "now documented" if flag in live_options else "flag is gone"
+            outdated.append(f"{flag} ({reason})")
         self.assertFalse(
-            ghosts,
-            "these entries in _UNDOCUMENTED no longer name a live action. "
-            f"Drop them from the set in {Path(__file__).name}, the flag is "
-            "gone:\n  " + "\n  ".join(ghosts),
+            outdated,
+            "these entries in _UNDOCUMENTED are out of date. Remove them from "
+            f"the set in {Path(__file__).name}:\n  " + "\n  ".join(outdated),
         )
 
     def test_no_new_stale_rows(self):
-        stale = _stale(self.cells, self.live_actions, self.deprecated_actions)
-        added = sorted(stale - _STALE_ROWS)
-        if added:
-            detail = "\n  ".join(f"{f} ({_classify_stale(f)})" for f in added)
-            self.fail(
-                "these rows in server_arguments.mdx name a flag that no "
-                "longer registers, live or deprecated and are not on the "
-                f"allow-list. Fix or delete the row or add it to "
-                f"_STALE_ROWS in {Path(__file__).name}:\n  {detail}"
-            )
-
-    def test_stale_allowlist_only_shrinks(self):
-        stale = _stale(self.cells, self.live_actions, self.deprecated_actions)
-        healed = sorted(_STALE_ROWS - stale)
+        added = sorted(self.stale - _STALE_ROWS)
         self.assertFalse(
-            healed,
-            "these rows are no longer stale but still listed in _STALE_ROWS. "
-            f"Remove them from the set in {Path(__file__).name} to lock in "
-            "the win:\n  " + "\n  ".join(healed),
+            added,
+            "server_arguments.mdx names these flags but they no longer register, "
+            "current or deprecated and are not on the allow list. The flag was "
+            "renamed (possibly via cli_name=) or removed or its field has no CLI "
+            "surface (no A[] annotation, or Arg(no_cli=True)). Fix or delete the "
+            f"mention or add it to _STALE_ROWS in {Path(__file__).name}:\n  "
+            + "\n  ".join(added),
         )
 
-    def test_stale_allowlist_has_no_ghosts(self):
-        stale = _stale(self.cells, self.live_actions, self.deprecated_actions)
-        ghosts = sorted(_STALE_ROWS - stale)
+    def test_stale_allowlist_is_current(self):
+        outdated = []
+        for flag in sorted(_STALE_ROWS - self.stale):
+            reason = "registers again" if flag in self.documented else "gone from doc"
+            outdated.append(f"{flag} ({reason})")
         self.assertFalse(
-            ghosts,
-            "these entries in _STALE_ROWS no longer correspond to an actual "
-            f"stale row. Drop them from the set in {Path(__file__).name}:\n  "
-            + "\n  ".join(ghosts),
-        )
-
-
-class TestClassifierIsAdvisoryOnly(CustomTestCase):
-    """The four buckets steer the fix, never the verdict. A classifier
-    that raised or returned something unexpected for every stale row would
-    only degrade the failure message above. Pin that it stays total and
-    string typed over the current baseline and not that its buckets are
-    exhaustive which is exactly what the fourth catch-all bucket admits it
-    is not."""
-
-    def test_classifies_every_current_stale_row_without_raising(self):
-        for flag in sorted(_STALE_ROWS):
-            with self.subTest(flag=flag):
-                verdict = _classify_stale(flag)
-                self.assertIsInstance(verdict, str)
-                self.assertTrue(verdict)
-
-    def test_known_bucket_examples(self):
-        # No field at all (renamed/removed): 3 of the 4 fall here.
-        self.assertEqual(
-            _classify_stale("--hybrid-kvcache-ratio"),
-            "no ServerArgs field at all -- renamed or removed",
-        )
-        # Field exists, but was never annotated for CLI at all.
-        self.assertEqual(
-            _classify_stale("--custom-sigquit-handler"),
-            "field exists with no A[] annotation -- never had a CLI surface",
+            outdated,
+            "these entries in _STALE_ROWS are out of date. Remove them from "
+            f"the set in {Path(__file__).name}:\n  " + "\n  ".join(outdated),
         )
 
 
