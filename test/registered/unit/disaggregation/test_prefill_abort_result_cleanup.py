@@ -11,6 +11,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -20,6 +24,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
+        self.cache_request_handle = CacheRequestHandle(self.rid, 0)
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
@@ -105,7 +110,9 @@ def test_aborted_final_result_releases_hybrid_cache(
     maybe_cache_unfinished_req.assert_not_called()
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
-    scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
+    scheduler.tree_cache.finish.assert_called_once_with(
+        req.cache_request_handle, CacheRequestOutcome.ABORT
+    )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     scheduler.send_kv_chunk.assert_not_called()
     assert req.output_ids == []
@@ -254,7 +261,9 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
-    scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
+    scheduler.tree_cache.finish.assert_called_once_with(
+        req.cache_request_handle, CacheRequestOutcome.ABORT
+    )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     scheduler.send_kv_chunk.assert_not_called()
 
