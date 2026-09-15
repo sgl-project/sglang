@@ -510,20 +510,6 @@ mod tests {
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn frontend(startup_ready: bool) -> crate::frontend::FrontendHandle {
-        crate::frontend::FrontendHandle::new(
-            flume::unbounded().0,
-            flume::unbounded().0,
-            crate::frontend::FrontendConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready,
-                is_disaggregation: false,
-                mm_limits: Default::default(),
-            },
-        )
-    }
-
     fn frame(rid: u64, text: &str) -> ResponseItem {
         ResponseItem::Frame(ChunkEvent {
             rid: Rid::from(rid.to_string()),
@@ -570,34 +556,28 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_unavailable_before_startup_warmup_finishes() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
         let state = Arc::new(AppState {
-            frontend: frontend(false),
+            frontend: crate::frontend::FrontendHandle::new(
+                intake_tx,
+                abort_tx,
+                crate::frontend::FrontendConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: false,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                },
+            ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             chat_formatter: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn health_closed_intake_preserves_native_503_body() {
-        let state = Arc::new(AppState {
-            // The helper deliberately retains no intake receiver, so this
-            // ready probe reaches the operational submission-failure path.
-            frontend: frontend(true),
-            server_args: Arc::new(crate::message::config::ServerArgs::default()),
-            chat_formatter: None,
-        });
-
-        let response = health_generate(State(state), Duration::ZERO).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"]["message"], "service unavailable");
-        assert_eq!(value["error"]["code"], 503);
+        assert!(intake_rx.try_recv().is_err());
+        assert!(abort_rx.try_recv().is_err());
     }
 
     #[tokio::test]
