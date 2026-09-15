@@ -80,6 +80,9 @@ validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 reasoning-parser = "=1.0.0"
+# TODO: bump once smg releases openai-protocol with smg-project/smg#2410
+# (ReasoningEffort None/Xhigh/Max + as_str/parse). Pin is exact (=) so this
+# fails loudly rather than silently picking up an incompatible version.
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.3.2"
