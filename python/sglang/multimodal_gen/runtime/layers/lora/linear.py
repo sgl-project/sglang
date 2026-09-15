@@ -16,9 +16,6 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -128,34 +125,43 @@ class BaseLayerWithLoRA(nn.Module):
         return True
 
     @torch.compile()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
+            return self.base_layer(input)
+
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):
             lora_B = self.lora_B.to_local()
             lora_A = self.lora_A.to_local()
 
+        input_parallel = self.base_layer.parallel_input(input)
+        output_parallel, output_bias = self.base_layer.apply_quant_method(
+            input_parallel, self.base_layer.bias
+        )
+
         # TODO: Support multiple LoRA adapters when use not merged mode
-        if not self.merged and not self.disable_lora:
+        if not self.merged:
             lora_dtype = lora_A.dtype
-            x_lora = x.to(dtype=lora_dtype)
+            input_lora = input.to(dtype=lora_dtype)
             lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=x.device, non_blocking=True)
+                lora_A.to(device=input.device, non_blocking=True)
             )
             lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=x.device, non_blocking=True)
+                lora_B.to(device=input.device, non_blocking=True)
             )
-            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
+            delta_parallel = _compute_lora_delta(
+                input_lora, lora_A_sliced, lora_B_sliced
+            )
             if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta = delta * self.strength
-            out, output_bias = self.base_layer(x)
-            out = out + delta.to(dtype=out.dtype)
-        else:
-            out, output_bias = self.base_layer(x)
-        return self._add_lora_output_offset(out), output_bias
+                delta_parallel *= self.lora_alpha / self.lora_rank  # type: ignore
+            delta_parallel *= self.strength
+            output_parallel += delta_parallel.to(dtype=output_parallel.dtype)
+
+        output = self.base_layer.collect_output(
+            self._add_lora_output_offset(output_parallel)
+        )
+        return output, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -628,48 +634,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
-            return self.base_layer(input_)
-
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
-        if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            input_lora = input_.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input_.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input_.device, non_blocking=True)
-            )
-            delta_parallel = _compute_lora_delta(
-                input_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
-            )
-        output_parallel = self._add_lora_output_offset(output_parallel)
-        if self.base_layer.gather_output:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
-        return output, output_bias
-
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
 
@@ -762,64 +726,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
-    def forward(self, input_: torch.Tensor):
-        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
-            return self.base_layer(input_)
-
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
-        if self.base_layer.input_is_parallel:
-            input_parallel = input_
-        else:
-            tp_rank = get_tp_rank()
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.base_layer.tp_size
-            )
-            input_parallel = splitted_input[tp_rank].contiguous()
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
-        )
-        if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            input_parallel_lora = input_parallel.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input_parallel.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input_parallel.device, non_blocking=True)
-            )
-            delta_parallel = _compute_lora_delta(
-                input_parallel_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
-            )
-
-        if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output_ = output_parallel
-
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return self._add_lora_output_offset(output), output_bias
+    def _add_lora_output_offset(self, output):
+        if self.base_layer.tp_rank != 0:
+            return output
+        return super()._add_lora_output_offset(output)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
@@ -850,7 +760,12 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     @torch.compile()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # nn.Linear.forward() returns a single tensor, not a tuple
+        output = self.base_layer(input)
+        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
+            return output
+
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):
@@ -858,28 +773,22 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             lora_A = self.lora_A.to_local()
 
         # TODO: Support multiple LoRA adapters when use not merged mode
-        if not self.merged and not self.disable_lora:
+        if not self.merged:
             lora_dtype = lora_A.dtype
-            x_lora = x.to(dtype=lora_dtype)
+            input_lora = input.to(dtype=lora_dtype)
             lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=x.device, non_blocking=True)
+                lora_A.to(device=input.device, non_blocking=True)
             )
             lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=x.device, non_blocking=True)
+                lora_B.to(device=input.device, non_blocking=True)
             )
-            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
+            delta = _compute_lora_delta(input_lora, lora_A_sliced, lora_B_sliced)
             if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta = delta * self.strength
-            # nn.Linear.forward() returns a single tensor, not a tuple
-            out = self.base_layer(x)
-            out = out + delta.to(dtype=out.dtype)
-        else:
-            # nn.Linear.forward() returns a single tensor
-            out = self.base_layer(x)
-        return self._add_lora_output_offset(out)
+                delta *= self.lora_alpha / self.lora_rank  # type: ignore
+            delta *= self.strength
+            output += delta.to(dtype=output.dtype)
+
+        return self._add_lora_output_offset(output)
 
 
 def _use_owned_base_snapshot(snapshot_base: bool, device_type: str) -> bool:
