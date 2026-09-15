@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
+    PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
@@ -105,7 +106,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
 
 class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
-    def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
+    def _new_unpublished_swa_state(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.is_mamba_enabled = False
         cache.tree_core = SimpleNamespace(is_eagle=False)
@@ -116,8 +117,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         component.prepare_for_caching_req.return_value = None
         cache._components_tuple = (component,)
         cache.insert = MagicMock()
-        last_node = object()
         req = SimpleNamespace(
+            rid="req",
             get_fill_ids=lambda: [1, 2, 3, 4],
             kv=SimpleNamespace(
                 req_pool_idx=1,
@@ -128,8 +129,68 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             priority=3,
             extra_key=None,
             cache_salt=None,
-            last_node=last_node,
+            kv_rotation_base=None,
+            last_node=object(),
         )
+        return cache, component, req
+
+    def _pop_bootstrapping_swa_branch(self, write_policy):
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.scheduler_stage_metrics = None
+        queue.pp_size = 1
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = SimpleNamespace(write_policy=write_policy)
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=None,
+            attn_tp_cpu_group=None,
+            tree_cache=cache,
+        )
+        queue.ensure_metadata_buffer = MagicMock(return_value=True)
+        req = SimpleNamespace(
+            rid="req",
+            disagg_kv_sender=object(),
+            prefill_attempt_count=0,
+            is_retracted=False,
+            swa_branching_seqlen=4,
+            kv=SimpleNamespace(cache_protected_len=2),
+        )
+        queue.queue = [req]
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.Bootstrapping],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.get_disagg",
+                return_value=SimpleNamespace(optimistic_prefill_attempts=2),
+            ),
+        ):
+            result = queue.pop_bootstrapped()
+
+        return queue, req, result
+
+    def test_write_through_pending_swa_branch_waits_for_bootstrap(self):
+        queue, req, result = self._pop_bootstrapping_swa_branch("write_through")
+
+        self.assertEqual(result, [])
+        self.assertEqual(queue.queue, [req])
+        self.assertEqual(req.prefill_attempt_count, 0)
+        queue.ensure_metadata_buffer.assert_not_called()
+
+    def test_other_write_policies_stay_optimistic(self):
+        for write_policy in ("write_back", "write_through_selective"):
+            with self.subTest(write_policy=write_policy):
+                queue, req, result = self._pop_bootstrapping_swa_branch(write_policy)
+
+                self.assertEqual(result, [req])
+                self.assertEqual(queue.queue, [])
+                self.assertEqual(req.prefill_attempt_count, 1)
+                queue.ensure_metadata_buffer.assert_called_once_with(req)
+
+    def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
+        cache, component, req = self._new_unpublished_swa_state()
+        last_node = req.last_node
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.advance_unpublished_req(req, chunked=True)
@@ -150,11 +211,45 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         cache.insert.assert_not_called()
 
+    def test_bootstrap_failure_after_swa_eviction_releases_once(self):
+        cache, component, req = self._new_unpublished_swa_state()
+        req.bootstrap_room = 7
+        req.disagg_kv_sender = MagicMock()
+        req.time_stats = SimpleNamespace(trace_ctx=MagicMock())
+        req.return_logprob = False
+        req.pending_bootstrap = True
+        req.metadata_buffer_index = -1
+        req.kv.holds_kv = True
+        req.kv.holds_mamba = False
+        scheduler = SimpleNamespace(
+            tree_cache=cache,
+            clear_pending_chunk_send=MagicMock(),
+            ps=SimpleNamespace(tp_rank=0),
+            req_to_metadata_buffer_idx_allocator=MagicMock(),
+            output_streamer=MagicMock(),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            enable_hicache_storage=False,
+        )
+
+        with (
+            envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
+            patch(
+                "sglang.srt.disaggregation.prefill.release_kv_cache"
+            ) as release_kv_cache,
+            patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+        ):
+            cache.advance_unpublished_req(req, chunked=True)
+            SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
+
+        component.free_out_of_window_slots.assert_called_once()
+        cache.insert.assert_not_called()
+        release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
+        self.assertFalse(req.pending_bootstrap)
+
     def test_write_through_pending_chunk_does_not_publish(self):
         scheduler = SimpleNamespace()
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.cache_controller = object()
-        cache.tree_core = SimpleNamespace(is_write_back=False)
+        cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
         scheduler.tree_cache = cache
         req = SimpleNamespace(pending_bootstrap=True)

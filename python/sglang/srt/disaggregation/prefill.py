@@ -110,6 +110,14 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _uses_write_through_cache(cache: object) -> bool:
+    return (
+        isinstance(cache, UnifiedRadixCache)
+        and cache.cache_controller is not None
+        and cache.cache_controller.write_policy == "write_through"
+    )
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # Hybrid pools count all layers in start_layer, but peer KV lists contain only
     # full-attention layers, so translate to a full-attention-relative offset.
@@ -482,6 +490,11 @@ class PrefillBootstrapQueue:
                 if (
                     req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
                     and not req.is_retracted  # engine paused
+                    and not (
+                        _uses_write_through_cache(self.scheduler.tree_cache)
+                        and req.swa_branching_seqlen is not None
+                        and req.swa_branching_seqlen > req.kv.cache_protected_len
+                    )
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
@@ -547,12 +560,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req, *, chunked: bool = False
     ) -> None:
         cache = self.tree_cache
-        if (
-            req.pending_bootstrap
-            and isinstance(cache, UnifiedRadixCache)
-            and cache.cache_controller is not None
-            and not cache.is_write_back
-        ):
+        if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req, chunked=chunked)
             return
 
