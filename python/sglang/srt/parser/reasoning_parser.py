@@ -2166,6 +2166,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV4Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
