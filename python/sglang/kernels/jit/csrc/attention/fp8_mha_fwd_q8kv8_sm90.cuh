@@ -2,6 +2,7 @@
 
 #include "../sparse_mla_q8kv8_prefill_sm90/config.h"
 #include "../sparse_mla_q8kv8_prefill_sm90/helpers.h"
+#include <cuda.h>
 #include <cuda_fp8.h>
 
 using namespace cute;
@@ -21,6 +22,11 @@ constexpr int kNumStages = 2;
 using fp8_t = cutlass::float_e4m3_t;
 using bf16_t = cutlass::bfloat16_t;
 
+struct TmaParams {
+  CUtensorMap k;
+  CUtensorMap v;
+};
+
 using SmemLayoutQ = decltype(coalesce(
     tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<kMmaRows>, Int<kHeadDim>>{}, Step<_1, _2>{}),
     Shape<_1, _1>{}));
@@ -38,20 +44,51 @@ struct SharedStorage {
   array_aligned<fp8_t, kNumStages * cosize_v<SmemLayoutK>> k;
   array_aligned<fp8_t, kNumStages * cosize_v<SmemLayoutK>> v;
   array_aligned<fp8_t, kNumStages * cosize_v<SmemLayoutVt>> vt;
-  int32_t slots[kNumStages][kTokenTile];
   bool valid[kNumStages][kTokenTile];
+  alignas(8) uint64_t kv_ready[kNumStages];
   int32_t batch;
   int32_t q_position;
   int32_t seq_len;
+  int32_t physical_page_start;
   int64_t request;
 };
 
-__device__ __forceinline__ void copy_16B(fp8_t* dst, const fp8_t* src, bool pred) {
-  if (pred) {
-    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-  } else {
-    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
-  }
+template <typename T>
+__device__ __forceinline__ uint32_t to_shared(T* ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+__device__ __forceinline__ void mbarrier_init(uint64_t* barrier) {
+  asm volatile("mbarrier.init.shared.b64 [%0], 1;" ::"r"(to_shared(barrier)));
+}
+
+__device__ __forceinline__ void fence_mbarrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* barrier, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(barrier)), "r"(bytes));
+}
+
+__device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, uint32_t phase) {
+  asm volatile(
+      "{\n\t.reg .pred complete;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 complete, [%0], %1;\n\t"
+      "@!complete bra WAIT_%=;\n\t}\n" ::"r"(to_shared(barrier)),
+      "r"(phase));
+}
+
+__device__ __forceinline__ void
+tma_load_3d(fp8_t* dst, const CUtensorMap* tensor_map, int32_t x, int32_t y, int32_t z, uint64_t* barrier) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {%2, %3, %4}], [%5];" ::"r"(to_shared(dst)),
+      "l"(tensor_map),
+      "r"(x),
+      "r"(y),
+      "r"(z),
+      "r"(to_shared(barrier))
+      : "memory");
 }
 
 __device__ __forceinline__ void copy_q_16B(fp8_t* dst, const fp8_t* src, bool pred) {
@@ -67,8 +104,7 @@ __device__ __forceinline__ void copy_q_16B(fp8_t* dst, const fp8_t* src, bool pr
 
 __device__ __forceinline__ void load_kv_tile(
     SharedStorage& storage,
-    const fp8_t* k_cache,
-    const fp8_t* v_cache,
+    const TmaParams& tma,
     const int32_t* req_to_token,
     int stage,
     int selected_block,
@@ -77,36 +113,41 @@ __device__ __forceinline__ void load_kv_tile(
     int num_kv_heads,
     int max_slots,
     int req_stride,
-    int tid,
-    int64_t cache_policy) {
-  constexpr int kVectorsPerRow = kHeadDim / 16;
+    int tid) {
   Tensor sK = make_tensor(make_smem_ptr(storage.k.data() + stage * cosize_v<SmemLayoutK>), SmemLayoutK{});
   Tensor sV = make_tensor(make_smem_ptr(storage.v.data() + stage * cosize_v<SmemLayoutK>), SmemLayoutK{});
 
   if (tid < kTokenTile) {
     const int logical_position = selected_block * kBlockSize + tile * kTokenTile + tid;
-    const bool is_valid =
+    storage.valid[stage][tid] =
         selected_block >= 0 && logical_position < storage.seq_len && logical_position <= storage.q_position;
-    storage.valid[stage][tid] = is_valid;
-    storage.slots[stage][tid] =
-        is_valid ? req_to_token[storage.request * static_cast<int64_t>(req_stride) + logical_position] : 0;
-    if (storage.slots[stage][tid] < 0) {
-      storage.slots[stage][tid] += max_slots;
-    } else if (storage.slots[stage][tid] >= max_slots) {
-      storage.slots[stage][tid] -= max_slots;
-    }
   }
-  __syncthreads();
-
-  for (int vector_idx = tid; vector_idx < kTokenTile * kVectorsPerRow; vector_idx += blockDim.x) {
-    const int token = vector_idx / kVectorsPerRow;
-    const int col = (vector_idx % kVectorsPerRow) * 16;
-    const int64_t cache_offset =
-        (static_cast<int64_t>(storage.slots[stage][token]) * num_kv_heads + kv_head) * kHeadDim + col;
-    sm90::cp_async_cacheglobal_l2_prefetch_256B(
-        k_cache + cache_offset, &sK(token, col), storage.valid[stage][token], cache_policy);
-    sm90::cp_async_cacheglobal_l2_prefetch_256B(
-        v_cache + cache_offset, &sV(token, col), storage.valid[stage][token], cache_policy);
+  if (tid == 0) {
+    // A sparse block is exactly one physical page. Resolve that page once,
+    // then reuse it for the two 64-token TMA stages.
+    if (tile == 0) {
+      const int logical_block_start = selected_block * kBlockSize;
+      int first_slot = 0;
+      if (selected_block >= 0) {
+        first_slot = req_to_token[storage.request * static_cast<int64_t>(req_stride) + logical_block_start];
+        if (first_slot < 0) {
+          first_slot += max_slots;
+        } else if (first_slot >= max_slots) {
+          first_slot -= max_slots;
+        }
+      }
+      // The native provider requires page_size == block_size == 128, so the
+      // first logical token of a sparse block is already the physical page
+      // base. Do not round here: rounding would hide a broken page contract.
+      storage.physical_page_start = first_slot;
+    }
+    const int physical_slot = storage.physical_page_start + tile * kTokenTile;
+    constexpr uint32_t kTransactionBytes = 2 * kTokenTile * kHeadDim * sizeof(fp8_t);
+    mbarrier_arrive_expect_tx(&storage.kv_ready[stage], kTransactionBytes);
+    tma_load_3d(&sK(0, 0), &tma.k, 0, physical_slot, kv_head * 2, &storage.kv_ready[stage]);
+    tma_load_3d(&sK(0, kHeadDim / 2), &tma.k, 0, physical_slot, kv_head * 2 + 1, &storage.kv_ready[stage]);
+    tma_load_3d(&sV(0, 0), &tma.v, 0, physical_slot, kv_head * 2, &storage.kv_ready[stage]);
+    tma_load_3d(&sV(0, kHeadDim / 2), &tma.v, 0, physical_slot, kv_head * 2 + 1, &storage.kv_ready[stage]);
   }
 }
 
@@ -121,6 +162,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ seq_lens,
     const int32_t* __restrict__ prefix_lens,
+    __grid_constant__ const TmaParams tma,
     int total_q,
     int num_q_heads,
     int num_kv_heads,
@@ -152,6 +194,9 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     storage.q_position = prefix_lens[batch] + q_idx - cu_seqlens[batch];
     storage.seq_len = seq_lens[batch];
     storage.request = slot_ids[batch];
+    mbarrier_init(&storage.kv_ready[0]);
+    mbarrier_init(&storage.kv_ready[1]);
+    fence_mbarrier_init();
   }
 
   constexpr int kVectorsPerRow = kHeadDim / 16;
@@ -169,6 +214,10 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     }
   }
   __syncthreads();
+  if (tid == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tma.k) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tma.v) : "memory");
+  }
 
   Tensor rP = partition_fragment_C(TiledMmaQK{}, Shape<Int<kMmaRows>, Int<kTokenTile>>{});
   Tensor rO = partition_fragment_C(TiledMmaPV{}, Shape<Int<kMmaRows>, Int<kHeadDim>>{});
@@ -183,29 +232,12 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
   using Transpose = SmemTransposeFp8_64x64<kTokenTile, kHeadDim>;
   using SrcLayout = typename Transpose::SmemLayoutTransposeV;
   using DstLayout = typename Transpose::SmemLayoutTransposeVt;
-  const int64_t cache_policy = sm90::createpolicy_evict_first();
-
   constexpr int kTilesPerBlock = kBlockSize / kTokenTile;
   const int total_tiles = topk * kTilesPerBlock;
   if (total_tiles > 0) {
     const int selected_block = topk_idx[(kv_head * total_q + q_idx) * topk];
-    load_kv_tile(
-        storage,
-        k_cache,
-        v_cache,
-        req_to_token,
-        0,
-        selected_block,
-        0,
-        kv_head,
-        num_kv_heads,
-        max_slots,
-        req_stride,
-        tid,
-        cache_policy);
-    asm volatile("cp.async.commit_group;\n" ::);
-    asm volatile("cp.async.wait_group 0;\n" ::);
-    fence_view_async_shared();
+    load_kv_tile(storage, tma, req_to_token, 0, selected_block, 0, kv_head, num_kv_heads, max_slots, req_stride, tid);
+    mbarrier_wait(&storage.kv_ready[0], 0);
     __syncthreads();
   }
 
@@ -221,8 +253,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
       const int next_selected_block = topk_idx[(kv_head * total_q + q_idx) * topk + next_selected_idx];
       load_kv_tile(
           storage,
-          k_cache,
-          v_cache,
+          tma,
           req_to_token,
           stage ^ 1,
           next_selected_block,
@@ -231,9 +262,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
           num_kv_heads,
           max_slots,
           req_stride,
-          tid,
-          cache_policy);
-      asm volatile("cp.async.commit_group;\n" ::);
+          tid);
     }
 
     Tensor sVSrc = as_position_independent_swizzle_tensor(
@@ -302,8 +331,9 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     warpgroup_commit_batch();
 
     if (next_tile_idx < total_tiles) {
-      asm volatile("cp.async.wait_group 0;\n" ::);
-      fence_view_async_shared();
+      const int next_stage = next_tile_idx % kNumStages;
+      const int next_phase = (next_tile_idx / kNumStages) & 1;
+      mbarrier_wait(&storage.kv_ready[next_stage], next_phase);
       __syncthreads();
     }
   }
@@ -364,6 +394,34 @@ inline void launch_fp8_mha_fwd_q8kv8_sm90(
     float effective_sm_scale,
     float v_scale,
     cudaStream_t stream) {
+  TmaParams tma;
+  uint64_t size[3] = {
+      static_cast<uint64_t>(kHeadDim / 2), static_cast<uint64_t>(max_slots), static_cast<uint64_t>(2 * num_kv_heads)};
+  uint64_t stride[2] = {
+      static_cast<uint64_t>(kHeadDim) * static_cast<uint64_t>(num_kv_heads) * sizeof(fp8_t),
+      static_cast<uint64_t>((kHeadDim / 2) * sizeof(fp8_t))};
+  // Two adjacent 64x64 SW64 slices form each logical 64x128 K/V tile.
+  uint32_t box_size[3] = {kHeadDim / 2, kTokenTile, 1};
+  uint32_t elem_stride[3] = {1, 1, 1};
+  auto encode_tma = [&](CUtensorMap* tensor_map, const fp8_t* cache) {
+    CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+        tensor_map,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        3,
+        const_cast<fp8_t*>(cache),
+        size,
+        stride,
+        box_size,
+        elem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    KU_ASSERT(result == CUDA_SUCCESS);
+  };
+  encode_tma(&tma.k, k_cache);
+  encode_tma(&tma.v, v_cache);
+
   auto kernel = &fp8_mha_fwd_q8kv8_kernel;
   constexpr size_t smem_size = sizeof(SharedStorage);
   KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -378,6 +436,7 @@ inline void launch_fp8_mha_fwd_q8kv8_sm90(
       cu_seqlens,
       seq_lens,
       prefix_lens,
+      tma,
       total_q,
       num_q_heads,
       num_kv_heads,

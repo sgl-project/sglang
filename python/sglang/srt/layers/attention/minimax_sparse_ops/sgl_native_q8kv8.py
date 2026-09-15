@@ -98,6 +98,7 @@ def sgl_native_q8kv8_sparse_prefill_main(
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
     block_size_k: int,
+    page_size: int,
     sm_scale: Optional[float] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
@@ -116,6 +117,10 @@ def sgl_native_q8kv8_sparse_prefill_main(
         prefix_lens,
         block_size_k,
     )
+    if page_size != block_size_k:
+        raise SglNativeQ8KV8UnavailableError(
+            "page_size must equal block_size_k for native Q8KV8"
+        )
     from sglang.kernels.ops.attention.minimax_sparse.prefill.sgl_native_q8kv8 import (
         SglNativeQ8KV8BuildError,
         sgl_native_q8kv8_sparse_prefill,
@@ -133,6 +138,7 @@ def sgl_native_q8kv8_sparse_prefill_main(
             seq_lens=seq_lens,
             prefix_lens=prefix_lens,
             block_size_k=block_size_k,
+            page_size=page_size,
             sm_scale=sm_scale,
             q_scale=q_scale,
             k_scale=k_scale,

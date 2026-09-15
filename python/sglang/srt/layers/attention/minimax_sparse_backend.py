@@ -246,11 +246,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and not self.fp8_attn_gemm
             and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             and self.block_size_k == 128
+            and self.kv_pool.page_size == self.block_size_k
         )
         if native_q8kv8_requested and not self.use_sgl_native_q8kv8:
             logger.warning(
                 "[MiniMaxSparse] SGL native Q8KV8 requested but unsupported "
-                "(requires SM90, FP8 E4M3 main KV, and block_size=128); "
+                "(requires SM90, FP8 E4M3 main KV, and "
+                "page_size=block_size_k=128); "
                 "falling back to the existing sparse provider."
             )
         if self.use_msa:
@@ -1561,6 +1563,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
                 use_sgl_native_q8kv8=self.use_sgl_native_q8kv8,
+                page_size=self.page_size,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,

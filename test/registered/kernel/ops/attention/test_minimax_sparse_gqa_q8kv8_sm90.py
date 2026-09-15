@@ -13,6 +13,17 @@ MODULE_NAME = "sglang.kernels.ops.attention.minimax_sparse.prefill.sgl_native_q8
 FP8 = torch.float8_e4m3fn
 
 
+def test_native_q8kv8_requires_page_aligned_sparse_blocks():
+    native_module = importlib.import_module(MODULE_NAME)
+
+    native_module._validate_page_contract(block_size_k=128, page_size=128)
+    with pytest.raises(
+        ValueError,
+        match="requires page_size=block_size_k=128",
+    ):
+        native_module._validate_page_contract(block_size_k=128, page_size=64)
+
+
 def _make_case(num_q_heads: int, num_kv_heads: int):
     torch.manual_seed(7)
     device = "cuda"
@@ -21,9 +32,15 @@ def _make_case(num_q_heads: int, num_kv_heads: int):
     q = (torch.randn(total_q, num_q_heads, head_dim, device=device) * 0.2).to(FP8)
     k = (torch.randn(seq_len, num_kv_heads, head_dim, device=device) * 0.2).to(FP8)
     v = (torch.randn(seq_len, num_kv_heads, head_dim, device=device) * 0.2).to(FP8)
-    req_to_token = torch.randperm(seq_len, device=device, dtype=torch.int64).to(
-        torch.int32
-    )[None, :]
+    page_order = torch.tensor([1, 0], device=device, dtype=torch.int64)
+    req_to_token = (
+        (
+            page_order[:, None] * block_size
+            + torch.arange(block_size, device=device, dtype=torch.int64)[None, :]
+        )
+        .reshape(1, seq_len)
+        .to(torch.int32)
+    )
     slot_ids = torch.zeros(1, device=device, dtype=torch.int64)
     topk_idx = (
         torch.tensor([0, 1], device=device, dtype=torch.int32)
@@ -146,6 +163,7 @@ def test_native_q8kv8_matches_fp8_probability_reference(
         seq_lens=seq_lens,
         prefix_lens=prefix_lens,
         block_size_k=block_size,
+        page_size=block_size,
         sm_scale=sm_scale,
         q_scale=q_scale,
         k_scale=k_scale,

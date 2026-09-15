@@ -37,6 +37,11 @@ def _unit_scale(value: Optional[float]) -> float:
     return 1.0 if value is None else float(value)
 
 
+def _validate_page_contract(block_size_k: int, page_size: int) -> None:
+    if block_size_k != 128 or page_size != block_size_k:
+        raise ValueError("the native Q8KV8 kernel requires page_size=block_size_k=128")
+
+
 @torch.no_grad()
 def sgl_native_q8kv8_sparse_prefill(
     q: torch.Tensor,
@@ -49,6 +54,7 @@ def sgl_native_q8kv8_sparse_prefill(
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
     block_size_k: int,
+    page_size: int,
     sm_scale: Optional[float] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
@@ -108,8 +114,7 @@ def sgl_native_q8kv8_sparse_prefill(
         raise ValueError("k_cache and v_cache must have identical shapes")
     if head_dim != 128 or k_head_dim != 128:
         raise ValueError("the native Q8KV8 kernel requires head_dim=128")
-    if block_size_k != 128:
-        raise ValueError("the native Q8KV8 kernel requires block_size_k=128")
+    _validate_page_contract(block_size_k, page_size)
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     group_size = num_q_heads // num_kv_heads
