@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
-from sglang.srt.observability.trace import trace_set_thread_info
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.observability.trace import trace_set_thread_info
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -696,9 +696,7 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=operation.prefix_keys,
-                extra_info=self._storage_trace_extra(
-                    operation, include_request_id=True
-                )
+                extra_info=self._storage_trace_extra(operation, include_request_id=True)
                 or None,
             )
             results = self.storage_backend.batch_get_v2(

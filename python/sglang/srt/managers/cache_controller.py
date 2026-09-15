@@ -94,12 +94,13 @@ def _synth_backup_trace_id(op_id: int) -> str:
 def _synth_backup_span_id(op_id: int) -> str:
     """Synthesize a per-backup-op OTel SpanId: 16 lowercase hex (8 bytes),
     non-zero, using a different mixing seed than the trace id."""
-    h = (
-        (int(op_id) * 0x9E3779B97F4A7C15) ^ (os.getpid() << 8) ^ _host_salt()
-    ) & (2**64 - 1)
+    h = ((int(op_id) * 0x9E3779B97F4A7C15) ^ (os.getpid() << 8) ^ _host_salt()) & (
+        2**64 - 1
+    )
     if h == 0:
         h = 1
     return h.to_bytes(8, "big").hex()
+
 
 device_module = get_device_module()
 
@@ -1053,9 +1054,7 @@ class HiCacheController:
         request_id) and backup synthesizes a per-op id so each backup op gets
         a distinct Mooncake trace.
         """
-        trace_ctx = TraceReqContext(
-            rid=str(rid), role=role, module_name="hicache"
-        )
+        trace_ctx = TraceReqContext(rid=str(rid), role=role, module_name="hicache")
         trace_id: Optional[str] = None
         span_id: Optional[str] = None
         if trace_ctx.tracing_enable:
@@ -1389,7 +1388,9 @@ class HiCacheController:
                     continue
                 # Start the opt-in hicache "Prefetch" span off the scheduler hot
                 # path, before _storage_hit_query forwards ids to Mooncake.
-                self._init_op_trace(operation, rid=operation.request_id, role="Prefetch")
+                self._init_op_trace(
+                    operation, rid=operation.request_id, role="Prefetch"
+                )
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:

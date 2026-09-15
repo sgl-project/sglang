@@ -605,7 +605,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertIsNone(ctx.thread_context)
 
 
-
 class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
     """Caller attribution (caller_id/caller_role) and the 'hicache' trace-module
     gate introduced for HiCache prefetch/backup root spans."""
@@ -682,16 +681,22 @@ class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
         # default: request only -> hicache filtered (just propagate).
         mod.global_trace_modules = ["request"]
         self.assertFalse(
-            TraceReqContext(rid="r", role="Prefetch", module_name="hicache").tracing_enable
+            TraceReqContext(
+                rid="r", role="Prefetch", module_name="hicache"
+            ).tracing_enable
         )
         # opt-in: hicache listed -> enabled (root span exported).
         mod.global_trace_modules = ["request", "hicache"]
         self.assertTrue(
-            TraceReqContext(rid="r", role="Backup", module_name="hicache").tracing_enable
+            TraceReqContext(
+                rid="r", role="Backup", module_name="hicache"
+            ).tracing_enable
         )
         # 'request' module is still allowed when listed.
         self.assertTrue(
-            TraceReqContext(rid="r", role="Prefetch", module_name="request").tracing_enable
+            TraceReqContext(
+                rid="r", role="Prefetch", module_name="request"
+            ).tracing_enable
         )
 
     def test_trace_disable_takes_precedence(self):
@@ -700,7 +705,9 @@ class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
         mod.global_trace_modules = ["hicache"]
         # Even with 'hicache' listed, tracing off -> disabled (TraceNullContext).
         self.assertFalse(
-            TraceReqContext(rid="r", role="Prefetch", module_name="hicache").tracing_enable
+            TraceReqContext(
+                rid="r", role="Prefetch", module_name="hicache"
+            ).tracing_enable
         )
 
 

@@ -1232,13 +1232,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # caller_id/caller_role and -- when the hicache span was exported --
         # its trace_id/span_id reach the bridge so backup spans correlate to
         # the (real or virtual) root.
-        with self.request_context(
-            **self._request_context_from_extra_info(extra_info)
-        ):
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
             # Apply config prefix if available.
             keys = self._tag_keys(keys)
 
-            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
             key_multiplier = len(key_strs) // len(keys)
             group_ids = (
                 self._expand_group_ids(keys, key_multiplier)
