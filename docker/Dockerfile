@@ -190,10 +190,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     # --no-deps prevents pip from pulling torch from default PyPI
     && python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps
 
-# Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
-# Rust extension during the stub wheel build; the crate's build.rs references
-# ../../proto for tonic_build. Split from the pip install so source changes to
-# these paths invalidate the dep-install layer, but Python source changes don't.
+# Copy the dependency spec, Rust extension sources, and shared protocol crate.
+# Split from the pip install so changes to these build inputs invalidate the
+# dependency layer, while unrelated Python source changes do not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
