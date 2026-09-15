@@ -2961,7 +2961,7 @@ def set_gpu_proc_affinity(
 
     # able to handle multiple DP per node
     start_index = ((gpu_id % tp_size_per_node) * num_cores_bind) % len(pool)
-    cores = pool[start_index : start_index + num_cores_bind] or pool[:1]
+    cores = pool[start_index : start_index + num_cores_bind]
 
     bind_cpu_ids = list(cores)
     if hyperthreaded:

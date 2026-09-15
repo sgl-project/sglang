@@ -37,7 +37,10 @@ class FakeProcess:
         if ids is None:
             return list(self.bound or sorted(self._allowed))
         if not ids:
-            raise ValueError("cpu_affinity() got an empty CPU list")
+            # Real psutil reads an empty list as "bind to every eligible CPU",
+            # so an empty slice unbinds the rank rather than failing loudly.
+            self.bound = sorted(self._allowed)
+            return self.bound
         for cpu in ids:
             if cpu not in self._allowed:
                 raise ValueError(
@@ -51,16 +54,14 @@ class FakeProcess:
 @contextlib.contextmanager
 def _without_sched_getaffinity():
     """Present a platform with no CPU affinity API, as macOS and Windows do."""
-    import os as _os
-
-    saved = getattr(_os, "sched_getaffinity", None)
+    saved = getattr(os, "sched_getaffinity", None)
     if saved is not None:
-        delattr(_os, "sched_getaffinity")
+        delattr(os, "sched_getaffinity")
     try:
         yield
     finally:
         if saved is not None:
-            _os.sched_getaffinity = saved
+            os.sched_getaffinity = saved
 
 
 @contextlib.contextmanager
@@ -108,8 +109,13 @@ class TestSetGpuProcAffinity(CustomTestCase):
 
     def test_whole_machine_without_hyperthreading_binds_contiguous_slice(self):
         self.assertEqual(
-            bind(n_physical=64, hyperthreading=False, allowed=range(64),
-                 gpu_id=3, tp_size=8),
+            bind(
+                n_physical=64,
+                hyperthreading=False,
+                allowed=range(64),
+                gpu_id=3,
+                tp_size=8,
+            ),
             list(range(24, 32)),
         )
 
@@ -124,8 +130,7 @@ class TestSetGpuProcAffinity(CustomTestCase):
         """Intersecting machine-wide ranges leaves some ranks unbound and
         others oversized; partitioning the allocation cannot."""
         slices = [
-            bind(**HT_NODE, allowed=UPPER_SOCKET, gpu_id=g, tp_size=4)
-            for g in range(4)
+            bind(**HT_NODE, allowed=UPPER_SOCKET, gpu_id=g, tp_size=4) for g in range(4)
         ]
         widths = {len(s) for s in slices}
         self.assertEqual(widths, {16}, f"uneven slice widths: {widths}")
@@ -144,8 +149,10 @@ class TestSetGpuProcAffinity(CustomTestCase):
 
     def test_non_contiguous_cpuset_slices_allowed_cpus_in_order(self):
         allowed = (
-            list(range(8)) + list(range(32, 40))
-            + list(range(64, 72)) + list(range(96, 104))
+            list(range(8))
+            + list(range(32, 40))
+            + list(range(64, 72))
+            + list(range(96, 104))
         )
         self.assertEqual(
             bind(**HT_NODE, allowed=allowed, gpu_id=2, tp_size=4),
@@ -167,8 +174,13 @@ class TestSetGpuProcAffinity(CustomTestCase):
     def test_uneven_cpu_count_yields_disjoint_nonempty_slices(self):
         allowed = list(range(20, 30))
         slices = [
-            bind(n_physical=64, hyperthreading=False, allowed=allowed,
-                 gpu_id=g, tp_size=4)
+            bind(
+                n_physical=64,
+                hyperthreading=False,
+                allowed=allowed,
+                gpu_id=g,
+                tp_size=4,
+            )
             for g in range(4)
         ]
         seen = set()
@@ -181,19 +193,36 @@ class TestSetGpuProcAffinity(CustomTestCase):
     def test_fewer_allowed_cpus_than_ranks_binds_at_least_one(self):
         for gpu_id in range(4):
             with self.subTest(gpu_id=gpu_id):
-                got = bind(n_physical=64, hyperthreading=False, allowed=[30, 31],
-                           gpu_id=gpu_id, tp_size=4)
-                self.assertTrue(got, "empty CPU list would raise in psutil")
+                got = bind(
+                    n_physical=64,
+                    hyperthreading=False,
+                    allowed=[30, 31],
+                    gpu_id=gpu_id,
+                    tp_size=4,
+                )
+                self.assertTrue(got, "an empty slice would silently unbind the rank")
                 self.assertTrue(set(got) <= {30, 31})
 
     def test_parallelism_matrix_determines_slice_width(self):
         # (tp_size, pp_size, nnodes) -> ranks sharing this node's 32 cores.
-        cases = [((8, 1, 1), 8), ((16, 1, 2), 8), ((8, 2, 2), 8),
-                 ((4, 2, 4), 2), ((4, 4, 1), 4), ((1, 1, 1), 1)]
+        cases = [
+            ((8, 1, 1), 8),
+            ((16, 1, 2), 8),
+            ((8, 2, 2), 8),
+            ((4, 2, 4), 2),
+            ((4, 4, 1), 4),
+            ((1, 1, 1), 1),
+        ]
         for (tp_size, pp_size, nnodes), ranks_per_node in cases:
             with self.subTest(tp=tp_size, pp=pp_size, nnodes=nnodes):
-                got = bind(**HT_NODE, allowed=UPPER_SOCKET, gpu_id=0,
-                           tp_size=tp_size, pp_size=pp_size, nnodes=nnodes)
+                got = bind(
+                    **HT_NODE,
+                    allowed=UPPER_SOCKET,
+                    gpu_id=0,
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    nnodes=nnodes,
+                )
                 self.assertEqual(len(got), (32 // ranks_per_node) * 2)
                 self.assertTrue(set(got) <= set(UPPER_SOCKET))
 
@@ -202,7 +231,10 @@ class TestSetGpuProcAffinity(CustomTestCase):
         proc = FakeProcess(range(128))
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                patch("psutil.cpu_count", side_effect=lambda logical=True: 128 if logical else 64)
+                patch(
+                    "psutil.cpu_count",
+                    side_effect=lambda logical=True: 128 if logical else 64,
+                )
             )
             stack.enter_context(patch("psutil.Process", return_value=proc))
             stack.enter_context(_without_sched_getaffinity())
@@ -213,10 +245,15 @@ class TestSetGpuProcAffinity(CustomTestCase):
         proc = FakeProcess(range(128))
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                patch("os.sched_getaffinity", side_effect=OSError("denied"), create=True)
+                patch(
+                    "os.sched_getaffinity", side_effect=OSError("denied"), create=True
+                )
             )
             stack.enter_context(
-                patch("psutil.cpu_count", side_effect=lambda logical=True: 128 if logical else 64)
+                patch(
+                    "psutil.cpu_count",
+                    side_effect=lambda logical=True: 128 if logical else 64,
+                )
             )
             stack.enter_context(patch("psutil.Process", return_value=proc))
             set_gpu_proc_affinity(1, 8, 1, 1)
