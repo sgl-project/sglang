@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 )
 from sglang.kernels.ops.attention.dsv4.indexer_postprocess import filter_topk_pages
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -195,6 +196,14 @@ class TestIndexerPostprocess(CustomTestCase):
             )
         torch.testing.assert_close(got_logits, ref_logits, rtol=0, atol=0)
         torch.testing.assert_close(got_keep, ref_keep, rtol=0, atol=0)
+        with envs.SGLANG_OPT_DSV41_DEEPSELECT_CANDIDATE_TOPK.override(True):
+            selector_keep = select_candidate_blocks(
+                ref_logits,
+                lengths[:, None],
+                topk_blocks=topk,
+                block_size=group,
+            )
+        torch.testing.assert_close(selector_keep, ref_keep, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
