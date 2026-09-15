@@ -242,7 +242,12 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
+    inplace_update: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not inplace_update:
+        raise NotImplementedError(
+            "GDN multi-item scoring is not supported by the XPU chunk kernel"
+        )
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     )

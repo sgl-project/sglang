@@ -33,7 +33,6 @@ from sglang.kernels.ops.mm.process.image import (
 from sglang.kernels.ops.moe import moe_route_quant_fused
 from sglang.kernels.ops.moe.moe_route_radix import route_radix
 from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
-from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
@@ -51,6 +50,18 @@ NOPE_DIM = 512
 ROPE_DIM = 64
 MLA_DIM = NOPE_DIM + ROPE_DIM
 MLA_PAGES = 256
+
+
+def _pack_topk_oracle(topk_ids, topk_weights):
+    """Pure-torch reference for the packed ids the fused route+quant kernel emits.
+
+    FlashInfer's routed MoE reads one int32 per entry: the expert id in the high
+    half and the bf16 weight bits in the low half.
+    """
+    weight_bits = (
+        topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    return (topk_ids.to(torch.int32) << 16) | weight_bits
 
 
 def _route_oracle(
@@ -311,7 +322,7 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
             self.skipTest("fused route+quant kernel unavailable")
         hidden = torch.randn(8, 3584, device="cuda", dtype=torch.bfloat16)
         ref_weights, ref_ids = route_radix(*args, sorted=False)
-        ref_packed = PackTopkIds.execute(ref_ids, ref_weights)
+        ref_packed = _pack_topk_oracle(ref_ids, ref_weights)
         ref_q, ref_scale = per_token_group_quant(
             hidden, group_size=32, scale_ue8m0=True
         )

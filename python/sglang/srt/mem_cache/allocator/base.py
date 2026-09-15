@@ -16,12 +16,26 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+class MambaFullCacheDonor(Protocol):
+    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
+
+    def flush_deferred_full_frees(self) -> None: ...
+
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        """Lower bound on new Full tokens before preparation can help."""
+        ...
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose layout-specific reclaim so Mamba capacity is queryable."""
+        ...
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -62,10 +76,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         evict_from_tree_cache(tree_cache, num_tokens)
 
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
         """Whether the next decode step's ``num_tokens`` allocation fits after
         evicting reclaimable cache. The retract loop converges on this same
-        check, so a shortfall here retracts instead of failing in alloc."""
+        check, so a shortfall here retracts instead of failing in alloc.
+        ``requests`` and ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
@@ -73,6 +96,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Idle-time diagnostic: recompute byte/slot accounting and return
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
+        """Return the shared-pool donor capability, if this allocator has one."""
+        return None
 
     def debug_print(self) -> str:
         return ""

@@ -94,6 +94,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -1077,6 +1078,13 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.language_model.": "model.",
+            "model.visual": "visual",
+        }
+    )
+
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": [
@@ -1200,6 +1208,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+            for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+                moe_prefix = f"model.layers.{layer_id}.mlp"
+                if quant_config.is_layer_excluded(
+                    f"{moe_prefix}.shared_experts"
+                ) and not quant_config.is_layer_excluded(f"{moe_prefix}.experts"):
+                    return (
+                        "ModelOpt FP4 keeps shared experts unquantized while routed "
+                        "experts are quantized."
+                    )
         if not _is_cuda:
             return "Shared experts fusion currently requires CUDA devices."
         if _device_sm is not None and _device_sm < 80:

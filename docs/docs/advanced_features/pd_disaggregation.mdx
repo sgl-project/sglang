@@ -28,6 +28,25 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](./sgl_model_gateway#prefill-decode-disaggregation).
 
+### Responses API under HTTP PD
+
+HTTP PD supports foreground generation through `POST /v1/responses`, including streaming generation with `stream=true` through the HTTP PD router. This requires both the router's Responses dispatch support and serving workers that accept Responses PD routing metadata.
+
+Store-backed and stateful Responses features are **not supported under PD**:
+
+- Response persistence (`store`) and response history.
+- Conversation chaining with `previous_response_id`.
+- Background Responses (`background=true`), including background streams.
+- Retrieval by response ID (`GET /v1/responses/{id}`).
+- Cancel-by-ID (`POST /v1/responses/{id}/cancel`).
+- Other workflows requiring shared process-local Responses history.
+
+Prefill and decode run in separate serving processes. Their process-local Responses stores cannot provide coherent shared state: both legs need the same conversation history to reconstruct the prompt, and prefill's stored response is not available to decode. Send explicit conversation history in foreground requests instead of relying on stored response IDs.
+
+Built-in tools (`web_search`, `code_interpreter`) are also unsupported under PD: each tool call requires another generation, but the router dispatches exactly one prefill/decode pair per HTTP request.
+
+Serving-side capability enforcement is tracked in [#39122](https://github.com/sgl-project/sglang/pull/39122). That change introduces opt-in standalone storage with `--enable-response-store`, disallows it under PD, and rejects stateful requests with HTTP 400 before generation. These checks require a serving version containing that change; older versions must not be assumed to reject every unsupported workflow at admission. The HTTP PD router also rejects detached background requests because it does not implement their retrieval/cancel lifecycle.
+
 
 ## Mooncake
 ### Requirements
@@ -568,7 +587,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 8 \
         --disable-radix-cache \
-        --cuda-graph-bs 1 2 4 8 10 12 14 16 \
+        --cuda-graph-bs-decode 1 2 4 8 10 12 14 16 \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
@@ -681,9 +700,8 @@ do
         --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
-        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
-        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
-        --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
+        --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
        	--load-balance-method round_robin
         NODE_RANK=$i
         break
