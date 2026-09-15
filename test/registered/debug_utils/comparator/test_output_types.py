@@ -591,9 +591,7 @@ class TestFormatAlignerPlan:
         )
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
-        assert result == (
-            "Aligner Plan:\n" "  baseline: (no steps)\n" "  target: (no steps)"
-        )
+        assert result == ("Aligner Plan:\n  baseline: (no steps)\n  target: (no steps)")
 
     def test_unsharder(self) -> None:
         unsharder: UnsharderPlan = UnsharderPlan(
@@ -614,9 +612,7 @@ class TestFormatAlignerPlan:
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
         assert result == (
-            "Aligner Plan:\n"
-            "  baseline: (no steps)\n"
-            "  target: [step=0: unsharder(tp)]"
+            "Aligner Plan:\n  baseline: (no steps)\n  target: [step=0: unsharder(tp)]"
         )
 
     def test_reorderer(self) -> None:

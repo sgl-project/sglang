@@ -167,9 +167,9 @@ class ZayaConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.kv_channels = kv_channels if kv_channels is not None else head_dim
         assert self.head_dim is not None, "head_dim is required for ZayaConfig"
-        assert (
-            self.num_query_groups == num_key_value_heads
-        ), "num_query_groups must equal num_key_value_heads for ZAYA1 checkpoints"
+        assert self.num_query_groups == num_key_value_heads, (
+            "num_query_groups must equal num_key_value_heads for ZAYA1 checkpoints"
+        )
         self.num_key_value_heads = num_key_value_heads
         self.activation_func = activation_func
         self.max_position_embeddings = max_position_embeddings
@@ -266,7 +266,6 @@ class ZayaConfig(PretrainedConfig):
         # equals the global TP group (DP attention is unsupported), so the two
         # are always identical in practice.
         try:
-
             tp_size = get_parallel().tp_size
         except (AssertionError, RuntimeError, ValueError):
             tp_size = 1

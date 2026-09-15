@@ -221,12 +221,12 @@ class FP8MQALogitsKernel:
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
-        assert (
-            block_kv % phys_block_kv == 0
-        ), f"block_kv={block_kv} must be divisible by phys_block_kv={phys_block_kv}"
-        assert (
-            self.num_blocks_per_mma <= 4
-        ), f"num_blocks_per_mma={self.num_blocks_per_mma} exceeds max 4"
+        assert block_kv % phys_block_kv == 0, (
+            f"block_kv={block_kv} must be divisible by phys_block_kv={phys_block_kv}"
+        )
+        assert self.num_blocks_per_mma <= 4, (
+            f"num_blocks_per_mma={self.num_blocks_per_mma} exceeds max 4"
+        )
         self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt

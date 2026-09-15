@@ -150,6 +150,7 @@ fn classify_rpc(status: Status) -> BridgeError {
 enum Action {
     Report {
         tier: i32,
+        parent_block_hash: Option<i64>,
         hashes: Vec<i64>,
         masks: Vec<Option<u32>>,
         block_sizes: Vec<Option<u32>>,
@@ -171,19 +172,27 @@ impl EventActions {
     /// with an immediately-preceding store to the same tier and never across a
     /// revoke/clear, so the final per-hash state is preserved. All hashes here
     /// share the event's component mask and block size.
-    fn report(&mut self, tier: i32, hashes: Vec<i64>, mask: Option<u32>, block_size: Option<u32>) {
+    fn report(
+        &mut self,
+        tier: i32,
+        parent_block_hash: Option<i64>,
+        hashes: Vec<i64>,
+        mask: Option<u32>,
+        block_size: Option<u32>,
+    ) {
         if hashes.is_empty() {
             return;
         }
         let n = hashes.len();
         if let Some(Action::Report {
             tier: last_tier,
+            parent_block_hash: _,
             hashes: last,
             masks,
             block_sizes,
         }) = self.actions.last_mut()
         {
-            if *last_tier == tier {
+            if *last_tier == tier && parent_block_hash == last.last().copied() {
                 last.extend(hashes);
                 masks.extend(std::iter::repeat_n(mask, n));
                 block_sizes.extend(std::iter::repeat_n(block_size, n));
@@ -192,6 +201,7 @@ impl EventActions {
         }
         self.actions.push(Action::Report {
             tier,
+            parent_block_hash,
             hashes,
             masks: vec![mask; n],
             block_sizes: vec![block_size; n],
@@ -401,6 +411,7 @@ fn build_apply_request(
         match action {
             Action::Report {
                 tier,
+                parent_block_hash,
                 hashes,
                 masks,
                 block_sizes,
@@ -413,6 +424,7 @@ fn build_apply_request(
                 // the backend keeps the whole-block fast path.
                 component_masks: encode_component_masks(&masks),
                 block_sizes: encode_block_sizes(&block_sizes),
+                parent_block_hash,
             }),
             Action::Revoke { tier, hashes } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionRevoke as i32,
@@ -420,6 +432,7 @@ fn build_apply_request(
                 hashes,
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
+                parent_block_hash: None,
             }),
             Action::ClearAll => {
                 for tier in &config.clear_tiers {
@@ -429,6 +442,7 @@ fn build_apply_request(
                         hashes: Vec::new(),
                         component_masks: Vec::new(),
                         block_sizes: Vec::new(),
+                        parent_block_hash: None,
                     });
                 }
             }
@@ -499,6 +513,15 @@ fn split_action(action: ExternalKvAction) -> Vec<ExternalKvAction> {
                 hashes: action.hashes[start..end].to_vec(),
                 component_masks: slice_or_empty(&action.component_masks, start, end),
                 block_sizes: slice_or_empty(&action.block_sizes, start, end),
+                parent_block_hash: if action.r#type == ExternalKvActionType::ActionReport as i32 {
+                    if start == 0 {
+                        action.parent_block_hash
+                    } else {
+                        Some(action.hashes[start - 1])
+                    }
+                } else {
+                    None
+                },
             }
         })
         .collect()
@@ -568,47 +591,76 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
-    let event = expect_array(event, "KV event")?;
-    let event_type = expect_str(
-        event
-            .first()
-            .ok_or_else(|| BridgeError::Decode("KV event is empty".to_string()))?,
-        "KV event tag",
-    )?;
+    // `KVCacheEvent` is a tagged map (`tag=True` without `array_like`).
+    match event {
+        Value::Map(entries) => decode_event_map(entries, actions),
+        _ => Err(BridgeError::Decode("KV event must be a map".to_string())),
+    }
+}
+
+fn map_field<'a>(entries: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(name))
+        .map(|(_, value)| value)
+}
+
+fn required_map_field<'a>(
+    entries: &'a [(Value, Value)],
+    name: &str,
+) -> Result<&'a Value, BridgeError> {
+    map_field(entries, name)
+        .ok_or_else(|| BridgeError::Decode(format!("KV event is missing `{name}`")))
+}
+
+/// Decodes one tagged-map event: `{"type": ..., "<field>": ...}`. Optional
+/// fields may be absent (msgspec omits `None` defaults) or present as nil.
+/// Keys the indexer does not use (`token_ids`, `lora_id`, `cache_salt`,
+/// `session_id`) are ignored.
+fn decode_event_map(
+    entries: &[(Value, Value)],
+    actions: &mut EventActions,
+) -> Result<(), BridgeError> {
+    let event_type = expect_str(required_map_field(entries, "type")?, "KV event type")?;
+    let medium = |field: &str| -> Result<Option<&str>, BridgeError> {
+        match map_field(entries, "medium") {
+            Some(value) => expect_optional_str(value, field),
+            None => Ok(None),
+        }
+    };
 
     match event_type {
         "BlockStored" => {
-            // At least 7 fields (the legacy schema); an 8th `component_types`
-            // slot appears with `--enable-kv-events-component-types`. Both
-            // shapes are accepted.
-            if event.len() < 7 {
-                return Err(BridgeError::Decode(
-                    "BlockStored must have at least 7 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            // `component_types` is the trailing slot: a list of component labels
-            // folded into a bitmask, or nil/absent for a legacy whole-block store.
-            let mask = match event.get(7) {
+            let tier = medium_to_tier(medium("BlockStored.medium")?)?;
+            let mask = match map_field(entries, "component_types") {
                 Some(value) => decode_component_mask(value)?,
                 None => None,
             };
-            // The token count is only carried alongside component-aware stores,
-            // where the query path needs it to accumulate trailing windows.
             let block_size = match mask {
-                Some(_) => Some(decode_block_size(&event[4])?),
+                Some(_) => Some(decode_block_size(required_map_field(
+                    entries,
+                    "block_size",
+                )?)?),
                 None => None,
             };
-            actions.report(tier, decode_hashes(&event[1])?, mask, block_size);
+            let parent_block_hash = match map_field(entries, "parent_block_hash") {
+                Some(value) => decode_optional_hash(value, "BlockStored.parent_block_hash")?,
+                None => None,
+            };
+            actions.report(
+                tier,
+                parent_block_hash,
+                decode_hashes(required_map_field(entries, "block_hashes")?)?,
+                mask,
+                block_size,
+            );
         }
         "BlockRemoved" => {
-            if event.len() < 3 {
-                return Err(BridgeError::Decode(
-                    "BlockRemoved must have 3 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
-            actions.revoke(tier, decode_hashes(&event[1])?);
+            let tier = medium_to_tier(medium("BlockRemoved.medium")?)?;
+            actions.revoke(
+                tier,
+                decode_hashes(required_map_field(entries, "block_hashes")?)?,
+            );
         }
         "AllBlocksCleared" => {
             actions.clear_all();
@@ -623,24 +675,27 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
     expect_array(value, "block_hashes")?
         .iter()
-        .map(|value| {
-            if let Some(value) = value.as_i64() {
-                return Ok(value);
-            }
-            // SGLang folds the unsigned top 64 bits of the SHA-256 into the
-            // signed range by subtracting 2^64 (`hash_str_to_int64`), which is
-            // two's complement, so a producer that serialises the unsigned half
-            // instead is carrying identical bits. Reinterpreting recovers the
-            // hash the router queries for; refusing the value would instead skip
-            // the whole event and lose every placement it carried.
-            if let Some(value) = value.as_u64() {
-                return Ok(value as i64);
-            }
-            Err(BridgeError::Decode(
-                "block hash must be an integer".to_string(),
-            ))
-        })
+        .map(|value| decode_hash(value, "block hash"))
         .collect()
+}
+
+fn decode_hash(value: &Value, field: &str) -> Result<i64, BridgeError> {
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    // SGLang folds the unsigned top 64 bits of the SHA-256 into the signed
+    // range by subtracting 2^64. Reinterpreting recovers the same bits.
+    if let Some(value) = value.as_u64() {
+        return Ok(value as i64);
+    }
+    Err(BridgeError::Decode(format!("{field} must be an integer")))
+}
+
+fn decode_optional_hash(value: &Value, field: &str) -> Result<Option<i64>, BridgeError> {
+    if matches!(value, Value::Nil) {
+        return Ok(None);
+    }
+    decode_hash(value, field).map(Some)
 }
 
 /// Decodes the optional `component_types` slot of a `BlockStored` into a component
@@ -836,29 +891,56 @@ mod tests {
     }
 
     fn stored(hashes: &[i64], medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            Value::Nil,         // parent_block_hash
-            ints(&[1]),         // token_ids
-            Value::from(1_i64), // block_size
-            Value::Nil,         // lora_id
-            Value::String(medium.into()),
-        ])
+        stored_with_parent(hashes, None, medium)
     }
 
-    /// A component-aware `BlockStored` (8-element schema): trailing
-    /// `component_types` slot plus a concrete `block_size` token count.
+    fn stored_with_parent(hashes: &[i64], parent: Option<i64>, medium: &str) -> Value {
+        stored_with_extra(hashes, parent, medium, vec![])
+    }
+
+    /// A `BlockStored` map plus `extra` keys the bridge must ignore.
+    fn stored_with_extra(
+        hashes: &[i64],
+        parent: Option<i64>,
+        medium: &str,
+        extra: Vec<(&str, Value)>,
+    ) -> Value {
+        let mut entries = vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(hashes)),
+            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(1_i64)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String(medium.into())),
+        ];
+        entries.extend(extra);
+        map_event(entries)
+    }
+
+    /// A component-aware `BlockStored`: a `component_types` key plus a
+    /// concrete `block_size` token count.
     fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            Value::Nil, // parent_block_hash
-            ints(&[1]), // token_ids
-            Value::from(block_size),
-            Value::Nil, // lora_id
-            Value::String(medium.into()),
-            components, // component_types (Nil or array of strings)
+        stored_c_with_parent(hashes, None, medium, block_size, components)
+    }
+
+    fn stored_c_with_parent(
+        hashes: &[i64],
+        parent: Option<i64>,
+        medium: &str,
+        block_size: i64,
+        components: Value,
+    ) -> Value {
+        map_event(vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(hashes)),
+            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(block_size)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String(medium.into())),
+            // component_types (Nil or array of strings)
+            ("component_types", components),
         ])
     }
 
@@ -868,8 +950,13 @@ mod tests {
 
     /// Legacy (whole-block) report action expectation.
     fn rep(tier: i32, hashes: &[&str]) -> Action {
+        rep_with_parent(tier, None, hashes)
+    }
+
+    fn rep_with_parent(tier: i32, parent_block_hash: Option<i64>, hashes: &[&str]) -> Action {
         Action::Report {
             tier,
+            parent_block_hash,
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             masks: vec![None; hashes.len()],
             block_sizes: vec![None; hashes.len()],
@@ -884,15 +971,73 @@ mod tests {
     }
 
     fn removed(hashes: &[i64], medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockRemoved".into()),
-            ints(hashes),
-            Value::String(medium.into()),
+        map_event(vec![
+            ("type", Value::String("BlockRemoved".into())),
+            ("block_hashes", ints(hashes)),
+            ("medium", Value::String(medium.into())),
         ])
     }
 
     fn cleared() -> Value {
-        Value::Array(vec![Value::String("AllBlocksCleared".into())])
+        map_event(vec![("type", Value::String("AllBlocksCleared".into()))])
+    }
+
+    /// A tagged event map: `{"type": ..., field: value, ...}`.
+    fn map_event(entries: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::String(key.into()), value))
+                .collect(),
+        )
+    }
+
+    fn tagged(event_type: &str) -> Value {
+        map_event(vec![("type", Value::String(event_type.into()))])
+    }
+
+    #[test]
+    fn attribution_keys_are_ignored() {
+        assert_eq!(
+            actions_of(vec![stored_with_extra(
+                &[2, 3],
+                Some(1),
+                "GPU",
+                vec![
+                    ("cache_salt", Value::String("tenant-a".into())),
+                    ("session_id", Value::String("session-a".into())),
+                ],
+            )]),
+            vec![rep_with_parent(hbm(), Some(1), &["2", "3"])]
+        );
+    }
+
+    #[test]
+    fn undecodable_events_are_skipped_and_siblings_survive() {
+        assert_eq!(
+            actions_of(vec![
+                // no `type`
+                map_event(vec![("block_hashes", ints(&[1]))]),
+                stored(&[1], "GPU"),
+                // no `medium`
+                map_event(vec![
+                    ("type", Value::String("BlockStored".into())),
+                    ("block_hashes", ints(&[9])),
+                ]),
+                // pre-map publishers encoded events as tagged arrays
+                Value::Array(vec![
+                    Value::String("BlockStored".into()),
+                    ints(&[7]),
+                    Value::Nil,
+                    ints(&[1]),
+                    Value::from(1_i64),
+                    Value::Nil,
+                    Value::String("GPU".into()),
+                ]),
+                removed(&[5], "GPU"),
+            ]),
+            vec![rep(hbm(), &["1"]), rev(hbm(), &["5"])]
+        );
     }
 
     /// Wrap events in a 3-element batch [ts, events, attn_dp_rank].
@@ -948,6 +1093,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -958,6 +1104,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -968,6 +1115,7 @@ mod tests {
             hashes: Vec::new(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -987,6 +1135,19 @@ mod tests {
     }
 
     #[test]
+    fn request_carries_parent_block_hash() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(
+            &config,
+            0,
+            vec![stored_with_parent(&[2, 3], Some(1), "GPU")],
+        );
+        assert_eq!(request.actions.len(), 1);
+        assert_eq!(request.actions[0].parent_block_hash, Some(1));
+        assert_eq!(request.actions[0].hashes, vec![2, 3]);
+    }
+
+    #[test]
     fn oversized_report_is_split_with_aligned_metadata() {
         let count = MAX_HASHES_PER_REQUEST + 1;
         let request = ApplyExternalKvBatchRequest {
@@ -998,6 +1159,7 @@ mod tests {
                 hashes: (0..count).map(|index| index as i64).collect(),
                 component_masks: (0..count as u32).collect(),
                 block_sizes: (0..count as u32).map(|index| index + 1).collect(),
+                parent_block_hash: None,
             }],
             worker_address: "http://worker-1".into(),
             cache_spec: None,
@@ -1007,6 +1169,7 @@ mod tests {
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].actions[0].hashes.len(), MAX_HASHES_PER_REQUEST);
+        assert_eq!(batches[0].actions[0].parent_block_hash, None);
         assert_eq!(
             batches[1].actions[0].hashes,
             vec![MAX_HASHES_PER_REQUEST as i64]
@@ -1014,6 +1177,10 @@ mod tests {
         assert_eq!(
             batches[1].actions[0].component_masks,
             vec![MAX_HASHES_PER_REQUEST as u32]
+        );
+        assert_eq!(
+            batches[1].actions[0].parent_block_hash,
+            Some(MAX_HASHES_PER_REQUEST as i64 - 1)
         );
         assert_eq!(
             batches[1].actions[0].block_sizes,
@@ -1078,7 +1245,7 @@ mod tests {
     #[test]
     fn batch_with_only_ignored_events_has_no_actions() {
         let config = test_config(vec![hbm()]);
-        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        let events = vec![tagged("BlockUpdated")];
         assert!(request_of(&config, 0, events).actions.is_empty());
     }
 
@@ -1167,8 +1334,19 @@ mod tests {
     #[test]
     fn adjacent_same_tier_stores_coalesce() {
         assert_eq!(
-            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
+            actions_of(vec![
+                stored(&[1], "GPU"),
+                stored_with_parent(&[2], Some(1), "GPU")
+            ]),
             vec![rep(hbm(), &["1", "2"])]
+        );
+    }
+
+    #[test]
+    fn same_tier_stores_on_different_chains_do_not_coalesce() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
+            vec![rep(hbm(), &["1"]), rep(hbm(), &["2"])]
         );
     }
 
@@ -1190,7 +1368,7 @@ mod tests {
 
     #[test]
     fn unknown_event_tag_is_ignored() {
-        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        let events = vec![tagged("BlockUpdated")];
         assert!(actions_of(events).is_empty());
     }
 
@@ -1210,16 +1388,11 @@ mod tests {
     fn python_msgspec_mixed_batch_golden_decodes() {
         // Generated by msgspec.msgpack.Encoder from the authoritative Python
         // KVEventBatch schema in sglang.srt.disaggregation.kv_events.
-        let payload = golden_bytes(concat!(
-            "93cb405edd2f1a9fbe779397ab426c6f636b53746f72656492",
-            "cf0000011f71fb04cbd2c521974f2a940a141e280407a3475055",
-            "93ac426c6f636b52656d6f7665649264ccc8a44449534b",
-            "91b0416c6c426c6f636b73436c656172656402"
-        ));
+        let payload = golden_bytes("93cb405edd2f1a9fbe779387a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392cf0000011f71fb04cbd2c521974fb1706172656e745f626c6f636b5f686173682aa9746f6b656e5f696473940a141e28aa626c6f636b5f73697a6504a76c6f72615f696407a66d656469756da347505583a474797065ac426c6f636b52656d6f766564ac626c6f636b5f6861736865739264ccc8a66d656469756da44449534b81a474797065b0416c6c426c6f636b73436c656172656402");
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![
-                rep(hbm(), &["1234567890123", "-987654321"]),
+                rep_with_parent(hbm(), Some(42), &["1234567890123", "-987654321"]),
                 rev(ssd(), &["100", "200"]),
                 Action::ClearAll,
             ]
@@ -1230,10 +1403,7 @@ mod tests {
     fn python_msgspec_bigram_tokens_golden_decodes() {
         // token_ids contains Python tuples as nested msgpack arrays; the
         // bridge ignores payload shape and indexes the published hashes.
-        let payload = golden_bytes(concat!(
-            "93cb3ff80000000000009197ab426c6f636b53746f726564916f",
-            "c092920a1492141e02c0a347505503"
-        ));
+        let payload = golden_bytes("93cb3ff80000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573916fb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647392920a1492141eaa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505503");
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![rep(hbm(), &["111"])]
@@ -1242,12 +1412,10 @@ mod tests {
 
     #[test]
     fn python_msgspec_nil_medium_golden_is_safely_skipped() {
-        // The Python schema permits medium=None; such events map to no
-        // Indexer tier, so they are isolated rather than given a placement.
-        let payload = golden_bytes(concat!(
-            "93cb00000000000000009297ab426c6f636b53746f7265649101",
-            "c092050602c0c093ac426c6f636b52656d6f7665649102c0c0"
-        ));
+        // The Python schema permits medium=None (the key is then omitted);
+        // such events map to no Indexer tier, so they are isolated rather
+        // than given a placement.
+        let payload = golden_bytes("93cb00000000000000009286a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920506aa626c6f636b5f73697a6502a76c6f72615f6964c082a474797065ac426c6f636b52656d6f766564ac626c6f636b5f6861736865739102c0");
         assert!(decode_event_batch(&payload).unwrap().actions.is_empty());
     }
 
@@ -1352,6 +1520,7 @@ mod tests {
             actions_of(vec![stored_c(&[1], "GPU", 64, strv(&["full", "swa"]))]),
             vec![Action::Report {
                 tier: hbm(),
+                parent_block_hash: None,
                 hashes: vec![1],
                 masks: vec![Some(
                     crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
@@ -1379,7 +1548,7 @@ mod tests {
             0,
             vec![
                 stored_c(&[1], "GPU", 64, strv(&["full", "swa"])),
-                stored_c(&[2], "GPU", 32, strv(&["full"])),
+                stored_c_with_parent(&[2], Some(1), "GPU", 32, strv(&["full"])),
             ],
         );
         assert_eq!(request.actions.len(), 1);

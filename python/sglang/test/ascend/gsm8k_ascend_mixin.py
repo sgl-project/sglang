@@ -102,12 +102,12 @@ class GSM8KAscendMixin(ABC):
             self.assertGreaterEqual(
                 metrics["score"],
                 accuracy_threshold,
-                f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {accuracy_threshold}',
+                f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {accuracy_threshold}",
             )
             self.assertGreaterEqual(
                 metrics["output_throughput"],
                 output_throughput_threshold,
-                f'Output throughput of {self.model} is {str(metrics["output_throughput"])}, is lower than {output_throughput_threshold}',
+                f"Output throughput of {self.model} is {str(metrics['output_throughput'])}, is lower than {output_throughput_threshold}",
             )
         except Exception as e:
             model_metrics["error"] = e

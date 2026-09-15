@@ -68,4 +68,18 @@ jobs:
           python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
             --hours ${{ (github.event_name == 'pull_request' && '0.34') || inputs.hours || '24' }} \
-            ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}
+            ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }} \
+            --queue-series-out queue-series.json
+
+      # The card rides on the scan above rather than running its own: a 24h
+      # window is ~5000 API calls, the whole hourly budget of ci-lark-notify's PAT.
+      - name: Post queue timeline card
+        if: >-
+          github.repository == 'sgl-project/sglang' &&
+          github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+        run: |
+          python scripts/ci_monitor/lark_notify.py queue-timeline \
+            --series-file queue-series.json
