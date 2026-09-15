@@ -332,6 +332,7 @@ class SchedulerProfilerManager:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
+        memory_profile_failure: Optional[str] = None
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
@@ -380,8 +381,19 @@ class SchedulerProfilerManager:
                 + stage_suffix
                 + ".pickle",
             )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
+            try:
+                torch.cuda.memory._dump_snapshot(memory_profile_path)
+            except Exception as e:
+                memory_profile_failure = f"Failed to dump memory profile: {e}"
+                logger.error(memory_profile_failure, exc_info=True)
+            finally:
+                try:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                except Exception as e:
+                    cleanup_failure = f"Failed to disable memory history: {e}"
+                    logger.error(cleanup_failure, exc_info=True)
+                    if memory_profile_failure is None:
+                        memory_profile_failure = cleanup_failure
 
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
@@ -403,6 +415,8 @@ class SchedulerProfilerManager:
         self.profiler_start_forward_ct = None
 
         self._apply_detailed_annotations(False)
+        if memory_profile_failure is not None:
+            return ProfileReqOutput(success=False, message=memory_profile_failure)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
