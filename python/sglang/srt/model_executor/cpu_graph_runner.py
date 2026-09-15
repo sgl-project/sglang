@@ -22,7 +22,6 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import tqdm
 
