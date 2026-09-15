@@ -38,6 +38,11 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>false</code></td>
     </tr>
     <tr>
+      <td><code>SGLANG_NPU_USE_SCATTER_PA_KV_CACHE</code></td>
+      <td>Use <code>npu_scatter_pa_kv_cache</code> for decode and speculative-decode MHA KV cache writes.<br/>Requires <code>ASCEND_USE_FIA=1</code>. Prefill writes continue to use ScatterNdUpdate.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
