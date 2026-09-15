@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSANVFP4TokenToKVPool,
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -1627,6 +1628,14 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        is_nvfp4 = is_float4_e2m1fn_x2(self.kv_cache_dtype)
+        if is_nvfp4 and (
+            get_memory().enable_hisparse or dsa_cp_layer_shard_rank is not None
+        ):
+            raise ValueError(
+                "The basic NVFP4 DSA cache path does not yet support HiSparse "
+                "or DSA cache layer splitting."
+            )
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1644,7 +1653,11 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
-            PoolCls = DSATokenToKVPool
+            PoolCls = DSANVFP4TokenToKVPool if is_nvfp4 else DSATokenToKVPool
+        if is_nvfp4:
+            pool_kwargs["quant_method"] = self._build_fp4_quant_method(
+                num_layers=self.layer_info.num_effective_layers
+            )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)

@@ -515,7 +515,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or nvfp4 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -548,6 +549,15 @@ def _check_dsa_backend_constraints(
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
+
+    if kv_cache_dtype == "nvfp4":
+        unsupported = {backend for backend in chosen if backend not in (None, "trtllm")}
+        if hip or unsupported:
+            raise ValueError(
+                "NVFP4 DSA KV cache currently requires CUDA and the trtllm "
+                "backend for both prefill and decode; got "
+                f"prefill={prefill_backend}, decode={decode_backend}."
+            )
 
 
 def _check_tilelang_dsa_fp8_kv(
@@ -672,8 +682,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
-    elif kv_cache_dtype == "fp8_e4m3":
-        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
+    elif kv_cache_dtype in ("fp8_e4m3", "nvfp4"):
+        if kv_cache_dtype == "nvfp4" and major != 10:
+            raise ValueError(
+                "The basic NVFP4 DSA KV cache path currently supports SM100/SM103; "
+                "Rubin support requires validation of the TRTLLM-GEN sparse MLA kernel."
+            )
+        # Blackwell FP8/NVFP4 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = default

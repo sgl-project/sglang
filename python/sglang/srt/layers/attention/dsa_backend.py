@@ -87,6 +87,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hip,
     is_xpu,
@@ -3377,6 +3378,8 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.forward_metadata
 
+        is_nvfp4_cache = is_float4_e2m1fn_x2(self.kv_cache_dtype)
+
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
         if self.kv_cache_dtype == torch.float8_e4m3fn:
@@ -3416,8 +3419,19 @@ class DeepseekSparseAttnBackend(
                         forward_batch, k, k_rope
                     )
             merge_query = False
+        elif is_nvfp4_cache:
+            # The basic NVFP4 path lets forward_absorb_prepare apply RoPE in
+            # BF16.  Keep the persistent KV in BF16 until the pool quantizes it,
+            # while converting only Q to the FP8 format TRTLLM-GEN consumes.
+            assert cos_sin_cache is None, (
+                "NVFP4 DSA currently expects RoPE to be applied before the backend."
+            )
+            assert q_rope is not None and k_rope is not None
+            q = concat_mla_absorb_q_general(q, q_rope).to(torch.float8_e4m3fn)
+            merge_query = False
 
-            # Save KV cache if requested
+        # Save the new main-attention cache row.  The NVFP4 pool packs K here;
+        # the FP8 pool simply scatters the already-quantized tensors.
         if save_kv_cache:
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
@@ -3429,8 +3443,11 @@ class DeepseekSparseAttnBackend(
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        if not is_nvfp4_cache:
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(
+                -1, self.real_page_size, self.kv_cache_dim
+            ).unsqueeze(1)
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -3474,10 +3491,16 @@ class DeepseekSparseAttnBackend(
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
 
         q_scale = 1.0
+        # NVFP4 gather applies the cache's global dequantization scale before
+        # casting to compact FP8, so no additional K descale belongs in BMM1.
         k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
+            1.0
+            if is_nvfp4_cache
+            else (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -3487,7 +3510,34 @@ class DeepseekSparseAttnBackend(
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        if is_nvfp4_cache:
+            from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+                gather_dequant_nvfp4_mla_cache,
+                gather_dequant_nvfp4_mla_cache_generation,
+            )
+
+            data_cache, scale_cache, global_scale = (
+                self.token_to_kv_pool.get_nvfp4_mla_buffers(layer.layer_id)
+            )
+            use_context_gather = is_prefill and not (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            gather_fn = (
+                gather_dequant_nvfp4_mla_cache
+                if use_context_gather
+                else gather_dequant_nvfp4_mla_cache_generation
+            )
+            kv, page_table_1 = gather_fn(
+                data_cache,
+                scale_cache,
+                page_table_1,
+                global_scale,
+                head_dim=self.kv_cache_dim,
+                page_size=self.real_page_size,
+            )
+        else:
+            kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 

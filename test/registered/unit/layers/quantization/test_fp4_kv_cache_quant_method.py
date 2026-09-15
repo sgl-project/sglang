@@ -442,6 +442,186 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         )
 
 
+class TestNVFP4DSAGather(CustomTestCase):
+    @skip_if_no_blackwell_nvfp4
+    def test_dsa_pool_quantizes_main_cache_only(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.mem_cache.memory_pool import DSANVFP4TokenToKVPool
+        from sglang.srt.runtime_context import get_parallel
+
+        method = NVFP4KVCacheMethod(num_layers=1, device="cuda")
+        pool = DSANVFP4TokenToKVPool(
+            size=64,
+            page_size=64,
+            kv_lora_rank=512,
+            dtype=torch.float4_e2m1fn_x2,
+            qk_rope_head_dim=64,
+            layer_num=1,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            quant_method=method,
+        )
+        layer = RadixAttention(
+            num_heads=128,
+            head_dim=576,
+            scaling=576**-0.5,
+            num_kv_heads=1,
+            layer_id=0,
+            v_head_dim=512,
+        )
+        loc = torch.tensor([1, 7], dtype=torch.int64, device="cuda")
+        k_nope = torch.randn(2, 1, 512, dtype=torch.bfloat16, device="cuda")
+        k_rope = torch.randn(2, 1, 64, dtype=torch.bfloat16, device="cuda")
+        with get_parallel().override(dcp_enabled=False):
+            pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+
+        data, scales, global_scale = pool.get_nvfp4_mla_buffers(0)
+        self.assertEqual(data.shape, (128, 1, 288))
+        self.assertEqual(scales.shape, (128, 1, 36))
+        self.assertEqual(global_scale.shape, (1,))
+        self.assertTrue(torch.any(data[loc] != 0))
+        self.assertTrue(torch.any(scales[loc] != 0))
+        # The independent indexer cache retains its original 132 bytes/token,
+        # packed as one page per row by IndexKeyCache.
+        self.assertEqual(
+            pool.get_index_k_with_scale_buffer(0).shape[-1], pool.page_size * 132
+        )
+
+    @skip_if_no_blackwell_nvfp4
+    def test_gather_dequant_deduplicates_and_remaps(self):
+        from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+            gather_dequant_nvfp4_mla_cache,
+            gather_dequant_nvfp4_mla_cache_generation,
+        )
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        head_dim = 576
+        page_size = 64
+        source = torch.randn(8, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+        global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        packed, scales, _ = NVFP4KVQuantizeUtil.quantize(source, global_scale)
+        physical = torch.tensor(
+            [[3, 1, 3, -1], [6, 1, -1, -1]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        compact, remapped = gather_dequant_nvfp4_mla_cache(
+            packed.view(torch.uint8),
+            scales.view(torch.uint8),
+            physical,
+            global_scale,
+            head_dim=head_dim,
+            page_size=page_size,
+        )
+
+        generation, generation_remapped = gather_dequant_nvfp4_mla_cache_generation(
+            packed.view(torch.uint8),
+            scales.view(torch.uint8),
+            physical,
+            global_scale,
+            head_dim=head_dim,
+            page_size=page_size,
+        )
+
+        self.assertEqual(compact.shape, (1, 1, page_size, head_dim))
+        self.assertEqual(compact.dtype, torch.float8_e4m3fn)
+        self.assertEqual(remapped.dtype, torch.int32)
+        self.assertEqual(remapped[0, 0].item(), remapped[0, 2].item())
+        self.assertEqual(remapped[0, 1].item(), remapped[1, 1].item())
+        self.assertTrue(torch.all(remapped[physical < 0] == -1))
+        self.assertEqual(generation.shape, (1, 1, page_size, head_dim))
+        self.assertTrue(torch.all(generation_remapped[physical < 0] == -1))
+
+        direct = NVFP4KVQuantizeUtil.dequantize(
+            packed, scales, global_scale, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
+        flat_compact = compact.view(-1, 1, head_dim)
+        for row in range(physical.shape[0]):
+            for col in range(physical.shape[1]):
+                src = int(physical[row, col].item())
+                if src < 0:
+                    continue
+                dst = int(remapped[row, col].item())
+                torch.testing.assert_close(
+                    flat_compact[dst].float(), direct[src].float(), rtol=0, atol=0
+                )
+                generation_dst = int(generation_remapped[row, col].item())
+                torch.testing.assert_close(
+                    generation.view(-1, 1, head_dim)[generation_dst].float(),
+                    direct[src].float(),
+                    rtol=0,
+                    atol=0,
+                )
+
+    @skip_if_no_blackwell_nvfp4
+    def test_trtllm_gen_consumes_compact_cache(self):
+        import flashinfer.decode
+
+        from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+            gather_dequant_nvfp4_mla_cache_generation,
+        )
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        batch, heads, latent_dim, rope_dim = 1, 128, 512, 64
+        head_dim, topk, page_size = latent_dim + rope_dim, 2048, 64
+        source = (
+            torch.randn(topk, 1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.2
+        )
+        query = (
+            torch.randn(batch, 1, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+            * 0.2
+        ).to(torch.float8_e4m3fn)
+        physical = torch.arange(topk, dtype=torch.int32, device="cuda").view(
+            batch, topk
+        )
+        seq_lens = torch.full((batch,), topk, dtype=torch.int32, device="cuda")
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+        def run_attention(kv, indices):
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=latent_dim,
+                kv_lora_rank=latent_dim,
+                qk_rope_head_dim=rope_dim,
+                block_tables=indices.unsqueeze(1),
+                seq_lens=seq_lens,
+                max_seq_len=topk,
+                sparse_mla_top_k=topk,
+                bmm1_scale=head_dim**-0.5,
+                backend="trtllm-gen",
+            )
+
+        reference = run_attention(
+            source.to(torch.float8_e4m3fn).view(-1, 1, page_size, head_dim),
+            physical,
+        )
+        global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        packed, scales, _ = NVFP4KVQuantizeUtil.quantize(source, global_scale)
+        compact, remapped = gather_dequant_nvfp4_mla_cache_generation(
+            packed.view(torch.uint8),
+            scales.view(torch.uint8),
+            physical,
+            global_scale,
+            head_dim=head_dim,
+            page_size=page_size,
+        )
+        actual = run_attention(compact, remapped)
+
+        self.assertEqual(actual.shape, reference.shape)
+        self.assertTrue(torch.isfinite(actual).all())
+        error = (actual.float() - reference.float()).abs().mean()
+        relative_error = error / reference.float().abs().mean()
+        self.assertLess(relative_error.item(), 0.3)
+
+
 class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
     """Test FP4MXBlock16KVCacheMethod buffer creation and roundtrip."""
 

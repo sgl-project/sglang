@@ -2106,6 +2106,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_npu=False),
             override_platform(is_xpu=False),
             override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 3)),
+        ):
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="nvfp4")),
+                {
+                    "dsa_prefill_backend": "trtllm",
+                    "dsa_decode_backend": "trtllm",
+                },
+            )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
             patch("torch.cuda.get_device_capability", return_value=(12, 0)),
         ):
             self.assertEqual(
@@ -2336,9 +2350,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
                     {"kv_cache_dtype": "bfloat16"},
                 )
-                # explicit value survives (no declaration)
+                # explicit values survive (no declaration)
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e4m3")), {}
+                )
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="nvfp4")), {}
                 )
                 # unsupported dtype rejected
                 with self.assertRaises(AssertionError):
