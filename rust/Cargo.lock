@@ -3697,6 +3697,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-parity"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "socket2 0.6.5",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "sglang-server"
 version = "0.1.0"
 dependencies = [
