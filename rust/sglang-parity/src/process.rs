@@ -271,7 +271,16 @@ impl SglangProcess {
         let stderr = stdout
             .try_clone()
             .map_err(|e| format!("cannot duplicate server log: {e}"))?;
-        let mut command = Command::new(&config.python);
+        // Resolve explicit relative paths before changing the child's directory;
+        // a bare executable name must still use PATH lookup.
+        let python = if config.python.is_relative() && config.python.components().count() > 1 {
+            std::env::current_dir()
+                .map_err(|e| format!("cannot resolve Python executable: {e}"))?
+                .join(&config.python)
+        } else {
+            config.python.clone()
+        };
+        let mut command = Command::new(python);
         command
             .args(["-m", "sglang.launch_server", "--model-path", &config.model])
             .args(&config.args)
@@ -478,6 +487,7 @@ fn group_exists(group: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     fn config() -> ServerConfig {
@@ -486,17 +496,31 @@ mod tests {
     }
 
     #[test]
-    fn reservation_is_not_inherited_by_a_concurrent_child() {
+    fn reservation_is_closed_in_an_executed_child() {
         let reservation = reserve_port(0).unwrap();
         let port = reservation.local_addr().unwrap().port();
-        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
-        drop(reservation);
-        let rebound = TcpListener::bind(("127.0.0.1", port));
-        let _ = child.kill();
-        child.wait().unwrap();
+        // A different concurrent child can hold even a CLOEXEC descriptor until
+        // it execs. Inspect this executed child's descriptor instead of treating
+        // any immediate rebind failure as a leak from this particular child.
+        let child = Command::new("python3")
+            .args([
+                "-c",
+                r#"import socket, sys
+try:
+    inherited = socket.socket(fileno=int(sys.argv[1]))
+except OSError:
+    sys.exit(0)
+assert inherited.getsockname() != ('127.0.0.1', int(sys.argv[2])), 'port reservation survived exec'
+"#,
+            ])
+            .arg(reservation.as_raw_fd().to_string())
+            .arg(port.to_string())
+            .output()
+            .unwrap();
         assert!(
-            rebound.is_ok(),
-            "child retained the reservation: {rebound:?}"
+            child.status.success(),
+            "reservation descriptor check failed: {}",
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 
@@ -635,6 +659,51 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn python_paths_and_path_lookup_survive_a_different_server_working_dir() {
+        let invocation_dir = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&invocation_dir).unwrap();
+        let relative_dir = directory.path().strip_prefix(&invocation_dir).unwrap();
+        let executable = directory.path().join("fake-python");
+        std::fs::write(&executable, "#!/bin/sh\npwd\nexit 17\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let working_dir = directory.path().join("server-dir");
+        std::fs::create_dir(&working_dir).unwrap();
+        let mut config = config();
+        config.working_dir = Some(relative_dir.join("server-dir"));
+        config.env.insert(
+            "PATH".into(),
+            directory.path().to_string_lossy().into_owned(),
+        );
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        config.port = socket.local_addr().unwrap().port();
+        drop(socket);
+        for python in [
+            PathBuf::from(".").join(relative_dir).join("fake-python"),
+            PathBuf::from("fake-python"),
+        ] {
+            config.python = python;
+            let log = directory.path().join("server.log");
+            let result = SglangProcess::start(
+                &config,
+                Implementation::Python,
+                &log,
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                result.unwrap_err().contains("exited before readiness"),
+                "did not execute {:?}",
+                config.python
+            );
+            assert_eq!(
+                Path::new(std::fs::read_to_string(log).unwrap().trim()),
+                working_dir
+            );
+        }
     }
 
     struct Fixture {

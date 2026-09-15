@@ -94,8 +94,7 @@ impl SseDecoder {
     }
 
     fn process_line(&mut self) -> Result<(), String> {
-        let bytes = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&bytes)
+        let line = std::str::from_utf8(&self.line)
             .map_err(|error| format!("invalid UTF-8 in SSE response: {error}"))?;
         let line = if std::mem::replace(&mut self.first_line, false) {
             line.strip_prefix('\u{feff}').unwrap_or(line)
@@ -116,21 +115,22 @@ impl SseDecoder {
                 });
             }
             self.event.clear();
-            return Ok(());
-        }
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "data" => {
-                self.data.push_str(value);
-                self.data.push('\n');
+        } else {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "data" => {
+                    self.data.push_str(value);
+                    self.data.push('\n');
+                }
+                "event" => self.event = value.into(),
+                "id" if !value.contains('\0') => self.id = Some(value.into()),
+                // Comments, retry hints and unknown fields do not carry event data.
+                // The client never reconnects, so retry hints have no side effects.
+                _ => {}
             }
-            "event" => self.event = value.into(),
-            "id" if !value.contains('\0') => self.id = Some(value.into()),
-            // Comments, retry hints and unknown fields do not carry event data.
-            // The client never reconnects, so retry hints have no side effects.
-            _ => {}
         }
+        self.line.clear();
         Ok(())
     }
 }

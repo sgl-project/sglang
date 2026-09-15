@@ -538,6 +538,16 @@ fn validate_frame<'a>(
 impl ResultState {
     fn accept(&mut self, value: &Value, incremental: bool, path: &str) -> Result<(), Violation> {
         let meta = value["meta_info"].as_object().expect("validated metadata");
+        // Existing delta positions already agreed on a previous frame. If either
+        // optional family is arriving for the first time, validate all overlap.
+        let checked_ids = if incremental {
+            self.ids
+                .as_ref()
+                .zip(self.output.get("output_token_logprobs"))
+                .map_or(0, |(ids, logprobs)| ids.len().min(logprobs.len()))
+        } else {
+            0
+        };
         if let Some(previous) = &self.last {
             for key in ["id", "prompt_tokens"] {
                 if previous["meta_info"][key] != meta[key] {
@@ -657,7 +667,10 @@ impl ResultState {
             }
         }
         if let (Some(ids), Some(logprobs)) = (&self.ids, self.output.get("output_token_logprobs"))
-            && ids.iter().zip(logprobs).any(|(id, lp)| id != &lp[1])
+            && ids[checked_ids..]
+                .iter()
+                .zip(&logprobs[checked_ids..])
+                .any(|(id, lp)| id != &lp[1])
         {
             return Err(Violation::new(
                 format!("{path}/meta_info/output_token_logprobs"),
@@ -757,7 +770,7 @@ fn validate_logprobs<'a>(
             continue;
         }
         let tuples = if flat {
-            vec![value]
+            std::slice::from_ref(value)
         } else {
             value
                 .as_array()
@@ -767,8 +780,7 @@ fn validate_logprobs<'a>(
                         "top/token-id logprobs must contain arrays or null",
                     )
                 })?
-                .iter()
-                .collect()
+                .as_slice()
         };
         for tuple in tuples {
             let valid = tuple.as_array().is_some_and(|tuple| {

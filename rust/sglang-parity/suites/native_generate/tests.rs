@@ -450,6 +450,55 @@ fn incremental_logprob_positions_track_cumulative_counts() {
 }
 
 #[test]
+fn incremental_new_token_logprobs_must_match_new_output_ids() {
+    let (case, policy) = case("greedy_stream", true);
+    let mut stream = events(true);
+    modify_event(&mut stream, 1, |frame| {
+        frame["meta_info"]["output_token_logprobs"][0][1] = json!(99);
+    });
+    let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
+    assert_eq!(errors[0].path, "/meta_info/output_token_logprobs");
+    assert_eq!(errors[0].event, Some(1));
+}
+
+#[test]
+fn incremental_late_token_ids_or_logprobs_validate_the_entire_new_overlap() {
+    let (case, policy) = case("greedy_stream", true);
+    for key in ["output_ids", "output_token_logprobs"] {
+        let mut stream = events(true);
+        modify_event(&mut stream, 0, |frame| {
+            let object = if key == "output_ids" {
+                frame
+            } else {
+                &mut frame["meta_info"]
+            };
+            object.as_object_mut().unwrap().remove(key);
+        });
+        modify_event(&mut stream, 1, |frame| {
+            if key == "output_ids" {
+                frame[key] = fixture()[key].clone();
+            } else {
+                frame["meta_info"][key] = fixture()["meta_info"][key].clone();
+            }
+        });
+        assert_eq!(
+            policy.prepare(&case, &observation(stream.clone())).unwrap(),
+            fixture()
+        );
+        modify_event(&mut stream, 1, |frame| {
+            if key == "output_ids" {
+                frame[key][0] = json!(99);
+            } else {
+                frame["meta_info"][key][0][1] = json!(99);
+            }
+        });
+        let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
+        assert_eq!(errors[0].path, "/meta_info/output_token_logprobs");
+        assert_eq!(errors[0].event, Some(1));
+    }
+}
+
+#[test]
 fn trimmed_stop_tokens_still_count_as_generated_tokens() {
     let (case, policy) = case("greedy_stream", true);
     let mut stream = events(true);
