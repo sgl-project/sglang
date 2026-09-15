@@ -454,6 +454,10 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
+            DispatcherOutputDtype.MXFP8: {
+                "use_fp8": False,
+                "use_nvfp4": False,
+            },
             DispatcherOutputDtype.NVFP4: {
                 "use_fp8": False,
                 "use_nvfp4": True,

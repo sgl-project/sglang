@@ -223,10 +223,17 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(1, 2)
         weight_scale.data = scale
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
-        if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
+        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
+        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
+        # preserves multi-node prefill when ``deepep-mode=auto``.
+        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {
+                    "normal_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "mxfp8",
+                }
+            )
 
     def apply(
         self,
