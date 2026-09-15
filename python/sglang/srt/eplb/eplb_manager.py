@@ -10,7 +10,10 @@ from torch import nn
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+    megamoe_prefill_only_recorder_enabled,
+)
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     format_expert_location_layout,
@@ -18,7 +21,11 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -71,7 +78,13 @@ class EPLBManager:
 
         self._main_generator = self._entrypoint()
 
-    def on_forward_pass_end(self):
+    def on_forward_pass_end(self, forward_batch=None):
+        if (
+            forward_batch is not None
+            and megamoe_prefill_only_recorder_enabled()
+            and not forward_batch.is_extend_in_batch
+        ):
+            return
         next(self._main_generator)
 
     def reset_generator(self):
