@@ -204,7 +204,7 @@ def _compare_case(case, num_warps, use_ring=False):
         rings_fus = {name: buf.clone() for name, buf in template.items()}
     else:
         rings_ref = rings_fus = None
-    o_ref, conv_ref, win_ref, ic_ref = _run_reference(
+    o_ref, _, win_ref, ic_ref = _run_reference(
         inp, B, T, H, HV, K, V, lower_bound, rings=rings_ref
     )
     o_fus, conv_fus, win_fus, ic_fus = _run_fused(
