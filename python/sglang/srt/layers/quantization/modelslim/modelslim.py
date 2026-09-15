@@ -63,6 +63,7 @@ def npu_wrapper_rmsnorm_forward(func):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
@@ -164,9 +165,9 @@ class ModelSlimConfig(QuantizationConfig):
             if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
                 continue
             if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.'):]}"
+                alias = f"markov_head.{rest[len('markov_head.') :]}"
             elif rest.startswith("confidence_head."):
-                alias = f"confidence_head.{rest[len('confidence_head.'):]}"
+                alias = f"confidence_head.{rest[len('confidence_head.') :]}"
             else:
                 mapped_rest = rest
                 if mapped_rest.startswith("attn."):
@@ -332,8 +333,7 @@ class ModelSlimConfig(QuantizationConfig):
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
         logger.warning(
-            f"Unsupported Linear modelslim scheme: "
-            f"{quant_schemes} in layer: {prefix}"
+            f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
         )
         return None
 
@@ -505,7 +505,6 @@ class ModelSlimConfig(QuantizationConfig):
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

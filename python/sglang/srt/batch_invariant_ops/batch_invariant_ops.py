@@ -176,9 +176,9 @@ def _matmul_persistent_triton(
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
     NUM_SMS = get_device_core_count()
     M, K = a.shape
     K, N = b.shape
@@ -255,6 +255,12 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
+    # DeepGEMM 0.2 defaults BF16 GEMMs to cuBLASLt, whose reduction can
+    # depend on the batch size. Older wheels always use the invariant kernel.
+    get_deterministic = getattr(deep_gemm, "get_deterministic_algorithms", None)
+    deterministic = get_deterministic() if get_deterministic else True
+    if not deterministic:
+        deep_gemm.use_deterministic_algorithms(True)
     try:
         deep_gemm.bf16_gemm_nn(a, b, out)
     except RuntimeError as e:
@@ -264,6 +270,9 @@ def _matmul_persistent_deepgemm(
             f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
             f"for small matrices. Original error: {e}"
         ) from e
+    finally:
+        if not deterministic:
+            deep_gemm.use_deterministic_algorithms(False)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -501,9 +510,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda or input.is_xpu, "Input must be a CUDA or XPU tensor"
-    assert (
-        -input.ndim <= dim < input.ndim
-    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    assert -input.ndim <= dim < input.ndim, (
+        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    )
 
     # Handle negative dim
     if dim < 0:

@@ -62,9 +62,9 @@ class TestKVPressureBasic(ScriptedTestCase):
             f"long req must really chunk under pinned cache; got chunks_done="
             f"{r_long.chunks_done}"
         )
-        assert (
-            r_long.lock_refs == 0
-        ), f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+        assert r_long.lock_refs == 0, (
+            f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+        )
 
         t._release_exhausted_pools()
         final_lock_refs = t.get_all_node_lock_refs()

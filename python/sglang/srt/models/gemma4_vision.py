@@ -204,7 +204,6 @@ class Gemma4VisionAttention(nn.Module):
         if is_cuda():
             major, _ = get_device_capability()
             if major == 9:
-
                 if get_platform().is_blackwell:
                     return "triton_attn"
                 return "fa3"
