@@ -147,7 +147,8 @@ env:
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
   # PR runs share a group per branch so new pushes cancel stale runs.
-  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  # Include the requested ROCm version so parallel AITER Scout calls do not share a group.
+  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}-${{ inputs.rocm_version || 'default' }}
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:

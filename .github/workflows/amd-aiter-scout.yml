@@ -88,9 +88,8 @@ jobs:
     needs: resolve-aiter
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
-        rocm_version: [rocm10, rocm724]
+        rocm_version: [rocm10, rocm724, rocm720]
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
@@ -106,9 +105,8 @@ jobs:
     needs: resolve-aiter
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
-        rocm_version: [rocm10, rocm724]
+        rocm_version: [rocm10, rocm724, rocm720]
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
@@ -136,8 +134,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Nightly AMD ROCm10 + ROCm7.2.4 | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD ROCm10 + ROCm7.2.4 Gate | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD ROCm10 + ROCm7.2.4 + ROCm7.2.0 | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm10 + ROCm7.2.4 + ROCm7.2.0 Gate | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Check if any job failed
         run: |
