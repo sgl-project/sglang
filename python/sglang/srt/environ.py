@@ -294,6 +294,18 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # --ple-offload-backend file: where the sparse, file-backed PLE table lives
+    # (deterministic name, reused across restarts), whether prefill-sized
+    # gathers hint the page cache first, and an escape hatch for the device
+    # attribute check (pageable host memory reachable through host page tables).
+    SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # Faulting rows in maps whole page-cache folios, so the mapping creeps
+    # towards full residency (~45 KB/token) and eats the free memory that
+    # sizes the KV pool. Cap its resident set; 0 disables the trim.
+    SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
+    SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)

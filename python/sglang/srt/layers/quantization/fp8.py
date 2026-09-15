@@ -2335,6 +2335,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        ):
+            # Neither runner has an fp8 MoE path; they get pinned globally for
+            # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
+            logger.info(
+                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
+                moe_runner_backend.name,
+            )
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()

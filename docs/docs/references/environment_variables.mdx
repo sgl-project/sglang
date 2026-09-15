@@ -83,6 +83,31 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache directory for model weights and other data. Also the default root for compiled-kernel caches: Triton, Inductor, FlashInfer, the CUDA driver and DeepGEMM are pointed under it unless their own env vars (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`, `CUDA_CACHE_PATH`, `SGLANG_DG_CACHE_DIR`) are set explicitly</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>~/.cache/sglang</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_DIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default directory for the file-backed Qwen4-Exp PLE table (`--ple-offload-backend file`); one subdirectory per model path is created under it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{SGLANG_CACHE_DIR}/ple</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_PREFETCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hint the page cache (`posix_fadvise(WILLNEED)`) with the rows a prefill-sized PLE gather is about to read from the file-backed table. Set to `0` to disable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the load-time check that the device reads pageable host memory through the host page tables (`cudaDevAttrPageableMemoryAccessUsesHostPageTables`) before using the file-backed PLE table; only for devices that cannot be queried</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cap (GiB) on the resident set of the file-backed PLE mapping. A row fault maps a whole page-cache folio, so the mapping otherwise creeps towards the full table and consumes the free memory that sizes the KV pool; over the cap the pages are dropped with `MADV_DONTNEED` and stay in the page cache. Set to `0` to disable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How often the file-backed PLE mapping's resident set is compared against `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>30.0</code></td>
+    </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFETCH_BLOCK_SIZE_MB</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>

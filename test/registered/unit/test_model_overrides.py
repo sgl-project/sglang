@@ -2323,6 +2323,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
+    def test_qwen3_moe_family_mixed_precision_moe_runner(self):
+        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
+
+        def _mixed(expert_algo):
+            return SimpleNamespace(
+                architectures=["Qwen4ExpForConditionalGeneration"],
+                quantization_config={
+                    "quant_method": "modelopt_mixed",
+                    "quantized_layers": {
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": expert_algo
+                        }
+                    },
+                },
+            )
+
+        args = SimpleNamespace(
+            quantization="modelopt_mixed",
+            _quantization_explicitly_unset=False,
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+        )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # W4A4 experts take trtllm-gen like modelopt_fp4; W4A16 has no
+            # trtllm-gen kernel and goes to marlin.
+            self.assertEqual(
+                _qwen3_moe_family_overrides(args, _mixed("NVFP4")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            self.assertEqual(
+                _qwen3_moe_family_overrides(args, _mixed("W4A16_NVFP4")),
+                {"moe_runner_backend": "marlin"},
+            )
+
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
 
