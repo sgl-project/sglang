@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -438,6 +438,9 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        # Scoped by a speculative worker to stage its shared reads before
+        # the target prefill graph publishes the read-done event.
+        self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
         set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
@@ -966,8 +969,8 @@ class ModelRunner:
             ),
         )
 
-    def post_capture_resize_kv_pool(self):
-        resize = compute_post_capture_kv_resize(self)
+    def post_capture_resize_kv_pool(self, *, draft_runners=()):
+        resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
         self.max_total_num_tokens = resize.max_total_num_tokens
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = resize.full_max_total_num_tokens
@@ -1081,6 +1084,19 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        # from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        # if get_moe_runner_backend().is_flashinfer_megamoe():
+        #     # Warmup's dummy batches aren't guaranteed to route through every
+        #     # MoE layer; a layer that first builds mid-capture instead of
+        #     # during warmup hits a hard RuntimeError (capture forbids the
+        #     # lazy build's blocking device sync). Force every layer to build
+        #     # here, eagerly, outside any graph.
+        #     from sglang.srt.layers.moe.flashinfer_megamoe import (
+        #         warmup_all_flashinfer_megamoe_layers,
+        #     )
+
+        #     warmup_all_flashinfer_megamoe_layers(self.model)
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1508,6 +1524,10 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
+        forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
+            forward_batch._forward_num_tokens()
+        )
         return forward_batch
 
     def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
@@ -1628,7 +1648,9 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            build_step_span_name(forward_batch, is_draft_worker=self.is_draft_worker)
+        )
 
         canary_ctx = (
             context_tuple(

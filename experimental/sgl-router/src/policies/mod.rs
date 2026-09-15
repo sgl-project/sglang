@@ -16,6 +16,7 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod selection;
 pub mod session_aware;
 pub mod sticky;
 
@@ -239,7 +240,7 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Cache-Aware uses this binding before Top-K truncation so an
+    /// Cache-Aware applies Bucket constraints before Top-K truncation so an
     /// incompatible cache holder cannot displace a lower-ranked usable one.
     pub fn with_prefill_cache_bucket(
         mut self,
