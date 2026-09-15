@@ -9,3 +9,5 @@ export ENVS2="$ENVS2 SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5"
 
 # fp4 MoE activations at decode too (fused SwiGLU path); costs accuracy, so performance-only
 export ENVS2="$ENVS2 GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0"
+# small-message all-reduce: sub-256 KB messages take the 1-stage kernel (S2 microbench: 9.4-11 vs 12 us)
+export ENVS2="$ENVS2 SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144"
