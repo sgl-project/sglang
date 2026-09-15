@@ -41,8 +41,9 @@ import multiprocessing
 import os
 import signal
 import socket
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -56,6 +57,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 
+from .metrics import start_metrics_server
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -67,6 +69,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    is_pid_alive,
     recv_msg,
     send_msg,
 )
@@ -101,6 +104,7 @@ class WeightCacheDaemonArgs:
     dist_init_method: Optional[str] = None
     timeout: int = 1800
     force: bool = False
+    metrics_port: Optional[int] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -124,6 +128,14 @@ class WeightCacheDaemonArgs:
         )
         parser.add_argument("--timeout", type=int, default=1800)
         parser.add_argument("--force", action="store_true")
+        parser.add_argument(
+            "--metrics-port",
+            type=int,
+            default=None,
+            help="Serve Prometheus metrics on this port. When the launcher "
+            "starts several daemons, daemon gpu_id=N listens on port+N. "
+            "Off when omitted.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -134,6 +146,7 @@ class WeightCacheDaemonArgs:
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            metrics_port=args.metrics_port,
         )
 
 
@@ -187,6 +200,21 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+
+        # Runtime counters surfaced by the `status` request (monitoring only).
+        self._started_at = time.time()
+        self._loaded_at: Optional[float] = None
+        self._load_seconds: Optional[float] = None
+        self._serve_count = 0  # successful fetch_state responses ("hit")
+        self._mismatch_count = 0  # fetch_state rejected on CacheConfig mismatch
+        self._last_served_at: Optional[float] = None
+        # Client-reported engine PIDs, pruned of dead ones at each snapshot.
+        # Best-effort: PID reuse or a client in another PID namespace can make
+        # os.kill(pid, 0) vouch for an unrelated process.
+        self._served_client_pids: Set[int] = set()
+        # The metrics HTTP thread reads the snapshot while the serve loop
+        # mutates the counters above; serialize the two.
+        self._status_lock = threading.Lock()
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -255,6 +283,7 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        load_tic = time.perf_counter()
         # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
         # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
         # instead of dying deep inside the export with an opaque error.
@@ -390,10 +419,13 @@ class WeightCacheDaemon:
         # Export all parameters and buffers as IPC handles
         self._export_state()
 
+        self._load_seconds = time.perf_counter() - load_tic
+        self._loaded_at = time.time()
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors as IPC handles in "
+            f"{self._load_seconds:.2f}s total. Ready to serve."
         )
 
     @staticmethod
@@ -482,6 +514,13 @@ class WeightCacheDaemon:
                 model_config=model_config,
                 moe_ep_rank=get_parallel().moe_ep_rank,
             )
+        )
+
+    def expose_metrics(self, port: int) -> None:
+        """Expose ``/metrics`` on ``port`` from a background thread."""
+        start_metrics_server(self._status_snapshot, port)
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Prometheus metrics on :{port}/metrics"
         )
 
     def serve(self):
@@ -573,6 +612,8 @@ class WeightCacheDaemon:
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
                     f"Config mismatch: {mismatches}"
                 )
+                with self._status_lock:
+                    self._mismatch_count += 1
                 send_msg(
                     conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
                 )
@@ -593,9 +634,19 @@ class WeightCacheDaemon:
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
+            client_pid = req.get("client_pid")
+            with self._status_lock:
+                self._serve_count += 1
+                self._last_served_at = time.time()
+                if isinstance(client_pid, int) and client_pid > 0:
+                    self._served_client_pids.add(client_pid)
 
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
+
+        elif req.get("type") == "status":
+            # Read-only monitoring snapshot; safe to poll frequently.
+            send_msg(conn, self._status_snapshot())
 
         else:
             send_msg(
@@ -605,6 +656,40 @@ class WeightCacheDaemon:
                     "message": f"Unknown request type: {req.get('type')}",
                 },
             )
+
+    def _status_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        # Only the fields the serve loop mutates need the lock.
+        with self._status_lock:
+            self._served_client_pids = {
+                pid for pid in self._served_client_pids if is_pid_alive(pid)
+            }
+            live_client_pids = sorted(self._served_client_pids)
+            serve_count = self._serve_count
+            mismatch_count = self._mismatch_count
+            last_served_at = self._last_served_at
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "gpu_id": self.gpu_id,
+            "socket_path": self.socket_path,
+            "ready_path": self.ready_path,
+            "config": self.config.to_dict() if self.config else None,
+            "transport_backend": (
+                self.transport_backend.name if self.transport_backend else None
+            ),
+            "num_tensors": len(self.state_entries),
+            "preloaded_weights_bytes": self.preloaded_weights_bytes,
+            "started_at": self._started_at,
+            "loaded_at": self._loaded_at,
+            "load_seconds": self._load_seconds,
+            "uptime_seconds": now - self._started_at,
+            "serve_count": serve_count,
+            "mismatch_count": mismatch_count,
+            "last_served_at": last_served_at,
+            "live_client_count": len(live_client_pids),
+            "live_client_pids": live_client_pids,
+        }
 
     def shutdown(self):
         """Release GPU memory and clean up."""
@@ -624,6 +709,7 @@ def run_weight_cache_daemon(
     tp_rank: int,
     pp_rank: int,
     dist_init_method: Optional[str] = None,
+    metrics_port: Optional[int] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
@@ -647,6 +733,8 @@ def run_weight_cache_daemon(
         dist_init_method=dist_init_method,
     )
 
+    if metrics_port is not None:
+        daemon.expose_metrics(metrics_port)
     daemon.load()
     daemon.serve()
 
@@ -658,12 +746,13 @@ def spawn_weight_cache_daemon(
     tp_rank: int,
     pp_rank: int,
     dist_init_method: str,
+    metrics_port: Optional[int] = None,
 ):
     """Start one daemon from the complete resolved server configuration."""
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(
         target=run_weight_cache_daemon,
-        args=(server_args, gpu_id, tp_rank, pp_rank, dist_init_method),
+        args=(server_args, gpu_id, tp_rank, pp_rank, dist_init_method, metrics_port),
     )
     proc.start()
     return proc
@@ -674,6 +763,7 @@ def launch_weight_cache_daemons(
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
+    metrics_port: Optional[int] = None,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
@@ -765,6 +855,9 @@ def launch_weight_cache_daemons(
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,
                 dist_init_method=dist_init_method,
+                # One scrape port per daemon, offset by gpu_id so the mapping
+                # is stable across restarts and readable from the port alone.
+                metrics_port=(None if metrics_port is None else metrics_port + gpu_id),
             )
             procs.append(proc)
             logger.info(
@@ -889,6 +982,8 @@ if __name__ == "__main__":
             tp_rank=tp_rank,
             pp_rank=daemon_args.pp_rank,
             dist_init_method=daemon_args.dist_init_method,
+            # Single-daemon launch: the port is used as given, no gpu offset.
+            metrics_port=daemon_args.metrics_port,
         )
     else:
         launch_weight_cache_daemons(
@@ -896,4 +991,5 @@ if __name__ == "__main__":
             dist_init_method=daemon_args.dist_init_method,
             timeout=daemon_args.timeout,
             force=daemon_args.force,
+            metrics_port=daemon_args.metrics_port,
         )
