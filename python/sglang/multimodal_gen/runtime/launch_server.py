@@ -248,6 +248,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader.close()
 
     logger.debug("All workers are ready")
+    logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
 
     if node_rank != 0:
         # The TokenizerManager / HTTP surface lives on the node that owns
