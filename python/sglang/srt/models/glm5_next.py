@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -99,7 +100,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -337,7 +344,25 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # Both fused projections shard on attention TP, including under DP
+        # attention where the attention and global TP groups differ.
+        # LoRA wraps the original projections, not these fused module types.
+        self.do_fuse_qkvbfg = not (
+            get_lora().enable_lora or get_lora().lora_paths
+        ) and are_linear_prefixes_unquantized(
+            quant_config,
+            (
+                f"{prefix}.{name}"
+                for name in (
+                    "qkv_proj",
+                    "b_proj",
+                    "f_a_proj",
+                    "f_b_proj",
+                    "g_a_proj",
+                    "g_b_proj",
+                )
+            ),
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -351,8 +376,11 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # Eligibility is resolved using the original projection names.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -365,7 +393,12 @@ class Glm5NextLinearAttention(nn.Module):
                 or torch.get_default_dtype()
             )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(

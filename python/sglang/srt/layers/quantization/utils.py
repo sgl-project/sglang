@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
@@ -123,6 +123,36 @@ def is_layer_skipped(
 
     assert is_skipped is not None
     return is_skipped
+
+
+def are_linear_prefixes_unquantized(
+    quant_config: Optional[QuantizationConfig], prefixes: Iterable[str]
+) -> bool:
+    """Check fusion eligibility for unquantized or native FP8 checkpoints.
+
+    Native Fp8Config resolves all LinearBase subclasses by prefix alone. Other
+    configs can match concrete module classes, so a LinearBase probe cannot
+    establish their real projection methods. Leave those configs unfused.
+    """
+    if quant_config is None:
+        return True
+
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    # Subclasses may override method selection (e.g. hybrid quantization).
+    if type(quant_config) is not Fp8Config:
+        return False
+
+    # LinearBase allocates no weights; subclasses do that in create_weights.
+    probe = LinearBase(input_size=1, output_size=1, quant_config=None)
+    return all(
+        isinstance(
+            quant_config.get_quant_method(probe, prefix), UnquantizedLinearMethod
+        )
+        for prefix in prefixes
+    )
 
 
 def per_tensor_dequantize(
