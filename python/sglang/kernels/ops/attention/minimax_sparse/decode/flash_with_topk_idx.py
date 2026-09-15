@@ -893,9 +893,10 @@ def flash_decode_with_topk_idx(
         dtype=torch.float32,
         device=q.device,
     )
+    # 16384 == TopKTrait::kMaxNumBlocksCap (minimax_decode_topk.cuh).
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and score.shape[2] <= 16384
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
