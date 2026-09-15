@@ -686,14 +686,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
-    def test_cuda_vmm_rejects_rust_server(self):
+    def test_cuda_vmm_allows_rust_server(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with (
+            patch.dict(os.environ, {}, clear=False),
             envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
         ):
             handle_multimodal_feature_transport(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
+        )
 
     @override_platform(is_cuda=True)
     def test_cuda_vmm_rejects_pipeline_parallelism(self):
@@ -2533,15 +2537,14 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_deterministic_inference_rejected(self):
+    def test_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             enable_deterministic_inference=True,
         )
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
-    def test_rl_on_policy_deterministic_inference_rejected(self):
+    def test_rl_on_policy_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
@@ -2554,8 +2557,7 @@ class TestDeepEPv2Args(CustomTestCase):
             ),
         ):
             handle_deterministic_inference(args)
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
     def test_deterministic_inference_does_not_affect_legacy_deepep(self):
         args = self._args(

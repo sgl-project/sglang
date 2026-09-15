@@ -107,6 +107,17 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],

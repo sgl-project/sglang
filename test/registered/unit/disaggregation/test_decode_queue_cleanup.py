@@ -81,6 +81,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
         )
+        queue._allocatable_token_budgets = MagicMock(
+            side_effect=lambda **_: physical_available
+        )
         queue._swa_tail_allocatable_token_budget = MagicMock(
             side_effect=lambda **_: physical_available
         )
@@ -127,6 +130,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.metrics_reporter.enable_metrics = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -181,6 +185,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -242,6 +247,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
