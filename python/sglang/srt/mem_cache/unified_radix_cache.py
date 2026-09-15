@@ -2417,7 +2417,13 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.completed_tokens
                     )
                 # L2->L3 outcome: write_storage_failed is set by the backup IO
-                if not operation.write_storage_failed:
+                if operation.write_storage_failed:
+                    self._account_transfer_outcome(
+                        self._write_outcome_stats,
+                        TransferTier.L2_TO_L3_WRIT,
+                        "write_failed",
+                    )
+                else:
                     self._account_transfer_outcome(
                         self._write_outcome_stats,
                         TransferTier.L2_TO_L3_WRIT,
