@@ -1281,6 +1281,8 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
+    # route all-reduces at or below this many bytes to the 1-stage kernel; 0 keeps one communicator
+    SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES = EnvInt(0)
     # NCCL channel count pinned on CUDA so the all-reduce reduces a token the
     # same way whatever else shares its batch. Raise it to buy back bandwidth
     # on links that can drive more channels.

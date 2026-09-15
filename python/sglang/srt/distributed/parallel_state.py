@@ -468,6 +468,8 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.small_ca_comm: Optional[Any] = None
+        self._small_ca_max_bytes = 0
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -485,6 +487,7 @@ class GroupCoordinator:
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+            self.small_ca_comm = self._make_small_message_ca_comm()
 
             if is_hip():
                 try:
@@ -600,6 +603,10 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        small_ca_comm = getattr(self, "small_ca_comm", None)
+        maybe_small_ca_context = (
+            nullcontext() if small_ca_comm is None else small_ca_comm.capture()
+        )
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -607,7 +614,11 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with (
+            self.device_module.stream(stream),
+            maybe_ca_context,
+            maybe_small_ca_context,
+        ):
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -726,7 +737,7 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
-        should_use_custom_allreduce = (
+        should_use_custom_allreduce = self._use_small_message_ca(input_) or (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
@@ -951,6 +962,36 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _make_small_message_ca_comm(self):
+        """A 1-stage custom all-reduce for small messages next to the main communicator."""
+        max_bytes = envs.SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES.get()
+        if not is_hip() or max_bytes <= 0 or self.ca_comm is None:
+            return None
+        if getattr(self.ca_comm, "use_amd_deterministic_impl", False):
+            return None
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        try:
+            comm = CustomAllreduce(group=self.cpu_group, device=self.device)
+        except Exception as e:
+            logger.warning("Small-message 1-stage all-reduce unavailable: %s", e)
+            return None
+        # the 1-stage kernel wins below ~200 KB at TP4 (9.7 vs 12 us), the 2-stage above
+        comm.use_amd_deterministic_impl = True
+        self._small_ca_max_bytes = max_bytes
+        return comm
+
+    def _use_small_message_ca(self, input_: torch.Tensor) -> bool:
+        comm = getattr(self, "small_ca_comm", None)
+        return (
+            comm is not None
+            and not comm.disabled
+            and input_.numel() * input_.element_size() <= self._small_ca_max_bytes
+            and comm.should_custom_ar(input_)
+        )
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
@@ -961,6 +1002,8 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        if not should_use_pymscclpp_allreduce and self._use_small_message_ca(input_):
+            return "ca_small"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -1037,7 +1080,9 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        if outplace_all_reduce_method == "ca_small":
+            out = self.small_ca_comm.custom_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
