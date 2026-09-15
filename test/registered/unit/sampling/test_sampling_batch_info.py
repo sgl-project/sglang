@@ -170,25 +170,28 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
                                 key: proc_a if key == 1 else proc_b for key in rows
                             }
                             or None,
-                            custom_logit_processor_row_indices={
-                                key: (values, torch.tensor(values, dtype=torch.long))
+                            custom_logit_processor_rows=rows,
+                            custom_logit_processor_batch_indices={
+                                key: torch.tensor(values, dtype=torch.long)
                                 for key, values in rows.items()
                             },
                             custom_params=[None] * size if rows else None,
                         )
                     )
                 left, right = infos
+                original_indices = left.custom_logit_processor_batch_indices.copy()
 
                 left.merge_batch(right)
 
                 self.assertEqual(set(left.custom_logit_processor or {}), set(expected))
-                self.assertEqual(
-                    set(left.custom_logit_processor_row_indices), set(expected)
-                )
+                self.assertEqual(set(left.custom_logit_processor_rows), set(expected))
                 for key, expected_rows in expected.items():
-                    rows, indices = left.custom_logit_processor_row_indices[key]
+                    rows = left.custom_logit_processor_rows[key]
+                    indices = left.custom_logit_processor_batch_indices[key]
                     self.assertEqual(rows, expected_rows)
                     self.assertEqual(indices.tolist(), expected_rows)
+                    if key not in right_rows:
+                        self.assertIs(indices, original_indices[key])
                     self.assertIs(
                         left.custom_logit_processor[key], proc_a if key == 1 else proc_b
                     )
@@ -440,19 +443,45 @@ class TestFilterBatch(CustomTestCase):
         self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
 
     def test_filter_with_custom_logit_processor(self):
-        """Test that filter updates custom params and processor rows."""
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
         info.custom_logit_processor = {42: proc}
-        info.custom_logit_processor_row_indices = {42: ([0, 2], torch.tensor([0, 2]))}
+        info.custom_logit_processor_rows = {42: [0, 2]}
+        info.custom_logit_processor_batch_indices = {42: torch.tensor([0, 2])}
         info.custom_params = [{"a": 1}, {"b": 2}, {"c": 3}]
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
         self.assertEqual(info.custom_params, [{"a": 1}, {"c": 3}])
-        rows, indices = info.custom_logit_processor_row_indices[42]
+        rows = info.custom_logit_processor_rows[42]
+        indices = info.custom_logit_processor_batch_indices[42]
         self.assertEqual(rows, [0, 1])
         self.assertEqual(indices.tolist(), rows)
+
+    def test_filter_reuses_indices_only_when_rows_are_unchanged(self):
+        for keep, expected_rows in (([0, 1], [0, 1]), ([1, 2], [0]), ([2], [])):
+            with self.subTest(keep=keep):
+                original_indices = torch.tensor([0, 1])
+                info = _make_info(
+                    batch_size=3,
+                    has_custom_logit_processor=True,
+                    custom_logit_processor={42: MagicMock()},
+                    custom_params=[None] * 3,
+                    custom_logit_processor_rows={42: [0, 1]},
+                    custom_logit_processor_batch_indices={42: original_indices},
+                )
+                info.filter_batch(keep, torch.tensor(keep))
+                if not expected_rows:
+                    self.assertEqual(info.custom_logit_processor_rows, {})
+                    self.assertEqual(info.custom_logit_processor_batch_indices, {})
+                    continue
+                self.assertEqual(info.custom_logit_processor_rows[42], expected_rows)
+                indices = info.custom_logit_processor_batch_indices[42]
+                self.assertEqual(indices.tolist(), expected_rows)
+                if expected_rows == [0, 1]:
+                    self.assertIs(indices, original_indices)
+                else:
+                    self.assertIsNot(indices, original_indices)
 
     def test_filter_merge_preserves_per_token_params(self):
         from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -467,7 +496,8 @@ class TestFilterBatch(CustomTestCase):
             has_custom_logit_processor=True,
             custom_logit_processor={42: processor},
             custom_params=[{"value": 10}, None, {"value": 20}],
-            custom_logit_processor_row_indices={42: ([0, 2], torch.tensor([0, 2]))},
+            custom_logit_processor_rows={42: [0, 2]},
+            custom_logit_processor_batch_indices={42: torch.tensor([0, 2])},
         )
         info.filter_batch([2, 1, 0], torch.tensor([2, 1, 0]))
         info.merge_batch(
@@ -476,10 +506,12 @@ class TestFilterBatch(CustomTestCase):
                 has_custom_logit_processor=True,
                 custom_logit_processor={42: processor},
                 custom_params=[{"value": 30}],
-                custom_logit_processor_row_indices={42: ([0], torch.tensor([0]))},
+                custom_logit_processor_rows={42: [0]},
+                custom_logit_processor_batch_indices={42: torch.tensor([0])},
             )
         )
-        rows, indices = info.custom_logit_processor_row_indices[42]
+        rows = info.custom_logit_processor_rows[42]
+        indices = info.custom_logit_processor_batch_indices[42]
         self.assertEqual(rows, [0, 2, 3])
         self.assertEqual(indices.tolist(), rows)
         for width in (1, 3):
@@ -495,12 +527,13 @@ class TestFilterBatch(CustomTestCase):
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
         info.custom_logit_processor = {42: proc}
-        info.custom_logit_processor_row_indices = {42: ([1], torch.tensor([1]))}
+        info.custom_logit_processor_rows = {42: [1]}
+        info.custom_logit_processor_batch_indices = {42: torch.tensor([1])}
         info.custom_params = [None, {"x": 1}, None]
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
         self.assertFalse(info.has_custom_logit_processor)
-        self.assertEqual(info.custom_logit_processor_row_indices, {})
+        self.assertEqual(info.custom_logit_processor_rows, {})
         self.assertIsNone(info.custom_logit_processor)
 
     def test_filter_with_none_sampling_seed(self):
@@ -559,7 +592,8 @@ class TestMergeBatch(CustomTestCase):
         info1 = _make_info(batch_size=1)
         info1.has_custom_logit_processor = True
         info1.custom_logit_processor = {1: proc}
-        info1.custom_logit_processor_row_indices = {1: ([0], torch.tensor([0]))}
+        info1.custom_logit_processor_rows = {1: [0]}
+        info1.custom_logit_processor_batch_indices = {1: torch.tensor([0])}
         info1.custom_params = [{"a": 1}]
         info2 = _make_info(batch_size=1)
         info2.has_custom_logit_processor = False
@@ -743,8 +777,9 @@ class TestFromScheduleBatch(CustomTestCase):
 
         left.merge_batch(right)
 
-        self.assertIsNotNone(left.custom_logit_processor_row_indices)
-        rows, indices = left.custom_logit_processor_row_indices[hash(processor_str)]
+        self.assertIsNotNone(left.custom_logit_processor_rows)
+        rows = left.custom_logit_processor_rows[hash(processor_str)]
+        indices = left.custom_logit_processor_batch_indices[hash(processor_str)]
         self.assertEqual(rows, [2])
         self.assertEqual(indices.tolist(), [2])
 
@@ -775,7 +810,8 @@ class TestFromScheduleBatch(CustomTestCase):
         key = list(info.custom_logit_processor.keys())[0]
         proc = info.custom_logit_processor[key]
         self.assertIsInstance(proc, DisallowedTokensLogitsProcessor)
-        rows, indices = info.custom_logit_processor_row_indices[key]
+        rows = info.custom_logit_processor_rows[key]
+        indices = info.custom_logit_processor_batch_indices[key]
         self.assertEqual(rows, [0])
         self.assertEqual(indices.tolist(), rows)
         self.assertEqual(indices.dtype, torch.long)

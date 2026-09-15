@@ -31,8 +31,9 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
             has_custom_logit_processor=True,
             custom_params=[{"token_id": 1}, None, {"token_id": 2}],
             custom_logit_processor={0: processor},
-            custom_logit_processor_row_indices={
-                0: ([0, 2], torch.tensor([0, 2], device="cuda"))
+            custom_logit_processor_rows={0: [0, 2]},
+            custom_logit_processor_batch_indices={
+                0: torch.tensor([0, 2], device="cuda")
             },
             device="cuda",
         )
@@ -93,13 +94,14 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
                 self.assertNotIn("aten::nonzero", names)
                 self.assertNotIn("aten::_local_scalar_dense", names)
                 if keep == [2, 1]:
-                    rows, indices = info.custom_logit_processor_row_indices[0]
+                    rows = info.custom_logit_processor_rows[0]
+                    indices = info.custom_logit_processor_batch_indices[0]
                     self.assertEqual(rows, [0])
                     self.assertEqual(indices.tolist(), [0])
                     self.assertEqual(info.custom_params, [{"token_id": 2}, None])
                     self.assertEqual(set(info.custom_logit_processor), {0})
                 else:
-                    self.assertEqual(info.custom_logit_processor_row_indices, {})
+                    self.assertEqual(info.custom_logit_processor_rows, {})
                     self.assertIsNone(info.custom_logit_processor)
                     self.assertFalse(info.has_custom_logit_processor)
 
