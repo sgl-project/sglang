@@ -243,7 +243,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
     ),
-
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(

@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -241,7 +240,7 @@ class AscendFABackend(AttentionBackend):
 class AscendFAImpl(AttentionImpl):
     # npu_fused_infer_attention_score_v2 requires per-token-group
     # quantization (mode 6) for Q/K and per-channel-group quantization (mode 8) for V.
-    # Only TND input lauout is available for MXFP8 scenario.
+    # Only TND input layout is available for MXFP8 scenario.
     _MXFP8_FA_PARAMS = {
         "q_quant_mode": 6,
         "k_quant_mode": 6,
@@ -281,9 +280,7 @@ class AscendFAImpl(AttentionImpl):
         )
         if self._quant_scheme is not None:
             self._head_size = head_size
-            self._mxfp8_head_chunk_size = (
-                envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
-            )
+            self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
             if not self.use_offline_qk_rotation:
                 self._ensure_rot_matrix(head_size)
                 self._rot_device: torch.Tensor | None = None
