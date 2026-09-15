@@ -155,6 +155,44 @@ class TestForwardPassMetrics(unittest.TestCase):
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
 
+    def test_emit_decode_batch_without_seq_lens_cpu(self):
+        decode_a = _FakeReq(8, output_len=2)
+        decode_b = _FakeReq(13, output_len=1)
+        batch = self._make_batch(
+            reqs=[decode_a, decode_b],
+            seq_lens_cpu=None,
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=101.0,
+        ):
+            self.reporter._emit_forward_pass_metrics(batch)
+
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        scheduled = self.scheduler._fpm_publisher.metrics[0].scheduled_requests
+        self.assertEqual(scheduled.num_decode_requests, 2)
+        self.assertEqual(
+            scheduled.sum_decode_kv_tokens, decode_a.seqlen + decode_b.seqlen
+        )
+
+    def test_emit_decode_batch_prefers_seq_lens_cpu(self):
+        batch = self._make_batch(
+            reqs=[_FakeReq(8, output_len=2), _FakeReq(13, output_len=1)],
+            seq_lens_cpu=[8, 13],
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=101.0,
+        ):
+            self.reporter._emit_forward_pass_metrics(batch)
+
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        scheduled = self.scheduler._fpm_publisher.metrics[0].scheduled_requests
+        self.assertEqual(scheduled.num_decode_requests, 2)
+        self.assertEqual(scheduled.sum_decode_kv_tokens, 21)
+
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.scheduler._fpm_dp_rank = 3
         self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
