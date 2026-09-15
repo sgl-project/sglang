@@ -310,6 +310,30 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
+    def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2)
+        indices = torch.tensor([0, 1, 2, 3, 6, 7, 10, 11], dtype=torch.int64)
+        got = NPUMLATokenToKVPool._copy_indices_for_buffer(
+            pool, indices, uses_global_slots=False
+        )
+        self.assertEqual(got.tolist(), [0, 1, 2])
+
+    def test_retraction_indices_keep_indexer_slots_global(self):
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2)
+        indices = torch.tensor([0, 1, 2, 7], dtype=torch.int64)
+        got = NPUMLATokenToKVPool._copy_indices_for_buffer(
+            pool, indices, uses_global_slots=True
+        )
+        self.assertTrue(torch.equal(got, indices))
+
+    def test_retraction_indices_are_identity_without_dcp(self):
+        pool = SimpleNamespace(dcp_size=1, dcp_rank=0)
+        indices = torch.tensor([0, 3, 8], dtype=torch.int64)
+        got = NPUMLATokenToKVPool._copy_indices_for_buffer(
+            pool, indices, uses_global_slots=False
+        )
+        self.assertTrue(torch.equal(got, indices))
+
     def test_transfer_view_keeps_page_shape_and_strides_global_slots(self):
         pool = SimpleNamespace(dcp_size=4)
         raw = torch.empty(4, 8, 1, 2, 3)

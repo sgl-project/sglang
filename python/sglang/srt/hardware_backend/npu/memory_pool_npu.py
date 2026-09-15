@@ -609,7 +609,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
         self.index_size = size if index_size is None else index_size
-        self.dcp_size = get_parallel().attn_dcp_size
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
@@ -682,6 +684,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
 
         self._finalize_allocation_log(size)
+
+    def _copy_indices_for_buffer(self, indices, uses_global_slots):
+        if uses_global_slots or self.dcp_size <= 1:
+            return indices
+        owned = indices % self.dcp_size == self.dcp_rank
+        return indices[owned] // self.dcp_size
 
     def get_kv_size_bytes(self):
         kv_size_bytes = 0
@@ -949,17 +957,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             index_k.view(-1, 1, self.index_head_dim),
         )
 
-    def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
+    def _chunk_copy_npu_to_cpu(
+        self, buf_of_layers, indices, uses_global_slots_per_layer
+    ):
         chunk_size = self.cpu_offloading_chunk_size
         out = []
-        for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf, ik_buf/None]
+        for tensors_per_layer, uses_global_slots in zip(
+            buf_of_layers, uses_global_slots_per_layer, strict=True
+        ):  # [k_buf, v_buf, ik_buf/None]
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[ci].to("cpu", non_blocking=True)
-                        for t in tensors_per_layer
+                        t[self._copy_indices_for_buffer(ci, uses_global)].to(
+                            "cpu", non_blocking=True
+                        )
+                        for t, uses_global in zip(
+                            tensors_per_layer, uses_global_slots, strict=True
+                        )
                         if t is not None
                     ]
                 )
@@ -991,8 +1007,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
         ]
+        uses_global_slots_per_layer = []
+        for buffers in buf_of_layers:
+            # MLA K/V is rank-local under DCP. The replicated
+            # indexer buffers retain allocator-global slot identities.
+            uses_global_slots_per_layer.append(
+                [self.is_draft_worker, self.is_draft_worker]
+                + [True] * (len(buffers) - 2)
+            )
 
-        kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
+        kv_cache_cpu = self._chunk_copy_npu_to_cpu(
+            buf_of_layers, indices, uses_global_slots_per_layer
+        )
         torch.npu.synchronize()
         return kv_cache_cpu
 
@@ -1006,7 +1032,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
-                for buffer, cpu in zip(buffers, chunk, strict=True):
-                    assert cpu.shape[0] == len(chunk_indices)
-                    buffer[chunk_indices] = cpu.to(buffer.device, non_blocking=True)
+                cpu_index = 0
+                for buffer, uses_global_slots in zip(
+                    buffers,
+                    [self.is_draft_worker, self.is_draft_worker]
+                    + [True] * (len(buffers) - 2),
+                    strict=True,
+                ):
+                    if buffer is None:
+                        continue
+                    cpu = chunk[cpu_index]
+                    cpu_index += 1
+                    target_indices = self._copy_indices_for_buffer(
+                        chunk_indices, uses_global_slots
+                    )
+                    assert cpu.shape[0] == len(target_indices)
+                    buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
