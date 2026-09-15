@@ -1720,6 +1720,18 @@ def w8a8_block_fp8_matmul_triton(
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 
+    # The kernel indexes scales per compute tile, so a tile must sit entirely
+    # inside one quantization K block. A hand-supplied config whose
+    # BLOCK_SIZE_K does not evenly divide the quantization block leaves the
+    # scale pointer stuck at the first block and computes silently wrong
+    # results; the tuned configs always satisfy this.
+    if block_size[1] % config["BLOCK_SIZE_K"] != 0:
+        raise ValueError(
+            f"BLOCK_SIZE_K={config['BLOCK_SIZE_K']} is incompatible with "
+            f"quantization block_size={block_size}: the quantization K block "
+            f"must be an exact multiple of BLOCK_SIZE_K"
+        )
+
     split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
     if split_k > 1:
         assert split_k & (split_k - 1) == 0

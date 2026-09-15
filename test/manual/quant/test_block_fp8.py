@@ -429,6 +429,41 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
             ):
                 self._w8a8_block_fp8_matmul(*params)
 
+    def test_w8a8_block_fp8_matmul_rejects_k_tile_crossing_quant_blocks(self):
+        # #39626: a hand-supplied BLOCK_SIZE_K that does not evenly divide the
+        # quantization K block left the scale pointer stuck at block 0 and
+        # silently computed 64 where the right answer is 288. It must fail
+        # loudly instead, while the aligned config keeps working.
+        from unittest.mock import patch
+
+        import sglang.kernels.ops.quantization.fp8_kernel as fk
+
+        A = torch.ones((16, 64), device="cuda").to(torch.float8_e4m3fn)
+        B = torch.ones((32, 64), device="cuda").to(torch.float8_e4m3fn)
+        As = torch.tensor([1.0, 4.0], device="cuda").repeat(16, 1)
+        Bs = torch.tensor([[1.0, 2.0]], device="cuda")
+        expected = torch.full((16, 32), 288.0, device="cuda", dtype=torch.bfloat16)
+
+        def run_with(bk):
+            config = dict(
+                BLOCK_SIZE_M=16,
+                BLOCK_SIZE_N=32,
+                BLOCK_SIZE_K=bk,
+                GROUP_SIZE_M=1,
+                num_warps=4,
+                num_stages=4,
+            )
+            with patch.object(fk, "get_w8a8_block_fp8_configs", return_value={16: config}):
+                return fk.w8a8_block_fp8_matmul_triton(
+                    A, B, As, Bs, [32, 32], output_dtype=torch.bfloat16
+                )
+
+        with self.assertRaisesRegex(ValueError, "BLOCK_SIZE_K=64.*block_size"):
+            run_with(64)
+        out = run_with(32)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(out, expected))
+
 
 def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
     upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
