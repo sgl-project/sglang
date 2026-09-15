@@ -87,7 +87,7 @@ inline void launch_hicache_relayout_kernel(
   LaunchKernel(static_cast<uint32_t>(grid), kRelayoutBlockSize, device)(kernel, params);
 }
 
-struct HicachePageUnifiedWriteBackParams {
+struct HicachePageUnifiedRelayoutParams {
   void* staging;
   const void* k_ptr_src;
   const void* v_ptr_src;
@@ -99,12 +99,15 @@ struct HicachePageUnifiedWriteBackParams {
 };
 
 // Stage in destination order: (page, group, layer, kv, token, head, dim).
+// MLA omits the group, K/V and head axes: (page, layer, token, dim).
 // Each thread moves 16 bytes; adjacent threads write adjacent staging vectors.
 // Source layers contain contiguous (token, group * head_in_group, dim) rows.
-template <typename Index, int64_t kGroupBytes>
-__global__ void hicache_page_unified_write_back_kernel(const __grid_constant__ HicachePageUnifiedWriteBackParams p) {
+template <typename Index, int64_t kGroupBytes, bool kIsMLA>
+__global__ void hicache_page_unified_relayout_kernel(const __grid_constant__ HicachePageUnifiedRelayoutParams p) {
   static_assert(kGroupBytes > 0 && kGroupBytes % 16 == 0);
   constexpr int64_t kGroupVecs = kGroupBytes / 16;
+  constexpr int64_t kComponents = kIsMLA ? 1 : 2;
+  const int64_t num_groups = kIsMLA ? 1 : p.num_groups;
   const auto tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
   for (uint64_t i = tid; i < p.total_vecs; i += stride) {
@@ -112,16 +115,16 @@ __global__ void hicache_page_unified_write_back_kernel(const __grid_constant__ H
     const auto vec = i % kGroupVecs;
     const auto token = remaining % p.page_size;
     remaining /= p.page_size;
-    const auto kv = remaining % 2;
-    remaining /= 2;
+    const auto kv = remaining % kComponents;
+    remaining /= kComponents;
     const auto layer = remaining % p.num_layers;
     remaining /= p.num_layers;
-    const auto group = remaining % p.num_groups;
-    const auto page = remaining / p.num_groups;
+    const auto group = remaining % num_groups;
+    const auto page = remaining / num_groups;
     const auto src_page = static_cast<const Index*>(p.src_pages)[page];
     const auto src_token = static_cast<int64_t>(src_page) * p.page_size + token;
     const auto ptrs = static_cast<const void* const*>(kv == 0 ? p.k_ptr_src : p.v_ptr_src);
-    const auto src = device::pointer::offset(ptrs[layer], (src_token * p.num_groups + group) * kGroupBytes + vec * 16);
+    const auto src = device::pointer::offset(ptrs[layer], (src_token * num_groups + group) * kGroupBytes + vec * 16);
     const auto value = device::details::load_nc(static_cast<const uint4*>(src));
     device::details::store_nc(static_cast<uint4*>(p.staging) + i, value);
   }

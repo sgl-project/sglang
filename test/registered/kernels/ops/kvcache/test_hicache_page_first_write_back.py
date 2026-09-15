@@ -15,6 +15,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
+    transfer_hicache_all_layer_mla_staged_lf_page_unified,
     transfer_hicache_all_layer_staged_lf_page_unified,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -368,6 +369,88 @@ def test_page_unified_write_back_invalid_input(invalid, match):
     with pytest.raises(Exception, match=match):
         transfer_hicache_all_layer_staged_lf_page_unified(
             ptrs, ptrs, src_pages, dst_pages, staging, dst
+        )
+
+
+@pytest.mark.parametrize(
+    "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("page_count", [0, 1, 2, 5])
+def test_page_unified_mla_staged_write_back(
+    layers, page_size, dim, dtype, index_dtype, page_count
+):
+    generator = torch.Generator().manual_seed(5678)
+    source_cpu = [
+        torch.randint(0, 128, (6 * page_size, dim), generator=generator).to(dtype)
+        for _ in range(layers)
+    ]
+    src_ids = [4, 0, 3, 4, 1][:page_count]
+    dst_ids = [6, 2, 0, 5, 3][:page_count]
+    shape = (layers, page_size, dim)
+    dst = torch.full((8, *shape), 255, dtype=dtype, pin_memory=True)
+    expected = dst.clone()
+    for src_page, dst_page in zip(src_ids, dst_ids):
+        for layer in range(layers):
+            expected[dst_page, layer].copy_(
+                source_cpu[layer][src_page * page_size : (src_page + 1) * page_size]
+            )
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        source_gpu = [t.to(DEVICE) for t in source_cpu]
+        ptrs = torch.tensor(
+            [t.data_ptr() for t in source_gpu], dtype=torch.uint64, device=DEVICE
+        )
+        src_pages = torch.tensor(src_ids, dtype=index_dtype, device=DEVICE)
+        dst_pages = torch.tensor(dst_ids, dtype=torch.int64)
+        staging = torch.empty((2, *shape), dtype=dtype, device=DEVICE)
+        transfer_hicache_all_layer_mla_staged_lf_page_unified(
+            ptrs, src_pages, dst_pages, staging, dst
+        )
+    stream.synchronize()
+    assert torch.equal(dst, expected)
+
+
+@pytest.mark.parametrize(
+    "invalid,match",
+    [
+        ("rank", "Expected MLA"),
+        ("dimension", "must be positive"),
+        ("alignment", "16-byte aligned"),
+        ("staging_capacity", "at least one page"),
+        ("page_shape", "matching page shapes"),
+        ("noncontiguous", "must be contiguous"),
+        ("dst_page", "destination page out of range"),
+        ("layer_count", "page byte size mismatch"),
+    ],
+)
+def test_page_unified_mla_write_back_invalid_input(invalid, match):
+    shape = (3, 4, 16)
+    if invalid == "dimension":
+        shape = (3, 4, 0)
+    elif invalid == "alignment":
+        shape = (3, 4, 7)
+    staging = torch.empty((1, *shape), dtype=torch.float16, device=DEVICE)
+    dst = torch.empty((2, *shape), dtype=torch.float16, pin_memory=True)
+    ptrs = torch.zeros(3, dtype=torch.uint64, device=DEVICE)
+    src_pages = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    dst_pages = torch.zeros(1, dtype=torch.int64)
+    if invalid == "rank":
+        staging = staging.unsqueeze(1)
+    elif invalid == "staging_capacity":
+        staging = staging[:0]
+    elif invalid == "page_shape":
+        staging = staging[:, :1]
+    elif invalid == "noncontiguous":
+        staging = staging.transpose(1, 2).contiguous().transpose(1, 2)
+    elif invalid == "dst_page":
+        dst_pages.fill_(-1)
+    elif invalid == "layer_count":
+        ptrs = ptrs[:2]
+    with pytest.raises(Exception, match=match):
+        transfer_hicache_all_layer_mla_staged_lf_page_unified(
+            ptrs, src_pages, dst_pages, staging, dst
         )
 
 

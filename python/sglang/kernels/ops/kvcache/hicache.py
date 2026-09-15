@@ -351,8 +351,8 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
 
 
 @cache_once
-def _jit_page_unified_write_back(group_bytes: int) -> Module:
-    args = make_cpp_args(group_bytes)
+def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> Module:
+    args = make_cpp_args(group_bytes, is_mla)
     return load_jit(
         "hicache_page_unified_write_back",
         *args,
@@ -393,13 +393,77 @@ def transfer_hicache_all_layer_staged_lf_page_unified(
         raise ValueError(
             "Expected (page, head_group, layer, 2, page_size, head_in_group, dim)"
         )
-    if staging.shape[1:] != dst.shape[1:] or staging.dtype != dst.dtype:
-        raise ValueError(
-            "Staging and destination must have matching page shapes and dtype"
-        )
     if dst.shape[3] != 2 or any(d <= 0 for d in dst.shape[1:]):
         raise ValueError(
             "Page dimensions must be positive and the K/V dimension must be 2"
+        )
+    _transfer_hicache_all_layer_staged_page_unified(
+        k_ptr_src,
+        v_ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[5] * dst.shape[6] * dst.element_size(),
+        num_groups=dst.shape[1],
+        page_size=dst.shape[4],
+        is_mla=False,
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_all_layer_mla_staged_lf_page_unified(
+    ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write compressed MLA KV pages in (page, layer, page_size, dim) order.
+
+    MLA has one latent cache per layer, with no head-group or separate K/V
+    axes. Source pointers address contiguous (token, dim) tensors; ``dim``
+    includes all stored latent and positional components. No dtype conversion
+    is performed. Each token row must be a positive multiple of 16 bytes.
+
+    Pointer tables, page IDs, pinned destination memory, staging reuse and
+    stream lifetime requirements match the MHA page_unified entry point.
+    ``src_pages`` and ``dst_pages`` contain physical page IDs, not token offsets.
+    """
+    if dst.ndim != 4 or staging.ndim != 4:
+        raise ValueError("Expected MLA (page, layer, page_size, dim)")
+    if any(d <= 0 for d in dst.shape[1:]):
+        raise ValueError("MLA page dimensions must be positive")
+    _transfer_hicache_all_layer_staged_page_unified(
+        ptr_src,
+        ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[3] * dst.element_size(),
+        num_groups=1,
+        page_size=dst.shape[2],
+        is_mla=True,
+    )
+
+
+def _transfer_hicache_all_layer_staged_page_unified(
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+    *,
+    group_bytes: int,
+    num_groups: int,
+    page_size: int,
+    is_mla: bool,
+) -> None:
+    if staging.shape[1:] != dst.shape[1:] or staging.dtype != dst.dtype:
+        raise ValueError(
+            "Staging and destination must have matching page shapes and dtype"
         )
     if not staging.is_contiguous() or not dst.is_contiguous():
         raise ValueError("Staging and destination must be contiguous")
@@ -413,10 +477,9 @@ def transfer_hicache_all_layer_staged_lf_page_unified(
         or src_pages.numel() != dst_pages.numel()
     ):
         raise ValueError("Source and destination page IDs must be equal-length vectors")
-    group_bytes = dst.shape[5] * dst.shape[6] * dst.element_size()
     if group_bytes % 16:
-        raise ValueError("Each head group's token data must be 16-byte aligned")
-    module = _jit_page_unified_write_back(group_bytes)
+        raise ValueError("Each copied token row must be 16-byte aligned")
+    module = _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
     capacity = staging.shape[0]
     page_elements = staging[0].numel()
     staging_flat = staging.view(capacity, page_elements)
@@ -430,6 +493,6 @@ def transfer_hicache_all_layer_staged_lf_page_unified(
             v_ptr_src,
             src_pages[begin:end],
             dst_pages[begin:end],
-            dst.shape[1],
-            dst.shape[4],
+            num_groups,
+            page_size,
         )
