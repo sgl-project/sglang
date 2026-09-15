@@ -145,6 +145,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
             tree_cache=cache,
+            processed_tokens_counter=0,
         )
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
         req = SimpleNamespace(
@@ -154,6 +155,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             is_retracted=False,
             swa_branching_seqlen=4,
             kv=SimpleNamespace(cache_protected_len=2),
+            time_stats=MagicMock(),
         )
         queue.queue = [req]
 
@@ -321,11 +323,17 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
         scheduler.disagg_prefill_inflight_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
+        scheduler.tree_cache = MagicMock()
 
-        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+        with (
+            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
+        ):
+            get_serving.return_value.weight_version = None
             scheduler.abort_request(AbortReq(rid="req"))
 
         scheduler.release_aborted_prefill_waiting_req.assert_called_once()
+        scheduler.tree_cache.finish.assert_called_once()
         release.assert_not_called()
 
 
