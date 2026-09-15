@@ -43,14 +43,11 @@ impl GrpcServerHandle {
 struct TokenizerInfo {
     tokenizer_path: Option<String>,
     tokenizer_mode: Option<String>,
+    dllm_mask_id: Option<u32>,
     context_len: i32,
 }
 
-/// Extract tokenizer path/mode and context_len from the Python RuntimeHandle (one-time GIL).
-///
-/// Missing `tokenizer_manager` indicates a misconfigured runtime handle and should surface at
-/// startup. Sub-fields are best-effort because unsupported native tokenizer backends can still
-/// fall back to Python tokenization.
+/// Read optional native-tokenizer metadata. Missing attributes can fall back to Python.
 fn try_get_attr(
     py: Python<'_>,
     obj: &Py<PyAny>,
@@ -91,6 +88,7 @@ fn try_get_attr_i32(
     })
 }
 
+/// Read tokenizer settings and the configured dLLM mask ID once at startup.
 fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo> {
     Python::attach(|py| {
         let tm = runtime_handle
@@ -133,6 +131,7 @@ fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo>
         Ok(TokenizerInfo {
             tokenizer_path,
             tokenizer_mode,
+            dllm_mask_id: tm.getattr(py, "dllm_mask_id")?.extract(py)?,
             context_len,
         })
     })
@@ -226,6 +225,7 @@ fn start_server(
     let bridge = Arc::new(PyBridge::new(
         runtime_handle,
         rust_tokenizer,
+        tokenizer_info.dllm_mask_id,
         tokenizer_info.context_len,
         response_channel_capacity,
         tokio_handle,

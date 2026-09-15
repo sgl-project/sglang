@@ -484,13 +484,20 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             let tokens = tok
                 .encode(&req.text, add_special)
                 .map_err(Status::internal)?;
-            let count = tokens.len() as i32;
-            return Ok(Response::new(proto::TokenizeResponse {
-                tokens: tokens.iter().map(|&t| t as i32).collect(),
-                count,
-                max_model_len: self.bridge.context_len(),
-                input_text: req.text,
-            }));
+            // Reserved dLLM mask IDs need the shared Python prompt normalization.
+            if !self
+                .bridge
+                .dllm_mask_id()
+                .is_some_and(|mask_id| tokens.contains(&mask_id))
+            {
+                let count = tokens.len() as i32;
+                return Ok(Response::new(proto::TokenizeResponse {
+                    tokens: tokens.iter().map(|&t| t as i32).collect(),
+                    count,
+                    max_model_len: self.bridge.context_len(),
+                    input_text: req.text,
+                }));
+            }
         }
 
         // Fallback to Python
