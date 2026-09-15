@@ -29,7 +29,7 @@ mkdir -p "$MODELS_DIR"
 if [ ! -x "$AIPERF_VENV/bin/aiperf" ]; then
   python3.12 -m venv "$AIPERF_VENV"
   [ -d "$AIPERF_DIR/.git" ] || git clone https://github.com/SemiAnalysisAI/aiperf "$AIPERF_DIR"
-  git -C "$AIPERF_DIR" checkout b7b16cf8
+  git -C "$AIPERF_DIR" checkout 754356e9
   "$AIPERF_VENV/bin/pip" install -q -e "$AIPERF_DIR"
 fi
 echo "setup complete"

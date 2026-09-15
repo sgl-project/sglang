@@ -1,3 +1,3 @@
 # ATOM/InferenceX client environment (recipes/MiniMax-M3-Agentic-InferenceX.md)
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000 AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300 AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0 AIPERF_FAILED_REQUEST_THRESHOLD=0.10 AIPERF_LIVE_FAILED_REQUEST_THRESHOLD=0.10 AIPERF_WARMUP_REQUESTS_PER_LANE=10 AIPERF_BENCHMARK_GRACE_PERIOD=30
-export ATOM_CLIENT_FLAGS="--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 --trace-idle-gap-cap-seconds 300 --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800 --failed-request-threshold 0.10 --stats-interval 30 --slice-duration 1.0"
+export ATOM_CLIENT_FLAGS="--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 --trace-idle-gap-cap-seconds 300 --warmup-requests-per-lane 10 --warmup-grace-period 1800 --failed-request-threshold 0.10 --stats-interval 30 --slice-duration 1.0"

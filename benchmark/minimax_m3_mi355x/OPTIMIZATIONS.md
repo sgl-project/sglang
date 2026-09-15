@@ -1,6 +1,6 @@
 # MiniMax-M3 on 4x MI350X: SGLang AgentX results and how to reproduce them
 
-Benchmark: AIPerf `inferencex-agentx-mvp` (393 SemiAnalysis coding-agent traces, seed 42), SemiAnalysis AIPerf fork with ATOM's client flags, TP4 on 4 GPUs. Score = total token throughput (prompt tokens incl. cache hits + completion) per second / 4. Hardware here is MI350X (gfx950, 288 GB, ROCm 7.2.4); ATOM's published figures are MI355X.
+Benchmark: AIPerf `inferencex-agentx-mvp` (393 SemiAnalysis coding-agent traces, seed 42), SemiAnalysis AIPerf fork at InferenceX's pinned commit 754356e9 with InferenceX/ATOM's client flags (idle cap 300 s, trajectory start 0.25-0.75, 10 warmup requests per lane), TP4 on 4 GPUs. Score = total token throughput (prompt tokens incl. cache hits + completion) per second / 4. Hardware here is MI350X (gfx950, 288 GB, ROCm 7.2.4); ATOM's published figures are MI355X.
 
 ## Results (tok/s per GPU; 3600 s at c=24/32, 1800 s at c=1/8)
 
