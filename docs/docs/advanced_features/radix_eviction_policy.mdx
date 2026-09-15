@@ -50,7 +50,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 ```
 
 <Note>
-`--radix-eviction-policy-config` is not supported by the experimental Rust tree core (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust`), which builds its strategy from the policy name alone. Passing both fails at startup.
+The Python and Rust tree cores both accept `--radix-eviction-policy-config`, including SLRU's `protected_threshold` parameter, and reject unrecognized policy parameters at startup.
 </Note>
 
 ### Policy parameters
