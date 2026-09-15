@@ -89,18 +89,17 @@ def _resolve_format_pair(name: str) -> tuple["AttentionFormat", "AttentionFormat
     rather than at import.
     """
     fp8 = _aiter_native_fp8_format()
-    bf16 = _AiterAttentionFormat.BF16
     int8 = _AiterAttentionFormat.INT8
     mxfp4 = _AiterAttentionFormat.MXFP4
     mxfp6 = _AiterAttentionFormat.MXFP6
     # Grouped by Q/K format, which is what selects the recipe family.
     pairs = {
-        "bf16fp8": (bf16, fp8),
         "fp8": (fp8, fp8),
         "f8f6": (fp8, mxfp6),
         "i8fp8": (int8, fp8),
         "mxfp6": (mxfp6, fp8),
         "f6f4": (mxfp6, mxfp4),
+        "mxfp4": (mxfp4, fp8),
         "f4f4": (mxfp4, mxfp4),
     }
     if name not in pairs:
@@ -137,8 +136,8 @@ class AITERQuantBackend(AttentionBackend):
 
 class AITERQuantImpl(AttentionImpl):
     """Quantized attention via aiter's mha_v4, with the variant selected by the
-    `format` key of --attention-backend-config (bf16fp8, fp8, f8f6, i8fp8,
-    mxfp6, f6f4, f4f4)."""
+    `format` key of --attention-backend-config (fp8, f8f6, i8fp8, mxfp6, f6f4,
+    mxfp4, f4f4)."""
 
     def __init__(
         self,
